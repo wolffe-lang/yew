@@ -1,0 +1,1403 @@
+//! term.input — the escape-sequence state machine: an arbitrary byte
+//! stream into normalized `Key` events, the kitty keyboard protocol on
+//! top of a complete legacy decoder, bracketed paste, SGR mouse, focus.
+//!
+//! Ports sagitta `src/term/input.c` (1,052 lines) and `input.h` (248) at
+//! 9ace98c2, under `s04-input-decoding.md`. The output contract is the
+//! point: from Sprint 13 on the keymap consumes `Key` and nothing else.
+//! The progress law (§2): every `input_next` either answers false or
+//! consumes at least one byte. Paste bytes are TEXT, never keys (§8),
+//! enforced structurally: `IN_PASTE`'s only exits are the terminator and
+//! EOF, and nothing in that state reaches `emit_named`. Time is injected
+//! (`now_ms`), as in `tty`; the lone-ESC deadline is never armed under
+//! kitty (§5).
+//!
+//! The wolf shapes. `Key` is seven ints and a `List[byte]` text (C: 32
+//! bytes, `_Static_assert`ed; the port's size is recorded in the note);
+//! the caller owns one `Key` and passes it `mut`, so the only per-key
+//! allocation is the text list it reuses (`key_clear` pops, never
+//! reallocates). `In`'s parameter tables are flat lists (`xpar[pi * 16 +
+//! si]`); its byte buffer is a `List[byte]` compacted by a slice copy
+//! when `rd` passes 4 KiB (`compact`, the C `memmove`); the paste chunk is
+//! a pre-filled 4080-byte list written by index with its own length, so a
+//! 200 MB paste costs 4 KiB of parser memory (§8). Drops are logged once
+//! per shape through `util.log` (`note_drop`, `input.c:93-126`).
+
+use unicode
+use util
+
+// The states (`input.c:15-27`).
+const IN_GROUND: int = 0
+
+const IN_ESC: int = 1
+
+const IN_CSI: int = 2
+
+const IN_SS3: int = 3
+
+const IN_STRING: int = 4
+
+const IN_STRING_ESC: int = 5
+
+const IN_X10: int = 6
+
+const IN_PASTE: int = 7
+
+const IN_STRING_DROP: int = 8
+
+const IN_STRING_DROP_ESC: int = 9
+
+const IN_CSI_DROP: int = 10
+
+// The once-per-shape log mask (`input.c:29-37`).
+const LOG_UNKNOWN: int = 1
+
+const LOG_MALFORMED: int = 2
+
+const LOG_STRING_CAP: int = 4
+
+const LOG_BUFFER_CAP: int = 8
+
+const LOG_UTF8: int = 16
+
+const LOG_MOUSE: int = 32
+
+const LOG_OSC52: int = 64
+
+/// The lone-ESC deadline in ms (`YEW_ESC_TIMEOUT_MS`, `input.h:11`).
+pub const ESC_TIMEOUT_MS: int = 25
+
+/// The most unread input retained (`YEW_IN_MAX_BUFFER`, 1 MiB).
+pub const IN_MAX_BUFFER: int = 1048576
+
+/// A paste chunk's bound (`YEW_IN_PASTE_CHUNK`, 4 KiB).
+pub const IN_PASTE_CHUNK: int = 4096
+
+/// A terminal string body's cap (`YEW_IN_STRING_MAX`, 8 KiB).
+pub const IN_STRING_MAX: int = 8192
+
+/// One past the last Unicode scalar: where the named keys start
+/// (`YEW_KEY_BASE`, `input.h:15`).
+pub const KEY_BASE: int = 1114112
+
+// Paste chunks are emitted at 4080 bytes, leaving headroom for the
+// six-byte terminator (`YEW_PASTE_EMIT`, `input.c:61`).
+const PASTE_EMIT: int = 4080
+
+/// `YewMods`: Shift.
+pub const MOD_SHIFT: int = 1
+
+/// Alt.
+pub const MOD_ALT: int = 2
+
+/// Ctrl.
+pub const MOD_CTRL: int = 4
+
+/// Super.
+pub const MOD_SUPER: int = 8
+
+/// Hyper.
+pub const MOD_HYPER: int = 16
+
+/// Meta.
+pub const MOD_META: int = 32
+
+/// Caps lock (kitty).
+pub const MOD_CAPS: int = 64
+
+/// Num lock (kitty).
+pub const MOD_NUM: int = 128
+
+/// `EvKind`: a recognized-and-dropped sequence.
+pub const EV_NONE: int = 0
+
+/// A key.
+pub const EV_KEY: int = 1
+
+/// A paste begins.
+pub const EV_PASTE_BEGIN: int = 2
+
+/// A paste chunk (`input_paste_chunk`).
+pub const EV_PASTE_DATA: int = 3
+
+/// A paste ends.
+pub const EV_PASTE_END: int = 4
+
+/// A mouse report.
+pub const EV_MOUSE: int = 5
+
+/// A focus change.
+pub const EV_FOCUS: int = 6
+
+/// The named keys (`YewKeyCode`, `input.h:39-139`), append-only ordinals
+/// from `KEY_BASE`: Escape.
+pub const KEY_ESCAPE: int = 1114112
+
+/// Enter.
+pub const KEY_ENTER: int = 1114113
+
+/// Tab.
+pub const KEY_TAB: int = 1114114
+
+/// Backspace.
+pub const KEY_BACKSPACE: int = 1114115
+
+/// Insert.
+pub const KEY_INSERT: int = 1114116
+
+/// Delete.
+pub const KEY_DELETE: int = 1114117
+
+/// Up.
+pub const KEY_UP: int = 1114118
+
+/// Down.
+pub const KEY_DOWN: int = 1114119
+
+/// Right.
+pub const KEY_RIGHT: int = 1114120
+
+/// Left.
+pub const KEY_LEFT: int = 1114121
+
+/// Home.
+pub const KEY_HOME: int = 1114122
+
+/// End.
+pub const KEY_END: int = 1114123
+
+/// Page up.
+pub const KEY_PAGE_UP: int = 1114124
+
+/// Page down.
+pub const KEY_PAGE_DOWN: int = 1114125
+
+/// Begin (keypad 5).
+pub const KEY_BEGIN: int = 1114126
+
+/// F1; F2..F35 follow in order (`KEY_F1 + n - 1`).
+pub const KEY_F1: int = 1114127
+
+/// F13 (`KEY_F1 + 12`).
+pub const KEY_F13: int = 1114139
+
+/// F35, the last function key.
+pub const KEY_F35: int = 1114161
+
+/// Keypad 0; KP_1..KP_9 follow.
+pub const KEY_KP_0: int = 1114162
+
+/// Keypad decimal; DIVIDE, MULTIPLY, SUBTRACT, ADD, ENTER, EQUAL,
+/// SEPARATOR follow in order.
+pub const KEY_KP_DECIMAL: int = 1114172
+
+/// Keypad divide.
+pub const KEY_KP_DIVIDE: int = 1114173
+
+/// Keypad multiply.
+pub const KEY_KP_MULTIPLY: int = 1114174
+
+/// Keypad subtract.
+pub const KEY_KP_SUBTRACT: int = 1114175
+
+/// Keypad add.
+pub const KEY_KP_ADD: int = 1114176
+
+/// Keypad enter.
+pub const KEY_KP_ENTER: int = 1114177
+
+/// Keypad equal.
+pub const KEY_KP_EQUAL: int = 1114178
+
+/// Keypad separator.
+pub const KEY_KP_SEPARATOR: int = 1114179
+
+/// Keypad left; RIGHT, UP, DOWN, PAGE_UP, PAGE_DOWN, HOME, END, INSERT,
+/// DELETE, BEGIN follow in order.
+pub const KEY_KP_LEFT: int = 1114180
+
+/// Keypad begin, the last keypad key.
+pub const KEY_KP_BEGIN: int = 1114190
+
+/// Caps lock.
+pub const KEY_CAPS_LOCK: int = 1114191
+
+/// Scroll lock.
+pub const KEY_SCROLL_LOCK: int = 1114192
+
+/// Num lock.
+pub const KEY_NUM_LOCK: int = 1114193
+
+/// Print screen.
+pub const KEY_PRINT_SCREEN: int = 1114194
+
+/// Pause.
+pub const KEY_PAUSE: int = 1114195
+
+/// Menu.
+pub const KEY_MENU: int = 1114196
+
+/// Focus in (`kind` is `EV_FOCUS`).
+pub const KEY_FOCUS_IN: int = 1114197
+
+/// Focus out.
+pub const KEY_FOCUS_OUT: int = 1114198
+
+/// Left shift; the eleven other modifier keys follow (left ctrl, alt,
+/// super, hyper, meta, then the right six).
+pub const KEY_LEFT_SHIFT: int = 1114199
+
+/// Right meta, the last named key.
+pub const KEY_RIGHT_META: int = 1114210
+
+/// `YewMouseButton`: no button (motion under 1003).
+pub const MB_NONE: int = 0
+
+/// Left.
+pub const MB_LEFT: int = 1
+
+/// Middle.
+pub const MB_MIDDLE: int = 2
+
+/// Right.
+pub const MB_RIGHT: int = 3
+
+/// Wheel up.
+pub const MB_WHEEL_UP: int = 4
+
+/// Wheel down.
+pub const MB_WHEEL_DOWN: int = 5
+
+/// Wheel left.
+pub const MB_WHEEL_LEFT: int = 6
+
+/// Wheel right.
+pub const MB_WHEEL_RIGHT: int = 7
+
+/// Button 8 (back).
+pub const MB_BACK: int = 8
+
+/// Button 9 (forward).
+pub const MB_FORWARD: int = 9
+
+/// `ev`: a press.
+pub const KEY_PRESS: int = 1
+
+/// A repeat (a drag, for the mouse).
+pub const KEY_REPEAT: int = 2
+
+/// A release.
+pub const KEY_RELEASE: int = 3
+
+/// The normalized event (`Key`, `input.h:167-177`): `code` is a scalar
+/// (the unshifted key) or a named key from `KEY_BASE`; `text` is the
+/// UTF-8 the key produced (at most 15 bytes, truncated on a codepoint
+/// boundary); `col`/`row` are 0-based mouse cells.
+pub struct Key {
+    code: int,
+    kind: int,
+    mods: int,
+    col: int,
+    row: int,
+    ev: int,
+    button: int,
+    text: List[byte],
+}
+
+/// An empty event.
+pub fn key_new() -> Key {
+    Key {
+        code: 0,
+        kind: EV_NONE,
+        mods: 0,
+        col: 0,
+        row: 0,
+        ev: 0,
+        button: 0,
+        text: List[byte](),
+    }
+}
+
+/// Zero a key, keeping its text list (`clear_key`, `input.c:128-131`).
+pub fn key_clear(mut out: Key) {
+    out.code = 0
+    out.kind = EV_NONE
+    out.mods = 0
+    out.col = 0
+    out.row = 0
+    out.ev = 0
+    out.button = 0
+    while out.text.len != 0 {
+        let _ = (mut out.text).pop() else (0 as byte)
+    }
+}
+
+/// The parser (`In`, `input.h:196-225`).
+pub struct In {
+    buf: List[byte],
+    rd: int,
+    state: int,
+    xpar: List[int],
+    xpresent: List[bool],
+    xnsub: List[int],
+    npar: int,
+    priv: int,
+    inter: int,
+    deadline: int,
+    in_paste: bool,
+    paste: List[byte],
+    paste_len: int,
+    caps: TtyCaps,
+    dropped: int,
+    seq_start: int,
+    scan: int,
+    string_len: int,
+    pending_mods: int,
+    log_mask: int,
+    eof: bool,
+    dispatch_ready: bool,
+}
+
+/// A parser in GROUND over the negotiated capabilities (`yew_input_init`).
+pub fn input_new(caps: TtyCaps) -> In {
+    var xpar = List[int]()
+    var xpresent = List[bool]()
+    var i = 0
+    while i < 256 {
+        (mut xpar).push(0)
+        (mut xpresent).push(false)
+        i += 1
+    }
+    var xnsub = List[int]()
+    i = 0
+    while i < 16 {
+        (mut xnsub).push(1)
+        i += 1
+    }
+    var paste = List[byte]()
+    i = 0
+    while i < PASTE_EMIT {
+        (mut paste).push(0 as byte)
+        i += 1
+    }
+    In {
+        buf: List[byte](),
+        rd: 0,
+        state: IN_GROUND,
+        xpar: xpar,
+        xpresent: xpresent,
+        xnsub: xnsub,
+        npar: 1,
+        priv: 0,
+        inter: 0,
+        deadline: 0,
+        in_paste: false,
+        paste: paste,
+        paste_len: 0,
+        caps: copy caps,
+        dropped: 0,
+        seq_start: 0,
+        scan: 0,
+        string_len: 0,
+        pending_mods: 0,
+        log_mask: 0,
+        eof: false,
+        dispatch_ready: false,
+    }
+}
+
+fn note_drop(mut inp: In, shape: int, message: str) {
+    inp.dropped += 1
+    if (inp.log_mask & shape) == 0 {
+        inp.log_mask = inp.log_mask | shape
+        util.log_debug("input: {message} (further instances suppressed)")
+    }
+}
+
+fn string_is_osc52(inp: In) -> bool {
+    let len = inp.scan - inp.seq_start
+    if len < 5 {
+        return false
+    }
+    let s = inp.seq_start
+    inp.buf[s] as int == 27 &&
+        inp.buf[s + 1] as int == 93 &&
+        inp.buf[s + 2] as int == 53 &&
+        inp.buf[s + 3] as int == 50 &&
+        inp.buf[s + 4] as int == 59
+}
+
+fn note_string_drop(mut inp: In, shape: int, message: str) {
+    if !string_is_osc52(inp) {
+        note_drop(mut inp, shape, message)
+        return
+    }
+    inp.dropped += 1
+    if (inp.log_mask & LOG_OSC52) == 0 {
+        inp.log_mask = inp.log_mask | LOG_OSC52
+        util.log_warn("input: unsolicited OSC 52 reply discarded (further instances suppressed)")
+    }
+}
+
+fn emit_named(mut out: Key, code: int, mods: int) {
+    out.kind = EV_KEY
+    out.code = code
+    out.mods = mods
+    out.ev = KEY_PRESS
+}
+
+fn emit_scalar(mut out: Key, cp: int, mods: int, s: List[byte], at: int, n: int) {
+    emit_named(mut out, cp, mods)
+    var take_n = n
+    if take_n > 16 {
+        take_n = 16
+    }
+    var i = 0
+    while i < take_n {
+        (mut out.text).push(s[at + i])
+        i += 1
+    }
+}
+
+// Drop the consumed prefix of the buffer when it is large (`compact`,
+// `input.c:152-170`): only in GROUND and PASTE, only past the thresholds,
+// so a 200 MB paste stays linear.
+fn compact(mut inp: In) {
+    if inp.state != IN_GROUND && inp.state != IN_PASTE {
+        return
+    }
+    if (inp.state == IN_GROUND && inp.rd <= IN_PASTE_CHUNK) ||
+        (inp.state == IN_PASTE && inp.rd < PASTE_EMIT) {
+        return
+    }
+    let consumed = inp.rd
+    inp.buf = inp.buf[consumed..inp.buf.len]
+    inp.rd = 0
+    if inp.state == IN_PASTE {
+        inp.scan -= consumed
+    }
+}
+
+fn reset_params(mut inp: In) {
+    var i = 0
+    while i < 256 {
+        inp.xpar[i] = 0
+        inp.xpresent[i] = false
+        i += 1
+    }
+    i = 0
+    while i < 16 {
+        inp.xnsub[i] = 1
+        i += 1
+    }
+    inp.npar = 1
+    inp.priv = 0
+    inp.inter = 0
+}
+
+fn xp(inp: In, pi: int, si: int) -> int {
+    inp.xpar[pi * 16 + si]
+}
+
+fn xpres(inp: In, pi: int, si: int) -> bool {
+    inp.xpresent[pi * 16 + si]
+}
+
+fn params_empty(inp: In) -> bool {
+    inp.npar == 1 && !xpres(inp, 0, 0) && inp.xnsub[0] == 1
+}
+
+fn params_plain(inp: In) -> bool {
+    var i = 0
+    while i < inp.npar {
+        if inp.xnsub[i] != 1 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn is_scalar(cp: int) -> bool {
+    cp <= 1114111 && !(cp >= 55296 && cp <= 57343)
+}
+
+// The modifier parameter at `index` (`m - 1` is the mask), or false for
+// an out-of-range one (`modifier`, `input.c:207-216`).
+fn modifier(inp: In, index: int) -> (bool, int) {
+    var m = 1
+    if index < inp.npar && xpres(inp, index, 0) {
+        m = xp(inp, index, 0)
+    }
+    if m == 0 || m > 256 {
+        return (false, 0)
+    }
+    (true, m - 1)
+}
+
+fn tilde_code(n: int) -> int {
+    if n == 1 || n == 7 {
+        return KEY_HOME
+    }
+    if n == 2 {
+        return KEY_INSERT
+    }
+    if n == 3 {
+        return KEY_DELETE
+    }
+    if n == 4 || n == 8 {
+        return KEY_END
+    }
+    if n == 5 {
+        return KEY_PAGE_UP
+    }
+    if n == 6 {
+        return KEY_PAGE_DOWN
+    }
+    if n >= 11 && n <= 15 {
+        return KEY_F1 + n - 11
+    }
+    if n >= 17 && n <= 21 {
+        return KEY_F1 + 5 + n - 17
+    }
+    if n == 23 || n == 24 {
+        return KEY_F1 + 10 + n - 23
+    }
+    if n == 25 || n == 26 {
+        return KEY_F13 + n - 25
+    }
+    if n == 28 || n == 29 {
+        return KEY_F13 + 2 + n - 28
+    }
+    if n >= 31 && n <= 34 {
+        return KEY_F13 + 4 + n - 31
+    }
+    0
+}
+
+fn kitty_code(cp: int) -> int {
+    if cp == 27 {
+        return KEY_ESCAPE
+    }
+    if cp == 13 {
+        return KEY_ENTER
+    }
+    if cp == 9 {
+        return KEY_TAB
+    }
+    if cp == 127 {
+        return KEY_BACKSPACE
+    }
+    if cp >= 57376 && cp <= 57398 {
+        return KEY_F13 + cp - 57376
+    }
+    if cp >= 57399 && cp <= 57408 {
+        return KEY_KP_0 + cp - 57399
+    }
+    if cp >= 57409 && cp <= 57416 {
+        return KEY_KP_DECIMAL + cp - 57409
+    }
+    if cp >= 57417 && cp <= 57427 {
+        return KEY_KP_LEFT + cp - 57417
+    }
+    if cp >= 57441 && cp <= 57452 {
+        return KEY_LEFT_SHIFT + cp - 57441
+    }
+    if cp == 57358 {
+        return KEY_CAPS_LOCK
+    }
+    if cp == 57359 {
+        return KEY_SCROLL_LOCK
+    }
+    if cp == 57360 {
+        return KEY_NUM_LOCK
+    }
+    if cp == 57361 {
+        return KEY_PRINT_SCREEN
+    }
+    if cp == 57362 {
+        return KEY_PAUSE
+    }
+    if cp == 57363 {
+        return KEY_MENU
+    }
+    if cp >= 57344 && cp <= 63743 {
+        return 0
+    }
+    if is_scalar(cp) {
+        return cp
+    }
+    0
+}
+
+fn append_text_cp(mut out: Key, cp: int) -> bool {
+    let n = unicode.utf8_len(cp)
+    if n == 0 || out.text.len >= 15 || n > 15 - out.text.len {
+        return false
+    }
+    let _ = unicode.utf8_encode_into(mut out.text, cp)
+    true
+}
+
+fn dispatch_kitty(inp: In, mut out: Key) -> bool {
+    if inp.priv != 0 || inp.inter != 0 || inp.npar > 3 || inp.xnsub[0] > 3 || inp.xnsub[1] > 2 {
+        return false
+    }
+    if !xpres(inp, 0, 0) {
+        return false
+    }
+    let primary = if inp.xnsub[0] >= 3 && xpres(inp, 0, 2) then xp(inp, 0, 2) else xp(inp, 0, 0)
+    let code = kitty_code(primary)
+    let (mok, mods) = modifier(inp, 1)
+    if code == 0 || !mok {
+        return false
+    }
+    var event = KEY_PRESS
+    if inp.npar >= 2 && inp.xnsub[1] >= 2 && xpres(inp, 1, 1) {
+        event = xp(inp, 1, 1)
+    }
+    if event < KEY_PRESS || event > KEY_RELEASE {
+        return false
+    }
+    var i = 0
+    while i < inp.xnsub[0] {
+        if xpres(inp, 0, i) && kitty_code(xp(inp, 0, i)) == 0 {
+            return false
+        }
+        i += 1
+    }
+    if inp.npar >= 3 {
+        i = 0
+        while i < inp.xnsub[2] {
+            if xpres(inp, 2, i) && !is_scalar(xp(inp, 2, i)) {
+                return false
+            }
+            i += 1
+        }
+    }
+    emit_named(mut out, code, mods)
+    out.ev = event
+    if inp.npar >= 3 {
+        i = 0
+        while i < inp.xnsub[2] {
+            if xpres(inp, 2, i) {
+                if !append_text_cp(mut out, xp(inp, 2, i)) {
+                    break
+                }
+            }
+            i += 1
+        }
+    } else if (mods & (MOD_CTRL | MOD_ALT | MOD_SUPER | MOD_HYPER | MOD_META)) == 0 && code < KEY_BASE {
+        let produced = if inp.xnsub[0] >= 2 && xpres(inp, 0, 1) then xp(inp, 0, 1) else xp(inp, 0, 0)
+        let _ = append_text_cp(mut out, produced)
+    }
+    true
+}
+
+fn decode_mouse(mut out: Key, cb: int, cx: int, cy: int, final: int) -> bool {
+    if cx == 0 || cy == 0 || cx > 65536 || cy > 65536 {
+        return false
+    }
+    var mods = 0
+    if (cb & 4) != 0 {
+        mods = mods | MOD_SHIFT
+    }
+    if (cb & 8) != 0 {
+        mods = mods | MOD_ALT
+    }
+    if (cb & 16) != 0 {
+        mods = mods | MOD_CTRL
+    }
+    out.mods = mods
+    let base = cb - (cb & 28)
+    out.kind = EV_MOUSE
+    out.code = 0
+    out.col = cx - 1
+    out.row = cy - 1
+    out.ev = KEY_PRESS
+    if final == 109 && base <= 2 {
+        out.button = MB_LEFT + base
+        out.ev = KEY_RELEASE
+    } else if final == 77 && base <= 2 {
+        out.button = MB_LEFT + base
+    } else if final == 77 && base >= 32 && base <= 34 {
+        out.button = MB_LEFT + base - 32
+        out.ev = KEY_REPEAT
+    } else if final == 77 && base == 35 {
+        out.button = MB_NONE
+        out.ev = KEY_REPEAT
+    } else if final == 77 && base >= 64 && base <= 67 {
+        out.button = MB_WHEEL_UP + base - 64
+    } else if final == 77 && base >= 128 && base <= 129 {
+        out.button = MB_BACK + base - 128
+    } else {
+        key_clear(mut out)
+        return false
+    }
+    true
+}
+
+fn simple_csi(inp: In, final: int, mut out: Key) -> bool {
+    let (mok, mods) = modifier(inp, 1)
+    if inp.priv != 0 || inp.inter != 0 || inp.npar > 2 || !params_plain(inp) ||
+        (!params_empty(inp) && xp(inp, 0, 0) != 1) || !mok {
+        return false
+    }
+    var code = 0
+    if final == 65 {
+        code = KEY_UP
+    } else if final == 66 {
+        code = KEY_DOWN
+    } else if final == 67 {
+        code = KEY_RIGHT
+    } else if final == 68 {
+        code = KEY_LEFT
+    } else if final == 69 {
+        code = KEY_BEGIN
+    } else if final == 70 {
+        code = KEY_END
+    } else if final == 72 {
+        code = KEY_HOME
+    } else if final == 80 {
+        code = KEY_F1
+    } else if final == 81 {
+        code = KEY_F1 + 1
+    } else if final == 82 {
+        code = KEY_F1 + 2
+    } else if final == 83 {
+        code = KEY_F1 + 3
+    } else {
+        return false
+    }
+    emit_named(mut out, code, mods)
+    true
+}
+
+fn dispatch_csi(mut inp: In, final: int, mut out: Key) -> bool {
+    if final == 117 {
+        return dispatch_kitty(inp, mut out)
+    }
+    if final == 82 && inp.priv == 0 && inp.npar == 2 && xpres(inp, 0, 0) && xp(inp, 0, 0) != 1 {
+        return false
+    }
+    if simple_csi(inp, final, mut out) {
+        return true
+    }
+    if final == 90 && inp.priv == 0 && inp.inter == 0 && params_empty(inp) {
+        emit_named(mut out, KEY_TAB, MOD_SHIFT)
+        return true
+    }
+    if (final == 73 || final == 79) && inp.priv == 0 && inp.inter == 0 && params_empty(inp) {
+        out.kind = EV_FOCUS
+        out.code = if final == 73 then KEY_FOCUS_IN else KEY_FOCUS_OUT
+        out.ev = KEY_PRESS
+        return true
+    }
+    if final == 126 && inp.priv == 0 && inp.inter == 0 && inp.npar <= 2 && params_plain(inp) {
+        let (mok, mods) = modifier(inp, 1)
+        if mok {
+            if xpres(inp, 0, 0) && xp(inp, 0, 0) == 200 && inp.npar == 1 {
+                inp.state = IN_PASTE
+                inp.in_paste = true
+                inp.rd = inp.scan - 1
+                out.kind = EV_PASTE_BEGIN
+                return true
+            }
+            if xpres(inp, 0, 0) && xp(inp, 0, 0) == 201 && inp.npar == 1 {
+                return false
+            }
+            let code = if xpres(inp, 0, 0) then tilde_code(xp(inp, 0, 0)) else 0
+            if code != 0 {
+                emit_named(mut out, code, mods)
+                return true
+            }
+        }
+    }
+    if (final == 77 || final == 109) && inp.priv == 60 && inp.inter == 0 && inp.npar == 3 &&
+        params_plain(inp) && xpres(inp, 0, 0) && xpres(inp, 1, 0) && xpres(inp, 2, 0) &&
+        decode_mouse(mut out, xp(inp, 0, 0), xp(inp, 1, 0), xp(inp, 2, 0), final) {
+        return true
+    }
+    false
+}
+
+fn dispatch_ss3(final: int, mut out: Key) -> bool {
+    var code = 0
+    if final == 65 {
+        code = KEY_UP
+    } else if final == 66 {
+        code = KEY_DOWN
+    } else if final == 67 {
+        code = KEY_RIGHT
+    } else if final == 68 {
+        code = KEY_LEFT
+    } else if final == 69 {
+        code = KEY_BEGIN
+    } else if final == 70 {
+        code = KEY_END
+    } else if final == 72 {
+        code = KEY_HOME
+    } else if final == 80 {
+        code = KEY_F1
+    } else if final == 81 {
+        code = KEY_F1 + 1
+    } else if final == 82 {
+        code = KEY_F1 + 2
+    } else if final == 83 {
+        code = KEY_F1 + 3
+    } else if final == 77 {
+        code = KEY_KP_ENTER
+    } else if final == 88 {
+        code = KEY_KP_EQUAL
+    } else if final == 106 {
+        code = KEY_KP_MULTIPLY
+    } else if final == 107 {
+        code = KEY_KP_ADD
+    } else if final == 108 {
+        code = KEY_KP_SEPARATOR
+    } else if final == 109 {
+        code = KEY_KP_SUBTRACT
+    } else if final == 110 {
+        code = KEY_KP_DECIMAL
+    } else if final == 111 {
+        code = KEY_KP_DIVIDE
+    } else if final >= 112 && final <= 121 {
+        code = KEY_KP_0 + final - 112
+    } else {
+        return false
+    }
+    emit_named(mut out, code, 0)
+    true
+}
+
+fn arm_deadline(mut inp: In, now_ms: int) {
+    if !inp.caps.kitty_kbd && inp.deadline == 0 {
+        inp.deadline = now_ms + ESC_TIMEOUT_MS
+    }
+}
+
+fn deadline_expired(inp: In, now_ms: int) -> bool {
+    inp.eof || (inp.deadline != 0 && now_ms >= inp.deadline)
+}
+
+fn expire_escape(mut inp: In, mut out: Key) -> bool {
+    var after_escape = inp.seq_start + 1
+    if after_escape > inp.buf.len {
+        after_escape = inp.buf.len
+    }
+    inp.rd = after_escape
+    inp.scan = inp.rd
+    inp.state = IN_GROUND
+    inp.deadline = 0
+    inp.pending_mods = 0
+    emit_named(mut out, KEY_ESCAPE, 0)
+    true
+}
+
+fn parse_ground(mut inp: In, mut out: Key) -> bool {
+    let b = inp.buf[inp.rd] as int
+    let mods = inp.pending_mods
+    if b == 27 && mods == 0 {
+        inp.seq_start = inp.rd
+        inp.scan = inp.rd + 1
+        inp.state = IN_ESC
+        return false
+    }
+    if b >= 128 {
+        var need = 1
+        let have = inp.buf.len - inp.rd
+        if b >= 194 && b <= 223 {
+            need = 2
+        } else if b >= 224 && b <= 239 {
+            need = 3
+        } else if b >= 240 && b <= 244 {
+            need = 4
+        }
+        if have < need && !inp.eof {
+            return false
+        }
+        let (cp, used) = unicode.utf8_decode(inp.buf, inp.rd, inp.buf.len)
+        inp.rd += used
+        inp.pending_mods = 0
+        if unicode.utf8_is_escape(cp) {
+            note_drop(mut inp, LOG_UTF8, "invalid UTF-8 byte")
+            return true
+        }
+        emit_scalar(mut out, cp, mods, inp.buf, inp.rd - used, used)
+        return true
+    }
+    inp.rd += 1
+    inp.pending_mods = 0
+    if b == 0 {
+        emit_named(mut out, 32, mods | MOD_CTRL)
+    } else if b >= 1 && b <= 7 {
+        emit_named(mut out, 97 + b - 1, mods | MOD_CTRL)
+    } else if b == 8 {
+        emit_named(mut out, KEY_BACKSPACE, mods | MOD_CTRL)
+    } else if b == 9 {
+        emit_named(mut out, KEY_TAB, mods)
+    } else if b == 10 {
+        emit_named(mut out, 106, mods | MOD_CTRL)
+    } else if b >= 11 && b <= 12 {
+        emit_named(mut out, 97 + b - 1, mods | MOD_CTRL)
+    } else if b == 13 {
+        emit_named(mut out, KEY_ENTER, mods)
+    } else if b >= 14 && b <= 26 {
+        emit_named(mut out, 97 + b - 1, mods | MOD_CTRL)
+    } else if b >= 28 && b <= 31 {
+        emit_named(mut out, 92 + b - 28, mods | MOD_CTRL)
+    } else if b == 127 {
+        emit_named(mut out, KEY_BACKSPACE, mods)
+    } else {
+        emit_scalar(mut out, b, mods, inp.buf, inp.rd - 1, 1)
+    }
+    true
+}
+
+fn is_paste_end_at(inp: In, at: int) -> bool {
+    inp.buf[at] as int == 27 &&
+        inp.buf[at + 1] as int == 91 &&
+        inp.buf[at + 2] as int == 50 &&
+        inp.buf[at + 3] as int == 48 &&
+        inp.buf[at + 4] as int == 49 &&
+        inp.buf[at + 5] as int == 126
+}
+
+fn paste_emit(mut inp: In, n: int) {
+    var i = 0
+    while i < n {
+        inp.paste[i] = inp.buf[inp.scan + i]
+        i += 1
+    }
+    inp.paste_len = n
+    inp.scan += n
+    inp.rd = inp.scan
+}
+
+fn paste_next(mut inp: In, mut out: Key) -> bool {
+    let marker_len = 6
+    let available = inp.buf.len - inp.scan
+    var search_len = available
+    if search_len > PASTE_EMIT + marker_len {
+        search_len = PASTE_EMIT + marker_len
+    }
+    var i = 0
+    while i + marker_len <= search_len {
+        if is_paste_end_at(inp, inp.scan + i) {
+            break
+        }
+        i += 1
+    }
+    if i + marker_len <= search_len {
+        if i != 0 {
+            let emit_len = if i < PASTE_EMIT then i else PASTE_EMIT
+            paste_emit(mut inp, emit_len)
+            out.kind = EV_PASTE_DATA
+            return true
+        }
+        inp.scan += marker_len
+        inp.rd = inp.scan
+        inp.state = IN_GROUND
+        inp.in_paste = false
+        out.kind = EV_PASTE_END
+        return true
+    }
+    if inp.eof {
+        if available != 0 {
+            let emit_len = if available < PASTE_EMIT then available else PASTE_EMIT
+            paste_emit(mut inp, emit_len)
+            out.kind = EV_PASTE_DATA
+            return true
+        }
+        inp.state = IN_GROUND
+        inp.in_paste = false
+        inp.rd = inp.scan
+        out.kind = EV_PASTE_END
+        return true
+    }
+    if available < PASTE_EMIT + marker_len {
+        return false
+    }
+    var emit_len = available - marker_len
+    if emit_len > PASTE_EMIT {
+        emit_len = PASTE_EMIT
+    }
+    paste_emit(mut inp, emit_len)
+    out.kind = EV_PASTE_DATA
+    true
+}
+
+/// Seed the parser with the bytes the probe left (`yew_input_seed`).
+pub fn input_seed(mut inp: In, pending: List[byte]) {
+    input_feed(mut inp, pending, 0, pending.len)
+}
+
+/// Feed bytes read from the terminal (`yew_input_feed`, `input.c:683-705`):
+/// past the 1 MiB cap the overflowing suffix is one dropped hostile shape.
+pub fn input_feed(mut inp: In, b: List[byte], at: int, end: int) {
+    var n = end - at
+    if n <= 0 {
+        return
+    }
+    compact(mut inp)
+    let retained = inp.buf.len - inp.rd
+    let room = if retained < IN_MAX_BUFFER then IN_MAX_BUFFER - retained else 0
+    if n > room {
+        note_drop(mut inp, LOG_BUFFER_CAP, "input buffer cap exceeded")
+        n = room
+    }
+    if n != 0 {
+        if !inp.caps.kitty_kbd && inp.deadline != 0 &&
+            (inp.state == IN_ESC || inp.state == IN_CSI || inp.state == IN_SS3) {
+            inp.deadline = 0
+        }
+        var i = 0
+        while i < n {
+            (mut inp.buf).push(b[at + i])
+            i += 1
+        }
+        inp.dispatch_ready = true
+    }
+}
+
+fn input_next_inner(mut inp: In, now_ms: int, mut out: Key) -> bool {
+    key_clear(mut out)
+    inp.paste_len = 0
+    compact(mut inp)
+    let before = inp.rd
+    loop {
+        if inp.state == IN_PASTE {
+            return paste_next(mut inp, mut out)
+        }
+        let scanning = inp.state == IN_ESC || inp.state == IN_CSI || inp.state == IN_SS3 ||
+            inp.state == IN_STRING || inp.state == IN_STRING_ESC
+        if (inp.state == IN_ESC || inp.state == IN_CSI || inp.state == IN_SS3) &&
+            deadline_expired(inp, now_ms) {
+            return expire_escape(mut inp, mut out)
+        }
+        if inp.state == IN_STRING_DROP || inp.state == IN_STRING_DROP_ESC {
+            while inp.rd < inp.buf.len {
+                let b = inp.buf[inp.rd] as int
+                inp.rd += 1
+                if inp.state == IN_STRING_DROP_ESC && b == 92 {
+                    inp.state = IN_GROUND
+                    break
+                }
+                if b == 7 {
+                    inp.state = IN_GROUND
+                    break
+                }
+                inp.state = if b == 27 then IN_STRING_DROP_ESC else IN_STRING_DROP
+            }
+            if inp.eof {
+                inp.state = IN_GROUND
+            }
+            if inp.state != IN_GROUND {
+                return false
+            }
+            continue
+        }
+        if inp.state == IN_CSI_DROP {
+            while inp.rd < inp.buf.len {
+                let b = inp.buf[inp.rd] as int
+                inp.rd += 1
+                if b >= 64 && b <= 126 {
+                    inp.state = IN_GROUND
+                    break
+                }
+            }
+            if inp.eof && inp.rd == inp.buf.len {
+                inp.state = IN_GROUND
+            }
+            if inp.state != IN_GROUND {
+                return false
+            }
+            continue
+        }
+        if inp.state == IN_X10 {
+            if inp.buf.len - inp.rd < 3 {
+                if !inp.eof {
+                    return false
+                }
+                inp.rd = inp.buf.len
+                inp.state = IN_GROUND
+                note_drop(mut inp, LOG_MOUSE, "truncated X10 mouse report")
+                return true
+            }
+            let b0 = inp.buf[inp.rd] as int
+            let b1 = inp.buf[inp.rd + 1] as int
+            let b2 = inp.buf[inp.rd + 2] as int
+            if b0 < 32 || b1 < 32 || b2 < 32 {
+                inp.rd += 3
+                inp.state = IN_GROUND
+                note_drop(mut inp, LOG_MOUSE, "malformed X10 mouse report")
+                return true
+            }
+            inp.rd += 3
+            inp.state = IN_GROUND
+            if !decode_mouse(mut out, b0 - 32, b1 - 32, b2 - 32, 77) {
+                note_drop(mut inp, LOG_MOUSE, "unsupported X10 mouse report")
+                return true
+            }
+            return true
+        }
+        let cursor = if scanning then inp.scan else inp.rd
+        if cursor == inp.buf.len {
+            if inp.state == IN_STRING || inp.state == IN_STRING_ESC {
+                if inp.eof {
+                    inp.rd = inp.scan
+                    inp.state = IN_GROUND
+                    note_string_drop(mut inp, LOG_UNKNOWN, "unterminated terminal string sequence")
+                    return false
+                }
+                return false
+            }
+            if inp.state != IN_GROUND {
+                arm_deadline(mut inp, now_ms)
+                if deadline_expired(inp, now_ms) {
+                    return expire_escape(mut inp, mut out)
+                }
+            }
+            return false
+        }
+        let b = inp.buf[cursor] as int
+        if inp.state == IN_GROUND {
+            let emitted = parse_ground(mut inp, mut out)
+            if emitted {
+                return true
+            }
+            if inp.state == IN_ESC {
+                continue
+            }
+            return false
+        }
+        if inp.state == IN_ESC {
+            inp.scan += 1
+            if b == 91 {
+                inp.state = IN_CSI
+                reset_params(mut inp)
+            } else if b == 79 {
+                inp.state = IN_SS3
+            } else if b == 93 || b == 80 || b == 95 || b == 94 || b == 88 {
+                inp.state = IN_STRING
+                inp.string_len = 0
+                inp.deadline = 0
+            } else if b == 27 {
+                emit_named(mut out, KEY_ESCAPE, 0)
+                inp.rd = inp.scan - 1
+                inp.seq_start = inp.rd
+                inp.scan = inp.rd + 1
+                inp.deadline = 0
+                if inp.scan == inp.buf.len {
+                    arm_deadline(mut inp, now_ms)
+                }
+                return true
+            } else {
+                inp.state = IN_GROUND
+                inp.deadline = 0
+                inp.rd = inp.scan - 1
+                inp.pending_mods = MOD_ALT
+            }
+            continue
+        }
+        if inp.state == IN_SS3 {
+            if b < 64 || b > 126 {
+                inp.scan += 1
+                inp.rd = inp.scan
+                inp.state = IN_GROUND
+                inp.deadline = 0
+                note_drop(mut inp, LOG_MALFORMED, "malformed SS3 sequence")
+                return true
+            }
+            inp.scan += 1
+            inp.rd = inp.scan
+            inp.state = IN_GROUND
+            inp.deadline = 0
+            if !dispatch_ss3(b, mut out) {
+                note_drop(mut inp, LOG_UNKNOWN, "unknown SS3 sequence")
+                return true
+            }
+            return true
+        }
+        if inp.state == IN_STRING || inp.state == IN_STRING_ESC {
+            inp.scan += 1
+            if inp.state == IN_STRING_ESC && b == 92 {
+                inp.rd = inp.scan
+                inp.state = IN_GROUND
+                inp.deadline = 0
+                note_string_drop(mut inp, LOG_UNKNOWN, "terminal string sequence")
+                continue
+            }
+            if b == 7 {
+                inp.rd = inp.scan
+                inp.state = IN_GROUND
+                inp.deadline = 0
+                note_string_drop(mut inp, LOG_UNKNOWN, "terminal string sequence")
+                continue
+            }
+            inp.string_len += 1
+            inp.state = if b == 27 then IN_STRING_ESC else IN_STRING
+            if inp.string_len > IN_STRING_MAX {
+                inp.rd = inp.scan
+                inp.state = if b == 27 then IN_STRING_DROP_ESC else IN_STRING_DROP
+                inp.deadline = 0
+                note_string_drop(mut inp, LOG_STRING_CAP, "terminal string cap exceeded")
+                return true
+            }
+            continue
+        }
+        if inp.state == IN_CSI {
+            let pi = inp.npar - 1
+            let si = inp.xnsub[pi] - 1
+            if b >= 48 && b <= 57 && inp.inter == 0 {
+                let digit = b - 48
+                var value = inp.xpar[pi * 16 + si]
+                inp.scan += 1
+                value = if value > (4294967295 - digit) / 10 then 4294967295 else value * 10 + digit
+                inp.xpar[pi * 16 + si] = value
+                inp.xpresent[pi * 16 + si] = true
+                continue
+            }
+            if b == 59 && inp.inter == 0 && inp.npar < 16 {
+                inp.scan += 1
+                inp.npar += 1
+                inp.xnsub[inp.npar - 1] = 1
+                continue
+            }
+            if b == 58 && inp.inter == 0 && inp.xnsub[pi] < 16 {
+                inp.scan += 1
+                inp.xnsub[pi] += 1
+                continue
+            }
+            if (b == 63 || b == 62 || b == 60 || b == 61) && pi == 0 && si == 0 &&
+                !inp.xpresent[0] && inp.priv == 0 {
+                inp.scan += 1
+                inp.priv = b
+                continue
+            }
+            if b >= 32 && b <= 47 {
+                inp.scan += 1
+                inp.inter = b
+                continue
+            }
+            if b >= 64 && b <= 126 {
+                inp.scan += 1
+                inp.rd = inp.scan
+                if b == 77 && inp.priv == 0 && inp.inter == 0 && params_empty(inp) {
+                    inp.state = IN_X10
+                    inp.deadline = 0
+                    continue
+                }
+                inp.state = IN_GROUND
+                inp.deadline = 0
+                let emitted = dispatch_csi(mut inp, b, mut out)
+                if !emitted {
+                    note_drop(mut inp, LOG_UNKNOWN, "unknown CSI sequence")
+                    return true
+                }
+                return true
+            }
+            inp.scan += 1
+            inp.rd = inp.scan
+            inp.state = IN_CSI_DROP
+            inp.deadline = 0
+            note_drop(mut inp, LOG_MALFORMED, "malformed CSI sequence")
+            return true
+        }
+        if inp.rd == before {
+            return false
+        }
+    }
+}
+
+/// The next event (`yew_input_next`, `input.c:984-997`): true with `out`
+/// filled (`kind` may be `EV_NONE` for a recognized-and-dropped
+/// sequence, so callers loop), false when the buffer is exhausted
+/// mid-sequence (feed more bytes or tick the deadline).
+pub fn input_next(mut inp: In, now_ms: int, mut out: Key) -> bool {
+    let emitted = input_next_inner(mut inp, now_ms, mut out)
+    inp.dispatch_ready = emitted && inp.rd < inp.buf.len
+    emitted
+}
+
+/// Whether a feed left work a parser pass can do (`yew_input_dispatch_ready`).
+pub fn input_dispatch_ready(inp: In) -> bool {
+    inp.dispatch_ready
+}
+
+/// The poll timeout the lone-ESC deadline wants: -1 when none is armed
+/// (always under kitty), else the ms left, floored at 0 (`yew_input_deadline`).
+pub fn input_deadline(inp: In, now_ms: int) -> int {
+    if inp.deadline == 0 || inp.caps.kitty_kbd {
+        return -1
+    }
+    let left = inp.deadline - now_ms
+    if left > 0 then left else 0
+}
+
+/// End of input (`yew_input_eof`): a pending ESC becomes Escape, an open
+/// paste ends with a synthetic `EV_PASTE_END`.
+pub fn input_eof(mut inp: In) {
+    inp.eof = true
+    inp.dispatch_ready = true
+}
+
+/// The current paste chunk, valid until the next `input_next`
+/// (`yew_input_paste_chunk`).
+pub fn input_paste_chunk(inp: In) -> List[byte] {
+    inp.paste[0..inp.paste_len]
+}
+
+/// How many sequences were recognized and dropped (`in->dropped`).
+pub fn input_dropped(inp: In) -> int {
+    inp.dropped
+}
+
+/// The unread bytes retained (`in->buf.len - in->rd`).
+pub fn input_retained(inp: In) -> int {
+    inp.buf.len - inp.rd
+}
+
+/// The buffer's length, for the streaming-paste memory bound.
+pub fn input_buf_len(inp: In) -> int {
+    inp.buf.len
+}
+
+/// The enable blob (`yew_input_enable`, `input.c:1029-1047`): bracketed
+/// paste, then (unless `YEW_MOUSE=0`) button-event mouse and SGR encoding
+/// in that load-bearing order, then focus, then the kitty push `CSI >21u`
+/// iff negotiated. Byte-pinned (s04 §8).
+pub fn input_enable_blob(kitty: bool, mouse_off: bool) -> str {
+    var blob = "\x1b[?2004h"
+    if !mouse_off {
+        blob = blob + "\x1b[?1002h\x1b[?1006h"
+    }
+    blob = blob + "\x1b[?1004h"
+    if kitty {
+        blob = blob + "\x1b[>21u"
+    }
+    blob
+}
+
+/// The disable blob (`input_disable`, `input.c:52-57`): the kitty pop
+/// first, then the four modes off in the restore order.
+pub fn input_disable_blob() -> str {
+    "\x1b[<u\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1004l"
+}
+
+/// Whether `YEW_MOUSE` turns the mouse modes off: present and starting
+/// with `0` (`input.c:1031,1042`).
+pub fn mouse_off_from_env(getv: fn(str) -> (str, bool)) -> bool {
+    let (value, present) = getv("YEW_MOUSE")
+    present && value.len != 0 && value.bytes()[0] as int == 48
+}
+
+/// Write the enable blob to the terminal (`yew_input_enable`).
+pub fn input_enable(caps: TtyCaps) {
+    tty_write_str(input_enable_blob(caps.kitty_kbd, mouse_off_from_env(env_getv))) else |_| {}
+}
+
+/// Write the disable blob to the terminal (`yew_input_disable`).
+pub fn input_disable() {
+    tty_write_str(input_disable_blob()) else |_| {}
+}
