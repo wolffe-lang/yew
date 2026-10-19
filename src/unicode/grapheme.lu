@@ -1,0 +1,395 @@
+//! unicode.grapheme — UAX #29 extended grapheme clusters with a
+//! two-field restartable state.
+//!
+//! Ports sagitta `src/unicode/grapheme.c` (305 lines) and `grapheme.h`
+//! (74) at 9ace98c2, under `s02-unicode-foundation.md` §5: the rules
+//! GB1–GB13 and GB999 in order, Extended_Pictographic for GB11, InCB
+//! for GB9c, with escapes (U+DC80–DCFF) taking class Control so an
+//! invalid byte is always its own cluster. The ASCII fast path
+//! (`grapheme.c:131-134`) is required, not an optimization: a printable
+//! ASCII byte after an Other is a boundary with no table lookup.
+//!
+//! Backward segmentation is not the mirror of forward (`s02` §5): GB12/
+//! 13 depend on the parity of an unbounded RI run and GB9c on an
+//! unbounded `[Extend|Linker]*` run, so `gb_prev_bytes` scans back to a
+//! safe restart point and segments forward, bounded at 64 codepoints
+//! (`grapheme.c:196-258`); the exact form takes the whole window.
+//!
+//! Every flat entry point takes `(s, end, pos)` — the buffer, one past
+//! its last byte, and the position — as `unicode.utf8` does. The
+//! `TextBuf`-flavoured wrappers (`yew_grapheme_next`, `coords.c`) are
+//! sagitta Sprint 9 (yw02).
+
+// The Grapheme_Cluster_Break classes (`YewGcb`, `grapheme.h:6-21`),
+// numbered as the trie's packed record stores them.
+
+/// GCB Other.
+pub const GCB_OTHER: int = 0
+
+/// GCB CR.
+pub const GCB_CR: int = 1
+
+/// GCB LF.
+pub const GCB_LF: int = 2
+
+/// GCB Control.
+pub const GCB_CONTROL: int = 3
+
+/// GCB Extend.
+pub const GCB_EXTEND: int = 4
+
+/// GCB ZWJ.
+pub const GCB_ZWJ: int = 5
+
+/// GCB Regional_Indicator.
+pub const GCB_RI: int = 6
+
+/// GCB Prepend.
+pub const GCB_PREPEND: int = 7
+
+/// GCB SpacingMark.
+pub const GCB_SPACINGMARK: int = 8
+
+/// GCB L (Hangul leading jamo).
+pub const GCB_L: int = 9
+
+/// GCB V (Hangul vowel jamo).
+pub const GCB_V: int = 10
+
+/// GCB T (Hangul trailing jamo).
+pub const GCB_T: int = 11
+
+/// GCB LV (a precomposed Hangul LV syllable).
+pub const GCB_LV: int = 12
+
+/// GCB LVT (a precomposed Hangul LVT syllable).
+pub const GCB_LVT: int = 13
+
+/// The number of GCB classes.
+pub const GCB_COUNT: int = 14
+
+// The Indic_Conjunct_Break values (`YewIncb`, `grapheme.h:23-28`).
+
+/// InCB None.
+pub const INCB_NONE: int = 0
+
+/// InCB Linker.
+pub const INCB_LINKER: int = 1
+
+/// InCB Consonant.
+pub const INCB_CONSONANT: int = 2
+
+/// InCB Extend.
+pub const INCB_EXTEND: int = 3
+
+// The state flags (`grapheme.h:35-40`, `grapheme.c:12`).
+const GBF_RI_ODD: int = 1
+
+const GBF_PICT: int = 2
+
+const GBF_INCB_C: int = 4
+
+const GBF_INCB_L: int = 8
+
+const GBF_SEEN: int = 128
+
+/// The width a lone TAB cluster reports (`YEW_CLUSTER_TAB`): the caller
+/// owns tab stops.
+pub const CLUSTER_TAB: int = 255
+
+/// The segmenter's restartable state (`YewGbState`, `grapheme.h:30-33`):
+/// two bytes in C, so a later sprint caches one per line. Zeroed is
+/// start-of-text.
+pub struct GbState {
+    prev_gcb: int,
+    flags: int,
+}
+
+/// A start-of-text state (`yew_gb_init`, `grapheme.c:33-38`).
+pub fn gb_init() -> GbState {
+    GbState { prev_gcb: GCB_OTHER, flags: 0 }
+}
+
+fn cp_gcb(cp: int, rec: int) -> int {
+    if utf8_is_escape(cp) {
+        return GCB_CONTROL
+    }
+    rec & U_GCB_MASK
+}
+
+fn cp_incb(rec: int) -> int {
+    (rec & U_INCB_MASK) >> U_INCB_SHIFT
+}
+
+fn is_control(gcb: int) -> bool {
+    gcb == GCB_CONTROL || gcb == GCB_CR || gcb == GCB_LF
+}
+
+/// Break before `curr`? The rules in order (`gb_break`, `grapheme.c:40-78`).
+fn gb_break(st: GbState, curr: int, incb: int, ext_pict: bool) -> bool {
+    let prev = st.prev_gcb
+    if st.flags & GBF_SEEN == 0 {
+        return true // GB1
+    }
+    if prev == GCB_CR && curr == GCB_LF {
+        return false // GB3
+    }
+    if is_control(prev) || is_control(curr) {
+        return true // GB4, GB5
+    }
+    if prev == GCB_L && (curr == GCB_L || curr == GCB_V || curr == GCB_LV || curr == GCB_LVT) {
+        return false // GB6
+    }
+    if (prev == GCB_LV || prev == GCB_V) && (curr == GCB_V || curr == GCB_T) {
+        return false // GB7
+    }
+    if (prev == GCB_LVT || prev == GCB_T) && curr == GCB_T {
+        return false // GB8
+    }
+    if curr == GCB_EXTEND || curr == GCB_ZWJ {
+        return false // GB9
+    }
+    if curr == GCB_SPACINGMARK {
+        return false // GB9a
+    }
+    if prev == GCB_PREPEND {
+        return false // GB9b
+    }
+    if incb == INCB_CONSONANT && st.flags & (GBF_INCB_C | GBF_INCB_L) == GBF_INCB_C | GBF_INCB_L {
+        return false // GB9c
+    }
+    if prev == GCB_ZWJ && st.flags & GBF_PICT != 0 && ext_pict {
+        return false // GB11
+    }
+    if curr == GCB_RI && st.flags & GBF_RI_ODD != 0 {
+        return false // GB12, GB13
+    }
+    true // GB999
+}
+
+/// `v` with the bits of `mask` cleared (C's `v & ~mask`; wolf has no
+/// bitwise not).
+fn without(v: int, mask: int) -> int {
+    v - (v & mask)
+}
+
+/// Absorbs `curr` into the state (`gb_absorb`, `grapheme.c:80-115`).
+fn gb_absorb(mut st: GbState, curr: int, incb: int, ext_pict: bool) {
+    let prev = st.prev_gcb
+    var flags = st.flags
+
+    if curr == GCB_RI {
+        flags = flags ^ GBF_RI_ODD
+    } else {
+        flags = without(flags, GBF_RI_ODD)
+    }
+
+    if ext_pict {
+        flags = flags | GBF_PICT
+    } else if curr == GCB_EXTEND && prev != GCB_ZWJ {
+        // Preserve ExtPict Extend*. Extend after the ZWJ is not GB11.
+    } else if curr == GCB_ZWJ && prev != GCB_ZWJ && flags & GBF_PICT != 0 {
+        // Preserve the chain for the single following pictograph.
+    } else {
+        flags = without(flags, GBF_PICT)
+    }
+
+    if incb == INCB_CONSONANT {
+        flags = flags | GBF_INCB_C
+        flags = without(flags, GBF_INCB_L)
+    } else if incb == INCB_LINKER && flags & GBF_INCB_C != 0 {
+        flags = flags | GBF_INCB_L
+    } else if incb != INCB_EXTEND {
+        flags = without(flags, GBF_INCB_C | GBF_INCB_L)
+    }
+
+    st.prev_gcb = curr
+    st.flags = flags | GBF_SEEN
+}
+
+/// Break BEFORE `cp`? Then absorbs it. This is the whole segmenter
+/// (`yew_gb_boundary`, `grapheme.c:117-160`).
+pub fn gb_boundary(mut st: GbState, cp: int) -> bool {
+    if st.prev_gcb == GCB_OTHER && cp >= 32 && cp < 127 {
+        st.flags = GBF_SEEN
+        return true
+    }
+
+    var curr = GCB_OTHER
+    var incb = INCB_NONE
+    var ext_pict = false
+    if !utf8_is_escape(cp) && cp < 128 {
+        if cp == 13 {
+            curr = GCB_CR
+        } else if cp == 10 {
+            curr = GCB_LF
+        } else if cp < 32 || cp == 127 {
+            curr = GCB_CONTROL
+        }
+    } else {
+        var rec = 0
+        if !utf8_is_escape(cp) {
+            rec = u_rec(cp)
+        }
+        curr = cp_gcb(cp, rec)
+        incb = cp_incb(rec)
+        ext_pict = rec & U_EXT_PICT != 0
+    }
+
+    let boundary = gb_break(st, curr, incb, ext_pict)
+    gb_absorb(mut st, curr, incb, ext_pict)
+    boundary
+}
+
+/// The end of the cluster starting at `pos` in `s[..end)`
+/// (`yew_gb_next_bytes`, `grapheme.c:162-182`); `end` when `pos >= end`.
+pub fn gb_next_bytes(s: List[byte], end: int, pos: int) -> int {
+    if pos >= end {
+        return end
+    }
+    var st = gb_init()
+    var off = pos
+    let (first, n) = utf8_decode(s, off, end)
+    off += n
+    let started = gb_boundary(mut st, first)
+    assert(started, "grapheme: the first codepoint starts a cluster")
+    while off < end {
+        let (cp, m) = utf8_decode(s, off, end)
+        if gb_boundary(mut st, cp) {
+            break
+        }
+        off += m
+    }
+    off
+}
+
+fn safe_restart_cp(cp: int) -> bool {
+    if utf8_is_escape(cp) {
+        return true
+    }
+    let rec = u_rec(cp)
+    let gcb = cp_gcb(cp, rec)
+    let incb = cp_incb(rec)
+    (gcb == GCB_OTHER || is_control(gcb)) &&
+        gcb != GCB_RI &&
+        rec & U_EXT_PICT == 0 &&
+        incb != INCB_CONSONANT
+}
+
+fn cp_is_prepend(cp: int) -> bool {
+    !utf8_is_escape(cp) && cp_gcb(cp, u_rec(cp)) == GCB_PREPEND
+}
+
+fn gb_prev_bytes_capped(s: List[byte], end: int, at: int, scan_cap: int) -> int {
+    if at == 0 || end == 0 {
+        return 0
+    }
+    var pos = at
+    if pos > end {
+        pos = end
+    }
+    var restart = pos
+    var cursor = pos
+    var scanned = 0
+    var found_safe = false
+    while cursor > 0 && scanned < scan_cap {
+        let (cp, n) = utf8_decode_prev(s, 0, cursor)
+        if n == 0 || n > cursor {
+            break
+        }
+        cursor -= n
+        restart = cursor
+        scanned += 1
+        if found_safe && !cp_is_prepend(cp) {
+            break
+        }
+        if !found_safe {
+            found_safe = safe_restart_cp(cp)
+        }
+    }
+
+    cursor = restart
+    while cursor < pos {
+        let next = gb_next_bytes(s, end, cursor)
+        if next >= pos {
+            return cursor
+        }
+        if next <= cursor {
+            break
+        }
+        cursor = next
+    }
+    restart
+}
+
+/// The start of the cluster ending at `pos` (`yew_gb_prev_bytes`,
+/// `grapheme.c:260-263`): bounded reverse navigation that may
+/// approximate after 64 codepoints (a 64-long RI run mis-parities its
+/// last cluster: documented and tested).
+pub fn gb_prev_bytes(s: List[byte], end: int, pos: int) -> int {
+    gb_prev_bytes_capped(s, end, pos, 64)
+}
+
+/// The exact final-cluster edge for an already bounded byte window
+/// (`yew_gb_prev_bytes_exact`, `grapheme.c:265-269`).
+pub fn gb_prev_bytes_exact(s: List[byte], end: int, pos: int) -> int {
+    gb_prev_bytes_capped(s, end, pos, end)
+}
+
+/// How many clusters `s[..end)` holds (`yew_gb_count_bytes`,
+/// `grapheme.c:271-284`).
+pub fn gb_count_bytes(s: List[byte], end: int) -> int {
+    var count = 0
+    var pos = 0
+    while pos < end {
+        let next = gb_next_bytes(s, end, pos)
+        assert(next > pos, "grapheme: a cluster is at least one byte")
+        pos = next
+        count += 1
+    }
+    count
+}
+
+/// One cluster with its width (`YewCluster`, `grapheme.h:57-62`):
+/// `off`, `len`, the base codepoint (the first non-Prepend), and `cells`
+/// — 0..4, or `CLUSTER_TAB` for a lone U+0009.
+pub struct Cluster {
+    off: int,
+    len: int,
+    base_cp: int,
+    cells: int,
+}
+
+/// The cluster starting at `pos`, cluster and width in one pass — the
+/// renderer's entry point (`yew_cluster_next`, `grapheme.c:286-305`).
+/// `none` at `end`; otherwise the next position is `off + len`.
+pub fn cluster_next(s: List[byte], end: int, pos: int) -> Cluster ! {none} {
+    if pos >= end {
+        return none
+    }
+    let off = pos
+    let cluster_end = gb_next_bytes(s, end, off)
+    var base_cp = 0
+    var scan = off
+    while scan < cluster_end {
+        let (cp, n) = utf8_decode(s, scan, cluster_end)
+        scan += n
+        let rec = if utf8_is_escape(cp) then 0 else u_rec(cp)
+        let gcb = cp_gcb(cp, rec)
+        if base_cp == 0 && gcb != GCB_PREPEND {
+            base_cp = cp
+        }
+    }
+    if base_cp == 0 {
+        let (first, n) = utf8_decode(s, off, cluster_end)
+        assert(n > 0, "grapheme: a cluster decodes")
+        base_cp = first
+    }
+    let len = cluster_end - off
+    let cells = if len == 1 && s[off] as int == 9 {
+        CLUSTER_TAB
+    } else {
+        cluster_width(s, off, cluster_end)
+    }
+    Cluster { off: off, len: len, base_cp: base_cp, cells: cells }
+}
