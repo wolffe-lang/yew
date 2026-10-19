@@ -52,6 +52,9 @@ no bound `.bytes()` in a hot loop).
 6. **`text.register` and the clipboard** (s11, `register.c`,
    `clipboard.c`, `yankstack.c`): the register file, the yank stack, and
    the OSC 52 clipboard with its subprocess fallbacks (`osc52` is yw01's;
+   the demo's `osc52` scene and sagitta's `osc52_frame` PTY case wait on
+   the registers and `text/clipboard.c`, so they are this lane's gate —
+   `tools/demo-paint/main.lu` hard-errors the scene naming yw02 today;
    the subprocess backends — `wl-copy`, `xclip`, `pbcopy`, `cmd:` — are
    yw02's, process groups available since 0.2.31). **Gap G5** (`xattr`,
    one use in a later save preset) is yw14's, not needed here.
