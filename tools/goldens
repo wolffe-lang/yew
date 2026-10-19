@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# goldens — C yew's own suites, run against a binary.
+#
+#   tools/goldens --yew BIN [--demo DEMO] [--suite S[,S...]] [--filter F]
+#
+# Runs sagitta's suites from the oracle tree `tools/oracle` built
+# (`target/oracle/sagitta`, its `build/` link), each pointed at BIN exactly as
+# sagitta's Makefile points them at its own `build/yew`, with the same
+# pinned child environment (the runners construct it; `LC_ALL=C` and the
+# budgets are the Makefile's), and prints one line per suite:
+#
+#   goldens: <suite>: pass=N fail=M skip=K exit=E
+#
+# then `goldens: GREEN` or `goldens: RED`. Exit 0 only when no suite
+# failed. The suites, and how each is counted:
+#
+#   version   BIN --version against build/yew --version, byte for byte
+#   pty       tests/pty/runner --demo DEMO --yew BIN: one `pty: <name>:
+#             ok` a case; a failure is the runner's own report (golden
+#             mismatch with its diff, unstable snapshot, timeout), kept
+#             in the log and printed here
+#   script    tests/script/runner --yew BIN --fakelsp …: `FAIL <name>`
+#             lines and its `script: N tests, … F failures` summary;
+#             `57_embedded_gate` excluded as sagitta's Makefile always
+#             excludes it from this harness (it needs a file argument)
+#   fletch    tests/fletch/run --yew BIN: `PASS`/`FAIL <unit>` lines and
+#             its `fletch: total=… pass=… fail=… skip=…` summary
+#   syn       scripts/check-syn-assets.sh BIN: the 432 syntax goldens
+#             and the diagnostics corpus; one verdict
+#   torture   batch-kill9 --yew BIN (SIGKILL during batch saves), the
+#             live-editor kill9 lane (YEW_TORTURE_YEW=BIN) and
+#             tty-restore --yew BIN (invariant 6); three verdicts
+#   roundtrip SKIP: sagitta's tests/roundtrip/runner links the C editor
+#             in-process and takes no binary; the port's own round-trip
+#             harness is campaign 07's (yw09)
+#
+# DEMO defaults to the oracle's own build/demo_paint: the two demo-scene
+# PTY cases then exercise C code, and a port of demo_paint (yw01, M-YW1)
+# passes its own with --demo. --filter F narrows the PTY suite to the
+# cases whose names contain F (the runner's own YEW_PTY_FILTER); the
+# other suites run whole (the script runner's filter exits 1 on an
+# empty selection, which is no verdict). `startup_` is the filter that
+# exercises the editor binary itself in four cases; `paint` and
+# `restore_crash` drive the demo binary and say nothing about --yew.
+#
+# A golden that disagrees is a STOP: nothing here updates a golden
+# (YEW_PTY_UPDATE is never set), and the oracle tree is never written.
+set -u
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export YEW_ROOT
+cd "$YEW_ROOT"
+
+bin=
+demo=
+suites=version,pty,script,fletch,syn,torture,roundtrip
+filter=
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --yew) bin=$2; shift 2 ;;
+    --demo) demo=$2; shift 2 ;;
+    --suite) suites=$2; shift 2 ;;
+    --filter) filter=$2; shift 2 ;;
+    *) echo "goldens: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+[ -n "$bin" ] || { echo "usage: tools/goldens --yew BIN [--demo DEMO] [--suite S,...] [--filter F]" >&2; exit 2; }
+case "$bin" in /*) ;; *) bin=$YEW_ROOT/$bin ;; esac
+[ -x "$bin" ] || { echo "goldens: $bin is not executable" >&2; exit 2; }
+
+tree=$YEW_ROOT/target/oracle/sagitta
+build=$tree/build
+[ -x "$build/yew" ] || { echo "goldens: no oracle build at $build; run tools/oracle first" >&2; exit 2; }
+if [ -z "$demo" ]; then demo=$build/demo_paint; fi
+case "$demo" in /*) ;; *) demo=$YEW_ROOT/$demo ;; esac
+logs=$YEW_ROOT/target/oracle/goldens
+mkdir -p "$logs"
+
+red=0
+report() { # suite pass fail skip exit
+    echo "goldens: $1: pass=$2 fail=$3 skip=$4 exit=$5"
+    [ "$3" = 0 ] && [ "$5" = 0 ] || red=1
+}
+count() { grep -c -- "$1" "$2" 2>/dev/null || true; }
+
+for suite in $(echo "$suites" | tr ',' ' '); do
+    log=$logs/$suite.log
+    case $suite in
+    version)
+        "$bin" --version >"$log" 2>&1; rc=$?
+        "$build/yew" --version >"$logs/version.want" 2>&1
+        if [ $rc -eq 0 ] && cmp -s "$log" "$logs/version.want"; then
+            report version 1 0 0 0
+        else
+            report version 0 1 0 $rc
+            diff "$logs/version.want" "$log" | sed 's/^/goldens:   /' | head -10
+        fi
+        ;;
+    pty)
+        ( cd "$tree" && ulimit -c 0 && \
+          YEW_PTY_BUDGET_MS=1350000 YEW_PTY_CASE_BUDGET_MS=20000 \
+          YEW_PTY_FILTER="$filter" \
+          "$build/pty_runner" --demo "$demo" --yew "$bin" ) >"$log" 2>&1; rc=$?
+        pass=$(count '^pty: .*: ok$' "$log")
+        # Every case not reported ok is a failure the runner described.
+        fail=$(grep -E '^pty: ' "$log" | grep -vcE ': ok$|^pty: xfailed=|^pty: global budget' || true)
+        report pty "$pass" "$fail" 0 $rc
+        [ "$fail" = 0 ] || grep -E '^pty: ' "$log" | grep -vE ': ok$' | head -5 | sed 's/^/goldens:   /'
+        ;;
+    script)
+        ( cd "$tree" && LC_ALL=C YEW_SCRIPT_BUDGET_MS=600000 \
+          "$build/script_runner" --exclude 57_embedded_gate \
+          --yew "$bin" --fakelsp "$build/tests/helpers/fakelsp" ) >"$log" 2>&1; rc=$?
+        fail=$(count '^FAIL ' "$log")
+        total=$(sed -nE 's/^script: ([0-9]+) tests.*/\1/p' "$log" | tail -1)
+        pass=$(( ${total:-0} - fail ))
+        [ $pass -ge 0 ] || pass=0
+        report script "$pass" "$fail" 0 $rc
+        [ "$fail" = 0 ] || grep -E '^FAIL ' "$log" | head -5 | sed 's/^/goldens:   /'
+        ;;
+    fletch)
+        ( cd "$tree" && LC_ALL=C "$build/fletch_run" --yew "$bin" ) >"$log" 2>&1; rc=$?
+        pass=$(count '^PASS ' "$log")
+        fail=$(count '^FAIL ' "$log")
+        skip=$(sed -nE 's/^fletch: total=[0-9]+ pass=[0-9]+ fail=[0-9]+ skip=([0-9]+).*/\1/p' "$log" | tail -1)
+        report fletch "$pass" "$fail" "${skip:-0}" $rc
+        [ "$fail" = 0 ] || grep -E '^FAIL ' "$log" | head -5 | sed 's/^/goldens:   /'
+        ;;
+    syn)
+        ( cd "$tree" && YEW_RUNTIME_DIR="$tree/runtime" scripts/check-syn-assets.sh "$bin" ) >"$log" 2>&1; rc=$?
+        if [ $rc -eq 0 ]; then report syn 1 0 0 0; else report syn 0 1 0 $rc; tail -3 "$log" | sed 's/^/goldens:   /'; fi
+        ;;
+    torture)
+        pass=0; fail=0
+        ( cd "$tree" && "$build/batch-kill9" --yew "$bin" --checker "$build/yew-torture" ) >"$log" 2>&1; rc1=$?
+        [ $rc1 -eq 0 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); tail -3 "$log" | sed 's/^/goldens:   batch-kill9: /'; }
+        ( cd "$tree" && YEW_TORTURE_CHECKER="$build/yew-torture" YEW_TORTURE_YEW="$bin" \
+          YEW_RUNTIME_DIR="$tree/runtime" YEW_TORTURE_LANE=live-editor YEW_TORTURE_SIGKILL_ITERS=500 \
+          "$build/kill9" "$build/yew-live-torture" "$build/tests/torture/faultshim.so" ) >"$logs/torture-live.log" 2>&1; rc2=$?
+        [ $rc2 -eq 0 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); tail -3 "$logs/torture-live.log" | sed 's/^/goldens:   live: /'; }
+        ( cd "$tree" && "$build/tty-restore" --yew "$bin" --shim "$build/tests/torture/faultshim.so" \
+          --fakelsp "$build/tests/helpers/fakelsp" --checker "$build/yew-torture" --runtime "$tree/runtime" ) >"$logs/torture-tty.log" 2>&1; rc3=$?
+        [ $rc3 -eq 0 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); tail -3 "$logs/torture-tty.log" | sed 's/^/goldens:   tty-restore: /'; }
+        rc=$(( rc1 | rc2 | rc3 ))
+        report torture "$pass" "$fail" 0 $rc
+        ;;
+    roundtrip)
+        echo "goldens: roundtrip: pass=0 fail=0 skip=1 exit=0 (in-process in sagitta; the port's harness is yw09's)"
+        ;;
+    *)
+        echo "goldens: unknown suite $suite" >&2; exit 2 ;;
+    esac
+done
+if [ $red -eq 0 ]; then echo "goldens: GREEN"; else echo "goldens: RED"; fi
+exit $red
