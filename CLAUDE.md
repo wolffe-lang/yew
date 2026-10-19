@@ -22,7 +22,22 @@ there is binding.
 - Sagitta's `.docs/plan/00-decisions.md` — its locked decisions and its
   ten invariants — binds the port as it binds yew. Read it, then
   `01-architecture.md`, `02-fletch.md`, and the sprint file the lane
-  ports (`.docs/sprints/`).
+  ports (`.docs/sprints/`). The ten, as the port holds them:
+  1. no data loss, ever (atomic saves, `kill -9` never corrupts, the
+     crash journal recovers);
+  2. no byte confusion (grapheme and width correctness, invalid UTF-8
+     round-trips losslessly);
+  3. no silent stubs (an unported path hard-errors naming its sprint
+     and lane);
+  4. latency budgets are CI gates (the 2x gate, ratcheting by ruling);
+  5. deterministic rendering (same state, byte-identical cell grid);
+  6. the terminal restored on every exit path;
+  7. bespoke first (wolf-std only; a dependency is a ruling);
+  8. a single-threaded core (the event loop and subprocesses; the one
+     `unsafe` module var is this rule's);
+  9. modal paradigm first (every feature keyboard-reachable);
+  10. the recorder/Fletch round-trip law (a recorded macro is valid,
+      readable Fletch).
 
 ## Read before writing a line of wolf
 
@@ -94,7 +109,8 @@ there is binding.
     tools/fetch-toolchain        stage the pinned toolchain into .wolf-bin/
     tools/build [--native|--release|--all|--static]
     tools/check-fmt              wolf fmt --check
-    tools/check-test             wolf test --deny-warnings src
+    tools/check-test [--native]  wolf test --deny-warnings src (the checked
+                                 machine), or each test file built and run
     tools/check-tables           regenerate src/unicode/tables.lu, diff
     tools/oracle [--unit|--test] fetch+build sagitta at the pin (gcc and
                                  clang), run its unit suite (or `make test`)
@@ -105,6 +121,9 @@ there is binding.
     tools/goldens-selftest       the harness sees a difference (planted red)
     tools/run-perf-unicode       campaign 00's perf gates, wolf beside C
                                  (tools/perf-unicode/ is the wolf half)
+    tools/run-fuzz-unicode       the decoder/segmenter fuzzer: a bounded
+                                 seeded driver (tools/fuzz-unicode/),
+                                 sagitta's nine invariants, --three-byte
 
 ## Build & test
 

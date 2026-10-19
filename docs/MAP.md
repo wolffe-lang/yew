@@ -101,7 +101,9 @@ test-script` 93 tests, 951 assertions, 0 failures, 1 skipped;
 `make torture`'s batch, live and tty-restore lanes green (32 signal/
 moment trials) and its git-hunk lane red at fixture setup
 (`git_hunk_kill9: fixture setup failed`, a host condition, not the
-oracle's verdict — `notes/yw00-the-map.md` §3). clang 23.1.1 refuses
+oracle's verdict). Fourteen PTY cases of sagitta's own depend on the
+checkout path's length (`notes/yw00-the-map.md` §2): green in a short
+tree, red under `target/oracle/`. clang 23.1.1 refuses
 the tree under `-Werror` (`tests/unit/harness.c:454`
 `-Wunused-but-set-global`), a sagitta issue for the maintainer; CI's
 clang 18 and Apple clang build it.
@@ -109,7 +111,10 @@ clang 18 and Apple clang build it.
 The port on kasumi: `wolf test` 11 files green on the checked machine
 and natively (`tools/check-test`, `--native`); the grapheme conformance
 run 1093/1093; `tools/check-tables` identical to sagitta's arrays
-(stage1 1,536, stage2 190 blocks, 41 palette records, 10 high ranges).
+(stage1 1,536, stage2 190 blocks, 41 palette records, 10 high ranges);
+`tools/run-fuzz-unicode`: 200,000 mutations at seed 1 (and 2) hold the
+nine invariants, the same seed gives the same hash, and the exhaustive
+three-byte space round-trips (`notes/yw00-evidence/fuzz-unicode.txt`).
 
 Performance, release tier, under `taskset -c 0-3`
 (`tools/run-perf-unicode`, `notes/yw00-evidence/perf-unicode.txt`),
@@ -147,6 +152,7 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G14 | **a `match` arm cannot assign** (E0208): `0 => d.x = v` | the decoder's state | if-chains (`unicode.utf8.pend_set`). | — | spec question for the orchestrator (grammar), not a bug |
 | G15 | **module state of a `List`** is refused (`[mem.static.3]`); only integers, `byte`, `bool`, floats and `str`. | every table | `str` constants of 7-bit digits (§1). The design is sound (static data only); the port's encoding is the cost: 2 chars an entry, 113 KB of source for the trie. | probe c1 | nothing to file (design); a `const` `List[byte]` of literal bytes would be the natural ask if the maintainer wants one |
 | G16 | **Linux aarch64 builds no tier** (wolf-lang#614). | CI's third host | asserted by name in CI, as pelt. | — | wolf-lang#614 (open) |
+| G18 | **a `mut` parameter inside a `region` block is E1010** ("still holds a value allocated in region … when the region is freed"), whatever the struct holds — a scalar-only RNG state too. | every per-turn scratch loop | the conservatism ledger: the analysis does not see that nothing of the region's reaches the struct. Thread the state functionally (`tools/fuzz-unicode/main.lu`: every mutator answers the next RNG state) or keep the loop's scratch out of a region. | `tools/fuzz-unicode/main.lu`'s header; the refused form is in the lane's log (`notes/yw00-the-map.md` §4) | wolf-lang (precision of the region analysis; a bug if the spec says a scalar struct may be written) |
 | G17 | **a native `wolf test` harness**: today `test_*` fns run on the checked machine only and `main`-shaped files run natively only as a fallback (`test_cmd.rs:645-665`). | every lane | `tools/check-test --native` builds and runs each test file. | — | wolf-lang (known: "the native multi-test harness lands", `test_cmd.rs:61-65`) |
 
 ## 6. Rulings asked

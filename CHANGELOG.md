@@ -21,7 +21,11 @@ The format follows Keep a Changelog; the port has no release yet.
 - Campaign 00 ported: `util` (strmap, intern, buf, sort; arena and vec
   are the language's regions and `List`) and `unicode` (UTF-8 with the
   lossless escape policy, grapheme segmentation, widths) with a wolf
-  generator over `ucd/16.0.0/` and sagitta's unit tests one for one.
+  generator over `ucd/16.0.0/` and sagitta's unit tests one for one;
+  `tools/run-fuzz-unicode`, the bounded seeded fuzzer (wolf has no
+  `fuzz` verb) holding s02's nine invariants over 200,000 mutations and
+  the exhaustive three-byte space; `tools/run-perf-unicode`, the
+  campaign's gates measured beside C yew.
 - `src/yew.lu`: `--version` as C yew prints it; every other path
   hard-errors naming its sagitta sprint and port lane.
 - `docs/MAP.md`: every sagitta directory and sprint file mapped to a
