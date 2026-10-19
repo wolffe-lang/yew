@@ -1,0 +1,668 @@
+//! gen-unicode-tables — writes `src/unicode/tables.lu`, yew's Unicode
+//! 16.0.0 property trie, from the checked-in UCD files.
+//!
+//! Ports sagitta `scripts/gen-unicode-tables.c` (the grapheme/width
+//! trie: `main` at lines 1366-1400, the parsers at 401-543, the trie at
+//! 545-603, the checks at 605-628, the emitter at 696-790) at 9ace98c2,
+//! under `s02-unicode-foundation.md` §7–§8. The word-break, category
+//! and case tables that generator also emits (`--word-break`,
+//! `--category`, `--case`) belong to the lanes that port their
+//! consumers (sagitta Sprints 16, 17 and 20: yw03, yw04); this program
+//! grows a mode for each then.
+//!
+//! The ALGORITHM is sagitta's, step for step, so the arrays come out
+//! identical: records are u16 bit-fields per codepoint (GCB in bits
+//! 0-3, InCB 4-5, ExtPict 6, EAW 7-9, zero-width 10, Emoji 11,
+//! Emoji_Presentation 12); the inputs are parsed in the same order
+//! (UnicodeData for zero-width, then the Hangul V/T jamo override,
+//! GraphemeBreakProperty, emoji-data, EastAsianWidth,
+//! DerivedCoreProperties for InCB), `@missing:` lines through the same
+//! whole-field path as data; the two-level trie uses 128-codepoint
+//! blocks over U+0000–U+2FFFF with first-occurrence dedup and a palette
+//! in first-use order; planes 3-16 are a sorted range table. A unit test
+//! (`src/unicode/tables_test.lu`) compares the emitted arrays element
+//! for element with sagitta's `tables.c` (`tests/fixtures/unicode/
+//! tables-c.txt`), and `--dump` prints them in that fixture's shape.
+//!
+//! The ENCODING is wolf's. Module state of a `List` type is refused
+//! (`[mem.static.3]`), so the arrays are `str` constants of 7-bit
+//! digits (every byte below 0x80, so the literal is valid UTF-8 and
+//! `.bytes()[i]` is a zero-copy read): stage1 as two base-128 digits an
+//! entry, stage2 as one digit an entry (a palette index; the generator
+//! refuses a palette past 127), the palette as two digits, the high
+//! ranges as three digits for each of lo, hi and record.
+//!
+//! Usage:
+//!   gen-unicode-tables <ucd-dir> <out.lu>        write the file
+//!   gen-unicode-tables --check <ucd-dir> <out.lu> regenerate, diff: 1 on drift
+//!   gen-unicode-tables --dump <ucd-dir>           the arrays, decimal, one a line
+
+use std.fs
+
+const CP_COUNT: int = 1114112
+
+const TRIE_HI: int = 196608
+
+const BLOCK_SIZE: int = 128
+
+const STAGE1_LEN: int = 1536
+
+const GCB_MASK: int = 15
+
+const INCB_MASK: int = 48
+
+const EXT_PICT: int = 64
+
+const EAW_MASK: int = 896
+
+const ZERO_WIDTH: int = 1024
+
+const EMOJI: int = 2048
+
+const EMOJI_PRESENTATION: int = 4096
+
+struct Gen {
+    records: List[int],
+    stage1: List[int],
+    stage2: List[int],
+    palette: List[int],
+    hi_lo: List[int],
+    hi_hi: List[int],
+    hi_rec: List[int],
+}
+
+fn die(what: str) {
+    eprint("gen-unicode-tables: {what}")
+    os_exit(1)
+}
+
+fn hex_cp(text: str, path: str, line_no: int) -> int {
+    let t = text.trim()
+    if t.len == 0 {
+        die("{path}:{line_no}: empty codepoint")
+    }
+    var value: int = 0
+    for b in t.bytes() {
+        let c = b as int
+        var digit = -1
+        if c >= 48 && c <= 57 {
+            digit = c - 48
+        } else if c >= 65 && c <= 70 {
+            digit = c - 55
+        } else if c >= 97 && c <= 102 {
+            digit = c - 87
+        }
+        if digit < 0 {
+            die("{path}:{line_no}: bad codepoint '{t}'")
+        }
+        value = value * 16 + digit
+    }
+    if value >= CP_COUNT {
+        die("{path}:{line_no}: codepoint past U+10FFFF '{t}'")
+    }
+    value
+}
+
+/// `LO..HI` or a bare `LO` (`parse_range`, C 260-279).
+fn parse_range(field: str, path: str, line_no: int) -> (int, int) {
+    let f = field.trim()
+    let dots = f.find("..") else {
+        let lo = hex_cp(f, path, line_no)
+        return (lo, lo)
+    }
+    let lo = hex_cp(f[0..dots], path, line_no)
+    let hi = hex_cp(f[dots + 2..], path, line_no)
+    if hi < lo {
+        die("{path}:{line_no}: reversed range")
+    }
+    (lo, hi)
+}
+
+fn set_field(mut g: Gen, lo: int, hi: int, mask: int, value: int) {
+    var cp = lo
+    while cp <= hi {
+        g.records[cp] = g.records[cp] - (g.records[cp] & mask) | value
+        cp += 1
+    }
+}
+
+fn gcb_value(name: str) -> int {
+    match name {
+        "Other" => 0,
+        "CR" => 1,
+        "LF" => 2,
+        "Control" => 3,
+        "Extend" => 4,
+        "ZWJ" => 5,
+        "Regional_Indicator" => 6,
+        "Prepend" => 7,
+        "SpacingMark" => 8,
+        "L" => 9,
+        "V" => 10,
+        "T" => 11,
+        "LV" => 12,
+        "LVT" => 13,
+        _ => -1,
+    }
+}
+
+fn eaw_value(name: str) -> int {
+    match name {
+        "N" => 0,
+        "Na" => 1,
+        "A" => 2,
+        "W" => 3,
+        "F" => 4,
+        "H" => 5,
+        _ => -1,
+    }
+}
+
+fn incb_value(name: str) -> int {
+    match name {
+        "None" => 0,
+        "Linker" => 1,
+        "Consonant" => 2,
+        "Extend" => 3,
+        _ => -1,
+    }
+}
+
+/// A `range ; property [; third] # comment` file (`parse_property_file`,
+/// C 401-482); `kind` 0 GCB, 1 EAW, 2 emoji-data, 3 InCB.
+fn parse_property_file(mut g: Gen, dir: str, name: str, kind: int) {
+    let path = "{dir}/{name}"
+    let text = fs.read_text(path) else {
+        die("cannot read {path}")
+        return
+    }
+    var line_no = 0
+    for raw in text.lines() {
+        line_no += 1
+        var line = raw
+        // Parse defaults through the same whole-field path as data.
+        let missing = line.find("@missing:") else -1
+        if missing >= 0 {
+            line = line[missing + 9..]
+        }
+        let hash = line.find("#") else -1
+        if hash >= 0 {
+            line = line[0..hash]
+        }
+        let range_field = line.trim()
+        if range_field.len == 0 {
+            continue
+        }
+        let semi = range_field.find(";") else {
+            die("{path}:{line_no}: property line has no semicolon")
+            return
+        }
+        var property = range_field[semi + 1..].trim()
+        var third = ""
+        var have_third = false
+        let semi2 = property.find(";") else -1
+        if semi2 >= 0 {
+            third = property[semi2 + 1..].trim()
+            have_third = true
+            property = property[0..semi2].trim()
+        }
+        let (lo, hi) = parse_range(range_field[0..semi], path, line_no)
+
+        if kind == 0 {
+            let value = gcb_value(property)
+            if value < 0 {
+                die("unknown Grapheme_Cluster_Break value {property}")
+            }
+            set_field(mut g, lo, hi, GCB_MASK, value)
+        } else if kind == 1 {
+            let value = eaw_value(property)
+            if value < 0 {
+                die("unknown East_Asian_Width value {property}")
+            }
+            set_field(mut g, lo, hi, EAW_MASK, value << 7)
+        } else if kind == 2 {
+            var bit = 0
+            if property == "Emoji" {
+                bit = EMOJI
+            } else if property == "Emoji_Presentation" {
+                bit = EMOJI_PRESENTATION
+            } else if property == "Extended_Pictographic" {
+                bit = EXT_PICT
+            } else {
+                continue
+            }
+            set_field(mut g, lo, hi, bit, bit)
+        } else {
+            if property != "InCB" {
+                continue
+            }
+            if !have_third {
+                die("{path}:{line_no}: InCB line has no value")
+            }
+            let value = incb_value(third)
+            if value < 0 {
+                die("unknown Indic_Conjunct_Break value {third}")
+            }
+            set_field(mut g, lo, hi, INCB_MASK, value << 4)
+        }
+    }
+}
+
+fn set_zero_width(mut g: Gen, lo: int, hi: int, category: str) {
+    if category == "Mn" || category == "Me" || category == "Cf" {
+        set_field(mut g, lo, hi, ZERO_WIDTH, ZERO_WIDTH)
+    }
+}
+
+/// `UnicodeData.txt`'s General_Category, with the `<…, First>` /
+/// `<…, Last>` range convention (`parse_unicode_data`, C 491-543).
+fn parse_unicode_data(mut g: Gen, dir: str) {
+    let path = "{dir}/UnicodeData.txt"
+    let text = fs.read_text(path) else {
+        die("cannot read {path}")
+        return
+    }
+    var line_no = 0
+    var have_pending = false
+    var pending_lo = 0
+    var pending_category = ""
+    for line in text.lines() {
+        line_no += 1
+        let fields = line.split(";")
+        if fields.len < 3 {
+            die("{path}:{line_no}: UnicodeData line has too few fields")
+        }
+        let cp = hex_cp(fields[0], path, line_no)
+        let name = fields[1]
+        let category = fields[2]
+        if name.contains(", First>") {
+            if have_pending {
+                die("{path}:{line_no}: nested UnicodeData First range")
+            }
+            pending_lo = cp
+            pending_category = category
+            have_pending = true
+        } else if name.contains(", Last>") {
+            if !have_pending || cp < pending_lo || category != pending_category {
+                die("{path}:{line_no}: malformed UnicodeData First/Last pair")
+            }
+            set_zero_width(mut g, pending_lo, cp, pending_category)
+            have_pending = false
+        } else {
+            if have_pending {
+                die("{path}:{line_no}: UnicodeData First not followed by Last")
+            }
+            set_zero_width(mut g, cp, cp, category)
+        }
+    }
+    if have_pending {
+        die("{path}: unterminated UnicodeData First range")
+    }
+}
+
+fn palette_index(mut g: Gen, rec: int) -> int {
+    var i = 0
+    while i < g.palette.len {
+        if g.palette[i] == rec {
+            return i
+        }
+        i += 1
+    }
+    if g.palette.len == 256 {
+        die("property palette exceeds 256 records")
+    }
+    (mut g.palette).push(rec)
+    g.palette.len - 1
+}
+
+/// The two-level trie with first-occurrence block dedup (`build_trie`,
+/// C 557-580).
+fn build_trie(mut g: Gen) {
+    var input_block = 0
+    while input_block < STAGE1_LEN {
+        var block = List[int]()
+        var i = 0
+        while i < BLOCK_SIZE {
+            (mut block).push(palette_index(mut g, g.records[input_block * BLOCK_SIZE + i]))
+            i += 1
+        }
+        let block_count = g.stage2.len / BLOCK_SIZE
+        var found = block_count
+        var b = 0
+        while b < block_count && found == block_count {
+            var same = true
+            var j = 0
+            while j < BLOCK_SIZE && same {
+                if g.stage2[b * BLOCK_SIZE + j] != block[j] {
+                    same = false
+                }
+                j += 1
+            }
+            if same {
+                found = b
+            }
+            b += 1
+        }
+        if found == block_count {
+            for x in block {
+                (mut g.stage2).push(x)
+            }
+        }
+        (mut g.stage1).push(found)
+        input_block += 1
+    }
+}
+
+/// The sorted range table above the trie (`build_high_ranges`, C 582-603).
+fn build_high_ranges(mut g: Gen) {
+    var cp = TRIE_HI
+    while cp < CP_COUNT {
+        if g.records[cp] == 0 {
+            cp += 1
+            continue
+        }
+        let lo = cp
+        let rec = g.records[cp]
+        cp += 1
+        while cp < CP_COUNT && g.records[cp] == rec {
+            cp += 1
+        }
+        if g.hi_lo.len == 128 {
+            die("high-plane range limit exceeded")
+        }
+        (mut g.hi_lo).push(lo)
+        (mut g.hi_hi).push(cp - 1)
+        (mut g.hi_rec).push(rec)
+    }
+}
+
+/// The Unicode 16.0.0 semantic spot check (`validate_records`, C 605-628).
+fn validate_records(g: Gen) {
+    let used_bits = GCB_MASK |
+        INCB_MASK |
+        EXT_PICT |
+        EAW_MASK |
+        ZERO_WIDTH |
+        EMOJI |
+        EMOJI_PRESENTATION
+    var cp = 0
+    while cp < CP_COUNT {
+        if g.records[cp] - (g.records[cp] & used_bits) != 0 {
+            die("reserved packed-record bits are not zero")
+        }
+        cp += 1
+    }
+    let r = g.records
+    if r[65] & EAW_MASK != 128 ||
+        r[769] & (GCB_MASK | INCB_MASK | ZERO_WIDTH) != 4 | 48 | ZERO_WIDTH ||
+        r[2381] & INCB_MASK != 16 ||
+        r[4448] & ZERO_WIDTH == 0 ||
+        r[4607] & ZERO_WIDTH == 0 ||
+        r[8205] & GCB_MASK != 5 ||
+        r[19968] & EAW_MASK != 384 ||
+        r[44032] & GCB_MASK != 12 ||
+        r[44033] & GCB_MASK != 13 ||
+        r[128512] & (EXT_PICT | EAW_MASK | EMOJI | EMOJI_PRESENTATION) !=
+            EXT_PICT | 384 | EMOJI | EMOJI_PRESENTATION {
+        die("Unicode 16.0.0 semantic spot check failed")
+    }
+}
+
+fn generate(dir: str) -> Gen {
+    var records = List[int]()
+    var cp = 0
+    while cp < CP_COUNT {
+        (mut records).push(0)
+        cp += 1
+    }
+    var g = Gen {
+        records: records,
+        stage1: List[int](),
+        stage2: List[int](),
+        palette: List[int](),
+        hi_lo: List[int](),
+        hi_hi: List[int](),
+        hi_rec: List[int](),
+    }
+    parse_unicode_data(mut g, dir)
+    // UAX #11 terminal-width policy: conjoining Hangul V/T jamo do not
+    // advance independently, regardless of their General_Category.
+    set_field(mut g, 4448, 4607, ZERO_WIDTH, ZERO_WIDTH)
+    parse_property_file(mut g, dir, "GraphemeBreakProperty.txt", 0)
+    parse_property_file(mut g, dir, "emoji-data.txt", 2)
+    parse_property_file(mut g, dir, "EastAsianWidth.txt", 1)
+    parse_property_file(mut g, dir, "DerivedCoreProperties.txt", 3)
+    validate_records(g)
+    build_trie(mut g)
+    build_high_ranges(mut g)
+    if g.palette.len > 64 {
+        die("property palette exceeds the 64-record budget")
+    }
+    if g.stage2.len / BLOCK_SIZE > 320 {
+        die("stage-2 exceeds the 320-block budget")
+    }
+    if g.hi_lo.len > 24 {
+        die("high-plane table exceeds the 24-range budget")
+    }
+    if g.palette.len > 127 {
+        die("the palette does not fit one 7-bit digit; widen the stage-2 encoding")
+    }
+    g
+}
+
+/// Element-wise equality: `==` on a `List` is refused this edition.
+fn same_bytes(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn push_str(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn hex2(n: int) -> str {
+    let digits = "0123456789abcdef"
+    "{digits[n / 16..n / 16 + 1]}{digits[n % 16..n % 16 + 1]}"
+}
+
+/// One 7-bit digit as a `\xNN` escape.
+fn push_digit(mut out: List[byte], d: int) {
+    assert(d >= 0 && d < 128, "a 7-bit digit")
+    push_str(mut out, "\\x{hex2(d)}")
+}
+
+fn push_digits(mut out: List[byte], value: int, count: int) {
+    var i = count - 1
+    while i >= 0 {
+        var d = value
+        var k = 0
+        while k < i {
+            d = d / 128
+            k += 1
+        }
+        push_digit(mut out, d % 128)
+        i -= 1
+    }
+}
+
+fn emit(g: Gen, dir: str) -> List[byte] {
+    var out = List[byte]()
+    let block_count = g.stage2.len / BLOCK_SIZE
+    let table_bytes = STAGE1_LEN * 2 + g.stage2.len + g.palette.len * 2 + g.hi_lo.len * 12
+    let dedup = (STAGE1_LEN - block_count) * 100 / STAGE1_LEN
+    push_str(mut out, "//! unicode.tables — GENERATED by tools/gen-unicode-tables from UCD\n")
+    push_str(mut out, "//! 16.0.0; do not edit; regenerate with `tools/check-tables --write`.\n")
+    push_str(mut out, "//! Data only: the lookups are `src/unicode/trie.lu`.\n")
+    push_str(mut out, "//!\n")
+    push_str(mut out, "//! The property trie sagitta's `src/unicode/tables.c` holds (ports its\n")
+    push_str(
+        mut out,
+        "//! `tables.h`, the packed record layout of `s02-unicode-foundation.md` §7):\n",
+    )
+    push_str(mut out, "//! one u16 record per codepoint — GCB class in bits 0-3, InCB in 4-5,\n")
+    push_str(mut out, "//! Extended_Pictographic 6, EAW class 7-9, zero-width 10, Emoji 11,\n")
+    push_str(mut out, "//! Emoji_Presentation 12 — through a two-level trie over U+0000–U+2FFFF\n")
+    push_str(mut out, "//! (128-codepoint blocks, a palette of distinct records) and a sorted\n")
+    push_str(mut out, "//! range table above it. The arrays are `str` constants of 7-bit digits\n")
+    push_str(mut out, "//! (the generator's header says why and how); `trie.lu` reads them.\n")
+    push_str(mut out, "//!\n")
+    push_str(
+        mut out,
+        "//! UCD 16.0.0; {table_bytes} bytes; {block_count}/{STAGE1_LEN} unique stage-2 blocks; {dedup}% dedup;\n",
+    )
+    push_str(
+        mut out,
+        "//! {g.palette.len} palette records; {g.hi_lo.len} high ranges. Inputs (ucd/MANIFEST):\n",
+    )
+    let manifest = fs.read_text("{dir}/../MANIFEST") else ""
+    for line in manifest.lines() {
+        if line.trim().len > 0 {
+            push_str(mut out, "//!   sha256 {line}\n")
+        }
+    }
+    push_str(mut out, "\n")
+    push_str(mut out, "/// The first codepoint the range table serves (`YEW_TRIE_HI`).\n")
+    push_str(mut out, "pub const TRIE_HI: int = {TRIE_HI}\n\n")
+    push_str(mut out, "/// log2 of the stage-2 block size (`YEW_TRIE_SHIFT`).\n")
+    push_str(mut out, "pub const TRIE_SHIFT: int = 7\n\n")
+    push_str(mut out, "/// The stage-2 block size (`YEW_TRIE_BLOCK`).\n")
+    push_str(mut out, "pub const TRIE_BLOCK: int = 128\n\n")
+    push_str(mut out, "/// Record bits 0-3: the GCB class (`YEW_U_GCB_MASK`).\n")
+    push_str(mut out, "pub const U_GCB_MASK: int = 15\n\n")
+    push_str(mut out, "/// Record bits 4-5: InCB (`YEW_U_INCB_SHIFT`, `YEW_U_INCB_MASK`).\n")
+    push_str(mut out, "pub const U_INCB_SHIFT: int = 4\n\n")
+    push_str(mut out, "/// The InCB mask.\n")
+    push_str(mut out, "pub const U_INCB_MASK: int = 48\n\n")
+    push_str(mut out, "/// Record bit 6: Extended_Pictographic (`YEW_U_EXT_PICT`).\n")
+    push_str(mut out, "pub const U_EXT_PICT: int = 64\n\n")
+    push_str(mut out, "/// Record bits 7-9: the EAW class (`YEW_U_EAW_SHIFT`, `YEW_U_EAW_MASK`).\n")
+    push_str(mut out, "pub const U_EAW_SHIFT: int = 7\n\n")
+    push_str(mut out, "/// The EAW mask.\n")
+    push_str(mut out, "pub const U_EAW_MASK: int = 896\n\n")
+    push_str(mut out, "/// Record bit 10: zero width (`YEW_U_ZERO_WIDTH`).\n")
+    push_str(mut out, "pub const U_ZERO_WIDTH: int = 1024\n\n")
+    push_str(mut out, "/// Record bit 11: Emoji (`YEW_U_EMOJI`).\n")
+    push_str(mut out, "pub const U_EMOJI: int = 2048\n\n")
+    push_str(mut out, "/// Record bit 12: Emoji_Presentation (`YEW_U_EMOJI_PRESENTATION`).\n")
+    push_str(mut out, "pub const U_EMOJI_PRESENTATION: int = 4096\n\n")
+    push_str(mut out, "/// The number of stage-2 blocks.\n")
+    push_str(mut out, "pub const U_STAGE2_BLOCKS: int = {block_count}\n\n")
+    push_str(mut out, "/// The number of palette records.\n")
+    push_str(mut out, "pub const U_PAL_LEN: int = {g.palette.len}\n\n")
+    push_str(mut out, "/// The number of high ranges (`yew_u_hi_len`).\n")
+    push_str(mut out, "pub const U_HI_LEN: int = {g.hi_lo.len}\n\n")
+
+    push_str(mut out, "// stage1: {STAGE1_LEN} block indices, two base-128 digits each.\n")
+    push_str(mut out, "let U_STAGE1: str = \"")
+    for v in g.stage1 {
+        push_digits(mut out, v, 2)
+    }
+    push_str(mut out, "\"\n\n")
+    push_str(mut out, "// stage2: {block_count} blocks of 128 palette indices, one digit each.\n")
+    push_str(mut out, "let U_STAGE2: str = \"")
+    for v in g.stage2 {
+        push_digits(mut out, v, 1)
+    }
+    push_str(mut out, "\"\n\n")
+    push_str(mut out, "// pal: {g.palette.len} packed records, two digits each.\n")
+    push_str(mut out, "let U_PAL: str = \"")
+    for v in g.palette {
+        push_digits(mut out, v, 2)
+    }
+    push_str(mut out, "\"\n\n")
+    push_str(mut out, "// hi: {g.hi_lo.len} ranges of (lo, hi, rec), three digits each.\n")
+    push_str(mut out, "let U_HI: str = \"")
+    var i = 0
+    while i < g.hi_lo.len {
+        push_digits(mut out, g.hi_lo[i], 3)
+        push_digits(mut out, g.hi_hi[i], 3)
+        push_digits(mut out, g.hi_rec[i], 3)
+        i += 1
+    }
+    push_str(mut out, "\"\n")
+
+    out
+}
+
+fn dump(g: Gen) {
+    var out = List[byte]()
+    push_str(
+        mut out,
+        "# yew's Unicode 16.0.0 property trie as sagitta 9ace98c2's scripts/gen-unicode-tables emitted it\n",
+    )
+    push_str(
+        mut out,
+        "# (src/unicode/tables.c): the cross-check for tools/gen-unicode-tables. Decimal, one array per line.\n",
+    )
+    push_str(mut out, "stage1")
+    for v in g.stage1 {
+        push_str(mut out, " {v}")
+    }
+    push_str(mut out, "\nstage2")
+    for v in g.stage2 {
+        push_str(mut out, " {v}")
+    }
+    push_str(mut out, "\npal")
+    for v in g.palette {
+        push_str(mut out, " {v}")
+    }
+    push_str(mut out, "\nhi")
+    var i = 0
+    while i < g.hi_lo.len {
+        push_str(mut out, " {g.hi_lo[i]},{g.hi_hi[i]},{g.hi_rec[i]}")
+        i += 1
+    }
+    push_str(mut out, "\n")
+    let stdout = fs_open_mode("/dev/stdout", 2) else {
+        die("cannot open standard output")
+        return
+    }
+    fs_write_chunk(stdout, out) else {
+        die("cannot write standard output")
+    }
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len == 2 && args[0] == "--dump" {
+        dump(generate(args[1]))
+        return 0
+    }
+    if args.len == 3 && args[0] == "--check" {
+        let want = emit(generate(args[1]), args[1])
+        let have = fs.read_bytes(args[2]) else {
+            eprint("gen-unicode-tables: cannot read {args[2]}")
+            return 1
+        }
+        if same_bytes(have, want) {
+            print("gen-unicode-tables: {args[2]} is the generated file")
+            return 0
+        }
+        eprint(
+            "gen-unicode-tables: {args[2]} DRIFTED from the generator's output ({have.len} vs {want.len} bytes); regenerate",
+        )
+        return 1
+    }
+    if args.len == 2 {
+        let out = emit(generate(args[0]), args[0])
+        fs.write_bytes(args[1], out) else {
+            eprint("gen-unicode-tables: cannot write {args[1]}")
+            return 1
+        }
+        print("gen-unicode-tables: wrote {args[1]} ({out.len} bytes)")
+        return 0
+    }
+    eprint("usage: gen-unicode-tables [--check] <ucd-dir> <out.lu> | --dump <ucd-dir>")
+    2
+}
