@@ -1,0 +1,193 @@
+//! term.osc52 — the OSC 52 clipboard write, plain or wrapped for tmux and
+//! screen.
+//!
+//! Ports sagitta `src/term/osc52.c` (187 lines) and `osc52.h` (31) at
+//! 9ace98c2 (Sprint 12's clipboard half, `s11`). The mode is chosen from
+//! the environment (`YEW_OSC52` forced; `TMUX` → tmux passthrough with
+//! every ESC doubled; `STY` or a `screen*` `TERM` → DCS chunks of 768
+//! bytes; else plain), the target `c`, `p` or `cp` from
+//! `YEW_CLIPBOARD_TARGET`, the encoded-size cap from `YEW_OSC52_MAX`
+//! (default 100000). A refused write leaves `out` unchanged. The env
+//! lookup is injected (`fn(str) -> (str, bool)`), as in `tty`.
+
+use util
+
+/// `YewOsc52Mode`: never write.
+pub const OSC52_OFF: int = 0
+
+/// A bare OSC 52.
+pub const OSC52_PLAIN: int = 1
+
+/// tmux passthrough (`DCS tmux ;` with ESC doubled).
+pub const OSC52_TMUX: int = 2
+
+/// screen's DCS chunks.
+pub const OSC52_SCREEN: int = 3
+
+/// The default cap on the encoded bytes (`YEW_OSC52_DEFAULT_MAX`).
+pub const OSC52_DEFAULT_MAX: int = 100000
+
+/// screen's chunk size (`YEW_OSC52_SCREEN_CHUNK`).
+pub const OSC52_SCREEN_CHUNK: int = 768
+
+/// The mode the environment selects (`yew_osc52_mode`, `osc52.c:25-49`).
+pub fn osc52_mode(getv: fn(str) -> (str, bool)) -> int {
+    let (forced, has_forced) = getv("YEW_OSC52")
+    if has_forced {
+        if forced == "off" {
+            return OSC52_OFF
+        }
+        if forced == "plain" {
+            return OSC52_PLAIN
+        }
+        if forced == "tmux" {
+            return OSC52_TMUX
+        }
+        if forced == "screen" {
+            return OSC52_SCREEN
+        }
+        util.log_warn("clipboard: ignoring invalid YEW_OSC52 mode")
+    }
+    let (tmux, _) = getv("TMUX")
+    if tmux.len != 0 {
+        return OSC52_TMUX
+    }
+    let (sty, _) = getv("STY")
+    if sty.len != 0 {
+        return OSC52_SCREEN
+    }
+    let (term, has_term) = getv("TERM")
+    if has_term && term.starts_with("screen") {
+        return OSC52_SCREEN
+    }
+    OSC52_PLAIN
+}
+
+/// The encoded-size cap (`yew_osc52_max`, `osc52.c:51-75`): `YEW_OSC52_MAX`
+/// when it is all digits, else the default (and a warning).
+pub fn osc52_max(getv: fn(str) -> (str, bool)) -> int {
+    let (value, _) = getv("YEW_OSC52_MAX")
+    if value.len == 0 {
+        return OSC52_DEFAULT_MAX
+    }
+    var parsed: int = 0
+    for b in value.bytes() {
+        let c = b as int
+        if c < 48 || c > 57 {
+            util.log_warn("clipboard: ignoring invalid YEW_OSC52_MAX")
+            return OSC52_DEFAULT_MAX
+        }
+        if parsed < 100000000000 {
+            parsed = parsed * 10 + (c - 48)
+        }
+    }
+    parsed
+}
+
+/// The selection target (`yew_osc52_target`, `osc52.c:77-88`): `c`, `p` or
+/// `cp`; anything else is `c` with a warning.
+pub fn osc52_target(getv: fn(str) -> (str, bool)) -> str {
+    let (target, has_target) = getv("YEW_CLIPBOARD_TARGET")
+    if !has_target || target == "c" {
+        return "c"
+    }
+    if target == "p" || target == "cp" {
+        return target
+    }
+    util.log_warn("clipboard: ignoring invalid YEW_CLIPBOARD_TARGET")
+    "c"
+}
+
+fn push_str(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn append_plain(mut out: List[byte], encoded: List[byte], target: str) {
+    push_str(mut out, "\x1b]52;")
+    push_str(mut out, target)
+    (mut out).push(59 as byte)
+    for b in encoded {
+        (mut out).push(b)
+    }
+    push_str(mut out, "\x1b\\")
+}
+
+fn append_tmux(mut out: List[byte], plain: List[byte]) {
+    push_str(mut out, "\x1bPtmux;")
+    for b in plain {
+        (mut out).push(b)
+        if b as int == 27 {
+            (mut out).push(27 as byte)
+        }
+    }
+    push_str(mut out, "\x1b\\")
+}
+
+fn append_screen(mut out: List[byte], encoded: List[byte], target: str) {
+    let n = encoded.len
+    var offset = 0
+    var first = true
+    loop {
+        var chunk = n - offset
+        if chunk > OSC52_SCREEN_CHUNK {
+            chunk = OSC52_SCREEN_CHUNK
+        }
+        push_str(mut out, "\x1bP")
+        if first {
+            push_str(mut out, "\x1b]52;")
+            push_str(mut out, target)
+            (mut out).push(59 as byte)
+            first = false
+        }
+        var i = 0
+        while i < chunk {
+            (mut out).push(encoded[offset + i])
+            i += 1
+        }
+        if offset + chunk == n {
+            push_str(mut out, "\x1b\\")
+        }
+        push_str(mut out, "\x1b\\")
+        offset += chunk
+        if offset >= n {
+            break
+        }
+    }
+}
+
+/// Append a complete clipboard write for `payload` (`yew_osc52_build`,
+/// `osc52.c:142-180`), or leave `out` unchanged and answer false when the
+/// mode is off or the encoded size passes `max_base64`. An unknown target
+/// is `c`.
+pub fn osc52_build(mut out: List[byte], payload: List[byte], target_in: str, mode: int, max_base64: int) -> bool {
+    if mode == OSC52_OFF {
+        return false
+    }
+    var target = target_in
+    if target != "c" && target != "p" && target != "cp" {
+        target = "c"
+    }
+    let encoded_len = util.base64_len(payload.len)
+    if encoded_len > max_base64 {
+        return false
+    }
+    let encoded = util.base64_encode(payload, 0, payload.len)
+    if mode == OSC52_SCREEN {
+        append_screen(mut out, encoded, target)
+    } else if mode == OSC52_TMUX {
+        var plain = List[byte]()
+        append_plain(mut plain, encoded, target)
+        append_tmux(mut out, plain)
+    } else {
+        append_plain(mut out, encoded, target)
+    }
+    true
+}
+
+/// `osc52_build` with every choice read from the environment
+/// (`yew_osc52_build_env`).
+pub fn osc52_build_env(mut out: List[byte], payload: List[byte], getv: fn(str) -> (str, bool)) -> bool {
+    osc52_build(mut out, payload, osc52_target(getv), osc52_mode(getv), osc52_max(getv))
+}
