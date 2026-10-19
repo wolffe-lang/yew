@@ -63,8 +63,22 @@ the same commit and before any port code.
 
 ## 3. The five sections (filled as the modules land)
 
-- **`term.tty`** — raw mode, the restore guarantee (interim B), the
-  alternate screen, window size, the capability probe, truecolor: PENDING.
+- **`term.tty`** — the PURE, idiom-setting core LANDED and green
+  (`src/term/tty.lu`, `tty_test.lu`, 13 cases on the checked machine and
+  native, kasumi): the raw-mode mapping (`rawios` builds a `std_term.Mode`
+  with the five reachable bits off and `VMIN=1`, and unlike `std_term.raw`
+  it clears `signals` too — Ctrl-C is a key); the restore blob bytes
+  byte-pinned against C (with the 1003-motion variant); the capability
+  probe state machine (kitty / DECRQM 2026 / DA1 / OSC 11 background
+  recognizers, the ambiguous-prefix flush, the deadline, chunk-safe);
+  truecolor detection (12 vectors); the probe config reader. The idiom
+  this sets, for every later terminal lane: a `_test.lu` lives in its
+  module and names items bare; reply recognizers answer `(cont, complete,
+  …)` tuples; `now_ms` injected; `str` constants for byte blobs read with
+  `.bytes()`; `copy` on a lent `List` getter (`tty_pending`). **Still
+  PENDING:** the I/O surface (open, raw via `os_term_set_mode`, the
+  restore's listen + re-raise and #93 R1's interim-B supervisor, winsize,
+  alt screen, suspend, handover, `drain_signals`).
 - **`term.input`** — the escape state machine, kitty, paste, mouse,
   focus: PENDING.
 - **`term.grid` / `term.render`** — the double buffer, damage, wide
@@ -130,13 +144,18 @@ press `ctrl+a`, not a lone ESC). Filed as `os_signal_wait_fds` (#795).
 
 ## Done-when
 
-- [ ] the pin bump with the prediction (this commit)
-- [ ] the two witnesses written before the first golden
-- [ ] `term.tty`, the restore guarantee (interim B), `term.input`,
+- [x] the pin bump with the prediction (`bf12b30`), verified clean
+      against campaign 00 under 0.2.33 (fmt, tables, 11 unit files green)
+- [x] the two witnesses written and run before any golden, with bytes
+      and issue texts (`bb1bbbd`; both mode-bit predictions HIT)
+- [x] yw02's contract drafted (`4997881`)
+- [~] `term.tty` PURE core landed and green on the checked machine and
+      native (`c25e377`); its I/O surface still pending
+- [ ] the restore guarantee (interim B), `term.input`,
       `term.grid`/`term.render`, `osc52`, `demo_paint`, the driver
 - [ ] the four golden profiles green; `tools/goldens-selftest` red on
       the plants; the restore proven
 - [ ] the 2× ratios recorded on kasumi under `taskset -c 0-3`
-- [ ] `docs/MAP.md` updated; yw02's contract drafted
+- [ ] `docs/MAP.md` §5 updated with the mode-bit gap
 - [ ] CI green; PR open; `lane-audit.sh yew yw01 <PR>` clean but for the
       final run
