@@ -54,7 +54,11 @@ there is binding.
   harness reminder says.
 - Tests are first class and land with the code they cover: sagitta's
   unit tests port one for one (`src/<dir>/<unit>_test.lu`, one file per
-  C test file, a black-box `main` running the ported tests in sagitta's
+  C test file — or `src/<dir>_<unit>_test.lu` at the package root with
+  `//! member: false` when the test imports a sibling module, since
+  `use` resolves beside the entry file, D32; a test that re-executes
+  itself hand-shakes `os_exe()` first and skips loudly under `wolf
+  test`, where `os_exe()` is `wolf` — a black-box `main` running the ported tests in sagitta's
   registry order), and C yew's own suites run against the wolf binary
   through `tools/goldens`. CI is first class.
 - **No silent stubs.** An unported path hard-errors naming its sagitta
