@@ -177,10 +177,11 @@ chunking test (`input_chunking_independence` / `--case chunking`) C
 (`render_resize_repaint_is_deterministic` / `--case resize_repaint`) C
 1,052 us, wolf 1,261 us, **1.20**.
 
-**Sizes.** `Cell` is 13 ints = 104 bytes against C's 20 (5.2×: wolf has
-no `u8`/`u16` fields in a struct, D-idiom §1; the eight inline bytes ride
-in two ints). `Key` is 7 ints plus the reused `List[byte]` text (C: see
-the sagitta `Key`). Nothing in campaign 01 allocates per keystroke after
+**Sizes** (C's by `sizeof` against the oracle's headers on kasumi, gcc
+x86-64). `Cell` is 13 ints = 104 bytes against C's 20 (5.2×: wolf has
+no `u8`/`u16` fields in a struct, idiom §1; the eight inline bytes ride
+in two ints). `Key` is 7 ints = 56 bytes plus the reused `List[byte]`
+text against C's 32 (1.75× before the list's header). Nothing in campaign 01 allocates per keystroke after
 warm-up but `Key.text`, kept as one reused list (the prediction held).
 
 **`unsafe` census**: one block in the repository, yw00's
