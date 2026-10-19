@@ -81,13 +81,52 @@ PENDING. The wolf/C ratios for keypress → paint and cold start, the
 
 ## 5. The two witnesses (the terminal gaps)
 
-PENDING — the mode bits (`[os.term.mode]` cannot reach `ICRNL`/`OPOST`/
-`ISTRIP`), and the multi-descriptor timed wait (`os_signal_wait_fds`,
-G2). Issue texts in §Issues.
+Both written and run on kasumi before the first PTY golden
+(`notes/yw01-evidence/witness/`).
 
-## Issues to file (listed, not filed)
+**W1 — the mode bits.** `os_term_set_mode`'s mode int reaches
+`ICANON`/`ECHO`/`ISIG`/`IXON`/`IEXTEN`/`VMIN`/`VTIME` and leaves every
+other termios field as found (`[os.term.mode]`), so `ICRNL`, `OPOST`,
+`ISTRIP`, `BRKINT`, `PARMRK`, `INPCK` and the `CS8` set are unreachable.
+Measured under a PTY (`run.txt`): the master writes CR and C yew reads
+**13** (CR, `ICRNL` cleared) while the port reads **10** (LF); the child
+writes one LF and C yew puts **0a** on the wire (`OPOST` cleared) while
+the port puts **0d0a** (CRLF). Both prediction clauses HIT. **Not a yw01
+blocker:** no campaign-01 golden sends CR as input nor emits a bare LF in
+paint output (the renderer is pure CSI/UTF-8, the quit key is `q`, the
+input cases press `ctrl+a`), so the divergence does not reach a
+campaign-01 golden; it bites yw03 (Enter in the editor). A STOP by the
+contract's letter (a bit the mode int cannot clear), filed; never worked
+around with a dumber terminal.
 
-PENDING.
+**W2 — the timed multi-descriptor wait** (`wait-fds.md`). `os_signal_wait_fd`
+takes one fd and no deadline; there is no wait over the tty + signals +
+job pipes with a timer, so the editor's loop cannot be written as sagitta
+writes it (witness by construction). Interim (#93 R2): `VTIME` polling
+(`Mode.time = 1`, 100 ms), which rounds the 25 ms lone-ESC deadline to
+100 ms in the `nokitty` profile only — a documented timing, never byte,
+divergence. Not a yw01 blocker (the cases settle on quiet periods and
+press `ctrl+a`, not a lone ESC). Filed as `os_signal_wait_fds` (#795).
+
+## Issues to file (listed, not filed by the lane; track rule 4)
+
+- **wolf-lang** — `[os.term.mode]` **widening** (W1, `run.txt`,
+  `witness/enter/`, `witness/opost/`): `os_term_set_mode`'s mode int
+  cannot clear `ICRNL`, `OPOST` or `ISTRIP`, which an editor's raw mode
+  needs (sagitta `src/term/tty.c:521-543`). Measured under a PTY: with
+  the port's raw mode a carriage return read is LF 0x0A, not CR 0x0D
+  (Enter = Ctrl-J), and a written LF reaches the wire as CRLF, not LF.
+  Proposed: three more mode bits — `CR_NL` (ICRNL), `OUTPUT_POST`
+  (OPOST/ONLCR), `STRIP8` (ISTRIP) — or an editor-raw flag that clears
+  the `cfmakeraw(3)` set. Needed in full by yw03 (Enter); yw01 ships
+  without it because campaign 01 does not press Enter.
+- **wolf-lang** — `os_signal_wait_fds(fds, set, deadline_ms)` (W2,
+  `wait-fds.md`): the widening of `os_signal_wait_fd` to several
+  descriptors and a deadline, ruling #93 R2 = A, s248/0.2.34. Already
+  filed as **wolf-lang#795** by the orchestrator at yw00; yw01 confirms
+  the shape and the VTIME interim.
+- The first is the same `[os.term.mode]` surface yw00's G1 names;
+  **wolf-lang#794** (restore at exit, #93 R1) is the sibling and stands.
 
 ## Done-when
 
