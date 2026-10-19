@@ -1,0 +1,449 @@
+//! unicode.utf8 — the UTF-8 DFA decoder and encoder, and the lossless
+//! invalid-byte policy.
+//!
+//! Ports sagitta `src/unicode/utf8.c` (375 lines) and `utf8.h` (51) at
+//! 9ace98c2, under `s02-unicode-foundation.md` §2–§4. UTF-8 validity is
+//! encoded entirely in a 12-class, 9-state DFA (`utf8.c:6-70`):
+//! overlong encodings, surrogate encodings and values above U+10FFFF
+//! cannot reach `ACC`, and the decoder performs no post-hoc range check
+//! (DoD 10: no comparison against 0xD800 or 0x10FFFF outside a
+//! comment). Every byte the DFA cannot place becomes the escape
+//! `0xDC00 + byte` (U+DC80–DCFF), which re-encodes to that byte alone,
+//! so encode∘decode is the identity on every byte string (the
+//! round-trip law). Escapes exist only in the decoded stream; storage
+//! stays byte-verbatim. yew performs no normalization (invariant 1).
+//!
+//! Recovery (`s02` §2): on `REJ` the first byte of the failed sequence
+//! alone is escaped and the DFA restarts at the byte after it, so
+//! `E1 41` yields escape(E1) then `A` (`utf8.c:98-131`).
+//!
+//! The wolf shapes. C takes `(const u8 *s, size_t len)` and advances the
+//! pointer; a wolf `List` slice copies, so every flat entry point takes
+//! `(s, at, end)` — the buffer, the first byte to read and one past the
+//! last — and answers absolute offsets. A decode answers `(cp, n)`: the
+//! codepoint and the bytes consumed. An encode pushes into a caller's
+//! `List[byte]` (`utf8_encode_into`) or answers a fresh one
+//! (`utf8_encode`); `utf8_len` allocates nothing. The DFA's three small
+//! tables are `str` constants read through `.bytes()` — module state of
+//! a `List` type is refused (`[mem.static.3]`), a `str` is `.rodata`,
+//! and an inline `.bytes()[i]` is a zero-copy read (measured: 2 ns a
+//! lookup, notes/yw00-the-map.md §4).
+//!
+//! `yew_utf8_validate`'s word-at-a-time ASCII scan (`utf8.c:252-283`)
+//! is a per-byte scan here: wolf has no `memcpy` of eight bytes into an
+//! int. Same answer, a slower one (docs/MAP.md names the gap).
+
+/// The longest UTF-8 sequence (`YEW_UTF8_MAX`).
+pub const UTF8_MAX: int = 4
+
+/// The most codepoints one pushed byte can flush (`YEW_U8_MAX_FLUSH`):
+/// three escapes and a scalar, for `F0 90 80 41`.
+pub const U8_MAX_FLUSH: int = 4
+
+/// The first escape codepoint (`YEW_CP_ESC_LO`): `0xDC00 + 0x80`.
+pub const CP_ESC_LO: int = 56448
+
+/// The last escape codepoint (`YEW_CP_ESC_HI`): `0xDC00 + 0xFF`.
+pub const CP_ESC_HI: int = 56575
+
+// The DFA states (`utf8.c:11-21`).
+const U8_ACC: int = 0
+
+const U8_REJ: int = 1
+
+const U8_T1: int = 2
+
+const U8_T2: int = 3
+
+const U8_T3: int = 4
+
+const U8_T2A: int = 5
+
+const U8_T2B: int = 6
+
+const U8_T3A: int = 7
+
+const U8_T3B: int = 8
+
+// The byte classes (`utf8.c:23-41`, `s02` §2's table): 256 entries,
+// one per byte: AS C8 C9 CA IL L2 E0 L3 ED F0 L4 F4 as 0..11.
+let U8_CLASS: str = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x04\x04\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x06\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x08\x07\x07\x09\x0a\x0a\x0a\x0b\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04\x04"
+
+// The transition table (`utf8.c:43-62`): 9 states x 12 classes.
+let U8_NEXT: str = "\x00\x01\x01\x01\x01\x02\x05\x03\x06\x07\x04\x08\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x00\x00\x00\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x03\x03\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x03\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01"
+
+// The payload mask a lead byte keeps, by class (`utf8.c:64-66`).
+let LEAD_MASK: str = "\x7f\x00\x00\x00\x00\x1f\x0f\x0f\x0f\x07\x07\x07"
+
+fn class_of(b: int) -> int {
+    U8_CLASS.bytes()[b] as int
+}
+
+fn next_state(state: int, cls: int) -> int {
+    U8_NEXT.bytes()[state * 12 + cls] as int
+}
+
+fn lead_mask(cls: int) -> int {
+    LEAD_MASK.bytes()[cls] as int
+}
+
+/// One byte in, one DFA step (`utf8.c:68-79`): the new state and the
+/// codepoint so far. Accumulate before branching: on a lead the payload
+/// width comes from the class, on a tail it is the low six bits.
+fn step(state: int, cp: int, b: int) -> (int, int) {
+    let cls = class_of(b)
+    let st = next_state(state, cls)
+    let next_cp = if state == U8_ACC then b & lead_mask(cls) else cp << 6 | b & 63
+    (st, next_cp)
+}
+
+/// The incremental decoder (`YewU8Dec`, `utf8.h:16-22`): zeroed is
+/// ready. `pend` holds the bytes of an incomplete sequence (at most
+/// four, `n` of them live); `out` holds the results of the last push or
+/// finish (`nout` of them live).
+pub struct Dec {
+    state: int,
+    n: int,
+    pend0: int,
+    pend1: int,
+    pend2: int,
+    pend3: int,
+    cp: int,
+    nout: int,
+    out0: int,
+    out1: int,
+    out2: int,
+    out3: int,
+}
+
+/// A ready decoder (`yew_utf8_dec_init`, `utf8.c:91-96`).
+pub fn utf8_dec_new() -> Dec {
+    Dec {
+        state: U8_ACC,
+        n: 0,
+        pend0: 0,
+        pend1: 0,
+        pend2: 0,
+        pend3: 0,
+        cp: 0,
+        nout: 0,
+        out0: 0,
+        out1: 0,
+        out2: 0,
+        out3: 0,
+    }
+}
+
+/// The i-th result of the last push or finish, `0 <= i < d.nout`
+/// (C: `d->out[i]`).
+pub fn utf8_dec_out(d: Dec, i: int) -> int {
+    match i {
+        0 => d.out0,
+        1 => d.out1,
+        2 => d.out2,
+        _ => d.out3,
+    }
+}
+
+fn pend_at(d: Dec, i: int) -> int {
+    match i {
+        0 => d.pend0,
+        1 => d.pend1,
+        2 => d.pend2,
+        _ => d.pend3,
+    }
+}
+
+fn pend_set(mut d: Dec, i: int, b: int) {
+    if i == 0 {
+        d.pend0 = b
+    } else if i == 1 {
+        d.pend1 = b
+    } else if i == 2 {
+        d.pend2 = b
+    } else {
+        d.pend3 = b
+    }
+}
+
+fn out_set(mut d: Dec, i: int, cp: int) {
+    if i == 0 {
+        d.out0 = cp
+    } else if i == 1 {
+        d.out1 = cp
+    } else if i == 2 {
+        d.out2 = cp
+    } else {
+        d.out3 = cp
+    }
+}
+
+fn out_push(mut d: Dec, cp: int) {
+    assert(d.nout < U8_MAX_FLUSH, "utf8: more than four results from one byte")
+    out_set(mut d, d.nout, cp)
+    d.nout += 1
+}
+
+/// Drops the first `count` pending bytes (`drop_pending`, `utf8.c:81-89`).
+fn drop_pending(mut d: Dec, count: int) {
+    assert(count <= d.n, "utf8: dropping more than is pending")
+    d.n -= count
+    var i = 0
+    while i < d.n {
+        pend_set(mut d, i, pend_at(d, i + count))
+        i += 1
+    }
+}
+
+/// Feeds one byte (`yew_utf8_push`, `utf8.c:98-131`); answers how many
+/// codepoints landed in `out`: 0 while a sequence is incomplete, up to
+/// four when an ill-formed run flushes as escapes and the pushed byte
+/// then starts a valid scalar (`F0 90 80 41`).
+pub fn utf8_push(mut d: Dec, b: int) -> int {
+    d.nout = 0
+    assert(d.n < UTF8_MAX, "utf8: a fifth pending byte")
+    pend_set(mut d, d.n, b)
+    d.n += 1
+
+    while d.n != 0 {
+        d.state = U8_ACC
+        d.cp = 0
+        var i = 0
+        var decided = false
+        while i < d.n && !decided {
+            let (st, cp) = step(d.state, d.cp, pend_at(d, i))
+            d.state = st
+            d.cp = cp
+            if st == U8_REJ {
+                out_push(mut d, utf8_escape_of(pend_at(d, 0)))
+                drop_pending(mut d, 1)
+                decided = true
+            } else if st == U8_ACC {
+                out_push(mut d, d.cp)
+                drop_pending(mut d, i + 1)
+                decided = true
+            } else {
+                i += 1
+            }
+        }
+        if !decided {
+            // Every pending byte stepped and the sequence is still open.
+            return d.nout
+        }
+    }
+
+    d.state = U8_ACC
+    d.cp = 0
+    d.nout
+}
+
+/// End of input (`yew_utf8_finish`, `utf8.c:133-145`): each byte of an
+/// incomplete sequence flushes as its own escape; answers how many.
+pub fn utf8_finish(mut d: Dec) -> int {
+    let n = d.n
+    d.nout = 0
+    var i = 0
+    while i < n {
+        out_push(mut d, utf8_escape_of(pend_at(d, i)))
+        i += 1
+    }
+    d.n = 0
+    d.state = U8_ACC
+    d.cp = 0
+    n
+}
+
+/// One-shot decode over `s[at..end)` (`yew_utf8_decode`,
+/// `utf8.c:147-176`): TOTAL. Answers `(cp, n)`: for `at < end` always
+/// consumes at least one byte and never reads past `end`; for an empty
+/// range answers `(0, 0)`.
+pub fn utf8_decode(s: List[byte], at: int, end: int) -> (int, int) {
+    if at >= end {
+        return (0, 0)
+    }
+    let avail = end - at
+    let limit = if avail < UTF8_MAX then avail else UTF8_MAX
+    var state = U8_ACC
+    var cp = 0
+    var i = 0
+    while i < limit {
+        let (st, next_cp) = step(state, cp, s[at + i] as int)
+        state = st
+        cp = next_cp
+        if st == U8_REJ {
+            return (utf8_escape_of(s[at] as int), 1)
+        }
+        if st == U8_ACC {
+            return (cp, i + 1)
+        }
+        i += 1
+    }
+    (utf8_escape_of(s[at] as int), 1)
+}
+
+/// The codepoint ENDING at `pos`, decoding forward from at most four
+/// bytes before it and never before `start` (`yew_utf8_decode_prev`,
+/// `utf8.c:178-205`): a backward scan alone cannot tell truncated from
+/// valid. Answers `(cp, n)`, or `(0, 0)` when `start >= pos`.
+pub fn utf8_decode_prev(s: List[byte], start: int, pos: int) -> (int, int) {
+    if start >= pos {
+        return (0, 0)
+    }
+    var cursor = if pos - start > UTF8_MAX then pos - UTF8_MAX else start
+    var previous_cp = 0
+    var previous_len = 0
+    while cursor < pos {
+        let (cp, n) = utf8_decode(s, cursor, pos)
+        previous_cp = cp
+        previous_len = n
+        cursor += n
+    }
+    (previous_cp, previous_len)
+}
+
+/// Whether `cp` is an escape (`yew_utf8_is_escape`, `utf8.c:207-210`).
+pub fn utf8_is_escape(cp: int) -> bool {
+    cp >= CP_ESC_LO && cp <= CP_ESC_HI
+}
+
+/// The byte an escape stands for (`yew_utf8_escape_byte`,
+/// `utf8.c:212-216`): `cp - 0xDC00`. Traps on a non-escape.
+pub fn utf8_escape_byte(cp: int) -> int {
+    assert(utf8_is_escape(cp), "utf8: escape_byte of a non-escape")
+    cp - 56320
+}
+
+/// The escape for byte `b >= 0x80` (`yew_utf8_escape_of`,
+/// `utf8.c:218-222`): `0xDC00 + b`. Traps below 0x80.
+pub fn utf8_escape_of(b: int) -> int {
+    assert(b >= 128, "utf8: escape_of a byte below 0x80")
+    56320 + b
+}
+
+/// Encodes `cp`, pushing its bytes onto `out` (`yew_utf8_encode`,
+/// `utf8.c:224-262`); answers how many. An escape emits its original
+/// byte (length 1). A non-escape surrogate or a value past U+10FFFF
+/// pushes nothing and answers 0: those cannot come from this decoder,
+/// so 0 means the caller synthesized a bad scalar.
+pub fn utf8_encode_into(mut out: List[byte], cp: int) -> int {
+    if utf8_is_escape(cp) {
+        (mut out).push(utf8_escape_byte(cp) as byte)
+        return 1
+    }
+    if cp <= 127 {
+        (mut out).push(cp as byte)
+        return 1
+    }
+    if cp <= 2047 {
+        (mut out).push((192 | cp >> 6) as byte)
+        (mut out).push((128 | cp & 63) as byte)
+        return 2
+    }
+    if cp >> 11 == 27 {
+        // The surrogate block, by its top bits (`utf8.c:243-244`).
+        return 0
+    }
+    if cp <= 65535 {
+        (mut out).push((224 | cp >> 12) as byte)
+        (mut out).push((128 | cp >> 6 & 63) as byte)
+        (mut out).push((128 | cp & 63) as byte)
+        return 3
+    }
+    if cp >> 16 <= 16 {
+        (mut out).push((240 | cp >> 18) as byte)
+        (mut out).push((128 | cp >> 12 & 63) as byte)
+        (mut out).push((128 | cp >> 6 & 63) as byte)
+        (mut out).push((128 | cp & 63) as byte)
+        return 4
+    }
+    0
+}
+
+/// Encodes `cp` into a fresh list: empty for a bad scalar.
+pub fn utf8_encode(cp: int) -> List[byte] {
+    var out = List[byte]()
+    let n = utf8_encode_into(mut out, cp)
+    assert(n == out.len, "utf8: encode length")
+    out
+}
+
+/// The encoded length of `cp`: 1..4; 1 for an escape; 0 for a bad
+/// scalar (`yew_utf8_len`, `utf8.c:264-269`), allocating nothing.
+pub fn utf8_len(cp: int) -> int {
+    if utf8_is_escape(cp) || cp <= 127 {
+        return 1
+    }
+    if cp <= 2047 {
+        return 2
+    }
+    if cp >> 11 == 27 {
+        return 0
+    }
+    if cp <= 65535 {
+        return 3
+    }
+    if cp >> 16 <= 16 {
+        return 4
+    }
+    0
+}
+
+/// The first invalid byte's offset in `s[at..end)`, or `end` when the
+/// range is valid (`yew_utf8_validate`, `utf8.c:271-300`). Sagitta
+/// skips ASCII a word at a time; this skips it a byte at a time.
+pub fn utf8_validate(s: List[byte], at: int, end: int) -> int {
+    var pos = at
+    while pos < end {
+        while pos < end && s[pos] as int < 128 {
+            pos += 1
+        }
+        if pos == end {
+            return end
+        }
+        let (cp, n) = utf8_decode(s, pos, end)
+        if utf8_is_escape(cp) {
+            return pos
+        }
+        pos += n
+    }
+    end
+}
+
+/// `utf8_validate`, also reporting whether every byte is printable
+/// ASCII or a line feed (`yew_utf8_validate_simple`, `utf8.c:302-349`):
+/// `(first_bad_or_end, simple_ascii)`. A tab, a DEL, any other control
+/// and any non-ASCII byte make it not simple.
+pub fn utf8_validate_simple(s: List[byte], at: int, end: int) -> (int, bool) {
+    var simple = true
+    var pos = at
+    while pos < end {
+        let b = s[pos] as int
+        pos += 1
+        if b >= 128 {
+            return (utf8_validate(s, at, end), false)
+        }
+        if b != 10 && (b < 32 || b == 127) {
+            simple = false
+        }
+    }
+    (end, simple)
+}
+
+/// Whether `pos` is a codepoint boundary of `s[at..end)`
+/// (`yew_utf8_is_boundary`, `utf8.c:351-369`): `at` and `end` are;
+/// past `end` is not.
+pub fn utf8_is_boundary(s: List[byte], at: int, end: int, pos: int) -> bool {
+    if pos > end {
+        return false
+    }
+    if pos == at {
+        return true
+    }
+    var cursor = at
+    while cursor < pos {
+        let (cp, n) = utf8_decode(s, cursor, end)
+        assert(cp >= 0, "utf8: decode answered")
+        cursor += n
+    }
+    cursor == pos
+}
