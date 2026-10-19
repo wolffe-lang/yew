@@ -1,0 +1,480 @@
+//! demo-paint — the first-paint fixture: a static screen through the whole
+//! stack, `tty` → `input` → `grid` → `render`, driven by sagitta's PTY
+//! harness (`tools/goldens --demo target/tools/demo_paint`).
+//!
+//! Ports sagitta `tests/pty/demo_paint.c` (1,020 lines) at 9ace98c2, the
+//! campaign-01 scenes of `s06-pty-test-harness.md` §9: `basic` (a box,
+//! `yew` centred, a styled strip), `wide` (CJK, emoji, VS16, a ZWJ family,
+//! a combining stack, a wide glyph at the last column), `colors` (a 64-step
+//! gradient, the sixteen indexed, default), `damage` (one cell a keypress,
+//! the second frame ≤ 32 bytes), `resize` (a frame sized to the live
+//! window), `echo` (the decoded key). The later scenes (`s15_*`, `s39_syntax`,
+//! `s46_diag_*`, `osc52`) belong to the lanes that port their subsystems
+//! and hard-error naming them (invariant 3).
+//!
+//! `--crash` ports `raise(SIGSEGV)` (`demo_paint.c:1016`) as
+//! `os_exit_signal(SEGMENT_FAULT)`: the process ends by that signal with
+//! nothing restored, and the guard sibling (`term.tty`, ruling #93 R1
+//! interim B) writes the restore blob and the fatal note — the
+//! `restore_crash` gate. `--guard N` is the sibling's own entry.
+//!
+//! Built by `tools/build-demo`, which stages `src/util`, `src/unicode` and
+//! `src/term` beside this file (`use` resolves beside the entry, D32).
+
+use std.signal
+use term
+use unicode
+
+struct Demo {
+    tty: term.Tty,
+    input: term.In,
+    grid: term.Grid,
+    render: term.Render,
+    frame: List[byte],
+    scene: str,
+    damage_flip: bool,
+    echo_ready: bool,
+    echo_key: term.Key,
+}
+
+fn now_ms() -> int {
+    clock_ms()
+}
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn put_text(mut g: term.Grid, row: int, col: int, text: str, fg: term.Color, bg: term.Color, attrs: int) {
+    if row < g.rows && col < g.cols {
+        let b = bytes_of(text)
+        let _ = term.grid_puts(mut g, row, col, b, 0, b.len, fg, bg, attrs)
+    }
+}
+
+fn put_bytes(mut g: term.Grid, row: int, col: int, b: List[byte], fg: term.Color, bg: term.Color, attrs: int) {
+    if row < g.rows && col < g.cols {
+        let _ = term.grid_puts(mut g, row, col, b, 0, b.len, fg, bg, attrs)
+    }
+}
+
+fn put_one(mut g: term.Grid, row: int, col: int, b: List[byte], fg: term.Color, bg: term.Color, attrs: int) {
+    let _ = term.grid_put(mut g, row, col, b, 0, b.len, fg, bg, attrs)
+}
+
+// `paint_box` (`demo_paint.c:227-259`): the border in the edge colour.
+fn paint_box(mut g: term.Grid) {
+    let edge = term.color_rgb(122, 162, 247)
+    let bg = term.color_rgb(26, 27, 38)
+    if g.rows < 2 || g.cols < 2 {
+        return
+    }
+    let tl = bytes_of("┌")
+    let tr = bytes_of("┐")
+    let bl = bytes_of("└")
+    let br = bytes_of("┘")
+    let hz = bytes_of("─")
+    let vt = bytes_of("│")
+    put_one(mut g, 0, 0, tl, edge, bg, 0)
+    put_one(mut g, 0, g.cols - 1, tr, edge, bg, 0)
+    put_one(mut g, g.rows - 1, 0, bl, edge, bg, 0)
+    put_one(mut g, g.rows - 1, g.cols - 1, br, edge, bg, 0)
+    var col = 1
+    while col + 1 < g.cols {
+        put_one(mut g, 0, col, hz, edge, bg, 0)
+        put_one(mut g, g.rows - 1, col, hz, edge, bg, 0)
+        col += 1
+    }
+    var row = 1
+    while row + 1 < g.rows {
+        put_one(mut g, row, 0, vt, edge, bg, 0)
+        put_one(mut g, row, g.cols - 1, vt, edge, bg, 0)
+        row += 1
+    }
+}
+
+// `paint_basic` (`demo_paint.c:261-285`).
+fn paint_basic(mut g: term.Grid) {
+    term.grid_clear(mut g)
+    paint_box(mut g)
+    let title_col = if g.cols > 3 then (g.cols - 3) / 2 else 0
+    let title_row = g.rows / 2
+    put_text(mut g, title_row, title_col, "yew", term.color_rgb(192, 202, 245), term.color_rgb(26, 27, 38), term.ATTR_BOLD)
+    if g.rows > 2 {
+        var strip = term.cell_blank()
+        strip.fg = term.color_indexed(0)
+        strip.bg = term.color_rgb(158, 206, 106)
+        term.grid_fill(mut g, g.rows - 2, 1, if g.cols > 1 then g.cols - 1 else g.cols, strip)
+        put_text(mut g, g.rows - 2, 3, "first paint", term.color_indexed(0), strip.bg, term.ATTR_BOLD)
+    }
+    term.grid_cursor(mut g, title_row, title_col, true)
+}
+
+// `paint_wide` (`demo_paint.c:287-327`).
+fn paint_wide(mut g: term.Grid) {
+    let fg = term.color_rgb(187, 154, 247)
+    let bg = term.color_default()
+    term.grid_clear(mut g)
+    put_bytes(mut g, 1, 2, bytes_of("CJK: 漢字"), fg, bg, 0)
+    put_bytes(mut g, 3, 2, bytes_of("emoji: 😀 ☀️"), term.color_rgb(224, 175, 104), bg, 0)
+    put_bytes(mut g, 5, 2, bytes_of("family: 👨‍👩‍👧‍👦"), term.color_rgb(125, 207, 255), bg, 0)
+    var stack = bytes_of("stack: e")
+    for v in [204, 129, 204, 167, 204, 130, 204, 136, 204, 132] {
+        (mut stack).push(v as byte)
+    }
+    put_bytes(mut g, 7, 2, stack, term.color_rgb(158, 206, 106), bg, term.ATTR_UNDERCURL)
+    if g.rows > 9 && g.cols != 0 {
+        put_one(mut g, 9, g.cols - 1, bytes_of("漢"), fg, bg, 0)
+    }
+    term.grid_cursor(mut g, if 5 < g.rows then 5 else 0, if 2 < g.cols then 2 else 0, true)
+}
+
+// `paint_colors` (`demo_paint.c:329-351`).
+fn paint_colors(mut g: term.Grid) {
+    term.grid_clear(mut g)
+    let limit = if g.cols < 64 then g.cols else 64
+    var col = 0
+    while col < limit {
+        var cell = term.cell_blank()
+        cell.bg = term.color_rgb((col * 4) % 256, (255 - col * 4) % 256, (col * 3) % 256)
+        term.grid_fill(mut g, 1, col, col + 1, cell)
+        col += 1
+    }
+    col = 0
+    while col < 16 && col < g.cols {
+        var cell = term.cell_blank()
+        cell.bg = term.color_indexed(col)
+        term.grid_fill(mut g, 3, col, col + 1, cell)
+        col += 1
+    }
+    if g.rows > 5 {
+        term.grid_fill(mut g, 5, 0, g.cols, term.cell_blank())
+    }
+    put_text(mut g, 5, 1, "default", term.color_default(), term.color_default(), 0)
+    term.grid_cursor(mut g, if 5 < g.rows then 5 else 0, 1, false)
+}
+
+fn hex2(b: int) -> str {
+    let digits = "0123456789abcdef"
+    let hi = digits[b >> 4..(b >> 4) + 1]
+    let lo = digits[b & 15..(b & 15) + 1]
+    "{hi}{lo}"
+}
+
+// `paint_echo` (`demo_paint.c:353-373`): the decoded key as text.
+fn paint_echo(mut g: term.Grid, key: term.Key) {
+    var text = ""
+    for b in key.text {
+        text = text + hex2(b as int)
+    }
+    let line = "kind={key.kind} code={key.code} mods={key.mods} ev={key.ev} text={text}"
+    term.grid_clear(mut g)
+    put_text(mut g, 2, 2, line, term.color_rgb(192, 202, 245), term.color_default(), term.ATTR_BOLD)
+    term.grid_cursor(mut g, 2, 2, true)
+}
+
+fn paint_echo_waiting(mut g: term.Grid) {
+    term.grid_clear(mut g)
+    put_text(mut g, 2, 2, "waiting for key", term.color_rgb(192, 202, 245), term.color_default(), term.ATTR_BOLD)
+    term.grid_cursor(mut g, 2, 2, true)
+}
+
+// `paint_damage` (`demo_paint.c:383-390`).
+fn paint_damage(mut d: Demo) {
+    paint_basic(mut d.grid)
+    let glyph = bytes_of(if d.damage_flip then "X" else "x")
+    put_one(mut d.grid, 1, 1, glyph, term.color_default(), term.color_default(), 0)
+}
+
+fn paint_scene(mut d: Demo) {
+    if d.scene == "wide" {
+        paint_wide(mut d.grid)
+    } else if d.scene == "colors" {
+        paint_colors(mut d.grid)
+    } else if d.scene == "damage" {
+        paint_damage(mut d)
+    } else if d.scene == "echo" {
+        if d.echo_ready {
+            paint_echo(mut d.grid, d.echo_key)
+        } else {
+            paint_echo_waiting(mut d.grid)
+        }
+    } else {
+        paint_basic(mut d.grid)
+    }
+}
+
+fn clear_frame(mut d: Demo) {
+    while d.frame.len != 0 {
+        let _ = (mut d.frame).pop() else (0 as byte)
+    }
+}
+
+// `emit_frame` (`demo_paint.c:726-742`): render, one write, flip; answers
+// the frame's byte count or -1.
+fn emit_frame(mut d: Demo) -> int {
+    clear_frame(mut d)
+    let n = term.render_frame(mut d.render, d.grid, mut d.frame)
+    if n != d.frame.len {
+        return -1
+    }
+    term.tty_write(d.frame) else |_| {
+        return -1
+    }
+    term.grid_flip(mut d.grid)
+    n
+}
+
+// `probe` (`demo_paint.c:744-784`): write the queries, pump replies and
+// signals until DONE or the deadline.
+fn probe(mut d: Demo) -> bool {
+    term.tty_probe_start(mut d.tty, now_ms())
+    while !term.probe_done(d.tty) {
+        let left = term.probe_deadline(d.tty, now_ms())
+        let m = term.tty_wait(mut d.tty, left) else |_| {
+            return false
+        }
+        if m != 0 {
+            let action = term.tty_on_signal(mut d.tty, m)
+            if !term.tty_is_raw(d.tty) {
+                return false
+            }
+            if action == term.SIG_WINCH && !term.tty_winsize(mut d.tty) {
+                return false
+            }
+        } else {
+            let bytes = term.tty_read(d.tty) else |e| match e {
+                hangup => { return false },
+                io => { return false },
+            }
+            if bytes.len != 0 {
+                let _ = term.probe_feed(mut d.tty, bytes, 0, bytes.len)
+            }
+        }
+        term.probe_tick(mut d.tty, now_ms())
+    }
+    true
+}
+
+// `handle_key` (`demo_paint.c:801-836`): `q` quits; `echo` repaints with
+// the key; `damage` flips one cell and gates the frame at 32 bytes.
+fn handle_key(mut d: Demo, key: term.Key) -> (bool, bool) {
+    if key.kind != term.EV_KEY {
+        return (true, true)
+    }
+    if key.code == 113 && key.mods == 0 {
+        return (true, false)
+    }
+    if d.scene == "echo" {
+        d.echo_key = copy_key(key)
+        d.echo_ready = true
+        paint_echo(mut d.grid, d.echo_key)
+        return (emit_frame(mut d) >= 0, true)
+    }
+    if d.scene == "damage" {
+        let glyph = bytes_of(if d.damage_flip then "x" else "X")
+        d.damage_flip = !d.damage_flip
+        put_one(mut d.grid, 1, 1, glyph, term.color_default(), term.color_default(), 0)
+        let emitted = emit_frame(mut d)
+        if emitted < 0 || emitted > 32 {
+            return (false, true)
+        }
+    }
+    (true, true)
+}
+
+fn copy_key(k: term.Key) -> term.Key {
+    var text = List[byte]()
+    for b in k.text {
+        (mut text).push(b)
+    }
+    term.Key {
+        code: k.code,
+        kind: k.kind,
+        mods: k.mods,
+        col: k.col,
+        row: k.row,
+        ev: k.ev,
+        button: k.button,
+        text: text,
+    }
+}
+
+// `handle_signals` (`demo_paint.c:838-868`) for one delivered meaning.
+fn handle_signal(mut d: Demo, m: int) -> bool {
+    let action = term.tty_on_signal(mut d.tty, m)
+    var repaint = false
+    if action == term.SIG_CONT {
+        if !term.tty_is_raw(d.tty) {
+            return false
+        }
+        term.tty_altscreen(mut d.tty, true)
+        if !term.tty_is_alt(d.tty) {
+            return false
+        }
+        term.input_enable(term.tty_caps(d.tty))
+        term.grid_invalidate(mut d.grid)
+        repaint = true
+    }
+    if action == term.SIG_WINCH {
+        if !term.tty_winsize(mut d.tty) {
+            return false
+        }
+        if d.grid.rows != term.tty_rows(d.tty) || d.grid.cols != term.tty_cols(d.tty) {
+            if !term.grid_resize(mut d.grid, term.tty_rows(d.tty), term.tty_cols(d.tty)) {
+                return false
+            }
+            paint_scene(mut d)
+            repaint = true
+        }
+    }
+    if repaint {
+        return emit_frame(mut d) >= 0
+    }
+    true
+}
+
+// `event_loop` (`demo_paint.c:870-915`) over the port's wait and read.
+fn event_loop(mut d: Demo) -> int {
+    var running = true
+    var eof = false
+    var key = term.key_new()
+    while running {
+        let deadline = term.input_deadline(d.input, now_ms())
+        let m = term.tty_wait(mut d.tty, deadline) else |_| {
+            return 1
+        }
+        if m != 0 {
+            if !handle_signal(mut d, m) {
+                return 1
+            }
+        } else if !eof {
+            let bytes = term.tty_read(d.tty) else |e| match e {
+                hangup => {
+                    eof = true
+                    term.input_eof(mut d.input)
+                    List[byte]()
+                },
+                io => { return 1 },
+            }
+            if bytes.len != 0 {
+                term.input_feed(mut d.input, bytes, 0, bytes.len)
+            }
+        }
+        while term.input_next(mut d.input, now_ms(), mut key) {
+            let (ok, keep) = handle_key(mut d, key)
+            if !ok {
+                return 1
+            }
+            if !keep {
+                running = false
+            }
+        }
+        if eof && running {
+            return 1
+        }
+    }
+    0
+}
+
+fn usage() -> int {
+    eprint("usage: demo_paint [--scene NAME] [--crash]")
+    2
+}
+
+fn not_yet(scene: str, sprint: str, lane: str) -> int {
+    eprint("demo_paint: error: not yet ported: scene {scene}: sagitta Sprint {sprint} ({lane})")
+    1
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len == 2 && args[0] == "--guard" {
+        return term.guard_main(args[1])
+    }
+    var scene = "basic"
+    var crash = false
+    var i = 0
+    while i < args.len {
+        if args[i] == "--scene" && i + 1 < args.len {
+            i += 1
+            scene = args[i]
+        } else if args[i] == "--crash" {
+            crash = true
+        } else {
+            return usage()
+        }
+        i += 1
+    }
+    if scene.starts_with("s15_") {
+        return not_yet(scene, "15 (the viewport and statusline)", "yw03")
+    }
+    if scene == "s39_syntax" {
+        return not_yet(scene, "39 (highlighting)", "yw10")
+    }
+    if scene.starts_with("s46_diag_") {
+        return not_yet(scene, "46 (diagnostics)", "yw11")
+    }
+    if scene == "osc52" {
+        return not_yet(scene, "12 (the clipboard)", "yw02")
+    }
+    if scene != "basic" && scene != "wide" && scene != "colors" && scene != "damage" && scene != "resize" && scene != "echo" {
+        return usage()
+    }
+    var d = Demo {
+        tty: term.tty_new(),
+        input: term.input_new(term.caps_new()),
+        grid: term.grid_new(1, 1),
+        render: term.render_new(term.caps_new(), fn(k: str) term.env_getv(k)),
+        frame: List[byte](),
+        scene: scene,
+        damage_flip: false,
+        echo_ready: false,
+        echo_key: term.key_new(),
+    }
+    term.tty_open(mut d.tty) else |_| {
+        term.tty_close(mut d.tty)
+        return 1
+    }
+    term.tty_raw(mut d.tty) else |_| {
+        term.tty_close(mut d.tty)
+        return 1
+    }
+    if !probe(mut d) {
+        term.tty_close(mut d.tty)
+        return 1
+    }
+    term.tty_altscreen(mut d.tty, true)
+    if !term.tty_is_alt(d.tty) {
+        term.tty_close(mut d.tty)
+        return 1
+    }
+    let caps = term.tty_caps(d.tty)
+    term.input_enable(caps)
+    d.input = term.input_new(caps)
+    term.input_seed(mut d.input, term.tty_pending(d.tty))
+    term.tty_clear_pending(mut d.tty)
+    d.grid = term.grid_new(term.tty_rows(d.tty), term.tty_cols(d.tty))
+    var render_caps = term.tty_caps(d.tty)
+    if scene == "damage" {
+        render_caps.sync_output = false
+    }
+    d.render = term.render_new(render_caps, fn(k: str) term.env_getv(k))
+    paint_scene(mut d)
+    if emit_frame(mut d) < 0 {
+        term.tty_close(mut d.tty)
+        return 1
+    }
+    if crash {
+        os_exit_signal(signal.segment_fault()) else |_| {}
+        os_exit(139)
+    }
+    let result = event_loop(mut d)
+    term.tty_close(mut d.tty)
+    let _ = unicode.UTF8_MAX
+    result
+}
