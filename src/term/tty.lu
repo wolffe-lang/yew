@@ -1,0 +1,650 @@
+//! term.tty — the terminal lifecycle: raw mode, the restore guarantee,
+//! the alternate screen, window size, the capability probe, truecolor.
+//!
+//! Ports sagitta `src/term/tty.c` (1,486 lines) and `tty.h` (167) at
+//! 9ace98c2, under `s03-tty-lifecycle.md`. This file lands the lane's
+//! PURE, unit-testable surface — the raw-mode flag mapping (§2), the
+//! restore blob bytes (§4), the capability-probe state machine (§6),
+//! truecolor detection (§7) and the probe config reader — exactly as C
+//! yew's `test_tty.c` exercises them. The I/O surface (open, raw via
+//! `os_term_set_mode`, the restore's listen + re-raise and #93 R1's
+//! interim-B supervisor, `winsize`, the alternate screen, suspend and
+//! handover, `drain_signals`) is this lane's too and lands beside this
+//! core; the PTY goldens (`demo_paint`) test it from the other side.
+//!
+//! The wolf shapes (idiom, `docs/MAP.md` §1, set by this lane):
+//!  - C's `yew_tty_rawios` is a termios transform; in wolf the mode is
+//!    `std.term`'s one int (`[os.term.mode]`), so the port builds a
+//!    `std_term.Mode` with the five reachable bits off and `VMIN=1`,
+//!    `VTIME=0`. The seven bits the int cannot reach (`ICRNL`, `OPOST`,
+//!    `ISTRIP`, `BRKINT`, `PARMRK`, `INPCK`, `CS8`) are the witnessed
+//!    gap (`notes/yw01-evidence/witness/run.txt`), filed, never worked
+//!    around with a dumber terminal. Unlike `std_term.raw`, which keeps
+//!    `signals` (ruling #81), the editor clears `signals` too — Ctrl-C,
+//!    Ctrl-Z and Ctrl-\ are keys (s03 §2), and the mode int has that bit.
+//!  - the restore blob and the probe query are `str` constants read
+//!    with `.bytes()` (module state of a `List` is refused,
+//!    `[mem.static.3]`; a `str` is `.rodata`), their bytes byte-pinned
+//!    against C (`YEW_TTY_RESTORE_BLOB`, `tty.c:54-73`).
+//!  - the probe prefix and `pending` are `List[byte]`; the recognizers
+//!    answer rows, never the pointer-walk C does.
+//!  - `now_ms` is injected everywhere (no clock in this file), so the
+//!    deadline paths are driven by a fake clock in the unit test exactly
+//!    as C's are (`tty.c:79-81`).
+
+use std.term as std_term
+
+/// The terminal's capabilities after a probe (`TtyCaps`, `tty.h:13-20`).
+pub struct TtyCaps {
+    probed: bool,
+    truecolor: bool,
+    kitty_kbd: bool,
+    kitty_flags: int,
+    sync_output: bool,
+    da1_seen: bool,
+}
+
+/// A fresh capability set, everything off (`memset` in `yew_tty_open`).
+pub fn caps_new() -> TtyCaps {
+    TtyCaps {
+        probed: false,
+        truecolor: false,
+        kitty_kbd: false,
+        kitty_flags: 0,
+        sync_output: false,
+        da1_seen: false,
+    }
+}
+
+/// The background the OSC 11 probe found (`TtyBackground`, `tty.h:27-31`).
+pub const BG_UNKNOWN: int = 0
+
+pub const BG_DARK: int = 1
+
+pub const BG_LIGHT: int = 2
+
+// The probe state machine's states (`tty.c:18-22`).
+const PROBE_IDLE: int = 0
+
+const PROBE_AWAIT: int = 1
+
+const PROBE_DONE: int = 2
+
+/// The default capability-probe deadline in ms (`YEW_TTY_PROBE_DEFAULT_MS`,
+/// `tty.c:24`).
+pub const PROBE_DEFAULT_MS: int = 50
+
+/// The three queries, in order: kitty keyboard, DECRQM 2026, DA1
+/// (`YEW_TTY_PROBE_QUERY`, `tty.c:25-28`). The fence is DA1, which every
+/// real terminal answers; its reply ends the capability wait.
+pub const PROBE_QUERY: str = "\x1b[?u\x1b[?2026$p\x1b[c"
+
+/// The OSC 11 background query (`YEW_TTY_BACKGROUND_QUERY`, `tty.c:29`).
+pub const BACKGROUND_QUERY: str = "\x1b]11;?\x07"
+
+/// The alternate-screen enter and leave (`tty.c:30-31`): `ESC 7` then
+/// `CSI ?1049h`; `CSI ?1049l` then `ESC 8`.
+pub const ALT_ON: str = "\x1b7\x1b[?1049h"
+
+pub const ALT_OFF: str = "\x1b[?1049l\x1b8"
+
+// The restore blob, byte-pinned against C (`tty.c:54-73`). HEAD then
+// TAIL; the motion variant adds `CSI ?1003l` between them when 1003
+// (any-motion mouse) was armed. One `str` each, not a built value.
+const RESTORE_BLOB: str =
+    "\x1b[<u\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2026l\x1b[0m\x1b[0 q\x1b[?1049l\x1b[?25h"
+
+const RESTORE_BLOB_MOTION: str =
+    "\x1b[<u\x1b[?2004l\x1b[?1003l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2026l\x1b[0m\x1b[0 q\x1b[?1049l\x1b[?25h"
+
+/// The exact bytes `yew_tty_restore` would write, 1003l included when
+/// `motion` (`yew_tty_restore_blob_for`, `tty.c:1476-1486`). The
+/// deterministic restore-blob unit pins these.
+pub fn restore_blob(motion: bool) -> str {
+    if motion {
+        return RESTORE_BLOB_MOTION
+    }
+    RESTORE_BLOB
+}
+
+/// The raw mode an editor sets (`yew_tty_rawios`, `tty.c:521-543`), as the
+/// five reachable bits: canonical, echo, signals, flow and extended all
+/// off, one byte a read (`VMIN=1`), no timer. The other seven termios
+/// bits C clears are unreachable through `[os.term.mode]` (the witnessed
+/// gap); `signals` IS reachable and IS cleared, unlike `std_term.raw`.
+pub fn rawios() -> std_term.Mode {
+    std_term.Mode {
+        canonical: false,
+        echo: false,
+        signals: false,
+        flow: false,
+        extended: false,
+        min: 1,
+        time: 0,
+    }
+}
+
+// ---- Truecolor detection (`yew_tty_detect_truecolor`, `tty.c:964-1002`).
+// The env lookup is injected (a `fn(str) -> str`, "" for an absent var,
+// where C's `getv` answers NULL) so the unit table drives it.
+
+fn str_contains(value: str, needle: str) -> bool {
+    value.contains(needle)
+}
+
+fn decimal_at_least(value: str, floor: int) -> bool {
+    if value.len == 0 {
+        return false
+    }
+    var parsed: int = 0
+    for b in value.bytes() {
+        let c = b as int
+        if c < 48 || c > 57 {
+            return false
+        }
+        if parsed < 1000000000 {
+            parsed = parsed * 10 + (c - 48)
+        }
+    }
+    parsed >= floor
+}
+
+/// Whether the terminal takes 24-bit colour, first hit wins (`tty.c:964`).
+pub fn detect_truecolor(getv: fn(str) -> str) -> bool {
+    let forced = getv("YEW_TRUECOLOR")
+    if forced == "0" {
+        return false
+    }
+    if forced == "1" {
+        return true
+    }
+    let colorterm = getv("COLORTERM")
+    if colorterm == "truecolor" || colorterm == "24bit" {
+        return true
+    }
+    let term = getv("TERM")
+    if str_contains(term, "direct") || str_contains(term, "truecolor") {
+        return true
+    }
+    let prefixes = term_prefixes()
+    for p in prefixes {
+        if term.starts_with(p) {
+            return true
+        }
+    }
+    let program = getv("TERM_PROGRAM")
+    let programs = program_names()
+    for p in programs {
+        if program == p {
+            return true
+        }
+    }
+    if decimal_at_least(getv("VTE_VERSION"), 3600) {
+        return true
+    }
+    getv("KONSOLE_VERSION") != ""
+}
+
+fn term_prefixes() -> List[str] {
+    var v = List[str]()
+    (mut v).push("xterm-kitty")
+    (mut v).push("kitty")
+    (mut v).push("foot")
+    (mut v).push("wezterm")
+    (mut v).push("alacritty")
+    (mut v).push("ghostty")
+    v
+}
+
+fn program_names() -> List[str] {
+    var v = List[str]()
+    (mut v).push("iTerm.app")
+    (mut v).push("WezTerm")
+    (mut v).push("ghostty")
+    (mut v).push("vscode")
+    v
+}
+
+/// The probe config a program's environment names (`TtyProbeConfig`,
+/// `yew_tty_probe_read_config`, `tty.c:1004-1042`).
+pub struct ProbeConfig {
+    enabled: bool,
+    timeout_ms: int,
+}
+
+pub fn probe_read_config(getv: fn(str) -> str) -> ProbeConfig {
+    var enabled = true
+    var timeout: int = PROBE_DEFAULT_MS
+    if getv("YEW_TTY_PROBE") == "0" {
+        enabled = false
+    }
+    let raw_timeout = getv("YEW_PROBE_TIMEOUT_MS")
+    if raw_timeout.len != 0 {
+        var parsed: int = 0
+        var valid = true
+        for b in raw_timeout.bytes() {
+            let c = b as int
+            if c < 48 || c > 57 {
+                valid = false
+            } else if parsed < 1000000000 {
+                parsed = parsed * 10 + (c - 48)
+            }
+        }
+        if valid && parsed > 0 {
+            timeout = parsed
+        }
+    }
+    ProbeConfig { enabled: enabled, timeout_ms: timeout }
+}
+
+/// The terminal object (`Tty`, `tty.h:33-54`), the probe-relevant fields.
+/// The I/O fields (`rfd`, `wfd`, `saved`, `sigpipe`) land with the I/O
+/// surface; here are the probe machine's state and its two byte buffers.
+pub struct Tty {
+    caps: TtyCaps,
+    pending: List[byte],
+    pstate: int,
+    pdeadline: int,
+    background: int,
+    background_await: bool,
+    capability_await: bool,
+    prefix: List[byte],
+}
+
+/// A terminal with an idle probe and empty buffers.
+pub fn tty_new() -> Tty {
+    Tty {
+        caps: caps_new(),
+        pending: List[byte](),
+        pstate: PROBE_IDLE,
+        pdeadline: 0,
+        background: BG_UNKNOWN,
+        background_await: false,
+        capability_await: false,
+        prefix: List[byte](),
+    }
+}
+
+/// Arm the capability probe (`yew_tty_probe_config`, `tty.c:1329-1362`,
+/// the pure half: the I/O half writes `PROBE_QUERY`). Resets the caps,
+/// moves to AWAIT, sets the deadline. `truecolor` is detected here as C
+/// does; the three reply caps start false.
+pub fn probe_arm(mut t: Tty, now_ms: int, config: ProbeConfig, truecolor: bool) {
+    t.caps = caps_new()
+    t.caps.truecolor = truecolor
+    t.background = BG_UNKNOWN
+    t.background_await = false
+    t.capability_await = false
+    t.prefix = List[byte]()
+    if !config.enabled {
+        t.pstate = PROBE_DONE
+        t.pdeadline = 0
+        t.caps.probed = true
+        return
+    }
+    t.pstate = PROBE_AWAIT
+    t.capability_await = true
+    t.pdeadline = now_ms + config.timeout_ms
+}
+
+/// The ambiguous-reply recognizers (`tty.c:1052-1241`). Each answers a
+/// row: `cont` whether the prefix could still become this reply, and the
+/// completion fields when it is one. The prefix is a `List[byte]`.
+
+fn prefix_is(s: List[byte], len: int, fixed: str) -> bool {
+    let fb = fixed.bytes()
+    var shared = len
+    if fb.len < shared {
+        shared = fb.len
+    }
+    var i = 0
+    while i < shared {
+        if (s[i] as int) != (fb[i] as int) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn starts_esc_bracket_q(s: List[byte], len: int) -> bool {
+    // "\x1b[?" at the head: 0x1b 0x5b 0x3f
+    s[0] as int == 27 && s[1] as int == 91 && s[2] as int == 63
+}
+
+// kitty: "\x1b[?" digits "u". Answers (cont, complete, flags).
+fn probe_kitty(s: List[byte], len: int) -> (bool, bool, int) {
+    if len <= 3 {
+        return (prefix_is(s, len, "\x1b[?"), false, 0)
+    }
+    if !starts_esc_bracket_q(s, len) {
+        return (false, false, 0)
+    }
+    var value: int = 0
+    var i = 3
+    while i < len {
+        let c = s[i] as int
+        if c == 117 && i + 1 == len && i > 3 {
+            return (true, true, value)
+        }
+        if c < 48 || c > 57 {
+            return (false, false, 0)
+        }
+        if value < 1000000000 {
+            value = value * 10 + (c - 48)
+        }
+        i += 1
+    }
+    (true, false, 0)
+}
+
+// DA1: "\x1b[?" digits and ';' then 'c'. Answers (cont, complete).
+fn probe_da1(s: List[byte], len: int) -> (bool, bool) {
+    if len <= 3 {
+        return (prefix_is(s, len, "\x1b[?"), false)
+    }
+    if !starts_esc_bracket_q(s, len) {
+        return (false, false)
+    }
+    var digit_seen = false
+    var i = 3
+    while i < len {
+        let c = s[i] as int
+        if c >= 48 && c <= 57 {
+            digit_seen = true
+        } else if c == 59 && digit_seen {
+            digit_seen = false
+        } else if c == 99 && digit_seen && i + 1 == len {
+            return (true, true)
+        } else {
+            return (false, false)
+        }
+        i += 1
+    }
+    (true, false)
+}
+
+// sync: "\x1b[?2026;" status('0'..'4') '$' 'y'. Answers (cont, complete, supported).
+fn probe_sync(s: List[byte], len: int) -> (bool, bool, bool) {
+    let prefix = "\x1b[?2026;"
+    let plen = prefix.len
+    if len <= plen {
+        return (prefix_is(s, len, prefix), false, false)
+    }
+    if !prefix_is(s, plen, prefix) {
+        return (false, false, false)
+    }
+    let status = s[plen] as int
+    if status < 48 || status > 52 {
+        return (false, false, false)
+    }
+    if len == plen + 1 {
+        return (true, false, false)
+    }
+    if s[plen + 1] as int != 36 {
+        return (false, false, false)
+    }
+    if len == plen + 2 {
+        return (true, false, false)
+    }
+    if s[plen + 2] as int != 121 || len != plen + 3 {
+        return (false, false, false)
+    }
+    let supported = status == 49 || status == 50 || status == 51
+    (true, true, supported)
+}
+
+fn hexval(byte: int) -> (int, bool) {
+    if byte >= 48 && byte <= 57 {
+        return (byte - 48, true)
+    }
+    if byte >= 97 && byte <= 102 {
+        return (10 + byte - 97, true)
+    }
+    if byte >= 65 && byte <= 70 {
+        return (10 + byte - 65, true)
+    }
+    (0, false)
+}
+
+fn rgb_component(s: List[byte], at: int, n: int) -> (int, bool) {
+    if n == 0 || n > 4 {
+        return (0, false)
+    }
+    var value = 0
+    var maximum = 0
+    var i = 0
+    while i < n {
+        let (d, ok) = hexval(s[at + i] as int)
+        if !ok {
+            return (0, false)
+        }
+        value = value * 16 + d
+        maximum = maximum * 16 + 15
+        i += 1
+    }
+    ((value * 255 + maximum / 2) / maximum, true)
+}
+
+// background: "\x1b]11;rgb:" R/G/B then ST or BEL. Answers (cont, complete, light).
+fn probe_background(s: List[byte], len: int) -> (bool, bool, bool) {
+    let prefix = "\x1b]11;rgb:"
+    let plen = prefix.len
+    if len <= plen {
+        return (prefix_is(s, len, prefix), false, false)
+    }
+    if !prefix_is(s, plen, prefix) {
+        return (false, false, false)
+    }
+    var end = len
+    var terminated = false
+    if s[end - 1] as int == 7 {
+        end -= 1
+        terminated = true
+    } else if end >= 2 && s[end - 2] as int == 27 && s[end - 1] as int == 92 {
+        end -= 2
+        terminated = true
+    } else if s[end - 1] as int == 27 {
+        return (true, false, false)
+    }
+    var slash_a = 0
+    var slash_b = 0
+    var i = plen
+    while i < end {
+        let c = s[i] as int
+        if c == 47 {
+            if slash_a == 0 {
+                slash_a = i
+            } else if slash_b == 0 {
+                slash_b = i
+            } else {
+                return (false, false, false)
+            }
+        } else {
+            let (_, ok) = hexval(c)
+            if !ok {
+                return (false, false, false)
+            }
+        }
+        i += 1
+    }
+    if !terminated {
+        return (end - plen <= 14, false, false)
+    }
+    if slash_a == 0 || slash_b == 0 {
+        return (false, false, false)
+    }
+    let (red, okr) = rgb_component(s, plen, slash_a - plen)
+    let (green, okg) = rgb_component(s, slash_a + 1, slash_b - slash_a - 1)
+    let (blue, okb) = rgb_component(s, slash_b + 1, end - slash_b - 1)
+    if !okr || !okg || !okb {
+        return (false, false, false)
+    }
+    let light = 299 * red + 587 * green + 114 * blue >= 128000
+    (true, true, light)
+}
+
+// Try every recognizer on the current prefix; on a completion set the
+// cap and clear the prefix (`yew_tty_probe_candidate`, `tty.c:1243-1299`).
+fn probe_candidate(mut t: Tty) -> bool {
+    let len = t.prefix.len
+    let (kcont, kdone, kflags) = probe_kitty(t.prefix, len)
+    let (dcont, ddone) = probe_da1(t.prefix, len)
+    let (scont, sdone, ssup) = probe_sync(t.prefix, len)
+    var bgcont = false
+    var bgdone = false
+    var bglight = false
+    if t.background_await {
+        let (bc, bd, bl) = probe_background(t.prefix, len)
+        bgcont = bc
+        bgdone = bd
+        bglight = bl
+    }
+    if bgdone {
+        t.background = if bglight then BG_LIGHT else BG_DARK
+        t.background_await = false
+        if !t.capability_await {
+            t.pstate = PROBE_DONE
+            t.pdeadline = 0
+        }
+        t.prefix = List[byte]()
+        return true
+    }
+    if kdone {
+        t.caps.kitty_kbd = true
+        t.caps.kitty_flags = kflags
+        t.prefix = List[byte]()
+        return true
+    }
+    if sdone {
+        t.caps.sync_output = ssup
+        t.prefix = List[byte]()
+        return true
+    }
+    if ddone {
+        t.caps.da1_seen = true
+        t.caps.probed = true
+        t.capability_await = false
+        if !t.background_await {
+            t.pstate = PROBE_DONE
+            t.pdeadline = 0
+        }
+        t.prefix = List[byte]()
+        return true
+    }
+    kcont || dcont || scont || bgcont
+}
+
+fn flush_prefix(mut t: Tty) {
+    for b in t.prefix {
+        (mut t.pending).push(b)
+    }
+    t.prefix = List[byte]()
+}
+
+// Feed one byte to the probe recognizer (`yew_tty_probe_byte`,
+// `tty.c:1301-1327`). Non-reply bytes land in `pending` in arrival order.
+fn probe_byte(mut t: Tty, byte: int) {
+    if t.prefix.len == 0 {
+        if byte == 27 {
+            (mut t.prefix).push(byte as byte)
+        } else {
+            (mut t.pending).push(byte as byte)
+        }
+        return
+    }
+    if t.prefix.len == 64 {
+        flush_prefix(mut t)
+        probe_byte(mut t, byte)
+        return
+    }
+    (mut t.prefix).push(byte as byte)
+    if probe_candidate(mut t) {
+        return
+    }
+    if byte == 27 {
+        // Flush all but the ESC just pushed, then restart on it.
+        var kept = List[byte]()
+        let last = t.prefix.len - 1
+        var i = 0
+        while i < last {
+            (mut t.pending).push(t.prefix[i])
+            i += 1
+        }
+        (mut kept).push(27 as byte)
+        t.prefix = kept
+    } else {
+        flush_prefix(mut t)
+    }
+}
+
+/// Feed bytes read from the terminal to the probe (`yew_tty_probe_feed`,
+/// `tty.c:1400-1420`). Before AWAIT or after DONE the bytes are pending.
+pub fn probe_feed(mut t: Tty, s: List[byte], at: int, end: int) -> int {
+    if t.pstate != PROBE_AWAIT {
+        var i = at
+        while i < end {
+            (mut t.pending).push(s[i])
+            i += 1
+        }
+        return end - at
+    }
+    var i = at
+    while i < end {
+        if t.pstate == PROBE_AWAIT {
+            probe_byte(mut t, s[i] as int)
+        } else {
+            (mut t.pending).push(s[i])
+        }
+        i += 1
+    }
+    end - at
+}
+
+/// The deadline check (`yew_tty_probe_tick`, `tty.c:1422-1436`): once the
+/// deadline passes with no DA1, the dumb terminal reaches DONE with every
+/// capability off.
+pub fn probe_tick(mut t: Tty, now_ms: int) {
+    if t.pstate != PROBE_AWAIT || now_ms < t.pdeadline {
+        return
+    }
+    flush_prefix(mut t)
+    t.background_await = false
+    t.capability_await = false
+    t.pstate = PROBE_DONE
+    t.pdeadline = 0
+    t.caps.probed = true
+}
+
+/// Whether the probe has reached DONE (`tty.c:1438-1444`).
+pub fn probe_done(t: Tty) -> bool {
+    t.pstate == PROBE_DONE
+}
+
+/// The poll timeout the probe wants now: -1 when not awaiting, 0 when the
+/// deadline has passed, else the remaining ms (`tty.c:1446-1456`).
+pub fn probe_deadline(t: Tty, now_ms: int) -> int {
+    if t.pstate != PROBE_AWAIT {
+        return -1
+    }
+    if now_ms >= t.pdeadline {
+        return 0
+    }
+    t.pdeadline - now_ms
+}
+
+/// The capabilities now (a copy, never a lent field: `[mem.tier0.mode.read]`).
+pub fn tty_caps(t: Tty) -> TtyCaps {
+    copy t.caps
+}
+
+/// The background the OSC 11 probe found (`yew_tty_probe_background`).
+pub fn tty_background(t: Tty) -> int {
+    t.background
+}
+
+/// The bytes the probe buffered that were not replies, in arrival order
+/// (`t->pending`), for the input decoder to seed (`yew_input_seed`).
+pub fn tty_pending(t: Tty) -> List[byte] {
+    copy t.pending
+}
