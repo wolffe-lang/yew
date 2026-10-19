@@ -1,0 +1,652 @@
+//! fuzz-unicode — the bounded, seeded random driver for the decoder and
+//! the segmenter: campaign 00's fuzz harness.
+//!
+//! wolf 0.2.32 has no `fuzz` verb, so this is the contract's "bounded
+//! random driver with a seed": a port of the shape of sagitta's
+//! `tests/fuzz/fuzzlib.c` (the xorshift64* PRNG, the corpus, the ten
+//! mutators at lines 742-911, the FNV-1a mutation hash at 915-926) and
+//! of `fuzz_utf8.c` and `fuzz_grapheme.c`'s checks, asserting the nine
+//! per-input invariants of `s02-unicode-foundation.md` §9:
+//!
+//!   1  no trap, no read past the end (the program's own)
+//!   2  totality: every decode consumes >= 1 byte; the scan ends at len
+//!   3  round-trip: re-encoding the decoded sequence reproduces the input
+//!   4  no decoded scalar in D800-DFFF but an escape, none > 10FFFF; a
+//!      non-escape re-encodes to exactly the bytes consumed
+//!   5  segmentation partitions: cluster lengths >= 1, summing to len,
+//!      every boundary a codepoint boundary
+//!   6  incremental law: a state restarted at any boundary reproduces the
+//!      single pass's remaining segmentation
+//!   7  gb_next_bytes(gb_prev_bytes(p)) == p at every boundary
+//!   8  0 <= cluster_width <= 4; str_clip never exceeds max_cells nor
+//!      splits a cluster
+//!   9  same seed and corpus => identical mutation-sequence hash (printed)
+//!
+//! plus the incremental decoder's agreement with the one-shot decoder
+//! (`fuzz_utf8.c`). The corpus is sagitta's golden corpus
+//! (`tests/fixtures/unicode/corpus.txt`) plus the invalid-byte seeds.
+//!
+//!   fuzz-unicode --iters N --seed S [--three-byte] [--corpus FILE]
+//!
+//! `--three-byte` also runs the exhaustive 16,777,216 three-byte inputs
+//! through the round-trip and agreement checks (`fuzz_utf8.c:8-72`;
+//! sagitta's fuzz lane). On a failing input the bytes are printed in
+//! hex with the seed and the iteration, and the exit is 1. Built and
+//! run by `tools/run-fuzz-unicode`, which copies `src/unicode` beside
+//! it (D32).
+
+use std.fs
+use unicode
+
+/// xorshift64* (`fuzzlib.c`), as a FUNCTIONAL state: the per-turn
+/// region refuses any `mut` parameter inside it (E1010, whatever it
+/// holds), so every step answers the next state as a scalar.
+fn rng_seed(seed: int) -> wrapping[u64] {
+    if seed == 0 {
+        return 11400714819323198485
+    }
+    seed as wrapping[u64]
+}
+
+/// `(value, next_state)`.
+fn rng_next(s: wrapping[u64]) -> (wrapping[u64], wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    (x * 2685821657736338717, x)
+}
+
+/// A value in `0..n` (n > 0) and the next state.
+fn pick(s: wrapping[u64], n: int) -> (int, wrapping[u64]) {
+    let (v, next) = rng_next(s)
+    ((v >> 33) as int % n, next)
+}
+
+/// FNV-1a over the length then the bytes (`fuzzlib.c:915-926`): the
+/// mutation-sequence hash, a scalar handed back so the per-turn region
+/// keeps nothing alive (E1010 on a `mut` struct touched inside it).
+fn hash_bytes(h: wrapping[u64], buf: List[byte]) -> wrapping[u64] {
+    var v = h
+    var i = 0
+    while i < 8 {
+        v = v ^ (buf.len >> i * 8 & 255) as wrapping[u64]
+        v = v * 1099511628211
+        i += 1
+    }
+    for b in buf {
+        v = v ^ b as int as wrapping[u64]
+        v = v * 1099511628211
+    }
+    v
+}
+
+fn hex_of(buf: List[byte]) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    for b in buf {
+        let v = b as int
+        out += "{digits[v / 16..v / 16 + 1]}{digits[v % 16..v % 16 + 1]} "
+    }
+    out.trim()
+}
+
+// ---- the corpus ------------------------------------------------------
+
+fn hex_digit(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    -1
+}
+
+fn parse_hex_bytes(field: str) -> List[byte] {
+    var out = List[byte]()
+    for word in field.words() {
+        var value = 0
+        for b in word.bytes() {
+            let d = hex_digit(b as int)
+            assert(d >= 0, "corpus: a hex byte")
+            value = value * 16 + d
+        }
+        (mut out).push(value as byte)
+    }
+    out
+}
+
+fn bytes_of(xs: List[int]) -> List[byte] {
+    var out = List[byte]()
+    for x in xs {
+        (mut out).push(x as byte)
+    }
+    out
+}
+
+/// sagitta's golden corpus plus the invalid-byte seeds (`fuzzlib.c:1595`).
+fn load_corpus(path: str) -> List[List[byte]] {
+    var corpus = List[List[byte]]()
+    let text = fs.read_text(path) else ""
+    for line in text.lines() {
+        let t = line.trim()
+        if t.len == 0 || t.starts_with("#") {
+            continue
+        }
+        let fields = t.split("|")
+        if fields.len == 4 {
+            (mut corpus).push(parse_hex_bytes(fields[1]))
+        }
+    }
+    (mut corpus).push(bytes_of([128, 192, 128, 237, 160, 128, 255, 65]))
+    (mut corpus).push(bytes_of([240, 144, 128, 65]))
+    (mut corpus).push(bytes_of([97, 9, 98, 13, 10, 0]))
+    (mut corpus).push(List[byte]())
+    corpus
+}
+
+// ---- the mutators (`fuzzlib.c:742-911`), each answering the RNG's next state
+
+fn mutate_flip(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        let (b, s1) = pick(s, 256)
+        (mut buf).push(b as byte)
+        return s1
+    }
+    let (at, s1) = pick(s, buf.len)
+    let (bit, s2) = pick(s1, 8)
+    buf[at] = (buf[at] as int ^ 1 << bit) as byte
+    s2
+}
+
+fn delete_range(mut buf: List[byte], at: int, len: int) {
+    var out = List[byte]()
+    var i = 0
+    while i < buf.len {
+        if i < at || i >= at + len {
+            (mut out).push(buf[i])
+        }
+        i += 1
+    }
+    buf = out
+}
+
+fn mutate_delete(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        return s
+    }
+    let (at, s1) = pick(s, buf.len)
+    let (span, s2) = pick(s1, 4)
+    delete_range(mut buf, at, 1 + span)
+    s2
+}
+
+fn mutate_duplicate(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 || buf.len > 4096 {
+        return s
+    }
+    let (at, s1) = pick(s, buf.len)
+    let (span, s2) = pick(s1, 8)
+    var len = 1 + span
+    if at + len > buf.len {
+        len = buf.len - at
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < buf.len {
+        (mut out).push(buf[i])
+        if i == at + len - 1 {
+            var k = at
+            while k < at + len {
+                (mut out).push(buf[k])
+                k += 1
+            }
+        }
+        i += 1
+    }
+    buf = out
+    s2
+}
+
+fn mutate_swap(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len < 2 {
+        return s
+    }
+    let (a, s1) = pick(s, buf.len)
+    let (b, s2) = pick(s1, buf.len)
+    let t = buf[a]
+    buf[a] = buf[b]
+    buf[b] = t
+    s2
+}
+
+fn mutate_truncate(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        return s
+    }
+    let (keep, s1) = pick(s, buf.len)
+    var out = List[byte]()
+    var i = 0
+    while i < keep {
+        (mut out).push(buf[i])
+        i += 1
+    }
+    buf = out
+    s1
+}
+
+fn mutate_splice(s: wrapping[u64], mut buf: List[byte], corpus: List[List[byte]]) -> wrapping[u64] {
+    if buf.len > 4096 {
+        return s
+    }
+    let (which, s1) = pick(s, corpus.len)
+    let other = corpus[which]
+    var at = 0
+    var s2 = s1
+    if buf.len > 0 {
+        let (a, s3) = pick(s1, buf.len + 1)
+        at = a
+        s2 = s3
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < at {
+        (mut out).push(buf[i])
+        i += 1
+    }
+    for b in other {
+        (mut out).push(b)
+    }
+    while i < buf.len {
+        (mut out).push(buf[i])
+        i += 1
+    }
+    buf = out
+    s2
+}
+
+/// Cut a multi-byte sequence in two (`mutate_split_utf8`).
+fn mutate_split_utf8(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        return mutate_flip(s, mut buf)
+    }
+    let (at, s1) = pick(s, buf.len)
+    let (cp, n) = unicode.utf8_decode(buf, at, buf.len)
+    assert(cp >= 0, "fuzz: decode answered")
+    if n > 1 {
+        let (cut, s2) = pick(s1, n - 1)
+        delete_range(mut buf, at + 1, cut + 1)
+        return s2
+    }
+    mutate_flip(s1, mut buf)
+}
+
+/// Replace a byte with a lead of another class (`mutate_lead_class`).
+fn mutate_lead_class(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    let leads = [128, 192, 194, 224, 225, 237, 240, 244, 245, 255]
+    let (which, s1) = pick(s, leads.len)
+    let b = leads[which] as byte
+    if buf.len == 0 {
+        (mut buf).push(b)
+        return s1
+    }
+    let (at, s2) = pick(s1, buf.len)
+    buf[at] = b
+    s2
+}
+
+/// Inject a lone continuation or a surrogate encoding (`mutate_continuation`).
+fn mutate_continuation(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    var at = 0
+    var s1 = s
+    if buf.len > 0 {
+        let (a, s2) = pick(s, buf.len + 1)
+        at = a
+        s1 = s2
+    }
+    let (kind, s3) = pick(s1, 2)
+    var inject = List[byte]()
+    var s4 = s3
+    if kind == 0 {
+        let (c, s5) = pick(s3, 64)
+        (mut inject).push((128 + c) as byte)
+        s4 = s5
+    } else {
+        inject = bytes_of([237, 160, 128])
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < at {
+        (mut out).push(buf[i])
+        i += 1
+    }
+    for b in inject {
+        (mut out).push(b)
+    }
+    while i < buf.len {
+        (mut out).push(buf[i])
+        i += 1
+    }
+    buf = out
+    s4
+}
+
+fn mutator_name(which: int) -> str {
+    match which {
+        0 => "byte-flip",
+        1 => "chunk-delete",
+        2 => "chunk-duplicate",
+        3 => "chunk-swap",
+        4 => "truncate",
+        5 => "corpus-splice",
+        6 => "utf8-split",
+        7 => "lead-class",
+        _ => "lone-continuation",
+    }
+}
+
+/// One mutation, chosen as `fuzzlib.c:899-911` chooses; answers
+/// `(which, next_state)`.
+fn mutate(s: wrapping[u64], mut buf: List[byte], corpus: List[List[byte]]) -> (int, wrapping[u64]) {
+    let (which, s1) = pick(s, 9)
+    var s2 = s1
+    if which == 0 {
+        s2 = mutate_flip(s1, mut buf)
+    } else if which == 1 {
+        s2 = mutate_delete(s1, mut buf)
+    } else if which == 2 {
+        s2 = mutate_duplicate(s1, mut buf)
+    } else if which == 3 {
+        s2 = mutate_swap(s1, mut buf)
+    } else if which == 4 {
+        s2 = mutate_truncate(s1, mut buf)
+    } else if which == 5 {
+        s2 = mutate_splice(s1, mut buf, corpus)
+    } else if which == 6 {
+        s2 = mutate_split_utf8(s1, mut buf)
+    } else if which == 7 {
+        s2 = mutate_lead_class(s1, mut buf)
+    } else {
+        s2 = mutate_continuation(s1, mut buf)
+    }
+    (which, s2)
+}
+
+// ---- the checks ------------------------------------------------------
+
+/// Invariants 2, 3, 4 and the incremental/one-shot agreement
+/// (`yew_fuzz_check_utf8`). Answers "" or the reason.
+fn check_utf8(data: List[byte]) -> str {
+    let len = data.len
+    var pos = 0
+    var encoded = List[byte]()
+    var decoded = List[int]()
+    while pos < len {
+        let (cp, n) = unicode.utf8_decode(data, pos, len)
+        if n < 1 || n > len - pos {
+            return "decode consumed {n} at {pos} (totality)"
+        }
+        if cp > 1114111 {
+            return "scalar {cp} past U+10FFFF at {pos}"
+        }
+        if cp >= 55296 && cp <= 57343 && !unicode.utf8_is_escape(cp) {
+            return "a non-escape surrogate {cp} at {pos}"
+        }
+        let produced = unicode.utf8_encode_into(mut encoded, cp)
+        if produced != n {
+            return "re-encoded {produced} bytes for {n} consumed at {pos}"
+        }
+        (mut decoded).push(cp)
+        pos += n
+    }
+    if pos != len {
+        return "the scan ended at {pos}, not {len}"
+    }
+    if encoded.len != len {
+        return "round trip: {encoded.len} bytes for {len}"
+    }
+    var i = 0
+    while i < len {
+        if encoded[i] != data[i] {
+            return "round trip differs at byte {i}"
+        }
+        i += 1
+    }
+    // The incremental decoder agrees with the one-shot decoder.
+    var dec = unicode.utf8_dec_new()
+    var seen = 0
+    for b in data {
+        let count = unicode.utf8_push(mut dec, b as int)
+        var k = 0
+        while k < count {
+            if seen >= decoded.len || unicode.utf8_dec_out(dec, k) != decoded[seen] {
+                return "the incremental decoder disagrees at result {seen}"
+            }
+            seen += 1
+            k += 1
+        }
+    }
+    let rest = unicode.utf8_finish(mut dec)
+    var k = 0
+    while k < rest {
+        if seen >= decoded.len || unicode.utf8_dec_out(dec, k) != decoded[seen] {
+            return "the incremental decoder's finish disagrees at result {seen}"
+        }
+        seen += 1
+        k += 1
+    }
+    if seen != decoded.len {
+        return "the incremental decoder answered {seen} of {decoded.len} codepoints"
+    }
+    ""
+}
+
+/// Invariants 5, 6, 7 and 8 (`fuzz_grapheme.c`).
+fn check_grapheme(data: List[byte]) -> str {
+    let len = data.len
+    // 5: the partition, and every boundary a codepoint boundary; collect
+    // the boundaries for 6.
+    var bounds = List[int]()
+    var pos = 0
+    var total = 0
+    while pos < len {
+        let next = unicode.gb_next_bytes(data, len, pos)
+        if next <= pos || next > len {
+            return "cluster at {pos} ends at {next}"
+        }
+        if !unicode.utf8_is_boundary(data, 0, len, next) {
+            return "cluster end {next} is not a codepoint boundary"
+        }
+        let width = unicode.cluster_width(data, pos, next)
+        if width < 0 || width > 4 {
+            return "cluster_width {width} at {pos}"
+        }
+        total += next - pos
+        (mut bounds).push(pos)
+        pos = next
+    }
+    if total != len {
+        return "cluster lengths sum to {total}, not {len}"
+    }
+    // 6: the single pass's verdict at every codepoint, then a restart at
+    // each boundary reproduces the verdicts after it.
+    var single = List[bool]()
+    var state = unicode.gb_init()
+    var p = 0
+    while p < len {
+        let (cp, n) = unicode.utf8_decode(data, p, len)
+        (mut single).push(unicode.gb_boundary(mut state, cp))
+        p += n
+    }
+    for start in bounds {
+        var st = unicode.gb_init()
+        var q = start
+        var idx = 0
+        // the index of `start` in the codepoint sequence
+        var scan = 0
+        while scan < start {
+            let (cp, n) = unicode.utf8_decode(data, scan, len)
+            assert(cp >= 0, "fuzz: decode answered")
+            scan += n
+            idx += 1
+        }
+        var first = true
+        while q < len {
+            let (cp, n) = unicode.utf8_decode(data, q, len)
+            let verdict = unicode.gb_boundary(mut st, cp)
+            if first {
+                if !verdict {
+                    return "a restart at boundary {start} did not begin a cluster"
+                }
+            } else if verdict != single[idx] {
+                return "a restart at boundary {start} changed the verdict at {q}"
+            }
+            first = false
+            q += n
+            idx += 1
+        }
+    }
+    // 7: next(prev(next)) == next at every cluster end.
+    for start in bounds {
+        let next = unicode.gb_next_bytes(data, len, start)
+        let prev = unicode.gb_prev_bytes(data, len, next)
+        if prev > next || unicode.gb_next_bytes(data, len, prev) != next {
+            return "prev/next disagree around {next} (prev {prev})"
+        }
+    }
+    // 8: clipping never exceeds the budget nor splits a cluster.
+    let full = unicode.str_width(data, 0, len, 4)
+    var max_cells = 0
+    while max_cells <= full + 1 {
+        let (kept, cells) = unicode.str_clip(data, 0, len, max_cells)
+        if cells > max_cells || kept > len {
+            return "str_clip({max_cells}) kept {kept} bytes, {cells} cells"
+        }
+        if kept > 0 && kept < len {
+            let prev = unicode.gb_prev_bytes(data, len, kept)
+            if unicode.gb_next_bytes(data, len, prev) != kept {
+                return "str_clip({max_cells}) split a cluster at {kept}"
+            }
+        }
+        max_cells += 1
+    }
+    ""
+}
+
+fn three_byte_space() -> int {
+    var value = 0
+    var input = List[byte]()
+    while value <= 16777215 {
+        (mut input).clear()
+        (mut input).push((value >> 16) as byte)
+        (mut input).push((value >> 8 & 255) as byte)
+        (mut input).push((value & 255) as byte)
+        let why = check_utf8(input)
+        if why.len > 0 {
+            print("fuzz-unicode: FAIL three-byte input {hex_of(input)}: {why}")
+            return 1
+        }
+        value += 1
+    }
+    print("fuzz-unicode: the 16777216 three-byte inputs round-trip")
+    0
+}
+
+fn main() -> int {
+    let args = env_args()
+    var iters = 200000
+    var seed = 1
+    var three = false
+    var corpus_path = "tests/fixtures/unicode/corpus.txt"
+    var i = 0
+    while i < args.len {
+        if args[i] == "--iters" && i + 1 < args.len {
+            iters = args[i + 1].to_int() else 200000
+            i += 2
+        } else if args[i] == "--seed" && i + 1 < args.len {
+            seed = args[i + 1].to_int() else 1
+            i += 2
+        } else if args[i] == "--three-byte" {
+            three = true
+            i += 1
+        } else if args[i] == "--corpus" && i + 1 < args.len {
+            corpus_path = args[i + 1]
+            i += 2
+        } else {
+            eprint("usage: fuzz-unicode [--iters N] [--seed S] [--three-byte] [--corpus FILE]")
+            return 2
+        }
+    }
+    let corpus = load_corpus(corpus_path)
+    if corpus.len < 40 {
+        eprint(
+            "fuzz-unicode: the corpus at {corpus_path} has {corpus.len} entries; need the golden corpus",
+        )
+        return 2
+    }
+    var rs = rng_seed(seed)
+    var h: wrapping[u64] = 14695981039346656037
+    var counts = List[int]()
+    var c = 0
+    while c < 9 {
+        (mut counts).push(0)
+        c += 1
+    }
+    // Every corpus entry first, unmutated.
+    for entry in corpus {
+        let a = check_utf8(entry)
+        if a.len > 0 {
+            print("fuzz-unicode: FAIL corpus entry {hex_of(entry)}: {a}")
+            return 1
+        }
+        let b = check_grapheme(entry)
+        if b.len > 0 {
+            print("fuzz-unicode: FAIL corpus entry {hex_of(entry)}: {b}")
+            return 1
+        }
+    }
+    var iter = 0
+    while iter < iters {
+        region turn {
+            let (entry, s1) = pick(rs, corpus.len)
+            let (extra, s2) = pick(s1, 4)
+            rs = s2
+            var buf = copy corpus[entry]
+            let rounds = 1 + extra
+            var k = 0
+            while k < rounds {
+                let (which, s3) = mutate(rs, mut buf, corpus)
+                rs = s3
+                counts[which] = counts[which] + 1
+                k += 1
+            }
+            h = hash_bytes(h, buf)
+            let a = check_utf8(buf)
+            if a.len > 0 {
+                print("fuzz-unicode: FAIL seed={seed} iter={iter} input {hex_of(buf)}: {a}")
+                return 1
+            }
+            let b = check_grapheme(buf)
+            if b.len > 0 {
+                print("fuzz-unicode: FAIL seed={seed} iter={iter} input {hex_of(buf)}: {b}")
+                return 1
+            }
+        }
+        iter += 1
+    }
+    var summary = ""
+    var m = 0
+    while m < 9 {
+        summary += " {mutator_name(m)}={counts[m]}"
+        m += 1
+    }
+    print("fuzz-unicode: ok seed={seed} iters={iters} corpus={corpus.len} hash={h}{summary}")
+    if three {
+        return three_byte_space()
+    }
+    0
+}
