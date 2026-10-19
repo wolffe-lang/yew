@@ -1,0 +1,917 @@
+//! term.render — the damage diff to a minimal escape stream: the
+//! cursor-motion cost model, SGR run coalescing, erase-to-EOL, the colour
+//! tiers, the frame envelope with synchronized output as one balanced pair.
+//!
+//! Ports sagitta `src/term/render.c` (884 lines) and `render.h` (63) at
+//! 9ace98c2, under `s05-grid-and-render.md` §5-§7. `render_frame` appends
+//! to a `List[byte]` and never touches a descriptor: the caller writes once
+//! and flips (s05 §5). A frame with no change emits zero bytes; a
+//! cell-bearing frame starts with the pen and position unknown so frames
+//! are independent; the final CUP clears any pending wrap.
+//!
+//! The wolf shapes. The out-of-band queue (`yew_term_oob_*`, a process
+//! global in C because yew owns one terminal) lives in the `Render` value,
+//! of which there is one; module state of a `List` is refused anyway. The
+//! renderer keeps one reusable scratch `List[byte]` for the per-cell
+//! grapheme and width check so the diff allocates nothing per cell. A
+//! malformed cell is an internal error (`util.bug`, exit 4), as C's
+//! `YEW_BUG`.
+
+use unicode
+use util
+
+/// `tier`: sixteen colours.
+pub const TIER_16: int = 0
+
+/// 256 colours.
+pub const TIER_256: int = 1
+
+/// 24-bit colour.
+pub const TIER_TRUECOLOR: int = 2
+
+// The ten terminal attributes (`render.c:10-22`).
+const ATTR_TERMINAL: int = 1023
+
+/// The renderer's believed terminal state (`Render`, `render.h:18-40`).
+pub struct Render {
+    fg: Color,
+    bg: Color,
+    attrs: int,
+    pen_known: bool,
+    row: int,
+    col: int,
+    pos_known: bool,
+    tier: int,
+    no_color: bool,
+    plain: bool,
+    sync: bool,
+    undercurl: bool,
+    ul_colors: List[Color],
+    cursor_known: bool,
+    cursor_visible: bool,
+    cursor_shape: int,
+    cursor_generation: int,
+    frames: int,
+    bytes: int,
+    oob: List[byte],
+    scratch: List[byte],
+}
+
+// `CUBE_LVL` (`render.c:95`).
+fn cube_level(i: int) -> int {
+    if i == 0 {
+        return 0
+    }
+    if i == 1 {
+        return 95
+    }
+    if i == 2 {
+        return 135
+    }
+    if i == 3 {
+        return 175
+    }
+    if i == 4 {
+        return 215
+    }
+    255
+}
+
+// The canonical sixteen (`ansi_rgb`, `render.c:97-106`): (r, g, b).
+fn ansi_rgb(i: int) -> (int, int, int) {
+    if i == 0 {
+        return (0, 0, 0)
+    }
+    if i == 1 {
+        return (128, 0, 0)
+    }
+    if i == 2 {
+        return (0, 128, 0)
+    }
+    if i == 3 {
+        return (128, 128, 0)
+    }
+    if i == 4 {
+        return (0, 0, 128)
+    }
+    if i == 5 {
+        return (128, 0, 128)
+    }
+    if i == 6 {
+        return (0, 128, 128)
+    }
+    if i == 7 {
+        return (192, 192, 192)
+    }
+    if i == 8 {
+        return (128, 128, 128)
+    }
+    if i == 9 {
+        return (255, 0, 0)
+    }
+    if i == 10 {
+        return (0, 255, 0)
+    }
+    if i == 11 {
+        return (255, 255, 0)
+    }
+    if i == 12 {
+        return (0, 0, 255)
+    }
+    if i == 13 {
+        return (255, 0, 255)
+    }
+    if i == 14 {
+        return (0, 255, 255)
+    }
+    (255, 255, 255)
+}
+
+fn put_str(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn decimal(mut out: List[byte], value_in: int) {
+    var digits = List[byte]()
+    var value = value_in
+    loop {
+        (mut digits).push((48 + value % 10) as byte)
+        value = value / 10
+        if value == 0 {
+            break
+        }
+    }
+    var i = digits.len
+    while i > 0 {
+        i -= 1
+        (mut out).push(digits[i])
+    }
+}
+
+fn cube_index(value: int) -> int {
+    if value < 48 {
+        return 0
+    }
+    if value < 115 {
+        return 1
+    }
+    (value - 35) / 40
+}
+
+fn color_distance(r1: int, g1: int, b1: int, r2: int, g2: int, b2: int) -> int {
+    let dr = r1 - r2
+    let dg = g1 - g2
+    let db = b1 - b2
+    2 * dr * dr + 4 * dg * dg + 3 * db * db
+}
+
+/// RGB → the nearest of the 6×6×6 cube or the grayscale ramp, integer
+/// only, ties to the cube (`yew_rgb_to_256`, `render.c:144-164`).
+pub fn rgb_to_256(r: int, g: int, b: int) -> int {
+    let ri = cube_index(r)
+    let gi = cube_index(g)
+    let bi = cube_index(b)
+    let cube = 16 + 36 * ri + 6 * gi + bi
+    let cube_dist = color_distance(r, g, b, cube_level(ri), cube_level(gi), cube_level(bi))
+    let average = (r + g + b) / 3
+    var gray_index = (average - 8 + 5) / 10
+    if gray_index < 0 {
+        gray_index = 0
+    }
+    if gray_index > 23 {
+        gray_index = 23
+    }
+    let gray = 8 + 10 * gray_index
+    if color_distance(r, g, b, gray, gray, gray) < cube_dist {
+        return 232 + gray_index
+    }
+    cube
+}
+
+/// RGB → the nearest canonical ANSI colour, ties to the lower index
+/// (`yew_rgb_to_16`, `render.c:166-183`).
+pub fn rgb_to_16(r: int, g: int, b: int) -> int {
+    var best = 0
+    let (r0, g0, b0) = ansi_rgb(0)
+    var best_dist = color_distance(r, g, b, r0, g0, b0)
+    var i = 1
+    while i < 16 {
+        let (ri, gi, bi) = ansi_rgb(i)
+        let candidate = color_distance(r, g, b, ri, gi, bi)
+        if candidate < best_dist {
+            best = i
+            best_dist = candidate
+        }
+        i += 1
+    }
+    best
+}
+
+// An index 0-255 as RGB (`indexed_rgb`, `render.c:185-202`).
+fn indexed_rgb(index: int) -> (int, int, int) {
+    if index < 16 {
+        return ansi_rgb(index)
+    }
+    if index < 232 {
+        let value = index - 16
+        return (cube_level(value / 36), cube_level((value / 6) % 6), cube_level(value % 6))
+    }
+    let v = 8 + 10 * (index - 232)
+    (v, v, v)
+}
+
+/// The colour tier, first hit wins (`yew_render_tier`, `render.c:204-225`):
+/// `YEW_COLORS` forced, else the probe's truecolor, else `TERM` naming
+/// 256 colours or direct, else 16.
+pub fn render_tier(caps: TtyCaps, getv: fn(str) -> (str, bool)) -> int {
+    let (forced, has_forced) = getv("YEW_COLORS")
+    if has_forced {
+        if forced == "truecolor" {
+            return TIER_TRUECOLOR
+        }
+        if forced == "256" {
+            return TIER_256
+        }
+        if forced == "16" {
+            return TIER_16
+        }
+    }
+    if caps.truecolor {
+        return TIER_TRUECOLOR
+    }
+    let (term, has_term) = getv("TERM")
+    if has_term && (term.contains("256color") || term.contains("direct")) {
+        return TIER_256
+    }
+    TIER_16
+}
+
+/// A renderer for the probed terminal (`yew_render_init`, `render.c:227-239`):
+/// `NO_COLOR` present (even empty) drops colours; `TERM=dumb` drops every
+/// attribute and the synchronized pair.
+pub fn render_new(caps: TtyCaps, getv: fn(str) -> (str, bool)) -> Render {
+    let tier = render_tier(caps, getv)
+    let (_, no_color) = getv("NO_COLOR")
+    let (term, has_term) = getv("TERM")
+    let plain = has_term && term == "dumb"
+    var ul = List[Color]()
+    (mut ul).push(color_default())
+    (mut ul).push(color_default())
+    (mut ul).push(color_default())
+    Render {
+        fg: color_default(),
+        bg: color_default(),
+        attrs: 0,
+        pen_known: false,
+        row: 0,
+        col: 0,
+        pos_known: false,
+        tier: tier,
+        no_color: no_color,
+        plain: plain,
+        sync: !plain && caps.sync_output,
+        undercurl: !plain && tier == TIER_TRUECOLOR,
+        ul_colors: ul,
+        cursor_known: false,
+        cursor_visible: false,
+        cursor_shape: CURSOR_BLOCK,
+        cursor_generation: 0,
+        frames: 0,
+        bytes: 0,
+        oob: List[byte](),
+        scratch: List[byte](),
+    }
+}
+
+/// The error, warning and info underline colours (`yew_render_set_underline_colors`).
+pub fn render_set_underline_colors(mut r: Render, error: Color, warn: Color, info: Color) {
+    r.ul_colors[0] = error
+    r.ul_colors[1] = warn
+    r.ul_colors[2] = info
+}
+
+/// Queue out-of-band bytes to follow the next frame's end marker
+/// (`yew_term_oob_queue`).
+pub fn render_oob_queue(mut r: Render, seq: List[byte]) {
+    for b in seq {
+        (mut r.oob).push(b)
+    }
+}
+
+/// How many out-of-band bytes wait (`yew_term_oob_pending`).
+pub fn render_oob_pending(r: Render) -> int {
+    r.oob.len
+}
+
+/// Append the queued out-of-band bytes and empty the queue
+/// (`yew_term_oob_flush`); answers how many.
+pub fn render_oob_flush(mut r: Render, mut out: List[byte]) -> int {
+    let n = r.oob.len
+    for b in r.oob {
+        (mut out).push(b)
+    }
+    r.oob = List[byte]()
+    n
+}
+
+/// Drop the queue (`yew_term_oob_clear`).
+pub fn render_oob_clear(mut r: Render) {
+    r.oob = List[byte]()
+}
+
+fn render_finish(mut r: Render, mut out: List[byte], start: int, frame_end: int) -> int {
+    if frame_end < start || frame_end > out.len {
+        util.bug("term.render", "renderer produced invalid frame bounds")
+        return 0
+    }
+    r.bytes += frame_end - start
+    let _ = render_oob_flush(mut r, mut out)
+    out.len - start
+}
+
+fn terminal_attrs(attrs: int, undercurl: bool) -> int {
+    var result = attrs & ATTR_TERMINAL
+    if (attrs & ATTR_INVALID_BYTE) != 0 {
+        result = result | ATTR_REVERSE
+    }
+    if (result & ATTR_UNDERCURL) != 0 {
+        if undercurl {
+            result = result - (result & ATTR_UNDERLINE)
+        } else {
+            result = result - (result & ATTR_UNDERCURL)
+            result = result | ATTR_UNDERLINE
+        }
+    }
+    result
+}
+
+fn param_sep(mut out: List[byte], mut first: bool) {
+    if !first {
+        (mut out).push(59 as byte)
+    }
+    first = false
+}
+
+fn param_num(mut out: List[byte], mut first: bool, value: int) {
+    param_sep(mut out, mut first)
+    decimal(mut out, value)
+}
+
+fn param_text(mut out: List[byte], mut first: bool, value: str) {
+    param_sep(mut out, mut first)
+    put_str(mut out, value)
+}
+
+fn color_ansi(color: Color) -> int {
+    if color.tag == COLOR_INDEXED {
+        if color.r < 16 {
+            return color.r
+        }
+        let (r, g, b) = indexed_rgb(color.r)
+        return rgb_to_16(r, g, b)
+    }
+    rgb_to_16(color.r, color.g, color.b)
+}
+
+fn color_param(mut out: List[byte], mut first: bool, color: Color, foreground: bool, tier: int, no_color: bool) {
+    if no_color {
+        return
+    }
+    if color.tag == COLOR_DEFAULT {
+        param_num(mut out, mut first, if foreground then 39 else 49)
+        return
+    }
+    if color.tag == COLOR_INDEXED && color.r < 16 {
+        let index = color.r
+        let code = if index < 8 then (if foreground then 30 else 40) + index else (if foreground then 90 else 100) + index - 8
+        param_num(mut out, mut first, code)
+        return
+    }
+    if tier == TIER_TRUECOLOR && color.tag == COLOR_RGB {
+        param_num(mut out, mut first, if foreground then 38 else 48)
+        param_num(mut out, mut first, 2)
+        param_num(mut out, mut first, color.r)
+        param_num(mut out, mut first, color.g)
+        param_num(mut out, mut first, color.b)
+        return
+    }
+    if (tier == TIER_TRUECOLOR && color.tag == COLOR_INDEXED) || tier == TIER_256 {
+        let index = if color.tag == COLOR_INDEXED then color.r else rgb_to_256(color.r, color.g, color.b)
+        param_num(mut out, mut first, if foreground then 38 else 48)
+        param_num(mut out, mut first, 5)
+        param_num(mut out, mut first, index)
+        return
+    }
+    let index = color_ansi(color)
+    let code = if index < 8 then (if foreground then 30 else 40) + index else (if foreground then 90 else 100) + index - 8
+    param_num(mut out, mut first, code)
+}
+
+fn underline_selector(r: Render, attrs: int) -> int {
+    if r.plain || r.no_color || r.tier != TIER_TRUECOLOR {
+        return 0
+    }
+    let line_attrs = terminal_attrs(attrs, r.undercurl)
+    if (line_attrs & (ATTR_UNDERLINE | ATTR_UNDERCURL)) == 0 {
+        return 0
+    }
+    let selector = (attrs & CELL_UL_MASK) >> CELL_UL_SHIFT
+    if selector == 0 || r.ul_colors[selector - 1].tag != COLOR_RGB {
+        return 0
+    }
+    selector
+}
+
+fn underline_color_param(r: Render, mut out: List[byte], mut first: bool, selector: int) {
+    let color = r.ul_colors[selector - 1]
+    param_num(mut out, mut first, 58)
+    param_num(mut out, mut first, 2)
+    param_num(mut out, mut first, color.r)
+    param_num(mut out, mut first, color.g)
+    param_num(mut out, mut first, color.b)
+}
+
+fn attrs_full(mut out: List[byte], mut first: bool, attrs: int, undercurl: bool) {
+    if (attrs & ATTR_BOLD) != 0 {
+        param_num(mut out, mut first, 1)
+    }
+    if (attrs & ATTR_DIM) != 0 {
+        param_num(mut out, mut first, 2)
+    }
+    if (attrs & ATTR_ITALIC) != 0 {
+        param_num(mut out, mut first, 3)
+    }
+    if (attrs & ATTR_UNDERLINE) != 0 {
+        param_num(mut out, mut first, 4)
+    }
+    if (attrs & ATTR_UNDERCURL) != 0 {
+        if undercurl {
+            param_text(mut out, mut first, "4:3")
+        } else if (attrs & ATTR_UNDERLINE) == 0 {
+            param_num(mut out, mut first, 4)
+        }
+    }
+    if (attrs & ATTR_BLINK) != 0 {
+        param_num(mut out, mut first, 5)
+    }
+    if (attrs & ATTR_REVERSE) != 0 {
+        param_num(mut out, mut first, 7)
+    }
+    if (attrs & ATTR_CONCEAL) != 0 {
+        param_num(mut out, mut first, 8)
+    }
+    if (attrs & ATTR_STRIKE) != 0 {
+        param_num(mut out, mut first, 9)
+    }
+    if (attrs & ATTR_OVERLINE) != 0 {
+        param_num(mut out, mut first, 53)
+    }
+}
+
+fn cleared(from: int, to: int, mask: int) -> bool {
+    (from & mask & (mask - (to & mask))) != 0
+}
+
+fn attr_reset_count(from: int, to: int) -> int {
+    var count = 0
+    if cleared(from, to, ATTR_BOLD | ATTR_DIM) {
+        count += 1
+    }
+    if cleared(from, to, ATTR_ITALIC) {
+        count += 1
+    }
+    if cleared(from, to, ATTR_UNDERLINE | ATTR_UNDERCURL) {
+        count += 1
+    }
+    if cleared(from, to, ATTR_BLINK) {
+        count += 1
+    }
+    if cleared(from, to, ATTR_REVERSE) {
+        count += 1
+    }
+    if cleared(from, to, ATTR_CONCEAL) {
+        count += 1
+    }
+    if cleared(from, to, ATTR_STRIKE) {
+        count += 1
+    }
+    if cleared(from, to, ATTR_OVERLINE) {
+        count += 1
+    }
+    count
+}
+
+fn attrs_delta(mut out: List[byte], mut first: bool, from: int, to: int, undercurl: bool) {
+    let shared = ATTR_BOLD | ATTR_DIM
+    let line = ATTR_UNDERLINE | ATTR_UNDERCURL
+    if cleared(from, to, shared) {
+        param_num(mut out, mut first, 22)
+        if (to & ATTR_BOLD) != 0 {
+            param_num(mut out, mut first, 1)
+        }
+        if (to & ATTR_DIM) != 0 {
+            param_num(mut out, mut first, 2)
+        }
+    } else {
+        if (to & ATTR_BOLD) != 0 && (from & ATTR_BOLD) == 0 {
+            param_num(mut out, mut first, 1)
+        }
+        if (to & ATTR_DIM) != 0 && (from & ATTR_DIM) == 0 {
+            param_num(mut out, mut first, 2)
+        }
+    }
+    if cleared(from, to, line) {
+        param_num(mut out, mut first, 24)
+        if (to & ATTR_UNDERLINE) != 0 {
+            param_num(mut out, mut first, 4)
+        }
+        if (to & ATTR_UNDERCURL) != 0 {
+            if undercurl {
+                param_text(mut out, mut first, "4:3")
+            } else if (to & ATTR_UNDERLINE) == 0 {
+                param_num(mut out, mut first, 4)
+            }
+        }
+    } else {
+        if (to & ATTR_UNDERLINE) != 0 && (from & ATTR_UNDERLINE) == 0 {
+            param_num(mut out, mut first, 4)
+        }
+        if (to & ATTR_UNDERCURL) != 0 && (from & ATTR_UNDERCURL) == 0 {
+            if undercurl {
+                param_text(mut out, mut first, "4:3")
+            } else if (to & ATTR_UNDERLINE) == 0 {
+                param_num(mut out, mut first, 4)
+            }
+        }
+    }
+    let bits = [ATTR_ITALIC, ATTR_BLINK, ATTR_REVERSE, ATTR_CONCEAL, ATTR_STRIKE, ATTR_OVERLINE]
+    let sets = [3, 5, 7, 8, 9, 53]
+    let resets = [23, 25, 27, 28, 29, 55]
+    var i = 0
+    while i < bits.len {
+        if (from & bits[i]) != 0 && (to & bits[i]) == 0 {
+            param_num(mut out, mut first, resets[i])
+        } else if (from & bits[i]) == 0 && (to & bits[i]) != 0 {
+            param_num(mut out, mut first, sets[i])
+        }
+        i += 1
+    }
+}
+
+// Emit the SGR delta from the pen to the cell's style (`set_style`,
+// `render.c:483-553`): nothing when equal, the delta when few resets, a
+// full `0;…` when three or more.
+fn set_style(mut r: Render, mut out: List[byte], cell: Cell) {
+    let attrs = terminal_attrs(cell.attrs, r.undercurl)
+    let old_attrs = terminal_attrs(r.attrs, r.undercurl)
+    let ul = underline_selector(r, cell.attrs)
+    let old_ul = underline_selector(r, r.attrs)
+    if r.plain {
+        r.fg = cell.fg
+        r.bg = cell.bg
+        r.attrs = cell.attrs
+        r.pen_known = true
+        return
+    }
+    if r.pen_known && old_attrs == attrs && old_ul == ul &&
+        (r.no_color || color_equal(r.fg, cell.fg)) && (r.no_color || color_equal(r.bg, cell.bg)) {
+        r.attrs = cell.attrs
+        return
+    }
+    let fg_changed = !r.no_color && (!r.pen_known || !color_equal(r.fg, cell.fg))
+    let bg_changed = !r.no_color && (!r.pen_known || !color_equal(r.bg, cell.bg))
+    var resets = if r.pen_known then attr_reset_count(old_attrs, attrs) else 3
+    if r.pen_known && fg_changed && cell.fg.tag == COLOR_DEFAULT {
+        resets += 1
+    }
+    if r.pen_known && bg_changed && cell.bg.tag == COLOR_DEFAULT {
+        resets += 1
+    }
+    let full = !r.pen_known || resets >= 3
+    put_str(mut out, "\x1b[")
+    var first = true
+    if full {
+        param_num(mut out, mut first, 0)
+        attrs_full(mut out, mut first, attrs, r.undercurl)
+        if cell.fg.tag != COLOR_DEFAULT {
+            color_param(mut out, mut first, cell.fg, true, r.tier, r.no_color)
+        }
+        if cell.bg.tag != COLOR_DEFAULT {
+            color_param(mut out, mut first, cell.bg, false, r.tier, r.no_color)
+        }
+        if ul != 0 {
+            underline_color_param(r, mut out, mut first, ul)
+        }
+    } else {
+        attrs_delta(mut out, mut first, old_attrs, attrs, r.undercurl)
+        if fg_changed {
+            color_param(mut out, mut first, cell.fg, true, r.tier, r.no_color)
+        }
+        if bg_changed {
+            color_param(mut out, mut first, cell.bg, false, r.tier, r.no_color)
+        }
+        if old_ul != ul {
+            if ul == 0 {
+                param_num(mut out, mut first, 59)
+            } else {
+                underline_color_param(r, mut out, mut first, ul)
+            }
+        }
+    }
+    (mut out).push(109 as byte)
+    r.fg = cell.fg
+    r.bg = cell.bg
+    r.attrs = cell.attrs
+    r.pen_known = true
+}
+
+// Fill the scratch with the cell's bytes: a blank is one space
+// (`cell_bytes`, `render.c:555-579`).
+fn load_scratch(mut r: Render, g: Grid, cell: Cell) {
+    while r.scratch.len != 0 {
+        let _ = (mut r.scratch).pop() else (0 as byte)
+    }
+    if !cell_interned(cell) && cell_byte(cell, 0) == 0 {
+        (mut r.scratch).push(32 as byte)
+        return
+    }
+    cell_bytes_into(mut r.scratch, g, cell)
+}
+
+fn emit_cell(mut r: Render, g: Grid, mut out: List[byte], cell: Cell) {
+    set_style(mut r, mut out, cell)
+    load_scratch(mut r, g, cell)
+    let len = r.scratch.len
+    if unicode.gb_next_bytes(r.scratch, len, 0) != len {
+        util.bug("term.render", "render cell {r.row},{r.col} contains multiple grapheme clusters")
+        return
+    }
+    var i = 0
+    while i < len {
+        let b = r.scratch[i] as int
+        if b < 32 || b == 127 {
+            util.bug("term.render", "render cell {r.row},{r.col} contains raw control byte {b}")
+            return
+        }
+        i += 1
+    }
+    if unicode.cluster_width(r.scratch, 0, len) != cell.w {
+        util.bug("term.render", "render cell {r.row},{r.col} has inconsistent grapheme width")
+        return
+    }
+    for b in r.scratch {
+        (mut out).push(b)
+    }
+    if r.pos_known {
+        let next = r.col + (if cell.w == 2 then 2 else 1)
+        if next > 65535 {
+            r.pos_known = false
+        } else {
+            r.col = next
+        }
+    }
+}
+
+fn printable_ascii_cell(cell: Cell) -> bool {
+    if cell_interned(cell) || cell.w != 1 {
+        return false
+    }
+    let b0 = cell_byte(cell, 0)
+    b0 >= 32 && b0 <= 126 && cell_byte(cell, 1) == 0
+}
+
+fn same_style(a: Cell, b: Cell) -> bool {
+    a.attrs == b.attrs && color_equal(a.fg, b.fg) && color_equal(a.bg, b.bg)
+}
+
+fn emit_printable_ascii_run(mut r: Render, g: Grid, mut out: List[byte], row: int, col: int, end: int) -> int {
+    let base = row * g.cols
+    let first = copy g.back[base + col]
+    set_style(mut r, mut out, first)
+    var next = col
+    while next < end {
+        let cell = copy g.back[base + next]
+        if cell_eq(g.front[base + next], cell) || !same_style(first, cell) || !printable_ascii_cell(cell) {
+            break
+        }
+        (mut out).push(cell_byte(cell, 0) as byte)
+        next += 1
+    }
+    if r.pos_known {
+        r.col = r.col + (next - col)
+    }
+    next
+}
+
+fn cup(mut r: Render, mut out: List[byte], row: int, col: int) {
+    if row == 0 && col == 0 {
+        put_str(mut out, "\x1b[H")
+    } else {
+        put_str(mut out, "\x1b[")
+        decimal(mut out, row + 1)
+        (mut out).push(59 as byte)
+        decimal(mut out, col + 1)
+        (mut out).push(72 as byte)
+    }
+    r.row = row
+    r.col = col
+    r.pos_known = true
+}
+
+fn cell_byte_len(g: Grid, cell: Cell) -> int {
+    if cell_interned(cell) {
+        return util.intern_len(g.gi, cell.lo)
+    }
+    let n = cell_inline_len(cell)
+    if n == 0 then 1 else n
+}
+
+// Whether re-emitting the unchanged cells between the pen and `target`
+// costs less than a CUF (`can_reemit_gap`, `render.c:674-705`).
+fn can_reemit_gap(r: Render, g: Grid, row: int, target: int) -> bool {
+    let motion_cost = 4
+    var reemit_cost = 0
+    if !r.pos_known || r.row != row || target <= r.col || target - r.col > 3 || !r.pen_known {
+        return false
+    }
+    let pen_attrs = terminal_attrs(r.attrs, r.undercurl)
+    let pen_ul = underline_selector(r, r.attrs)
+    var col = r.col
+    while col < target {
+        let cell = copy g.back[row * g.cols + col]
+        let cell_attrs = terminal_attrs(cell.attrs, r.undercurl)
+        if cell.w != 1 || cell_attrs != pen_attrs || underline_selector(r, cell.attrs) != pen_ul ||
+            (!r.no_color && !r.plain && (!color_equal(cell.fg, r.fg) || !color_equal(cell.bg, r.bg))) {
+            return false
+        }
+        let len = cell_byte_len(g, cell)
+        if len >= motion_cost - reemit_cost {
+            return false
+        }
+        reemit_cost += len
+        col += 1
+    }
+    reemit_cost < motion_cost
+}
+
+fn move_to(mut r: Render, g: Grid, mut out: List[byte], row: int, col: int) {
+    if r.pos_known && r.row == row && r.col == col {
+        return
+    }
+    if can_reemit_gap(r, g, row, col) {
+        while r.col < col {
+            let cell = copy g.back[row * g.cols + r.col]
+            emit_cell(mut r, g, mut out, cell)
+        }
+        return
+    }
+    if r.pos_known && r.row == row && col > r.col {
+        put_str(mut out, "\x1b[")
+        decimal(mut out, col - r.col)
+        (mut out).push(67 as byte)
+        r.col = col
+        return
+    }
+    cup(mut r, mut out, row, col)
+}
+
+fn blank_tail(g: Grid, row: int, col: int) -> bool {
+    if g.cols - col < 6 {
+        return false
+    }
+    let base = row * g.cols
+    var i = col
+    while i < g.cols {
+        let cell = copy g.back[base + i]
+        if cell_interned(cell) || cell_byte(cell, 0) != 0 || cell.w != 1 || cell.bg.tag != COLOR_DEFAULT || cell.attrs != 0 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn has_changes(g: Grid) -> bool {
+    let lo = if g.dmg_lo < g.rows then g.dmg_lo else g.rows
+    let hi = if g.dmg_hi < g.rows then g.dmg_hi else g.rows
+    var row = lo
+    while row < hi {
+        let d = g.dmg[row]
+        let c0 = if d.lo < g.cols then d.lo else g.cols
+        let c1 = if d.hi < g.cols then d.hi else g.cols
+        var col = c0
+        while col < c1 {
+            let at = row * g.cols + col
+            if !cell_eq(g.front[at], g.back[at]) {
+                return true
+            }
+            col += 1
+        }
+        row += 1
+    }
+    false
+}
+
+fn cursor_shape(mut r: Render, g: Grid, mut out: List[byte]) {
+    if g.cur_shape == CURSOR_BLOCK {
+        put_str(mut out, "\x1b[2 q")
+    } else if g.cur_shape == CURSOR_BAR {
+        put_str(mut out, "\x1b[6 q")
+    } else {
+        util.bug("term.render", "renderer received invalid cursor shape")
+        return
+    }
+    r.cursor_shape = g.cur_shape
+    r.cursor_generation = g.cursor_generation
+}
+
+/// Render one frame (`yew_render_frame`, `render.c:781-884`): the bytes
+/// appended to `out`, their count answered. Zero bytes for no change; a
+/// cursor-only delta when only the cursor moved; else the envelope — BSU
+/// iff sync, hide, [shape], the damaged runs, [59m], the final CUP, show
+/// iff visible, ESU iff sync — then the out-of-band queue.
+pub fn render_frame(mut r: Render, g: Grid, mut out: List[byte]) -> int {
+    let start = out.len
+    r.frames += 1
+    if g.rows == 0 || g.cols == 0 {
+        return render_finish(mut r, mut out, start, out.len)
+    }
+    let cells_changed = has_changes(g)
+    let cursor_changed = r.cursor_known && (r.row != g.cur_row || r.col != g.cur_col || r.cursor_visible != g.cur_vis)
+    let shape_changed = r.cursor_generation != g.cursor_generation || r.cursor_shape != g.cur_shape
+    if !cells_changed && !cursor_changed && (!shape_changed || !r.cursor_known) {
+        return render_finish(mut r, mut out, start, out.len)
+    }
+    if !cells_changed {
+        if r.sync {
+            put_str(mut out, "\x1b[?2026h")
+        }
+        if shape_changed {
+            cursor_shape(mut r, g, mut out)
+        }
+        cup(mut r, mut out, g.cur_row, g.cur_col)
+        if r.cursor_visible != g.cur_vis {
+            put_str(mut out, if g.cur_vis then "\x1b[?25h" else "\x1b[?25l")
+        }
+        if r.sync {
+            put_str(mut out, "\x1b[?2026l")
+        }
+        r.cursor_known = true
+        r.cursor_visible = g.cur_vis
+        return render_finish(mut r, mut out, start, out.len)
+    }
+    r.pos_known = false
+    r.pen_known = false
+    if r.sync {
+        put_str(mut out, "\x1b[?2026h")
+    }
+    put_str(mut out, "\x1b[?25l")
+    if shape_changed {
+        cursor_shape(mut r, g, mut out)
+    }
+    let lo = if g.dmg_lo < g.rows then g.dmg_lo else g.rows
+    let hi = if g.dmg_hi < g.rows then g.dmg_hi else g.rows
+    var row = lo
+    while row < hi {
+        let d = g.dmg[row]
+        var col = if d.lo < g.cols then d.lo else g.cols
+        let end = if d.hi < g.cols then d.hi else g.cols
+        while col < end {
+            let at = row * g.cols + col
+            let cell = copy g.back[at]
+            if cell_eq(g.front[at], cell) || cell.w == 0 {
+                col += 1
+                continue
+            }
+            move_to(mut r, g, mut out, row, col)
+            if blank_tail(g, row, col) {
+                set_style(mut r, mut out, cell)
+                put_str(mut out, "\x1b[K")
+                break
+            }
+            if printable_ascii_cell(cell) {
+                col = emit_printable_ascii_run(mut r, g, mut out, row, col, end)
+                continue
+            }
+            emit_cell(mut r, g, mut out, cell)
+            col += if cell.w == 2 then 2 else 1
+        }
+        row += 1
+    }
+    if underline_selector(r, r.attrs) != 0 {
+        put_str(mut out, "\x1b[59m")
+        r.attrs = r.attrs - (r.attrs & CELL_UL_MASK)
+    }
+    cup(mut r, mut out, g.cur_row, g.cur_col)
+    if g.cur_vis {
+        put_str(mut out, "\x1b[?25h")
+    }
+    if r.sync {
+        put_str(mut out, "\x1b[?2026l")
+    }
+    r.cursor_known = true
+    r.cursor_visible = g.cur_vis
+    render_finish(mut r, mut out, start, out.len)
+}

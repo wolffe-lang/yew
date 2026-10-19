@@ -1,0 +1,908 @@
+//! term.grid — the cell grid: the front/back double buffer with per-row
+//! damage spans, wide-glyph pairs with the three rules, the cursor.
+//!
+//! Ports sagitta `src/term/grid.c` (650 lines) and `grid.h` (142) at
+//! 9ace98c2, under `s05-grid-and-render.md` §1-§4. Damage is a span per
+//! row (`[lo, hi)`), the diff compares cells inside it; a resize forgets
+//! the physical screen (`front.w = 255`) and marks every row. A width-2
+//! cluster is a head (`w = 2`) and a continuation (`w = 0`) with the
+//! head's style; writing on either half destroys the other
+//! (`break_pair`); a wide glyph at the last column is a styled space; the
+//! cursor snaps left off a continuation.
+//!
+//! The wolf shapes. C's `Cell` is 20 bytes: a union of eight inline UTF-8
+//! bytes or an intern id, two 4-byte colours, `attrs`, `w`, `flags`. The
+//! port's `Cell` packs the eight bytes into two ints (`lo` bytes 0-3, `hi`
+//! bytes 4-7, little-endian; the intern id in `lo` when `CELL_INTERNED`)
+//! so a cell is Copy, a put allocates nothing, and `cell_eq` is a field
+//! compare — thirteen ints, which the note records against C's 20 bytes.
+//! The interner is the grid's own (`gi`), not a pointer handed in; the
+//! renderer reads it through the grid. The `cursor_overlay_*` fields of
+//! Sprint 57 land with the UI lanes that read them.
+
+use unicode
+use util
+
+/// `YewColor.tag`: the terminal's default.
+pub const COLOR_DEFAULT: int = 0
+
+/// An indexed colour (`r` is the index, 0-255).
+pub const COLOR_INDEXED: int = 1
+
+/// A 24-bit colour.
+pub const COLOR_RGB: int = 2
+
+/// `attrs` bits (`grid.h:25-43`): bold.
+pub const ATTR_BOLD: int = 1
+
+/// Dim.
+pub const ATTR_DIM: int = 2
+
+/// Italic.
+pub const ATTR_ITALIC: int = 4
+
+/// Underline.
+pub const ATTR_UNDERLINE: int = 8
+
+/// Undercurl (`4:3`, truecolor terminals; plain underline elsewhere).
+pub const ATTR_UNDERCURL: int = 16
+
+/// Blink.
+pub const ATTR_BLINK: int = 32
+
+/// Reverse.
+pub const ATTR_REVERSE: int = 64
+
+/// Conceal.
+pub const ATTR_CONCEAL: int = 128
+
+/// Strike.
+pub const ATTR_STRIKE: int = 256
+
+/// Overline.
+pub const ATTR_OVERLINE: int = 512
+
+/// The underline-colour selector's shift (two bits above the attrs).
+pub const CELL_UL_SHIFT: int = 10
+
+/// The underline-colour selector's mask.
+pub const CELL_UL_MASK: int = 3072
+
+/// The error underline colour.
+pub const CELL_UL_ERROR: int = 1024
+
+/// The warning underline colour.
+pub const CELL_UL_WARN: int = 2048
+
+/// The info underline colour.
+pub const CELL_UL_INFO: int = 3072
+
+/// The cell carries a lowered invalid byte (rendered reverse).
+pub const ATTR_INVALID_BYTE: int = 4096
+
+/// Every attribute bit a cell may hold.
+pub const CELL_ATTR_MASK: int = 8191
+
+/// `flags`: the glyph is an intern id, not inline bytes.
+pub const CELL_INTERNED: int = 1
+
+/// `grid_overlay` fields: the foreground.
+pub const OVERLAY_FG: int = 1
+
+/// The background.
+pub const OVERLAY_BG: int = 2
+
+/// The attributes.
+pub const OVERLAY_ATTRS: int = 4
+
+/// The cursor shapes (`YewCursorShape`): block.
+pub const CURSOR_BLOCK: int = 0
+
+/// Bar.
+pub const CURSOR_BAR: int = 1
+
+/// The port's `Cell` in ints, for the record beside C's 20 bytes.
+pub const CELL_INTS: int = 13
+
+/// A colour (`YewColor`, `grid.h:10-15`): `tag` says which of `r`/`g`/`b`
+/// mean anything (indexed: `r` is the index).
+pub struct Color {
+    tag: int,
+    r: int,
+    g: int,
+    b: int,
+}
+
+/// The terminal's default colour.
+pub fn color_default() -> Color {
+    Color { tag: COLOR_DEFAULT, r: 0, g: 0, b: 0 }
+}
+
+/// A 24-bit colour.
+pub fn color_rgb(r: int, g: int, b: int) -> Color {
+    Color { tag: COLOR_RGB, r: r, g: g, b: b }
+}
+
+/// An indexed colour.
+pub fn color_indexed(index: int) -> Color {
+    Color { tag: COLOR_INDEXED, r: index, g: 0, b: 0 }
+}
+
+/// Whether two colours are the same colour (`color_equal`, `render.c:251`).
+pub fn color_equal(a: Color, b: Color) -> bool {
+    if a.tag != b.tag {
+        return false
+    }
+    if a.tag == COLOR_DEFAULT {
+        return true
+    }
+    if a.tag == COLOR_INDEXED {
+        return a.r == b.r
+    }
+    a.r == b.r && a.g == b.g && a.b == b.b
+}
+
+// A colour as a cell stores it (`color_normalize`, `grid.c:68-77`): an
+// unknown tag is the default; an indexed colour carries only its index.
+fn color_normalize(c: Color) -> Color {
+    if c.tag == COLOR_DEFAULT || c.tag > COLOR_RGB {
+        return color_default()
+    }
+    if c.tag == COLOR_INDEXED {
+        return Color { tag: COLOR_INDEXED, r: c.r, g: 0, b: 0 }
+    }
+    c
+}
+
+/// A cell (`Cell`, `grid.h:78-88`): the inline cluster packed in `lo`/`hi`
+/// (or the intern id in `lo` under `CELL_INTERNED`), its style, its width
+/// (1, 2 for a head, 0 for a continuation; 255 marks an unknown physical
+/// cell in `front`).
+pub struct Cell {
+    lo: int,
+    hi: int,
+    fg: Color,
+    bg: Color,
+    attrs: int,
+    w: int,
+    flags: int,
+}
+
+/// The blank cell: no glyph, default colours, width 1 (`g->blank`).
+pub fn cell_blank() -> Cell {
+    Cell { lo: 0, hi: 0, fg: color_default(), bg: color_default(), attrs: 0, w: 1, flags: 0 }
+}
+
+/// Inline byte `i` (0-7) of a cell, 0 past its cluster (`c->utf8[i]`).
+pub fn cell_byte(c: Cell, i: int) -> int {
+    if i < 4 {
+        return (c.lo >> (8 * i)) & 255
+    }
+    (c.hi >> (8 * (i - 4))) & 255
+}
+
+/// The inline cluster's byte length (`inline_len`, `grid.c:99-106`).
+pub fn cell_inline_len(c: Cell) -> int {
+    var n = 0
+    while n < 8 && cell_byte(c, n) != 0 {
+        n += 1
+    }
+    n
+}
+
+/// Whether the cell is interned (`flags & CELL_INTERNED`).
+pub fn cell_interned(c: Cell) -> bool {
+    (c.flags & CELL_INTERNED) != 0
+}
+
+/// The intern id of an interned cell (`c->id`).
+pub fn cell_id(c: Cell) -> int {
+    c.lo
+}
+
+fn pack_bytes(s: List[byte], at: int, n: int) -> (int, int) {
+    var lo = 0
+    var hi = 0
+    var i = 0
+    while i < n {
+        let b = s[at + i] as int
+        if i < 4 {
+            lo = lo + (b << (8 * i))
+        } else {
+            hi = hi + (b << (8 * (i - 4)))
+        }
+        i += 1
+    }
+    (lo, hi)
+}
+
+/// Whether two cells are the same (`yew_cell_eq`, a 20-byte `memcmp`).
+pub fn cell_eq(a: Cell, b: Cell) -> bool {
+    a.lo == b.lo && a.hi == b.hi && a.fg.tag == b.fg.tag && a.fg.r == b.fg.r && a.fg.g == b.fg.g &&
+        a.fg.b == b.fg.b && a.bg.tag == b.bg.tag && a.bg.r == b.bg.r && a.bg.g == b.bg.g &&
+        a.bg.b == b.bg.b && a.attrs == b.attrs && a.w == b.w && a.flags == b.flags
+}
+
+/// A row's damage span `[lo, hi)`; `lo >= hi` is clean (`Damage`).
+pub struct Damage {
+    lo: int,
+    hi: int,
+}
+
+/// The grid (`Grid`, `grid.h:97-117`).
+pub struct Grid {
+    rows: int,
+    cols: int,
+    front: List[Cell],
+    back: List[Cell],
+    dmg: List[Damage],
+    dmg_lo: int,
+    dmg_hi: int,
+    gi: util.Interner,
+    cur_row: int,
+    cur_col: int,
+    cur_vis: bool,
+    cur_shape: int,
+    cursor_generation: int,
+    blank: Cell,
+}
+
+fn damage_reset(mut g: Grid) {
+    var row = 0
+    while row < g.rows {
+        g.dmg[row] = Damage { lo: g.cols, hi: 0 }
+        row += 1
+    }
+    g.dmg_lo = g.rows
+    g.dmg_hi = 0
+}
+
+fn damage_add(mut g: Grid, row: int, lo: int, hi_in: int) {
+    if row >= g.rows || lo >= hi_in || lo >= g.cols {
+        return
+    }
+    var hi = hi_in
+    if hi > g.cols {
+        hi = g.cols
+    }
+    let d = g.dmg[row]
+    if d.lo >= d.hi {
+        g.dmg[row] = Damage { lo: lo, hi: hi }
+    } else {
+        var nlo = d.lo
+        var nhi = d.hi
+        if lo < nlo {
+            nlo = lo
+        }
+        if hi > nhi {
+            nhi = hi
+        }
+        g.dmg[row] = Damage { lo: nlo, hi: nhi }
+    }
+    if row < g.dmg_lo {
+        g.dmg_lo = row
+    }
+    if row + 1 > g.dmg_hi {
+        g.dmg_hi = row + 1
+    }
+}
+
+// Clear whichever pair overlaps `col`, widening the span the caller will
+// commit (`break_pair`, `grid.c:47-66`). Answers the widened `(lo, hi)`.
+fn break_pair(mut g: Grid, row: int, col: int, lo_in: int, hi_in: int) -> (int, int) {
+    var lo = lo_in
+    var hi = hi_in
+    let base = row * g.cols
+    if g.back[base + col].w == 0 && col > 0 {
+        g.back[base + col - 1] = copy g.blank
+        if col - 1 < lo {
+            lo = col - 1
+        }
+    }
+    if g.back[base + col].w == 2 && col + 1 < g.cols {
+        g.back[base + col + 1] = copy g.blank
+    }
+    if col < lo {
+        lo = col
+    }
+    if col + 2 < g.cols {
+        if col + 2 > hi {
+            hi = col + 2
+        }
+    } else if g.cols > hi {
+        hi = g.cols
+    }
+    (lo, hi)
+}
+
+fn cell_make(mut gi: util.Interner, s: List[byte], at: int, n: int, fg: Color, bg: Color, attrs: int, width: int) -> Cell {
+    var c = cell_blank()
+    c.fg = color_normalize(fg)
+    c.bg = color_normalize(bg)
+    c.attrs = attrs & CELL_ATTR_MASK
+    c.w = width
+    if n <= 8 {
+        let (lo, hi) = pack_bytes(s, at, n)
+        c.lo = lo
+        c.hi = hi
+    } else {
+        let text = str_from_utf8(s[at..at + n]) else {
+            util.bug("term.grid", "cluster to intern is not UTF-8")
+            return c
+        }
+        c.lo = util.intern(mut gi, text)
+        c.flags = CELL_INTERNED
+    }
+    c
+}
+
+/// The cluster bytes of a cell appended to `dst` (inline or interned), for
+/// the renderer and the join of a zero-width mark.
+pub fn cell_bytes_into(mut dst: List[byte], g: Grid, c: Cell) {
+    if cell_interned(c) {
+        let text = util.intern_str(g.gi, c.lo) else {
+            util.bug("term.grid", "cell contains invalid grapheme intern id {c.lo}")
+            return
+        }
+        for b in text.bytes() {
+            (mut dst).push(b)
+        }
+        return
+    }
+    var i = 0
+    while i < 8 {
+        let b = cell_byte(c, i)
+        if b == 0 {
+            break
+        }
+        (mut dst).push(b as byte)
+        i += 1
+    }
+}
+
+// Append a zero-width cluster to the cell before `col` (`append_zero_width`,
+// `grid.c:108-229`): a fragment can turn its ASCII base into a two-cell
+// keycap, so the joined cluster is revalidated and the geometry updated.
+fn append_zero_width(mut g: Grid, row: int, col: int, s: List[byte], at: int, n: int) -> int {
+    if col == 0 || row >= g.rows || col > g.cols {
+        util.log_warn("dropping zero-width cluster without a base")
+        return col
+    }
+    let base_row = row * g.cols
+    var base_col = col - 1
+    if g.back[base_row + base_col].w == 0 {
+        if base_col == 0 || g.back[base_row + base_col - 1].w != 2 {
+            util.log_warn("dropping zero-width cluster after orphan continuation")
+            return col
+        }
+        base_col -= 1
+    }
+    let base = copy g.back[base_row + base_col]
+    if base.w != 1 && base.w != 2 {
+        util.log_warn("dropping zero-width cluster without a base")
+        return col
+    }
+    if !cell_interned(base) && cell_byte(base, 0) == 0 {
+        util.log_warn("dropping zero-width cluster after a blank")
+        return col
+    }
+    var joined = List[byte]()
+    cell_bytes_into(mut joined, g, base)
+    let old_n = joined.len
+    var i = 0
+    while i < n {
+        (mut joined).push(s[at + i])
+        i += 1
+    }
+    let total = old_n + n
+    if unicode.gb_next_bytes(joined, total, 0) != total {
+        util.log_warn("dropping zero-width fragment that does not join its base")
+        return col
+    }
+    let joined_width = unicode.cluster_width(joined, 0, total)
+    if joined_width != 1 && joined_width != 2 {
+        util.log_warn("dropping zero-width fragment with unsupported joined width {joined_width}")
+        return col
+    }
+    let old_width = base.w
+    var lo = base_col
+    var hi = base_col + old_width
+    if joined_width == 2 && old_width == 1 {
+        if base_col + 1 >= g.cols {
+            var space = List[byte]()
+            (mut space).push(32 as byte)
+            g.back[base_row + base_col] = cell_make(mut g.gi, space, 0, 1, base.fg, base.bg, base.attrs, 1)
+            damage_add(mut g, row, base_col, base_col + 1)
+            return g.cols
+        }
+        let (nlo, nhi) = break_pair(mut g, row, base_col + 1, lo, hi)
+        lo = nlo
+        hi = nhi
+    } else if joined_width == 1 && old_width == 2 {
+        g.back[base_row + base_col + 1] = copy g.blank
+    }
+    var updated = copy base
+    if total <= 8 {
+        let (lo_b, hi_b) = pack_bytes(joined, 0, total)
+        updated.lo = lo_b
+        updated.hi = hi_b
+        updated.flags = 0
+    } else {
+        let text = str_from_utf8(joined) else {
+            util.bug("term.grid", "joined cluster is not UTF-8")
+            return col
+        }
+        updated.lo = util.intern(mut g.gi, text)
+        updated.hi = 0
+        updated.flags = CELL_INTERNED
+    }
+    updated.w = joined_width
+    g.back[base_row + base_col] = updated
+    if joined_width == 2 {
+        var tail = cell_blank()
+        tail.fg = updated.fg
+        tail.bg = updated.bg
+        tail.attrs = updated.attrs
+        tail.w = 0
+        g.back[base_row + base_col + 1] = tail
+        if g.cur_row == row && g.cur_col == base_col + 1 {
+            g.cur_col = base_col
+        }
+    }
+    if base_col + joined_width > hi {
+        hi = base_col + joined_width
+    }
+    damage_add(mut g, row, lo, hi)
+    base_col + joined_width
+}
+
+fn put_ascii_expansion(mut g: Grid, row: int, col_in: int, bytes: List[byte], fg: Color, bg: Color, attrs: int) -> int {
+    var col = col_in
+    var i = 0
+    while i < bytes.len && col < g.cols {
+        col = grid_put(mut g, row, col, bytes, i, i + 1, fg, bg, attrs)
+        i += 1
+    }
+    col
+}
+
+// The bulk write of a printable-ASCII run (`put_printable_ascii_run`,
+// `grid.c:242-270`): one template cell, one byte a cell.
+fn put_printable_ascii_run(mut g: Grid, row: int, col: int, s: List[byte], at: int, n: int, fg: Color, bg: Color, attrs: int) -> int {
+    let available = g.cols - col
+    let count = if n < available then n else available
+    if count == 0 {
+        return col
+    }
+    var lo = col
+    var hi = col + count
+    let (lo1, hi1) = break_pair(mut g, row, col, lo, hi)
+    lo = lo1
+    hi = hi1
+    if count > 1 {
+        let (lo2, hi2) = break_pair(mut g, row, col + count - 1, lo, hi)
+        lo = lo2
+        hi = hi2
+    }
+    var cell = cell_blank()
+    cell.fg = color_normalize(fg)
+    cell.bg = color_normalize(bg)
+    cell.attrs = attrs & CELL_ATTR_MASK
+    cell.w = 1
+    let base = row * g.cols
+    var i = 0
+    while i < count {
+        cell.lo = s[at + i] as int
+        g.back[base + col + i] = copy cell
+        i += 1
+    }
+    damage_add(mut g, row, lo, hi)
+    col + count
+}
+
+// A control, C1 or invalid byte lowered to printable cells
+// (`control_expansion`, `grid.c:272-297`): `<XX>` or `^X`. Answers
+// (lowered, the bytes, invalid).
+fn control_expansion(s: List[byte], at: int, n: int) -> (bool, List[byte], bool) {
+    let (cp, _) = unicode.utf8_decode(s, at, at + n)
+    let invalid = unicode.utf8_is_escape(cp)
+    var out = List[byte]()
+    if invalid || (cp >= 128 && cp <= 159) {
+        let b = if invalid then unicode.utf8_escape_byte(cp) else cp
+        let hex = "0123456789ABCDEF"
+        (mut out).push(60 as byte)
+        (mut out).push(hex.bytes()[b >> 4])
+        (mut out).push(hex.bytes()[b & 15])
+        (mut out).push(62 as byte)
+        return (true, out, invalid)
+    }
+    if cp <= 31 || cp == 127 {
+        (mut out).push(94 as byte)
+        (mut out).push((if cp == 127 then 63 else cp + 64) as byte)
+        return (true, out, false)
+    }
+    (false, out, false)
+}
+
+/// A grid of `rows` × `cols` blank cells with an unknown physical screen
+/// (`yew_grid_init`, `grid.c:299-308`).
+pub fn grid_new(rows: int, cols: int) -> Grid {
+    var g = Grid {
+        rows: 0,
+        cols: 0,
+        front: List[Cell](),
+        back: List[Cell](),
+        dmg: List[Damage](),
+        dmg_lo: 0,
+        dmg_hi: 0,
+        gi: util.interner_new(),
+        cur_row: 0,
+        cur_col: 0,
+        cur_vis: false,
+        cur_shape: CURSOR_BLOCK,
+        cursor_generation: 0,
+        blank: cell_blank(),
+    }
+    let _ = grid_resize(mut g, rows, cols)
+    g
+}
+
+/// Resize (`yew_grid_resize`, `grid.c:320-357`): both buffers reallocated,
+/// `front` filled with a value no real cell equals (`w = 255`), the cursor
+/// clamped, every row marked. Preserving `front` across a resize is the
+/// classic post-resize garbage screen.
+pub fn grid_resize(mut g: Grid, rows: int, cols: int) -> bool {
+    let count = rows * cols
+    var front = List[Cell]()
+    var back = List[Cell]()
+    var i = 0
+    while i < count {
+        var unknown = cell_blank()
+        unknown.w = 255
+        (mut front).push(unknown)
+        (mut back).push(copy g.blank)
+        i += 1
+    }
+    var dmg = List[Damage]()
+    i = 0
+    while i < rows {
+        (mut dmg).push(Damage { lo: 0, hi: 0 })
+        i += 1
+    }
+    g.front = front
+    g.back = back
+    g.dmg = dmg
+    g.rows = rows
+    g.cols = cols
+    if rows == 0 {
+        g.cur_row = 0
+    } else if g.cur_row >= rows {
+        g.cur_row = rows - 1
+    }
+    if cols == 0 {
+        g.cur_col = 0
+    } else if g.cur_col >= cols {
+        g.cur_col = cols - 1
+    }
+    damage_reset(mut g)
+    grid_mark_all(mut g)
+    true
+}
+
+/// `back := blank` everywhere, every row marked (`yew_grid_clear`).
+pub fn grid_clear(mut g: Grid) {
+    let count = g.rows * g.cols
+    var i = 0
+    while i < count {
+        g.back[i] = copy g.blank
+        i += 1
+    }
+    grid_mark_all(mut g)
+}
+
+/// Forget the physical image, keep the desired one (`yew_grid_invalidate`):
+/// the next frame emits every cell.
+pub fn grid_invalidate(mut g: Grid) {
+    let count = g.rows * g.cols
+    var i = 0
+    while i < count {
+        var c = copy g.front[i]
+        c.w = 255
+        g.front[i] = c
+        i += 1
+    }
+    grid_mark_all(mut g)
+}
+
+/// Write one cluster (`s[at..end]`) at `(row, col)` with a style
+/// (`yew_grid_put`, `grid.c:385-452`); answers the next column. A control
+/// or invalid byte is lowered to printable cells; a zero-width cluster
+/// joins the cell before it; a wide glyph at the last column is a styled
+/// space and answers `cols`.
+pub fn grid_put(mut g: Grid, row: int, col: int, s: List[byte], at: int, end: int, fg: Color, bg: Color, attrs_in: int) -> int {
+    let n = end - at
+    if row >= g.rows || col > g.cols || n <= 0 {
+        return if col > g.cols then g.cols else col
+    }
+    if n == 1 && s[at] as int == 9 {
+        util.log_warn("dropping unresolved tab passed to grid")
+        return col
+    }
+    let width = unicode.cluster_width(s, at, end)
+    let (lowered, expanded, invalid) = control_expansion(s, at, n)
+    if lowered {
+        var attrs = attrs_in
+        if invalid {
+            attrs = attrs | ATTR_INVALID_BYTE
+        }
+        return put_ascii_expansion(mut g, row, col, expanded, fg, bg, attrs)
+    }
+    if width == 0 {
+        return append_zero_width(mut g, row, col, s, at, n)
+    }
+    if col == g.cols {
+        return col
+    }
+    if width != 1 && width != 2 {
+        util.log_warn("dropping cluster with unsupported width {width}")
+        return col
+    }
+    let base = row * g.cols
+    var lo = col
+    var hi = col + 1
+    let (lo1, hi1) = break_pair(mut g, row, col, lo, hi)
+    lo = lo1
+    hi = hi1
+    if width == 2 && col + 1 >= g.cols {
+        var space = List[byte]()
+        (mut space).push(32 as byte)
+        g.back[base + col] = cell_make(mut g.gi, space, 0, 1, fg, bg, attrs_in, 1)
+        damage_add(mut g, row, lo, hi)
+        return g.cols
+    }
+    if width == 2 {
+        let (lo2, hi2) = break_pair(mut g, row, col + 1, lo, hi)
+        lo = lo2
+        hi = hi2
+    }
+    let head = cell_make(mut g.gi, s, at, n, fg, bg, attrs_in, width)
+    g.back[base + col] = copy head
+    if width == 2 {
+        var tail = cell_blank()
+        tail.fg = head.fg
+        tail.bg = head.bg
+        tail.attrs = head.attrs
+        tail.w = 0
+        g.back[base + col + 1] = tail
+        if g.cur_row == row && g.cur_col == col + 1 {
+            g.cur_col = col
+        }
+    }
+    damage_add(mut g, row, lo, hi)
+    col + width
+}
+
+/// Write a byte string, segmented into clusters (`yew_grid_puts`,
+/// `grid.c:454-487`), with the printable-ASCII bulk path that keeps the
+/// last ASCII byte for the grapheme walker (a keycap or combining suffix
+/// may own it, YEW-F-003).
+pub fn grid_puts(mut g: Grid, row: int, col_in: int, s: List[byte], at: int, end: int, fg: Color, bg: Color, attrs: int) -> int {
+    var col = col_in
+    if row >= g.rows {
+        return col
+    }
+    var pos = at
+    while pos < end && col < g.cols {
+        let b = s[pos] as int
+        if b >= 32 && b <= 126 {
+            var run_end = pos + 1
+            while run_end < end && (s[run_end] as int) >= 32 && (s[run_end] as int) <= 126 {
+                run_end += 1
+            }
+            if run_end == end || run_end - pos > 1 {
+                if run_end != end {
+                    run_end -= 1
+                }
+                col = put_printable_ascii_run(mut g, row, col, s, pos, run_end - pos, fg, bg, attrs)
+                pos = run_end
+                continue
+            }
+        }
+        let next = unicode.gb_next_bytes(s, end, pos)
+        if next <= pos || next > end {
+            util.bug("term.grid", "grapheme iterator returned invalid grid boundary")
+            return col
+        }
+        col = grid_put(mut g, row, col, s, pos, next, fg, bg, attrs)
+        pos = next
+    }
+    col
+}
+
+/// Fill `[c0, c1)` of a row with one cell (`yew_grid_fill`, `grid.c:489-545`):
+/// a template whose width is not 1 fills with styled blanks; a glyph must
+/// be one printable width-1 cluster.
+pub fn grid_fill(mut g: Grid, row: int, c0: int, c1_in: int, template: Cell) {
+    if row >= g.rows || c0 >= g.cols || c0 >= c1_in {
+        return
+    }
+    var c1 = c1_in
+    if c1 > g.cols {
+        c1 = g.cols
+    }
+    var lo = c0
+    var hi = c1
+    let (lo1, hi1) = break_pair(mut g, row, c0, lo, hi)
+    lo = lo1
+    hi = hi1
+    if c1 - 1 != c0 {
+        let (lo2, hi2) = break_pair(mut g, row, c1 - 1, lo, hi)
+        lo = lo2
+        hi = hi2
+    }
+    var c = copy template
+    if c.w != 1 {
+        let fg = c.fg
+        let bg = c.bg
+        let attrs = c.attrs
+        c = copy g.blank
+        c.fg = color_normalize(fg)
+        c.bg = color_normalize(bg)
+        c.attrs = attrs & CELL_ATTR_MASK
+    } else {
+        c.fg = color_normalize(c.fg)
+        c.bg = color_normalize(c.bg)
+        c.attrs = c.attrs & CELL_ATTR_MASK
+        c.flags = c.flags & CELL_INTERNED
+        var data = List[byte]()
+        cell_bytes_into(mut data, g, c)
+        if cell_interned(c) && data.len == 0 {
+            util.bug("term.grid", "grid fill contains invalid grapheme intern id {c.lo}")
+            return
+        }
+        if data.len != 0 &&
+            (unicode.gb_next_bytes(data, data.len, 0) != data.len || unicode.cluster_width(data, 0, data.len) != 1) {
+            util.bug("term.grid", "grid fill requires one printable width-1 grapheme")
+            return
+        }
+    }
+    let base = row * g.cols
+    var col = c0
+    while col < c1 {
+        g.back[base + col] = copy c
+        col += 1
+    }
+    damage_add(mut g, row, lo, hi)
+}
+
+/// Apply style fields over `[c0, c1)` without touching glyphs
+/// (`yew_grid_overlay`, `grid.c:547-577`); a wide pair is styled whole.
+pub fn grid_overlay(mut g: Grid, row: int, c0_in: int, c1_in: int, style: Cell, fields: int) {
+    if row >= g.rows || c0_in >= c1_in || c0_in >= g.cols {
+        return
+    }
+    var c0 = c0_in
+    var c1 = c1_in
+    if c1 > g.cols {
+        c1 = g.cols
+    }
+    let base = row * g.cols
+    if g.back[base + c0].w == 0 && c0 > 0 {
+        c0 -= 1
+    }
+    if c1 < g.cols && g.back[base + c1 - 1].w == 2 {
+        c1 += 1
+    }
+    var col = c0
+    while col < c1 {
+        var c = copy g.back[base + col]
+        if (fields & OVERLAY_FG) != 0 {
+            c.fg = color_normalize(style.fg)
+        }
+        if (fields & OVERLAY_BG) != 0 {
+            c.bg = color_normalize(style.bg)
+        }
+        if (fields & OVERLAY_ATTRS) != 0 {
+            let attrs = style.attrs & CELL_ATTR_MASK
+            if (attrs & CELL_UL_MASK) != 0 {
+                c.attrs = c.attrs - (c.attrs & CELL_UL_MASK)
+            }
+            c.attrs = c.attrs | attrs
+        }
+        g.back[base + col] = c
+        col += 1
+    }
+    damage_add(mut g, row, c0, c1)
+}
+
+/// Place the cursor (`yew_grid_cursor`, `grid.c:579-598`): clamped, and
+/// snapped left off a continuation.
+pub fn grid_cursor(mut g: Grid, row_in: int, col_in: int, visible: bool) {
+    if g.rows == 0 || g.cols == 0 {
+        g.cur_row = 0
+        g.cur_col = 0
+        g.cur_vis = false
+        return
+    }
+    var row = row_in
+    var col = col_in
+    if row >= g.rows {
+        row = g.rows - 1
+    }
+    if col >= g.cols {
+        col = g.cols - 1
+    }
+    if g.back[row * g.cols + col].w == 0 && col > 0 {
+        col -= 1
+    }
+    g.cur_row = row
+    g.cur_col = col
+    g.cur_vis = visible
+}
+
+/// Set the cursor shape (`yew_grid_cursor_shape`); a change bumps the
+/// generation the renderer watches.
+pub fn grid_cursor_shape(mut g: Grid, shape: int) {
+    if shape != CURSOR_BLOCK && shape != CURSOR_BAR {
+        util.bug("term.grid", "grid cursor: invalid shape")
+        return
+    }
+    if g.cur_shape == shape {
+        return
+    }
+    g.cur_shape = shape
+    g.cursor_generation += 1
+}
+
+/// Mark every row dirty end to end (`yew_grid_mark_all`).
+pub fn grid_mark_all(mut g: Grid) {
+    if g.rows == 0 || g.cols == 0 {
+        return
+    }
+    var row = 0
+    while row < g.rows {
+        g.dmg[row] = Damage { lo: 0, hi: g.cols }
+        row += 1
+    }
+    g.dmg_lo = 0
+    g.dmg_hi = g.rows
+    g.cursor_generation += 1
+}
+
+/// `back → front` over the damage, damage cleared (`yew_grid_flip`).
+pub fn grid_flip(mut g: Grid) {
+    var row = g.dmg_lo
+    while row < g.dmg_hi {
+        let d = g.dmg[row]
+        if d.lo < d.hi {
+            let base = row * g.cols
+            var col = d.lo
+            while col < d.hi {
+                g.front[base + col] = copy g.back[base + col]
+                col += 1
+            }
+        }
+        row += 1
+    }
+    damage_reset(mut g)
+}
+
+/// The back cell at `(row, col)` (a copy).
+pub fn grid_back(g: Grid, row: int, col: int) -> Cell {
+    copy g.back[row * g.cols + col]
+}
+
+/// The front cell at `(row, col)` (a copy).
+pub fn grid_front(g: Grid, row: int, col: int) -> Cell {
+    copy g.front[row * g.cols + col]
+}
+
+/// A row's damage span (a copy).
+pub fn grid_damage(g: Grid, row: int) -> Damage {
+    copy g.dmg[row]
+}
+
+/// Set a back cell directly (the invalid-cell drills of `test_render.c`).
+pub fn grid_set_back(mut g: Grid, row: int, col: int, c: Cell) {
+    g.back[row * g.cols + col] = c
+}
