@@ -299,6 +299,15 @@ maintainer.
   `[os.term.mode]`; (B) leave LF as `C-j` — Enter then neither accepts
   `:` nor breaks a line on any terminal (kitty keeps Enter legacy at
   C's flags). **Recommend A** (implemented, `bcf2163`).
+- **R-yw03-5 — `test_multicursor`'s two sync-count cases** (G3): (A)
+  KNOWN-RED by name, the bodies green, the one `fsync-file` per
+  transaction reported unobservable — R-yw02-2's shape (recommended,
+  implemented); (B) SKIP.
+- **R-yw03-6 — the paste key reaches R-yw02-3's STOP** (G30): (A) the
+  editor exits 4 by name where a subprocess clipboard reader is
+  detected, as yw02's reader does (implemented); (B) the paste refuses
+  with C's deferred status and a message naming G30, the session kept.
+  **Recommend B**, in yw04.
 - **R5 — the module-name collisions** (`unicode`, `term`, `search`
   against std): (A) the port keeps sagitta's names and aliases std
   where both are needed (recommended, done); (B) prefix the port's
