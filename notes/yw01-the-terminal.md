@@ -182,7 +182,15 @@ port, C again; 20 cold starts and 300 keys each, `target/perf/`):
 
 p99: starts C 14.4 ms (one outlier; the second C run 5.0 ms) / wolf 7.2
 ms; keys C 285 us / wolf 268 us. Both within 2.0; the step is in CI as
-an announced advisory (the hosted runner is unpinned). sagitta's own
+an announced advisory (the hosted runner is unpinned): the ubuntu leg
+of run 39356480306 printed **1.60** / **0.88** (C 2,084 → wolf 3,325 us;
+79 → 69 us; 10 starts, 100 keys), PASS. The macOS leg of the same run
+hung in that step for 56 minutes until the job's timeout cancelled it:
+a pty master whose child is gone answers an empty read forever on macOS
+(Linux raises `EIO`), and the driver's drain loop spun on it; e5654b4
+makes the child's end an error, adds a 240 s watchdog, and c492acb gives
+the step its own 10-minute timeout. Why the demo ended there is the
+next run's answer (the step prints it now). sagitta's own
 `perf_latency.c`/`perf_startup.c` drive the editor (`--workspace`,
 `--config`, a file) and so cannot measure the port before yw03; the
 same two points are measured over the demo by
