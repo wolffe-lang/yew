@@ -1,0 +1,661 @@
+//! text.cset — the cursor set: one primary caret and any number of
+//! others, kept sorted with overlaps merged, moved by every edit.
+//!
+//! Ports the set half of sagitta `src/edit/multicursor.c` (lines 1-600,
+//! 708-860 of 965) and `multicursor.h` (50) at 9ace98c2, under
+//! `s16-multicursor.md`'s set model. In sagitta it is `src/edit/`; here it
+//! is `text`'s, because the text layer holds a set (`EditCtx.cset`, the
+//! undo tree's cursor snapshots, the registers' paste) and `edit` (yw03)
+//! will import `text` (a cycle is E0303). The command fan-out
+//! (`yew_mc_run`, the skip plans, `command_original_range`) is campaign
+//! 03's and stays in yw03's `edit`. `SelStack` is `edit/motion.h`'s
+//! selection-expansion stack, carried in parallel as C carries it; the
+//! motions that push onto it are yw03's.
+//!
+//! The rules (`s16` §1): positions sorted ascending; overlapping or
+//! touching selections merge, and so do collapsed carets at one point;
+//! the primary survives every merge it takes part in; every caret has a
+//! nonzero identity stamp, monotonic across reseeds (YEW-F-079).
+
+use util
+
+/// `YEW_MC_MAX`.
+pub const MC_MAX: int = 10000
+
+/// `YEW_MC_ACTIVE_NONE` (C's `UINT32_MAX`).
+pub const MC_ACTIVE_NONE: int = -1
+
+/// `YEW_SEL_DEPTH`.
+pub const SEL_DEPTH: int = 16
+
+/// A selection-expansion stack (`SelStack`, `edit/motion.h:14-17`).
+pub struct SelStack {
+    s: List[Span],
+    n: int,
+}
+
+/// The empty stack.
+pub fn selstack_empty() -> SelStack {
+    SelStack { s: List[Span](), n: 0 }
+}
+
+/// A cursor set (`CursorSet`, `multicursor.h:16-26`).
+pub struct CursorSet {
+    curs: List[Cursor],
+    stamps: List[int],
+    selstacks: List[SelStack],
+    primary: int,
+    active: int,
+    next_stamp: int,
+    batch_delta: int,
+    batch_next: int,
+    batching: bool,
+}
+
+struct CursorItem {
+    cursor: Cursor,
+    stamp: int,
+    order: int,
+    stack_index: int,
+    primary: bool,
+    active: bool,
+}
+
+fn cursor_lo(c: Cursor) -> int {
+    if c.pos < c.anchor {
+        return c.pos
+    }
+    c.anchor
+}
+
+fn cursor_hi(c: Cursor) -> int {
+    if c.pos > c.anchor {
+        return c.pos
+    }
+    c.anchor
+}
+
+fn cursor_selected(c: Cursor) -> bool {
+    c.pos != c.anchor
+}
+
+// `cmp_pos` (by == 0) and `cmp_span_start` (by == 1) as a strict "a
+// before b".
+fn item_less(a: CursorItem, b: CursorItem, by: int) -> bool {
+    if by == 0 {
+        return a.cursor.pos < b.cursor.pos
+    }
+    cursor_lo(a.cursor) < cursor_lo(b.cursor)
+}
+
+// `yew_sort_stable` over cursor items: a bottom-up merge, a tie takes the
+// left run (the order util.sort_stable keeps). Local, so no function
+// value crosses a module boundary (G19/G20).
+fn sort_items(mut xs: List[CursorItem], by: int) {
+    let n = xs.len
+    if n < 2 {
+        return
+    }
+    var src = copy xs
+    var width = 1
+    while width < n {
+        var dst = List[CursorItem]()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if lo + 2 * width < n then lo + 2 * width else n
+            var i = lo
+            var j = mid
+            while i < mid && j < hi {
+                if item_less(src[j], src[i], by) {
+                    (mut dst).push(copy src[j])
+                    j += 1
+                } else {
+                    (mut dst).push(copy src[i])
+                    i += 1
+                }
+            }
+            while i < mid {
+                (mut dst).push(copy src[i])
+                i += 1
+            }
+            while j < hi {
+                (mut dst).push(copy src[j])
+                j += 1
+            }
+            lo = hi
+        }
+        src = dst
+        width *= 2
+    }
+    xs = src
+}
+
+fn spans_merge(lo: int, hi: int, selected: bool, c: Cursor) -> bool {
+    let other_lo = cursor_lo(c)
+    let other_hi = cursor_hi(c)
+    if other_lo > hi || other_hi < lo {
+        return false
+    }
+    if selected || cursor_selected(c) {
+        return true
+    }
+    lo == other_lo
+}
+
+fn merged_cursor(governing: CursorItem, lo: int, hi: int) -> Cursor {
+    var m = copy governing.cursor
+    if governing.cursor.pos < governing.cursor.anchor {
+        m.pos = lo
+        m.anchor = hi
+    } else {
+        m.pos = hi
+        m.anchor = lo
+    }
+    m
+}
+
+fn collapsed_strictly_sorted(cs: CursorSet) -> bool {
+    if cs.curs[0].pos != cs.curs[0].anchor {
+        return false
+    }
+    var i = 1
+    while i < cs.curs.len {
+        if cs.curs[i].pos != cs.curs[i].anchor || cs.curs[i - 1].pos >= cs.curs[i].pos {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `normalize_unclamped`, `multicursor.c:110-226`.
+fn normalize_unclamped(mut cs: CursorSet) {
+    if cs.curs.len == 0 {
+        util.bug("text.cset", "cursor set: empty set")
+    }
+    if cs.primary < 0 || cs.primary >= cs.curs.len {
+        util.bug("text.cset", "cursor set: primary index out of range")
+    }
+    if cs.stamps.len != cs.curs.len {
+        util.bug("text.cset", "cursor set: tracking length mismatch")
+    }
+    if cs.selstacks.len != cs.curs.len {
+        util.bug("text.cset", "cursor set: selection-stack length mismatch")
+    }
+    if cs.active != MC_ACTIVE_NONE && cs.active >= cs.curs.len {
+        util.bug("text.cset", "cursor set: active index out of range")
+    }
+    if collapsed_strictly_sorted(cs) {
+        cset_check(cs)
+        return
+    }
+    var items = List[CursorItem]()
+    var i = 0
+    while i < cs.curs.len {
+        (mut items).push(CursorItem {
+            cursor: copy cs.curs[i],
+            stamp: cs.stamps[i],
+            order: i,
+            stack_index: i,
+            primary: i == cs.primary,
+            active: i == cs.active,
+        })
+        i += 1
+    }
+    sort_items(mut items, 0)
+    i = 0
+    while i < items.len {
+        items[i].order = i
+        i += 1
+    }
+    sort_items(mut items, 1)
+    var groups = List[CursorItem]()
+    var group_stacks = List[SelStack]()
+    i = 0
+    while i < items.len {
+        var governing = copy items[i]
+        var point_survivor = copy items[i]
+        var lo = cursor_lo(items[i].cursor)
+        var hi = cursor_hi(items[i].cursor)
+        var selected = cursor_selected(items[i].cursor)
+        var primary = items[i].primary
+        var active = items[i].active
+        var j = i + 1
+        while j < items.len && spans_merge(lo, hi, selected, items[j].cursor) {
+            let next_lo = cursor_lo(items[j].cursor)
+            let next_hi = cursor_hi(items[j].cursor)
+            if next_lo < lo {
+                lo = next_lo
+            }
+            if next_hi > hi {
+                hi = next_hi
+            }
+            selected = selected || cursor_selected(items[j].cursor)
+            if items[j].order < point_survivor.order {
+                point_survivor = copy items[j]
+            }
+            if items[j].primary || !primary && items[j].order < governing.order {
+                governing = copy items[j]
+            }
+            primary = primary || items[j].primary
+            active = active || items[j].active
+            j += 1
+        }
+        if !selected && !primary {
+            governing = copy point_survivor
+        }
+        let gi = groups.len
+        (mut group_stacks).push(copy cs.selstacks[governing.stack_index])
+        (mut groups).push(CursorItem {
+            cursor: merged_cursor(governing, lo, hi),
+            stamp: governing.stamp,
+            order: governing.order,
+            stack_index: gi,
+            primary: primary,
+            active: active,
+        })
+        i = j
+    }
+    sort_items(mut groups, 0)
+    cs.primary = 0
+    cs.active = MC_ACTIVE_NONE
+    var curs = List[Cursor]()
+    var stamps = List[int]()
+    var stacks = List[SelStack]()
+    i = 0
+    while i < groups.len {
+        (mut curs).push(copy groups[i].cursor)
+        (mut stamps).push(groups[i].stamp)
+        (mut stacks).push(copy group_stacks[groups[i].stack_index])
+        if groups[i].primary {
+            cs.primary = i
+        }
+        if groups[i].active {
+            cs.active = i
+        }
+        i += 1
+    }
+    cs.curs = curs
+    cs.stamps = stamps
+    cs.selstacks = stacks
+    cset_check(cs)
+}
+
+/// A set holding `primary` alone (`yew_cset_init`).
+pub fn cset_init(primary: Cursor) -> CursorSet {
+    var cs = CursorSet {
+        curs: List[Cursor](),
+        stamps: List[int](),
+        selstacks: List[SelStack](),
+        primary: 0,
+        active: MC_ACTIVE_NONE,
+        next_stamp: 2,
+        batch_delta: 0,
+        batch_next: 0,
+        batching: false,
+    }
+    (mut cs.curs).push(copy primary)
+    (mut cs.stamps).push(1)
+    (mut cs.selstacks).push(selstack_empty())
+    cs
+}
+
+/// Add one caret; true when the set grew (`yew_cset_add`).
+pub fn cset_add(mut cs: CursorSet, c: Cursor) -> bool {
+    let old_len = cs.curs.len
+    var one = List[Cursor]()
+    (mut one).push(copy c)
+    if !cset_add_many(mut cs, one) {
+        return false
+    }
+    cs.curs.len > old_len
+}
+
+/// Add several carets, then normalize (`yew_cset_add_many`).
+pub fn cset_add_many(mut cs: CursorSet, cursors: List[Cursor]) -> bool {
+    if cs.curs.len + cursors.len > MC_MAX {
+        return false
+    }
+    if cursors.len == 0 {
+        return true
+    }
+    if cs.next_stamp == 0 {
+        cset_reseed(mut cs)
+    }
+    for c in cursors {
+        (mut cs.curs).push(copy c)
+        (mut cs.stamps).push(cs.next_stamp)
+        cs.next_stamp += 1
+        (mut cs.selstacks).push(selstack_empty())
+    }
+    normalize_unclamped(mut cs)
+    true
+}
+
+fn remove_at(mut cs: CursorSet, at: int) {
+    var c = List[Cursor]()
+    var s = List[int]()
+    var st = List[SelStack]()
+    var i = 0
+    while i < cs.curs.len {
+        if i != at {
+            (mut c).push(copy cs.curs[i])
+            (mut s).push(cs.stamps[i])
+            (mut st).push(copy cs.selstacks[i])
+        }
+        i += 1
+    }
+    cs.curs = c
+    cs.stamps = s
+    cs.selstacks = st
+}
+
+/// Drop the most recently added non-primary caret (`yew_cset_drop_latest`).
+pub fn cset_drop_latest(mut cs: CursorSet) -> bool {
+    if cs.curs.len == 0 || cs.primary >= cs.curs.len {
+        util.bug("text.cset", "cset_drop_latest: invalid set")
+    }
+    if cs.curs.len == 1 {
+        return false
+    }
+    var latest = if cs.primary == 0 then 1 else 0
+    var i = 0
+    while i < cs.curs.len {
+        if i != cs.primary && cs.stamps[i] > cs.stamps[latest] {
+            latest = i
+        }
+        i += 1
+    }
+    remove_at(mut cs, latest)
+    if cs.primary > latest {
+        cs.primary -= 1
+    }
+    if cs.active != MC_ACTIVE_NONE {
+        if cs.active > latest {
+            cs.active -= 1
+        } else if cs.active == latest {
+            cs.active = MC_ACTIVE_NONE
+        }
+    }
+    cset_check(cs)
+    true
+}
+
+/// Keep the primary caret alone (`yew_cset_remove_all_but_primary`).
+pub fn cset_remove_all_but_primary(mut cs: CursorSet) {
+    if cs.curs.len == 0 || cs.primary >= cs.curs.len {
+        util.bug("text.cset", "cset_remove_all_but_primary: invalid set")
+    }
+    let p = copy cs.curs[cs.primary]
+    let stamp = cs.stamps[cs.primary]
+    let stack = copy cs.selstacks[cs.primary]
+    cs.curs = List[Cursor]()
+    (mut cs.curs).push(p)
+    cs.stamps = List[int]()
+    (mut cs.stamps).push(stamp)
+    cs.selstacks = List[SelStack]()
+    (mut cs.selstacks).push(stack)
+    cs.primary = 0
+    cs.active = MC_ACTIVE_NONE
+}
+
+/// Fresh identities for every caret, monotonic (`yew_cset_reseed`,
+/// YEW-F-079).
+pub fn cset_reseed(mut cs: CursorSet) {
+    if cs.curs.len == 0 || cs.curs.len > MC_MAX {
+        util.bug("text.cset", "cset_reseed: invalid set")
+    }
+    var first = cs.next_stamp
+    if first <= 0 {
+        first = 1
+    }
+    var stamps = List[int]()
+    var i = 0
+    while i < cs.curs.len {
+        (mut stamps).push(first + i)
+        i += 1
+    }
+    cs.stamps = stamps
+    while cs.selstacks.len < cs.curs.len {
+        (mut cs.selstacks).push(selstack_empty())
+    }
+    while cs.selstacks.len > cs.curs.len {
+        let _ = (mut cs.selstacks).pop() else selstack_empty()
+    }
+    cs.next_stamp = first + cs.curs.len
+    cs.active = MC_ACTIVE_NONE
+    cs.batch_delta = 0
+    cs.batch_next = 0
+    cs.batching = false
+}
+
+/// Clamp every caret onto the buffer's boundaries, then merge
+/// (`yew_cset_normalize`).
+pub fn cset_normalize(tb: TextBuf, mut cs: CursorSet) {
+    var i = 0
+    while i < cs.curs.len {
+        cursor_clamp(tb, mut cs.curs[i])
+        i += 1
+    }
+    normalize_unclamped(mut cs)
+    cset_check_text(tb, cs)
+}
+
+// `adjust_off`, `multicursor.c:421-444`.
+fn adjust_off(position: int, right_bias: bool, op: int, at: int, len: int) -> int {
+    if op == JOURNAL_INS {
+        if position > at || position == at && right_bias {
+            return position + len
+        }
+        return position
+    }
+    if op != JOURNAL_DEL {
+        util.bug("text.cset", "cset_adjust: unknown edit operation {op}")
+    }
+    let end = at + len
+    if end <= position {
+        return position - len
+    }
+    if at <= position {
+        return at
+    }
+    position
+}
+
+fn materialize_from(mut cs: CursorSet, first: int) {
+    if !cs.batching {
+        return
+    }
+    var i = first
+    while i < cs.curs.len {
+        cs.curs[i].pos += cs.batch_delta
+        cs.curs[i].anchor += cs.batch_delta
+        i += 1
+    }
+    cs.batch_delta = 0
+    cs.batch_next = cs.curs.len
+}
+
+// `batch_remove_future`, `multicursor.c:509-541`.
+fn batch_remove_future(mut cs: CursorSet, first: int, count: int) {
+    if count == 0 {
+        return
+    }
+    let after = first + count
+    if cs.primary >= first && cs.primary < after {
+        cs.curs[cs.active].goal_col = cs.curs[cs.primary].goal_col
+        cs.selstacks[cs.active] = copy cs.selstacks[cs.primary]
+        cs.primary = cs.active
+    } else if cs.primary >= after {
+        cs.primary -= count
+    }
+    var c = List[Cursor]()
+    var s = List[int]()
+    var st = List[SelStack]()
+    var i = 0
+    while i < cs.curs.len {
+        if i < first || i >= after {
+            (mut c).push(copy cs.curs[i])
+            (mut s).push(cs.stamps[i])
+            (mut st).push(copy cs.selstacks[i])
+        }
+        i += 1
+    }
+    cs.curs = c
+    cs.stamps = s
+    cs.selstacks = st
+    cs.batch_next = first
+}
+
+// `batch_adjust`, `multicursor.c:543-599`: the fan-out's deferred delta.
+fn batch_adjust(mut cs: CursorSet, op: int, at: int, len: int) -> bool {
+    if !cs.batching || cs.active == MC_ACTIVE_NONE || cs.active >= cs.batch_next {
+        return false
+    }
+    let first = cs.batch_next
+    var last = first
+    if op == JOURNAL_DEL {
+        let end = at + len
+        while last < cs.curs.len {
+            let pos = cs.curs[last].pos + cs.batch_delta
+            let anchor = cs.curs[last].anchor + cs.batch_delta
+            if pos != anchor || pos >= end {
+                break
+            }
+            if pos < at {
+                return false
+            }
+            last += 1
+        }
+    } else if op != JOURNAL_INS {
+        return false
+    }
+    let a = cs.active
+    let collapsed = cs.curs[a].pos == cs.curs[a].anchor
+    cs.curs[a].pos = adjust_off(cs.curs[a].pos, true, op, at, len)
+    if collapsed {
+        cs.curs[a].anchor = cs.curs[a].pos
+    } else {
+        cs.curs[a].anchor = adjust_off(cs.curs[a].anchor, false, op, at, len)
+    }
+    if op == JOURNAL_INS {
+        cs.batch_delta += len
+        return true
+    }
+    batch_remove_future(mut cs, first, last - first)
+    cs.batch_delta -= len
+    true
+}
+
+/// Move every caret for an edit (`yew_cset_adjust`, `multicursor.c:756-782`):
+/// a caret at the insertion point moves past it (right bias), an anchor
+/// stays (left bias); a caret inside a deletion collapses to its start.
+pub fn cset_adjust(mut cs: CursorSet, op: int, at_off: ByteOff, len: int) {
+    if op != JOURNAL_INS && op != JOURNAL_DEL {
+        util.bug("text.cset", "cset_adjust: unknown edit operation {op}")
+    }
+    let at = at_off as int
+    if batch_adjust(mut cs, op, at, len) {
+        return
+    }
+    if cs.batching {
+        materialize_from(mut cs, cs.batch_next)
+        cs.batching = false
+        cs.batch_delta = 0
+        cs.batch_next = 0
+    }
+    var i = 0
+    while i < cs.curs.len {
+        let collapsed = cs.curs[i].pos == cs.curs[i].anchor
+        cs.curs[i].pos = adjust_off(cs.curs[i].pos, true, op, at, len)
+        if collapsed {
+            cs.curs[i].anchor = cs.curs[i].pos
+        } else {
+            cs.curs[i].anchor = adjust_off(cs.curs[i].anchor, false, op, at, len)
+        }
+        i += 1
+    }
+    normalize_unclamped(mut cs)
+}
+
+/// The set's invariants (`yew_cset_check`, `multicursor.c:784-831`); a
+/// violation is the internal-error report.
+pub fn cset_check(cs: CursorSet) {
+    if cs.curs.len == 0 ||
+        cs.curs.len > MC_MAX ||
+        cs.primary < 0 ||
+        cs.primary >= cs.curs.len ||
+        cs.stamps.len != cs.curs.len ||
+        cs.selstacks.len != cs.curs.len ||
+        cs.active != MC_ACTIVE_NONE && cs.active >= cs.curs.len {
+        util.bug("text.cset", "cursor set invariant: invalid primary or empty set")
+    }
+    for s in cs.stamps {
+        if s == 0 {
+            util.bug("text.cset", "cursor set invariant: invalid tracking stamp")
+        }
+    }
+    var i = 1
+    while i < cs.curs.len {
+        if cs.curs[i - 1].pos > cs.curs[i].pos {
+            util.bug("text.cset", "cursor set invariant: cursors are not sorted")
+        }
+        i += 1
+    }
+    if collapsed_strictly_sorted(cs) {
+        return
+    }
+    var items = List[CursorItem]()
+    i = 0
+    while i < cs.curs.len {
+        (mut items).push(CursorItem {
+            cursor: copy cs.curs[i],
+            stamp: 0,
+            order: i,
+            stack_index: i,
+            primary: i == cs.primary,
+            active: false,
+        })
+        i += 1
+    }
+    sort_items(mut items, 1)
+    var lo = cursor_lo(items[0].cursor)
+    var hi = cursor_hi(items[0].cursor)
+    var selected = cursor_selected(items[0].cursor)
+    i = 1
+    while i < items.len {
+        if spans_merge(lo, hi, selected, items[i].cursor) {
+            util.bug("text.cset", "cursor set invariant: mergeable cursors remain")
+        }
+        lo = cursor_lo(items[i].cursor)
+        hi = cursor_hi(items[i].cursor)
+        selected = cursor_selected(items[i].cursor)
+        i += 1
+    }
+}
+
+/// The invariants against a buffer: inside it, on grapheme boundaries
+/// (`yew_cset_check_text`).
+pub fn cset_check_text(tb: TextBuf, cs: CursorSet) {
+    cset_check(cs)
+    let len = textbuf_len(tb)
+    for c in cs.curs {
+        if c.pos > len || c.anchor > len {
+            util.bug("text.cset", "cursor set invariant: cursor outside text buffer")
+        }
+        if !is_grapheme_boundary(tb, c.pos as ByteOff) ||
+            !is_grapheme_boundary(tb, c.anchor as ByteOff) {
+            util.bug("text.cset", "cursor set invariant: cursor splits grapheme")
+        }
+    }
+}
+
+/// One caret only, or the internal-error report
+/// (`yew_cset_require_single_edit`).
+pub fn cset_require_single_edit(cs: CursorSet) {
+    cset_check(cs)
+    if cs.curs.len > 1 {
+        util.bug("text.cset", "multi-cursor edits require a MULTI transaction")
+    }
+}
