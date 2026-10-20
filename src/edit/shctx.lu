@@ -1,0 +1,2970 @@
+//! edit.shctx — the shell completion context engine (Sprint 57.23).
+//!
+//! Ports sagitta `src/ui/shctx.c` (2,615 lines) and `shctx.h` at
+//! 9ace98c2: a completion-grade lexer for the sh/bash/zsh family that
+//! READS a `:!` body up to the caret and describes it (`shctx.h:4-26`),
+//! the directory model of Sprint 57.32 (`shctx.h:149-185`), and §6's
+//! shell quoting (`shctx.c:2445-2600`). Nothing decided here reaches
+//! execution: the parser still hands the whole body to `sh -c` as one
+//! argument.
+//!
+//! The port's shape, against C's:
+//! - ONE forward pass over the line's bytes `[0, caret)` (`shctx.c:13-33`);
+//!   the line is a `List[byte]` lent to every step (never copied into the
+//!   lexer), the frames a `List` indexed by position — C's `CmdFr *c`
+//!   pointer is an index `ci`, and a function that may push or pop a frame
+//!   answers the index that is current afterwards, as C's `word_end`
+//!   answers the pointer (`shctx.c:1265-1270`).
+//! - C's strings are NUL-terminated copies (`arena_strndup` keeps an
+//!   embedded NUL but every later `strcmp`/`strlen` stops at it), so each
+//!   decoded word, stem and path here is its bytes up to the first NUL
+//!   (`sx_cstr`): the same value every C reader sees.
+//! - C's `DirV.path` is a `const char *` into the arena and its pushd stack
+//!   a persistent list of nodes; here a path is an index into the lexer's
+//!   path pool and the stack a node pool with indices (-1 the empty stack,
+//!   -2 C's `stk_poison`, `shctx.c:325`), so a `DirV` is four scalars and a
+//!   copy of a flow is a copy of scalars.
+//! - C's two callbacks become values (no function value crosses a module
+//!   boundary, G19/G20): the environment `YewShEnv` (`get`, `ud`, `base`,
+//!   `shctx.h:136-147`) is `ShEnv` over `term.Env`, and the wrapper lookup
+//!   `YewShWrapperLookup` (`shctx.h:168-174`) is `ShWrapTable`, the rows a
+//!   completion-spec registry answers (`edit.compspec`), matched in one
+//!   place (`sx_wrapper_of`).
+//! - `~user` (`shctx.c:788-800`) reads the user database with
+//!   `getpwnam(3)`; wolf 0.2.33 has no user-database surface (G37,
+//!   `docs/MAP.md` §5), so the port reads `/etc/passwd` by name, named
+//!   where it happens (`sx_passwd_home`): an NSS source other than files
+//!   is invisible to it, and the answer is then NULL — C's answer for an
+//!   unknown user.
+
+use term
+use unicode
+
+/// The nesting bound (`YEW_SH_DEPTH_MAX`, `shctx.h:36-41`).
+pub const SH_DEPTH_MAX: int = 64
+
+/// The word the shell would execute.
+pub const SH_POS_COMMAND: int = 0
+
+/// An operand of the simple command.
+pub const SH_POS_ARGUMENT: int = 1
+
+/// The target of a redirection.
+pub const SH_POS_REDIRECT: int = 2
+
+/// The value side of `NAME=`.
+pub const SH_POS_ASSIGN: int = 3
+
+/// `$NA` or `${NA`.
+pub const SH_POS_VARIABLE: int = 4
+
+/// A comment, heredoc delimiter, arithmetic, case body.
+pub const SH_POS_NONE: int = 5
+
+/// Unquoted.
+pub const SH_Q_NONE: int = 0
+
+/// `'...'`.
+pub const SH_Q_SINGLE: int = 1
+
+/// `"..."`.
+pub const SH_Q_DOUBLE: int = 2
+
+/// `$'...'`.
+pub const SH_Q_DOLLAR: int = 3
+
+/// What the lexer says about the caret (`YewShCtx`, `shctx.h:58-128`).
+/// `argv` has `argc` words (C's NULL terminator is the length); `dirv`
+/// parallels it, `dirv_known[i]` false where C's `dirv[i]` is NULL.
+pub struct ShCtx {
+    pos: int,
+    quote: int,
+    replace_lo: int,
+    replace_hi: int,
+    stem: List[byte],
+    argv: List[List[byte]],
+    argc: int,
+    arg_index: int,
+    dashdash: bool,
+    brace_var: bool,
+    depth: int,
+    tilde: bool,
+    expands: bool,
+    cwd: List[byte],
+    cwd_known: bool,
+    dirv: List[List[byte]],
+    dirv_known: List[bool],
+}
+
+/// The environment the lexer may consult (`YewShEnv`, `shctx.h:136-147`):
+/// `vars` answers HOME, OLDPWD and CDPATH; `base` is the absolute
+/// directory `:!` commands start in (`has_base` false is C's NULL).
+/// `present` false is C's NULL environment: everything unknown.
+pub struct ShEnv {
+    present: bool,
+    vars: term.Env,
+    base: str,
+    has_base: bool,
+}
+
+/// No environment (`env == NULL`).
+pub fn shenv_none() -> ShEnv {
+    ShEnv { present: false, vars: term.env_of(Map[str, str]()), base: "", has_base: false }
+}
+
+/// An environment over `vars`, starting in `base` ("" with `has_base`
+/// false for none).
+pub fn shenv_of(vars: term.Env, base: str, has_base: bool) -> ShEnv {
+    ShEnv { present: true, vars: copy vars, base: base, has_base: has_base }
+}
+
+/// One precommand wrapper (`YewShWrapper`, `shctx.h:155-166`), as a spec
+/// row answers it. `verdict` is the lookup's answer: 1 a wrapper, 0 not
+/// one (a spec without `precommand` un-wraps a table row).
+pub struct ShWrapRow {
+    name: List[byte],
+    verdict: int,
+    consumes: List[List[byte]],
+    operands: int,
+    skips_assign: bool,
+}
+
+/// The wrapper lookup as data: a name absent from `rows` is "no opinion"
+/// (-1), and the built-in table answers (`shctx.c:2078-2100`). An empty
+/// table is `yew_shctx_at`'s NULL lookup.
+pub struct ShWrapTable {
+    rows: List[ShWrapRow],
+}
+
+/// The NULL lookup: the built-in table alone.
+pub fn shwrap_none() -> ShWrapTable {
+    ShWrapTable { rows: List[ShWrapRow]() }
+}
+
+// Frame kinds (`shctx.c:35-43`).
+const SX_FR_TOP: int = 0
+
+const SX_FR_PAREN: int = 1
+
+const SX_FR_CMDSUB: int = 2
+
+const SX_FR_BACKTICK: int = 3
+
+const SX_FR_PROCSUB: int = 4
+
+const SX_FR_BRACE: int = 5
+
+const SX_FR_DQ: int = 6
+
+// Quote modes of the current word (`shctx.c:45-49`).
+const SX_Q_NONE: int = 0
+
+const SX_Q_SINGLE: int = 1
+
+const SX_Q_DOLLAR: int = 2
+
+// Word flags (`shctx.c:51-59`).
+const SX_W_QUOTED: int = 1
+
+const SX_W_EXPANDS: int = 2
+
+const SX_W_ASSIGN: int = 4
+
+const SX_W_SYNTH: int = 8
+
+const SX_W_GLOB: int = 16
+
+const SX_W_TILDE: int = 32
+
+// The one expansion a directory operand may hold (`shctx.c:61-68`).
+const SX_VK_NONE: int = 0
+
+const SX_VK_HOME: int = 1
+
+const SX_VK_PWD: int = 2
+
+const SX_VK_OLDPWD: int = 3
+
+const SX_VK_OTHER: int = 4
+
+// What the next word IS (`shctx.c:70-76`).
+const SX_EXP_NONE: int = 0
+
+const SX_EXP_REDIR: int = 1
+
+const SX_EXP_HEREDOC: int = 2
+
+const SX_EXP_HERESTR: int = 3
+
+const SX_FOR_NONE: int = 0
+
+const SX_FOR_NAME: int = 1
+
+const SX_FOR_AFTER_NAME: int = 2
+
+const SX_FOR_LIST: int = 3
+
+const SX_CASE_NONE: int = 0
+
+const SX_CASE_WORD: int = 1
+
+const SX_CASE_IN: int = 2
+
+const SX_CASE_BODY: int = 3
+
+// `SH_NO_OFF` (`shctx.c:92`).
+const SX_NO_OFF: int = -1
+
+// Directory states (`shctx.c:111-116`).
+const SX_DV_UNREACH: int = 0
+
+const SX_DV_KNOWN: int = 1
+
+const SX_DV_UNKNOWN: int = 2
+
+// The empty pushd stack and C's `stk_poison` (`shctx.c:323-325`).
+const SX_STK_NULL: int = -1
+
+const SX_STK_POISON: int = -2
+
+// Pipeline connectors (`shctx.c:129-142`).
+const SX_OP_LIST: int = 0
+
+const SX_OP_AND: int = 1
+
+const SX_OP_OR: int = 2
+
+const SX_OP_PIPE: int = 3
+
+const SX_OP_AMP: int = 4
+
+const SX_CONN_NONE: int = 0
+
+const SX_CONN_AND: int = 1
+
+const SX_CONN_OR: int = 2
+
+// Compound commands (`shctx.c:209-221`).
+const SX_CK_IF: int = 0
+
+const SX_CK_LOOP: int = 1
+
+const SX_CK_CASE: int = 2
+
+const SX_CK_FN: int = 3
+
+// Bounds (`shctx.c:239-246`).
+const SX_STACK_MAX: int = 130
+
+const SX_HEREDOC_MAX: int = 16
+
+const SX_CONSTRUCT_MAX: int = 32
+
+// `word_dir`'s answers (`shctx.c:746-750`).
+const SX_WD_EXPANDED: int = 0
+
+const SX_WD_LITERAL: int = 1
+
+const SX_WD_RESOLVED: int = 2
+
+// The caret's role (`shctx.c:2125-2129`).
+const SX_ROLE_WORD: int = 0
+
+const SX_ROLE_REDIR: int = 1
+
+const SX_ROLE_HERESTR: int = 2
+
+struct SxWord {
+    text: List[byte],
+    flags: int,
+    vk: int,
+    var_q: bool,
+}
+
+struct SxDirV {
+    st: int,
+    moved: bool,
+    path: int,
+    stk: int,
+}
+
+struct SxNode {
+    dir: int,
+    next: int,
+}
+
+struct SxFlow {
+    list_in: SxDirV,
+    pipe_in: SxDirV,
+    ls: SxDirV,
+    lf: SxDirV,
+    last_s: SxDirV,
+    last_f: SxDirV,
+    ov_s: SxDirV,
+    ov_f: SxDirV,
+    stages: int,
+    conn: int,
+    negate: bool,
+    override: bool,
+}
+
+struct SxFrame {
+    kind: int,
+    words: List[SxWord],
+    n: int,
+    expect: int,
+    forst: int,
+    casest: int,
+    case_nest: int,
+    dbracket: bool,
+    in_word: bool,
+    w_start: int,
+    dec: List[byte],
+    w_flags: int,
+    qmode: int,
+    w_digits: bool,
+    w_tilde: bool,
+    w_name: bool,
+    w_eq: bool,
+    w_tilde_eq: bool,
+    w_eq_raw: int,
+    w_eq_dec: int,
+    w_expand_raw: int,
+    w_first_q: int,
+    w_nexp: int,
+    w_var: int,
+    w_var_q: bool,
+    began: bool,
+    fn_pending: bool,
+    fn_body: bool,
+    fl: SxFlow,
+}
+
+struct SxHereDoc {
+    delim: List[byte],
+    strip_tabs: bool,
+}
+
+struct SxCons {
+    kind: int,
+    loop_kind: int,
+    has_else: bool,
+    dirty: bool,
+    braces: int,
+    frame: int,
+    entry: SxDirV,
+    acc_s: SxDirV,
+    acc_f: SxDirV,
+    cond_f: SxDirV,
+    saved: SxFlow,
+}
+
+struct SxLexer {
+    end: int,
+    kinds: List[int],
+    nk: int,
+    cmd: List[SxFrame],
+    nc: int,
+    heredocs: List[SxHereDoc],
+    nheredocs: int,
+    stop: bool,
+    none: bool,
+    in_var: bool,
+    var_brace: bool,
+    var_start: int,
+    cons: List[SxCons],
+    ncons: int,
+    dir_lost: bool,
+    env_dirty: bool,
+    paths: List[List[byte]],
+    nodes: List[SxNode],
+}
+
+// ------------------------------------------------------------------
+// Bytes as C strings
+// ------------------------------------------------------------------
+
+/// `b[at, end)` as C's `arena_strndup` and every later reader see it: up
+/// to the first NUL.
+fn sx_cstr(b: List[byte], at: int, end: int) -> List[byte] {
+    var out = List[byte]()
+    var i = at
+    while i < end {
+        if b[i] as int == 0 {
+            break
+        }
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+fn sx_bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+    out
+}
+
+/// `strcmp(a, want) == 0`.
+fn sx_eq(a: List[byte], want: str) -> bool {
+    if a.len != want.len {
+        return false
+    }
+    var i = 0
+    for b in want.bytes() {
+        if a[i] != b {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn sx_same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `strstr(a, want) != NULL`.
+fn sx_contains(a: List[byte], want: str) -> bool {
+    let n = want.len
+    if n == 0 {
+        return true
+    }
+    var i = 0
+    while i + n <= a.len {
+        var j = 0
+        var hit = true
+        for b in want.bytes() {
+            if a[i + j] != b {
+                hit = false
+                break
+            }
+            j += 1
+        }
+        if hit {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+/// `strchr(a, c)` as an offset, or -1.
+fn sx_find(a: List[byte], c: int) -> int {
+    var i = 0
+    while i < a.len {
+        if a[i] as int == c {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn sx_at(a: List[byte], i: int) -> int {
+    if i < a.len then a[i] as int else 0
+}
+
+fn sx_append(mut out: List[byte], b: List[byte]) {
+    for x in b {
+        (mut out).push(x)
+    }
+}
+
+fn sx_append_str(mut out: List[byte], s: str) {
+    for x in s.bytes() {
+        (mut out).push(x)
+    }
+}
+
+fn sx_slice(b: List[byte], at: int, end: int) -> List[byte] {
+    var out = List[byte]()
+    var i = at
+    while i < end {
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+fn sx_is_name_start(c: int) -> bool {
+    c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95
+}
+
+fn sx_is_name_char(c: int) -> bool {
+    sx_is_name_start(c) || c >= 48 && c <= 57
+}
+
+fn sx_is_digit(c: int) -> bool {
+    c >= 48 && c <= 57
+}
+
+/// `peek` (`shctx.c:262-265`): the byte at `at`, or -1 at the caret.
+fn sx_peek(s: List[byte], lx: SxLexer, at: int) -> int {
+    if at < lx.end then s[at] as int else -1
+}
+
+fn sx_top_kind(lx: SxLexer) -> int {
+    lx.kinds[lx.nk - 1]
+}
+
+fn sx_give_up(mut lx: SxLexer) {
+    lx.none = true
+    lx.stop = true
+}
+
+// ------------------------------------------------------------------
+// Sprint 57.32 §1: directories
+// ------------------------------------------------------------------
+
+fn sx_dv(st: int, path: int) -> SxDirV {
+    SxDirV { st: st, moved: false, path: path, stk: SX_STK_NULL }
+}
+
+fn sx_dv_unknown() -> SxDirV {
+    sx_dv(SX_DV_UNKNOWN, -1)
+}
+
+fn sx_dv_unreach() -> SxDirV {
+    sx_dv(SX_DV_UNREACH, -1)
+}
+
+/// A path into the pool.
+fn sx_path(mut lx: SxLexer, p: List[byte]) -> int {
+    (mut lx.paths).push(p)
+    lx.paths.len - 1
+}
+
+fn sx_dv_same(lx: SxLexer, a: SxDirV, b: SxDirV) -> bool {
+    if a.st != b.st {
+        return false
+    }
+    a.st != SX_DV_KNOWN || sx_same(lx.paths[a.path], lx.paths[b.path])
+}
+
+fn sx_stk_equal(lx: SxLexer, a0: int, b0: int) -> bool {
+    var a = a0
+    var b = b0
+    while a != SX_STK_NULL && b != SX_STK_NULL {
+        if a == SX_STK_POISON || b == SX_STK_POISON {
+            return a == b
+        }
+        let da = lx.nodes[a].dir
+        let db = lx.nodes[b].dir
+        if (da < 0) != (db < 0) {
+            return false
+        }
+        if da >= 0 && !sx_same(lx.paths[da], lx.paths[db]) {
+            return false
+        }
+        a = lx.nodes[a].next
+        b = lx.nodes[b].next
+    }
+    a == b
+}
+
+/// `dv_join` (`shctx.c:356-370`).
+fn sx_dv_join(lx: SxLexer, a: SxDirV, b: SxDirV) -> SxDirV {
+    if a.st == SX_DV_UNREACH {
+        return copy b
+    }
+    if b.st == SX_DV_UNREACH {
+        return copy a
+    }
+    if a.st == SX_DV_KNOWN && b.st == SX_DV_KNOWN && sx_same(lx.paths[a.path], lx.paths[b.path]) {
+        var out = copy a
+        out.moved = a.moved || b.moved
+        if !sx_stk_equal(lx, a.stk, b.stk) {
+            out.stk = SX_STK_POISON
+        }
+        return out
+    }
+    sx_dv_unknown()
+}
+
+fn sx_flow_list(mut f: SxFlow, inp: SxDirV) {
+    f.list_in = copy inp
+    f.pipe_in = copy inp
+    f.ls = sx_dv_unreach()
+    f.lf = sx_dv_unreach()
+    f.conn = SX_CONN_NONE
+    f.stages = 0
+    f.negate = false
+}
+
+fn sx_flow_new(inp: SxDirV) -> SxFlow {
+    SxFlow {
+        list_in: copy inp,
+        pipe_in: copy inp,
+        ls: sx_dv_unreach(),
+        lf: sx_dv_unreach(),
+        last_s: copy inp,
+        last_f: copy inp,
+        ov_s: sx_dv_unreach(),
+        ov_f: sx_dv_unreach(),
+        stages: 0,
+        conn: SX_CONN_NONE,
+        negate: false,
+        override: false,
+    }
+}
+
+/// `flow_init` (`shctx.c:383-389`): the overriding outcome is kept as it
+/// was (C leaves `ov_s`/`ov_f` alone and clears `override`).
+fn sx_flow_init(mut f: SxFlow, inp: SxDirV) {
+    sx_flow_list(mut f, inp)
+    f.last_s = copy inp
+    f.last_f = copy inp
+    f.override = false
+}
+
+fn sx_flow_pick(s: SxDirV, f: SxDirV) -> SxDirV {
+    if s.st != SX_DV_UNREACH then copy s else copy f
+}
+
+/// `frame_eff_in` (`shctx.c:403-424`).
+fn sx_frame_eff_in(lx: SxLexer, idx0: int, v: SxDirV) -> SxDirV {
+    var idx = idx0
+    loop {
+        var k = 0
+        while k < lx.ncons {
+            if lx.cons[k].frame == idx &&
+                lx.cons[k].kind == SX_CK_LOOP &&
+                !sx_dv_same(lx, lx.cons[k].entry, v) {
+                return sx_dv_unknown()
+            }
+            k += 1
+        }
+        if lx.cmd[idx].kind != SX_FR_BRACE || lx.cmd[idx].fn_body || idx == 0 {
+            break
+        }
+        idx -= 1
+    }
+    if lx.dir_lost {
+        return sx_dv_unknown()
+    }
+    copy v
+}
+
+fn sx_frame_new() -> SxFrame {
+    SxFrame {
+        kind: SX_FR_TOP,
+        words: List[SxWord](),
+        n: 0,
+        expect: SX_EXP_NONE,
+        forst: SX_FOR_NONE,
+        casest: SX_CASE_NONE,
+        case_nest: 0,
+        dbracket: false,
+        in_word: false,
+        w_start: 0,
+        dec: List[byte](),
+        w_flags: 0,
+        qmode: SX_Q_NONE,
+        w_digits: false,
+        w_tilde: false,
+        w_name: false,
+        w_eq: false,
+        w_tilde_eq: false,
+        w_eq_raw: 0,
+        w_eq_dec: 0,
+        w_expand_raw: SX_NO_OFF,
+        w_first_q: 0,
+        w_nexp: 0,
+        w_var: SX_VK_NONE,
+        w_var_q: false,
+        began: false,
+        fn_pending: false,
+        fn_body: false,
+        fl: sx_flow_new(sx_dv_unreach()),
+    }
+}
+
+/// `frame_init` (`shctx.c:426-432`): every field zero, `w_expand_raw`
+/// none. The slot's lists are reused.
+fn sx_frame_init(mut lx: SxLexer, i: int, kind: int) {
+    if i >= lx.cmd.len {
+        (mut lx.cmd).push(sx_frame_new())
+    }
+    lx.cmd[i].kind = kind
+    lx.cmd[i].n = 0
+    lx.cmd[i].expect = SX_EXP_NONE
+    lx.cmd[i].forst = SX_FOR_NONE
+    lx.cmd[i].casest = SX_CASE_NONE
+    lx.cmd[i].case_nest = 0
+    lx.cmd[i].dbracket = false
+    lx.cmd[i].in_word = false
+    lx.cmd[i].w_start = 0
+    lx.cmd[i].dec = List[byte]()
+    lx.cmd[i].w_flags = 0
+    lx.cmd[i].qmode = SX_Q_NONE
+    lx.cmd[i].w_digits = false
+    lx.cmd[i].w_tilde = false
+    lx.cmd[i].w_name = false
+    lx.cmd[i].w_eq = false
+    lx.cmd[i].w_tilde_eq = false
+    lx.cmd[i].w_eq_raw = 0
+    lx.cmd[i].w_eq_dec = 0
+    lx.cmd[i].w_expand_raw = SX_NO_OFF
+    lx.cmd[i].w_first_q = 0
+    lx.cmd[i].w_nexp = 0
+    lx.cmd[i].w_var = SX_VK_NONE
+    lx.cmd[i].w_var_q = false
+    lx.cmd[i].began = false
+    lx.cmd[i].fn_pending = false
+    lx.cmd[i].fn_body = false
+    lx.cmd[i].fl = sx_flow_new(sx_dv_unreach())
+}
+
+fn sx_push_kind(mut lx: SxLexer, kind: int) {
+    if lx.nk < lx.kinds.len {
+        lx.kinds[lx.nk] = kind
+    } else {
+        (mut lx.kinds).push(kind)
+    }
+    lx.nk += 1
+}
+
+/// `push_cmd` (`shctx.c:434-463`).
+fn sx_push_cmd(mut lx: SxLexer, kind: int) -> bool {
+    if lx.nc >= SH_DEPTH_MAX + 1 || lx.nk >= SX_STACK_MAX {
+        sx_give_up(mut lx)
+        return false
+    }
+    sx_frame_init(mut lx, lx.nc, kind)
+    lx.nc += 1
+    sx_push_kind(mut lx, kind)
+    let p = lx.nc - 2
+    let ch = lx.nc - 1
+    var inp = sx_frame_eff_in(lx, p, lx.cmd[p].fl.pipe_in)
+    if lx.cmd[p].fn_pending && (kind == SX_FR_BRACE || kind == SX_FR_PAREN) {
+        lx.cmd[p].fn_pending = false
+        lx.cmd[ch].fn_body = true
+        inp = sx_dv_unknown()
+    }
+    sx_flow_init(mut lx.cmd[ch].fl, inp)
+    true
+}
+
+fn sx_push_dq(mut lx: SxLexer) -> bool {
+    if lx.nk >= SX_STACK_MAX {
+        sx_give_up(mut lx)
+        return false
+    }
+    sx_push_kind(mut lx, SX_FR_DQ)
+    true
+}
+
+/// `pop_frame` (`shctx.c:479-492`).
+fn sx_pop_frame(mut lx: SxLexer) {
+    if lx.nk <= 1 {
+        return
+    }
+    if lx.kinds[lx.nk - 1] != SX_FR_DQ {
+        lx.nc -= 1
+        while lx.ncons != 0 && lx.cons[lx.ncons - 1].frame >= lx.nc {
+            lx.ncons -= 1
+        }
+    }
+    lx.nk -= 1
+}
+
+fn sx_push_word(mut lx: SxLexer, ci: int, text: List[byte], flags: int) {
+    let w = SxWord { text: text, flags: flags, vk: SX_VK_NONE, var_q: false }
+    let n = lx.cmd[ci].n
+    if n < lx.cmd[ci].words.len {
+        lx.cmd[ci].words[n] = w
+    } else {
+        (mut lx.cmd[ci].words).push(w)
+    }
+    lx.cmd[ci].n = n + 1
+}
+
+fn sx_push_synth(mut lx: SxLexer, ci: int) {
+    sx_push_word(mut lx, ci, List[byte](), SX_W_SYNTH)
+}
+
+/// `word_begin` (`shctx.c:516-539`).
+fn sx_word_begin(mut lx: SxLexer, ci: int, at: int) {
+    lx.cmd[ci].began = true
+    if lx.cmd[ci].in_word {
+        return
+    }
+    lx.cmd[ci].in_word = true
+    lx.cmd[ci].w_start = at
+    lx.cmd[ci].dec = List[byte]()
+    lx.cmd[ci].w_flags = 0
+    lx.cmd[ci].w_digits = true
+    lx.cmd[ci].w_tilde = false
+    lx.cmd[ci].w_name = true
+    lx.cmd[ci].w_eq = false
+    lx.cmd[ci].w_tilde_eq = false
+    lx.cmd[ci].w_eq_raw = 0
+    lx.cmd[ci].w_eq_dec = 0
+    lx.cmd[ci].w_expand_raw = SX_NO_OFF
+    lx.cmd[ci].w_first_q = SX_NO_OFF
+    lx.cmd[ci].w_nexp = 0
+    lx.cmd[ci].w_var = SX_VK_NONE
+    lx.cmd[ci].w_var_q = false
+}
+
+/// `word_byte` (`shctx.c:543-573`).
+fn sx_word_byte(mut lx: SxLexer, ci: int, b: int, quoted: bool, raw: int) {
+    let before = lx.cmd[ci].dec.len
+    if quoted {
+        lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_QUOTED
+        if lx.cmd[ci].w_first_q == SX_NO_OFF {
+            lx.cmd[ci].w_first_q = before
+        }
+        lx.cmd[ci].w_digits = false
+        if !lx.cmd[ci].w_eq {
+            lx.cmd[ci].w_name = false
+        }
+    } else {
+        if !sx_is_digit(b) {
+            lx.cmd[ci].w_digits = false
+        }
+        if b == 42 || b == 63 || b == 91 || b == 123 {
+            lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_GLOB
+        }
+        if before == 0 && b == 126 {
+            lx.cmd[ci].w_tilde = true
+        }
+        if lx.cmd[ci].w_eq && before == lx.cmd[ci].w_eq_dec && b == 126 {
+            lx.cmd[ci].w_tilde_eq = true
+        }
+        if !lx.cmd[ci].w_eq && lx.cmd[ci].w_name {
+            if b == 61 && before != 0 {
+                lx.cmd[ci].w_eq = true
+                lx.cmd[ci].w_eq_raw = raw + 1
+                lx.cmd[ci].w_eq_dec = before + 1
+            } else if !(sx_is_name_start(b) || before != 0 && sx_is_digit(b)) {
+                lx.cmd[ci].w_name = false
+            }
+        }
+    }
+    (mut lx.cmd[ci].dec).push(b as byte)
+}
+
+fn sx_word_expands(mut lx: SxLexer, ci: int, raw: int) {
+    lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_EXPANDS
+    lx.cmd[ci].w_digits = false
+    if !lx.cmd[ci].w_eq {
+        lx.cmd[ci].w_name = false
+    }
+    if lx.cmd[ci].w_expand_raw == SX_NO_OFF {
+        lx.cmd[ci].w_expand_raw = raw
+    }
+    lx.cmd[ci].w_nexp += 1
+}
+
+/// `word_var` (`shctx.c:592-606`): `s[at, at + n)` is the name.
+fn sx_word_var(mut lx: SxLexer, ci: int, s: List[byte], at: int, n: int, in_dq: bool) {
+    var kind = SX_VK_OTHER
+    if lx.cmd[ci].dec.len == 0 {
+        let name = sx_slice(s, at, at + n)
+        if sx_eq(name, "HOME") {
+            kind = SX_VK_HOME
+        } else if sx_eq(name, "PWD") {
+            kind = SX_VK_PWD
+        } else if sx_eq(name, "OLDPWD") {
+            kind = SX_VK_OLDPWD
+        }
+    }
+    lx.cmd[ci].w_var = kind
+    lx.cmd[ci].w_var_q = in_dq
+}
+
+fn sx_word_is(text: List[byte], flags: int, want: str) -> bool {
+    flags & (SX_W_QUOTED | SX_W_EXPANDS) == 0 && sx_eq(text, want)
+}
+
+// ------------------------------------------------------------------
+// Sprint 57.32 §1: which commands move the shell
+// ------------------------------------------------------------------
+
+/// `env_get` (`shctx.c:617-622`): `(value, set)`.
+fn sx_env_get(env: ShEnv, name: str) -> (List[byte], bool) {
+    if !env.present {
+        return (List[byte](), false)
+    }
+    let (v, ok) = term.env_lookup(env.vars, name)
+    if !ok {
+        return (List[byte](), false)
+    }
+    (sx_bytes(v), true)
+}
+
+/// `norm_path` (`shctx.c:631-682`).
+fn sx_norm_path(s: List[byte]) -> List[byte] {
+    var b = List[byte]()
+    let abs = s.len != 0 && s[0] as int == 47
+    if abs {
+        (mut b).push(47 as byte)
+    }
+    let base = b.len
+    var dots = 0
+    var p = 0
+    while p < s.len {
+        while p < s.len && s[p] as int == 47 {
+            p += 1
+        }
+        if p >= s.len {
+            break
+        }
+        var q = p
+        while q < s.len && s[q] as int != 47 {
+            q += 1
+        }
+        let n = q - p
+        if n == 1 && s[p] as int == 46 {
+            // nothing
+        } else if n == 2 && s[p] as int == 46 && s[p + 1] as int == 46 {
+            if b.len > base + dots {
+                var cut = b.len
+                while cut > base + dots && b[cut - 1] as int != 47 {
+                    cut -= 1
+                }
+                if cut > base + dots {
+                    cut -= 1
+                }
+                b = sx_slice(b, 0, cut)
+            } else if !abs {
+                if b.len > base {
+                    (mut b).push(47 as byte)
+                }
+                (mut b).push(46 as byte)
+                (mut b).push(46 as byte)
+                dots = b.len - base
+            }
+        } else {
+            if b.len > base {
+                (mut b).push(47 as byte)
+            }
+            var i = p
+            while i < q {
+                (mut b).push(s[i])
+                i += 1
+            }
+        }
+        p = q
+    }
+    b
+}
+
+/// `yew_sh_dir_join` (`shctx.c:684-702`): `operand` resolved against
+/// `dir` ("" relative stays relative), lexically normalised.
+pub fn sh_dir_join(dir: List[byte], operand: List[byte]) -> List[byte] {
+    if operand.len != 0 && operand[0] as int == 47 || dir.len == 0 {
+        return sx_norm_path(operand)
+    }
+    var b = copy dir
+    (mut b).push(47 as byte)
+    sx_append(mut b, operand)
+    sx_norm_path(b)
+}
+
+/// `abs_of` (`shctx.c:704-713`): `(path, known)`.
+fn sx_abs_of(env: ShEnv, path: List[byte]) -> (List[byte], bool) {
+    if path.len != 0 && path[0] as int == 47 {
+        return (copy path, true)
+    }
+    if !env.present || !env.has_base {
+        return (List[byte](), false)
+    }
+    (sh_dir_join(sx_bytes(env.base), path), true)
+}
+
+/// `splits` (`shctx.c:715-719`): a byte the shell splits or globs on.
+fn sx_splits(s: List[byte]) -> bool {
+    for b in s {
+        let c = b as int
+        if c == 32 || c == 9 || c == 10 || c == 42 || c == 63 || c == 91 {
+            return true
+        }
+    }
+    false
+}
+
+fn sx_plain(w: SxWord, want: str, any: bool) -> bool {
+    if w.flags & (SX_W_QUOTED | SX_W_EXPANDS | SX_W_SYNTH | SX_W_GLOB) != 0 {
+        return false
+    }
+    any || sx_eq(w.text, want)
+}
+
+/// The home directory of `user` from `/etc/passwd`, or none. C asks
+/// `getpwnam(3)` (`shctx.c:793-797`); wolf 0.2.33 has no user-database
+/// surface (G37), so the files source is all the port can read.
+fn sx_passwd_home(user: List[byte]) -> (List[byte], bool) {
+    let text = fs_read_bytes("/etc/passwd") else |_| { return (List[byte](), false) }
+    var at = 0
+    while at < text.len {
+        var e = at
+        while e < text.len && text[e] as int != 10 {
+            e += 1
+        }
+        // name:passwd:uid:gid:gecos:dir:shell
+        var fields = List[List[byte]]()
+        var f = at
+        var i = at
+        while i <= e {
+            if i == e || text[i] as int == 58 {
+                (mut fields).push(sx_slice(text, f, i))
+                f = i + 1
+            }
+            i += 1
+        }
+        if fields.len >= 7 && sx_same(fields[0], user) {
+            return (copy fields[5], true)
+        }
+        at = e + 1
+    }
+    (List[byte](), false)
+}
+
+/// `word_dir` (`shctx.c:752-813`): `(dir, known, how)`.
+fn sx_word_dir(lx: SxLexer, env: ShEnv, w: SxWord, inp: SxDirV, full: bool) -> (
+    List[byte],
+    bool,
+    int,
+) {
+    let none = List[byte]()
+    if w.flags & (SX_W_GLOB | SX_W_SYNTH) != 0 {
+        return (none, false, SX_WD_EXPANDED)
+    }
+    if w.flags & SX_W_EXPANDS != 0 {
+        if w.flags & SX_W_TILDE != 0 {
+            return (none, false, SX_WD_EXPANDED)
+        }
+        var val = List[byte]()
+        var have = false
+        if w.vk == SX_VK_HOME {
+            if !lx.env_dirty {
+                let (v, ok) = sx_env_get(env, "HOME")
+                val = v
+                have = ok
+            }
+        } else if w.vk == SX_VK_OLDPWD {
+            if !lx.env_dirty && !inp.moved {
+                let (v, ok) = sx_env_get(env, "OLDPWD")
+                val = v
+                have = ok
+            }
+        } else if w.vk == SX_VK_PWD {
+            if !full ||
+                lx.env_dirty ||
+                inp.st != SX_DV_KNOWN ||
+                w.text.len != 0 && w.text[0] as int != 47 {
+                return (none, false, SX_WD_EXPANDED)
+            }
+            let ip = copy lx.paths[inp.path]
+            if !w.var_q {
+                if sx_splits(ip) {
+                    return (none, false, SX_WD_EXPANDED)
+                }
+                if ip.len == 0 || ip[0] as int != 47 {
+                    if !env.present || sx_splits(sx_bytes(env.base)) {
+                        return (none, false, SX_WD_EXPANDED)
+                    }
+                }
+            }
+            let rest = if w.text.len != 0 && w.text[0] as int == 47 {
+                sx_slice(w.text, 1, w.text.len)
+            } else {
+                List[byte]()
+            }
+            return (sh_dir_join(ip, rest), true, SX_WD_RESOLVED)
+        } else {
+            return (none, false, SX_WD_EXPANDED)
+        }
+        if !have || val.len == 0 || val[0] as int != 47 || !w.var_q && sx_splits(val) {
+            return (none, false, SX_WD_EXPANDED)
+        }
+        var cat = sx_cstr(val, 0, val.len)
+        sx_append(mut cat, w.text)
+        return (sx_norm_path(cat), true, SX_WD_EXPANDED)
+    }
+    if w.flags & SX_W_TILDE != 0 {
+        let slash = sx_find(w.text, 47)
+        let ulen = if slash < 0 then w.text.len - 1 else slash - 1
+        var home = List[byte]()
+        var have = false
+        if ulen == 0 {
+            if !lx.env_dirty {
+                let (v, ok) = sx_env_get(env, "HOME")
+                home = sx_cstr(v, 0, v.len)
+                have = ok
+            }
+        } else if full {
+            let (v, ok) = sx_passwd_home(sx_slice(w.text, 1, 1 + ulen))
+            home = v
+            have = ok
+        }
+        if !have || home.len == 0 || home[0] as int != 47 {
+            return (none, false, SX_WD_EXPANDED)
+        }
+        let rest = if slash < 0 then List[byte]() else sx_slice(w.text, slash + 1, w.text.len)
+        return (sh_dir_join(home, rest), true, SX_WD_EXPANDED)
+    }
+    if w.text.len == 0 {
+        return (none, false, SX_WD_EXPANDED)
+    }
+    (copy w.text, true, SX_WD_LITERAL)
+}
+
+fn sx_dir_exists(path: List[byte]) -> bool {
+    let p = str_from_utf8(path) else |_| { return false }
+    fs_is_dir(p)
+}
+
+/// `cdpath_applies` (`shctx.c:823-831`).
+fn sx_cdpath_applies(op: List[byte]) -> bool {
+    let c0 = sx_at(op, 0)
+    let c1 = sx_at(op, 1)
+    let c2 = sx_at(op, 2)
+    if c0 == 47 {
+        return false
+    }
+    if c0 == 46 && (c1 == 0 || c1 == 47) {
+        return false
+    }
+    !(c0 == 46 && c1 == 46 && (c2 == 0 || c2 == 47))
+}
+
+/// `cd_target` (`shctx.c:834-880`).
+fn sx_cd_target(
+    mut lx: SxLexer,
+    env: ShEnv,
+    inp: SxDirV,
+    op: List[byte],
+    known: bool,
+    how: int,
+) -> SxDirV {
+    var out = copy inp
+    out.moved = true
+    if !known {
+        return sx_dv_unknown()
+    }
+    if op.len != 0 && op[0] as int == 47 || how == SX_WD_RESOLVED {
+        out.st = SX_DV_KNOWN
+        out.path = sx_path(mut lx, sx_norm_path(op))
+        return out
+    }
+    if inp.st != SX_DV_KNOWN {
+        return sx_dv_unknown()
+    }
+    let (cdpath, cd_set) = sx_env_get(env, "CDPATH")
+    let literal = how == SX_WD_LITERAL
+    if literal && sx_cdpath_applies(op) && (lx.env_dirty || cd_set && cdpath.len != 0) {
+        if lx.env_dirty || !cd_set {
+            return sx_dv_unknown()
+        }
+        let p = sx_cstr(cdpath, 0, cdpath.len)
+        var at = 0
+        loop {
+            var colon = at
+            while colon < p.len && p[colon] as int != 58 {
+                colon += 1
+            }
+            let entry = sx_slice(p, at, colon)
+            let cand = sh_dir_join(lx.paths[inp.path], sh_dir_join(entry, op))
+            let (abs, ok) = sx_abs_of(env, cand)
+            if !ok {
+                return sx_dv_unknown()
+            }
+            if sx_dir_exists(abs) {
+                out.path = sx_path(mut lx, cand)
+                return out
+            }
+            if colon >= p.len {
+                break
+            }
+            at = colon + 1
+        }
+    }
+    let joined = sh_dir_join(lx.paths[inp.path], op)
+    out.path = sx_path(mut lx, joined)
+    out
+}
+
+/// `env_taint` (`shctx.c:884-895`).
+fn sx_env_taint(mut lx: SxLexer, ci: int) {
+    var k = 0
+    while k < lx.cmd[ci].n {
+        if sx_contains(lx.cmd[ci].words[k].text, "HOME") ||
+            sx_contains(lx.cmd[ci].words[k].text, "PWD") ||
+            sx_contains(lx.cmd[ci].words[k].text, "CDPATH") {
+            lx.env_dirty = true
+        }
+        k += 1
+    }
+}
+
+/// `strspn(t + 1, "LP") == strlen(t + 1)`.
+fn sx_all_lp(t: List[byte]) -> bool {
+    var i = 1
+    while i < t.len {
+        let c = t[i] as int
+        if c != 76 && c != 80 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `cd_effect` (`shctx.c:899-967`): words `[k, n)` of frame `ci` are the
+/// arguments of `name`.
+fn sx_cd_effect(
+    mut lx: SxLexer,
+    env: ShEnv,
+    name: List[byte],
+    ci: int,
+    k0: int,
+    n: int,
+    inp: SxDirV,
+) -> SxDirV {
+    var k = k0
+    if sx_eq(name, "popd") {
+        if k != n || inp.stk < 0 || lx.nodes[inp.stk].dir < 0 {
+            return sx_dv_unknown()
+        }
+        var s = copy inp
+        s.st = SX_DV_KNOWN
+        s.path = lx.nodes[inp.stk].dir
+        s.stk = lx.nodes[inp.stk].next
+        s.moved = true
+        return s
+    }
+    if sx_eq(name, "pushd") {
+        if k + 1 != n ||
+            sx_at(lx.cmd[ci].words[k].text, 0) == 45 ||
+            sx_at(lx.cmd[ci].words[k].text, 0) == 43 {
+            return sx_dv_unknown()
+        }
+        let w = copy lx.cmd[ci].words[k]
+        let (target, known, how) = sx_word_dir(lx, env, w, inp, true)
+        var s = sx_cd_target(mut lx, env, inp, target, known, how)
+        if s.st != SX_DV_KNOWN {
+            return s
+        }
+        let dir = if inp.st == SX_DV_KNOWN then inp.path else -1
+        (mut lx.nodes).push(SxNode { dir: dir, next: inp.stk })
+        s.stk = lx.nodes.len - 1
+        return s
+    }
+    while k < n {
+        let w = copy lx.cmd[ci].words[k]
+        if !sx_plain(w, "", true) || sx_at(w.text, 0) != 45 || w.text.len == 1 {
+            break
+        }
+        k += 1
+        if sx_eq(w.text, "--") {
+            break
+        }
+        if !sx_all_lp(w.text) {
+            return sx_dv_unknown()
+        }
+    }
+    if k == n {
+        var home = List[byte]()
+        var have = false
+        if !lx.env_dirty {
+            let (v, ok) = sx_env_get(env, "HOME")
+            home = sx_cstr(v, 0, v.len)
+            have = ok
+        }
+        if !have || home.len == 0 || home[0] as int != 47 {
+            return sx_dv_unknown()
+        }
+        return sx_cd_target(mut lx, env, inp, home, true, SX_WD_EXPANDED)
+    }
+    if k + 1 != n || sx_plain(lx.cmd[ci].words[k], "-", false) {
+        return sx_dv_unknown()
+    }
+    let w = copy lx.cmd[ci].words[k]
+    let (target, known, how) = sx_word_dir(lx, env, w, inp, true)
+    sx_cd_target(mut lx, env, inp, target, known, how)
+}
+
+/// `cmd_effect` (`shctx.c:974-999`): `(success, failure)`.
+fn sx_cmd_effect(mut lx: SxLexer, env: ShEnv, ci: int, inp: SxDirV) -> (SxDirV, SxDirV) {
+    let n = lx.cmd[ci].n
+    var i = 0
+    var assigns = false
+    var s = copy inp
+    var f = copy inp
+    while i < n && lx.cmd[ci].words[i].flags & SX_W_ASSIGN != 0 {
+        assigns = true
+        i += 1
+    }
+    while i < n &&
+        (
+            sx_plain(lx.cmd[ci].words[i], "builtin", false) ||
+                sx_plain(lx.cmd[ci].words[i], "command", false)
+        ) {
+        i += 1
+    }
+    if i < n &&
+        (
+            sx_plain(lx.cmd[ci].words[i], "exit", false) ||
+                sx_plain(lx.cmd[ci].words[i], "return", false)
+        ) {
+        s = sx_dv_unreach()
+        f = sx_dv_unreach()
+    } else if i < n &&
+        inp.st != SX_DV_UNREACH &&
+        (
+            sx_plain(lx.cmd[ci].words[i], "cd", false) ||
+                sx_plain(lx.cmd[ci].words[i], "pushd", false) ||
+                sx_plain(lx.cmd[ci].words[i], "popd", false)
+        ) {
+        if assigns {
+            s = sx_dv_unknown()
+        } else {
+            let name = copy lx.cmd[ci].words[i].text
+            s = sx_cd_effect(mut lx, env, name, ci, i + 1, n, inp)
+        }
+    }
+    sx_env_taint(mut lx, ci)
+    (s, f)
+}
+
+/// `cmd_done` (`shctx.c:1006-1080`).
+fn sx_cmd_done(mut lx: SxLexer, env: ShEnv, ci: int, op: int) {
+    if !lx.cmd[ci].began && lx.cmd[ci].n == 0 && !lx.cmd[ci].fl.override {
+        return
+    }
+    lx.cmd[ci].began = false
+    let pin = copy lx.cmd[ci].fl.pipe_in
+    var (s, f) = sx_cmd_effect(mut lx, env, ci, pin)
+    if lx.cmd[ci].fl.override {
+        s = copy lx.cmd[ci].fl.ov_s
+        f = copy lx.cmd[ci].fl.ov_f
+        lx.cmd[ci].fl.override = false
+    }
+    if op == SX_OP_PIPE {
+        lx.cmd[ci].fl.stages += 1
+        return
+    }
+    if lx.cmd[ci].fl.stages != 0 {
+        s = sx_dv_join(lx, lx.cmd[ci].fl.pipe_in, s)
+        f = sx_dv_join(lx, lx.cmd[ci].fl.pipe_in, f)
+    }
+    if lx.cmd[ci].fl.negate {
+        s = sx_dv_join(lx, s, f)
+        f = copy s
+    }
+    lx.cmd[ci].fl.stages = 0
+    lx.cmd[ci].fl.negate = false
+    let conn = lx.cmd[ci].fl.conn
+    if conn == SX_CONN_AND {
+        lx.cmd[ci].fl.ls = copy s
+        lx.cmd[ci].fl.lf = sx_dv_join(lx, lx.cmd[ci].fl.lf, f)
+    } else if conn == SX_CONN_OR {
+        lx.cmd[ci].fl.ls = sx_dv_join(lx, lx.cmd[ci].fl.ls, s)
+        lx.cmd[ci].fl.lf = copy f
+    } else {
+        lx.cmd[ci].fl.ls = copy s
+        lx.cmd[ci].fl.lf = copy f
+    }
+    if op == SX_OP_AND {
+        lx.cmd[ci].fl.conn = SX_CONN_AND
+        lx.cmd[ci].fl.pipe_in = copy lx.cmd[ci].fl.ls
+    } else if op == SX_OP_OR {
+        lx.cmd[ci].fl.conn = SX_CONN_OR
+        lx.cmd[ci].fl.pipe_in = copy lx.cmd[ci].fl.lf
+    } else if op == SX_OP_AMP {
+        let li = copy lx.cmd[ci].fl.list_in
+        lx.cmd[ci].fl.last_s = copy li
+        lx.cmd[ci].fl.last_f = copy li
+        sx_flow_list(mut lx.cmd[ci].fl, li)
+    } else {
+        lx.cmd[ci].fl.last_s = copy lx.cmd[ci].fl.ls
+        lx.cmd[ci].fl.last_f = copy lx.cmd[ci].fl.lf
+        let next = sx_flow_pick(lx.cmd[ci].fl.ls, lx.cmd[ci].fl.lf)
+        sx_flow_list(mut lx.cmd[ci].fl, next)
+    }
+}
+
+/// `con_top` (`shctx.c:1082-1091`): the index, or -1.
+fn sx_con_top(lx: SxLexer, kind: int) -> int {
+    if lx.ncons == 0 {
+        return -1
+    }
+    let k = lx.ncons - 1
+    if lx.cons[k].frame == lx.nc - 1 && lx.cons[k].kind == kind then k else -1
+}
+
+/// `con_open` (`shctx.c:1095-1114`).
+fn sx_con_open(mut lx: SxLexer, ci: int, kind: int, loop_kind: int) {
+    if lx.ncons >= SX_CONSTRUCT_MAX {
+        lx.dir_lost = true
+        return
+    }
+    let entry = copy lx.cmd[ci].fl.pipe_in
+    let k = SxCons {
+        kind: kind,
+        loop_kind: loop_kind,
+        has_else: false,
+        dirty: false,
+        braces: 0,
+        frame: lx.nc - 1,
+        entry: copy entry,
+        acc_s: sx_dv_unreach(),
+        acc_f: sx_dv_unreach(),
+        cond_f: sx_dv_unreach(),
+        saved: copy lx.cmd[ci].fl,
+    }
+    if lx.ncons < lx.cons.len {
+        lx.cons[lx.ncons] = k
+    } else {
+        (mut lx.cons).push(k)
+    }
+    lx.ncons += 1
+    let start = if kind == SX_CK_FN then sx_dv_unknown() else entry
+    sx_flow_init(mut lx.cmd[ci].fl, start)
+}
+
+/// `con_close` (`shctx.c:1118-1129`).
+fn sx_con_close(mut lx: SxLexer, ci: int, s: SxDirV, f: SxDirV) {
+    lx.ncons -= 1
+    let k = lx.ncons
+    lx.cmd[ci].fl = copy lx.cons[k].saved
+    if lx.cons[k].kind == SX_CK_FN {
+        return
+    }
+    lx.cmd[ci].fl.override = true
+    lx.cmd[ci].fl.ov_s = copy s
+    lx.cmd[ci].fl.ov_f = copy f
+}
+
+/// `flow_reserved` (`shctx.c:1132-1172`).
+fn sx_flow_reserved(mut lx: SxLexer, ci: int, t: List[byte]) {
+    lx.cmd[ci].began = false
+    if sx_eq(t, "if") {
+        sx_con_open(mut lx, ci, SX_CK_IF, 0)
+    } else if sx_eq(t, "while") || sx_eq(t, "until") {
+        sx_con_open(mut lx, ci, SX_CK_LOOP, if t[0] as int == 117 then 1 else 0)
+    } else if sx_eq(t, "!") {
+        lx.cmd[ci].fl.negate = true
+    } else if sx_eq(t, "then") {
+        let k = sx_con_top(lx, SX_CK_IF)
+        if k >= 0 {
+            lx.cons[k].cond_f = copy lx.cmd[ci].fl.last_f
+            let ls = copy lx.cmd[ci].fl.last_s
+            sx_flow_init(mut lx.cmd[ci].fl, ls)
+        }
+    } else if sx_eq(t, "elif") || sx_eq(t, "else") {
+        let k = sx_con_top(lx, SX_CK_IF)
+        if k >= 0 {
+            lx.cons[k].acc_s = sx_dv_join(lx, lx.cons[k].acc_s, lx.cmd[ci].fl.last_s)
+            lx.cons[k].acc_f = sx_dv_join(lx, lx.cons[k].acc_f, lx.cmd[ci].fl.last_f)
+            lx.cons[k].has_else = t[2] as int == 115
+            let cf = copy lx.cons[k].cond_f
+            sx_flow_init(mut lx.cmd[ci].fl, cf)
+        }
+    } else if sx_eq(t, "do") {
+        let k = sx_con_top(lx, SX_CK_LOOP)
+        if k >= 0 {
+            var body = sx_dv_unreach()
+            if lx.cons[k].loop_kind == 1 {
+                body = copy lx.cmd[ci].fl.last_f
+                lx.cons[k].cond_f = copy lx.cmd[ci].fl.last_s
+            } else if lx.cons[k].loop_kind == 0 {
+                body = copy lx.cmd[ci].fl.last_s
+                lx.cons[k].cond_f = copy lx.cmd[ci].fl.last_f
+            } else {
+                body = sx_flow_pick(lx.cmd[ci].fl.last_s, lx.cmd[ci].fl.last_f)
+                lx.cons[k].cond_f = copy body
+            }
+            sx_flow_init(mut lx.cmd[ci].fl, body)
+        }
+    }
+}
+
+/// `flow_closer` (`shctx.c:1175-1199`).
+fn sx_flow_closer(mut lx: SxLexer, ci: int, t: List[byte]) {
+    if sx_eq(t, "fi") {
+        let k = sx_con_top(lx, SX_CK_IF)
+        if k >= 0 {
+            var s = sx_dv_join(lx, lx.cons[k].acc_s, lx.cmd[ci].fl.last_s)
+            let f = sx_dv_join(lx, lx.cons[k].acc_f, lx.cmd[ci].fl.last_f)
+            if !lx.cons[k].has_else {
+                s = sx_dv_join(lx, s, lx.cons[k].cond_f)
+            }
+            sx_con_close(mut lx, ci, s, f)
+        }
+    } else if sx_eq(t, "done") {
+        let k = sx_con_top(lx, SX_CK_LOOP)
+        if k >= 0 {
+            let end = sx_flow_pick(lx.cmd[ci].fl.last_s, lx.cmd[ci].fl.last_f)
+            let keep = sx_dv_same(lx, end, lx.cons[k].entry) &&
+                (
+                    lx.cons[k].cond_f.st == SX_DV_UNREACH ||
+                        sx_dv_same(lx, lx.cons[k].cond_f, lx.cons[k].entry)
+                )
+            let out = if keep then copy lx.cons[k].entry else sx_dv_unknown()
+            sx_con_close(mut lx, ci, out, out)
+        }
+    } else if sx_eq(t, "esac") {
+        let k = sx_con_top(lx, SX_CK_CASE)
+        if k >= 0 {
+            let out = if lx.cons[k].dirty then sx_dv_unknown() else copy lx.cons[k].entry
+            sx_con_close(mut lx, ci, out, out)
+        }
+    }
+}
+
+/// `fn_header` (`shctx.c:1202-1210`).
+fn sx_fn_header(lx: SxLexer, ci: int) -> bool {
+    let n = lx.cmd[ci].n
+    if n == 2 && sx_plain(lx.cmd[ci].words[1], "()", false) {
+        return true
+    }
+    (n == 2 || n == 3 && sx_plain(lx.cmd[ci].words[2], "()", false)) &&
+        sx_plain(lx.cmd[ci].words[0], "function", false)
+}
+
+fn sx_after_construct(mut lx: SxLexer, ci: int) {
+    lx.cmd[ci].n = 0
+    lx.cmd[ci].expect = SX_EXP_NONE
+    lx.cmd[ci].dbracket = false
+    sx_push_synth(mut lx, ci)
+}
+
+/// `opens_command` (`shctx.c:1221-1233`).
+fn sx_opens_command(t: List[byte]) -> bool {
+    sx_eq(t, "!") ||
+        sx_eq(t, "if") ||
+        sx_eq(t, "then") ||
+        sx_eq(t, "else") ||
+        sx_eq(t, "elif") ||
+        sx_eq(t, "do") ||
+        sx_eq(t, "while") ||
+        sx_eq(t, "until") ||
+        sx_eq(t, "time")
+}
+
+/// `word_end` (`shctx.c:1240-1440`): finish the current word; answers the
+/// frame that is current afterwards.
+fn sx_word_end(mut lx: SxLexer, env: ShEnv, ci: int) -> int {
+    if !lx.cmd[ci].in_word {
+        return lx.nc - 1
+    }
+    lx.cmd[ci].in_word = false
+    lx.cmd[ci].qmode = SX_Q_NONE
+    let text = sx_cstr(lx.cmd[ci].dec, 0, lx.cmd[ci].dec.len)
+    var flags = lx.cmd[ci].w_flags
+    var var_kind = SX_VK_NONE
+    if lx.cmd[ci].w_eq {
+        flags = flags | SX_W_ASSIGN
+    }
+    if lx.cmd[ci].w_tilde {
+        let slash = sx_find(text, 47)
+        let prefix = if slash < 0 then text.len else slash
+        if lx.cmd[ci].w_first_q == SX_NO_OFF || lx.cmd[ci].w_first_q >= prefix {
+            flags = flags | SX_W_TILDE
+        }
+    }
+    if lx.cmd[ci].w_nexp != 0 {
+        var_kind = if lx.cmd[ci].w_nexp == 1 then lx.cmd[ci].w_var else SX_VK_OTHER
+        if var_kind == SX_VK_NONE {
+            var_kind = SX_VK_OTHER
+        }
+    }
+    let expect = lx.cmd[ci].expect
+    if expect == SX_EXP_REDIR || expect == SX_EXP_HERESTR {
+        lx.cmd[ci].expect = SX_EXP_NONE
+        return lx.nc - 1
+    }
+    if expect == SX_EXP_HEREDOC {
+        lx.cmd[ci].expect = SX_EXP_NONE
+        if lx.nheredocs >= SX_HEREDOC_MAX {
+            sx_give_up(mut lx)
+            return lx.nc - 1
+        }
+        while lx.heredocs.len <= lx.nheredocs {
+            (mut lx.heredocs).push(SxHereDoc { delim: List[byte](), strip_tabs: false })
+        }
+        lx.heredocs[lx.nheredocs].delim = text
+        lx.nheredocs += 1
+        return lx.nc - 1
+    }
+    if lx.cmd[ci].casest == SX_CASE_BODY {
+        if sx_word_is(text, flags, "case") {
+            lx.cmd[ci].case_nest += 1
+        } else if sx_word_is(text, flags, "esac") {
+            if lx.cmd[ci].case_nest != 0 {
+                lx.cmd[ci].case_nest -= 1
+            } else {
+                lx.cmd[ci].casest = SX_CASE_NONE
+                sx_flow_closer(mut lx, ci, sx_bytes("esac"))
+                sx_after_construct(mut lx, ci)
+            }
+        } else if sx_word_is(text, flags, "cd") ||
+            sx_word_is(text, flags, "pushd") ||
+            sx_word_is(text, flags, "popd") {
+            let k = sx_con_top(lx, SX_CK_CASE)
+            if k >= 0 {
+                lx.cons[k].dirty = true
+            }
+        }
+        return lx.nc - 1
+    }
+    if lx.cmd[ci].casest == SX_CASE_WORD {
+        lx.cmd[ci].casest = SX_CASE_IN
+        return lx.nc - 1
+    }
+    if lx.cmd[ci].casest == SX_CASE_IN {
+        lx.cmd[ci].casest = SX_CASE_BODY
+        return lx.nc - 1
+    }
+    if lx.cmd[ci].forst == SX_FOR_NAME {
+        lx.cmd[ci].forst = SX_FOR_AFTER_NAME
+        return lx.nc - 1
+    }
+    if lx.cmd[ci].forst == SX_FOR_AFTER_NAME {
+        if sx_word_is(text, flags, "in") {
+            lx.cmd[ci].forst = SX_FOR_LIST
+            sx_push_synth(mut lx, ci)
+        } else {
+            lx.cmd[ci].forst = SX_FOR_NONE
+        }
+        return lx.nc - 1
+    }
+    if lx.cmd[ci].dbracket {
+        if sx_word_is(text, flags, "]]") {
+            lx.cmd[ci].dbracket = false
+        }
+        sx_push_word(mut lx, ci, text, flags)
+        return lx.nc - 1
+    }
+    if lx.cmd[ci].n == 0 && flags & (SX_W_QUOTED | SX_W_EXPANDS) == 0 {
+        let pending = lx.cmd[ci].fn_pending
+        lx.cmd[ci].fn_pending = false
+        if sx_opens_command(text) {
+            sx_flow_reserved(mut lx, ci, text)
+            return lx.nc - 1
+        }
+        if sx_eq(text, "{{") {
+            lx.cmd[ci].fn_pending = pending
+            lx.cmd[ci].began = false
+            let _ = sx_push_cmd(mut lx, SX_FR_BRACE)
+            lx.cmd[ci].fn_pending = false
+            return lx.nc - 1
+        }
+        if sx_eq(text, "}}") {
+            let fnk = sx_con_top(lx, SX_CK_FN)
+            if fnk >= 0 && lx.cons[fnk].braces != 0 {
+                lx.cons[fnk].braces -= 1
+                sx_after_construct(mut lx, ci)
+            } else if fnk >= 0 {
+                sx_con_close(mut lx, ci, sx_dv_unknown(), sx_dv_unknown())
+                sx_after_construct(mut lx, ci)
+            } else if sx_top_kind(lx) == SX_FR_BRACE {
+                let s = copy lx.cmd[ci].fl.last_s
+                let f = copy lx.cmd[ci].fl.last_f
+                let is_fn = lx.cmd[ci].fn_body
+                sx_pop_frame(mut lx)
+                let p = lx.nc - 1
+                sx_after_construct(mut lx, p)
+                if !is_fn {
+                    lx.cmd[p].fl.override = true
+                    lx.cmd[p].fl.ov_s = s
+                    lx.cmd[p].fl.ov_f = f
+                }
+            } else {
+                sx_after_construct(mut lx, ci)
+            }
+            return lx.nc - 1
+        }
+        if sx_eq(text, "fi") || sx_eq(text, "done") || sx_eq(text, "esac") {
+            sx_flow_closer(mut lx, ci, text)
+            sx_after_construct(mut lx, ci)
+            return lx.nc - 1
+        }
+        if sx_eq(text, "for") || sx_eq(text, "select") {
+            lx.cmd[ci].forst = SX_FOR_NAME
+            lx.cmd[ci].began = false
+            sx_con_open(mut lx, ci, SX_CK_LOOP, 2)
+            return lx.nc - 1
+        }
+        if sx_eq(text, "case") {
+            lx.cmd[ci].casest = SX_CASE_WORD
+            lx.cmd[ci].began = false
+            sx_con_open(mut lx, ci, SX_CK_CASE, 0)
+            sx_push_synth(mut lx, ci)
+            return lx.nc - 1
+        }
+        if sx_eq(text, "[[") {
+            lx.cmd[ci].dbracket = true
+        }
+    }
+    let fnk = sx_con_top(lx, SX_CK_FN)
+    if sx_word_is(text, flags, "{{") && fnk >= 0 {
+        lx.cons[fnk].braces += 1
+    } else if sx_word_is(text, flags, "{{") && sx_fn_header(lx, ci) {
+        sx_push_word(mut lx, ci, text, flags)
+        sx_con_open(mut lx, ci, SX_CK_FN, 0)
+        return lx.nc - 1
+    }
+    let vq = lx.cmd[ci].w_var_q
+    sx_push_word(mut lx, ci, text, flags)
+    let last = lx.cmd[ci].n - 1
+    lx.cmd[ci].words[last].vk = var_kind
+    lx.cmd[ci].words[last].var_q = vq
+    let _ = env
+    lx.nc - 1
+}
+
+/// `end_cmd` (`shctx.c:1443-1457`).
+fn sx_end_cmd(mut lx: SxLexer, env: ShEnv, ci0: int, op: int) -> int {
+    let ci = sx_word_end(mut lx, env, ci0)
+    lx.cmd[ci].fn_pending = lx.cmd[ci].n != 0 && sx_fn_header(lx, ci)
+    sx_cmd_done(mut lx, env, ci, op)
+    lx.cmd[ci].n = 0
+    lx.cmd[ci].expect = SX_EXP_NONE
+    lx.cmd[ci].dbracket = false
+    if lx.cmd[ci].forst != SX_FOR_NAME {
+        lx.cmd[ci].forst = SX_FOR_NONE
+    }
+    ci
+}
+
+fn sx_dbracket_word(mut lx: SxLexer, env: ShEnv, ci0: int, op: str) {
+    let ci = sx_word_end(mut lx, env, ci0)
+    sx_push_word(mut lx, ci, sx_bytes(op), 0)
+}
+
+/// `skip_heredocs` (`shctx.c:1471-1508`).
+fn sx_skip_heredocs(s: List[byte], mut lx: SxLexer, at0: int) -> int {
+    var at = at0
+    var h = 0
+    while h < lx.nheredocs {
+        let delim = copy lx.heredocs[h].delim
+        let dlen = delim.len
+        loop {
+            var ls = at
+            if at >= lx.end {
+                sx_give_up(mut lx)
+                return lx.end
+            }
+            while at < lx.end && s[at] as int != 10 {
+                at += 1
+            }
+            if at >= lx.end {
+                sx_give_up(mut lx)
+                return lx.end
+            }
+            let le = at
+            at += 1
+            while lx.heredocs[h].strip_tabs && ls < le && s[ls] as int == 9 {
+                ls += 1
+            }
+            if le - ls == dlen {
+                var same = true
+                var i = 0
+                while i < dlen {
+                    if s[ls + i] != delim[i] {
+                        same = false
+                        break
+                    }
+                    i += 1
+                }
+                if same {
+                    break
+                }
+            }
+        }
+        h += 1
+    }
+    lx.nheredocs = 0
+    at
+}
+
+/// `skip_arith` (`shctx.c:1514-1536`).
+fn sx_skip_arith(s: List[byte], mut lx: SxLexer, from: int) -> int {
+    var at = from
+    var depth = 0
+    while at < lx.end {
+        let c = s[at] as int
+        if c == 40 {
+            depth += 1
+        } else if c == 41 {
+            if depth == 0 {
+                if at + 1 < lx.end && s[at + 1] as int == 41 {
+                    return at + 2
+                }
+                break
+            }
+            depth -= 1
+        }
+        at += 1
+    }
+    sx_give_up(mut lx)
+    lx.end
+}
+
+/// `word_utf8` (`shctx.c:1539-1565`).
+fn sx_word_utf8(mut lx: SxLexer, ci: int, cp: int, raw: int) {
+    var b = List[int]()
+    if cp < 128 {
+        (mut b).push(cp)
+    } else if cp < 2048 {
+        (mut b).push(192 | cp >> 6)
+        (mut b).push(128 | cp & 63)
+    } else if cp < 65536 {
+        (mut b).push(224 | cp >> 12)
+        (mut b).push(128 | cp >> 6 & 63)
+        (mut b).push(128 | cp & 63)
+    } else {
+        (mut b).push(240 | cp >> 18)
+        (mut b).push(128 | cp >> 12 & 63)
+        (mut b).push(128 | cp >> 6 & 63)
+        (mut b).push(128 | cp & 63)
+    }
+    for x in b {
+        sx_word_byte(mut lx, ci, x & 255, true, raw)
+    }
+}
+
+fn sx_hex_val(ch: int) -> int {
+    if ch >= 48 && ch <= 57 {
+        return ch - 48
+    }
+    if ch >= 97 && ch <= 102 {
+        return ch - 97 + 10
+    }
+    if ch >= 65 && ch <= 70 {
+        return ch - 65 + 10
+    }
+    -1
+}
+
+/// `dollar_escape` (`shctx.c:1583-1652`).
+fn sx_dollar_escape(s: List[byte], mut lx: SxLexer, ci: int, at: int) -> int {
+    let e = sx_peek(s, lx, at + 1)
+    var p = at + 2
+    var v = 0
+    var digits = 0
+    if e == -1 {
+        return at + 1
+    }
+    let simple = match e {
+        97 => 7,
+        98 => 8,
+        101 => 27,
+        69 => 27,
+        102 => 12,
+        110 => 10,
+        114 => 13,
+        116 => 9,
+        118 => 11,
+        92 => 92,
+        39 => 39,
+        34 => 34,
+        63 => 63,
+        _ => -1,
+    }
+    if simple >= 0 {
+        sx_word_byte(mut lx, ci, simple, true, at)
+        return p
+    }
+    if e == 99 {
+        let c = sx_peek(s, lx, p)
+        if c >= 0 {
+            sx_word_byte(mut lx, ci, c & 31, true, at)
+            return p + 1
+        }
+        return p
+    }
+    if e == 120 || e == 117 || e == 85 {
+        let max = if e == 120 then 2 else if e == 117 then 4 else 8
+        while digits < max && sx_hex_val(sx_peek(s, lx, p)) >= 0 {
+            // C's `u32` accumulates eight hex digits without overflow.
+            v = v * 16 + sx_hex_val(sx_peek(s, lx, p))
+            p += 1
+            digits += 1
+        }
+        if digits == 0 {
+            sx_word_byte(mut lx, ci, 92, true, at)
+            sx_word_byte(mut lx, ci, e, true, at)
+            return p
+        }
+        if e == 120 {
+            sx_word_byte(mut lx, ci, v & 255, true, at)
+        } else if v <= 1114111 && !(v >= 55296 && v <= 57343) {
+            sx_word_utf8(mut lx, ci, v, at)
+        }
+        return p
+    }
+    if e >= 48 && e <= 55 {
+        p = at + 1
+        while digits < 3 && sx_peek(s, lx, p) >= 48 && sx_peek(s, lx, p) <= 55 {
+            v = v * 8 + (sx_peek(s, lx, p) - 48)
+            p += 1
+            digits += 1
+        }
+        sx_word_byte(mut lx, ci, v & 255, true, at)
+        return p
+    }
+    sx_word_byte(mut lx, ci, 92, true, at)
+    sx_word_byte(mut lx, ci, e, true, at)
+    p
+}
+
+/// `strchr("?$!#@*-", c)`.
+fn sx_special_param(c: int) -> bool {
+    c == 63 || c == 36 || c == 33 || c == 35 || c == 64 || c == 42 || c == 45
+}
+
+/// `lex_dollar` (`shctx.c:1658-1756`).
+fn sx_lex_dollar(s: List[byte], mut lx: SxLexer, ci: int, at: int, in_dq: bool) -> int {
+    let n1 = sx_peek(s, lx, at + 1)
+    sx_word_begin(mut lx, ci, at)
+    if n1 < 0 {
+        sx_word_expands(mut lx, ci, at)
+        lx.in_var = true
+        lx.var_start = at + 1
+        lx.stop = true
+        return lx.end
+    }
+    if n1 == 40 {
+        sx_word_expands(mut lx, ci, at)
+        if sx_peek(s, lx, at + 2) == 40 {
+            return sx_skip_arith(s, mut lx, at + 3)
+        }
+        let _ = sx_push_cmd(mut lx, SX_FR_CMDSUB)
+        return at + 2
+    }
+    if n1 == 123 {
+        sx_word_expands(mut lx, ci, at)
+        var j = at + 2
+        if sx_peek(s, lx, j) < 0 || sx_is_name_start(sx_peek(s, lx, j)) {
+            while sx_peek(s, lx, j) >= 0 && sx_is_name_char(sx_peek(s, lx, j)) {
+                j += 1
+            }
+            if j >= lx.end {
+                lx.in_var = true
+                lx.var_brace = true
+                lx.var_start = at + 2
+                lx.stop = true
+                return lx.end
+            }
+            if s[j] as int == 125 && j > at + 2 {
+                sx_word_var(mut lx, ci, s, at + 2, j - (at + 2), in_dq)
+            }
+        }
+        var depth = 0
+        while j < lx.end {
+            let ch = s[j] as int
+            if ch == 92 {
+                j += 1
+            } else if ch == 123 {
+                depth += 1
+            } else if ch == 125 {
+                if depth == 0 {
+                    return j + 1
+                }
+                depth -= 1
+            }
+            j += 1
+        }
+        sx_give_up(mut lx)
+        return lx.end
+    }
+    if !in_dq && n1 == 39 {
+        lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_QUOTED
+        lx.cmd[ci].w_digits = false
+        if !lx.cmd[ci].w_eq {
+            lx.cmd[ci].w_name = false
+        }
+        lx.cmd[ci].qmode = SX_Q_DOLLAR
+        return at + 2
+    }
+    if !in_dq && n1 == 34 {
+        lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_QUOTED
+        lx.cmd[ci].w_digits = false
+        if !lx.cmd[ci].w_eq {
+            lx.cmd[ci].w_name = false
+        }
+        let _ = sx_push_dq(mut lx)
+        return at + 2
+    }
+    if sx_is_name_start(n1) {
+        sx_word_expands(mut lx, ci, at)
+        var j = at + 1
+        while j < lx.end && sx_is_name_char(s[j] as int) {
+            j += 1
+        }
+        if j >= lx.end {
+            lx.in_var = true
+            lx.var_start = at + 1
+            lx.stop = true
+            return lx.end
+        }
+        sx_word_var(mut lx, ci, s, at + 1, j - (at + 1), in_dq)
+        return j
+    }
+    if sx_is_digit(n1) || n1 != 0 && sx_special_param(n1) {
+        sx_word_expands(mut lx, ci, at)
+        return at + 2
+    }
+    sx_word_byte(mut lx, ci, 36, in_dq, at)
+    at + 1
+}
+
+/// `lex_dq` (`shctx.c:1759-1790`).
+fn sx_lex_dq(s: List[byte], mut lx: SxLexer, ci: int, at: int) -> int {
+    let ch = s[at] as int
+    if ch == 34 {
+        sx_pop_frame(mut lx)
+        return at + 1
+    }
+    if ch == 92 {
+        let n1 = sx_peek(s, lx, at + 1)
+        if n1 < 0 {
+            return at + 1
+        }
+        if n1 == 10 {
+            return at + 2
+        }
+        if n1 == 34 || n1 == 92 || n1 == 36 || n1 == 96 {
+            sx_word_byte(mut lx, ci, n1, true, at + 1)
+            return at + 2
+        }
+        sx_word_byte(mut lx, ci, 92, true, at)
+        return at + 1
+    }
+    if ch == 36 {
+        return sx_lex_dollar(s, mut lx, ci, at, true)
+    }
+    if ch == 96 {
+        sx_word_expands(mut lx, ci, at)
+        let _ = sx_push_cmd(mut lx, SX_FR_BACKTICK)
+        return at + 1
+    }
+    sx_word_byte(mut lx, ci, ch, true, at)
+    at + 1
+}
+
+/// `lex_redirect` (`shctx.c:1793-1888`).
+fn sx_lex_redirect(s: List[byte], mut lx: SxLexer, env: ShEnv, ci0: int, at: int) -> int {
+    let ch = s[at] as int
+    let n1 = sx_peek(s, lx, at + 1)
+    var ci = ci0
+    var p = 0
+    var dup = false
+    lx.cmd[ci].began = true
+    if lx.cmd[ci].in_word &&
+        lx.cmd[ci].w_digits &&
+        lx.cmd[ci].dec.len != 0 &&
+        lx.cmd[ci].w_flags == 0 &&
+        ch != 38 {
+        lx.cmd[ci].in_word = false
+    } else {
+        ci = sx_word_end(mut lx, env, ci)
+    }
+    if ch == 38 {
+        p = at + 2
+        if sx_peek(s, lx, p) == 62 {
+            p += 1
+        }
+        lx.cmd[ci].expect = SX_EXP_REDIR
+        return p
+    }
+    if ch == 60 {
+        if n1 == 60 {
+            if sx_peek(s, lx, at + 2) == 60 {
+                lx.cmd[ci].expect = SX_EXP_HERESTR
+                return at + 3
+            }
+            lx.cmd[ci].expect = SX_EXP_HEREDOC
+            while lx.heredocs.len <= lx.nheredocs && lx.heredocs.len < SX_HEREDOC_MAX {
+                (mut lx.heredocs).push(SxHereDoc { delim: List[byte](), strip_tabs: false })
+            }
+            if sx_peek(s, lx, at + 2) == 45 {
+                if lx.nheredocs < SX_HEREDOC_MAX {
+                    lx.heredocs[lx.nheredocs].strip_tabs = true
+                }
+                return at + 3
+            }
+            if lx.nheredocs < SX_HEREDOC_MAX {
+                lx.heredocs[lx.nheredocs].strip_tabs = false
+            }
+            return at + 2
+        }
+        if n1 == 62 {
+            lx.cmd[ci].expect = SX_EXP_REDIR
+            return at + 2
+        }
+        if n1 == 38 {
+            dup = true
+            p = at + 2
+        } else {
+            lx.cmd[ci].expect = SX_EXP_REDIR
+            return at + 1
+        }
+    } else {
+        if n1 == 62 || n1 == 124 {
+            lx.cmd[ci].expect = SX_EXP_REDIR
+            return at + 2
+        }
+        if n1 == 38 {
+            dup = true
+            p = at + 2
+        } else {
+            lx.cmd[ci].expect = SX_EXP_REDIR
+            return at + 1
+        }
+    }
+    if dup {
+        var q = p
+        while q < lx.end && sx_is_digit(s[q] as int) {
+            q += 1
+        }
+        if q < lx.end && s[q] as int == 45 {
+            q += 1
+        }
+        if q != p {
+            lx.cmd[ci].expect = SX_EXP_NONE
+            return q
+        }
+        lx.cmd[ci].expect = SX_EXP_REDIR
+    }
+    p
+}
+
+/// `lex_cmd` (`shctx.c:1891-2045`): one step outside any quote.
+fn sx_lex_cmd(s: List[byte], mut lx: SxLexer, env: ShEnv, ci: int, at: int) -> int {
+    let ch = s[at] as int
+    let n1 = sx_peek(s, lx, at + 1)
+    if ch == 32 || ch == 9 {
+        let _ = sx_word_end(mut lx, env, ci)
+        return at + 1
+    }
+    if ch == 10 {
+        let _ = sx_end_cmd(mut lx, env, ci, SX_OP_LIST)
+        if lx.nheredocs != 0 {
+            return sx_skip_heredocs(s, mut lx, at + 1)
+        }
+        return at + 1
+    }
+    if ch == 92 {
+        sx_word_begin(mut lx, ci, at)
+        if n1 < 0 {
+            lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_QUOTED
+            lx.cmd[ci].w_digits = false
+            return at + 1
+        }
+        if n1 == 10 {
+            if lx.cmd[ci].dec.len == 0 && lx.cmd[ci].w_start == at {
+                lx.cmd[ci].in_word = false
+            }
+            return at + 2
+        }
+        sx_word_byte(mut lx, ci, n1, true, at + 1)
+        return at + 2
+    }
+    if ch == 39 {
+        sx_word_begin(mut lx, ci, at)
+        lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_QUOTED
+        lx.cmd[ci].w_digits = false
+        if !lx.cmd[ci].w_eq {
+            lx.cmd[ci].w_name = false
+        }
+        lx.cmd[ci].qmode = SX_Q_SINGLE
+        return at + 1
+    }
+    if ch == 34 {
+        sx_word_begin(mut lx, ci, at)
+        lx.cmd[ci].w_flags = lx.cmd[ci].w_flags | SX_W_QUOTED
+        lx.cmd[ci].w_digits = false
+        if !lx.cmd[ci].w_eq {
+            lx.cmd[ci].w_name = false
+        }
+        let _ = sx_push_dq(mut lx)
+        return at + 1
+    }
+    if ch == 96 {
+        if sx_top_kind(lx) == SX_FR_BACKTICK {
+            let _ = sx_word_end(mut lx, env, ci)
+            sx_pop_frame(mut lx)
+            return at + 1
+        }
+        sx_word_begin(mut lx, ci, at)
+        sx_word_expands(mut lx, ci, at)
+        let _ = sx_push_cmd(mut lx, SX_FR_BACKTICK)
+        return at + 1
+    }
+    if ch == 36 {
+        return sx_lex_dollar(s, mut lx, ci, at, false)
+    }
+    if ch == 35 && !lx.cmd[ci].in_word {
+        var p = at
+        while p < lx.end && s[p] as int != 10 {
+            p += 1
+        }
+        if p >= lx.end {
+            sx_give_up(mut lx)
+            return lx.end
+        }
+        return p
+    }
+    if ch == 124 {
+        if lx.cmd[ci].dbracket {
+            sx_dbracket_word(mut lx, env, ci, if n1 == 124 then "||" else "|")
+            return if n1 == 124 then at + 2 else at + 1
+        }
+        let _ = sx_end_cmd(mut lx, env, ci, if n1 == 124 then SX_OP_OR else SX_OP_PIPE)
+        return if n1 == 124 || n1 == 38 then at + 2 else at + 1
+    }
+    if ch == 38 {
+        if n1 == 62 {
+            return sx_lex_redirect(s, mut lx, env, ci, at)
+        }
+        if lx.cmd[ci].dbracket && n1 == 38 {
+            sx_dbracket_word(mut lx, env, ci, "&&")
+            return at + 2
+        }
+        let _ = sx_end_cmd(mut lx, env, ci, if n1 == 38 then SX_OP_AND else SX_OP_AMP)
+        return if n1 == 38 then at + 2 else at + 1
+    }
+    if ch == 59 {
+        var p = at + 1
+        if sx_peek(s, lx, p) == 59 {
+            p += 1
+            if sx_peek(s, lx, p) == 38 {
+                p += 1
+            }
+        } else if sx_peek(s, lx, p) == 38 {
+            p += 1
+        }
+        let _ = sx_end_cmd(mut lx, env, ci, SX_OP_LIST)
+        return p
+    }
+    if ch == 40 {
+        if lx.cmd[ci].casest == SX_CASE_BODY {
+            let _ = sx_word_end(mut lx, env, ci)
+            return at + 1
+        }
+        if lx.cmd[ci].dbracket {
+            sx_dbracket_word(mut lx, env, ci, "(")
+            return at + 1
+        }
+        if !lx.cmd[ci].in_word &&
+            n1 == 40 &&
+            (lx.cmd[ci].n == 0 || lx.cmd[ci].forst == SX_FOR_NAME) {
+            lx.cmd[ci].forst = SX_FOR_NONE
+            let next = sx_skip_arith(s, mut lx, at + 2)
+            if !lx.stop {
+                sx_after_construct(mut lx, ci)
+            }
+            return next
+        }
+        let c2 = sx_word_end(mut lx, env, ci)
+        if n1 == 41 {
+            sx_word_begin(mut lx, c2, at)
+            sx_word_byte(mut lx, c2, 40, false, at)
+            sx_word_byte(mut lx, c2, 41, false, at + 1)
+            let _ = sx_word_end(mut lx, env, c2)
+            return at + 2
+        }
+        if sx_fn_header(lx, c2) {
+            lx.cmd[c2].fn_pending = true
+        }
+        let _ = sx_push_cmd(mut lx, SX_FR_PAREN)
+        return at + 1
+    }
+    if ch == 41 {
+        if lx.cmd[ci].casest == SX_CASE_BODY {
+            let _ = sx_word_end(mut lx, env, ci)
+            return at + 1
+        }
+        if lx.cmd[ci].dbracket {
+            sx_dbracket_word(mut lx, env, ci, ")")
+            return at + 1
+        }
+        let c2 = sx_word_end(mut lx, env, ci)
+        let tk = sx_top_kind(lx)
+        if tk == SX_FR_PAREN {
+            sx_pop_frame(mut lx)
+            let p = lx.nc - 1
+            sx_after_construct(mut lx, p)
+        } else if tk == SX_FR_CMDSUB || tk == SX_FR_PROCSUB {
+            sx_pop_frame(mut lx)
+        } else {
+            lx.cmd[c2].expect = SX_EXP_NONE
+        }
+        return at + 1
+    }
+    if ch == 60 || ch == 62 {
+        if lx.cmd[ci].dbracket {
+            sx_dbracket_word(mut lx, env, ci, if ch == 60 then "<" else ">")
+            return at + 1
+        }
+        if n1 == 40 {
+            sx_word_begin(mut lx, ci, at)
+            sx_word_expands(mut lx, ci, at)
+            let _ = sx_push_cmd(mut lx, SX_FR_PROCSUB)
+            return at + 2
+        }
+        return sx_lex_redirect(s, mut lx, env, ci, at)
+    }
+    sx_word_begin(mut lx, ci, at)
+    sx_word_byte(mut lx, ci, ch, false, at)
+    at + 1
+}
+
+/// `lex_squote` (`shctx.c:2048-2061`).
+fn sx_lex_squote(s: List[byte], mut lx: SxLexer, ci: int, at: int) -> int {
+    let ch = s[at] as int
+    if ch == 39 {
+        lx.cmd[ci].qmode = SX_Q_NONE
+        return at + 1
+    }
+    if lx.cmd[ci].qmode == SX_Q_DOLLAR && ch == 92 {
+        return sx_dollar_escape(s, mut lx, ci, at)
+    }
+    sx_word_byte(mut lx, ci, ch, true, at)
+    at + 1
+}
+
+// ------------------------------------------------------------------
+// §2: simple-command resolution
+// ------------------------------------------------------------------
+
+/// One wrapper as the resolution reads it (`Wrapper`, `shctx.c:2067-2072`).
+struct SxWrapper {
+    found: bool,
+    consumes: List[List[byte]],
+    operands: int,
+    skips_assign: bool,
+}
+
+fn sx_flags(names: str) -> List[List[byte]] {
+    var out = List[List[byte]]()
+    for w in names.words() {
+        (mut out).push(sx_bytes(w))
+    }
+    out
+}
+
+/// §2's built-in table (`shctx.c:2074-2100`).
+fn sx_builtin_wrapper(name: List[byte]) -> SxWrapper {
+    let none = SxWrapper {
+        found: false,
+        consumes: List[List[byte]](),
+        operands: 0,
+        skips_assign: false,
+    }
+    let n = str_from_utf8(name) else |_| { return none }
+    match n {
+        "sudo" =>
+            SxWrapper {
+                found: true,
+                consumes: sx_flags("-u -g -C -h -p -U -r -t -D -R"),
+                operands: 0,
+                skips_assign: true,
+            },
+        "doas" =>
+            SxWrapper {
+                found: true,
+                consumes: sx_flags("-u -C"),
+                operands: 0,
+                skips_assign: false,
+            },
+        "env" =>
+            SxWrapper {
+                found: true,
+                consumes: sx_flags("-u -C -S"),
+                operands: 0,
+                skips_assign: true,
+            },
+        "nice" =>
+            SxWrapper { found: true, consumes: sx_flags("-n"), operands: 0, skips_assign: false },
+        "timeout" =>
+            SxWrapper {
+                found: true,
+                consumes: sx_flags("-s -k"),
+                operands: 1,
+                skips_assign: false,
+            },
+        "xargs" =>
+            SxWrapper {
+                found: true,
+                consumes: sx_flags("-a -d -E -e -I -i -L -l -n -P -s"),
+                operands: 0,
+                skips_assign: false,
+            },
+        "nohup" =>
+            SxWrapper {
+                found: true,
+                consumes: List[List[byte]](),
+                operands: 0,
+                skips_assign: false,
+            },
+        "time" =>
+            SxWrapper {
+                found: true,
+                consumes: List[List[byte]](),
+                operands: 0,
+                skips_assign: false,
+            },
+        "command" =>
+            SxWrapper {
+                found: true,
+                consumes: List[List[byte]](),
+                operands: 0,
+                skips_assign: false,
+            },
+        "builtin" =>
+            SxWrapper {
+                found: true,
+                consumes: List[List[byte]](),
+                operands: 0,
+                skips_assign: false,
+            },
+        "exec" =>
+            SxWrapper {
+                found: true,
+                consumes: List[List[byte]](),
+                operands: 0,
+                skips_assign: false,
+            },
+        "caffeinate" =>
+            SxWrapper {
+                found: true,
+                consumes: List[List[byte]](),
+                operands: 0,
+                skips_assign: false,
+            },
+        "unbuffer" =>
+            SxWrapper {
+                found: true,
+                consumes: List[List[byte]](),
+                operands: 0,
+                skips_assign: false,
+            },
+        _ => none,
+    }
+}
+
+/// `wrapper_of` (`shctx.c:2109-2136`): the table's row first, then §2's.
+fn sx_wrapper_of(wrap: ShWrapTable, w: SxWord) -> SxWrapper {
+    let none = SxWrapper {
+        found: false,
+        consumes: List[List[byte]](),
+        operands: 0,
+        skips_assign: false,
+    }
+    if w.flags & (SX_W_QUOTED | SX_W_EXPANDS | SX_W_SYNTH) != 0 {
+        return none
+    }
+    for r in wrap.rows {
+        if sx_same(r.name, w.text) {
+            if r.verdict == 0 {
+                return none
+            }
+            if r.verdict > 0 {
+                return SxWrapper {
+                    found: true,
+                    consumes: copy r.consumes,
+                    operands: r.operands,
+                    skips_assign: r.skips_assign,
+                }
+            }
+        }
+    }
+    sx_builtin_wrapper(w.text)
+}
+
+fn sx_wrapper_consumes(wr: SxWrapper, flag: List[byte]) -> bool {
+    for c in wr.consumes {
+        if sx_same(c, flag) {
+            return true
+        }
+    }
+    false
+}
+
+fn sx_skip_assign(lx: SxLexer, ci: int, i0: int, n: int) -> int {
+    var i = i0
+    while i < n && lx.cmd[ci].words[i].flags & SX_W_ASSIGN != 0 {
+        i += 1
+    }
+    i
+}
+
+/// `command_index` (`shctx.c:2138-2201`).
+fn sx_command_index(
+    lx: SxLexer,
+    wrap: ShWrapTable,
+    ci: int,
+    n: int,
+    role: int,
+    caret_flag: bool,
+) -> int {
+    var i = sx_skip_assign(lx, ci, 0, n)
+    loop {
+        if i >= n {
+            return n
+        }
+        let wr = sx_wrapper_of(wrap, lx.cmd[ci].words[i])
+        if !wr.found {
+            return i
+        }
+        var j = i + 1
+        var ended = false
+        while j < n {
+            if lx.cmd[ci].words[j].flags & SX_W_QUOTED == 0 &&
+                sx_eq(lx.cmd[ci].words[j].text, "--") {
+                j += 1
+                ended = true
+                break
+            }
+            if sx_at(lx.cmd[ci].words[j].text, 0) == 45 && lx.cmd[ci].words[j].text.len > 1 {
+                if sx_wrapper_consumes(wr, lx.cmd[ci].words[j].text) {
+                    if j + 1 >= n {
+                        return i
+                    }
+                    j += 2
+                    continue
+                }
+                j += 1
+                continue
+            }
+            if wr.skips_assign && lx.cmd[ci].words[j].flags & SX_W_ASSIGN != 0 {
+                j += 1
+                continue
+            }
+            break
+        }
+        if j >= n {
+            if role != SX_ROLE_WORD {
+                return i
+            }
+            if !ended && caret_flag {
+                return i
+            }
+            if wr.operands != 0 {
+                return i
+            }
+            return n
+        }
+        var k = 0
+        while k < wr.operands {
+            if j >= n {
+                return i
+            }
+            j += 1
+            k += 1
+        }
+        i = sx_skip_assign(lx, ci, j, n)
+    }
+}
+
+fn sx_ctx_new() -> ShCtx {
+    ShCtx {
+        pos: SH_POS_NONE,
+        quote: SH_Q_NONE,
+        replace_lo: 0,
+        replace_hi: 0,
+        stem: List[byte](),
+        argv: List[List[byte]](),
+        argc: 0,
+        arg_index: 0,
+        dashdash: false,
+        brace_var: false,
+        depth: 0,
+        tilde: false,
+        expands: false,
+        cwd: List[byte](),
+        cwd_known: false,
+        dirv: List[List[byte]](),
+        dirv_known: List[bool](),
+    }
+}
+
+/// `resolve` (`shctx.c:2203-2264`).
+fn sx_resolve(
+    lx: SxLexer,
+    env: ShEnv,
+    wrap: ShWrapTable,
+    ci: int,
+    role: int,
+    assign: bool,
+    mut out: ShCtx,
+) {
+    let n = lx.cmd[ci].n
+    let caret_flag = sx_at(out.stem, 0) == 45 &&
+        (!lx.cmd[ci].in_word || lx.cmd[ci].w_flags & SX_W_QUOTED == 0)
+    let cmd = sx_command_index(lx, wrap, ci, n, role, caret_flag)
+    out.argv = List[List[byte]]()
+    out.dirv = List[List[byte]]()
+    out.dirv_known = List[bool]()
+    if role == SX_ROLE_WORD && cmd == n {
+        out.pos = if assign then SH_POS_ASSIGN else SH_POS_COMMAND
+        out.argc = 0
+        out.arg_index = 0
+        return
+    }
+    out.pos = if role == SX_ROLE_REDIR then SH_POS_REDIRECT else SH_POS_ARGUMENT
+    if cmd == n {
+        out.argc = 2
+        out.arg_index = 1
+        (mut out.argv).push(List[byte]())
+        (mut out.argv).push(copy out.stem)
+        (mut out.dirv).push(List[byte]())
+        (mut out.dirv).push(List[byte]())
+        (mut out.dirv_known).push(false)
+        (mut out.dirv_known).push(false)
+        return
+    }
+    out.arg_index = n - cmd
+    out.argc = out.arg_index + 1
+    var k = cmd
+    while k < n {
+        let w = copy lx.cmd[ci].words[k]
+        let (d, known, _) = sx_word_dir(lx, env, w, sx_dv_unknown(), false)
+        (mut out.argv).push(copy w.text)
+        (mut out.dirv).push(d)
+        (mut out.dirv_known).push(known)
+        k += 1
+    }
+    (mut out.argv).push(copy out.stem)
+    (mut out.dirv).push(List[byte]())
+    (mut out.dirv_known).push(false)
+    if role == SX_ROLE_WORD {
+        k = cmd + 1
+        while k < n {
+            if lx.cmd[ci].words[k].flags & SX_W_QUOTED == 0 &&
+                sx_eq(lx.cmd[ci].words[k].text, "--") {
+                out.dashdash = true
+            }
+            k += 1
+        }
+    }
+}
+
+/// `set_none` (`shctx.c:2266-2282`).
+fn sx_set_none(lx: SxLexer, mut out: ShCtx) {
+    out.pos = SH_POS_NONE
+    out.replace_lo = lx.end
+    out.replace_hi = lx.end
+    out.stem = List[byte]()
+    out.argc = 0
+    out.arg_index = 0
+    out.argv = List[List[byte]]()
+    out.dirv = List[List[byte]]()
+    out.dirv_known = List[bool]()
+    out.dashdash = false
+    out.brace_var = false
+    out.tilde = false
+    out.expands = false
+}
+
+/// `finish` (`shctx.c:2284-2369`).
+fn sx_finish(s: List[byte], lx: SxLexer, env: ShEnv, wrap: ShWrapTable, mut out: ShCtx) {
+    let ci = lx.nc - 1
+    var assign = false
+    var role = SX_ROLE_WORD
+    out.depth = 0
+    var i = 1
+    while i < lx.nk {
+        if lx.kinds[i] != SX_FR_DQ {
+            out.depth += 1
+        }
+        i += 1
+    }
+    let qm = lx.cmd[ci].qmode
+    out.quote = if sx_top_kind(lx) == SX_FR_DQ {
+        SH_Q_DOUBLE
+    } else if qm == SX_Q_SINGLE {
+        SH_Q_SINGLE
+    } else if qm == SX_Q_DOLLAR {
+        SH_Q_DOLLAR
+    } else {
+        SH_Q_NONE
+    }
+    let v = sx_frame_eff_in(lx, ci, lx.cmd[ci].fl.pipe_in)
+    out.cwd_known = v.st == SX_DV_KNOWN
+    out.cwd = if out.cwd_known then copy lx.paths[v.path] else List[byte]()
+    if lx.none {
+        sx_set_none(lx, mut out)
+        return
+    }
+    i = 0
+    while i < lx.nc {
+        if lx.cmd[i].casest == SX_CASE_BODY || lx.cmd[i].casest == SX_CASE_IN {
+            sx_set_none(lx, mut out)
+            return
+        }
+        i += 1
+    }
+    if lx.cmd[ci].expect == SX_EXP_HEREDOC ||
+        lx.cmd[ci].forst == SX_FOR_NAME ||
+        lx.cmd[ci].forst == SX_FOR_AFTER_NAME {
+        sx_set_none(lx, mut out)
+        return
+    }
+    if lx.cmd[ci].expect == SX_EXP_REDIR {
+        role = SX_ROLE_REDIR
+    } else if lx.cmd[ci].expect == SX_EXP_HERESTR {
+        role = SX_ROLE_HERESTR
+    }
+    if lx.in_var {
+        out.replace_lo = lx.var_start
+        out.replace_hi = lx.end
+        out.stem = sx_cstr(s, lx.var_start, lx.end)
+        out.brace_var = lx.var_brace
+        out.tilde = false
+        out.expands = false
+    } else if lx.cmd[ci].in_word {
+        out.replace_lo = lx.cmd[ci].w_start
+        out.replace_hi = lx.end
+        out.stem = sx_cstr(lx.cmd[ci].dec, 0, lx.cmd[ci].dec.len)
+        out.tilde = lx.cmd[ci].w_tilde
+        out.expands = lx.cmd[ci].w_expand_raw != SX_NO_OFF
+        assign = role == SX_ROLE_WORD && lx.cmd[ci].w_eq
+    } else {
+        out.replace_lo = lx.end
+        out.replace_hi = lx.end
+        out.stem = List[byte]()
+    }
+    sx_resolve(lx, env, wrap, ci, role, assign, mut out)
+    if lx.in_var {
+        out.pos = SH_POS_VARIABLE
+        return
+    }
+    if out.pos == SH_POS_ASSIGN {
+        out.replace_lo = lx.cmd[ci].w_eq_raw
+        out.replace_hi = lx.end
+        out.stem = sx_cstr(lx.cmd[ci].dec, lx.cmd[ci].w_eq_dec, lx.cmd[ci].dec.len)
+        out.tilde = lx.cmd[ci].w_tilde_eq
+        out.expands = lx.cmd[ci].w_expand_raw != SX_NO_OFF &&
+            lx.cmd[ci].w_expand_raw >= lx.cmd[ci].w_eq_raw
+    }
+}
+
+/// `yew_shctx_at` (`shctx.c:2371-2375`): the built-in wrapper table, no
+/// environment. `(ok, ctx)`; false only for a caret past the line.
+pub fn shctx_at(line: List[byte], cursor: int) -> (bool, ShCtx) {
+    shctx_at_env(line, cursor, shwrap_none(), shenv_none())
+}
+
+/// `yew_shctx_at_with` (`shctx.c:2377-2382`).
+pub fn shctx_at_with(line: List[byte], cursor: int, wrap: ShWrapTable) -> (bool, ShCtx) {
+    shctx_at_env(line, cursor, wrap, shenv_none())
+}
+
+/// `yew_shctx_at_env` (`shctx.c:2384-2425`): never fails on any byte
+/// sequence; a line it cannot classify is `SH_POS_NONE`.
+pub fn shctx_at_env(line: List[byte], cursor: int, wrap: ShWrapTable, env: ShEnv) -> (bool, ShCtx) {
+    var out = sx_ctx_new()
+    if cursor < 0 || cursor > line.len {
+        return (false, out)
+    }
+    var lx = SxLexer {
+        end: cursor,
+        kinds: List[int](),
+        nk: 0,
+        cmd: List[SxFrame](),
+        nc: 0,
+        heredocs: List[SxHereDoc](),
+        nheredocs: 0,
+        stop: false,
+        none: false,
+        in_var: false,
+        var_brace: false,
+        var_start: 0,
+        cons: List[SxCons](),
+        ncons: 0,
+        dir_lost: false,
+        env_dirty: false,
+        paths: List[List[byte]](),
+        nodes: List[SxNode](),
+    }
+    sx_push_kind(mut lx, SX_FR_TOP)
+    sx_frame_init(mut lx, 0, SX_FR_TOP)
+    let root = sx_path(mut lx, List[byte]())
+    lx.cmd[0].fl = sx_flow_new(sx_dv(SX_DV_KNOWN, root))
+    lx.nc = 1
+    var at = 0
+    while at < lx.end && !lx.stop {
+        let ci = lx.nc - 1
+        var next = 0
+        if sx_top_kind(lx) == SX_FR_DQ {
+            next = sx_lex_dq(line, mut lx, ci, at)
+        } else if lx.cmd[ci].qmode != SX_Q_NONE {
+            next = sx_lex_squote(line, mut lx, ci, at)
+        } else {
+            next = sx_lex_cmd(line, mut lx, env, ci, at)
+        }
+        at = if next > at then next else at + 1
+    }
+    sx_finish(line, lx, env, wrap, mut out)
+    (true, out)
+}
+
+// ------------------------------------------------------------------
+// §6: shell quoting
+// ------------------------------------------------------------------
+
+/// `needs_single_quote` (`shctx.c:2447-2456`): a control byte, or invalid
+/// UTF-8.
+fn sx_needs_single_quote(s: List[byte], at: int, end: int) -> bool {
+    var i = at
+    while i < end {
+        let c = s[i] as int
+        if c < 32 || c == 127 {
+            return true
+        }
+        i += 1
+    }
+    unicode.utf8_validate(s, at, end) != end
+}
+
+/// `none_special` (`shctx.c:2467-2474`).
+fn sx_none_special(b: int, first: bool) -> bool {
+    let always = " \t\\'\"$`!*?[](){{}}<>|&;~#^"
+    if b != 0 {
+        for x in always.bytes() {
+            if x as int == b {
+                return true
+            }
+        }
+    }
+    first && b == 61
+}
+
+/// `yew_shq_quote` (`shctx.c:2476-2543`): `text` quoted for insertion at
+/// a caret in state `q`; `(bytes, closing)`.
+pub fn shq_quote(text: List[byte], at: int, end: int, q: int) -> (List[byte], str) {
+    var out = List[byte]()
+    var closing = ""
+    if q == SH_Q_NONE {
+        if sx_needs_single_quote(text, at, end) {
+            shell_quote_into(mut out, text, at, end)
+        } else {
+            var i = at
+            while i < end {
+                if sx_none_special(text[i] as int, i == at) {
+                    (mut out).push(92 as byte)
+                }
+                (mut out).push(text[i])
+                i += 1
+            }
+        }
+    } else if q == SH_Q_SINGLE {
+        var i = at
+        while i < end {
+            if text[i] as int == 39 {
+                sx_append_str(mut out, "'\\''")
+            } else {
+                (mut out).push(text[i])
+            }
+            i += 1
+        }
+        closing = "'"
+    } else if q == SH_Q_DOUBLE {
+        var i = at
+        while i < end {
+            let c = text[i] as int
+            if c == 34 || c == 36 || c == 96 || c == 92 {
+                (mut out).push(92 as byte)
+            }
+            (mut out).push(text[i])
+            i += 1
+        }
+        closing = "\""
+    } else {
+        let hex = "0123456789abcdef"
+        var i = at
+        while i < end {
+            let c = text[i] as int
+            if c == 92 || c == 39 {
+                (mut out).push(92 as byte)
+                (mut out).push(text[i])
+            } else if c < 32 || c == 127 {
+                (mut out).push(92 as byte)
+                (mut out).push(120 as byte)
+                (mut out).push(hex.bytes()[c >> 4])
+                (mut out).push(hex.bytes()[c & 15])
+            } else {
+                (mut out).push(text[i])
+            }
+            i += 1
+        }
+        closing = "'"
+    }
+    // C's arena_strndup + strlen: the bytes up to the first NUL.
+    (
+        sx_cstr(out, 0, out.len),
+        closing,
+    )
+}
+
+/// `yew_shq_insert` (`shctx.c:2552-2601`): the first `literal_prefix`
+/// bytes verbatim (a bare `~`, the rest quoted unquoted-style), the opener
+/// `q` needs, then `shq_quote` of the rest. `(bytes, closing)`.
+pub fn shq_insert(text: List[byte], literal_prefix0: int, q: int) -> (List[byte], str) {
+    let len = text.len
+    let literal_prefix = if literal_prefix0 > len then len else literal_prefix0
+    var out = List[byte]()
+    if literal_prefix != 0 {
+        var pre = 0
+        var plen = literal_prefix
+        if text[0] as int == 126 {
+            (mut out).push(126 as byte)
+            pre = 1
+            plen -= 1
+        }
+        if plen != 0 {
+            let (qp, _) = shq_quote(text, pre, pre + plen, SH_Q_NONE)
+            sx_append(mut out, qp)
+        }
+    }
+    if q == SH_Q_SINGLE {
+        (mut out).push(39 as byte)
+    } else if q == SH_Q_DOUBLE {
+        (mut out).push(34 as byte)
+    } else if q == SH_Q_DOLLAR {
+        (mut out).push(36 as byte)
+        (mut out).push(39 as byte)
+    }
+    let (rest, closing) = shq_quote(text, literal_prefix, len, q)
+    sx_append(mut out, rest)
+    (sx_cstr(out, 0, out.len), closing)
+}
+
+/// `yew_shctx_dir` (`shctx.c:2603-2615`): the directory the caret's
+/// command runs in against `base`, or `(_, false)` when unknown.
+pub fn shctx_dir(ctx: ShCtx, base0: str) -> (List[byte], bool) {
+    if !ctx.cwd_known {
+        return (List[byte](), false)
+    }
+    let base = if base0.len == 0 then "." else base0
+    if ctx.cwd.len == 0 {
+        return (sx_bytes(base), true)
+    }
+    let out = sh_dir_join(sx_bytes(base), ctx.cwd)
+    if out.len == 0 {
+        return (sx_bytes("."), true)
+    }
+    (out, true)
+}
