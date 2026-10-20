@@ -1,0 +1,1606 @@
+//! text.coords — typed columns over a piece buffer: grapheme, character
+//! and cell columns, grapheme motion, and the grapheme index the buffer
+//! keeps current across edits.
+//!
+//! Ports sagitta `src/unicode/coords.c` (1676 lines), `coords.h` (60) and
+//! `coords_internal.h` (15) at 9ace98c2, under `s09-cursors-and-coords.md`.
+//! In sagitta this is `src/unicode/`; here it is the `text` module, because
+//! the columns read `text.TextBuf` and the piece tree calls the index
+//! hooks on every edit (`yew_coords_index_note_edit`), and a module cycle
+//! `unicode` ↔ `text` is E0303. The segmenter and the width table are
+//! `unicode`'s (yw00); nothing here classifies a codepoint itself.
+//!
+//! The index (`YewGraphemeIndex`): a checkpoint every 64 grapheme columns
+//! and a resumable segmenter state every 512 bytes; an edit is queued with
+//! a snapshot of its after-state (at most two, `GRAPHEME_PENDING_MAX`) and
+//! replayed against that snapshot when a query needs the index, rescanning
+//! from the last motion checkpoint before the edit until the segmenter
+//! state converges with an old checkpoint, then shifting the rest
+//! (`coords_index_apply_edit`, `coords.c:701-899`). A buffer of printable
+//! ASCII lines answers by formula (`simple_ascii_direct`); a buffer over
+//! 16 MiB that is not defers the index until a query needs it.
+//!
+//! The wolf shapes. C's `const TextBuf *` queries mutate the cache through
+//! a cast (`coords_index`, `coords.c:1006-1023`); the queries that can
+//! build or replay it here take `mut tb` (`off_to_gcol`, `gcol_to_off`,
+//! `grapheme_prev_boundary`), the others read. C's reader probes by
+//! copying itself (`probe = *reader`); a wolf copy would copy the
+//! iterator's stack list per codepoint, so the reader peeks inside its
+//! current chunk and descends the tree only when a sequence crosses a
+//! piece seam (`reader_peek`).
+
+use unicode
+use util
+
+/// A codepoint column (`CharCol`).
+pub type CharCol = distinct int
+
+/// A grapheme column (`GCol`).
+pub type GCol = distinct int
+
+/// A cell column (`CCol`).
+pub type CCol = distinct int
+
+/// One grapheme cluster of a buffer (`YewTextCluster`, `coords.h:20-25`).
+pub struct TextCluster {
+    lo: int,
+    hi: int,
+    base_cp: int,
+    cells: int,
+    tab: bool,
+}
+
+const GCOL_CHECKPOINT_STRIDE: int = 64
+
+const MOTION_CHECKPOINT_STRIDE: int = 512
+
+const SIMPLE_ASCII_BYPASS_BYTES: int = 65536
+
+// Keep the 8 MiB first-motion latency gate eager while the 100 MiB open
+// budget fixtures defer their full index (`coords.c:254-256`).
+const DEFER_INDEX_BYTES: int = 16777216
+
+// The tree a reader walks: the live buffer or a pending edit's snapshot.
+struct Src {
+    root: int,
+    len: int,
+    gen: int,
+    snap: bool,
+}
+
+fn src_live(tb: TextBuf) -> Src {
+    Src { root: tb.root, len: textbuf_len(tb), gen: tb.gen, snap: false }
+}
+
+fn src_snap(s: TextSnap) -> Src {
+    Src { root: s.root, len: s.len, gen: s.gen, snap: true }
+}
+
+// `TextReader`, `coords.c:14-23`: the current chunk is `clen` bytes of
+// store `src` from `at`, `cpos` of them consumed.
+struct TextReader {
+    it: TextIter,
+    root: int,
+    src: int,
+    at: int,
+    clen: int,
+    cpos: int,
+    off: int,
+    end: int,
+    active: bool,
+}
+
+fn reader_new() -> TextReader {
+    TextReader {
+        it: textiter_new(),
+        root: -1,
+        src: 0,
+        at: 0,
+        clen: 0,
+        cpos: 0,
+        off: 0,
+        end: 0,
+        active: false,
+    }
+}
+
+// `reader_init`, `coords.c:58-74`.
+fn reader_init(mut r: TextReader, tb: TextBuf, s: Src, start: int, end: int) {
+    r.root = s.root
+    r.off = start
+    r.end = end
+    r.cpos = 0
+    r.clen = 0
+    r.active = start < end && textiter_seek(mut r.it, tb, s.root, s.len, s.gen, s.snap, start)
+    if r.active {
+        let c = textiter_chunk(r.it, tb)
+        if !c.ok {
+            util.bug("text.coords", "unicode coordinates: iterator has no first chunk")
+        }
+        r.src = c.src
+        r.at = c.at
+        r.clen = c.len
+    }
+}
+
+// Move onto the next chunk once the current one is consumed.
+fn reader_settle(mut r: TextReader, tb: TextBuf) {
+    while r.cpos == r.clen && r.off < r.end {
+        if !r.active || !textiter_advance(mut r.it, tb) {
+            util.bug("text.coords", "unicode coordinates: iterator ended early")
+        }
+        let c = textiter_chunk(r.it, tb)
+        if !c.ok || c.len == 0 {
+            util.bug("text.coords", "unicode coordinates: iterator yielded empty chunk")
+        }
+        r.src = c.src
+        r.at = c.at
+        r.clen = c.len
+        r.cpos = 0
+    }
+}
+
+// One byte, or -1 at the end (`reader_get`, `coords.c:76-93`).
+fn reader_get(mut r: TextReader, tb: TextBuf) -> int {
+    if r.off >= r.end {
+        return -1
+    }
+    reader_settle(mut r, tb)
+    let b = store_byte(tb, r.src, r.at + r.cpos) as int
+    r.cpos += 1
+    r.off += 1
+    b
+}
+
+fn byte_at_root(tb: TextBuf, root: int, off: int) -> int {
+    var n = root
+    var pos = off
+    while n >= 0 {
+        let left = tb.nodes[n].left
+        let left_bytes = if left < 0 then 0 else tb.nodes[left].sub_bytes
+        let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+        if pos < left_bytes {
+            n = left
+        } else if pos < left_bytes + piece_len {
+            return store_byte(tb, tb.nodes[n].src, tb.nodes[n].lo + pos - left_bytes) as int
+        } else {
+            pos -= left_bytes + piece_len
+            n = tb.nodes[n].right
+        }
+    }
+    util.bug("text.coords", "unicode coordinates: offset outside the tree")
+    0
+}
+
+// The byte `k` past the cursor (`off + k < end`), without consuming.
+fn reader_peek(r: TextReader, tb: TextBuf, k: int) -> int {
+    if r.cpos + k < r.clen {
+        return store_byte(tb, r.src, r.at + r.cpos + k) as int
+    }
+    byte_at_root(tb, r.root, r.off + k)
+}
+
+fn utf8_candidate_len(lead: int) -> int {
+    if lead < 128 {
+        return 1
+    }
+    if lead >= 194 && lead <= 223 {
+        return 2
+    }
+    if lead >= 224 && lead <= 239 {
+        return 3
+    }
+    if lead >= 240 && lead <= 244 {
+        return 4
+    }
+    1
+}
+
+// The codepoint at the cursor and its length, without consuming
+// (`reader_cp`'s probe, `coords.c:109-136`).
+fn reader_peek_cp(mut r: TextReader, tb: TextBuf) -> (int, int) {
+    reader_settle(mut r, tb)
+    let avail = r.end - r.off
+    let wanted = utf8_candidate_len(reader_peek(r, tb, 0))
+    let have = if wanted < avail then wanted else avail
+    if r.cpos + have <= r.clen {
+        let p = r.at + r.cpos
+        if r.src == STORE_ORIG {
+            return unicode.utf8_decode(tb.orig.bytes, p, p + have)
+        }
+        return unicode.utf8_decode(tb.add.bytes, p, p + have)
+    }
+    var scratch = List[byte]()
+    var k = 0
+    while k < have {
+        (mut scratch).push(reader_peek(r, tb, k) as byte)
+        k += 1
+    }
+    unicode.utf8_decode(scratch, 0, have)
+}
+
+fn reader_skip(mut r: TextReader, tb: TextBuf, n_in: int) {
+    var n = n_in
+    while n > 0 {
+        reader_settle(mut r, tb)
+        var step = r.clen - r.cpos
+        if step > n {
+            step = n
+        }
+        r.cpos += step
+        r.off += step
+        n -= step
+    }
+}
+
+// A decoded codepoint and its byte range (`StreamCp`).
+struct StreamCp {
+    ok: bool,
+    cp: int,
+    start: int,
+    end: int,
+}
+
+// `reader_cp`, `coords.c:109-136`.
+fn reader_cp(mut r: TextReader, tb: TextBuf) -> StreamCp {
+    if r.off >= r.end {
+        return StreamCp { ok: false, cp: 0, start: r.off, end: r.off }
+    }
+    let start = r.off
+    let (cp, used) = reader_peek_cp(mut r, tb)
+    if used <= 0 {
+        util.bug("text.coords", "unicode coordinates: decoder returned invalid length")
+    }
+    reader_skip(mut r, tb, used)
+    StreamCp { ok: true, cp: cp, start: start, end: r.off }
+}
+
+// `StreamCluster`, `coords.c:39-45`.
+struct StreamCluster {
+    ok: bool,
+    start: int,
+    end: int,
+    cells: int,
+    base_cp: int,
+    tab: bool,
+}
+
+// `cluster_next`, `coords.c:150-200`.
+fn cluster_next(mut r: TextReader, tb: TextBuf, need_width: bool) -> StreamCluster {
+    if r.off >= r.end {
+        return StreamCluster {
+            ok: false,
+            start: r.off,
+            end: r.off,
+            cells: 0,
+            base_cp: 0,
+            tab: false,
+        }
+    }
+    let start = r.off
+    var gb = unicode.gb_init()
+    var width = unicode.cluster_width_init()
+    let first = reader_cp(mut r, tb)
+    if !first.ok {
+        util.bug("text.coords", "unicode coordinates: missing cluster head")
+    }
+    let _ = unicode.gb_boundary(mut gb, first.cp)
+    var cp_count = 1
+    if need_width {
+        unicode.cluster_width_push(mut width, first.cp)
+    }
+    while r.off < r.end {
+        let (cp, n) = reader_peek_cp(mut r, tb)
+        var next_gb = copy gb
+        if unicode.gb_boundary(mut next_gb, cp) {
+            break
+        }
+        reader_skip(mut r, tb, n)
+        gb = next_gb
+        cp_count += 1
+        if need_width {
+            unicode.cluster_width_push(mut width, cp)
+        }
+    }
+    var cells = 0
+    var tab = false
+    if need_width {
+        tab = cp_count == 1 && first.cp == 9
+        if !tab {
+            cells = unicode.cluster_width_finish(width)
+            if cells < 0 {
+                util.bug("text.coords", "unicode coordinates: negative cluster width")
+            }
+        }
+    }
+    StreamCluster { ok: true, start: start, end: r.off, cells: cells, base_cp: first.cp, tab: tab }
+}
+
+fn require_span(tb: TextBuf, line: Span) {
+    if line.lo < 0 || line.lo > line.hi || line.hi > textbuf_len(tb) {
+        util.bug("text.coords", "unicode coordinates: invalid line span")
+    }
+}
+
+fn require_pos(line: Span, pos: int) {
+    if pos < line.lo || pos > line.hi {
+        util.bug("text.coords", "unicode coordinates: offset outside line span")
+    }
+}
+
+/// The grapheme cluster starting at `at` inside `sp`, decoded without
+/// flattening the tree (`yew_text_cluster_next`, `coords.c:202-226`);
+/// false at the span's end.
+pub fn text_cluster_next(tb: TextBuf, sp: Span, at: ByteOff) -> (bool, TextCluster) {
+    let a = at as int
+    require_span(tb, sp)
+    require_pos(sp, a)
+    if a == sp.hi {
+        return (false, TextCluster { lo: a, hi: a, base_cp: 0, cells: 0, tab: false })
+    }
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), a, sp.hi)
+    let c = cluster_next(mut r, tb, true)
+    if !c.ok || c.end <= c.start {
+        util.bug("text.coords", "text_cluster_next: invalid cluster")
+    }
+    (true, TextCluster { lo: c.start, hi: c.end, base_cp: c.base_cp, cells: c.cells, tab: c.tab })
+}
+
+// The end of a line's content: before its LF, or its CRLF
+// (`line_content_end`, `coords.c:228-250`).
+fn line_content_end(tb: TextBuf, line: Span) -> int {
+    if line.lo == line.hi {
+        return line.hi
+    }
+    if textbuf_byte_at(tb, line.hi - 1) != 10 {
+        return line.hi
+    }
+    if line.hi - line.lo >= 2 && textbuf_byte_at(tb, line.hi - 2) == 13 {
+        return line.hi - 2
+    }
+    line.hi - 1
+}
+
+// The segmenter state a scan carries (`IndexScanState`, `coords.c:260-266`).
+struct ScanState {
+    gb: unicode.GbState,
+    cluster_start: int,
+    gcol: int,
+    have_cluster: bool,
+    after_lf: bool,
+}
+
+// The index under construction (`IndexBuilder`, `coords.c:268-271`); an
+// inactive builder is C's NULL.
+struct Builder {
+    active: bool,
+    data: List[GraphemeCheckpoint],
+    motion: List[MotionCheckpoint],
+    next_motion: int,
+}
+
+fn builder_none() -> Builder {
+    Builder {
+        active: false,
+        data: List[GraphemeCheckpoint](),
+        motion: List[MotionCheckpoint](),
+        next_motion: 0,
+    }
+}
+
+fn builder_new(next_motion: int) -> Builder {
+    Builder {
+        active: true,
+        data: List[GraphemeCheckpoint](),
+        motion: List[MotionCheckpoint](),
+        next_motion: next_motion,
+    }
+}
+
+fn scan_init() -> ScanState {
+    ScanState {
+        gb: unicode.gb_init(),
+        cluster_start: 0,
+        gcol: 0,
+        have_cluster: false,
+        after_lf: false,
+    }
+}
+
+fn scan_resume(m: MotionCheckpoint) -> ScanState {
+    ScanState {
+        gb: unicode.GbState { prev_gcb: m.prev_gcb, flags: m.flags },
+        cluster_start: m.cluster_start,
+        gcol: m.gcol,
+        have_cluster: m.have_cluster,
+        after_lf: m.after_lf,
+    }
+}
+
+// `index_push`, `coords.c:273-292`.
+fn index_push(mut data: List[GraphemeCheckpoint], off: int, gcol: int) {
+    if data.len != 0 {
+        let previous = data[data.len - 1].off
+        if off < previous {
+            util.bug("text.coords", "grapheme coordinate index is not ordered")
+        }
+        if off == previous {
+            return
+        }
+    }
+    (mut data).push(GraphemeCheckpoint { off: off, gcol: gcol })
+}
+
+// `motion_index_push`, `coords.c:294-315`.
+fn motion_index_push(mut motion: List[MotionCheckpoint], c: MotionCheckpoint) {
+    if motion.len != 0 {
+        let previous = motion[motion.len - 1].off
+        if c.off < previous {
+            util.bug("text.coords", "grapheme motion index is not ordered")
+        }
+        if c.off == previous {
+            return
+        }
+    }
+    (mut motion).push(c)
+}
+
+// `index_finalize_cluster`, `coords.c:326-334`.
+fn index_finalize_cluster(mut b: Builder, st: ScanState) {
+    if !b.active ||
+        !st.have_cluster ||
+        st.after_lf ||
+        st.gcol == 0 ||
+        st.gcol % GCOL_CHECKPOINT_STRIDE != 0 {
+        return
+    }
+    index_push(mut b.data, st.cluster_start, st.gcol)
+}
+
+// `index_motion_maybe`, `coords.c:336-357`.
+fn index_motion_maybe(mut b: Builder, st: ScanState, off: int) {
+    if !b.active || off < b.next_motion {
+        return
+    }
+    motion_index_push(mut b.motion, MotionCheckpoint {
+        off: off,
+        cluster_start: st.cluster_start,
+        gcol: st.gcol,
+        prev_gcb: st.gb.prev_gcb,
+        flags: st.gb.flags,
+        have_cluster: st.have_cluster,
+        after_lf: st.after_lf,
+    })
+    b.next_motion += MOTION_CHECKPOINT_STRIDE
+}
+
+// `index_consume_cp`, `coords.c:359-383`.
+fn index_consume_cp(mut b: Builder, mut st: ScanState, cp: int, start: int, end: int) {
+    let boundary = unicode.gb_boundary(mut st.gb, cp)
+    if boundary {
+        index_finalize_cluster(mut b, st)
+        if !st.have_cluster || st.after_lf {
+            st.gcol = 0
+        } else {
+            st.gcol += 1
+        }
+        st.cluster_start = start
+        st.have_cluster = true
+        st.after_lf = false
+    } else if !st.have_cluster {
+        util.bug("text.coords", "grapheme index first codepoint was not a boundary")
+    }
+    if cp == 10 {
+        st.after_lf = true
+    }
+    index_motion_maybe(mut b, st, end)
+}
+
+// `index_scan_part`, `coords.c:385-397`.
+fn index_scan_part(tb: TextBuf, s: Src, start: int, end: int, mut st: ScanState, mut b: Builder) {
+    var r = reader_new()
+    reader_init(mut r, tb, s, start, end)
+    loop {
+        let cp = reader_cp(mut r, tb)
+        if !cp.ok {
+            break
+        }
+        index_consume_cp(mut b, mut st, cp.cp, cp.start, cp.end)
+    }
+    if r.off != end {
+        util.bug("text.coords", "grapheme index scan ended early")
+    }
+}
+
+fn index_scan(tb: TextBuf, s: Src, start: int, end: int, mut st: ScanState, mut b: Builder) {
+    index_scan_part(tb, s, start, end, mut st, mut b)
+    index_finalize_cluster(mut b, st)
+}
+
+// LF or printable ASCII only (`bytes_are_simple_ascii`, `coords.c:406-435`).
+fn bytes_are_simple_ascii(bytes: List[byte], lo: int, hi: int) -> bool {
+    var i = lo
+    while i < hi {
+        let b = bytes[i] as int
+        if b != 10 && (b < 32 || b >= 127) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn store_simple_ascii(tb: TextBuf, src: int, lo: int, hi: int) -> bool {
+    if src == STORE_ORIG {
+        return bytes_are_simple_ascii(tb.orig.bytes, lo, hi)
+    }
+    bytes_are_simple_ascii(tb.add.bytes, lo, hi)
+}
+
+// Consume a printable-ASCII run up to `limit`; answers its length
+// (`reader_take_simple_ascii`, `coords.c:437-478`).
+fn reader_take_simple_ascii(mut r: TextReader, tb: TextBuf, limit: int) -> int {
+    let start = r.off
+    while r.off < limit {
+        reader_settle(mut r, tb)
+        var available = r.clen - r.cpos
+        if available > limit - r.off {
+            available = limit - r.off
+        }
+        let p = r.at + r.cpos
+        if store_simple_ascii(tb, r.src, p, p + available) {
+            r.cpos += available
+            r.off += available
+            continue
+        }
+        var step = available
+        while step != 0 {
+            let b = store_byte(tb, r.src, r.at + r.cpos) as int
+            if b < 32 || b >= 127 {
+                return r.off - start
+            }
+            r.cpos += 1
+            r.off += 1
+            step -= 1
+        }
+    }
+    r.off - start
+}
+
+// `index_consume_simple_ascii_run`, `coords.c:480-505`.
+fn index_consume_simple_ascii_run(mut st: ScanState, start: int, end: int) {
+    if start >= end {
+        util.bug("text.coords", "empty simple ASCII run")
+    }
+    var none = builder_none()
+    index_consume_cp(mut none, mut st, 120, start, start + 1)
+    if start + 1 == end {
+        return
+    }
+    st.gcol += end - start - 2
+    index_consume_cp(mut none, mut st, 120, end - 1, end)
+}
+
+// `range_is_simple_ascii`, `coords.c:507-538`.
+fn range_is_simple_ascii(tb: TextBuf, start: int, end: int) -> bool {
+    var remaining = end - start
+    if remaining == 0 {
+        return true
+    }
+    var it = textiter_new()
+    if !textiter_begin(mut it, tb, start as ByteOff) {
+        util.bug("text.coords", "simple ASCII scan cannot begin")
+    }
+    loop {
+        let c = textiter_chunk(it, tb)
+        if !c.ok || c.len == 0 {
+            util.bug("text.coords", "simple ASCII scan found an empty chunk")
+        }
+        var n = c.len
+        if n > remaining {
+            n = remaining
+        }
+        if !store_simple_ascii(tb, c.src, c.at, c.at + n) {
+            return false
+        }
+        remaining -= n
+        if remaining == 0 {
+            return true
+        }
+        if !textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    util.bug("text.coords", "simple ASCII scan ended early")
+    false
+}
+
+// `pending_clear`, `coords.c:540-551`: release every after-snapshot.
+fn pending_clear(mut tb: TextBuf) {
+    let pend = copy tb.graphemes.pending
+    tb.graphemes.pending = List[PendingEdit]()
+    for e in pend {
+        if e.after.active {
+            var s = copy e.after
+            textsnap_release(mut tb, mut s)
+        }
+    }
+}
+
+// `coords_index_rebuild`, `coords.c:553-570`.
+fn coords_index_rebuild(mut tb: TextBuf) {
+    var st = scan_init()
+    var b = builder_new(MOTION_CHECKPOINT_STRIDE)
+    let len = textbuf_len(tb)
+    index_scan(tb, src_live(tb), 0, len, mut st, mut b)
+    let simple = range_is_simple_ascii(tb, 0, len)
+    tb.graphemes.data = b.data
+    tb.graphemes.motion = b.motion
+    tb.graphemes.gen = tb.gen
+    tb.graphemes.simple_ascii = simple
+    tb.graphemes.simple_ascii_direct = false
+    tb.graphemes.initialized = true
+    pending_clear(mut tb)
+}
+
+/// Seed the index with the load's ASCII classification trusted
+/// (`yew_coords_index_seed_simple`, `coords.c:572-605`).
+pub fn coords_index_seed_simple(mut tb: TextBuf, simple_ascii: bool) {
+    let len = textbuf_len(tb)
+    if len >= SIMPLE_ASCII_BYPASS_BYTES && simple_ascii {
+        tb.graphemes.data = List[GraphemeCheckpoint]()
+        tb.graphemes.motion = List[MotionCheckpoint]()
+        tb.graphemes.gen = tb.gen
+        tb.graphemes.simple_ascii = true
+        tb.graphemes.simple_ascii_direct = true
+        tb.graphemes.initialized = true
+        pending_clear(mut tb)
+        return
+    }
+    if len >= DEFER_INDEX_BYTES {
+        tb.graphemes.data = List[GraphemeCheckpoint]()
+        tb.graphemes.motion = List[MotionCheckpoint]()
+        tb.graphemes.gen = tb.gen
+        tb.graphemes.simple_ascii = false
+        tb.graphemes.simple_ascii_direct = false
+        tb.graphemes.initialized = false
+        pending_clear(mut tb)
+        return
+    }
+    coords_index_rebuild(mut tb)
+}
+
+/// Seed the index at construction (`yew_coords_index_seed`).
+pub fn coords_index_seed(mut tb: TextBuf) {
+    let len = textbuf_len(tb)
+    var simple = false
+    if len >= SIMPLE_ASCII_BYPASS_BYTES {
+        simple = range_is_simple_ascii(tb, 0, len)
+    }
+    coords_index_seed_simple(mut tb, simple)
+}
+
+/// Drop the index with the buffer (`yew_coords_index_dispose`).
+pub fn coords_index_dispose(mut tb: TextBuf) {
+    pending_clear(mut tb)
+    tb.graphemes = index_empty()
+}
+
+fn motion_lower_bound_off(idx: GraphemeIndex, off: int) -> int {
+    var lo = 0
+    var hi = idx.motion.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if idx.motion[mid].off < off {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn motion_upper_bound_off(idx: GraphemeIndex, off: int) -> int {
+    var lo = 0
+    var hi = idx.motion.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if idx.motion[mid].off <= off {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn shifted_offset(off: int, deleted_len: int, inserted_len: int) -> int {
+    if deleted_len != 0 {
+        return off - deleted_len
+    }
+    off + inserted_len
+}
+
+fn shifted_gcol(gcol: int, old_gcol: int, new_gcol: int) -> int {
+    if new_gcol >= old_gcol {
+        return gcol + (new_gcol - old_gcol)
+    }
+    if gcol < old_gcol - new_gcol {
+        util.bug("text.coords", "grapheme index edit column underflow")
+    }
+    gcol - (old_gcol - new_gcol)
+}
+
+fn scan_state_matches(st: ScanState, old: MotionCheckpoint) -> bool {
+    st.gb.prev_gcb == old.prev_gcb &&
+        st.gb.flags == old.flags &&
+        st.have_cluster == old.have_cluster &&
+        st.after_lf == old.after_lf
+}
+
+fn shifted_cluster_start(off: int, old_range: Span, inserted_len: int) -> int {
+    let deleted_len = old_range.hi - old_range.lo
+    if off <= old_range.lo {
+        return off
+    }
+    if off < old_range.hi {
+        return old_range.lo + inserted_len
+    }
+    shifted_offset(off, deleted_len, inserted_len)
+}
+
+fn next_motion_threshold(off: int) -> int {
+    let remainder = off % MOTION_CHECKPOINT_STRIDE
+    let add = if remainder == 0 {
+        MOTION_CHECKPOINT_STRIDE
+    } else {
+        MOTION_CHECKPOINT_STRIDE - remainder
+    }
+    off + add
+}
+
+// Replay one pending edit against its after-snapshot
+// (`coords_index_apply_edit`, `coords.c:701-899`).
+fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
+    let old_range = edit.range
+    let inserted_len = edit.inserted_len
+    let old_affected = edit.affected
+    if tb.graphemes.gen != edit.old_gen {
+        util.bug("text.coords", "grapheme index pending edit is inconsistent")
+    }
+    if old_range.lo > old_range.hi ||
+        old_affected.lo > old_range.lo ||
+        old_affected.hi < old_range.hi {
+        util.bug("text.coords", "grapheme index pending edit has invalid range")
+    }
+    let source = src_snap(edit.after)
+    let deleted_len = old_range.hi - old_range.lo
+    let motion_first = motion_lower_bound_off(tb.graphemes, old_affected.lo)
+    let motion_after = motion_upper_bound_off(tb.graphemes, old_range.lo)
+    var st = scan_init()
+    var scan_start = old_affected.lo
+    var rebuild_lo = old_affected.lo
+    if motion_after > motion_first {
+        let resume = copy tb.graphemes.motion[motion_after - 1]
+        st = scan_resume(resume)
+        scan_start = resume.off
+        rebuild_lo = if resume.cluster_start > old_affected.lo {
+            resume.cluster_start
+        } else {
+            old_affected.lo
+        }
+    }
+    if old_affected.hi < deleted_len {
+        util.bug("text.coords", "grapheme index edit span underflow")
+    }
+    let scan_end = old_affected.hi - deleted_len + inserted_len
+    var b = builder_new(next_motion_threshold(scan_start))
+    var i = 0
+    while i < tb.graphemes.data.len {
+        let c = copy tb.graphemes.data[i]
+        if c.off >= rebuild_lo {
+            break
+        }
+        index_push(mut b.data, c.off, c.gcol)
+        i += 1
+    }
+    i = 0
+    while i < tb.graphemes.motion.len {
+        let m = copy tb.graphemes.motion[i]
+        if m.off > scan_start {
+            break
+        }
+        motion_index_push(mut b.motion, m)
+        i += 1
+    }
+    var scan_cursor = scan_start
+    var candidate = motion_upper_bound_off(tb.graphemes, old_range.hi)
+    var converged = false
+    var conv_off = 0
+    var conv_old_gcol = 0
+    var conv_new_gcol = 0
+    var conv_old_cluster_start = 0
+    var conv_new_cluster_start = 0
+    while candidate < tb.graphemes.motion.len {
+        let m = copy tb.graphemes.motion[candidate]
+        candidate += 1
+        if m.off > old_affected.hi {
+            break
+        }
+        let candidate_end = shifted_offset(m.off, deleted_len, inserted_len)
+        if candidate_end < scan_cursor || candidate_end > scan_end {
+            continue
+        }
+        index_scan_part(tb, source, scan_cursor, candidate_end, mut st, mut b)
+        scan_cursor = candidate_end
+        if !scan_state_matches(st, m) {
+            continue
+        }
+        conv_off = m.off
+        conv_old_gcol = m.gcol
+        conv_new_gcol = st.gcol
+        conv_old_cluster_start = m.cluster_start
+        conv_new_cluster_start = st.cluster_start
+        converged = true
+        break
+    }
+    if !converged {
+        index_scan_part(tb, source, scan_cursor, scan_end, mut st, mut b)
+        index_finalize_cluster(mut b, st)
+    }
+    i = 0
+    while i < tb.graphemes.data.len {
+        var c = copy tb.graphemes.data[i]
+        i += 1
+        if converged && c.off >= conv_off && c.off < old_affected.hi {
+            c.off = shifted_offset(c.off, deleted_len, inserted_len)
+            c.gcol = shifted_gcol(c.gcol, conv_old_gcol, conv_new_gcol)
+            index_push(mut b.data, c.off, c.gcol)
+            continue
+        }
+        if c.off < old_affected.hi {
+            continue
+        }
+        index_push(mut b.data, shifted_offset(c.off, deleted_len, inserted_len), c.gcol)
+    }
+    i = 0
+    while i < tb.graphemes.motion.len {
+        var m = copy tb.graphemes.motion[i]
+        i += 1
+        if converged && m.off >= conv_off && m.off <= old_affected.hi {
+            m.off = shifted_offset(m.off, deleted_len, inserted_len)
+            if m.cluster_start == conv_old_cluster_start {
+                m.cluster_start = conv_new_cluster_start
+            } else {
+                m.cluster_start = shifted_cluster_start(m.cluster_start, old_range, inserted_len)
+            }
+            m.gcol = shifted_gcol(m.gcol, conv_old_gcol, conv_new_gcol)
+            motion_index_push(mut b.motion, m)
+            continue
+        }
+        if m.off <= old_affected.hi {
+            continue
+        }
+        m.off = shifted_offset(m.off, deleted_len, inserted_len)
+        m.cluster_start = shifted_cluster_start(m.cluster_start, old_range, inserted_len)
+        motion_index_push(mut b.motion, m)
+    }
+    tb.graphemes.data = b.data
+    tb.graphemes.motion = b.motion
+    tb.graphemes.gen = edit.new_gen
+    tb.graphemes.initialized = true
+}
+
+// `coords_index_apply_pending`, `coords.c:901-926`.
+fn coords_index_apply_pending(mut tb: TextBuf, through_gen: int) {
+    let pend = copy tb.graphemes.pending
+    if pend.len == 0 ||
+        pend[0].old_gen != tb.graphemes.gen ||
+        pend[pend.len - 1].new_gen != through_gen {
+        util.bug("text.coords", "grapheme index pending journal is inconsistent")
+    }
+    for e in pend {
+        coords_index_apply_edit(mut tb, e)
+        var s = copy e.after
+        textsnap_release(mut tb, mut s)
+    }
+    tb.graphemes.pending = List[PendingEdit]()
+}
+
+/// The piece tree's edit hook (`yew_coords_index_note_edit`,
+/// `coords.c:928-1004`): `old_range` the replaced bytes in before-state
+/// coordinates, `inserted_len` the new bytes, `old_affected` the lines
+/// they touched, `old_gen` the generation before the edit.
+pub fn coords_index_note_edit(
+    mut tb: TextBuf,
+    old_range: Span,
+    inserted_len: int,
+    old_affected: Span,
+    old_gen: int,
+) {
+    if old_range.lo > old_range.hi ||
+        old_affected.lo > old_range.lo ||
+        old_affected.hi < old_range.hi {
+        util.bug("text.coords", "coords_index_note_edit: invalid old range")
+    }
+    if !tb.graphemes.initialized {
+        if tb.graphemes.pending.len != 0 {
+            util.bug("text.coords", "deferred grapheme index has pending edits")
+        }
+        tb.graphemes.gen = tb.gen
+        return
+    }
+    if tb.graphemes.simple_ascii {
+        let len = textbuf_len(tb)
+        let old_len = len - inserted_len + (old_range.hi - old_range.lo)
+        let inserted_hi = old_range.lo + inserted_len
+        if inserted_hi < old_range.lo || inserted_hi > len {
+            util.bug("text.coords", "simple ASCII edit range overflow")
+        }
+        let inserted_simple = range_is_simple_ascii(tb, old_range.lo, inserted_hi)
+        if tb.graphemes.simple_ascii_direct && tb.graphemes.pending.len != 0 {
+            util.bug("text.coords", "direct simple ASCII index has pending edits")
+        }
+        if inserted_simple &&
+            tb.graphemes.pending.len == 0 &&
+            old_range.lo == old_len &&
+            old_range.hi == old_len {
+            tb.graphemes.data = List[GraphemeCheckpoint]()
+            tb.graphemes.motion = List[MotionCheckpoint]()
+            tb.graphemes.gen = tb.gen
+            tb.graphemes.simple_ascii_direct = true
+            return
+        }
+        if inserted_simple &&
+            tb.graphemes.pending.len == 0 &&
+            (tb.graphemes.simple_ascii_direct || old_len >= SIMPLE_ASCII_BYPASS_BYTES) {
+            tb.graphemes.gen = tb.gen
+            tb.graphemes.simple_ascii_direct = true
+            return
+        }
+        if !inserted_simple {
+            if tb.graphemes.simple_ascii_direct {
+                if tb.graphemes.pending.len != 0 || tb.graphemes.gen != old_gen {
+                    util.bug("text.coords", "direct simple ASCII index is inconsistent")
+                }
+                tb.graphemes.data = List[GraphemeCheckpoint]()
+                tb.graphemes.motion = List[MotionCheckpoint]()
+                tb.graphemes.simple_ascii = false
+                tb.graphemes.simple_ascii_direct = false
+                tb.graphemes.gen = tb.gen
+                tb.graphemes.initialized = false
+                return
+            }
+            tb.graphemes.simple_ascii = false
+            tb.graphemes.simple_ascii_direct = false
+        }
+    }
+    let np = tb.graphemes.pending.len
+    let expected_gen = if np == 0 then tb.graphemes.gen else tb.graphemes.pending[np - 1].new_gen
+    if expected_gen != old_gen || tb.gen != old_gen + 1 {
+        util.bug("text.coords", "coords_index_note_edit: generation mismatch")
+    }
+    if np == GRAPHEME_PENDING_MAX {
+        coords_index_apply_pending(mut tb, old_gen)
+        if tb.graphemes.gen != old_gen {
+            util.bug("text.coords", "coords_index_note_edit: replay ended at wrong generation")
+        }
+    }
+    let after = textbuf_snap(mut tb)
+    (mut tb.graphemes.pending).push(PendingEdit {
+        range: old_range,
+        affected: old_affected,
+        inserted_len: inserted_len,
+        old_gen: old_gen,
+        new_gen: tb.gen,
+        after: after,
+    })
+}
+
+// Build or replay the index a query needs (`coords_index`,
+// `coords.c:1006-1023`).
+fn coords_index(mut tb: TextBuf) {
+    if !tb.graphemes.initialized {
+        if tb.graphemes.pending.len != 0 {
+            util.bug("text.coords", "deferred grapheme index has pending edits")
+        }
+        coords_index_rebuild(mut tb)
+    } else if tb.graphemes.gen != tb.gen {
+        if tb.graphemes.pending.len != 0 {
+            coords_index_apply_pending(mut tb, tb.gen)
+        } else {
+            util.bug("text.coords", "grapheme index generation changed without an edit")
+        }
+    }
+}
+
+fn index_lower_bound_off(idx: GraphemeIndex, off: int) -> int {
+    var lo = 0
+    var hi = idx.data.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if idx.data[mid].off < off {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+// `index_before_off`, `coords.c:1040-1058`.
+fn index_before_off(idx: GraphemeIndex, line: Span, end: int, off: int) -> GraphemeCheckpoint {
+    var lo = index_lower_bound_off(idx, line.lo)
+    var hi = index_lower_bound_off(idx, end)
+    let first = lo
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if idx.data[mid].off <= off {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo == first {
+        return GraphemeCheckpoint { off: line.lo, gcol: 0 }
+    }
+    copy idx.data[lo - 1]
+}
+
+// `index_before_gcol`, `coords.c:1060-1078`.
+fn index_before_gcol(idx: GraphemeIndex, line: Span, end: int, gcol: int) -> GraphemeCheckpoint {
+    let first = index_lower_bound_off(idx, line.lo)
+    var lo = first
+    var hi = index_lower_bound_off(idx, end)
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if idx.data[mid].gcol <= gcol {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo == first {
+        return GraphemeCheckpoint { off: line.lo, gcol: 0 }
+    }
+    copy idx.data[lo - 1]
+}
+
+fn cluster_cells(c: StreamCluster, cells: int, tabw_in: int) -> int {
+    if !c.tab {
+        return c.cells
+    }
+    let tabw = if tabw_in == 0 then 1 else tabw_in
+    tabw - cells % tabw
+}
+
+/// The cells a TAB at cell column `at` takes (`yew_tab_cells`).
+pub fn tab_cells(at: CCol, tabw_in: int) -> int {
+    let tabw = if tabw_in == 0 then 1 else tabw_in
+    tabw - at as int % tabw
+}
+
+fn coords_simple_ascii(tb: TextBuf) -> bool {
+    tb.graphemes.initialized && tb.graphemes.simple_ascii && tb.graphemes.gen == tb.gen
+}
+
+/// True only when this generation is already proven printable ASCII and
+/// line endings; never builds an index (`yew_coords_simple_ascii_current`).
+pub fn coords_simple_ascii_current(tb: TextBuf) -> bool {
+    coords_simple_ascii(tb)
+}
+
+fn simple_col_to_off(tb: TextBuf, line: Span, col: int) -> ByteOff {
+    let end = line_content_end(tb, line)
+    let len = end - line.lo
+    if col <= len {
+        return (line.lo + col) as ByteOff
+    }
+    if end < line.hi {
+        return end as ByteOff
+    }
+    if len == 0 {
+        return end as ByteOff
+    }
+    (end - 1) as ByteOff
+}
+
+// `unindexed_line_gcol`, `coords.c:1127-1173`.
+fn unindexed_line_gcol(tb: TextBuf, start: int, end: int, pos: int) -> GCol {
+    var st = scan_init()
+    var none = builder_none()
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), start, end)
+    while r.off < pos {
+        let run_start = r.off
+        let run_len = reader_take_simple_ascii(mut r, tb, pos)
+        if run_len != 0 {
+            index_consume_simple_ascii_run(mut st, run_start, run_start + run_len)
+            continue
+        }
+        let (cp, n) = reader_peek_cp(mut r, tb)
+        if pos < r.off + n {
+            break
+        }
+        let cstart = r.off
+        reader_skip(mut r, tb, n)
+        index_consume_cp(mut none, mut st, cp, cstart, r.off)
+    }
+    if !st.have_cluster {
+        return 0 as GCol
+    }
+    var next_is_boundary = true
+    if r.off != end {
+        let (cp, _) = reader_peek_cp(mut r, tb)
+        var gb = copy st.gb
+        next_is_boundary = unicode.gb_boundary(mut gb, cp)
+    }
+    if next_is_boundary {
+        st.gcol += 1
+    }
+    st.gcol as GCol
+}
+
+/// The grapheme column of `pos` in `line` (`yew_off_to_gcol`,
+/// `coords.c:1175-1258`); a position past the content clamps to its end,
+/// inside a cluster rounds left.
+pub fn off_to_gcol(mut tb: TextBuf, line: Span, pos_in: ByteOff) -> GCol {
+    var pos = pos_in as int
+    require_span(tb, line)
+    require_pos(line, pos)
+    if coords_simple_ascii(tb) {
+        let e = line_content_end(tb, line)
+        return ((if pos > e then e else pos) - line.lo) as GCol
+    }
+    let end = line_content_end(tb, line)
+    if pos > end {
+        pos = end
+    }
+    if pos == line.lo {
+        return 0 as GCol
+    }
+    if !tb.graphemes.initialized {
+        return unindexed_line_gcol(tb, line.lo, end, pos)
+    }
+    coords_index(mut tb)
+    let first = motion_lower_bound_off(tb.graphemes, line.lo)
+    let after = motion_upper_bound_off(tb.graphemes, pos)
+    if after > first {
+        let m = copy tb.graphemes.motion[after - 1]
+        var boundary = pos == end
+        var st = scan_resume(m)
+        var none = builder_none()
+        index_scan_part(tb, src_live(tb), m.off, pos, mut st, mut none)
+        if !boundary {
+            let next = textbuf_byte_at(tb, pos)
+            if next & 192 != 128 {
+                var probe = copy st.gb
+                var r = reader_new()
+                reader_init(mut r, tb, src_live(tb), pos, end)
+                let cp = reader_cp(mut r, tb)
+                if !cp.ok {
+                    util.bug("text.coords", "unicode coordinates: missing next codepoint")
+                }
+                boundary = unicode.gb_boundary(mut probe, cp.cp)
+            }
+        }
+        if boundary && st.have_cluster && !st.after_lf {
+            st.gcol += 1
+        }
+        if boundary || pos == st.cluster_start {
+            return st.gcol as GCol
+        }
+    }
+    let checkpoint = index_before_off(tb.graphemes, line, end, pos)
+    var count = checkpoint.gcol
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), checkpoint.off, end)
+    loop {
+        let c = cluster_next(mut r, tb, false)
+        if !c.ok || pos < c.end {
+            break
+        }
+        count += 1
+    }
+    count as GCol
+}
+
+/// The offset of grapheme column `g` in `line` (`yew_gcol_to_off`,
+/// `coords.c:1260-1341`); past the line, the content end (or the last
+/// cluster of a final line without an EOL).
+pub fn gcol_to_off(mut tb: TextBuf, line: Span, g_in: GCol) -> ByteOff {
+    let g = g_in as int
+    require_span(tb, line)
+    if coords_simple_ascii(tb) {
+        return simple_col_to_off(tb, line, g)
+    }
+    let end = line_content_end(tb, line)
+    var last = line.lo
+    var have_cluster = false
+    var count = 0
+    if !tb.graphemes.initialized {
+        var r = reader_new()
+        reader_init(mut r, tb, src_live(tb), line.lo, end)
+        while r.off < end {
+            let run_start = r.off
+            var run_len = reader_take_simple_ascii(mut r, tb, end)
+            // The final ASCII byte can share a cluster with what follows
+            // (`x` + Extend): leave it for cluster_next.
+            if run_len != 0 && r.off < end {
+                run_len -= 1
+                reader_init(mut r, tb, src_live(tb), run_start + run_len, end)
+            }
+            if run_len != 0 {
+                if g >= count && g - count < run_len {
+                    return (run_start + (g - count)) as ByteOff
+                }
+                last = run_start + run_len - 1
+                have_cluster = true
+                count += run_len
+                continue
+            }
+            let c = cluster_next(mut r, tb, false)
+            if !c.ok {
+                util.bug("text.coords", "unindexed grapheme column scan ended early")
+            }
+            if count == g {
+                return c.start as ByteOff
+            }
+            last = c.start
+            have_cluster = true
+            count += 1
+        }
+        if g == count || end < line.hi || !have_cluster {
+            return end as ByteOff
+        }
+        return last as ByteOff
+    }
+    coords_index(mut tb)
+    let checkpoint = index_before_gcol(tb.graphemes, line, end, g)
+    count = checkpoint.gcol
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), checkpoint.off, end)
+    loop {
+        let c = cluster_next(mut r, tb, false)
+        if !c.ok {
+            break
+        }
+        if count == g {
+            return c.start as ByteOff
+        }
+        last = c.start
+        have_cluster = true
+        count += 1
+    }
+    if g == count || end < line.hi || !have_cluster {
+        return end as ByteOff
+    }
+    last as ByteOff
+}
+
+/// The codepoint column of `pos` (`yew_off_to_charcol`, `coords.c:1343-1370`).
+pub fn off_to_charcol(tb: TextBuf, line: Span, pos_in: ByteOff) -> CharCol {
+    var pos = pos_in as int
+    require_span(tb, line)
+    require_pos(line, pos)
+    if coords_simple_ascii(tb) {
+        let e = line_content_end(tb, line)
+        return ((if pos > e then e else pos) - line.lo) as CharCol
+    }
+    let end = line_content_end(tb, line)
+    if pos > end {
+        pos = end
+    }
+    var count = 0
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), line.lo, end)
+    loop {
+        let cp = reader_cp(mut r, tb)
+        if !cp.ok || pos < cp.end {
+            break
+        }
+        count += 1
+    }
+    count as CharCol
+}
+
+/// The cell column of `pos` with tab stops every `tabw` cells
+/// (`yew_off_to_ccol`, `coords.c:1372-1404`).
+pub fn off_to_ccol(tb: TextBuf, line: Span, pos_in: ByteOff, tabw: int) -> CCol {
+    var pos = pos_in as int
+    require_span(tb, line)
+    require_pos(line, pos)
+    if coords_simple_ascii(tb) {
+        let e = line_content_end(tb, line)
+        return ((if pos > e then e else pos) - line.lo) as CCol
+    }
+    let end = line_content_end(tb, line)
+    if pos > end {
+        pos = end
+    }
+    if range_is_simple_ascii(tb, line.lo, pos) &&
+        (pos == line.lo || pos == end || range_is_simple_ascii(tb, pos, pos + 1)) {
+        return (pos - line.lo) as CCol
+    }
+    var cells = 0
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), line.lo, end)
+    loop {
+        let c = cluster_next(mut r, tb, true)
+        if !c.ok || pos < c.end {
+            break
+        }
+        cells += cluster_cells(c, cells, tabw)
+    }
+    cells as CCol
+}
+
+/// The offset whose character occupies cell column `c` (`yew_ccol_to_off`,
+/// `coords.c:1406-1452`): a cell beyond the line answers its last
+/// character.
+pub fn ccol_to_off(tb: TextBuf, line: Span, c_in: CCol, tabw: int) -> ByteOff {
+    let c = c_in as int
+    require_span(tb, line)
+    if coords_simple_ascii(tb) {
+        return simple_col_to_off(tb, line, c)
+    }
+    let end = line_content_end(tb, line)
+    if c <= end - line.lo {
+        let candidate = line.lo + c
+        if range_is_simple_ascii(tb, line.lo, candidate) &&
+            (
+                candidate == line.lo ||
+                    candidate == end ||
+                    range_is_simple_ascii(tb, candidate, candidate + 1)
+            ) {
+            return candidate as ByteOff
+        }
+    }
+    if c > end - line.lo && range_is_simple_ascii(tb, line.lo, end) {
+        if end < line.hi || end == line.lo {
+            return end as ByteOff
+        }
+        return (end - 1) as ByteOff
+    }
+    var cells = 0
+    var last = line.lo
+    var have_cluster = false
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), line.lo, end)
+    loop {
+        let cl = cluster_next(mut r, tb, true)
+        if !cl.ok {
+            break
+        }
+        if c <= cells {
+            return cl.start as ByteOff
+        }
+        let next = cells + cluster_cells(cl, cells, tabw)
+        if c < next {
+            return cl.start as ByteOff
+        }
+        last = cl.start
+        have_cluster = true
+        cells = next
+    }
+    if c == cells || end < line.hi || !have_cluster {
+        return end as ByteOff
+    }
+    last as ByteOff
+}
+
+/// The caret form of `ccol_to_off`: a cell past the content lands at the
+/// content's end (`yew_ccol_to_off_padded`, `coords.c:1454-1466`).
+pub fn ccol_to_off_padded(tb: TextBuf, line: Span, c: CCol, tabw: int) -> ByteOff {
+    require_span(tb, line)
+    let end = line_content_end(tb, line)
+    let end_col = off_to_ccol(tb, line, end as ByteOff, tabw) as int
+    let col = c as int
+    if col >= end_col {
+        return end as ByteOff
+    }
+    ccol_to_off(tb, line, col as CCol, tabw)
+}
+
+/// The padding a block paste needs after landing short of `target`
+/// (`yew_ccol_shortfall`).
+pub fn ccol_shortfall(target: CCol, landed: CCol) -> int {
+    let t = target as int
+    let l = landed as int
+    if l > t {
+        util.bug("text.coords", "cell-column landing exceeds target")
+    }
+    t - l
+}
+
+/// The larger of two cell columns (`yew_ccol_max`).
+pub fn ccol_max(left: CCol, right: CCol) -> CCol {
+    let l = left as int
+    let r = right as int
+    if l >= r {
+        return l as CCol
+    }
+    r as CCol
+}
+
+fn motion_span(tb: TextBuf, pos: int, previous: bool) -> Span {
+    let line = textbuf_line_of(tb, pos as ByteOff) as int
+    var sp = textbuf_line_span(tb, line as LineNo)
+    if previous && pos == sp.lo && line != 0 {
+        sp = textbuf_line_span(tb, (line - 1) as LineNo)
+    }
+    sp
+}
+
+/// The end of the cluster holding `pos` (`yew_grapheme_next`,
+/// `coords.c:1489-1512`).
+pub fn grapheme_next(tb: TextBuf, pos_in: ByteOff) -> ByteOff {
+    let pos = pos_in as int
+    let len = textbuf_len(tb)
+    if pos >= len {
+        return len as ByteOff
+    }
+    if coords_simple_ascii(tb) {
+        return (pos + 1) as ByteOff
+    }
+    let sp = motion_span(tb, pos, false)
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), sp.lo, sp.hi)
+    loop {
+        let c = cluster_next(mut r, tb, false)
+        if !c.ok {
+            break
+        }
+        if pos < c.end {
+            return c.end as ByteOff
+        }
+    }
+    sp.hi as ByteOff
+}
+
+/// The next boundary from a boundary `pos` (`yew_grapheme_next_boundary`).
+pub fn grapheme_next_boundary(tb: TextBuf, pos_in: ByteOff) -> ByteOff {
+    let pos = pos_in as int
+    let len = textbuf_len(tb)
+    if pos >= len {
+        return len as ByteOff
+    }
+    if coords_simple_ascii(tb) {
+        return (pos + 1) as ByteOff
+    }
+    let sp = motion_span(tb, pos, false)
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), pos, sp.hi)
+    let c = cluster_next(mut r, tb, false)
+    if !c.ok {
+        util.bug("text.coords", "grapheme_next_boundary: no cluster at offset")
+    }
+    c.end as ByteOff
+}
+
+/// The start of the cluster before `pos` (`yew_grapheme_prev`,
+/// `coords.c:1537-1572`).
+pub fn grapheme_prev(tb: TextBuf, pos_in: ByteOff) -> ByteOff {
+    var pos = pos_in as int
+    let len = textbuf_len(tb)
+    if pos > len {
+        pos = len
+    }
+    if pos == 0 {
+        return 0 as ByteOff
+    }
+    if coords_simple_ascii(tb) {
+        return (pos - 1) as ByteOff
+    }
+    let sp = motion_span(tb, pos, true)
+    var previous = sp.lo
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), sp.lo, sp.hi)
+    loop {
+        let c = cluster_next(mut r, tb, false)
+        if !c.ok {
+            break
+        }
+        if pos <= c.start {
+            return previous as ByteOff
+        }
+        if pos < c.end {
+            return c.start as ByteOff
+        }
+        previous = c.start
+    }
+    previous as ByteOff
+}
+
+/// The previous boundary from a boundary `pos`, resumed from the nearest
+/// motion checkpoint (`yew_grapheme_prev_boundary`, `coords.c:1574-1640`).
+pub fn grapheme_prev_boundary(mut tb: TextBuf, pos_in: ByteOff) -> ByteOff {
+    var pos = pos_in as int
+    let len = textbuf_len(tb)
+    if pos > len {
+        pos = len
+    }
+    if pos == 0 {
+        return 0 as ByteOff
+    }
+    if coords_simple_ascii(tb) {
+        return (pos - 1) as ByteOff
+    }
+    let sp = motion_span(tb, pos, true)
+    let previous = textbuf_byte_at(tb, pos - 1)
+    if previous < 128 {
+        if pos - sp.lo == 1 {
+            return (pos - 1) as ByteOff
+        }
+        let before_previous = textbuf_byte_at(tb, pos - 2)
+        if before_previous < 128 {
+            if previous == 10 && before_previous == 13 {
+                return (pos - 2) as ByteOff
+            }
+            return (pos - 1) as ByteOff
+        }
+    }
+    coords_index(mut tb)
+    let first = motion_lower_bound_off(tb.graphemes, sp.lo)
+    let after = motion_upper_bound_off(tb.graphemes, pos)
+    var st = scan_init()
+    var scan_start = sp.lo
+    if after > first {
+        let m = copy tb.graphemes.motion[after - 1]
+        st = scan_resume(m)
+        scan_start = m.off
+    }
+    var none = builder_none()
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), scan_start, pos)
+    loop {
+        let cp = reader_cp(mut r, tb)
+        if !cp.ok {
+            break
+        }
+        index_consume_cp(mut none, mut st, cp.cp, cp.start, cp.end)
+    }
+    if r.off != pos {
+        util.bug("text.coords", "grapheme_prev_boundary: checkpoint ended early")
+    }
+    if !st.have_cluster {
+        util.bug("text.coords", "grapheme_prev_boundary: checkpoint has no cluster")
+    }
+    st.cluster_start as ByteOff
+}
+
+/// Whether `pos` is a grapheme boundary (`yew_is_grapheme_boundary`,
+/// `coords.c:1642-1676`).
+pub fn is_grapheme_boundary(tb: TextBuf, pos_in: ByteOff) -> bool {
+    let pos = pos_in as int
+    let len = textbuf_len(tb)
+    if pos > len {
+        return false
+    }
+    if coords_simple_ascii(tb) {
+        return true
+    }
+    if pos == 0 || pos == len {
+        return true
+    }
+    let sp = motion_span(tb, pos, false)
+    if pos == sp.lo {
+        return true
+    }
+    var r = reader_new()
+    reader_init(mut r, tb, src_live(tb), sp.lo, sp.hi)
+    loop {
+        let c = cluster_next(mut r, tb, false)
+        if !c.ok {
+            break
+        }
+        if pos == c.end {
+            return true
+        }
+        if pos < c.end {
+            break
+        }
+    }
+    false
+}

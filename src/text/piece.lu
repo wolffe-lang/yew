@@ -1,0 +1,1582 @@
+//! text.piece — the piece tree: two append-only stores, a weight-balanced
+//! tree of pieces carrying subtree byte, newline and node counts,
+//! copy-on-write snapshots, chunk and line iterators, the checker.
+//!
+//! Ports sagitta `src/text/piece.c` (1411 lines), `piece.h` (195) and
+//! `coords.h` (31) at 9ace98c2, under `s07-piece-tree.md`. The decisions
+//! are sagitta's, kept: the original store is the file read whole (no
+//! mmap, invariant 1); the add store only appends; the tree is a WBT with
+//! Δ = 3, Γ = 2 (`node_balance`, `piece.c:216-241`) and no parent links; a
+//! piece's newlines are a window `[lf_first, lf_first + lf_count)` into its
+//! store's ascending `lfs` index, so line ↔ offset is two descents and an
+//! array read (`s07` §6); typing at the end of the latest add-store piece
+//! extends it in place (`node_extend_predecessor`, the mandatory
+//! coalescing), and a repeated fan-out payload reuses the store's tail
+//! (YEW-F-072, `piece.c:802-829`).
+//!
+//! The wolf shapes. C's nodes are slab-allocated structs behind pointers
+//! with a reference count; here every node is an element of the buffer's
+//! own `nodes` list, a child is an index (`-1` for none), and the free
+//! list threads through `left` as C's does (`node_alloc`, `piece.c:64-83`).
+//! C shares one `TextBacking` between a buffer and its snapshots; a wolf
+//! value cannot be shared mutably, so the backing IS the buffer: a
+//! snapshot is a root index, a length and a generation that every call
+//! reads through the buffer that made it, and `textbuf_free` releases the
+//! live tree but keeps the stores while a snapshot holds them (`refs`), so
+//! "buffer before snapshot" (`test_piece_buffer_release_before_snapshot`)
+//! is a released buffer value still holding the snapshot's nodes. A chunk
+//! is `(src, at, len)` into a store, never a copy; the caller indexes the
+//! store. The payload of an insert is a separate `List[byte]` (a read
+//! parameter cannot alias `mut tb`), so C's aliasing stage
+//! (`payload_aliases_store`) has no port. `TextStore.cap` is the capacity
+//! C's growth law holds (16 KiB, doubling, `store_append`); wolf's list
+//! grows itself, and the field keeps `test_piece`'s arithmetic one for one.
+//! The grapheme index C keeps in the buffer is `text.coords`' (the two
+//! share the `text` module because a module cycle is E0303).
+
+use util
+
+/// A byte offset into a buffer (`ByteOff`, `coords.h:6-8`).
+pub type ByteOff = distinct int
+
+/// A zero-based line number (`LineNo`, `coords.h:10-12`).
+pub type LineNo = distinct int
+
+/// A half-open byte range `[lo, hi)` (`Span`, `coords.h:14-17`):
+/// deliberately untyped, the ledger's and the stores' range.
+pub struct Span {
+    lo: int,
+    hi: int,
+}
+
+/// `BYTEOFF(x)`.
+pub fn byteoff(x: int) -> ByteOff {
+    x as ByteOff
+}
+
+/// `LINENO(x)`.
+pub fn lineno(x: int) -> LineNo {
+    x as LineNo
+}
+
+/// `(Span){lo, hi}`.
+pub fn span(lo: int, hi: int) -> Span {
+    Span { lo: lo, hi: hi }
+}
+
+/// The human ordinal of a zero-based coordinate (`yew_coord_display`,
+/// `coords.h:24-27`, YEW-F-016).
+pub fn coord_display(zero_based: int) -> int {
+    zero_based + 1
+}
+
+/// `YEW_STORE_ORIG`: the original store.
+pub const STORE_ORIG: int = 0
+
+/// `YEW_STORE_ADD`: the append-only add store.
+pub const STORE_ADD: int = 1
+
+/// `YEW_PIECE_MAX_DEPTH`: a 3:1 WBT over the full u32 node domain can
+/// pass 64 levels (`piece.h:10`).
+pub const PIECE_MAX_DEPTH: int = 128
+
+// `YEW_ADD_INITIAL_CAP` (`piece.c:10`).
+const ADD_INITIAL_CAP: int = 16384
+
+/// A piece as a value (`Piece`, `piece.h:21-26`).
+pub struct Piece {
+    src: int,
+    lo: int,
+    hi: int,
+    lf_first: int,
+    lf_count: int,
+}
+
+/// A tree node (`PieceNode`, `piece.h:30-43`): its piece `[lo, hi)` of
+/// store `src`, the piece's newline window, and the subtree totals.
+pub struct PieceNode {
+    left: int,
+    right: int,
+    lo: int,
+    hi: int,
+    sub_bytes: int,
+    sub_lfs: int,
+    lf_count: int,
+    sub_count: int,
+    refs: int,
+    src: int,
+    lf_first: int,
+}
+
+/// A store (`TextStore`, `piece.h:53-58`): its bytes, the ascending
+/// offsets of every LF in them, and C's capacity (module doc).
+pub struct TextStore {
+    bytes: List[byte],
+    lfs: List[int],
+    cap: int,
+}
+
+/// A copy-on-write snapshot (`TextSnap`, `piece.h:69-75`): one tree
+/// reference and one store reference, read through the buffer `bid`
+/// names.
+pub struct TextSnap {
+    root: int,
+    bid: int,
+    len: int,
+    gen: int,
+    active: bool,
+}
+
+/// One grapheme-column checkpoint (`YewGraphemeCheckpoint`).
+pub struct GraphemeCheckpoint {
+    off: int,
+    gcol: int,
+}
+
+/// One resumable segmenter state (`YewGraphemeMotionCheckpoint`).
+pub struct MotionCheckpoint {
+    off: int,
+    cluster_start: int,
+    gcol: int,
+    prev_gcb: int,
+    flags: int,
+    have_cluster: bool,
+    after_lf: bool,
+}
+
+/// An edit the grapheme index has not replayed yet
+/// (`YewGraphemePendingEdit`): the after-state is a snapshot.
+pub struct PendingEdit {
+    range: Span,
+    affected: Span,
+    inserted_len: int,
+    old_gen: int,
+    new_gen: int,
+    after: TextSnap,
+}
+
+/// `YEW_GRAPHEME_PENDING_MAX`.
+pub const GRAPHEME_PENDING_MAX: int = 2
+
+/// The grapheme index (`YewGraphemeIndex`, `piece.h:106-120`), owned by
+/// `text.coords`: `data.len` is C's `len`, `motion.len` its `motion_len`.
+pub struct GraphemeIndex {
+    data: List[GraphemeCheckpoint],
+    motion: List[MotionCheckpoint],
+    gen: int,
+    simple_ascii: bool,
+    simple_ascii_direct: bool,
+    initialized: bool,
+    pending: List[PendingEdit],
+}
+
+/// The buffer (`TextBuf` and its `TextBacking`, `piece.h:61-67`,
+/// `122-133`): the stores, the node pool, the live root, the edit
+/// generation, the grapheme index and the add-tail cache.
+pub struct TextBuf {
+    orig: TextStore,
+    add: TextStore,
+    nodes: List[PieceNode],
+    free_nodes: int,
+    refs: int,
+    bid: int,
+    root: int,
+    gen: int,
+    graphemes: GraphemeIndex,
+    add_tail_at: int,
+    add_tail_known: bool,
+    live: bool,
+}
+
+/// A chunk iterator (`TextIter`, `piece.h:135-143`): the descent stack of
+/// node indices, the generation it was made at, the bytes to skip in the
+/// current piece.
+pub struct TextIter {
+    stack: List[int],
+    bid: int,
+    gen: int,
+    skip: int,
+    snapshot: bool,
+}
+
+/// One maximal run of bytes (`yew_textiter_chunk`'s outputs): `len` bytes
+/// of store `src` from `at`; `ok` is false past the end.
+pub struct Chunk {
+    ok: bool,
+    src: int,
+    at: int,
+    len: int,
+}
+
+/// A line iterator (`LineIter`, `piece.h:145-149`).
+pub struct LineIter {
+    bid: int,
+    next_line: int,
+    gen: int,
+}
+
+fn store_new(cap: int) -> TextStore {
+    TextStore { bytes: List[byte](), lfs: List[int](), cap: cap }
+}
+
+fn index_empty() -> GraphemeIndex {
+    GraphemeIndex {
+        data: List[GraphemeCheckpoint](),
+        motion: List[MotionCheckpoint](),
+        gen: 0,
+        simple_ascii: false,
+        simple_ascii_direct: false,
+        initialized: false,
+        pending: List[PendingEdit](),
+    }
+}
+
+// A fresh buffer identity: C compares pointers; a wolf value has none, so
+// each buffer draws 56 random bits (`os_random`), which no output reads.
+fn new_bid() -> int {
+    let r = os_random(7)
+    var id = 0
+    for b in r {
+        id = id * 256 + (b & 255)
+    }
+    id
+}
+
+/// An empty snapshot (released, `active` false).
+pub fn textsnap_none() -> TextSnap {
+    TextSnap { root: -1, bid: 0, len: 0, gen: 0, active: false }
+}
+
+fn node_bytes(tb: TextBuf, n: int) -> int {
+    if n < 0 {
+        return 0
+    }
+    tb.nodes[n].sub_bytes
+}
+
+fn node_lfs(tb: TextBuf, n: int) -> int {
+    if n < 0 {
+        return 0
+    }
+    tb.nodes[n].sub_lfs
+}
+
+fn node_count(tb: TextBuf, n: int) -> int {
+    if n < 0 {
+        return 0
+    }
+    tb.nodes[n].sub_count
+}
+
+fn node_weight(tb: TextBuf, n: int) -> int {
+    node_count(tb, n) + 1
+}
+
+fn node_ref(mut tb: TextBuf, n: int) {
+    if n < 0 {
+        return
+    }
+    tb.nodes[n].refs += 1
+}
+
+// The one augmentation site (`node_fix`, `piece.c:41-62`).
+fn node_fix(mut tb: TextBuf, n: int) {
+    let l = tb.nodes[n].left
+    let r = tb.nodes[n].right
+    let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+    let bytes = node_bytes(tb, l) + piece_len + node_bytes(tb, r)
+    let lfs = node_lfs(tb, l) + tb.nodes[n].lf_count + node_lfs(tb, r)
+    let count = node_count(tb, l) + 1 + node_count(tb, r)
+    if count > 4294967295 {
+        util.bug("text.piece", "piece tree node count overflow")
+    }
+    tb.nodes[n].sub_bytes = bytes
+    tb.nodes[n].sub_lfs = lfs
+    tb.nodes[n].sub_count = count
+}
+
+// `node_alloc`, `piece.c:64-83`: the free list threads through `left`.
+fn node_alloc(mut tb: TextBuf) -> int {
+    if tb.free_nodes >= 0 {
+        let n = tb.free_nodes
+        tb.free_nodes = tb.nodes[n].left
+        return n
+    }
+    (mut tb.nodes).push(PieceNode {
+        left: -1,
+        right: -1,
+        lo: 0,
+        hi: 0,
+        sub_bytes: 0,
+        sub_lfs: 0,
+        lf_count: 0,
+        sub_count: 0,
+        refs: 0,
+        src: 0,
+        lf_first: 0,
+    })
+    tb.nodes.len - 1
+}
+
+fn node_new(mut tb: TextBuf, p: Piece) -> int {
+    let n = node_alloc(mut tb)
+    tb.nodes[n] = PieceNode {
+        left: -1,
+        right: -1,
+        lo: p.lo,
+        hi: p.hi,
+        sub_bytes: p.hi - p.lo,
+        sub_lfs: p.lf_count,
+        lf_count: p.lf_count,
+        sub_count: 1,
+        refs: 1,
+        src: p.src,
+        lf_first: p.lf_first,
+    }
+    n
+}
+
+// Consumes one reference and answers a uniquely-owned replacement
+// (`node_own`, `piece.c:104-118`).
+fn node_own(mut tb: TextBuf, n: int) -> int {
+    if n < 0 || tb.nodes[n].refs == 1 {
+        return n
+    }
+    let c = node_alloc(mut tb)
+    var dup = copy tb.nodes[n]
+    dup.refs = 1
+    tb.nodes[c] = dup
+    node_ref(mut tb, tb.nodes[c].left)
+    node_ref(mut tb, tb.nodes[c].right)
+    tb.nodes[n].refs -= 1
+    c
+}
+
+// `node_release`, `piece.c:120-152`: iterative, an explicit stack.
+fn node_release(mut tb: TextBuf, root: int) {
+    if root < 0 {
+        return
+    }
+    var stack = List[int]()
+    (mut stack).push(root)
+    while stack.len != 0 {
+        let n = (mut stack).pop() else -1
+        if tb.nodes[n].refs == 0 {
+            util.bug("text.piece", "piece node reference count underflow")
+        }
+        tb.nodes[n].refs -= 1
+        if tb.nodes[n].refs != 0 {
+            continue
+        }
+        let l = tb.nodes[n].left
+        let r = tb.nodes[n].right
+        tb.nodes[n].left = tb.free_nodes
+        tb.nodes[n].right = -1
+        tb.free_nodes = n
+        if l >= 0 {
+            (mut stack).push(l)
+        }
+        if r >= 0 {
+            (mut stack).push(r)
+        }
+    }
+}
+
+fn rotate_left(mut tb: TextBuf, n: int) -> int {
+    let right = node_own(mut tb, tb.nodes[n].right)
+    if right < 0 {
+        util.bug("text.piece", "piece tree left rotation without right child")
+    }
+    tb.nodes[n].right = tb.nodes[right].left
+    tb.nodes[right].left = n
+    node_fix(mut tb, n)
+    node_fix(mut tb, right)
+    right
+}
+
+fn rotate_right(mut tb: TextBuf, n: int) -> int {
+    let left = node_own(mut tb, tb.nodes[n].left)
+    if left < 0 {
+        util.bug("text.piece", "piece tree right rotation without left child")
+    }
+    tb.nodes[n].left = tb.nodes[left].right
+    tb.nodes[left].right = n
+    node_fix(mut tb, n)
+    node_fix(mut tb, left)
+    left
+}
+
+fn rotate_left_double(mut tb: TextBuf, n: int) -> int {
+    let right = node_own(mut tb, tb.nodes[n].right)
+    if right < 0 {
+        util.bug("text.piece", "piece tree double rotation without right child")
+    }
+    tb.nodes[n].right = right
+    let middle = node_own(mut tb, tb.nodes[right].left)
+    if middle < 0 {
+        util.bug("text.piece", "piece tree double rotation without middle child")
+    }
+    tb.nodes[n].right = tb.nodes[middle].left
+    tb.nodes[right].left = tb.nodes[middle].right
+    tb.nodes[middle].left = n
+    tb.nodes[middle].right = right
+    node_fix(mut tb, n)
+    node_fix(mut tb, right)
+    node_fix(mut tb, middle)
+    middle
+}
+
+fn rotate_right_double(mut tb: TextBuf, n: int) -> int {
+    let left = node_own(mut tb, tb.nodes[n].left)
+    if left < 0 {
+        util.bug("text.piece", "piece tree double rotation without left child")
+    }
+    tb.nodes[n].left = left
+    let middle = node_own(mut tb, tb.nodes[left].right)
+    if middle < 0 {
+        util.bug("text.piece", "piece tree double rotation without middle child")
+    }
+    tb.nodes[n].left = tb.nodes[middle].right
+    tb.nodes[left].right = tb.nodes[middle].left
+    tb.nodes[middle].right = n
+    tb.nodes[middle].left = left
+    node_fix(mut tb, n)
+    node_fix(mut tb, left)
+    node_fix(mut tb, middle)
+    middle
+}
+
+// `node_balance`, `piece.c:216-241`: Δ = 3, Γ = 2.
+fn node_balance(mut tb: TextBuf, n: int) -> int {
+    if n < 0 {
+        return -1
+    }
+    let wl = node_weight(tb, tb.nodes[n].left)
+    let wr = node_weight(tb, tb.nodes[n].right)
+    if wr > 3 * wl {
+        let right = tb.nodes[n].right
+        if right >= 0 &&
+            node_weight(tb, tb.nodes[right].left) >= 2 * node_weight(tb, tb.nodes[right].right) {
+            return rotate_left_double(mut tb, n)
+        }
+        return rotate_left(mut tb, n)
+    }
+    if wl > 3 * wr {
+        let left = tb.nodes[n].left
+        if left >= 0 &&
+            node_weight(tb, tb.nodes[left].right) >= 2 * node_weight(tb, tb.nodes[left].left) {
+            return rotate_right_double(mut tb, n)
+        }
+        return rotate_right(mut tb, n)
+    }
+    n
+}
+
+// `node` is a singleton; left, node and right are consumed
+// (`node_link`, `piece.c:243-266`).
+fn node_link(mut tb: TextBuf, n: int, left_in: int, right_in: int) -> int {
+    let wl = node_weight(tb, left_in)
+    let wr = node_weight(tb, right_in)
+    if wl > 3 * wr {
+        let left = node_own(mut tb, left_in)
+        let inner = node_link(mut tb, n, tb.nodes[left].right, right_in)
+        tb.nodes[left].right = inner
+        node_fix(mut tb, left)
+        return node_balance(mut tb, left)
+    }
+    if wr > 3 * wl {
+        let right = node_own(mut tb, right_in)
+        let inner = node_link(mut tb, n, left_in, tb.nodes[right].left)
+        tb.nodes[right].left = inner
+        node_fix(mut tb, right)
+        return node_balance(mut tb, right)
+    }
+    tb.nodes[n].left = left_in
+    tb.nodes[n].right = right_in
+    node_fix(mut tb, n)
+    n
+}
+
+// Consumes root; answers (minimum singleton, the rest)
+// (`node_take_min`, `piece.c:268-285`).
+fn node_take_min(mut tb: TextBuf, root_in: int) -> (int, int) {
+    let root = node_own(mut tb, root_in)
+    if tb.nodes[root].left < 0 {
+        let rest = tb.nodes[root].right
+        tb.nodes[root].right = -1
+        node_fix(mut tb, root)
+        return (root, rest)
+    }
+    let (minimum, left_rest) = node_take_min(mut tb, tb.nodes[root].left)
+    tb.nodes[root].left = left_rest
+    node_fix(mut tb, root)
+    let rest = node_balance(mut tb, root)
+    (minimum, rest)
+}
+
+// (`node_take_max`, `piece.c:287-304`).
+fn node_take_max(mut tb: TextBuf, root_in: int) -> (int, int) {
+    let root = node_own(mut tb, root_in)
+    if tb.nodes[root].right < 0 {
+        let rest = tb.nodes[root].left
+        tb.nodes[root].left = -1
+        node_fix(mut tb, root)
+        return (root, rest)
+    }
+    let (maximum, right_rest) = node_take_max(mut tb, tb.nodes[root].right)
+    tb.nodes[root].right = right_rest
+    node_fix(mut tb, root)
+    let rest = node_balance(mut tb, root)
+    (maximum, rest)
+}
+
+// Consumes both trees; every byte of left precedes every byte of right.
+// Two adjacent spans of one store coalesce (`node_concat`, `piece.c:306-344`).
+fn node_concat(mut tb: TextBuf, left_in: int, right_in: int) -> int {
+    if left_in < 0 {
+        return right_in
+    }
+    if right_in < 0 {
+        return left_in
+    }
+    var le = left_in
+    while tb.nodes[le].right >= 0 {
+        le = tb.nodes[le].right
+    }
+    var re = right_in
+    while tb.nodes[re].left >= 0 {
+        re = tb.nodes[re].left
+    }
+    if tb.nodes[le].src == tb.nodes[re].src && tb.nodes[le].hi == tb.nodes[re].lo {
+        let (middle, left_rest) = node_take_max(mut tb, left_in)
+        let (successor, right_rest) = node_take_min(mut tb, right_in)
+        tb.nodes[middle].hi = tb.nodes[successor].hi
+        tb.nodes[middle].lf_count += tb.nodes[successor].lf_count
+        node_fix(mut tb, middle)
+        node_release(mut tb, successor)
+        return node_link(mut tb, middle, left_rest, right_rest)
+    }
+    let (middle, rest) = node_take_min(mut tb, right_in)
+    node_link(mut tb, middle, left_in, rest)
+}
+
+// The first index of `lfs` whose offset is >= `off` (`store_lower_bound`).
+fn store_lower_bound(st: TextStore, off: int) -> int {
+    var lo = 0
+    var hi = st.lfs.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if st.lfs[mid] < off {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn store_len(tb: TextBuf, src: int) -> int {
+    if src == STORE_ORIG {
+        return tb.orig.bytes.len
+    }
+    if src == STORE_ADD {
+        return tb.add.bytes.len
+    }
+    util.bug("text.piece", "piece references unknown store {src}")
+    0
+}
+
+fn store_lb(tb: TextBuf, src: int, off: int) -> int {
+    if src == STORE_ORIG {
+        return store_lower_bound(tb.orig, off)
+    }
+    store_lower_bound(tb.add, off)
+}
+
+/// The LF offset at index `i` of store `src`'s newline index.
+pub fn store_lf(tb: TextBuf, src: int, i: int) -> int {
+    if src == STORE_ORIG {
+        return tb.orig.lfs[i]
+    }
+    tb.add.lfs[i]
+}
+
+/// Byte `i` of store `src`.
+pub fn store_byte(tb: TextBuf, src: int, i: int) -> byte {
+    if src == STORE_ORIG {
+        return tb.orig.bytes[i]
+    }
+    tb.add.bytes[i]
+}
+
+// `piece_make`, `piece.c:368-386`.
+fn piece_make(tb: TextBuf, src: int, lo: int, hi: int) -> Piece {
+    let n = store_len(tb, src)
+    if lo >= hi || hi > n {
+        util.bug("text.piece", "invalid piece span [{lo},{hi}) for store length {n}")
+    }
+    let first = store_lb(tb, src, lo)
+    let end = store_lb(tb, src, hi)
+    Piece { src: src, lo: lo, hi: hi, lf_first: first, lf_count: end - first }
+}
+
+fn node_make_singleton(mut tb: TextBuf, n: int) {
+    tb.nodes[n].left = -1
+    tb.nodes[n].right = -1
+    node_fix(mut tb, n)
+}
+
+fn node_set_piece(mut tb: TextBuf, n: int, p: Piece) {
+    tb.nodes[n].lo = p.lo
+    tb.nodes[n].hi = p.hi
+    tb.nodes[n].lf_first = p.lf_first
+    tb.nodes[n].lf_count = p.lf_count
+}
+
+// Consumes root; partitions it at a byte seam, splitting one piece
+// (`node_split`, `piece.c:395-449`). Answers (left, right).
+fn node_split(mut tb: TextBuf, root_in: int, at: int) -> (int, int) {
+    if root_in < 0 {
+        if at != 0 {
+            util.bug("text.piece", "piece split offset outside empty tree")
+        }
+        return (-1, -1)
+    }
+    if at > tb.nodes[root_in].sub_bytes {
+        util.bug("text.piece", "piece split offset outside tree")
+    }
+    let root = node_own(mut tb, root_in)
+    let left_bytes = node_bytes(tb, tb.nodes[root].left)
+    let piece_len = tb.nodes[root].hi - tb.nodes[root].lo
+    if at < left_bytes {
+        let old_right = tb.nodes[root].right
+        let (l, a) = node_split(mut tb, tb.nodes[root].left, at)
+        node_make_singleton(mut tb, root)
+        let r = node_link(mut tb, root, a, old_right)
+        return (l, r)
+    }
+    if at > left_bytes + piece_len {
+        let old_left = tb.nodes[root].left
+        let (b, r) = node_split(mut tb, tb.nodes[root].right, at - left_bytes - piece_len)
+        node_make_singleton(mut tb, root)
+        let l = node_link(mut tb, root, old_left, b)
+        return (l, r)
+    }
+    let a = tb.nodes[root].left
+    let b = tb.nodes[root].right
+    node_make_singleton(mut tb, root)
+    if at == left_bytes {
+        let r = node_link(mut tb, root, -1, b)
+        return (a, r)
+    }
+    if at == left_bytes + piece_len {
+        let l = node_link(mut tb, root, a, -1)
+        return (l, b)
+    }
+    let split = tb.nodes[root].lo + at - left_bytes
+    let src = tb.nodes[root].src
+    let tail = piece_make(tb, src, split, tb.nodes[root].hi)
+    let tail_node = node_new(mut tb, tail)
+    let head = piece_make(tb, src, tb.nodes[root].lo, split)
+    node_set_piece(mut tb, root, head)
+    node_fix(mut tb, root)
+    let l = node_link(mut tb, root, a, -1)
+    let r = node_link(mut tb, tail_node, -1, b)
+    (l, r)
+}
+
+// Consumes root and `inserted`; inserts one piece at the byte seam
+// (`node_insert`, `piece.c:451-498`).
+fn node_insert(mut tb: TextBuf, root_in: int, at: int, inserted: int) -> int {
+    if root_in < 0 {
+        if at != 0 {
+            util.bug("text.piece", "piece insert offset outside empty tree")
+        }
+        return inserted
+    }
+    if at > tb.nodes[root_in].sub_bytes {
+        util.bug("text.piece", "piece insert offset outside tree")
+    }
+    let root = node_own(mut tb, root_in)
+    let left_bytes = node_bytes(tb, tb.nodes[root].left)
+    let piece_len = tb.nodes[root].hi - tb.nodes[root].lo
+    if at <= left_bytes {
+        let l = node_insert(mut tb, tb.nodes[root].left, at, inserted)
+        tb.nodes[root].left = l
+        node_fix(mut tb, root)
+        return node_balance(mut tb, root)
+    }
+    if at >= left_bytes + piece_len {
+        let r = node_insert(mut tb, tb.nodes[root].right, at - left_bytes - piece_len, inserted)
+        tb.nodes[root].right = r
+        node_fix(mut tb, root)
+        return node_balance(mut tb, root)
+    }
+    let old_left = tb.nodes[root].left
+    let old_right = tb.nodes[root].right
+    let split = tb.nodes[root].lo + at - left_bytes
+    let src = tb.nodes[root].src
+    let tail = piece_make(tb, src, split, tb.nodes[root].hi)
+    let head = piece_make(tb, src, tb.nodes[root].lo, split)
+    node_set_piece(mut tb, root, head)
+    node_make_singleton(mut tb, root)
+    let tail_node = node_new(mut tb, tail)
+    let tail_tree = node_link(mut tb, tail_node, -1, old_right)
+    let inserted_tree = node_link(mut tb, inserted, -1, tail_tree)
+    node_link(mut tb, root, old_left, inserted_tree)
+}
+
+// `store_append`, `piece.c:500-532`, for the add store: the bytes, every
+// LF's offset, and C's capacity law.
+fn add_append(mut tb: TextBuf, bytes: List[byte], lo: int, hi: int) {
+    let old_len = tb.add.bytes.len
+    let len = hi - lo
+    if len == 0 {
+        return
+    }
+    let need = old_len + len
+    if need > tb.add.cap {
+        var cap = if tb.add.cap != 0 then tb.add.cap else ADD_INITIAL_CAP
+        while cap < need {
+            cap *= 2
+        }
+        tb.add.cap = cap
+    }
+    var i = lo
+    while i < hi {
+        let b = bytes[i]
+        (mut tb.add.bytes).push(b)
+        if b as int == 10 {
+            (mut tb.add.lfs).push(old_len + i - lo)
+        }
+        i += 1
+    }
+}
+
+// `store_index_original`, `piece.c:534-556`: one memchr sweep.
+fn index_original(bytes: List[byte]) -> List[int] {
+    var lfs = List[int]()
+    let size = bytes.len
+    var pos = 0
+    while pos < size {
+        let off = bytes_find(bytes, 10 as byte, pos) else {
+            break
+        }
+        (mut lfs).push(off)
+        pos = off + 1
+        while pos < size && bytes[pos] as int == 10 {
+            (mut lfs).push(pos)
+            pos += 1
+        }
+    }
+    lfs
+}
+
+fn textbuf_blank() -> TextBuf {
+    TextBuf {
+        orig: store_new(0),
+        add: store_new(0),
+        nodes: List[PieceNode](),
+        free_nodes: -1,
+        refs: 1,
+        bid: new_bid(),
+        root: -1,
+        gen: 0,
+        graphemes: index_empty(),
+        add_tail_at: 0,
+        add_tail_known: false,
+        live: true,
+    }
+}
+
+/// An empty buffer (`yew_textbuf_new`, `piece.c:653-661`).
+pub fn textbuf_new() -> TextBuf {
+    var tb = textbuf_blank()
+    coords_index_seed(mut tb)
+    tb
+}
+
+fn textbuf_from_store(take bytes: List[byte], classified: bool, simple_ascii: bool) -> TextBuf {
+    var tb = textbuf_blank()
+    let len = bytes.len
+    let lfs = index_original(bytes)
+    tb.orig = TextStore { bytes: bytes, lfs: lfs, cap: len }
+    if len != 0 {
+        let p = piece_make(tb, STORE_ORIG, 0, len)
+        tb.root = node_new(mut tb, p)
+    }
+    if classified {
+        coords_index_seed_simple(mut tb, simple_ascii)
+    } else {
+        coords_index_seed(mut tb)
+    }
+    tb
+}
+
+/// A buffer over a copy of `bytes[lo..hi)` (`yew_textbuf_from_bytes`,
+/// `piece.c:663-677`).
+pub fn textbuf_from_bytes(bytes: List[byte], lo: int, hi: int) -> TextBuf {
+    var copied = List[byte]()
+    var i = lo
+    while i < hi {
+        (mut copied).push(bytes[i])
+        i += 1
+    }
+    textbuf_from_store(take copied, false, false)
+}
+
+/// A buffer over the bytes of `s` (the tests' `from_bytes` of a literal).
+pub fn textbuf_from_str(s: str) -> TextBuf {
+    var copied = List[byte]()
+    for b in s.bytes() {
+        (mut copied).push(b)
+    }
+    textbuf_from_store(take copied, false, false)
+}
+
+/// A buffer that takes `bytes` as its original store, no copy
+/// (`yew_textbuf_from_owned_bytes`, `piece.c:704-707`).
+pub fn textbuf_from_owned_bytes(take bytes: List[byte]) -> TextBuf {
+    textbuf_from_store(take bytes, false, false)
+}
+
+/// The same with the load's ASCII classification trusted, so the index
+/// seeds without a rescan (`yew_textbuf_from_owned_bytes_simple`).
+pub fn textbuf_from_owned_bytes_simple(take bytes: List[byte], simple_ascii: bool) -> TextBuf {
+    textbuf_from_store(take bytes, true, simple_ascii)
+}
+
+fn backing_release(mut tb: TextBuf) {
+    if tb.refs <= 0 {
+        util.bug("text.piece", "text backing reference count underflow")
+    }
+    tb.refs -= 1
+    if tb.refs != 0 {
+        return
+    }
+    tb.orig = store_new(0)
+    tb.add = store_new(0)
+    tb.nodes = List[PieceNode]()
+    tb.free_nodes = -1
+}
+
+/// Release the live buffer (`yew_textbuf_free`, `piece.c:715-723`): its
+/// tree and its index go; the stores stay while a snapshot holds them.
+pub fn textbuf_free(mut tb: TextBuf) {
+    if !tb.live {
+        return
+    }
+    coords_index_dispose(mut tb)
+    node_release(mut tb, tb.root)
+    tb.root = -1
+    tb.live = false
+    backing_release(mut tb)
+}
+
+/// The buffer's length in bytes (`yew_textbuf_len`).
+pub fn textbuf_len(tb: TextBuf) -> int {
+    node_bytes(tb, tb.root)
+}
+
+/// The line count: newlines + 1 (`yew_textbuf_line_count`).
+pub fn textbuf_line_count(tb: TextBuf) -> int {
+    node_lfs(tb, tb.root) + 1
+}
+
+/// The number of pieces (`yew_textbuf_piece_count`).
+pub fn textbuf_piece_count(tb: TextBuf) -> int {
+    node_count(tb, tb.root)
+}
+
+// `node_extend_predecessor`, `piece.c:745-781`: own the path to the piece
+// ending at `at` and stretch it over the add store's new tail.
+fn node_extend_predecessor(
+    mut tb: TextBuf,
+    slot: int,
+    at: int,
+    old_add_len: int,
+    new_add_len: int,
+) -> (int, bool) {
+    if slot < 0 {
+        return (slot, false)
+    }
+    let n = node_own(mut tb, slot)
+    let left_bytes = node_bytes(tb, tb.nodes[n].left)
+    let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+    var changed = false
+    if at <= left_bytes {
+        let (child, ch) = node_extend_predecessor(
+            mut tb,
+            tb.nodes[n].left,
+            at,
+            old_add_len,
+            new_add_len,
+        )
+        tb.nodes[n].left = child
+        changed = ch
+    } else if at == left_bytes + piece_len {
+        changed = tb.nodes[n].src == STORE_ADD && tb.nodes[n].hi == old_add_len
+        if changed {
+            let p = piece_make(tb, STORE_ADD, tb.nodes[n].lo, new_add_len)
+            node_set_piece(mut tb, n, p)
+        }
+    } else if at > left_bytes + piece_len {
+        let (child, ch) = node_extend_predecessor(
+            mut tb,
+            tb.nodes[n].right,
+            at - left_bytes - piece_len,
+            old_add_len,
+            new_add_len,
+        )
+        tb.nodes[n].right = child
+        changed = ch
+    }
+    if changed {
+        node_fix(mut tb, n)
+    }
+    (n, changed)
+}
+
+// The node whose piece ends exactly at `at`, or -1 (`node_ending_at`).
+fn node_ending_at(tb: TextBuf, root: int, at_in: int) -> int {
+    var n = root
+    var at = at_in
+    while n >= 0 {
+        let left_bytes = node_bytes(tb, tb.nodes[n].left)
+        let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+        if at <= left_bytes {
+            n = tb.nodes[n].left
+        } else if at == left_bytes + piece_len {
+            return n
+        } else if at < left_bytes + piece_len {
+            return -1
+        } else {
+            at -= left_bytes + piece_len
+            n = tb.nodes[n].right
+        }
+    }
+    -1
+}
+
+fn edit_require_live(tb: TextBuf, what: str) {
+    if !tb.live {
+        util.bug("text.piece", "{what}: released buffer")
+    }
+}
+
+/// Insert `bytes[lo..hi)` at `at`; answers the add-store offset that owns
+/// the inserted payload (`yew_textbuf_insert_payload`, `piece.c:801-886`):
+/// the predecessor is extended when it is the latest add run, the
+/// store's tail is reused when it already holds the payload (YEW-F-072),
+/// else the payload is appended and spliced in as a new piece.
+pub fn textbuf_insert_payload(
+    mut tb: TextBuf,
+    at_off: ByteOff,
+    bytes: List[byte],
+    lo: int,
+    hi: int,
+) -> int {
+    edit_require_live(tb, "textbuf_insert")
+    let at = at_off as int
+    let buffer_len = textbuf_len(tb)
+    if at < 0 || at > buffer_len {
+        util.bug("text.piece", "insert offset {at} beyond buffer length {buffer_len}")
+    }
+    let len = hi - lo
+    if len == 0 {
+        return tb.add.bytes.len
+    }
+    let old_gen = tb.gen
+    let old_affected = textbuf_line_span(tb, textbuf_line_of(tb, at as ByteOff))
+    let old_add_len = tb.add.bytes.len
+    let predecessor = node_ending_at(tb, tb.root, at)
+    let extend = predecessor >= 0 &&
+        tb.nodes[predecessor].src == STORE_ADD &&
+        tb.nodes[predecessor].hi == old_add_len
+    var reuse = false
+    if !extend && len <= old_add_len {
+        reuse = true
+        let base = old_add_len - len
+        var i = 0
+        while i < len {
+            if tb.add.bytes[base + i] != bytes[lo + i] {
+                reuse = false
+                break
+            }
+            i += 1
+        }
+    }
+    if reuse {
+        let shared_lo = old_add_len - len
+        let p = piece_make(tb, STORE_ADD, shared_lo, old_add_len)
+        let middle = node_new(mut tb, p)
+        let (before, after) = node_split(mut tb, tb.root, at)
+        let joined = node_concat(mut tb, before, middle)
+        tb.root = node_concat(mut tb, joined, after)
+        tb.gen += 1
+        coords_index_note_edit(mut tb, Span { lo: at, hi: at }, len, old_affected, old_gen)
+        tb.add_tail_at = at + len
+        tb.add_tail_known = true
+        return shared_lo
+    }
+    add_append(mut tb, bytes, lo, hi)
+    if extend {
+        let (root, changed) = node_extend_predecessor(
+            mut tb,
+            tb.root,
+            at,
+            old_add_len,
+            tb.add.bytes.len,
+        )
+        tb.root = root
+        if !changed {
+            util.bug("text.piece", "extensible add-store predecessor disappeared")
+        }
+        tb.gen += 1
+        coords_index_note_edit(mut tb, Span { lo: at, hi: at }, len, old_affected, old_gen)
+        tb.add_tail_at = at + len
+        tb.add_tail_known = true
+        return old_add_len
+    }
+    let p = piece_make(tb, STORE_ADD, old_add_len, tb.add.bytes.len)
+    let middle = node_new(mut tb, p)
+    tb.root = node_insert(mut tb, tb.root, at, middle)
+    tb.gen += 1
+    coords_index_note_edit(mut tb, Span { lo: at, hi: at }, len, old_affected, old_gen)
+    tb.add_tail_at = at + len
+    tb.add_tail_known = true
+    old_add_len
+}
+
+/// Insert `bytes[lo..hi)` at `at` (`yew_textbuf_insert`).
+pub fn textbuf_insert_part(mut tb: TextBuf, at: ByteOff, bytes: List[byte], lo: int, hi: int) {
+    let _ = textbuf_insert_payload(mut tb, at, bytes, lo, hi)
+}
+
+/// Insert all of `bytes` at `at` (`yew_textbuf_insert`).
+pub fn textbuf_insert(mut tb: TextBuf, at: ByteOff, bytes: List[byte]) {
+    let _ = textbuf_insert_payload(mut tb, at, bytes, 0, bytes.len)
+}
+
+/// Insert the bytes of `s` at `at` (the tests' literal inserts).
+pub fn textbuf_insert_str(mut tb: TextBuf, at: ByteOff, s: str) {
+    var b = List[byte]()
+    for x in s.bytes() {
+        (mut b).push(x)
+    }
+    let _ = textbuf_insert_payload(mut tb, at, b, 0, b.len)
+}
+
+/// Splice an existing immutable store span in at `at` without appending
+/// its bytes (`yew_textbuf_insert_span`, `piece.c:893-934`).
+pub fn textbuf_insert_span(mut tb: TextBuf, at_off: ByteOff, src: int, sp: Span) {
+    edit_require_live(tb, "textbuf_insert_span")
+    let at = at_off as int
+    let buffer_len = textbuf_len(tb)
+    if at < 0 || at > buffer_len {
+        util.bug("text.piece", "span insert offset {at} beyond buffer length {buffer_len}")
+    }
+    let n = store_len(tb, src)
+    if sp.lo > sp.hi || sp.hi > n {
+        util.bug("text.piece", "invalid inserted span [{sp.lo},{sp.hi}) for store length {n}")
+    }
+    let inserted_len = sp.hi - sp.lo
+    if inserted_len == 0 {
+        return
+    }
+    let old_gen = tb.gen
+    let old_affected = textbuf_line_span(tb, textbuf_line_of(tb, at as ByteOff))
+    let p = piece_make(tb, src, sp.lo, sp.hi)
+    let middle = node_new(mut tb, p)
+    let (before, after) = node_split(mut tb, tb.root, at)
+    let joined = node_concat(mut tb, before, middle)
+    tb.root = node_concat(mut tb, joined, after)
+    tb.gen += 1
+    coords_index_note_edit(mut tb, Span { lo: at, hi: at }, inserted_len, old_affected, old_gen)
+    tb.add_tail_known = false
+}
+
+/// Delete `range` (`yew_textbuf_delete`, `piece.c:936-969`): split at both
+/// ends, release the middle, join. The bytes stay in their stores.
+pub fn textbuf_delete(mut tb: TextBuf, range: Span) {
+    edit_require_live(tb, "textbuf_delete")
+    let len = textbuf_len(tb)
+    if range.lo < 0 || range.lo > range.hi || range.hi > len {
+        util.bug("text.piece", "delete range [{range.lo},{range.hi}) beyond buffer length {len}")
+    }
+    if range.lo == range.hi {
+        return
+    }
+    let old_gen = tb.gen
+    let first_line = textbuf_line_of(tb, range.lo as ByteOff)
+    let last_line = textbuf_line_of(tb, range.hi as ByteOff)
+    let affected_lo = textbuf_line_start(tb, first_line) as int
+    let affected_hi = textbuf_line_span(tb, last_line).hi
+    let (before_end, after) = node_split(mut tb, tb.root, range.hi)
+    let (before, removed) = node_split(mut tb, before_end, range.lo)
+    node_release(mut tb, removed)
+    tb.root = node_concat(mut tb, before, after)
+    tb.gen += 1
+    coords_index_note_edit(mut tb, range, 0, Span { lo: affected_lo, hi: affected_hi }, old_gen)
+    tb.add_tail_known = false
+}
+
+/// The offset line `line` starts at (`yew_textbuf_line_start`,
+/// `piece.c:971-1006`): a descent by newline count, then one array read.
+pub fn textbuf_line_start(tb: TextBuf, line_no: LineNo) -> ByteOff {
+    let line = line_no as int
+    if line < 0 || line >= textbuf_line_count(tb) {
+        util.bug("text.piece", "line {line} outside buffer")
+    }
+    if line == 0 {
+        return 0 as ByteOff
+    }
+    var n = tb.root
+    var remaining = line
+    var before = 0
+    while n >= 0 {
+        let left = tb.nodes[n].left
+        let left_lfs = node_lfs(tb, left)
+        if remaining <= left_lfs {
+            n = left
+            continue
+        }
+        before += node_bytes(tb, left)
+        remaining -= left_lfs
+        if remaining <= tb.nodes[n].lf_count {
+            let lf = store_lf(tb, tb.nodes[n].src, tb.nodes[n].lf_first + remaining - 1)
+            return (before + lf + 1 - tb.nodes[n].lo) as ByteOff
+        }
+        remaining -= tb.nodes[n].lf_count
+        before += tb.nodes[n].hi - tb.nodes[n].lo
+        n = tb.nodes[n].right
+    }
+    util.bug("text.piece", "piece newline index is inconsistent")
+    0 as ByteOff
+}
+
+/// The line holding `off`; the buffer's end maps to the last line
+/// (`yew_textbuf_line_of`, `piece.c:1008-1049`).
+pub fn textbuf_line_of(tb: TextBuf, off: ByteOff) -> LineNo {
+    let len = textbuf_len(tb)
+    var pos = off as int
+    if pos < 0 || pos > len {
+        util.bug("text.piece", "offset {pos} outside buffer")
+    }
+    var n = tb.root
+    var lines = 0
+    while n >= 0 {
+        let left = tb.nodes[n].left
+        let left_bytes = node_bytes(tb, left)
+        let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+        if pos < left_bytes {
+            n = left
+            continue
+        }
+        if pos <= left_bytes + piece_len {
+            let src = tb.nodes[n].src
+            let target = tb.nodes[n].lo + pos - left_bytes
+            let first = tb.nodes[n].lf_first
+            var end = first + tb.nodes[n].lf_count
+            var lo = first
+            lines += node_lfs(tb, left)
+            while lo < end {
+                let mid = lo + (end - lo) / 2
+                if store_lf(tb, src, mid) < target {
+                    lo = mid + 1
+                } else {
+                    end = mid
+                }
+            }
+            return (lines + lo - first) as LineNo
+        }
+        lines += node_lfs(tb, left) + tb.nodes[n].lf_count
+        pos -= left_bytes + piece_len
+        n = tb.nodes[n].right
+    }
+    lines as LineNo
+}
+
+/// Line `line`'s span, its EOL included (`yew_textbuf_line_span`).
+pub fn textbuf_line_span(tb: TextBuf, line: LineNo) -> Span {
+    let count = textbuf_line_count(tb)
+    let lo = textbuf_line_start(tb, line) as int
+    let l = line as int
+    var hi = textbuf_len(tb)
+    if l + 1 < count {
+        hi = textbuf_line_start(tb, (l + 1) as LineNo) as int
+    }
+    Span { lo: lo, hi: hi }
+}
+
+/// A fresh iterator, positioned nowhere (`TextIter` storage).
+pub fn textiter_new() -> TextIter {
+    TextIter { stack: List[int](), bid: 0, gen: 0, skip: 0, snapshot: false }
+}
+
+// `textiter_seek`, `piece.c:1102-1140`.
+fn textiter_seek(
+    mut it: TextIter,
+    tb: TextBuf,
+    root: int,
+    len: int,
+    gen: int,
+    snapshot: bool,
+    at: int,
+) -> bool {
+    if it.stack.len != 0 {
+        it.stack = List[int]()
+    }
+    it.bid = tb.bid
+    it.gen = gen
+    it.snapshot = snapshot
+    it.skip = 0
+    if at < 0 || at > len {
+        util.bug("text.piece", "iterator offset {at} outside text length {len}")
+    }
+    if at == len {
+        return false
+    }
+    var n = root
+    var pos = at
+    while n >= 0 {
+        if it.stack.len == PIECE_MAX_DEPTH {
+            util.bug("text.piece", "piece iterator stack overflow")
+        }
+        (mut it.stack).push(n)
+        let left_bytes = node_bytes(tb, tb.nodes[n].left)
+        let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+        if pos < left_bytes {
+            n = tb.nodes[n].left
+        } else if pos < left_bytes + piece_len {
+            it.skip = pos - left_bytes
+            return true
+        } else {
+            pos -= left_bytes + piece_len
+            n = tb.nodes[n].right
+        }
+    }
+    util.bug("text.piece", "piece iterator could not resolve a valid offset")
+    false
+}
+
+fn textiter_validate(it: TextIter, tb: TextBuf) {
+    if it.snapshot {
+        if it.bid != tb.bid {
+            util.bug("text.piece", "snapshot iterator used with a different text buffer")
+        }
+        return
+    }
+    if it.bid != tb.bid || !tb.live {
+        util.bug("text.piece", "live iterator used with a different text buffer")
+    }
+    if it.gen != tb.gen {
+        util.bug("text.piece", "piece iterator invalidated by edit")
+    }
+}
+
+/// Position `it` at `at` of the live buffer; false at the end
+/// (`yew_textiter_begin`).
+pub fn textiter_begin(mut it: TextIter, tb: TextBuf, at: ByteOff) -> bool {
+    textiter_seek(mut it, tb, tb.root, textbuf_len(tb), tb.gen, false, at as int)
+}
+
+/// The current maximal run (`yew_textiter_chunk`, `piece.c:1167-1189`):
+/// borrowed until the next live edit or the snapshot's release.
+pub fn textiter_chunk(it: TextIter, tb: TextBuf) -> Chunk {
+    textiter_validate(it, tb)
+    if it.stack.len == 0 {
+        return Chunk { ok: false, src: 0, at: 0, len: 0 }
+    }
+    let n = it.stack[it.stack.len - 1]
+    let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+    if it.skip >= piece_len {
+        util.bug("text.piece", "piece iterator skip outside current piece")
+    }
+    Chunk { ok: true, src: tb.nodes[n].src, at: tb.nodes[n].lo + it.skip, len: piece_len - it.skip }
+}
+
+/// Step to the next piece; false past the end (`yew_textiter_advance`,
+/// `piece.c:1191-1222`).
+pub fn textiter_advance(mut it: TextIter, tb: TextBuf) -> bool {
+    textiter_validate(it, tb)
+    if it.stack.len == 0 {
+        return false
+    }
+    var n = it.stack[it.stack.len - 1]
+    it.skip = 0
+    if tb.nodes[n].right >= 0 {
+        n = tb.nodes[n].right
+        loop {
+            if it.stack.len == PIECE_MAX_DEPTH {
+                util.bug("text.piece", "piece iterator stack overflow")
+            }
+            (mut it.stack).push(n)
+            if tb.nodes[n].left < 0 {
+                return true
+            }
+            n = tb.nodes[n].left
+        }
+    }
+    var child = n
+    let _ = (mut it.stack).pop() else -1
+    while it.stack.len != 0 {
+        n = it.stack[it.stack.len - 1]
+        if tb.nodes[n].left == child {
+            return true
+        }
+        child = n
+        let _ = (mut it.stack).pop() else -1
+    }
+    false
+}
+
+/// A line iterator from line `at`; false when `at` is past the last line
+/// (`yew_lineiter_begin`).
+pub fn lineiter_begin(tb: TextBuf, at: LineNo) -> (LineIter, bool) {
+    let a = at as int
+    if a > textbuf_line_count(tb) {
+        util.bug("text.piece", "line iterator starts outside buffer")
+    }
+    (LineIter { bid: tb.bid, next_line: a, gen: tb.gen }, a < textbuf_line_count(tb))
+}
+
+/// The next line's span, or false (`yew_lineiter_next`).
+pub fn lineiter_next(mut it: LineIter, tb: TextBuf) -> (bool, Span) {
+    if it.bid != tb.bid {
+        util.bug("text.piece", "line iterator used with a different text buffer")
+    }
+    if it.gen != tb.gen {
+        util.bug("text.piece", "line iterator invalidated by edit")
+    }
+    if it.next_line >= textbuf_line_count(tb) {
+        return (false, Span { lo: 0, hi: 0 })
+    }
+    let s = textbuf_line_span(tb, it.next_line as LineNo)
+    it.next_line += 1
+    (true, s)
+}
+
+/// An O(1) snapshot: one tree reference, one store reference
+/// (`yew_textbuf_snap`, `piece.c:1251-1268`).
+pub fn textbuf_snap(mut tb: TextBuf) -> TextSnap {
+    edit_require_live(tb, "textbuf_snap")
+    node_ref(mut tb, tb.root)
+    tb.refs += 1
+    TextSnap { root: tb.root, bid: tb.bid, len: textbuf_len(tb), gen: tb.gen, active: true }
+}
+
+/// Release a snapshot (`yew_textsnap_release`, `piece.c:1270-1283`);
+/// the buffer may already be released.
+pub fn textsnap_release(mut tb: TextBuf, mut snap: TextSnap) {
+    if !snap.active {
+        util.bug("text.piece", "textsnap_release: snapshot already released")
+    }
+    if snap.bid != tb.bid {
+        util.bug("text.piece", "textsnap_release: snapshot belongs to another buffer")
+    }
+    node_release(mut tb, snap.root)
+    backing_release(mut tb)
+    snap = textsnap_none()
+}
+
+/// Position `it` at `at` of a snapshot (`yew_textsnap_iter`).
+pub fn textsnap_iter(mut it: TextIter, tb: TextBuf, snap: TextSnap, at: ByteOff) -> bool {
+    if !snap.active {
+        util.bug("text.piece", "textsnap_iter: released snapshot")
+    }
+    if snap.bid != tb.bid {
+        util.bug("text.piece", "textsnap_iter: snapshot belongs to another buffer")
+    }
+    textiter_seek(mut it, tb, snap.root, snap.len, snap.gen, true, at as int)
+}
+
+/// Append `[lo, hi)` of the live buffer to `out` (the save path's and the
+/// tests' materialize, chunk by chunk).
+pub fn textbuf_append_range(mut out: List[byte], tb: TextBuf, lo: int, hi: int) {
+    if lo >= hi {
+        return
+    }
+    var it = textiter_new()
+    if !textiter_begin(mut it, tb, lo as ByteOff) {
+        return
+    }
+    var done = lo
+    loop {
+        let c = textiter_chunk(it, tb)
+        if !c.ok {
+            break
+        }
+        var step = c.len
+        if step > hi - done {
+            step = hi - done
+        }
+        var i = 0
+        if c.src == STORE_ORIG {
+            while i < step {
+                (mut out).push(tb.orig.bytes[c.at + i])
+                i += 1
+            }
+        } else {
+            while i < step {
+                (mut out).push(tb.add.bytes[c.at + i])
+                i += 1
+            }
+        }
+        done += step
+        if done >= hi || !textiter_advance(mut it, tb) {
+            break
+        }
+    }
+}
+
+/// The live buffer's bytes `[lo, hi)` as a fresh list.
+pub fn textbuf_copy_range(tb: TextBuf, lo: int, hi: int) -> List[byte] {
+    var out = List[byte]()
+    textbuf_append_range(mut out, tb, lo, hi)
+    out
+}
+
+/// Every byte of the live buffer.
+pub fn textbuf_bytes(tb: TextBuf) -> List[byte] {
+    textbuf_copy_range(tb, 0, textbuf_len(tb))
+}
+
+/// Every byte of a snapshot.
+pub fn textsnap_bytes(tb: TextBuf, snap: TextSnap) -> List[byte] {
+    var out = List[byte]()
+    var it = textiter_new()
+    if !textsnap_iter(mut it, tb, snap, 0 as ByteOff) {
+        return out
+    }
+    loop {
+        let c = textiter_chunk(it, tb)
+        if !c.ok {
+            break
+        }
+        var i = 0
+        while i < c.len {
+            (mut out).push(store_byte(tb, c.src, c.at + i))
+            i += 1
+        }
+        if !textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    out
+}
+
+/// One byte of the live buffer at `off` (a descent; for probes and the
+/// line-ending checks, not loops).
+pub fn textbuf_byte_at(tb: TextBuf, off: int) -> int {
+    var n = tb.root
+    var pos = off
+    while n >= 0 {
+        let left = tb.nodes[n].left
+        let left_bytes = node_bytes(tb, left)
+        let piece_len = tb.nodes[n].hi - tb.nodes[n].lo
+        if pos < left_bytes {
+            n = left
+        } else if pos < left_bytes + piece_len {
+            return store_byte(tb, tb.nodes[n].src, tb.nodes[n].lo + pos - left_bytes) as int
+        } else {
+            pos -= left_bytes + piece_len
+            n = tb.nodes[n].right
+        }
+    }
+    util.bug("text.piece", "byte offset {off} outside buffer")
+    0
+}
+
+struct CheckTotals {
+    bytes: int,
+    lfs: int,
+    count: int,
+}
+
+// `node_check`, `piece.c:1305-1355`.
+fn node_check(tb: TextBuf, n: int, depth: int) -> CheckTotals {
+    if n < 0 {
+        return CheckTotals { bytes: 0, lfs: 0, count: 0 }
+    }
+    if depth >= PIECE_MAX_DEPTH {
+        util.bug("text.piece", "piece tree exceeds maximum depth")
+    }
+    let node = copy tb.nodes[n]
+    if node.refs <= 0 {
+        util.bug("text.piece", "piece tree contains unreferenced node")
+    }
+    if node.src != STORE_ORIG && node.src != STORE_ADD {
+        util.bug("text.piece", "piece tree contains invalid store id")
+    }
+    if node.lo >= node.hi || node.hi > store_len(tb, node.src) {
+        util.bug("text.piece", "piece tree contains invalid or empty span")
+    }
+    let first = store_lb(tb, node.src, node.lo)
+    let end = store_lb(tb, node.src, node.hi)
+    if node.lf_first != first || node.lf_count != end - first {
+        util.bug("text.piece", "piece tree newline metadata mismatch")
+    }
+    let left = node_check(tb, node.left, depth + 1)
+    let right = node_check(tb, node.right, depth + 1)
+    let total = CheckTotals {
+        bytes: left.bytes + (node.hi - node.lo) + right.bytes,
+        lfs: left.lfs + node.lf_count + right.lfs,
+        count: left.count + 1 + right.count,
+    }
+    if node.sub_bytes != total.bytes || node.sub_lfs != total.lfs || node.sub_count != total.count {
+        util.bug("text.piece", "piece tree subtree metadata mismatch")
+    }
+    let wl = left.count + 1
+    let wr = right.count + 1
+    if wl > 3 * wr || wr > 3 * wl {
+        util.bug("text.piece", "piece tree weight-balance invariant violated")
+    }
+    total
+}
+
+// No two adjacent pieces may coalesce (`node_check_canonical`).
+fn node_check_canonical(tb: TextBuf, root: int) {
+    var stack = List[int]()
+    var n = root
+    var previous = -1
+    while n >= 0 || stack.len != 0 {
+        while n >= 0 {
+            if stack.len == PIECE_MAX_DEPTH {
+                util.bug("text.piece", "piece canonical-check stack overflow")
+            }
+            (mut stack).push(n)
+            n = tb.nodes[n].left
+        }
+        n = (mut stack).pop() else -1
+        if previous >= 0 &&
+            tb.nodes[previous].src == tb.nodes[n].src &&
+            tb.nodes[previous].hi == tb.nodes[n].lo {
+            util.bug("text.piece", "piece tree contains coalescible adjacent spans")
+        }
+        previous = n
+        n = tb.nodes[n].right
+    }
+}
+
+/// The invariant checker (`yew_textbuf_check`, `piece.c:1380-1411`): WBT
+/// balance at every node, subtree totals recomputed, spans inside their
+/// store, newline windows matching a search of the index, no empty and
+/// no coalescible piece, references live, the add-tail cache true. A
+/// failure is the internal-error report (exit 4).
+pub fn textbuf_check(tb: TextBuf) {
+    if !tb.live || tb.refs <= 0 {
+        util.bug("text.piece", "text buffer has no live backing store")
+    }
+    let _ = node_check(tb, tb.root, 0)
+    node_check_canonical(tb, tb.root)
+    if tb.add_tail_known {
+        if tb.add_tail_at > node_bytes(tb, tb.root) {
+            util.bug("text.piece", "text buffer add-tail position is outside the tree")
+        }
+        let tail = node_ending_at(tb, tb.root, tb.add_tail_at)
+        if tail < 0 || tb.nodes[tail].src != STORE_ADD || tb.nodes[tail].hi != tb.add.bytes.len {
+            util.bug("text.piece", "text buffer add-tail cache is stale")
+        }
+    }
+}
