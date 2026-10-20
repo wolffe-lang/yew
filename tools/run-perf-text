@@ -1,0 +1,114 @@
+#!/bin/sh
+# run-perf-text — campaign 02's ratios: the port's text engine beside C's.
+#
+#   tools/run-perf-text [--taskset 0-3] [--rounds N] [--huge]
+#
+# Runs sagitta's own `perf_piece` and `perf_textbuf` (built by
+# tools/oracle into the oracle tree) and the port's twin
+# (tools/perf-text/main.lu, release tier) on this host, pinned to the
+# CPUs given (the track's rule on kasumi: `--taskset 0-3`), over
+# sagitta's deterministic fixtures (generated here by C's own
+# `gen-bigfile`, verified against `tests/perf/fixtures.sha`), and prints
+# each wolf/C ratio:
+#
+#   perf-text: <metric> C=<n><unit> wolf=<n><unit> ratio=<x.xx>
+#
+#   piece.insert       perf_piece's 1M inserts (rounds; best of each)
+#   open.100m-code     the 100 MB load, median-run p50 (perf_textbuf)
+#   open.100m-utf8     the same on the UTF-8 profile
+#   line_start.1g-code / line_of.1g-code   (--huge: 1 GiB fixtures, C's
+#                      per-query p50 against the port's batch mean —
+#                      tools/perf-text/main.lu says why)
+#
+# Exit 0 always but on a harness fault (2): the ratios are a FINDING for
+# the lane's note (contract §8: recorded; the open budgets are yw15's).
+set -eu
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export YEW_ROOT
+cd "$YEW_ROOT"
+. tools/lib-toolchain.sh
+
+pin=
+rounds=3
+huge=
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --taskset) pin=$2; shift 2 ;;
+    --rounds) rounds=$2; shift 2 ;;
+    --huge) huge=1; shift ;;
+    *) echo "run-perf-text: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+run() { if [ -n "$pin" ]; then taskset -c "$pin" "$@"; else "$@"; fi; }
+
+tree=$YEW_ROOT/target/oracle/sagitta
+for b in perf_piece perf_textbuf gen-bigfile; do
+    [ -x "$tree/build/$b" ] || { echo "run-perf-text: no $tree/build/$b; run tools/oracle first" >&2; exit 2; }
+done
+
+fix=$YEW_ROOT/target/perf-fixtures
+mkdir -p "$fix"
+profiles="100m-code 100m-utf8 100m-allnl"
+[ -n "$huge" ] && profiles="$profiles 1g-code 1g-noline"
+for p in $profiles; do
+    line=$(awk -v p="$p" '$1 == p { print $2, $3, $4 }' "$tree/tests/perf/fixtures.sha")
+    set -- $line
+    if [ ! -f "$fix/$p.bin" ]; then
+        "$tree/build/gen-bigfile" --profile "$p" --size "$1" --seed "$2" --output "$fix/$p.bin" >/dev/null
+    fi
+    "$tree/build/gen-bigfile" --verify "$fix/$p.bin" "0x$3" >/dev/null ||
+        { echo "run-perf-text: $p.bin does not hash to 0x$3" >&2; exit 2; }
+done
+
+stage=$YEW_ROOT/target/perf-text
+rm -rf "$stage"
+mkdir -p "$stage/src"
+cp tools/perf-text/main.lu "$stage/src/main.lu"
+for m in util unicode term text; do
+    cp -R "src/$m" "$stage/src/$m"
+    rm -f "$stage/src/$m"/*_test.lu
+done
+"$WOLF" build --release --deny-warnings "$stage/src/main.lu" -o "$stage/perf-text"
+
+: >"$stage/c-piece.txt"; : >"$stage/w-piece.txt"
+i=0
+while [ $i -lt "$rounds" ]; do
+    YEW_PERF_ADVISORY=1 run "$tree/build/perf_piece" >>"$stage/c-piece.txt" 2>&1 || true
+    run "$stage/perf-text" piece >>"$stage/w-piece.txt" 2>&1
+    i=$((i + 1))
+done
+hflag=
+[ -n "$huge" ] && hflag=--huge
+YEW_PERF_ADVISORY=1 run "$tree/build/perf_textbuf" --fixtures "$fix" --baseline /nonexistent \
+    --runner-id "$(hostname)" $hflag >"$stage/c-textbuf.txt" 2>&1 || true
+: >"$stage/w-textbuf.txt"
+for p in 100m-code 100m-utf8 100m-allnl; do
+    run "$stage/perf-text" open "$fix" "$p" >>"$stage/w-textbuf.txt" 2>&1
+done
+if [ -n "$huge" ]; then
+    run "$stage/perf-text" queries "$fix" 1g-code >>"$stage/w-textbuf.txt" 2>&1
+fi
+
+ratio() { awk -v c="$2" -v w="$3" -v m="$1" -v u="$4" 'BEGIN {
+    if (c > 0 && w != "") printf "perf-text: %s C=%s%s wolf=%s%s ratio=%.2f\n", m, c, u, w, u, w / c;
+    else printf "perf-text: %s C=%s%s wolf=%s%s ratio=?\n", m, c, u, w, u }'; }
+echo "perf-text: host $(uname -sm) $(hostname), pin ${pin:-none}, rounds $rounds"
+c=$(sed -n 's/.*elapsed_ms=\([0-9]*\).*/\1/p' "$stage/c-piece.txt" | sort -n | head -1)
+w=$(sed -n 's/.*elapsed_ms=\([0-9]*\).*/\1/p' "$stage/w-piece.txt" | sort -n | head -1)
+ratio piece.insert "$c" "$w" ms
+for p in 100m-code 100m-utf8 100m-allnl; do
+    if [ "$p" = 100m-allnl ]; then cname=rss.100m-allnl; else cname=open.$p; fi
+    cns=$(awk -v n="$cname" '$1 == n { sub("p50_ns=", "", $2); print $2 }' "$stage/c-textbuf.txt")
+    c=$(awk -v x="$cns" 'BEGIN { if (x != "") printf "%.1f", x / 1000000 }')
+    w=$(awk -v n="open.$p" '$1 == n { sub("p50_ms=", "", $2); print $2 }' "$stage/w-textbuf.txt")
+    ratio "open.$p" "$c" "$w" ms
+done
+if [ -n "$huge" ]; then
+    for q in line_start line_of; do
+        c=$(awk -v n="$q.1g-code" '$1 == n { sub("p50_ns=", "", $2); print $2 }' "$stage/c-textbuf.txt")
+        w=$(awk -v n="$q.1g-code" '$1 == n { sub("mean_ns=", "", $2); print $2 }' "$stage/w-textbuf.txt")
+        ratio "$q.1g-code (C p50, wolf mean)" "$c" "$w" ns
+    done
+fi
+sed 's/^/perf-text: C:    /' "$stage/c-piece.txt" "$stage/c-textbuf.txt"
+sed 's/^/perf-text: wolf: /' "$stage/w-piece.txt" "$stage/w-textbuf.txt"

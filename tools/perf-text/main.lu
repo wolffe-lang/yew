@@ -1,0 +1,291 @@
+//! perf-text — campaign 02's ratios, the port's half (yw02 contract §8:
+//! the wolf/C ratios for the piece tree's insert and offset queries and
+//! for the 100 MB load are RECORDED; the `open.100m_*` budgets are
+//! yw15's gate).
+//!
+//! Three measurements, each sagitta's own at 9ace98c2, line for line:
+//!
+//!   perf-text piece
+//!       `tests/perf/perf_piece.c`: 1,000,000 inserts of 1-8 bytes at
+//!       random offsets into a 1 MiB buffer of `x`, seed
+//!       0x9e3779b97f4a7c15, xorshift 13/7/17 (`next_random`, lines
+//!       57-66), the ops generated before the clock starts, the tree
+//!       checked after it stops. One line in C's shape:
+//!       `piece-perf: ops=N bytes=N pieces=N elapsed_ms=N`.
+//!   perf-text open DIR PROFILE
+//!       `tests/perf/perf_textbuf.c` `measure_open` (198-257): three
+//!       warm loads, then three runs of three timed `file_load`s of
+//!       DIR/PROFILE.bin; the run's p50 and max, the median run's
+//!       reported; the tree checked outside the clock (`load_once`,
+//!       161-196). `open.PROFILE p50_ms=N max_ms=N rss_bytes=N`.
+//!   perf-text queries DIR PROFILE
+//!       `measure_queries` (599-686): 100,000 `line_start` at random
+//!       lines and 100,000 `line_of` at random offsets per run, three
+//!       runs, the random draws in C's order (xorshift* seed
+//!       0x9e3779b97f4a7c15, `random_next` 74-83). C times each query
+//!       with two `clock_gettime` calls and reports the p50; wolf's
+//!       clock is milliseconds (std.time: "a library cannot invent
+//!       precision it was not given"), so the port times each run's
+//!       100,000 queries as one batch and reports the MEAN
+//!       (`line_start mean_ns=N`): a mean against C's p50, with C's
+//!       per-sample clock overhead inside C's number — said beside the
+//!       ratio wherever it is quoted.
+//!
+//! `use text` resolves beside the ENTRY (D32), so tools/run-perf-text
+//! stages the modules beside a copy of this file under target/; nothing
+//! there is committed.
+
+use text
+
+fn usage() -> int {
+    eprint("usage: perf-text piece | open DIR PROFILE | queries DIR PROFILE")
+    2
+}
+
+// `next_random`, `perf_piece.c:57-66`.
+fn piece_random(s: wrapping[u64]) -> wrapping[u64] {
+    var x = s
+    x = x ^ x << 13
+    x = x ^ x >> 7
+    x = x ^ x << 17
+    x
+}
+
+// `random_next`, `perf_textbuf.c:74-83`: xorshift64*.
+fn star_random(s: wrapping[u64]) -> (wrapping[u64], wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    (x, x * 2685821657736338717)
+}
+
+fn below(x: wrapping[u64], n: int) -> int {
+    (x % n as wrapping[u64]) as int
+}
+
+fn sorted(xs: List[int]) -> List[int] {
+    var v = copy xs
+    var i = 1
+    while i < v.len {
+        let x = v[i]
+        var at = i
+        while at != 0 && v[at - 1] > x {
+            v[at] = v[at - 1]
+            at -= 1
+        }
+        v[at] = x
+        i += 1
+    }
+    v
+}
+
+// Resident bytes, `rss_bytes` (`perf_textbuf.c:117-149`): Linux statm.
+fn rss_bytes() -> int {
+    let t = fs_read_text("/proc/self/statm") else {
+        return 0
+    }
+    var field = 0
+    var n = 0
+    for b in t.bytes() {
+        if b == 32 as byte {
+            if field == 1 {
+                break
+            }
+            field += 1
+            n = 0
+            continue
+        }
+        if field == 1 {
+            n = n * 10 + (b as int - 48)
+        }
+    }
+    n * 4096
+}
+
+fn run_piece() -> int {
+    let initial_bytes = 1024 * 1024
+    let insert_ops = 1000000
+    var rng: wrapping[u64] = 11400714819323198485
+    var expected = initial_bytes
+    var at = List[int]()
+    var lo = List[int]()
+    var payload = List[byte]()
+    var op = 0
+    while op < insert_ops {
+        rng = piece_random(rng)
+        let len = 1 + below(rng, 8)
+        rng = piece_random(rng)
+        (mut at).push(below(rng, expected + 1))
+        (mut lo).push(payload.len)
+        var i = 0
+        while i < len {
+            rng = piece_random(rng)
+            (mut payload).push((97 + below(rng, 26)) as byte)
+            i += 1
+        }
+        expected += len
+        op += 1
+    }
+    (mut lo).push(payload.len)
+    var initial = List[byte]()
+    var i = 0
+    while i < initial_bytes {
+        (mut initial).push(120 as byte)
+        i += 1
+    }
+    var tb = text.textbuf_from_bytes(initial, 0, initial.len)
+    let start = time_now_ms()
+    op = 0
+    while op < insert_ops {
+        text.textbuf_insert_part(mut tb, text.byteoff(at[op]), payload, lo[op], lo[op + 1])
+        op += 1
+    }
+    let elapsed = time_now_ms() - start
+    text.textbuf_check(tb)
+    let len = text.textbuf_len(tb)
+    print(
+        "piece-perf: seed=9e3779b97f4a7c15 ops={insert_ops} bytes={len} pieces={text.textbuf_piece_count(tb)} elapsed_ms={elapsed}",
+    )
+    if len != expected {
+        eprint("perf-text: piece: length {len}, expected {expected}")
+        return 1
+    }
+    0
+}
+
+// One `load_once` (`perf_textbuf.c:161-196`): the elapsed milliseconds
+// and the resident growth, or -1.
+fn load_once(path: str) -> (int, int) {
+    let before = rss_bytes()
+    let start = time_now_ms()
+    var (rc, tb, meta) = text.file_load(path)
+    let end = time_now_ms()
+    let after = rss_bytes()
+    if rc != text.LOAD_OK {
+        eprint("perf-text: cannot load {path}: {rc}")
+        return (-1, 0)
+    }
+    text.textbuf_check(tb)
+    text.filemeta_dispose(mut meta, mut tb)
+    text.textbuf_free(mut tb)
+    let growth = if after > before then after - before else 0
+    (end - start, growth)
+}
+
+fn run_open(dir: str, profile: str) -> int {
+    let path = "{dir}/{profile}.bin"
+    var max_rss = 0
+    var warm = 0
+    while warm < 3 {
+        let (ms, rss) = load_once(path)
+        if ms < 0 {
+            return 2
+        }
+        if rss > max_rss {
+            max_rss = rss
+        }
+        warm += 1
+    }
+    var p50s = List[int]()
+    var maxes = List[int]()
+    var run = 0
+    while run < 3 {
+        var samples = List[int]()
+        var s = 0
+        while s < 3 {
+            let (ms, rss) = load_once(path)
+            if ms < 0 {
+                return 2
+            }
+            if rss > max_rss {
+                max_rss = rss
+            }
+            (mut samples).push(ms)
+            s += 1
+        }
+        let sv = sorted(samples)
+        (mut p50s).push(sv[1])
+        (mut maxes).push(sv[2])
+        run += 1
+    }
+    let p = sorted(p50s)
+    let m = sorted(maxes)
+    print("open.{profile} p50_ms={p[1]} max_ms={m[1]} rss_bytes={max_rss}")
+    0
+}
+
+fn run_queries(dir: str, profile: str) -> int {
+    let path = "{dir}/{profile}.bin"
+    var (rc, tb, meta) = text.file_load(path)
+    if rc != text.LOAD_OK {
+        eprint("perf-text: cannot load {path}: {rc}")
+        return 2
+    }
+    let lines = text.textbuf_line_count(tb)
+    let len = text.textbuf_len(tb)
+    let samples = 100000
+    var sink = 0
+    var i = 0
+    while i < 3 {
+        sink += text.textbuf_line_start(tb, text.lineno(i % lines)) as int
+        sink += text.textbuf_line_of(tb, text.byteoff(i % (len + 1))) as int
+        i += 1
+    }
+    var rng: wrapping[u64] = 11400714819323198485
+    var start_means = List[int]()
+    var of_means = List[int]()
+    var run = 0
+    while run < 3 {
+        var line_at = List[int]()
+        var off_at = List[int]()
+        i = 0
+        while i < samples {
+            let (s1, v1) = star_random(rng)
+            let (s2, v2) = star_random(s1)
+            rng = s2
+            (mut line_at).push(below(v1, lines))
+            (mut off_at).push(below(v2, len + 1))
+            i += 1
+        }
+        var t0 = time_now_ms()
+        i = 0
+        while i < samples {
+            sink += text.textbuf_line_start(tb, text.lineno(line_at[i])) as int
+            i += 1
+        }
+        var t1 = time_now_ms()
+        (mut start_means).push((t1 - t0) * 1000000 / samples)
+        t0 = time_now_ms()
+        i = 0
+        while i < samples {
+            sink += text.textbuf_line_of(tb, text.byteoff(off_at[i])) as int
+            i += 1
+        }
+        t1 = time_now_ms()
+        (mut of_means).push((t1 - t0) * 1000000 / samples)
+        run += 1
+    }
+    let s = sorted(start_means)
+    let o = sorted(of_means)
+    print("line_start.{profile} mean_ns={s[1]} lines={lines} bytes={len} samples={samples}")
+    print("line_of.{profile} mean_ns={o[1]} sink={sink % 1000}")
+    text.filemeta_dispose(mut meta, mut tb)
+    text.textbuf_free(mut tb)
+    0
+}
+
+fn main() -> int {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let args = env_args()
+    if args.len == 1 && args[0] == "piece" {
+        return run_piece()
+    }
+    if args.len == 3 && args[0] == "open" {
+        return run_open(args[1], args[2])
+    }
+    if args.len == 3 && args[0] == "queries" {
+        return run_queries(args[1], args[2])
+    }
+    usage()
+}
