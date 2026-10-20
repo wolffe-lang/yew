@@ -1,0 +1,355 @@
+//! edit.loop — the event loop: the wait over the tty and the signal set,
+//! the timer heap, typeahead coalescing, one render per turn.
+//!
+//! Ports sagitta `src/edit/loop.c` (757 lines) and `loop.h` (40) at
+//! 9ace98c2, under `s14-modes-L-I.md` §4. C's loop is one `poll(2)` over
+//! the tty, a signal self-pipe and every job/clipboard/HTTP descriptor
+//! with the earliest deadline as its timeout; at wolf 0.2.33 the wait is
+//! `term.tty_wait` (ruling #93 R2's interim: `os_signal_wait_fd` parked,
+//! `VTIME` ticks when a deadline is pending — 100 ms granularity, the
+//! swap point for `os_signal_wait_fds`, wolf-lang#795, G2). Campaign 03
+//! has no job, HTTP or subprocess clipboard descriptor (yw04, yw12, G30).
+//!
+//! C's timer is a callback and a context pointer (`TimerFn`,
+//! `loop.h:20`); the port's is a KIND and a payload (no function value
+//! across a module boundary, G19/G20), popped one due timer at a time so
+//! a firing that adds a due timer is fired in the same turn, as C's loop
+//! does (`yew_timers_fire`, `loop.c:220-229`).
+
+use term
+use text
+use util
+
+/// No timer (`YEW_TIMER_NONE`).
+pub const TIMER_NONE: int = 0
+
+/// A message's expiry (`message_expire`, `message.c:66-80`).
+pub const TIMER_MSG_EXPIRE: int = 1
+
+/// A unit test's mark: the payload is the value it records.
+pub const TIMER_TEST_MARK: int = 100
+
+/// A unit test's spawning mark (`timer_spawn`, `test_loop.c:56-62`).
+pub const TIMER_TEST_SPAWN: int = 101
+
+/// `YEW_INPUT_BURST_MAX` (`loop.h:8`): one turn drains at most this much.
+pub const INPUT_BURST_MAX: int = 262144
+
+/// A timer (`YewTimer`, `loop.c:56-62`).
+pub struct Timer {
+    at_ms: int,
+    order: int,
+    id: int,
+    kind: int,
+    payload: int,
+}
+
+/// The timer heap (`TimerHeap`, `loop.h:22-28`): a binary min-heap by
+/// (deadline, insertion order).
+pub struct TimerHeap {
+    v: List[Timer],
+    len: int,
+    next_id: int,
+    next_order: int,
+}
+
+/// An empty heap (`yew_timers_init`).
+pub fn timers_new() -> TimerHeap {
+    TimerHeap { v: List[Timer](), len: 0, next_id: 1, next_order: 0 }
+}
+
+fn timer_before(a: Timer, b: Timer) -> bool {
+    a.at_ms < b.at_ms || a.at_ms == b.at_ms && a.order < b.order
+}
+
+fn timer_swap(mut h: TimerHeap, i: int, j: int) {
+    let t = copy h.v[i]
+    h.v[i] = copy h.v[j]
+    h.v[j] = t
+}
+
+fn timer_up(mut h: TimerHeap, at_in: int) {
+    var at = at_in
+    while at != 0 {
+        let parent = (at - 1) / 2
+        if !timer_before(h.v[at], h.v[parent]) {
+            break
+        }
+        timer_swap(mut h, at, parent)
+        at = parent
+    }
+}
+
+fn timer_down(mut h: TimerHeap, at_in: int) {
+    var at = at_in
+    loop {
+        let left = at * 2 + 1
+        let right = left + 1
+        var next = at
+        if left < h.len && timer_before(h.v[left], h.v[next]) {
+            next = left
+        }
+        if right < h.len && timer_before(h.v[right], h.v[next]) {
+            next = right
+        }
+        if next == at {
+            break
+        }
+        timer_swap(mut h, at, next)
+        at = next
+    }
+}
+
+/// `yew_timer_add` (`loop.c:121-150`): the timer's id.
+pub fn timer_add(mut h: TimerHeap, at_ms: int, kind: int, payload: int) -> int {
+    let t = Timer { at_ms: at_ms, order: h.next_order, id: h.next_id, kind: kind, payload: payload }
+    h.next_order += 1
+    h.next_id += 1
+    if h.len < h.v.len {
+        h.v[h.len] = copy t
+    } else {
+        (mut h.v).push(copy t)
+    }
+    h.len += 1
+    timer_up(mut h, h.len - 1)
+    t.id
+}
+
+/// `yew_timer_cancel` (`loop.c:152-174`).
+pub fn timer_cancel(mut h: TimerHeap, id: int) -> bool {
+    if id == TIMER_NONE {
+        return false
+    }
+    var i = 0
+    while i < h.len {
+        if h.v[i].id == id {
+            h.len -= 1
+            if i != h.len {
+                h.v[i] = copy h.v[h.len]
+                if i != 0 && timer_before(h.v[i], h.v[(i - 1) / 2]) {
+                    timer_up(mut h, i)
+                } else {
+                    timer_down(mut h, i)
+                }
+            }
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+/// `yew_timers_deadline` (`loop.c:176-185`): ms until the earliest, 0 when
+/// due, -1 when none.
+pub fn timers_deadline(h: TimerHeap, now_ms: int) -> int {
+    if h.len == 0 {
+        return -1
+    }
+    if h.v[0].at_ms <= now_ms {
+        return 0
+    }
+    h.v[0].at_ms - now_ms
+}
+
+/// Pop the earliest timer if it is due (one step of `yew_timers_fire`):
+/// answers (fired, kind, payload).
+pub fn timer_pop_due(mut h: TimerHeap, now_ms: int) -> (bool, int, int) {
+    if h.len == 0 || h.v[0].at_ms > now_ms {
+        return (false, 0, 0)
+    }
+    let first = copy h.v[0]
+    h.len -= 1
+    if h.len != 0 {
+        h.v[0] = copy h.v[h.len]
+        timer_down(mut h, 0)
+    }
+    (true, first.kind, first.payload)
+}
+
+/// `yew_now_ms` (`loop.c:231-241`): the monotonic clock.
+pub fn now_ms() -> int {
+    time_now_ms()
+}
+
+fn deadline_min(a: int, b: int) -> int {
+    if a < 0 {
+        return b
+    }
+    if b < 0 {
+        return a
+    }
+    if a < b then a else b
+}
+
+fn absolute_deadline(at_ms: int, now: int) -> int {
+    if at_ms < 0 {
+        return -1
+    }
+    if at_ms <= now {
+        return 0
+    }
+    at_ms - now
+}
+
+/// `yew_loop_deadline` (`loop.c:280-357`) over campaign 03's clocks: a
+/// dispatch-ready key, the chord, the input's ESC, the timers, the
+/// clipboard queue, the probe.
+pub fn loop_deadline(ed: Ed, now: int) -> int {
+    if term.input_dispatch_ready(ed.input) {
+        return 0
+    }
+    var d = -1
+    d = deadline_min(d, absolute_deadline(dispatch_deadline(ed), now))
+    d = deadline_min(d, term.input_deadline(ed.input, now))
+    d = deadline_min(d, timers_deadline(ed.timers, now))
+    d = deadline_min(d, absolute_deadline(text.clip_deadline(ed.regs.clip), now))
+    if !term.probe_done(ed.tty) {
+        d = deadline_min(d, term.probe_deadline(ed.tty, now))
+    }
+    if d < 0 {
+        return -1
+    }
+    if d > 2147483647 then 2147483647 else d
+}
+
+/// `loop_seed_probe` (`loop.c:359-375`): once the startup probe is done,
+/// the input and the renderer take its capabilities and the typed-ahead
+/// bytes it held.
+pub fn loop_seed_probe(mut ed: Ed) {
+    if ed.probe_seeded || !term.probe_done(ed.tty) {
+        return
+    }
+    let caps = term.tty_caps(ed.tty)
+    ed.input.caps = copy caps
+    if ed.input_ready {
+        term.input_enable(caps)
+    }
+    if ed.render_ready {
+        ed.render = term.render_new(copy caps, term.env_process())
+        theme_sync_surfaces(mut ed)
+    }
+    let pending = term.tty_pending(ed.tty)
+    term.input_seed(mut ed.input, pending)
+    term.tty_clear_pending(mut ed.tty)
+    ed.probe_seeded = true
+    ed.full_damage = true
+}
+
+fn feed_bytes(mut ed: Ed, bytes: List[byte]) {
+    if ed.probe_seeded {
+        term.input_feed(mut ed.input, bytes, 0, bytes.len)
+    } else {
+        let _ = term.probe_feed(mut ed.tty, bytes, 0, bytes.len)
+    }
+    loop_seed_probe(mut ed)
+}
+
+// `loop_read_input` (`loop.c:377-424`): the bytes the wait said are there,
+// then everything else already queued (the drain), up to the burst cap,
+// so a burst of typeahead is ONE dispatch pass and ONE frame. Answers
+// (ok, eof, burst_cap).
+fn loop_read_input(mut ed: Ed) -> (bool, bool, bool) {
+    let first = term.tty_read(ed.tty) else |e| match e {
+        hangup => { return (true, true, false) },
+        io => { return (false, false, false) },
+    }
+    if first.len == 0 {
+        return (true, false, false)
+    }
+    var drained = first.len
+    feed_bytes(mut ed, first)
+    term.tty_drain_begin(mut ed.tty)
+    while drained < INPUT_BURST_MAX {
+        let more = term.tty_read(ed.tty) else |_| List[byte]()
+        if more.len == 0 {
+            break
+        }
+        drained += more.len
+        feed_bytes(mut ed, more)
+    }
+    term.tty_drain_end(mut ed.tty)
+    (true, false, drained >= INPUT_BURST_MAX)
+}
+
+/// `yew_loop_dispatch_event` (`loop.c:426-473`): one decoded event.
+pub fn loop_dispatch_event(mut ed: Ed, key: term.Key, now: int) {
+    ed.now_ms = now
+    if key.kind == term.EV_KEY {
+        ed_handle_key(mut ed, key, now)
+    } else if key.kind == term.EV_PASTE_BEGIN {
+        ed_handle_paste(mut ed, List[byte](), true, false)
+    } else if key.kind == term.EV_PASTE_DATA {
+        let chunk = term.input_paste_chunk(ed.input)
+        ed_handle_paste(mut ed, chunk, false, false)
+    } else if key.kind == term.EV_PASTE_END {
+        ed_handle_paste(mut ed, List[byte](), false, true)
+    }
+}
+
+/// Fire every due timer (`yew_timers_fire`): a firing may add a due timer,
+/// which fires this turn too.
+pub fn ed_timers_fire(mut ed: Ed, now: int) {
+    loop {
+        let (fired, kind, _) = timer_pop_due(mut ed.timers, now)
+        if !fired {
+            break
+        }
+        if kind == TIMER_MSG_EXPIRE {
+            msg_expire(mut ed)
+        }
+    }
+}
+
+fn handle_signal(mut ed: Ed, m: int) {
+    let action = term.tty_on_signal(mut ed.tty, m)
+    if action == term.SIG_WINCH {
+        ed_resize(mut ed, false)
+    } else if action == term.SIG_CONT {
+        ed_resize(mut ed, true)
+    }
+}
+
+/// `yew_loop_run` (`loop.c:509-757`): wait, read, drain signals, decode
+/// and dispatch every event, fire deadlines, lay out, render once.
+pub fn loop_run(mut ed: Ed) -> int {
+    var key = term.key_new()
+    loop {
+        var now = now_ms()
+        loop_seed_probe(mut ed)
+        let m = term.tty_wait(mut ed.tty, loop_deadline(ed, now)) else |_| {
+            return util.EXIT_IO
+        }
+        now = now_ms()
+        ed.now_ms = now
+        if m != 0 {
+            handle_signal(mut ed, m)
+        } else {
+            let (ok, eof, _) = loop_read_input(mut ed)
+            if !ok {
+                return util.EXIT_IO
+            }
+            if eof {
+                term.input_eof(mut ed.input)
+                ed.quit = true
+            }
+        }
+        term.probe_tick(mut ed.tty, now)
+        loop_seed_probe(mut ed)
+        while term.input_next(mut ed.input, now, mut key) {
+            loop_dispatch_event(mut ed, key, now)
+        }
+        dispatch_tick(mut ed, now)
+        ed_timers_fire(mut ed, now)
+        if ed.quit {
+            return ed.exit_code
+        }
+        if ed.layout_dirty {
+            ed_layout(mut ed)
+        }
+        ed_render(mut ed)
+        if ed.quit {
+            return ed.exit_code
+        }
+    }
+    ed.exit_code
+}
