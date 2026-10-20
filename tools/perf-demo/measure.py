@@ -29,6 +29,18 @@ import sys
 import termios
 import time
 
+# A hard cap on the whole measurement: a PTY read that never returns, or
+# a child that dies in a way this driver did not foresee, must end in an
+# exit code, never in a job that runs until its timeout kills it
+# (yew run 39356480306, the macOS leg: 56 minutes in this step).
+WATCHDOG_S = 240
+
+
+def watchdog(signum, frame):
+    print("measure: watchdog: %d s elapsed, giving up" % WATCHDOG_S,
+          file=sys.stderr, flush=True)
+    os._exit(2)
+
 QUERIES = b"\x1b[?u\x1b[?2026$p\x1b[c"
 REPLY = b"\x1b[?0u\x1b[?2026;2$y\x1b[?62;22c"
 FRAME_END = b"\x1b[?2026l"
@@ -75,10 +87,21 @@ def spawn(binary, scene, env):
     return master, pid, started
 
 
+def read_chunk(master):
+    """One read of the master; None when the child's side is gone (Linux
+    raises EIO, macOS answers an empty read, both forever after)."""
+    try:
+        chunk = os.read(master, 65536)
+    except OSError:
+        return None
+    return chunk if chunk else None
+
+
 def read_until(master, needle, deadline_ns, buf):
     """Append master's output to buf until needle appears; answer the
     probe queries the moment they are complete.  Returns the time the
-    needle's last byte was read, or None on the deadline."""
+    needle's last byte was read, or None on the deadline or the child's
+    end."""
     answered = QUERIES in buf
     while True:
         at = buf.find(needle)
@@ -90,11 +113,8 @@ def read_until(master, needle, deadline_ns, buf):
         r, _, _ = select.select([master], [], [], (deadline_ns - now) / 1e9)
         if not r:
             return None
-        try:
-            chunk = os.read(master, 65536)
-        except OSError:
-            return None
-        if not chunk:
+        chunk = read_chunk(master)
+        if chunk is None:
             return None
         buf += chunk
         if not answered and QUERIES in buf:
@@ -140,17 +160,21 @@ def keypresses(binary, env, keys):
         raise RuntimeError("damage scene did not paint")
     time.sleep(0.05)
     samples = []
-    for _ in range(keys):
+    for i in range(keys):
         # Drain anything pending so the next read is the answer to this key.
         while select.select([master], [], [], 0)[0]:
-            os.read(master, 65536)
+            if read_chunk(master) is None:
+                stop(master, pid)
+                raise RuntimeError("the child ended before key %d" % i)
         t0 = time.monotonic_ns()
         os.write(master, b"a")
         r, _, _ = select.select([master], [], [], 1.0)
         if not r:
             stop(master, pid)
-            raise RuntimeError("no paint within 1 s of a key")
-        os.read(master, 65536)
+            raise RuntimeError("no paint within 1 s of key %d" % i)
+        if read_chunk(master) is None:
+            stop(master, pid)
+            raise RuntimeError("the child ended at key %d" % i)
         samples.append(time.monotonic_ns() - t0)
     stop(master, pid)
     return samples
@@ -169,13 +193,15 @@ def main():
     ap.add_argument("--keys", type=int, default=300)
     ap.add_argument("--state", required=True)
     a = ap.parse_args()
+    signal.signal(signal.SIGALRM, watchdog)
+    signal.alarm(WATCHDOG_S)
     os.makedirs(a.state, exist_ok=True)
     env = child_env(a.state)
     try:
         starts = [one_start(a.bin, env) for _ in range(a.starts)]
         keys = keypresses(a.bin, env, a.keys)
     except RuntimeError as e:
-        print("measure: %s: %s" % (a.label, e), file=sys.stderr)
+        print("measure: %s: %s" % (a.label, e), file=sys.stderr, flush=True)
         return 2
     print("startup.first_paint.%s p50_ns=%d p99_ns=%d n=%d"
           % (a.label, pct(starts, 0.5), pct(starts, 0.99), len(starts)))
