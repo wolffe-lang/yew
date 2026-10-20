@@ -1,0 +1,694 @@
+//! edit.compfish — fish as a completion oracle (Sprint 57.26 §2).
+//!
+//! Ports sagitta `src/ui/compfish.c` (783 lines) and `compfish.h` (163)
+//! at 9ace98c2, in C's order: the line fish sees, detection, the cache
+//! and the request queue, the lookup, the parse, and the job. fish is RUN
+//! as a black box (`fish -N --private -c QUERY -- LINE CMD`); its source
+//! is never read.
+//!
+//! What runs at wolf 0.2.33: the line (each word escaped for fish), the
+//! query stem, detection (`$YEW_TEST_FISH`, then `fish` on the absolute
+//! `$PATH` elements), the key, the cache and the queue, the lookup and
+//! the parse of `complete -C` output. The idle path that spawns fish is a
+//! job whose pipe is read while the loop runs (G2): it takes C's own
+//! spawn-failure path (`compfish.c:766-778`) — the oracle disabled for
+//! the session with one log line naming the refusal (R-yw04-1), every
+//! request dropped — so the ladder falls through to the `--help` rung, as
+//! C's does when fish cannot start.
+//!
+//! The port's shape: C's state is module statics (`fish`,
+//! `compfish.c:165-175`); here the value `CompFish`, owned by the editor
+//! (`Ed.fish`). The prompt's refilter on an arrival
+//! (`yew_cmdline_compgen_arrived`) is the completion engine's; at 0.2.33
+//! nothing arrives.
+
+use util
+
+/// An answer is fresh this long (`YEW_COMPFISH_FRESH_MS`).
+pub const COMPFISH_FRESH_MS: int = 5000
+
+/// At most this many rows (`YEW_COMPFISH_MAX_LINES`).
+pub const COMPFISH_MAX_LINES: int = 5000
+
+/// fish's deadline (`YEW_COMPFISH_TIMEOUT_MS`).
+pub const COMPFISH_TIMEOUT_MS: int = 2000
+
+/// The collection ceiling (`YEW_COMPFISH_COLLECT_MAX`).
+pub const COMPFISH_COLLECT_MAX: int = 1048576
+
+/// The one script fish runs (`YEW_COMPFISH_QUERY`, `compfish.c:36-41`):
+/// fixed text; the user's words are argv.
+pub fn compfish_query() -> str {
+    "set -p fish_complete_path $__fish_config_dir/completions; set -p fish_function_path $__fish_config_dir/functions; set -l r (complete -C -- $argv[1]); if complete -c $argv[2] | string length -q; printf '%s\\n' $r; end"
+}
+
+// `compfish.c:43-48`.
+const FISH_CACHE_MAX: int = 32
+
+const FISH_QUEUE_MAX: int = 8
+
+const FISH_INFLIGHT_MAX: int = 1
+
+/// `YewFishState` (`compfish.h:64-69`): not asked.
+pub const FISH_OFF: int = 0
+
+/// Queued or in flight, nothing cached yet.
+pub const FISH_PENDING: int = 1
+
+/// The gate is open: fish's rows answer.
+pub const FISH_ROWS: int = 2
+
+/// fish has no rules here: the next rung answers.
+pub const FISH_CLOSED: int = 3
+
+/// One row (`YewFishRow`, `compfish.h:58-62`).
+pub struct FishRow {
+    text: str,
+    desc: str,
+    has_desc: bool,
+    is_dir: bool,
+}
+
+/// A lookup's answer (`YewFishLookup`, `compfish.h:71-78`).
+pub struct FishLookup {
+    state: int,
+    rows: List[FishRow],
+    key: str,
+}
+
+struct CfEntry {
+    key: str,
+    stamp: int,
+    gate: bool,
+    rows: List[FishRow],
+}
+
+struct CfReq {
+    key: str,
+    line: List[byte],
+    cmd: str,
+    cwd: str,
+    inflight: bool,
+    job_id: int,
+}
+
+/// The oracle's state (C's `fish`, `compfish.c:165-175`).
+pub struct CompFish {
+    resolved: bool,
+    path: str,
+    has_path: bool,
+    disabled: bool,
+    cache: List[CfEntry],
+    q: List[CfReq],
+    spawns: int,
+}
+
+/// A fresh oracle.
+pub fn compfish_new() -> CompFish {
+    CompFish {
+        resolved: false,
+        path: "",
+        has_path: false,
+        disabled: false,
+        cache: List[CfEntry](),
+        q: List[CfReq](),
+        spawns: 0,
+    }
+}
+
+// ==================================================================
+// The line fish sees
+// ==================================================================
+
+/// `fish_special` (`compfish.c:54-60`).
+fn cf_special(c: int) -> bool {
+    c == 32 ||
+        c == 36 ||
+        c == 42 ||
+        c == 63 ||
+        c == 126 ||
+        c == 35 ||
+        c == 40 ||
+        c == 41 ||
+        c == 123 ||
+        c == 125 ||
+        c == 91 ||
+        c == 93 ||
+        c == 60 ||
+        c == 62 ||
+        c == 38 ||
+        c == 124 ||
+        c == 59 ||
+        c == 34 ||
+        c == 39 ||
+        c == 92
+}
+
+/// `yew_compfish_escape` (`compfish.c:62-82`): `word` (up to a NUL, a C
+/// string) escaped for fish onto `out`.
+pub fn compfish_escape(mut out: List[byte], word: List[byte]) {
+    let hex = "0123456789abcdef"
+    for b in word {
+        let c = b as int
+        if c == 0 {
+            return
+        }
+        if c == 9 {
+            (mut out).push(92 as byte)
+            (mut out).push(116 as byte)
+        } else if c == 10 {
+            (mut out).push(92 as byte)
+            (mut out).push(110 as byte)
+        } else if c < 32 || c == 127 {
+            (mut out).push(92 as byte)
+            (mut out).push(120 as byte)
+            (mut out).push(hex.bytes()[c >> 4])
+            (mut out).push(hex.bytes()[c & 15])
+        } else {
+            if cf_special(c) {
+                (mut out).push(92 as byte)
+            }
+            (mut out).push(b)
+        }
+    }
+}
+
+/// `yew_compfish_query_stem` (`compfish.c:84-107`): "" (every candidate),
+/// "-" for a flag stem, `--name=` for a flag's value, "." for a dot.
+pub fn compfish_query_stem(stem: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    if stem.len == 0 || stem[0] as int == 0 {
+        return out
+    }
+    if stem[0] as int == 45 {
+        var eq = -1
+        var i = 0
+        while i < stem.len && stem[i] as int != 0 {
+            if stem[i] as int == 61 {
+                eq = i
+                break
+            }
+            i += 1
+        }
+        if eq >= 0 && stem.len > 1 && stem[1] as int == 45 {
+            var k = 0
+            while k <= eq {
+                (mut out).push(stem[k])
+                k += 1
+            }
+            return out
+        }
+        (mut out).push(45 as byte)
+        return out
+    }
+    if stem[0] as int == 46 {
+        (mut out).push(46 as byte)
+    }
+    out
+}
+
+/// `yew_compfish_line` (`compfish.c:109-138`): argv[0 .. arg_index)
+/// escaped and space-joined, a space, the query stem; `(false, _)` when
+/// the context has no command.
+pub fn compfish_line(ctx: ShCtx) -> (bool, List[byte]) {
+    var b = List[byte]()
+    if ctx.argc == 0 || ctx.argv[0].len == 0 || ctx.argv[0][0] as int == 0 || ctx.arg_index == 0 {
+        return (false, b)
+    }
+    var i = 0
+    while i < ctx.arg_index && i < ctx.argc {
+        if i != 0 {
+            (mut b).push(32 as byte)
+        }
+        if ctx.argv[i].len == 0 || ctx.argv[i][0] as int == 0 {
+            (mut b).push(39 as byte)
+            (mut b).push(39 as byte)
+        } else {
+            compfish_escape(mut b, ctx.argv[i])
+        }
+        i += 1
+    }
+    (mut b).push(32 as byte)
+    compfish_escape(mut b, compfish_query_stem(ctx.stem))
+    (true, b)
+}
+
+// ==================================================================
+// Detection
+// ==================================================================
+
+/// `find_on_path` (`compfish.c:181-212`): the absolute `$PATH` elements
+/// only.
+fn cf_find_on_path(name: str) -> (bool, str) {
+    let env = env_get("PATH") else |_| { return (false, "") }
+    for dir in env.split(":") {
+        if dir.len != 0 && dir.starts_with("/") {
+            let path = "{dir}/{name}"
+            if job_exec_ok(path) {
+                return (true, path)
+            }
+        }
+    }
+    (false, "")
+}
+
+/// `yew_compfish_path` (`compfish.c:214-229`): `$YEW_TEST_FISH` when set
+/// (empty: none), else `fish` on `$PATH`; resolved once.
+pub fn compfish_path(mut f: CompFish) -> (bool, str) {
+    if !f.resolved {
+        f.resolved = true
+        let seam = env_get("YEW_TEST_FISH") else |_| { "\u{0}" }
+        if seam != "\u{0}" {
+            f.has_path = seam.len != 0
+            f.path = seam
+        } else {
+            let (ok, p) = cf_find_on_path("fish")
+            f.has_path = ok
+            f.path = p
+        }
+    }
+    (f.has_path, f.path)
+}
+
+/// `option_auto` (`compfish.c:231-241`): `shell.complete_fish` is not
+/// `off` (the literal store until the options model, yw09).
+fn cf_option_auto(ed: Ed) -> bool {
+    let v = ed.opts.store["shell.complete_fish"] else "auto"
+    v != "off"
+}
+
+/// `yew_compfish_enabled` (`compfish.c:243-246`).
+pub fn compfish_enabled(mut ed: Ed) -> bool {
+    if !cf_option_auto(ed) || ed.fish.disabled {
+        return false
+    }
+    let (has, _) = compfish_path(mut ed.fish)
+    has
+}
+
+/// `yew_compfish_test_disabled` (`compfish.c:248-251`).
+pub fn compfish_disabled(f: CompFish) -> bool {
+    f.disabled
+}
+
+// ==================================================================
+// The cache and the queue
+// ==================================================================
+
+fn cf_entry_find(f: CompFish, key: str) -> int {
+    var i = 0
+    while i < f.cache.len {
+        if f.cache[i].key == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `entry_store` (`compfish.c:281-312`), which an arrival runs
+/// (`fish_complete`, `:643-687`): a full cache drops its oldest. Public
+/// for the pin whose job layer delivers fish's answer, and the tests.
+pub fn compfish_store(mut f: CompFish, key: str, now: int, gate: bool, take rows: List[FishRow]) {
+    let e = cf_entry_find(f, key)
+    if e >= 0 {
+        // The whole element: a `take` stored into a field of a `mut`
+        // parameter's element is E1004 (G35).
+        f.cache[e] = CfEntry { key: key, stamp: now, gate: gate, rows: rows }
+        return
+    }
+    if f.cache.len == FISH_CACHE_MAX {
+        var oldest = 0
+        var i = 1
+        while i < f.cache.len {
+            if f.cache[i].stamp < f.cache[oldest].stamp {
+                oldest = i
+            }
+            i += 1
+        }
+        var keep = List[CfEntry]()
+        i = 0
+        while i < f.cache.len {
+            if i != oldest {
+                (mut keep).push(copy f.cache[i])
+            }
+            i += 1
+        }
+        f.cache = keep
+    }
+    (mut f.cache).push(CfEntry { key: key, stamp: now, gate: gate, rows: rows })
+}
+
+fn cf_req_drop_at(mut f: CompFish, at: int) {
+    var keep = List[CfReq]()
+    var i = 0
+    while i < f.q.len {
+        if i != at {
+            (mut keep).push(copy f.q[i])
+        }
+        i += 1
+    }
+    f.q = keep
+}
+
+fn cf_req_find(f: CompFish, key: str) -> int {
+    var i = 0
+    while i < f.q.len {
+        if f.q[i].key == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `queue_request` (`compfish.c:339-366`).
+fn cf_queue_request(mut f: CompFish, key: str, line: List[byte], cmd: str, cwd: str) {
+    if cf_req_find(f, key) >= 0 {
+        return
+    }
+    if f.q.len == FISH_QUEUE_MAX {
+        var i = 0
+        while i < f.q.len {
+            if !f.q[i].inflight {
+                cf_req_drop_at(mut f, i)
+                break
+            }
+            i += 1
+        }
+        if f.q.len == FISH_QUEUE_MAX {
+            return
+        }
+    }
+    (mut f.q).push(CfReq {
+        key: key,
+        line: copy line,
+        cmd: cmd,
+        cwd: cwd,
+        inflight: false,
+        job_id: 0,
+    })
+}
+
+/// `yew_compfish_inflight` (`compfish.c:368-378`).
+pub fn compfish_inflight(f: CompFish) -> int {
+    var n = 0
+    for r in f.q {
+        if r.inflight {
+            n += 1
+        }
+    }
+    n
+}
+
+/// `yew_compfish_queued` (`compfish.c:380-383`).
+pub fn compfish_queued(f: CompFish) -> int {
+    f.q.len - compfish_inflight(f)
+}
+
+/// `yew_compfish_awaiting` (`compfish.c:385-389`).
+pub fn compfish_awaiting(f: CompFish, key: str) -> bool {
+    key.starts_with("fish:") && cf_req_find(f, key) >= 0 && cf_entry_find(f, key) < 0
+}
+
+/// `yew_compfish_prompt_closed` (`compfish.c:391-403`).
+pub fn compfish_prompt_closed(mut f: CompFish) {
+    var i = 0
+    while i < f.q.len {
+        if f.q[i].inflight {
+            i += 1
+        } else {
+            cf_req_drop_at(mut f, i)
+        }
+    }
+}
+
+/// `yew_compfish_reset` (`compfish.c:405-426`).
+pub fn compfish_reset(mut f: CompFish) {
+    f = compfish_new()
+}
+
+/// `yew_compfish_test_spawns` (`compfish.c:428-431`).
+pub fn compfish_spawns(f: CompFish) -> int {
+    f.spawns
+}
+
+/// `yew_compfish_test_age` (`compfish.c:433-439`).
+pub fn compfish_age(mut f: CompFish, ms: int) {
+    var i = 0
+    while i < f.cache.len {
+        f.cache[i].stamp -= ms
+        i += 1
+    }
+}
+
+// ==================================================================
+// The lookup
+// ==================================================================
+
+/// `fnv_str` (`compfish.c:445-456`): the bytes AND their NUL.
+fn cf_fnv(h0: wrapping[u64], s: List[byte]) -> wrapping[u64] {
+    var h = h0
+    for b in s {
+        if b as int == 0 {
+            break
+        }
+        h = h ^ b as int as wrapping[u64]
+        h = h * 1099511628211
+    }
+    h * 1099511628211
+}
+
+/// `base_of` (`compfish.c:458-463`): a trailing `/` keeps the path.
+fn cf_base_of(path: str) -> str {
+    let slash = path.rfind("/") else -1
+    if slash < 0 || slash + 1 == path.len then path else path[slash + 1..]
+}
+
+/// `yew_compfish_lookup` (`compfish.c:465-472`): the `:!` directory.
+pub fn compfish_lookup(mut ed: Ed, ctx: ShCtx, now: int) -> FishLookup {
+    let cwd = shell_ws_root(ed)
+    compfish_lookup_in(mut ed, ctx, cwd, true, now)
+}
+
+/// `yew_compfish_lookup_in` (`compfish.c:474-519`): fish's answer for an
+/// ARGUMENT caret, fish run in `cwd` and keyed on it; a miss queues.
+pub fn compfish_lookup_in(
+    mut ed: Ed,
+    ctx: ShCtx,
+    cwd0: str,
+    has_cwd: bool,
+    now: int,
+) -> FishLookup {
+    var out = FishLookup { state: FISH_OFF, rows: List[FishRow](), key: "" }
+    if ctx.pos != SH_POS_ARGUMENT || !compfish_enabled(mut ed) {
+        return out
+    }
+    let (has_line, line) = compfish_line(ctx)
+    if !has_line {
+        return out
+    }
+    let (_, path) = compfish_path(mut ed.fish)
+    let cwd = if has_cwd then cwd0 else ""
+    var h: wrapping[u64] = 14695981039346656037
+    var pb = List[byte]()
+    for b in path.bytes() {
+        (mut pb).push(b)
+    }
+    var cb = List[byte]()
+    for b in cwd.bytes() {
+        (mut cb).push(b)
+    }
+    h = cf_fnv(h, pb)
+    h = cf_fnv(h, cb)
+    h = cf_fnv(h, line)
+    out.key = "fish:{cf_hex16(h)}"
+    let e = cf_entry_find(ed.fish, out.key)
+    if e < 0 || now - ed.fish.cache[e].stamp >= COMPFISH_FRESH_MS {
+        let a0 = str_from_utf8(ctx.argv[0]) else ""
+        cf_queue_request(mut ed.fish, out.key, line, cf_base_of(a0), cwd)
+    }
+    if e < 0 {
+        out.state = FISH_PENDING
+        return out
+    }
+    out.state = if ed.fish.cache[e].gate then FISH_ROWS else FISH_CLOSED
+    out.rows = copy ed.fish.cache[e].rows
+    out
+}
+
+fn cf_hex16(h: wrapping[u64]) -> str {
+    let digits = "0123456789abcdef"
+    var b = List[byte]()
+    var k: int = 0
+    while k < 16 {
+        var v = h
+        var sh = 0
+        while sh < 15 - k {
+            v = v >> 4
+            sh += 1
+        }
+        (mut b).push(digits.bytes()[(v & 15) as int])
+        k += 1
+    }
+    str_from_utf8(b) else ""
+}
+
+// ==================================================================
+// The parse
+// ==================================================================
+
+/// `clean_field` (`compfish.c:525-548`).
+fn cf_clean_field(s: List[byte], at: int, n0: int) -> str {
+    var n = n0
+    while n > 0 &&
+        (s[at + n - 1] as int == 32 || s[at + n - 1] as int == 9 || s[at + n - 1] as int == 13) {
+        n -= 1
+    }
+    var b = List[byte]()
+    var i = 0
+    while i < n {
+        let c = s[at + i] as int
+        if c < 32 || c == 127 {
+            (mut b).push(194 as byte)
+            (mut b).push(183 as byte)
+        } else {
+            (mut b).push(s[at + i])
+        }
+        i += 1
+    }
+    str_from_utf8(b) else ""
+}
+
+/// `yew_compfish_parse` (`compfish.c:550-626`): rows of `complete -C`
+/// output (first TAB separates; a trailing `/` marks a directory; a row
+/// whose text holds a control byte is dropped; duplicates dropped). A
+/// candidate that is not UTF-8 cannot be a `str` row and is dropped too.
+pub fn compfish_parse(data: List[byte]) -> List[FishRow] {
+    var rows = List[FishRow]()
+    var at = 0
+    let len = data.len
+    while at < len && rows.len < COMPFISH_MAX_LINES {
+        var e = at
+        while e < len && data[e] as int != 10 {
+            e += 1
+        }
+        let line = at
+        let ll = e - at
+        at = e + 1
+        var tab = -1
+        var k = 0
+        while k < ll {
+            if data[line + k] as int == 9 {
+                tab = k
+                break
+            }
+            k += 1
+        }
+        var tn = if tab < 0 then ll else tab
+        var is_dir = false
+        if tn > 1 && data[line + tn - 1] as int == 47 {
+            is_dir = true
+            tn -= 1
+        }
+        if tn == 0 {
+            continue
+        }
+        var ctl = false
+        var tb = List[byte]()
+        k = 0
+        while k < tn {
+            let c = data[line + k] as int
+            if c < 32 || c == 127 {
+                ctl = true
+                break
+            }
+            (mut tb).push(data[line + k])
+            k += 1
+        }
+        if ctl {
+            continue
+        }
+        let text = str_from_utf8(tb) else |_| { continue }
+        var dup = false
+        for r in rows {
+            if r.text == text {
+                dup = true
+                break
+            }
+        }
+        if dup {
+            continue
+        }
+        var row = FishRow { text: text, desc: "", has_desc: false, is_dir: is_dir }
+        if tab >= 0 {
+            let d = cf_clean_field(data, line + tab + 1, ll - tab - 1)
+            if d.len != 0 {
+                row.desc = d
+                row.has_desc = true
+            }
+        }
+        (mut rows).push(row)
+    }
+    rows
+}
+
+// ==================================================================
+// The job
+// ==================================================================
+
+/// `disable_once` (`compfish.c:632-641`).
+fn cf_disable_once(mut f: CompFish, why: str) {
+    if f.disabled {
+        return
+    }
+    f.disabled = true
+    util.log_info("completion: fish oracle disabled: {why}")
+}
+
+/// `yew_compfish_idle_ready` (`compfish.c:701-715`). `others` is the
+/// generator and help flights that share the four slots.
+pub fn compfish_idle_ready(f: CompFish, others: int) -> bool {
+    let flying = compfish_inflight(f)
+    if f.disabled || flying >= FISH_INFLIGHT_MAX || others + flying >= COMPGEN_MAX_INFLIGHT {
+        return false
+    }
+    for r in f.q {
+        if !r.inflight {
+            return true
+        }
+    }
+    false
+}
+
+/// `yew_compfish_idle` (`compfish.c:717-783`). At wolf 0.2.33 fish's pipe
+/// cannot be read while the loop runs (G2), so the spawn takes C's
+/// failure path (`:766-778`): the oracle disabled for the session with
+/// one log line naming the refusal, every request dropped. Answers the
+/// jobs started (0).
+pub fn compfish_idle(mut ed: Ed, others: int) -> int {
+    if !compfish_idle_ready(ed.fish, others) {
+        return 0
+    }
+    var at = -1
+    var i = 0
+    while i < ed.fish.q.len {
+        if !ed.fish.q[i].inflight {
+            at = i
+            break
+        }
+        i += 1
+    }
+    if at < 0 {
+        return 0
+    }
+    let (has, _) = compfish_path(mut ed.fish)
+    if !cf_option_auto(ed) || !has {
+        cf_req_drop_at(mut ed.fish, at)
+        return 0
+    }
+    ed.fish.spawns += 1
+    cf_disable_once(mut ed.fish, job_stop_g2("the fish completion job"))
+    ed.fish.q = List[CfReq]()
+    0
+}
