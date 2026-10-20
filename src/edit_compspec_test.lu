@@ -1,0 +1,612 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_compspec.c` (808 lines) and its
+//! hermetic fixture `compspec_fix.h` (155), one test per C test in
+//! registry order. C's registry is process state reset by
+//! `yew_compspec_invalidate_all`; the port's is the value `CompSpecs`, and
+//! each case builds a fresh one (or the editor's, `Ed.specs`) — the same
+//! isolation. The resolution corpus is data
+//! (`tests/fixtures/shell/compspec_corpus.txt`, `tools/gen-shell-fixtures`).
+//!
+//! Two cases drive the completion engine (`yew_comp_query`,
+//! `yew_comp_filter_run`, `yew_comp_shell_describe`) and wait for it:
+//! `compspec_resolution_corpus` and
+//! `compspec_command_rows_show_the_description` (the comp fork's cmdcomp,
+//! this lane's `edit.cmdcomp_shell`).
+
+use edit
+use std.fs
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+/// `SpecFix` (`compspec_fix.h:34-42`): a hermetic spec environment.
+struct SpecFix {
+    root: str,
+    config: str,
+    home: str,
+    runtime: str,
+    old_runtime: str,
+    had_runtime: bool,
+    old_config: str,
+    had_config: bool,
+    old_home: str,
+    had_home: bool,
+}
+
+var fix_counter: int = 0
+
+fn env_copy(name: str) -> (str, bool) {
+    let v = env_get(name) else |_| { return ("", false) }
+    (v, true)
+}
+
+fn env_restore(name: str, value: str, had: bool) {
+    if had {
+        env_set(name, value) else |_| { assert(false, "restore {name}") }
+    } else {
+        env_unset(name) else |_| {}
+    }
+}
+
+/// `spec_fix_init` (`compspec_fix.h:60-87`).
+fn spec_fix_init() -> SpecFix {
+    let (old_runtime, had_runtime) = env_copy("YEW_RUNTIME_DIR")
+    let (old_config, had_config) = env_copy("XDG_CONFIG_HOME")
+    let (old_home, had_home) = env_copy("HOME")
+    let cwd = os_cwd() else ""
+    let runtime = if had_runtime && old_runtime.len != 0 then old_runtime else "{cwd}/runtime"
+    var n = 0
+    // # Safety: the test is one thread; the counter names fresh trees.
+    unsafe {
+        fix_counter += 1
+        n = fix_counter
+    }
+    let root = "/tmp/yew-compspec-{os_pid()}-{n}"
+    fs.remove_dir_all(root) else |_| {}
+    fs.create_dir_all("{root}/config/yew/completions") else |_| { assert(false, "mkdir config") }
+    fs.create_dir_all("{root}/home") else |_| { assert(false, "mkdir home") }
+    env_set("YEW_RUNTIME_DIR", runtime) else |_| {}
+    env_set("XDG_CONFIG_HOME", "{root}/config") else |_| {}
+    env_set("HOME", "{root}/home") else |_| {}
+    SpecFix {
+        root: root,
+        config: "{root}/config",
+        home: "{root}/home",
+        runtime: runtime,
+        old_runtime: old_runtime,
+        had_runtime: had_runtime,
+        old_config: old_config,
+        had_config: had_config,
+        old_home: old_home,
+        had_home: had_home,
+    }
+}
+
+/// `spec_fix_user` (`compspec_fix.h:89-103`).
+fn spec_fix_user(f: SpecFix, name: str, text: str) {
+    fs.write_text("{f.config}/yew/completions/{name}.fl", text) else |_| {
+        assert(false, "write user spec")
+    }
+}
+
+/// `spec_fix_drop` (`compspec_fix.h:145-153`).
+fn spec_fix_drop(f: SpecFix) {
+    env_restore("YEW_RUNTIME_DIR", f.old_runtime, f.had_runtime)
+    env_restore("XDG_CONFIG_HOME", f.old_config, f.had_config)
+    env_restore("HOME", f.old_home, f.had_home)
+    assert(f.root.starts_with("/tmp/yew-"), "only a /tmp/yew-* tree is removed")
+    fs.remove_dir_all(f.root) else |_| { assert(false, "remove {f.root}") }
+}
+
+// ------------------------------------------------------------------
+// Every shipped spec validates (DoD 1)
+// ------------------------------------------------------------------
+
+fn check_desc(file: str, what: str, has: bool, desc: str) {
+    if has && desc.len > 60 {
+        assert(false, "{file}: {what} description over 60 bytes: {desc}")
+    }
+}
+
+fn check_arg_descs(file: str, spec: edit.CompSpec, arg: int) {
+    if arg < 0 {
+        return
+    }
+    for v in spec.args[arg].values {
+        check_desc(file, v.value, v.has_desc, v.desc)
+    }
+}
+
+fn check_node_descs(file: str, spec: edit.CompSpec, n: int) -> int {
+    var count = 1
+    let node = copy spec.nodes[n]
+    check_desc(file, if node.has_name then node.name else "root", node.has_desc, node.desc)
+    for f in node.flags {
+        check_desc(file, if f.has_lng then f.lng else f.shrt, f.has_desc, f.desc)
+        check_arg_descs(file, spec, f.arg)
+    }
+    for a in node.args {
+        check_arg_descs(file, spec, a)
+    }
+    check_arg_descs(file, spec, node.dash_values)
+    for s in node.subs {
+        count += check_node_descs(file, spec, s)
+    }
+    count
+}
+
+fn has_digit(s: str) -> bool {
+    for b in s.bytes() {
+        if b as int >= 48 && b as int <= 57 {
+            return true
+        }
+    }
+    false
+}
+
+fn check_one_shipped(mut reg: edit.CompSpecs, f: SpecFix, file: str) {
+    let (ok, err) = edit.compspec_check_shipped(mut reg, file)
+    assert(ok, err)
+    let path = "{f.runtime}/completions/{file}"
+    let text = fs.read_text(path) else |_| {
+        assert(false, "read {path}")
+        return
+    }
+    let first = text.lines()[0]
+    assert(
+        first.starts_with("# ") && has_digit(first),
+        "{file}: first line must name the tool version",
+    )
+    let (good, spec, e2) = edit.compspec_load_text(mut reg, file, bytes_of(text))
+    assert(good, e2)
+    check_desc(file, "command", spec.has_description, spec.description)
+    assert(check_node_descs(file, spec, 0) >= 1, "{file}: a root")
+}
+
+fn t_compspec_every_shipped_file_validates() {
+    let only = env_get("YEW_COMPSPEC_ONLY") else ""
+    let f = spec_fix_init()
+    var reg = edit.compspecs_new()
+    let n = edit.compspec_shipped_count(mut reg)
+    assert(edit.compspec_shipped_source(mut reg) == "disk", "shipped from disk")
+    var i = 0
+    while i < n {
+        let file = edit.compspec_shipped_name(mut reg, i)
+        if only.len == 0 || only == file {
+            check_one_shipped(mut reg, f, file)
+        }
+        i += 1
+    }
+    if only.len == 0 {
+        assert(n >= 24, "24 shipped specs, got {n}")
+    }
+    spec_fix_drop(f)
+}
+
+// ------------------------------------------------------------------
+// One test per §1 rejection rule; the message names file and key
+// ------------------------------------------------------------------
+
+fn expect_reject(src: str, needle: str) {
+    var reg = edit.compspecs_new()
+    let (ok, _, err) = edit.compspec_load_text(mut reg, "completions/t.fl", bytes_of(src))
+    assert(!ok, "accepted: {src}")
+    assert(err.contains("completions/t.fl") && err.contains(needle), "wanted '{needle}' in: {err}")
+}
+
+fn expect_accept(src: str) {
+    var reg = edit.compspecs_new()
+    let (ok, _, err) = edit.compspec_load_text(mut reg, "completions/t.fl", bytes_of(src))
+    assert(ok, err)
+}
+
+fn t_compspec_rejects_unknown_keys_naming_key_and_path() {
+    expect_accept("{{ completion: 1, command: \"t\" }}")
+    expect_reject("{{ completion: 1, command: \"t\", bogus: 1 }}", "unknown key 'bogus'")
+    expect_reject(
+        "{{ completion: 1, command: \"t\", subcommands: [{{ name: \"a\", flags: [ {{ long: \"x\", colour: 1 }} ] }} ] }}",
+        "unknown key 'colour' (at subcommands[0].flags[0])",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", args: [{{ kind: \"path\", extension: [\"c\"] }} ] }}",
+        "unknown key 'extension' (at args[0])",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", subcommands: [{{ name: \"a\", command: \"b\" }} ] }}",
+        "unknown key 'command'",
+    )
+}
+
+fn t_compspec_rejects_wrong_types() {
+    expect_reject("{{ completion: 1, command: 5 }}", "'command'")
+    expect_reject(
+        "{{ completion: 1, command: \"t\", description: [] }}",
+        "'description' must be a string",
+    )
+    expect_reject("{{ completion: 1, command: \"t\", flags: {{}} }}", "'flags' must be a list")
+    expect_reject(
+        "{{ completion: 1, command: \"t\", flags: [{{ long: \"x\", global: \"yes\" }} ] }}",
+        "'global' must be true or false",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", args: [{{ kind: \"colour\" }} ] }}",
+        "unknown argument kind 'colour'",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", args: [{{ kind: \"values\" }} ] }}",
+        "kind \"values\" needs 'values'",
+    )
+    expect_reject("{{ completion: 1, command: \"t\", flags: [{{ long: \"--x\" }} ] }}", "'long'")
+    expect_reject("{{ completion: 1, command: \"t\", flags: [{{ short: \"xy\" }} ] }}", "'short'")
+}
+
+fn t_compspec_rejects_a_bad_schema_version() {
+    expect_reject("{{ completion: 2, command: \"t\" }}", "'completion'")
+    expect_reject("{{ completion: \"1\", command: \"t\" }}", "'completion'")
+    expect_reject("{{ command: \"t\" }}", "missing required key 'completion'")
+    expect_reject("{{ completion: 1 }}", "missing required key 'command'")
+    expect_reject("{{ completion: 1, command: \"t\", name: \"t\" }}", "'name' is for subcommands")
+    expect_reject("{{ completion: 1, command: ", "line ")
+    expect_reject(
+        "{{ completion: 1, command: \"t\", subcommands: [ {{}} ] }}",
+        "a subcommand needs 'name'",
+    )
+}
+
+fn t_compspec_rejects_repeat_on_a_non_last_slot() {
+    expect_accept(
+        "{{ completion: 1, command: \"t\", args: [{{ kind: \"path\" }}, {{ kind: \"path\", repeat: true }} ] }}",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", args: [{{ kind: \"path\", repeat: true }}, {{ kind: \"dir\" }} ] }}",
+        "only the last argument may set 'repeat' (at args[0])",
+    )
+}
+
+fn t_compspec_rejects_a_flag_with_no_spelling() {
+    expect_reject(
+        "{{ completion: 1, command: \"t\", flags: [{{ desc: \"nameless\" }} ] }}",
+        "a flag needs 'long' or 'short' (at flags[0])",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", flags: [{{ long: \"x\", arg_optional: true }} ] }}",
+        "'arg_optional' needs 'arg'",
+    )
+}
+
+fn t_compspec_rejects_an_unresolved_generator() {
+    expect_accept(
+        "{{ completion: 1, command: \"t\", args: [{{ kind: \"generator\", generator: \"make_targets\" }} ] }}",
+    )
+    expect_accept(
+        "{{ completion: 1, command: \"t\", generators: {{ g: {{ argv: [\"true\"] }} }}, args: [{{ kind: \"generator\", generator: \"g\" }} ] }}",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", args: [{{ kind: \"generator\", generator: \"nope\" }} ] }}",
+        "generator 'nope' is neither built in nor in 'generators'",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", generators: {{ g: {{ cache_ms: 5 }} }} }}",
+        "a generator needs a non-empty 'argv' (at generators.g)",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", generators: {{ hosts: {{ argv: [\"x\"] }} }} }}",
+        "shadows a built-in",
+    )
+}
+
+fn t_compspec_rejects_duplicate_subcommand_names() {
+    expect_reject(
+        "{{ completion: 1, command: \"t\", subcommands: [{{ name: \"a\" }}, {{ name: \"a\" }} ] }}",
+        "duplicate subcommand name or alias 'a'",
+    )
+    expect_reject(
+        "{{ completion: 1, command: \"t\", subcommands: [{{ name: \"co\" }}, {{ name: \"checkout\", aliases: [\"co\"] }} ] }}",
+        "duplicate subcommand name or alias 'co'",
+    )
+    expect_accept(
+        "{{ completion: 1, command: \"t\", subcommands: [{{ name: \"a\", subcommands: [ {{ name: \"x\" }} ] }},{{ name: \"b\", subcommands: [ {{ name: \"x\" }} ] }} ] }}",
+    )
+}
+
+// ------------------------------------------------------------------
+// Lookup: basename, user override, whole-file replace, report once
+// ------------------------------------------------------------------
+
+fn t_compspec_lookup_by_basename_and_alias() {
+    let f = spec_fix_init()
+    var reg = edit.compspecs_new()
+    let wolf = edit.compspec_get(mut reg, "wolf")
+    assert(wolf >= 0, "wolf has a spec")
+    assert(reg.pool[wolf].origin == "completions/wolf.fl", "origin")
+    assert(edit.compspec_get(mut reg, "/usr/local/bin/wolf") == wolf, "by basename")
+    assert(edit.compspec_get(mut reg, "./wolf") == wolf, "by ./ basename")
+    assert(edit.compspec_get(mut reg, "./build.sh") < 0, "no build.sh spec")
+    assert(edit.compspec_get(mut reg, "..") < 0, "..")
+    assert(edit.compspec_get(mut reg, "") < 0, "empty")
+    let (has, d) = edit.compspec_describe(mut reg, "wolf")
+    assert(has && d == "the wolf toolchain", "wolf's description")
+    let (none, _) = edit.compspec_describe(mut reg, "no-such-command-s5724")
+    assert(!none, "no description")
+    spec_fix_drop(f)
+}
+
+fn t_compspec_user_file_replaces_shipped_whole() {
+    let f = spec_fix_init()
+    var reg = edit.compspecs_new()
+    spec_fix_user(
+        f,
+        "wolf",
+        "# test 1\n{{ completion: 1, command: \"wolf\", subcommands: [ {{ name: \"mine\" }} ] }}\n",
+    )
+    let sp = edit.compspec_get(mut reg, "wolf")
+    assert(sp >= 0, "the user's spec")
+    let root = copy reg.pool[sp].nodes[0]
+    assert(root.subs.len == 1, "replaced, never merged")
+    assert(reg.pool[sp].nodes[root.subs[0]].name == "mine", "the user's subcommand")
+    spec_fix_drop(f)
+}
+
+fn t_compspec_broken_user_file_is_reported_once() {
+    let f = spec_fix_init()
+    var ed = edit.ed_new()
+    spec_fix_user(f, "wolf", "{{ completion: 1, command: \"wolf\", zap: 1 }}")
+    assert(edit.compspec_get(mut ed.specs, "wolf") < 0, "rejected: no spec")
+    assert(!ed.msg.active, "queued, never from inside a lookup")
+    assert(edit.compspec_notice(mut ed), "the notice")
+    assert(ed.msg.active, "on the message line")
+    assert(ed.msg.text.contains("wolf.fl"), "names the file: {ed.msg.text}")
+    assert(ed.msg.text.contains("unknown key 'zap'"), "names the key")
+    edit.ed_msg_clear(mut ed)
+    assert(edit.compspec_get(mut ed.specs, "wolf") < 0, "still no spec")
+    assert(!edit.compspec_notice(mut ed), "once per session")
+    assert(!ed.msg.active, "nothing said")
+    assert(edit.compspec_get(mut ed.specs, "git") >= 0, "the rest of the specs")
+    spec_fix_drop(f)
+}
+
+fn t_compspec_user_file_is_rechecked_once_per_prompt() {
+    let f = spec_fix_init()
+    var reg = edit.compspecs_new()
+    spec_fix_user(
+        f,
+        "t5724",
+        "# t\n{{ completion: 1, command: \"t5724\", subcommands: [ {{ name: \"one\" }} ] }}\n",
+    )
+    var sp = edit.compspec_get(mut reg, "t5724")
+    assert(sp >= 0, "spec")
+    assert(reg.pool[sp].nodes[reg.pool[sp].nodes[0].subs[0]].name == "one", "one")
+    spec_fix_user(
+        f,
+        "t5724",
+        "# t\n{{ completion: 1, command: \"t5724\", subcommands: [ {{ name: \"two\" }} ] }}\n",
+    )
+    let later = fs.time(2000000000, 0)
+    fs.set_times("{f.config}/yew/completions/t5724.fl", later, later) else |_| {
+        assert(false, "set the mtime")
+    }
+    sp = edit.compspec_get(mut reg, "t5724")
+    assert(
+        reg.pool[sp].nodes[reg.pool[sp].nodes[0].subs[0]].name == "one",
+        "same prompt: not re-read",
+    )
+    edit.compspec_prompt_closed(mut reg)
+    sp = edit.compspec_get(mut reg, "t5724")
+    assert(
+        reg.pool[sp].nodes[reg.pool[sp].nodes[0].subs[0]].name == "two",
+        "re-read after the prompt closed",
+    )
+    spec_fix_drop(f)
+}
+
+fn t_compspec_description_index_parses_nothing() {
+    let f = spec_fix_init()
+    var reg = edit.compspecs_new()
+    let before = edit.compspec_parse_count(reg)
+    let (h1, d1) = edit.compspec_describe(mut reg, "wolf")
+    assert(h1 && d1 == "the wolf toolchain", "wolf")
+    let (h2, _) = edit.compspec_describe(mut reg, "git")
+    assert(h2, "git")
+    // C compares the two answers with YEW_ASSERT_EQ_STR, NULL equal to
+    // NULL. Both ARE NULL at the pin: make.fl lists `command` before
+    // `description`, and the index scan stops at the command list's `]`
+    // (`compspec.c:1626-1632`: `scan_value` returns at depth 0 without
+    // consuming it), so make's description is never indexed — the port
+    // keeps C's scan, so the same pair.
+    let (h3, d3) = edit.compspec_describe(mut reg, "gmake")
+    let (h4, d4) = edit.compspec_describe(mut reg, "make")
+    assert(h3 == h4 && d3 == d4, "gmake is make's")
+    var i = 0
+    while i < 100 {
+        let _ = edit.compspec_describe(mut reg, "wolf")
+        let _ = edit.compspec_describe(mut reg, "no-such-s5724")
+        i += 1
+    }
+    assert(edit.compspec_parse_count(reg) == before, "no parse per keystroke")
+    assert(edit.compspec_get(mut reg, "gmake") >= 0, "gmake")
+    assert(edit.compspec_get(mut reg, "make") >= 0, "make")
+    assert(edit.compspec_parse_count(reg) == before + 1, "one parse")
+    spec_fix_drop(f)
+}
+
+fn t_compspec_precommand_feeds_the_lexer() {
+    let f = spec_fix_init()
+    var reg = edit.compspecs_new()
+    let (v1, w1) = edit.compspec_wrapper(mut reg, "sudo")
+    assert(v1 == 1, "sudo wraps")
+    assert(w1.consumes.len != 0, "sudo's flags")
+    assert(w1.skips_assign, "sudo skips assignments")
+    let (v2, w2) = edit.compspec_wrapper(mut reg, "timeout")
+    assert(v2 == 1 && w2.operands == 1, "timeout's one operand")
+    let (v3, _) = edit.compspec_wrapper(mut reg, "git")
+    assert(v3 == 0, "git un-wraps")
+    let (v4, _) = edit.compspec_wrapper(mut reg, "unbuffer")
+    assert(v4 == -1, "no spec defers to the table")
+    spec_fix_drop(f)
+}
+
+// ------------------------------------------------------------------
+// Where shipped specs may come from
+// ------------------------------------------------------------------
+
+struct RootFix {
+    f: SpecFix,
+    cwd: str,
+    prefix: str,
+    repo: str,
+}
+
+/// `root_fix_init` (`test_compspec.c:676-708`).
+fn root_fix_init(mut reg: edit.CompSpecs, with_repo_init: bool) -> RootFix {
+    let f = spec_fix_init()
+    env_unset("YEW_RUNTIME_DIR") else |_| {}
+    let cwd = os_cwd() else ""
+    let prefix = "{f.root}/prefix"
+    let repo = "{f.root}/repo"
+    fs.create_dir_all(prefix) else |_| { assert(false, "mkdir prefix") }
+    fs.create_dir_all("{repo}/runtime/completions") else |_| { assert(false, "mkdir repo") }
+    if with_repo_init {
+        fs.write_text("{repo}/runtime/init.fl", "# repo init\n") else |_| {}
+    }
+    fs.write_text(
+        "{repo}/runtime/completions/lsx5724.fl",
+        "# evil 1\n{{ completion: 1, command: \"lsx5724\",\n  generators: {{ g: {{ argv: [\"sh\", \"-c\", \"x\"] }} }},\n  args: [ {{ kind: \"generator\", generator: \"g\" }} ] }}\n",
+    ) else |_| {}
+    os_chdir(repo) else |_| { assert(false, "chdir repo") }
+    edit.compspec_test_set_default_root(mut reg, prefix)
+    RootFix { f: f, cwd: cwd, prefix: prefix, repo: repo }
+}
+
+fn root_fix_drop(mut reg: edit.CompSpecs, r: RootFix) {
+    os_chdir(r.cwd) else |_| { assert(false, "chdir back") }
+    edit.compspec_test_set_default_root(mut reg, "")
+    spec_fix_drop(r.f)
+}
+
+// The stale install: the prefix has init.fl but no completions/; the
+// cwd's runtime/completions is NOT loaded and the reinstall message says
+// so once. C's test build embeds nothing, so its `git` lookup answers
+// NULL here and its message "no command specs"; the port always embeds
+// the runtime (R-yw03-2), so its `git` is the built-in spec and its
+// message the "using built-in specs" branch C's own embedded build
+// takes (`compspec.c:1842-1846`) — asserted as the port's truth.
+fn t_compspec_stale_install_never_falls_back_to_cwd() {
+    var reg = edit.compspecs_new()
+    let r = root_fix_init(mut reg, true)
+    fs.write_text("{r.prefix}/init.fl", "# installed init\n") else |_| {}
+    edit.compspec_invalidate_all(mut reg)
+    let (kind, _) = edit.runtime_root_at(reg.test_prefix)
+    assert(kind == edit.RUNTIME_ROOT_PREFIX, "the prefix wins")
+    var ed = edit.ed_new()
+    ed.specs = reg
+    assert(edit.compspec_get(mut ed.specs, "lsx5724") < 0, "the cwd's spec is never loaded")
+    assert(edit.compspec_notice(mut ed), "the reinstall notice")
+    assert(edit.compspec_shipped_source(mut ed.specs) == "embedded", "only the embedded image")
+    assert(ed.msg.active, "said")
+    assert(ed.msg.text.contains(r.prefix), "names the prefix")
+    assert(ed.msg.text.contains("no completions/"), "no completions/")
+    assert(ed.msg.text.contains("reinstall"), "reinstall")
+    assert(ed.msg.text.contains("using built-in specs"), "the port embeds its specs")
+    edit.ed_msg_clear(mut ed)
+    assert(edit.compspec_get(mut ed.specs, "lsx5724") < 0, "still not loaded")
+    assert(
+        edit.compspec_get(mut ed.specs, "git") >= 0,
+        "the embedded git spec (C: NULL, no embedded image)",
+    )
+    assert(!edit.compspec_notice(mut ed), "said once")
+    assert(!ed.msg.active, "nothing more")
+    reg = ed.specs
+    fs.create_dir_all("{r.prefix}/completions") else |_| {}
+    fs.write_text(
+        "{r.prefix}/completions/pfx5724.fl",
+        "# t 1\n{{ completion: 1, command: \"pfx5724\" }}\n",
+    ) else |_| {}
+    edit.compspec_invalidate_all(mut reg)
+    assert(edit.compspec_get(mut reg, "pfx5724") >= 0, "the prefix's specs")
+    assert(edit.compspec_get(mut reg, "lsx5724") < 0, "never the cwd's")
+    root_fix_drop(mut reg, r)
+}
+
+fn t_compspec_uninstalled_build_uses_its_source_tree() {
+    var reg = edit.compspecs_new()
+    let r = root_fix_init(mut reg, true)
+    let (kind, _) = edit.runtime_root_at(reg.test_prefix)
+    assert(kind == edit.RUNTIME_ROOT_SOURCE, "the source tree")
+    assert(edit.compspec_get(mut reg, "lsx5724") >= 0, "its own specs")
+    assert(edit.compspec_shipped_source(mut reg) == "disk", "from disk")
+    root_fix_drop(mut reg, r)
+}
+
+fn t_compspec_runtime_dir_env_is_the_only_directory() {
+    var reg = edit.compspecs_new()
+    let r = root_fix_init(mut reg, false)
+    fs.write_text("{r.prefix}/init.fl", "# installed init\n") else |_| {}
+    fs.create_dir_all("{r.prefix}/completions") else |_| {}
+    fs.write_text(
+        "{r.prefix}/completions/pfx5724.fl",
+        "# t 1\n{{ completion: 1, command: \"pfx5724\" }}\n",
+    ) else |_| {}
+    let env = "{r.f.root}/envrt"
+    fs.create_dir_all("{env}/completions") else |_| {}
+    fs.write_text(
+        "{env}/completions/env5724.fl",
+        "# t 1\n{{ completion: 1, command: \"env5724\" }}\n",
+    ) else |_| {}
+    env_set("YEW_RUNTIME_DIR", env) else |_| {}
+    edit.compspec_invalidate_all(mut reg)
+    let (kind, _) = edit.runtime_root_at(reg.test_prefix)
+    assert(kind == edit.RUNTIME_ROOT_ENV, "the environment wins")
+    assert(edit.compspec_get(mut reg, "env5724") >= 0, "env's spec")
+    assert(edit.compspec_get(mut reg, "pfx5724") < 0, "not the prefix's")
+    assert(edit.compspec_get(mut reg, "lsx5724") < 0, "not the cwd's")
+    assert(edit.compspec_shipped_count(mut reg) == 1, "one shipped file")
+    env_unset("YEW_RUNTIME_DIR") else |_| {}
+    fs.remove("{r.prefix}/init.fl") else |_| {}
+    edit.compspec_invalidate_all(mut reg)
+    assert(edit.compspec_get(mut reg, "lsx5724") < 0, "a cwd without runtime/init.fl is no runtime")
+    root_fix_drop(mut reg, r)
+}
+
+fn skip(name: str, why: str) -> int {
+    print("compspec_test: SKIP {name}: {why}")
+    eprint("compspec_test: SKIP {name}: {why}")
+    1
+}
+
+fn main() {
+    fs.create_dir_all("target/tests") else |_| {}
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var skips = 0
+    t_compspec_every_shipped_file_validates()
+    t_compspec_rejects_unknown_keys_naming_key_and_path()
+    t_compspec_rejects_wrong_types()
+    t_compspec_rejects_a_bad_schema_version()
+    t_compspec_rejects_repeat_on_a_non_last_slot()
+    t_compspec_rejects_a_flag_with_no_spelling()
+    t_compspec_rejects_an_unresolved_generator()
+    t_compspec_rejects_duplicate_subcommand_names()
+    t_compspec_lookup_by_basename_and_alias()
+    t_compspec_user_file_replaces_shipped_whole()
+    t_compspec_broken_user_file_is_reported_once()
+    t_compspec_user_file_is_rechecked_once_per_prompt()
+    t_compspec_description_index_parses_nothing()
+    t_compspec_precommand_feeds_the_lexer()
+    skips += skip(
+        "compspec_resolution_corpus",
+        "the completion engine's shell describe (cmdcomp, the comp fork) is not merged yet",
+    )
+    skips += skip(
+        "compspec_command_rows_show_the_description",
+        "the completion engine's filter (cmdcomp, the comp fork) is not merged yet",
+    )
+    t_compspec_stale_install_never_falls_back_to_cwd()
+    t_compspec_uninstalled_build_uses_its_source_tree()
+    t_compspec_runtime_dir_env_is_the_only_directory()
+    print("compspec_test: {19 - skips} cases pass, {skips} SKIP")
+}
