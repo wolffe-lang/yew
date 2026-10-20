@@ -1,0 +1,514 @@
+//! edit.jumplist — navigation history: the walks over the jump list and
+//! the change list, the named marks' table, and their commands.
+//!
+//! Ports sagitta `src/edit/jumplist.c` (503 lines) and `jumplist.h` (112)
+//! at 9ace98c2, under `s21-search-replace.md` §5, with the named marks of
+//! §7 (`yew_ed_mark_set`/`_get`, `ed.c:1070-1101`). Two rings with one
+//! entry shape and opposite owners (`jumplist.h:4-22`): the jump list is
+//! the WINDOW's (`Win.jumps`), the change list the BUFFER's (its edit
+//! context's `changes`, recorded at the edit choke point by
+//! `text.jumpring`, which holds the ring and its push rules). Positions
+//! are marks, never offsets, so an edit above an entry carries it along.
+//!
+//! A walk moves the ring it walks into the editor's `jump_walk` slot and
+//! back (a swap through a local, the seam's shape, no allocation), so it
+//! can read every buffer while it edits the ring. C's `Buffer.named[26]`
+//! is one row per set mark in the editor's `named_marks`, keyed by buffer
+//! id; the mark itself lives in the buffer's mark set, as C's. The
+//! serializer is Sprint 25's (yw06) and nobody calls it; nothing here
+//! opens a file (DoD 11).
+
+use text
+
+/// A named mark (C's `Buffer.named[slot]` with `named_set[slot]`).
+pub struct NamedMark {
+    buf_id: int,
+    name: int,
+    mark: text.MarkId,
+}
+
+/// Record `from` in window `w`'s jump list before a jump moves away from
+/// it (`yew_jump_push`, `jumplist.c:138-144`); the clock is handed in.
+pub fn jump_push(mut ed: Ed, w: int, from: int, now_ms: int) {
+    if w < 0 || w >= ed.wins.len {
+        return
+    }
+    let b = ed.wins[w].buf
+    if b < 0 || b >= ed.bufs.len {
+        return
+    }
+    text.ring_push(
+        mut ed.wins[w].jumps,
+        text.JUMPLIST_MAX,
+        mut ed.bufs[b].ec.marks,
+        ed.bufs[b].ec.tb,
+        ed.bufs[b].id,
+        from,
+        now_ms,
+    )
+}
+
+// `entry_live` (`jumplist.c:146-160`): the buffer index and the position
+// of a live entry, or -1.
+fn entry_live(bufs: List[Buffer], je: text.JumpEntry) -> (int, int) {
+    var i = 0
+    while i < bufs.len {
+        if bufs[i].id == je.buf_id {
+            if !text.mark_alive(bufs[i].ec.marks, je.mark) {
+                return (-1, 0)
+            }
+            return (i, text.mark_pos(bufs[i].ec.marks, je.mark) as int)
+        }
+        i += 1
+    }
+    (-1, 0)
+}
+
+// Rule 5 (`ring_compact`, `jumplist.c:162-200`): dead entries are
+// dropped, the survivors rebuilt contiguously from slot 0 and `cur` moved
+// down by the dead ones behind it.
+fn ring_compact(mut r: text.JumpList, cap: int, bufs: List[Buffer]) {
+    var nkept = 0
+    var dead_behind = 0
+    let at_now = r.cur >= r.len
+    var i = 0
+    while i < r.len {
+        let (bi, _) = entry_live(bufs, r.e[text.ring_slot(r.head, r.len, cap, i)])
+        if bi >= 0 {
+            nkept += 1
+        } else if i < r.cur {
+            dead_behind += 1
+        }
+        i += 1
+    }
+    if nkept == r.len {
+        return
+    }
+    var kept = List[text.JumpEntry]()
+    i = 0
+    while i < r.len {
+        let slot = text.ring_slot(r.head, r.len, cap, i)
+        let (bi, _) = entry_live(bufs, r.e[slot])
+        if bi >= 0 {
+            (mut kept).push(copy r.e[slot])
+        }
+        i += 1
+    }
+    i = 0
+    while i < r.e.len {
+        r.e[i] = if i < kept.len then copy kept[i] else text.jump_entry_zero()
+        i += 1
+    }
+    r.head = nkept % cap
+    r.len = nkept
+    r.cur = if at_now then nkept else if r.cur >= dead_behind then r.cur - dead_behind else 0
+    if r.cur > nkept {
+        r.cur = nkept
+    }
+}
+
+const WALK_JUMPS: int = 0
+
+const WALK_CHANGES: int = 1
+
+// Move the ring `which` names into `ed.jump_walk`, or back: one swap.
+fn walk_swap(mut ed: Ed, w: int, which: int) {
+    if which == WALK_JUMPS {
+        let t = ed.wins[w].jumps
+        ed.wins[w].jumps = ed.jump_walk
+        ed.jump_walk = t
+    } else {
+        let b = ed.wins[w].buf
+        let t = ed.bufs[b].ec.changes.ring
+        ed.bufs[b].ec.changes.ring = ed.jump_walk
+        ed.jump_walk = t
+    }
+}
+
+// `walk` (`jumplist.c:202-266`), over the ring in `ed.jump_walk`.
+fn walk_ring(mut ed: Ed, w: int, cap: int, older: bool, count: int, empty_msg: str) -> bool {
+    ring_compact(mut ed.jump_walk, cap, ed.bufs)
+    if ed.jump_walk.len == 0 {
+        ed_msg(mut ed, MSG_INFO, empty_msg)
+        return false
+    }
+    if older && ed.jump_walk.cur >= ed.jump_walk.len {
+        // Rule 3: the first step back records where we are standing, so
+        // forward can bring us home; we are standing ON it.
+        let b = ed.wins[w].buf
+        let here = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+        text.ring_push(
+            mut ed.jump_walk,
+            cap,
+            mut ed.bufs[b].ec.marks,
+            ed.bufs[b].ec.tb,
+            ed.bufs[b].id,
+            here,
+            0,
+        )
+        ed.jump_walk.cur = ed.jump_walk.len - 1
+    }
+    var moved = 0
+    while moved < count {
+        if older {
+            if ed.jump_walk.cur == 0 {
+                break
+            }
+            ed.jump_walk.cur -= 1
+        } else {
+            if ed.jump_walk.cur + 1 >= ed.jump_walk.len {
+                break
+            }
+            ed.jump_walk.cur += 1
+        }
+        moved += 1
+    }
+    if moved == 0 {
+        ed_msg(mut ed, MSG_INFO, empty_msg)
+        return false
+    }
+    let slot = text.ring_slot(ed.jump_walk.head, ed.jump_walk.len, cap, ed.jump_walk.cur)
+    let (bi, pos) = entry_live(ed.bufs, ed.jump_walk.e[slot])
+    if bi < 0 {
+        ed_msg(mut ed, MSG_INFO, empty_msg)
+        return false
+    }
+    if bi != ed.wins[w].buf {
+        ed_show_buffer(mut ed, bi)
+    }
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p].pos = pos
+    // A jump is an absolute move: the remembered column is stale.
+    ed.wins[w].cs.curs[p].goal_col = 0
+    let b = ed.wins[w].buf
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+    ed_damage_document(mut ed)
+    true
+}
+
+fn walk(mut ed: Ed, w: int, which: int, older: bool, count_in: int, empty_msg: str) -> bool {
+    if w < 0 || w >= ed.wins.len || ed.wins[w].buf < 0 {
+        return false
+    }
+    let count = if count_in == 0 then 1 else count_in
+    let cap = if which == WALK_JUMPS then text.JUMPLIST_MAX else text.CHANGELIST_MAX
+    walk_swap(mut ed, w, which)
+    let ok = walk_ring(mut ed, w, cap, older, count, empty_msg)
+    walk_swap(mut ed, w, which)
+    ok
+}
+
+/// `yew_jump_back` (`jumplist.c:268-275`).
+pub fn jump_back(mut ed: Ed, w: int, count: int) -> bool {
+    walk(mut ed, w, WALK_JUMPS, true, count, "no older jump position")
+}
+
+/// `yew_jump_fwd` (`jumplist.c:277-284`).
+pub fn jump_fwd(mut ed: Ed, w: int, count: int) -> bool {
+    walk(mut ed, w, WALK_JUMPS, false, count, "no newer jump position")
+}
+
+/// `yew_change_record` into buffer index `b` (`jumplist.c:286-322`): the
+/// edit choke point calls `text.change_record` itself; this is the
+/// tests' and the recorder's door.
+pub fn change_record(mut ed: Ed, b: int, at: int, now_ms: int) {
+    if b < 0 || b >= ed.bufs.len {
+        return
+    }
+    text.change_record(mut ed.bufs[b].ec, at, now_ms)
+}
+
+/// `yew_change_older` (`jumplist.c:324-332`).
+pub fn change_older(mut ed: Ed, w: int, count: int) -> bool {
+    walk(mut ed, w, WALK_CHANGES, true, count, "no older change position")
+}
+
+/// `yew_change_newer` (`jumplist.c:334-342`).
+pub fn change_newer(mut ed: Ed, w: int, count: int) -> bool {
+    walk(mut ed, w, WALK_CHANGES, false, count, "no newer change position")
+}
+
+fn push_dec(mut out: List[byte], v: int) {
+    if v >= 10 {
+        push_dec(mut out, v / 10)
+    }
+    (mut out).push((48 + v % 10) as byte)
+}
+
+fn push_text(mut out: List[byte], s: str) {
+    for x in s.bytes() {
+        (mut out).push(x)
+    }
+}
+
+/// Sprint 25's schema, landed and uncalled (`yew_jumplist_serialize`,
+/// `jumplist.c:344-385`): `jumplist 1` then one `path\tline\tcol\tstamp`
+/// record per entry, marks resolved to line and column.
+pub fn jumplist_serialize(jl: text.JumpList, ed: Ed) -> List[byte] {
+    var out = List[byte]()
+    push_text(mut out, "jumplist 1\n")
+    var i = 0
+    while i < jl.len {
+        let je = copy jl.e[text.ring_slot(jl.head, jl.len, text.JUMPLIST_MAX, i)]
+        let bi = ed_buf_index(ed, je.buf_id)
+        var line = je.line_hint
+        var col = 0
+        if bi >= 0 && text.mark_alive(ed.bufs[bi].ec.marks, je.mark) {
+            let pos = text.mark_pos(ed.bufs[bi].ec.marks, je.mark)
+            line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos) as int
+            let ls = text.textbuf_line_start(ed.bufs[bi].ec.tb, line as text.LineNo) as int
+            col = pos as int - ls
+        }
+        if bi >= 0 && ed.bufs[bi].has_path {
+            push_text(mut out, ed.bufs[bi].path)
+        }
+        (mut out).push(9 as byte)
+        push_dec(mut out, line)
+        (mut out).push(9 as byte)
+        push_dec(mut out, col)
+        (mut out).push(9 as byte)
+        push_dec(mut out, je.stamp_ms)
+        (mut out).push(10 as byte)
+        i += 1
+    }
+    out
+}
+
+/// `yew_jumplist_deserialize` (`jumplist.c:387-438`): the list a blob
+/// holds, or false for a foreign blob (the list then empty). Marks do not
+/// survive a process: an entry carries its line hint and stamp only.
+pub fn jumplist_deserialize(bytes: List[byte]) -> (bool, text.JumpList) {
+    var jl = text.jumplist_new()
+    let magic = "jumplist 1\n"
+    if bytes.len < 11 {
+        return (false, jl)
+    }
+    var k = 0
+    while k < 11 {
+        if bytes[k] != magic.bytes()[k] {
+            return (false, jl)
+        }
+        k += 1
+    }
+    var at = 11
+    var count = 0
+    while at < bytes.len && count < text.JUMPLIST_MAX {
+        var eol = at
+        while eol < bytes.len && bytes[eol] != 10 as byte {
+            eol += 1
+        }
+        var field = at
+        while field < eol && bytes[field] != 9 as byte {
+            field += 1
+        }
+        var n = 0
+        var line = 0
+        var stamp = 0
+        while field < eol && n < 3 {
+            var v = 0
+            field += 1
+            while field < eol && bytes[field] >= 48 as byte && bytes[field] <= 57 as byte {
+                v = v * 10 + (bytes[field] as int - 48)
+                field += 1
+            }
+            if n == 0 {
+                line = v
+            } else if n == 2 {
+                stamp = v
+            }
+            n += 1
+        }
+        if n == 3 {
+            var je = text.jump_entry_zero()
+            je.line_hint = line
+            je.stamp_ms = stamp
+            text.ring_put(mut jl, jl.head, je)
+            jl.head = (jl.head + 1) % text.JUMPLIST_MAX
+            jl.len += 1
+            count += 1
+        }
+        at = if eol < bytes.len then eol + 1 else bytes.len
+    }
+    jl.cur = jl.len
+    (true, jl)
+}
+
+// ---- named marks (`ed.c:1070-1101`) -----------------------------------
+
+fn named_index(ed: Ed, buf_id: int, name: int) -> int {
+    var i = 0
+    while i < ed.named_marks.len {
+        if ed.named_marks[i].buf_id == buf_id && ed.named_marks[i].name == name {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_ed_mark_set` (`ed.c:1070-1085`): mark `name` (a-z) of buffer `b`
+/// at `at`, replacing the old one; false for any other name.
+pub fn ed_mark_set(mut ed: Ed, b: int, name: int, at: int) -> bool {
+    if b < 0 || b >= ed.bufs.len || name < 97 || name > 122 {
+        return false
+    }
+    let id = ed.bufs[b].id
+    let i = named_index(ed, id, name)
+    let m = text.mark_add(mut ed.bufs[b].ec.marks, at as text.ByteOff, text.BIAS_LEFT)
+    if i >= 0 {
+        let old = copy ed.named_marks[i].mark
+        if text.mark_alive(ed.bufs[b].ec.marks, old) {
+            text.mark_del(mut ed.bufs[b].ec.marks, old)
+        }
+        ed.named_marks[i].mark = m
+    } else {
+        (mut ed.named_marks).push(NamedMark { buf_id: id, name: name, mark: m })
+    }
+    true
+}
+
+/// `yew_ed_mark_get` (`ed.c:1087-1101`): where mark `name` of buffer `b`
+/// is, or the `none` row when it is unset or dead.
+pub fn ed_mark_get(ed: Ed, b: int, name: int) -> int ! {none} {
+    if b < 0 || b >= ed.bufs.len || name < 97 || name > 122 {
+        return none
+    }
+    let i = named_index(ed, ed.bufs[b].id, name)
+    if i < 0 || !text.mark_alive(ed.bufs[b].ec.marks, ed.named_marks[i].mark) {
+        return none
+    }
+    text.mark_pos(ed.bufs[b].ec.marks, ed.named_marks[i].mark) as int
+}
+
+// ---- commands ---------------------------------------------------------
+
+// `jump_count` (`jumplist.c:444-447`).
+fn jump_count(cx: CmdCtx) -> int {
+    if cx.count_given && cx.count != 0 then cx.count else 1
+}
+
+fn cmd_win(ed: Ed, cx: CmdCtx) -> int {
+    if cx.win >= 0 then cx.win else ed.win
+}
+
+/// `ed.jump.back` (`yew_jump_cmd_back`): a walk with nowhere to go has
+/// already said so.
+pub fn jump_cmd_back(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = jump_back(mut ed, cmd_win(ed, cx), jump_count(cx))
+    CMD_OK
+}
+
+/// `ed.jump.fwd` (`yew_jump_cmd_fwd`).
+pub fn jump_cmd_fwd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = jump_fwd(mut ed, cmd_win(ed, cx), jump_count(cx))
+    CMD_OK
+}
+
+/// `ed.change.older` (`yew_change_cmd_older`).
+pub fn change_cmd_older(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = change_older(mut ed, cmd_win(ed, cx), jump_count(cx))
+    CMD_OK
+}
+
+/// `ed.change.newer` (`yew_change_cmd_newer`).
+pub fn change_cmd_newer(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = change_newer(mut ed, cmd_win(ed, cx), jump_count(cx))
+    CMD_OK
+}
+
+/// `yew_buf_label` (`ed.c:333-340`): its name, else its path, else
+/// "[No Name]".
+pub fn buf_label(b: Buffer) -> str {
+    if b.has_name {
+        return b.name
+    }
+    if b.has_path then b.path else "[No Name]"
+}
+
+fn pad3(n: int) -> str {
+    if n < 10 {
+        return "  {n}"
+    }
+    if n < 100 {
+        return " {n}"
+    }
+    "{n}"
+}
+
+/// `ed.jump.list` (`yew_jump_cmd_list`, `jumplist.c:478-503`): newest
+/// first, into the message line.
+pub fn jump_cmd_list(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = cmd_win(ed, cx)
+    if w < 0 {
+        return CMD_ERR_STATE
+    }
+    let n = ed.wins[w].jumps.len
+    if n == 0 {
+        ed_msg(mut ed, MSG_INFO, "jumplist is empty")
+        return CMD_OK
+    }
+    var out = ""
+    var i = n
+    while i > 0 {
+        let je = text.jumplist_at(ed.wins[w].jumps, i - 1) else text.jump_entry_zero()
+        let bi = ed_buf_index(ed, je.buf_id)
+        var line = je.line_hint
+        if bi >= 0 && text.mark_alive(ed.bufs[bi].ec.marks, je.mark) {
+            line = text.textbuf_line_of(
+                ed.bufs[bi].ec.tb,
+                text.mark_pos(ed.bufs[bi].ec.marks, je.mark),
+            ) as int
+        }
+        let label = if bi >= 0 then buf_label(ed.bufs[bi]) else "(closed)"
+        let sep = if i == n then "" else "\n"
+        out = "{out}{sep}{pad3(n - i)}  {label}:{line + 1}"
+        i -= 1
+    }
+    ed_msg(mut ed, MSG_INFO, out)
+    CMD_OK
+}
+
+// ---- the mark commands (`search_cmds.c:461-506`) ----------------------
+
+// The name comes from the captured key (`ma`) or the argument (`:mark
+// a`): one byte (`mark_name_arg`, `search_cmds.c:465-470`).
+fn mark_name_arg(cx: CmdCtx) -> int {
+    if cx.has_sarg && cx.sarg.len == 1 {
+        return cx.sarg.bytes()[0] as int
+    }
+    0
+}
+
+/// `ed.mark.set` (`yew_mark_cmd_set`, `search_cmds.c:472-489`).
+pub fn mark_cmd_set(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = cmd_win(ed, cx)
+    if w < 0 || ed.wins[w].buf < 0 {
+        return CMD_ERR_STATE
+    }
+    let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    if !ed_mark_set(mut ed, ed.wins[w].buf, mark_name_arg(cx), pos) {
+        ed_msg(mut ed, MSG_ERROR, "mark names are a single letter a-z")
+        return CMD_ERR_ARG
+    }
+    CMD_OK
+}
+
+/// `ed.mark.jump` (`yew_mark_cmd_jump`, `search_cmds.c:491-506`): a mark
+/// jump does NOT push the jump list (§5's push table).
+pub fn mark_cmd_jump(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = cmd_win(ed, cx)
+    if w < 0 || ed.wins[w].buf < 0 {
+        return CMD_ERR_STATE
+    }
+    let b = ed.wins[w].buf
+    let at = ed_mark_get(ed, b, mark_name_arg(cx)) else |_| {
+        ed_msg(mut ed, MSG_ERROR, "mark not set")
+        return CMD_ERR_STATE
+    }
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p].pos = at
+    ed.wins[w].cs.curs[p].goal_col = 0
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+    ed_damage_document(mut ed)
+    CMD_OK
+}
