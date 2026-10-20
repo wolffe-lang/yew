@@ -1,0 +1,220 @@
+//! perf-cmdcomp — sagitta's `perf_cmdcomp` (`tests/perf/perf_cmdcomp.c`,
+//! 928 lines at 9ace98c2), the port's half: the per-KEYSTROKE completion
+//! cost of typing `file.open entry000` at `:` over a 10,000-entry
+//! directory (`entry00000`..`entry09999`), PERF_COMP_PREFIX's three
+//! regimes — the command name, the space that switches to the path
+//! source and pays the cold directory read, the digits that narrow it.
+//!
+//! What a key costs here: the completion query at the caret, the live
+//! filter at the prompt's budget (`CMDLINE_LIVE_BUDGET_US`, 1.5 ms), the
+//! ranked set installed in a `Menu`, and the menu drawn into a 24 x 100
+//! grid with its regions — the engine and the widget, which is what this
+//! lane's comp work ports. C times `yew_cmdline_key` + `yew_cmdline_draw`
+//! (`perf_cmdcomp.c:247-304`), which ALSO insert the byte into the
+//! prompt's buffer, run the tolerant parse and draw the prompt line; the
+//! harness stands in for the parse with the split a typed `file.open X`
+//! needs (word 0 a command, word 1 its `f` argument) until the full
+//! prompt is in the tree, and says so beside every ratio.
+//!
+//! The clock is milliseconds (G8), so per-key costs are DITHERED MEANS:
+//! each key is timed with two `time_now_ms` reads in every one of
+//! `--trials` trials (default 400) and the readings summed — each
+//! reading is off by under one tick with a phase that does not follow
+//! the work, so the mean converges on the cost. Each trial starts cold
+//! (the listing and the filter retired), as C's fresh `Ed` per trial
+//! does; three warm-up trials first (`PERF_COMP_WARMUPS`).
+//!
+//!   perf-cmdcomp ROOT [--trials N]
+//!
+//! ROOT holds the fixture (`tools/run-perf-cmdcomp` makes it). Output:
+//!
+//!   perf-cmdcomp-port: entries=N keys=18 trials=T mean_key_ms=X
+//!     slowest_key=I('c') slowest_mean_ms=Y opendirs=1 rows=R
+//!   perf-cmdcomp-port: per_key_mean_ms=a,b,...
+
+use edit
+use term
+
+const PREFIX: str = "file.open entry000"
+
+fn now() -> int {
+    time_now_ms()
+}
+
+// The stand-in for the tolerant parse (module header): the query for
+// `line` with the caret at its end.
+fn query_of(ed: edit.Ed, line: List[byte]) -> (bool, edit.CompQuery) {
+    var sp = -1
+    var i = 0
+    while i < line.len {
+        if line[i] as int == 32 {
+            sp = i
+            break
+        }
+        i += 1
+    }
+    if sp < 0 {
+        return edit.comp_query_point(
+            ed,
+            false,
+            0,
+            false,
+            0,
+            line,
+            0,
+            line.len,
+            false,
+            line,
+            line.len,
+        )
+    }
+    var name = List[byte]()
+    for b in "ed.".bytes() {
+        (mut name).push(b)
+    }
+    var k = 0
+    while k < sp {
+        (mut name).push(line[k])
+        k += 1
+    }
+    let cmd = str_from_utf8(name) else ""
+    let id = edit.cmd_lookup(ed.reg, cmd)
+    var stem = List[byte]()
+    k = sp + 1
+    while k < line.len {
+        (mut stem).push(line[k])
+        k += 1
+    }
+    edit.comp_query_point(ed, false, 1, id != 0, id, stem, sp + 1, line.len, false, line, line.len)
+}
+
+// One key: the line grown by `c`, then query, filter, menu, draw.
+fn key_step(
+    mut ed: edit.Ed,
+    mut f: edit.CompFilter,
+    mut menu: edit.Menu,
+    mut line: List[byte],
+    c: byte,
+    style: edit.UiStyle,
+) {
+    (mut line).push(c)
+    let (ok, q) = query_of(ed, line)
+    // The live path completes no EMPTY token (`cmdline_refilter_as`,
+    // `cmdline.c:893-967`): the space that ends `file.open` opens nothing.
+    if ok && q.replace.hi > q.replace.lo {
+        var out = List[edit.CompItem]()
+        let total = edit.comp_filter_run(mut ed, mut f, q, edit.CMDLINE_LIVE_BUDGET_US, mut out)
+        if out.len == 0 {
+            edit.menu_dismiss(mut menu)
+        } else {
+            menu.items = out
+            edit.menu_reset(mut menu, total, copy q.replace)
+        }
+    } else {
+        edit.menu_dismiss(mut menu)
+    }
+    edit.region_frame_begin(mut ed.regions)
+    edit.menu_draw(mut ed.grid, mut ed.regions, mut menu, edit.rect(0, 0, 100, 23), style)
+}
+
+fn trial(mut ed: edit.Ed, mut sums: List[int], style: edit.UiStyle) -> (int, int) {
+    edit.comp_listing_invalidate(mut ed)
+    var f = edit.compfilter_new()
+    var menu = edit.menu_new(edit.menuspec_default())
+    var line = List[byte]()
+    let before = edit.comp_listing_opendirs(ed)
+    var i = 0
+    while i < PREFIX.len {
+        let t0 = now()
+        key_step(mut ed, mut f, mut menu, mut line, PREFIX.bytes()[i], style)
+        let t1 = now()
+        sums[i] = sums[i] + (t1 - t0)
+        i += 1
+    }
+    (edit.comp_listing_opendirs(ed) - before, menu.items.len)
+}
+
+fn ms3(sum: int, n: int) -> str {
+    // sum ms over n readings, to 3 places, without floats.
+    let micro = sum * 1000 / n
+    let whole = micro / 1000
+    let frac = micro % 1000
+    if frac < 10 {
+        return "{whole}.00{frac}"
+    }
+    if frac < 100 {
+        return "{whole}.0{frac}"
+    }
+    "{whole}.{frac}"
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len < 1 {
+        eprint("usage: perf-cmdcomp ROOT [--trials N]")
+        return 2
+    }
+    let root = args[0]
+    var trials = 400
+    if args.len >= 3 && args[1] == "--trials" {
+        trials = args[2].to_int() else 400
+    }
+    var ed = edit.ed_new()
+    ed.ws_dir = root
+    ed.grid = term.grid_new(24, 100)
+    ed.grid_ready = true
+    let style = edit.message_style(ed)
+    var sums = List[int]()
+    var i = 0
+    while i < PREFIX.len {
+        (mut sums).push(0)
+        i += 1
+    }
+    var warm = List[int]()
+    i = 0
+    while i < PREFIX.len {
+        (mut warm).push(0)
+        i += 1
+    }
+    var w = 0
+    while w < 3 {
+        let _ = trial(mut ed, mut warm, style)
+        w += 1
+    }
+    var worst_opendirs = 0
+    var rows = 0
+    var t = 0
+    while t < trials {
+        let (opendirs, n) = trial(mut ed, mut sums, style)
+        if opendirs > worst_opendirs {
+            worst_opendirs = opendirs
+        }
+        rows = n
+        t += 1
+    }
+    if rows == 0 {
+        eprint("perf-cmdcomp: menu was empty")
+        return 2
+    }
+    var total = 0
+    var slow = 0
+    i = 0
+    while i < sums.len {
+        total += sums[i]
+        if sums[i] > sums[slow] {
+            slow = i
+        }
+        i += 1
+    }
+    var per = ""
+    i = 0
+    while i < sums.len {
+        per += if i == 0 then ms3(sums[i], trials) else ",{ms3(sums[i], trials)}"
+        i += 1
+    }
+    print(
+        "perf-cmdcomp-port: entries=10000 keys={PREFIX.len} trials={trials} mean_key_ms={ms3(total, trials * PREFIX.len)} slowest_key={slow}('{PREFIX[slow..slow + 1]}') slowest_mean_ms={ms3(sums[slow], trials)} opendirs={worst_opendirs} rows={rows}",
+    )
+    print("perf-cmdcomp-port: per_key_mean_ms={per}")
+    0
+}
