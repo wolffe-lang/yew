@@ -467,7 +467,10 @@ buy and the one the port does not claim.
   fixed (`055de26`, `5c1beaa`, `02806d4`, `9e3e62e`); run 39393219720 at
   `a8f9236` green on linux in both jobs (the driver over the port's
   child, the replica three ways, `osc52_frame`, the text fuzz at two
-  seeds). The final run is the PR's.
+  seeds), and on macOS too: there the driver interposes the fault shim
+  with `DYLD_INSERT_LIBRARIES` over the wolf binary and answers exactly
+  the linux lines (the step ran recorded in that run and is gated from
+  `789db88`'s successor on). The final run is the PR's.
 - The plants (RULES §7, draft PRs closed unmerged, each on `a8f9236`):
   yew#8 (`da7eafb`, the journal record never written) seen red in run
   39393453647, oracle linux, "sagitta's kill9 driver over the port's
