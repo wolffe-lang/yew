@@ -1,0 +1,423 @@
+//! edit.search_cmds — the `:s` surface, the confirm run, the `:g`
+//! refusal, and the search commands.
+//!
+//! Ports sagitta `src/edit/search_cmds.c` (506 lines) and
+//! `search_cmds.h` (45) at 9ace98c2, under `s21-search-replace.md` §4.
+//! Sprint 18's grammar hands the substitution body over as ONE opaque
+//! string (`cmdparse`'s `ed.search.replace` body); splitting it on its
+//! delimiter is this file's job (`search_cmds.c:1-8`). The mark commands
+//! of §7 are `edit.jumplist`'s.
+//!
+//! The port's shape. C moves the plan into `Ed.confirm` (`SearchConfirm`,
+//! `search_cmds.h:27-36`); the port's `SearchConfirm` owns the plan and
+//! its walk, and the prompt text it repeats.
+
+use search
+use text
+
+/// A running confirm (`SearchConfirm`, `search_cmds.h:27-36`).
+pub struct SearchConfirm {
+    active: bool,
+    plan: search.ReplPlan,
+    walk: search.ReplConfirm,
+    shown: List[byte],
+}
+
+/// No confirm run.
+pub fn search_confirm_new() -> SearchConfirm {
+    SearchConfirm {
+        active: false,
+        plan: search.repl_plan_new(),
+        walk: search.ReplConfirm { at: 0, done: true },
+        shown: List[byte](),
+    }
+}
+
+// `ScmdSubParts` (`search_cmds.c:20-26`): the pattern, the replacement and
+// the flags, as byte ranges of the body.
+struct ScmdSubParts {
+    pat_lo: int,
+    pat_hi: int,
+    rep_lo: int,
+    rep_hi: int,
+    flags: int,
+}
+
+// `delim_ok` (`search_cmds.c:28-41`): punctuation, never a letter, a
+// digit or a backslash.
+fn scmd_delim_ok(c: int) -> bool {
+    if c == 92 || c == 0 {
+        return false
+    }
+    if c >= 48 && c <= 57 {
+        return false
+    }
+    if c >= 97 && c <= 122 || c >= 65 && c <= 90 {
+        return false
+    }
+    c > 32 && c < 127
+}
+
+// `scan_field` (`search_cmds.c:43-58`): the next unescaped delimiter,
+// escapes left in place for the regex and template parsers.
+fn scmd_scan_field(s: List[byte], at_in: int, delim: int) -> int {
+    var at = at_in
+    while at < s.len {
+        if s[at] as int == 92 && at + 1 < s.len {
+            at += 2
+            continue
+        }
+        if s[at] as int == delim {
+            return at
+        }
+        at += 1
+    }
+    s.len
+}
+
+// `parse_flags` (`search_cmds.c:60-87`): answers (ok, flags, error).
+fn scmd_parse_flags(s: List[byte], lo: int, flags_in: int) -> (bool, int, str) {
+    var flags = flags_in
+    var i = lo
+    while i < s.len {
+        let c = s[i] as int
+        if c == 103 {
+            flags = flags | search.SUB_GLOBAL
+        } else if c == 99 {
+            flags = flags | search.SUB_CONFIRM
+        } else if c == 110 {
+            flags = flags | search.SUB_COUNT_ONLY
+        } else if c == 105 {
+            flags = flags | search.SUB_ICASE
+        } else if c == 73 {
+            flags = flags | search.SUB_CASE
+        } else if c == 112 {
+            flags = flags | search.SUB_PRESERVE
+        } else if c == 101 {
+            flags = flags | search.SUB_QUIET
+        } else if c != 32 && c != 9 {
+            return (false, flags, "unknown :s flag")
+        }
+        i += 1
+    }
+    if flags & search.SUB_ICASE != 0 && flags & search.SUB_CASE != 0 {
+        return (false, flags, ":s flags i and I contradict each other")
+    }
+    (true, flags, "")
+}
+
+// `parse_sub` (`search_cmds.c:89-121`): answers (ok, parts, error).
+fn scmd_parse_sub(body: List[byte]) -> (bool, ScmdSubParts, str) {
+    var out = ScmdSubParts { pat_lo: 0, pat_hi: 0, rep_lo: 0, rep_hi: 0, flags: 0 }
+    let len = body.len
+    if len == 0 {
+        return (false, out, "usage: :s/pattern/replacement/flags")
+    }
+    let delim = body[0] as int
+    if !scmd_delim_ok(delim) {
+        return (false, out, ":s delimiter must be punctuation, not a letter, digit or backslash")
+    }
+    let p_end = scmd_scan_field(body, 1, delim)
+    out.pat_lo = 1
+    out.pat_hi = p_end
+    if p_end >= len {
+        // `:s/pat`: no replacement given, which means delete it.
+        out.rep_lo = len
+        out.rep_hi = len
+        return (true, out, "")
+    }
+    let r_end = scmd_scan_field(body, p_end + 1, delim)
+    out.rep_lo = p_end + 1
+    out.rep_hi = r_end
+    if r_end >= len {
+        return (true, out, "")
+    }
+    let (ok, flags, err) = scmd_parse_flags(body, r_end + 1, 0)
+    out.flags = flags
+    (ok, out, err)
+}
+
+fn scmd_slice(s: List[byte], lo: int, hi: int) -> List[byte] {
+    var out = List[byte]()
+    var i = lo
+    while i < hi {
+        (mut out).push(s[i])
+        i += 1
+    }
+    out
+}
+
+// `sub_range` (`search_cmds.c:123-150`): the range, defaulting to the
+// cursor's line. Answers (ok, lo, hi).
+fn scmd_sub_range(ed: Ed, w: int, cx: CmdCtx) -> (bool, int, int) {
+    let b = ed.wins[w].buf
+    let nlines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    if nlines == 0 {
+        return (false, 0, 0)
+    }
+    if cx.range.kind == RANGE_BUFFER {
+        return (true, 0, nlines - 1)
+    }
+    if cx.range.kind == RANGE_LINES {
+        return (true, cx.range.lo, cx.range.hi)
+    }
+    let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    (true, line, line)
+}
+
+fn scmd_shown(bytes: List[byte]) -> str {
+    str_from_utf8(bytes) else "<bytes>"
+}
+
+fn scmd_sc_win(ed: Ed, cx: CmdCtx) -> int {
+    if cx.win >= 0 then cx.win else ed.win
+}
+
+/// `:s` (`yew_search_cmd_replace`, `search_cmds.c:152-293`).
+pub fn search_cmd_replace(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = scmd_sc_win(ed, cx)
+    if w < 0 || ed.wins[w].buf < 0 {
+        return CMD_ERR_STATE
+    }
+    var body = List[byte]()
+    if cx.has_sarg {
+        for x in cx.sarg.bytes() {
+            (mut body).push(x)
+        }
+    }
+    let (pok, parts, perr) = scmd_parse_sub(body)
+    if !pok {
+        ed_msg(mut ed, MSG_ERROR, perr)
+        return CMD_ERR_ARG
+    }
+    let (rok, lo, hi) = scmd_sub_range(ed, w, cx)
+    if !rok {
+        return CMD_ERR_STATE
+    }
+    var opts = copy ed.search_opts
+    if parts.flags & search.SUB_ICASE != 0 {
+        opts.ignorecase = true
+        opts.smartcase = false
+    } else if parts.flags & search.SUB_CASE != 0 {
+        opts.ignorecase = false
+    }
+    // An empty pattern reuses the last search (`:s//new/`).
+    var pat = scmd_slice(body, parts.pat_lo, parts.pat_hi)
+    if pat.len == 0 {
+        let slash = text.reg_get(mut ed.regs, 47) else |_| {
+            ed_msg(mut ed, MSG_ERROR, "no previous search pattern")
+            return CMD_ERR_STATE
+        }
+        if slash.bytes.len == 0 {
+            ed_msg(mut ed, MSG_ERROR, "no previous search pattern")
+            return CMD_ERR_STATE
+        }
+        pat = copy slash.bytes
+    }
+    var rerr = search.re_err_new()
+    let re = search_compile(pat, opts, mut rerr) else |_| {
+        let m = if rerr.msg.len != 0 then rerr.msg else "bad pattern"
+        ed_msg(mut ed, MSG_ERROR, "{m} (at {rerr.off})")
+        return CMD_ERR_ARG
+    }
+    // Reject a bad template before touching the buffer.
+    let rep = scmd_slice(body, parts.rep_lo, parts.rep_hi)
+    let terr = search.repl_check(rep, search.re_group_count(re))
+    if !terr.ok {
+        let m = if terr.msg.len != 0 then terr.msg else "bad replacement"
+        ed_msg(mut ed, MSG_ERROR, "{m} (at {terr.off})")
+        return CMD_ERR_ARG
+    }
+    let b = ed.wins[w].buf
+    let (bok, plan, berr) = search.repl_plan_build(re, ed.bufs[b].ec.tb, lo, hi, rep, parts.flags)
+    if !bok {
+        ed_msg(mut ed, MSG_ERROR, if berr.msg.len != 0 then berr.msg else "replacement failed")
+        return CMD_ERR_ARG
+    }
+    if plan.v.len == 0 {
+        // `e` lets a script run a substitution that may not apply.
+        if parts.flags & search.SUB_QUIET == 0 {
+            ed_msg(mut ed, MSG_ERROR, "pattern not found: {scmd_shown(pat)}")
+            return CMD_ERR_STATE
+        }
+        return CMD_OK
+    }
+    if parts.flags & search.SUB_COUNT_ONLY != 0 {
+        ed_msg(mut ed, MSG_INFO, "{plan.v.len} matches on {plan.lines} lines")
+        return CMD_OK
+    }
+    if parts.flags & search.SUB_CONFIRM != 0 {
+        // The plan moves into the editor here, where it was built (a
+        // `take` parameter stored into a field of `ed` is E1004, G35).
+        if ed.confirm.active {
+            search_confirm_cancel(mut ed)
+        }
+        ed.confirm.plan = plan
+        search_confirm_start(mut ed, rep)
+        return CMD_OK
+    }
+    let lines = plan.lines
+    let n = scmd_ed_repl_apply(mut ed, w, plan)
+    ed_msg(mut ed, MSG_INFO, "{n} replacements on {lines} lines")
+    ed_damage_document(mut ed)
+    CMD_OK
+}
+
+// Apply a plan through window `w`'s seam, then the journal's health
+// (`yew_repl_plan_apply` + `yew_ed_finish_edit`).
+fn scmd_ed_repl_apply(mut ed: Ed, w: int, plan: search.ReplPlan) -> int {
+    let b = ed.wins[w].buf
+    edit_take(mut ed, w)
+    let n = search.repl_plan_apply(plan, mut ed.bufs[b].ec)
+    edit_give(mut ed, w)
+    ed_finish_edit(mut ed, w)
+    n
+}
+
+/// `:g`, a permanent non-goal (`yew_search_cmd_global`,
+/// `search_cmds.c:295-313`): a rejection with its reason, not a deferral.
+pub fn search_cmd_global(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    ed_msg(
+        mut ed,
+        MSG_ERROR,
+        ":g is Fletch's query API (buf.find(re) mapped over an action); a bespoke global-command mini-language is a permanent non-goal",
+    )
+    CMD_ERR_ARG
+}
+
+// ---- the confirm run (`search_cmds.c:315-410`) ------------------------
+
+// `confirm_prompt`: the cursor on the match asked about, the question.
+fn scmd_confirm_prompt(mut ed: Ed) {
+    let cur = search.repl_confirm_current(ed.confirm.walk, ed.confirm.plan)
+    if cur < 0 || ed.win < 0 {
+        return
+    }
+    let w = ed.win
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p].pos = ed.confirm.plan.v[cur].lo
+    let b = ed.wins[w].buf
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+    ed_damage_document(mut ed)
+    ed_msg(mut ed, MSG_INFO, "replace with '{scmd_shown(ed.confirm.shown)}'? (y/n/a/q/l/^E/^Y)")
+}
+
+// `confirm_finish`: ONE transaction for the whole run, a run ended with
+// `q` included.
+fn scmd_confirm_finish(mut ed: Ed) {
+    let lines = ed.confirm.plan.lines
+    var n = 0
+    if ed.win >= 0 {
+        let w = ed.win
+        let b = ed.wins[w].buf
+        edit_take(mut ed, w)
+        n = search.repl_plan_apply(ed.confirm.plan, mut ed.bufs[b].ec)
+        edit_give(mut ed, w)
+        ed_finish_edit(mut ed, w)
+    }
+    ed_msg(mut ed, MSG_INFO, "{n} replacements on {lines} lines")
+    ed.confirm = search_confirm_new()
+    ed_damage_document(mut ed)
+}
+
+/// Start a confirm run over the plan the caller moved into
+/// `ed.confirm.plan` (`yew_search_confirm_start`): `rep` is the
+/// replacement text the question repeats.
+pub fn search_confirm_start(mut ed: Ed, rep: List[byte]) {
+    ed.confirm.shown = copy rep
+    ed.confirm.walk = search.repl_confirm_begin(mut ed.confirm.plan)
+    ed.confirm.active = true
+    if !search.repl_confirm_pending(ed.confirm.walk, ed.confirm.plan) {
+        scmd_confirm_finish(mut ed)
+        return
+    }
+    scmd_confirm_prompt(mut ed)
+}
+
+/// Feed one key to a running confirm (`yew_search_confirm_key`): true
+/// when the key was consumed, so the dispatcher does not run it.
+pub fn search_confirm_key(mut ed: Ed, key: int) -> bool {
+    if !ed.confirm.active {
+        return false
+    }
+    if !search.repl_confirm_answer(mut ed.confirm.walk, mut ed.confirm.plan, key) {
+        // ^E/^Y scroll while deciding; anything else is ignored rather
+        // than taken as an answer.
+        return true
+    }
+    if search.repl_confirm_pending(ed.confirm.walk, ed.confirm.plan) {
+        scmd_confirm_prompt(mut ed)
+    } else {
+        scmd_confirm_finish(mut ed)
+    }
+    true
+}
+
+/// Restate the question once the `:` prompt that started the run has
+/// closed (`yew_search_confirm_reprompt`).
+pub fn search_confirm_reprompt(mut ed: Ed) {
+    if !ed.confirm.active {
+        return
+    }
+    if search.repl_confirm_pending(ed.confirm.walk, ed.confirm.plan) {
+        scmd_confirm_prompt(mut ed)
+    }
+}
+
+/// Drop a running confirm (`yew_search_confirm_cancel`).
+pub fn search_confirm_cancel(mut ed: Ed) {
+    if !ed.confirm.active {
+        return
+    }
+    ed.confirm = search_confirm_new()
+}
+
+// ---- the search commands (`search_cmds.c:412-459`) --------------------
+
+fn scmd_step_count(cx: CmdCtx) -> int {
+    if cx.count_given && cx.count != 0 then cx.count else 1
+}
+
+/// `ed.search.open` (`/`).
+pub fn search_cmd_open(mut ed: Ed, cx: CmdCtx) -> int {
+    search_open(mut ed, scmd_sc_win(ed, cx), false)
+    CMD_OK
+}
+
+/// `ed.search.open_back` (`?`).
+pub fn search_cmd_open_back(mut ed: Ed, cx: CmdCtx) -> int {
+    search_open(mut ed, scmd_sc_win(ed, cx), true)
+    CMD_OK
+}
+
+/// `ed.search.next` (`n`).
+pub fn search_cmd_next(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = search_step(mut ed, scmd_sc_win(ed, cx), true, scmd_step_count(cx))
+    CMD_OK
+}
+
+/// `ed.search.prev` (`N`).
+pub fn search_cmd_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = search_step(mut ed, scmd_sc_win(ed, cx), false, scmd_step_count(cx))
+    CMD_OK
+}
+
+/// `ed.search.word_next` (`*`).
+pub fn search_cmd_word_next(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = search_word(mut ed, scmd_sc_win(ed, cx), true)
+    CMD_OK
+}
+
+/// `ed.search.word_prev` (`#`).
+pub fn search_cmd_word_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = search_word(mut ed, scmd_sc_win(ed, cx), false)
+    CMD_OK
+}
+
+/// `ed.search.clear_highlight`.
+pub fn search_cmd_clear_highlight(mut ed: Ed, cx: CmdCtx) -> int {
+    search_clear_highlight(mut ed, scmd_sc_win(ed, cx))
+    CMD_OK
+}
