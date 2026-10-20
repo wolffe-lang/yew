@@ -26,7 +26,7 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | `Strmap`, `Interner` | `util.Strmap[V]` (two `List`s and a `Map` index), `util.Interner` | insertion order kept explicitly (§5 of `s00`); wolf's `Map` promises only that its three iterators agree |
 | `yew_sort_stable` | `util.sort_stable` over `std.list.sort_by` (the same bottom-up stable merge) | one name for sagitta's rule |
 | `static const` tables (`u8_class[256]`, the Unicode trie) | module `let` **`str` constants** of 7-bit digits, read with `.bytes()[i]` inline | module state of a `List` is refused (`[mem.static.3]`); a `str` is `.rodata`; an inline `.bytes()[i]` is a zero-copy read at 2 ns a lookup (probe t1); a bound `let b = s.bytes()` COPIES and must never be written in a loop (probe t3 took 60 GB) |
-| a process-wide option (`width_opts`) | a module `var` behind `unsafe { }` with `// # Safety:` naming invariant 8 (single-threaded core) | `[mem.static.2]`; the `unsafe` census is this table: `unicode.width`'s `ambiguous_wide`, `text.file`'s `temp_counter` and `text.undo`'s `text_hash_calls` (yw02), nothing else |
+| a process-wide option (`width_opts`) | a module `var` behind `unsafe { }` with `// # Safety:` naming invariant 8 (single-threaded core) | `[mem.static.2]`; the `unsafe` census is this table: `unicode.width`'s `ambiguous_wide`, `text.file`'s `temp_counter` and `text.undo`'s `text_hash_calls` (yw02), `edit.gutter`'s warn-once mask (yw03), nothing else |
 | `v & ~mask` | `v - (v & mask)` (`unicode.grapheme.without`) | wolf has no bitwise not (§5) |
 | a getter returning a field of a `read` parameter | `copy m.vals[i]` | `[mem.tier0.mode.read]`, wolf-lang#366: a lent value is never handed on |
 | `bytebuf_printf(b, "%s:%d", …)` | `buf_append_str(mut b, "{s}:{n}")` | interpolation; `std.fmt` for `%02x` and padding |
@@ -42,6 +42,12 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | `fsync(fd)`, `fsync(dirfd)` at 0.2.33 | a NAMED call that syncs nothing (`text.file`'s `no_sync_g3`, `no_sync_dir_g3`), so the day the pin has the syncs two bodies change (yw02) | G3: never a silent claim of a sync |
 | `realpath(3)` at 0.2.33 | `text.file_realpath`, a component walk with `fs_read_link` (yw02) | G4 |
 | a rebuilt array swapped in and the old one freed (`free(old)`) | in a value that lives for the session, a spare `List` pair rebuilt in place and swapped (the grapheme index); per-iteration scratch in a `region` block (yw02) | G33: a replaced `List` is held until its owner's region ends |
+| a function-pointer table (`CmdDesc.fn`, `UnitEngine` vtables) | a handler KIND and an implementation id per row, and ONE `match` on literal ids (`edit.impl.run_impl`, each arm's `IMPL_*` name in a comment; the unit engines `edit.unit_next`'s `match` on the kind) (yw03) | no function value across a module boundary (G19/G20, wolf-lang#806); a `match` arm on a const NAME is a binding that matches everything (W0801) |
+| a pointer lent into another struct for one call (the window's `CursorSet` as `ec.cset`, the editor's journals) | a swap through a local (`let t = a; a = b; b = t`) out and back around the call (`edit.edit_take`/`edit_give`), every return path restoring it (yw03) | a moved field must be stored back (E1001); a placeholder `List` costs 48 B an edit (G33) |
+| `ed.c` calling `ui/*.c` that take `Ed *` | one module: the `ui` files campaign 03 owns are `src/edit/*.lu` with sagitta's names (yw03) | a module cycle is E0303 |
+| a `poll(fd, 0)` between reads (the typeahead drain) | `term.tty_drain_begin`/`tty_drain_end`: `VMIN=0, VTIME=0` for the drain, the wait's mode after (yw03) | no zero-timeout readiness query on a tty at 0.2.33 (G2) |
+| a field or local named `impl`, `take` or `use` | another name (`impl_id`, `n_take`, `keep`) (yw03) | keywords |
+| two files of one module each with a private `push_str` | one helper per module (yw03) | a module's private names are module-wide (E0302): file boundaries create no scopes |
 
 ## 2. Source directories
 
@@ -52,9 +58,9 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | `src/unicode/` | 21 | 12,534 | **yw00** (`utf8`, `grapheme`, `width`, `tables`), **yw02** (`coords`, `u16` — ported INTO `text`: `coords` reads the piece tree and the tree calls the grapheme index, a module cycle, E0303), yw03 (`wordbreak`, `tables_wb`), yw04 (`category`, `tables_cat`, `case`, `tables_case`) | `unicode` | none; the generator grows `--word-break`, `--category`, `--case` modes |
 | `src/term/` | 10 | 4,910 | **yw01** | `term` (aliasing `std.term`) | the fatal-signal restore (§5 G1); a wait over tty + signals + job pipes (G2) |
 | `src/text/` | 21 | 11,688 | **yw02** (with `unicode/coords`, `u16` and the cursor set's core from `edit/multicursor.c`) | `text` | `fsync` of a file and a directory (G3, met by name); `realpath` (G4, a walk); `xattr` (G5, yw14); the clipboard's subprocess backends (G30, a STOP); an inherited descriptor as a handle (G26) |
-| `src/edit/` | 80 | 31,689 | yw03 (modes, keymap, dispatch, motion, select, multicursor), yw04 (`shell*`, `shsession`, `job`, `search_cmds`), yw06 (`ws_cmds`, `pane_cmds`), yw09 (`batch`, `flapi_cmds`), yw11 (`lsp_cmds`, `shadow*`, `completion`), yw15 (`prof_cmds`) | `edit` | process groups and the foreground terminal for `:!` (ruling #79, available since 0.2.31) |
+| `src/edit/` | 80 | 31,689 | **yw03** (`cmd`, `keymap`, `keys_default`/`keys_highlight` → `edit.keys`, `mode`, `dispatch`, `motion`, `word`, `block`, `indent`, `select`, `sel_actions`, `multicursor`'s editor half, `ed`, `loop`, `edit_cmds`, `file_cmds`, and `pairs` — s57.16's, ported here because `runtime/init.fl` sets `autopair`; `bind`/`option` only as far as `init.fl`'s `set` and `bind` rows reach, through `edit.config` and the literal reader `edit.fldata`, R-yw03-2), yw04 (`shell*`, `shsession`, `job`, `search_cmds`, `readline_cmds` — s57.21, the prompt's and I mode's readline keys, whose commands refuse naming yw04), yw06 (`ws_cmds`, `pane_cmds`), yw09 (`batch`, `flapi_cmds`, the full `bind`/`option`/`flconf`), yw11 (`lsp_cmds`, `shadow*`, `completion`), yw15 (`prof_cmds`) | `edit` | process groups and the foreground terminal for `:!` (ruling #79, available since 0.2.31); `ICRNL`/`OPOST`/`ISTRIP` in the raw mode (G34) |
 | `src/search/` | 16 | 7,491 | yw04 | `search` (aliasing `std.search`) | none; the port's regex is a `std.regex` candidate |
-| `src/ui/` | 74 | 46,140 | yw03 (`viewport`, `statusline`, `gutter`, `message`, `draw`, `win`: sprint 15 is campaign 03's — corrected by yw02), yw05 (layout, panes, tabs, groups, cmdline, region, glyphs), yw06 (pickers, finder, mouse, ctxmenu, strip, typejump), yw04 (`cmdcomp`, `compgen`, `compspec`, `comphelp`, `compfish`, `shctx`, `complmenu`) | `ui` | none known |
+| `src/ui/` | 74 | 46,140 | **yw03** (`viewport`, `statusline`, `gutter`, `message`, `draw`, `win`: sprint 15 is campaign 03's — corrected by yw02 — and every one takes the `Ed` that `edit` calls them with, a cycle wolf refuses (E0303), so they are `src/edit/*.lu` with sagitta's names; plus the two interims the goldens need: `tabs`' single-tab strip, `edit.tabs`, R-yw03-3, and a narrow `:` from `cmdline`, `edit.cmdline`, R-yw03-1), yw05 (layout, panes, tabs in full, groups, region, glyphs), yw06 (pickers, finder, mouse, ctxmenu, strip, typejump), yw04 (`cmdline` in full, `cmdedit`, `cmdcomp`, `compgen`, `compspec`, `comphelp`, `compfish`, `shctx`, `complmenu`) | `edit` (campaign 03's), `ui` (later) | none known |
 | `src/ws/` | 28 | 10,820 | yw06 (workspace, state_*, walk, gitignore, trust*), yw11 (`sym*`, `fuzzy`) | `ws` | `realpath` (G4); XDG dirs |
 | `src/fl/` | 61 | 26,269 | yw07 (lex, parse, compile, vm, value, gc, opcodes, diag, dump, data, module, std*), yw08 (repl, trace, suggest, vmcheck), yw09 (flapi, flconf, fleval, flhook, flruntime, fltxn, handle, record, macrolib, motion_tab, origin, stdai) | `fl` | a GC's shape in wolf's memory model (G6) |
 | `src/syn/` | 14 | 13,064 | yw10 | `syn` | none known |
@@ -69,7 +75,7 @@ Other trees:
 | sagitta | port |
 |---|---|
 | `ucd/16.0.0/` (10 files), `ucd/LICENSE`, `ucd/MANIFEST` | copied verbatim (yw00); the generator reads them; `ucd/MANIFEST` is checked by `shasum -c` |
-| `runtime/` (`init.fl`, 48 `syntax/*.fl`, 2 themes, tutor, presets, completions) | Fletch stays Fletch: the files are copied verbatim by the lane that first needs them (yw09 `init.fl`; yw10 syntax and themes; yw16 tutor) and never edited |
+| `runtime/` (`init.fl`, 48 `syntax/*.fl`, 2 themes, tutor, presets, completions) | Fletch stays Fletch: the files are copied verbatim by the lane that first needs them and never edited. **yw03** needed `init.fl` and the two themes first (every editor frame paints in `quiver-dark` with `init.fl`'s keys and options): copied verbatim, embedded by `tools/gen-runtime` as `edit.runtime_blob` (the last resort after `$YEW_RUNTIME_DIR`, the install prefix and `./runtime`), checked against the pin by `tools/check-runtime`, and read by `edit.fldata`'s literal reader until Fletch (R-yw03-2); yw10 syntax; yw16 tutor |
 | `tests/unit/` (319 files) | ported one for one, per directory, by the lane that ports the directory (`src/<dir>/<unit>_test.lu`) |
 | `tests/pty/` (552 goldens, the runner, the VT, `demo_paint`) | the runner and goldens are the oracle's, run by `tools/goldens`; `demo_paint` is ported by yw01 (M-YW1) |
 | `tests/script/` (94 `.fl`), `tests/fletch/` (20 `.fl`), `tests/syn/` (432 `.spans`), `tests/roundtrip/`, `tests/torture/` | the oracle's, run by `tools/goldens` (roundtrip is in-process: the port's own harness is yw09's) |
@@ -89,8 +95,8 @@ the `s57_*` sequence are placed with their consumers).
 | 01 terminal | s03, s04, s05, s06 | **yw01** | M-YW1 first paint: `demo_paint` through the stack; every campaign-01 PTY golden green in four profiles |
 | 02 text engine | s07, s08, s09, s10, s11, s12 | yw02 | M-YW2: `make torture`'s save-boundary and SIGKILL campaigns against the wolf binary |
 | 03 modal core | s13, s14, s15, s16, s17 | yw03 | M-YW3: campaign 03's PTY and script goldens |
-| 04 execute and search | s18, s18.5, s19, s20, s21; s57.17, s57.18, s57.23–s57.32 (the `:` prompt and `:!` completion) | yw04 | M-YW4: the regex corpus and the `:!` goldens |
-| 05 UI and workspace | s22, s23, s24, s25, s26, s27; s57.5–s57.16, s57.20, s57.22, s56.5 (the field repairs) | yw05 (s22–s24, s57.8, s57.13–s57.16, s57.22), yw06 (s25–s27, s56.5, s57.5–s57.7, s57.9–s57.12, s57.20) | M-YW5 daily driver; M-YW-PAX1 |
+| 04 execute and search | s18, s18.5, s19, s20, s21; s57.17, s57.18, s57.21, s57.23–s57.32 (the `:` prompt, its readline keys and `:!` completion; s57.21 placed by yw03) | yw04 | M-YW4: the regex corpus and the `:!` goldens |
+| 05 UI and workspace | s22, s23, s24, s25, s26, s27; s57.5–s57.16, s57.20, s57.22, s56.5 (the field repairs) | yw05 (s22–s24, s57.8, s57.13–s57.15, s57.22), yw06 (s25–s27, s56.5, s57.5–s57.7, s57.9–s57.12, s57.20); s57.16's auto-pairing landed early in yw03 (`edit.pairs`: `init.fl` turns it on, so every campaign-03 bracket goes through it) | M-YW5 daily driver; M-YW-PAX1 |
 | 06 Fletch core | s28, s29, s30, s31, s32, s33 | yw07 (s28–s31), yw08 (s32, s33) | M-YW6: the Fletch conformance and GC-stress runs |
 | 07 Fletch in the editor | s34, s35, s36, s37, s38 | yw09 | M-YW7: round-trip and batch |
 | 08 highlighting | s39, s40, s41, s41.5, s42, s42.5 | yw10 | M-YW8: all 432 syntax goldens; M-YW-PAX2 |
@@ -193,6 +199,8 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G31 | **no host OS/arch query** (comptime or run time). | yw02's clipboard (pbcopy is a macOS-arm64 compile-time choice in C) | PATH alone, said in `text.clipboard`'s header (a Linux PATH with a `pbcopy` differs from C) | `witness/host-os` (`os_name`: E0301; none in the prelude) | wolf-lang (gap) |
 | G33 | **a `List` that replaces a field of a long-lived value is held until the value's region ends** — no per-object free, so a rebuild-and-swap that C does with malloc/free leaks the old storage. | yw02 (the grapheme index: 670 KB per edit of a 1 MiB buffer), yw03 (`Ed` lives for the session) | rebuild into a spare pair and swap, or edit in place (`pop`, element writes); `std.list.clear`/`truncate` themselves allocate a new list | `src/text_coords_test.lu`'s `t_port_coords_index_edits_reuse_storage` (red at yw02 `02806d4`'s parent) | wolf-lang (design note for the guide; a reclaiming assignment or a storage-reusing `clear`) |
 | G32 | **the fs rows C yew uses and 0.2.33 lacks**: `access(2)`, `O_NOFOLLOW`, an advisory lock, a handle's dev/ino (`fs_fstat` answers three words), `mkfifo`. | yw02 (save, journal, clipboard, the serial test's FIFO) | each worked around by name (mode bits against uid/gids for `access`; `lstat` before open; the `mkfifo` utility) | the prelude (no name) | wolf-lang (one gap issue listing them) |
+| G34 | **the raw mode cannot clear `ICRNL`, `OPOST` or `ISTRIP`**: `[os.term.mode]` reaches five termios bits (`ICANON`, `ECHO`, `ISIG`, `IXON`, `IEXTEN`) and `VMIN`/`VTIME`; C yew's raw mode clears the `cfmakeraw(3)` set (`tty.c:521-543`). With `ICRNL` set the kernel turns the CR a legacy terminal sends for Enter into LF, so Enter reads as `C-j`; kitty's `\x1b[>21u` (`input.c:58`) leaves Enter, Tab and Backspace as legacy bytes, so this is every terminal's Enter, not only a legacy one's. | yw01 (measured, not needed: campaign 01 presses no Enter), **yw03** (Enter accepts `:` and is I mode's newline; sagitta's `perf_latency` quits with `:q!\r`) | the interim (ruling R-yw03-4): while the port's raw mode is in force (`term.tty_icrnl_stuck`) the decoder reads a legacy LF as Enter (`term.input_set_lf_enter`); a raw `C-j`, unbound in every campaign-03 mode, reads as Enter too; a written LF still reaches the wire as CRLF (`OPOST`; the renderer writes none) | yw01's W1 (`notes/yw01-evidence/witness/enter/`, `opost/`); yw03: the port at `bcf2163`'s parent did not quit on `\x1b[27u:q!\r` under a PTY and does at `bcf2163` (`port_input_lf_is_enter_while_icrnl_stuck` in `src/term_input_test.lu`) | wolf-lang (listed by yw01, not yet filed: three more mode bits — `CR_NL`, `OUTPUT_POST`, `STRIP8` — or an editor-raw flag); the pin that has it retires the interim |
+| G35 | **a `take` parameter stored into a FIELD of a `mut` parameter's list element is E1004** ("parameter regions are independent by default"), though the same store of the whole element builds. | yw03 (`finish_lift`: the lifted cursor set replacing the window's) | store in the caller, where the value was built (`edit_cmds.lu`'s three lifts) | `notes/yw03-evidence/witness/take-region/` (`main.lu`, `run.txt`: exit 2) | wolf-lang (precision of the region analysis: `take` is a hand-over; or the planned shared-region signature) |
 
 ## 6. Rulings asked
 
@@ -254,6 +262,43 @@ maintainer.
   exit 4 by name, until wolf has a non-blocking pipe write and `os_fork`
   (recommended, implemented); (B) a blocking writer (refused,
   invariant 4); (C) a helper thread per write.
+- **R-yw03-1 — a narrow `:` in yw03.** Every one of campaign 03's 62
+  PTY cases tears down through `esc : ed.quit(_force) enter`
+  (`tests/pty/registry.c:679-700`), `notepad_restore_suspend` types
+  `:ed.suspend`, and the case's verdict is its snapshot AND its exit, so
+  M-YW3 needs a `:` the launch decision ("yw03 carries no `:` line")
+  did not foresee. (A) the narrowest one — E mode entered by `:`, `e`
+  and `!`, printable text and paste collected into a hidden one-line
+  buffer, `<cr>` resolving the first word by name or abbreviation and
+  invoking it through the registry with its string or integer
+  argument, `<esc>` cancelling, the line drawn over the footer;
+  ranges, history, completion, the menu and the editing keys refuse
+  naming yw04 (`edit.cmdline`, implemented); the live-editor kill9 lane
+  stays yw04's (R-yw02-1 = A); (B) no `:`, M-YW3 deferred to yw04.
+  **Recommend A** (implemented).
+- **R-yw03-2 — the runtime files before Fletch.** Every frame is painted
+  in `quiver-dark` with `init.fl`'s keys and options, which C gets by
+  running `init.fl` in the Fletch VM (yw07–yw09). (A) copy the files
+  verbatim, embed them (`tools/gen-runtime`, `tools/check-runtime`),
+  and read their flat shape — call statements, `let NAME = literal`
+  (the PTY harness's user `init.fl` is `let lsp = {servers: {}}`) and
+  literals — with a reader that refuses anything else by line and
+  column naming the VM's lane (`edit.fldata`, `edit.config`), the
+  `bind` rows going through the same builder Fletch's `bind()` will
+  feed; (B) hard-code the 381 bindings in wolf. **Recommend A**
+  (implemented); the reader is retired by yw09.
+- **R-yw03-3 — the single-tab strip.** Row 0 of every editor golden is
+  the tab strip (`ui/tabs.c`, campaign 05's). (A) paint the one-tab
+  strip campaign 03 needs (`edit.tabs`: the label, the dirty mark, the
+  `+` tail), several tabs refusing naming yw05; (B) wait for yw05.
+  **Recommend A** (implemented).
+- **R-yw03-4 — Enter while `ICRNL` cannot be cleared (G34).** (A) read a
+  legacy LF as Enter while the port's raw mode is in force (a raw
+  `C-j` then reads as Enter too; campaign 03 binds Enter in I, E, H and
+  F and `C-j` nowhere), retired by the pin that widens
+  `[os.term.mode]`; (B) leave LF as `C-j` — Enter then neither accepts
+  `:` nor breaks a line on any terminal (kitty keeps Enter legacy at
+  C's flags). **Recommend A** (implemented, `bcf2163`).
 - **R5 — the module-name collisions** (`unicode`, `term`, `search`
   against std): (A) the port keeps sagitta's names and aliases std
   where both are needed (recommended, done); (B) prefix the port's
@@ -289,7 +334,11 @@ One paragraph each; yw01's is drafted in full
   PTY and script cases (M-YW3). **Drafted in full by yw02**
   (`notes/contracts/yw03-the-modal-core.md`), with sprint 15's `ui`
   files and the command registry's shape (no function value across a
-  module boundary) as its first ruling.
+  module boundary) as its first ruling. **Landed by yw03**
+  (`notes/yw03-the-modal-core.md`): the 62 PTY goldens gated by name
+  (the script suite's campaign-03 rows need `--batch`, yw09), with a
+  narrow `:`, the runtime files read before Fletch and the one-tab
+  strip as interims (R-yw03-1..3).
 - **yw04 — execute and search** (s18, s18.5, s19, s20, s21, s57.17,
   s57.18, s57.23–s57.32; `src/search/`, `src/edit/shell*`, `job.c`,
   `src/ui/comp*`, `shctx.c`; `src/unicode/category.c`, `case.h`,
