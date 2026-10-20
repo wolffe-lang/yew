@@ -1,128 +1,1032 @@
-//! edit.sel_actions — STUB while the H/multi-cursor fork ports
-//! `src/edit/sel_actions.c` (yw03-hmode). Each command refuses by name.
+//! edit.sel_actions — what H mode does to its selections: yank, delete,
+//! change, the clipboard, case, indent, join, replace, shift, and the
+//! rectangle's insert and append carets.
+//!
+//! Ports sagitta `src/edit/sel_actions.c` (1,164 lines) and
+//! `sel_actions.h` (54) at 9ace98c2, under `s17-mode-H-multicursor.md`
+//! §4. Every command here is an AGGREGATE (`CMD_MULTI_AGGREGATE`): it
+//! owns its fan-out over the cursor set instead of passing through
+//! `mc_run`, building one edit PLAN — the spans to replace, ascending and
+//! disjoint, each stated in the offsets the command saw before any was
+//! applied — and replaying it through `sel_apply_edits` with a running
+//! signed delta, inside the one transaction and one damage batch the
+//! dispatcher opened. C's plan hands its `EditCtx` copy's journal handle
+//! back on every exit (`yew_sel_apply_edits`'s comment); the port's edits
+//! go through the seam (`ed_edit_insert`/`ed_edit_delete`, `ed.lu`), which
+//! swaps the journal list in and out per edit, so there is no handle to
+//! drop and the single exit is `ed_finish_edit`'s health check. The
+//! prompt's own selection (Sprint 57.29) is yw04's: the narrow `:` has
+//! none, so `clip_scope` answers "inert" there, as C's does for a prompt
+//! with nothing selected.
 
-// stub until the fork lands.
-fn sc_yank(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.yank (yw03-hmode)")
-    CMD_ERR_DEFERRED
+use text
+use unicode
+
+/// One span the plan replaces (`SelEdit`, `sel_actions.h:9-26`): an
+/// empty `replacement` is a pure delete.
+pub struct SelEdit {
+    span: text.Span,
+    replacement: List[byte],
 }
 
-// stub until the fork lands.
-fn sc_clip_copy(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.clip_copy (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `action_context` (`sel_actions.c:20-36`): (ok, window, buffer, the
+// acting cursor — the batch's active one, else the primary).
+fn action_context(ed: Ed, cx: CmdCtx) -> (bool, int, int, int) {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len {
+        return (false, 0, 0, 0)
+    }
+    let b = ed.wins[w].buf
+    if b < 0 || !ed.bufs[b].resident || ed.wins[w].cs.curs.len == 0 {
+        return (false, 0, 0, 0)
+    }
+    let index = if ed.wins[w].cs.active != text.MC_ACTIVE_NONE {
+        ed.wins[w].cs.active
+    } else {
+        ed.wins[w].cs.primary
+    }
+    if index >= ed.wins[w].cs.curs.len {
+        return (false, 0, 0, 0)
+    }
+    (true, w, b, index)
 }
 
-// stub until the fork lands.
-fn sc_clip_cut(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.clip_cut (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `text_byte` (`sel_actions.c:38-48`).
+fn text_byte(tb: text.TextBuf, off: int) -> int {
+    if off < 0 || off >= text.textbuf_len(tb) {
+        bug("selection action: cannot read valid byte offset")
+    }
+    text.textbuf_byte_at(tb, off)
 }
 
-// stub until the fork lands.
-fn sc_clip_paste(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.clip_paste (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `append_span` (`sel_actions.c:50-76`).
+fn append_span(mut out: List[byte], tb: text.TextBuf, sp: text.Span) {
+    if sp.lo > sp.hi || sp.hi > text.textbuf_len(tb) {
+        bug("selection action: invalid source span")
+    }
+    if sp.hi == sp.lo {
+        return
+    }
+    text.textbuf_append_range(mut out, tb, sp.lo, sp.hi)
 }
 
-// stub until the fork lands.
-fn sc_delete(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.delete (yw03-hmode)")
-    CMD_ERR_DEFERRED
+/// The bytes of `sp` (`yew_sel_copy_span`, `sel_actions.c:78-85`).
+pub fn sel_copy_span(tb: text.TextBuf, sp: text.Span) -> List[byte] {
+    var out = List[byte]()
+    append_span(mut out, tb, sp)
+    out
 }
 
-// stub until the fork lands.
-fn sc_all(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.all (yw03-hmode)")
-    CMD_ERR_DEFERRED
+/// Append a plan entry for `sp` with no replacement yet
+/// (`yew_sel_edit_push`, `sel_actions.c:96-104`); answers its index.
+pub fn sel_edit_push(mut edits: List[SelEdit], sp: text.Span) -> int {
+    (mut edits).push(SelEdit { span: sp, replacement: List[byte]() })
+    edits.len - 1
 }
 
-// stub until the fork lands.
-fn sc_change(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.change (yw03-hmode)")
-    CMD_ERR_DEFERRED
+/// Replay `edits` through window `cx.win` (`yew_sel_apply_edits`,
+/// `sel_actions.c:106-160`): each span shifted by the running delta,
+/// deleted, then its replacement inserted, as one damage batch. Answers
+/// (ok, the first span's ORIGINAL start; 0 for an empty plan).
+pub fn sel_apply_edits(mut ed: Ed, cx: CmdCtx, edits: List[SelEdit]) -> (bool, int) {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len {
+        return (false, 0)
+    }
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident {
+        return (false, 0)
+    }
+    let first = if edits.len != 0 then edits[0].span.lo else 0
+    ed_damage_batch_begin(mut ed, w)
+    var delta = 0
+    var ok = true
+    var i = 0
+    while ok && i < edits.len {
+        let removed = edits[i].span.hi - edits[i].span.lo
+        if delta < 0 && edits[i].span.lo < -delta {
+            bug("selection action: edit offset underflow")
+        }
+        let lo = edits[i].span.lo + delta
+        let n = edits[i].replacement.len
+        if removed != 0 && !ed_edit_delete(mut ed, w, lo, lo + removed) {
+            ok = false
+        } else if n != 0 && !ed_edit_insert(mut ed, w, lo, edits[i].replacement, 0, n) {
+            ok = false
+        } else {
+            delta += n - removed
+        }
+        i += 1
+    }
+    ed_finish_edit(mut ed, w)
+    ed_damage_batch_end(mut ed)
+    (ok, first)
 }
 
-// stub until the fork lands.
-fn sc_case_upper(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.case_upper (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `collapse_all` (`sel_actions.c:162-176`): every cursor to its
+// selection's start, goal column 0, the set normalized.
+fn collapse_all(mut ed: Ed, w: int) {
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let p = ed.wins[w].cs.curs[i].pos
+        let a = ed.wins[w].cs.curs[i].anchor
+        let start = if p < a then p else a
+        ed.wins[w].cs.curs[i].pos = start
+        ed.wins[w].cs.curs[i].anchor = start
+        ed.wins[w].cs.curs[i].goal_col = 0
+        i += 1
+    }
+    let b = ed.wins[w].buf
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
 }
 
-// stub until the fork lands.
-fn sc_case_lower(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.case_lower (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `cursor_place` (`sel_actions.c:178-190`): the acting cursor to `at`.
+fn sa_cursor_place(mut ed: Ed, w: int, at: int) {
+    var index = if ed.wins[w].cs.active != text.MC_ACTIVE_NONE {
+        ed.wins[w].cs.active
+    } else {
+        ed.wins[w].cs.primary
+    }
+    if index >= ed.wins[w].cs.curs.len {
+        index = ed.wins[w].cs.primary
+    }
+    ed.wins[w].cs.curs[index].pos = at
+    ed.wins[w].cs.curs[index].anchor = at
+    ed.wins[w].cs.curs[index].goal_col = text.CCOL_HERE
 }
 
-// stub until the fork lands.
-fn sc_case_toggle(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.case_toggle (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `finish_action` (`sel_actions.c:192-199`): the caret to `at`, every
+// selection collapsed, then I or L.
+fn finish_action(mut ed: Ed, w: int, at: int, insert: bool) -> int {
+    sa_cursor_place(mut ed, w, at)
+    collapse_all(mut ed, w)
+    if insert {
+        return mode_enter(mut ed, MODE_I)
+    }
+    mode_enter(mut ed, MODE_L)
 }
 
-// stub until the fork lands.
-fn sc_indent(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.indent (yw03-hmode)")
-    CMD_ERR_DEFERRED
+fn buf_tabw(ed: Ed, b: int) -> int {
+    sel_tabwidth(ed.bufs[b].tabwidth)
 }
 
-// stub until the fork lands.
-fn sc_dedent(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.dedent (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `selection_spans` (`sel_actions.c:201-209`).
+fn selection_spans(ed: Ed, w: int, c: text.Cursor, mut spans: List[text.Span]) {
+    let b = ed.wins[w].buf
+    if ed.wins[w].h.kind == SEL_RECT {
+        for sp in sel_rect_spans(ed.bufs[b].ec.tb, ed.wins[w].h.kind, buf_tabw(ed, b), c) {
+            (mut spans).push(sp)
+        }
+    } else {
+        (mut spans).push(sel_span(ed.bufs[b].ec.tb, ed.wins[w].h.kind, c))
+    }
 }
 
-// stub until the fork lands.
-fn sc_shift_left(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.shift_left (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `all_selection_spans` (`sel_actions.c:211-217`).
+fn all_selection_spans(ed: Ed, w: int) -> List[text.Span] {
+    var spans = List[text.Span]()
+    for c in ed.wins[w].cs.curs {
+        selection_spans(ed, w, c, mut spans)
+    }
+    spans
 }
 
-// stub until the fork lands.
-fn sc_shift_right(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.shift_right (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `selection_reg_type` (`sel_actions.c:219-226`).
+fn selection_reg_type(kind: int) -> int {
+    if kind == SEL_LINE {
+        return text.REG_LINEWISE
+    }
+    if kind == SEL_RECT {
+        return text.REG_BLOCKWISE
+    }
+    text.REG_CHARWISE
 }
 
-// stub until the fork lands.
-fn sc_join(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.join (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `regval_from_rect` (`sel_actions.c:228-283`): a blockwise value, each
+// non-ragged row padded with spaces to the block's cell width (YEW-F-077).
+fn regval_from_rect(ed: Ed, w: int, c: text.Cursor) -> text.RegVal {
+    let b = ed.wins[w].buf
+    let kind = ed.wins[w].h.kind
+    let spans = sel_rect_spans(ed.bufs[b].ec.tb, kind, buf_tabw(ed, b), c)
+    let start = if c.pos < c.anchor then c.pos else c.anchor
+    let first = text.textbuf_line_of(ed.bufs[b].ec.tb, start as text.ByteOff) as int
+    let (_, _, c0, c1) = sel_rect_row(ed.bufs[b].ec.tb, kind, buf_tabw(ed, b), c, first)
+    let tabwidth = if ed.bufs[b].tabwidth != 0 then ed.bufs[b].tabwidth else VP_TABWIDTH
+    var value = text.regval_new()
+    value.kind = text.REG_BLOCKWISE
+    value.width = c1 - c0
+    value.ragged = false
+    var i = 0
+    while i < spans.len {
+        let line = first + i
+        let ls = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+        let lo_col = text.off_to_ccol(
+            ed.bufs[b].ec.tb,
+            ls,
+            spans[i].lo as text.ByteOff,
+            tabwidth,
+        ) as int
+        let hi_col = text.off_to_ccol(
+            ed.bufs[b].ec.tb,
+            ls,
+            spans[i].hi as text.ByteOff,
+            tabwidth,
+        ) as int
+        let row_lo = value.bytes.len
+        append_span(mut value.bytes, ed.bufs[b].ec.tb, spans[i])
+        if hi_col < lo_col {
+            bug("rectangular register: reversed row columns")
+        }
+        var padding = if hi_col - lo_col < value.width {
+            text.ccol_shortfall(value.width as text.CCol, (hi_col - lo_col) as text.CCol)
+        } else {
+            0
+        }
+        while padding != 0 {
+            (mut value.bytes).push(32 as byte)
+            padding -= 1
+        }
+        (mut value.rows).push(text.span(row_lo, value.bytes.len))
+        i += 1
+    }
+    value
 }
 
-// stub until the fork lands.
-fn sc_replace_char(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.replace_char (yw03-hmode)")
-    CMD_ERR_DEFERRED
+// `capture_selection` (`sel_actions.c:285-332`): every cursor's
+// selection as one register value, rectangles row by row.
+fn capture_selection(ed: Ed, w: int) -> text.RegVal {
+    let kind = selection_reg_type(ed.wins[w].h.kind)
+    let b = ed.wins[w].buf
+    var value = text.regval_new()
+    if kind == text.REG_BLOCKWISE {
+        for c in ed.wins[w].cs.curs {
+            let part = regval_from_rect(ed, w, c)
+            if value.rows.len != 0 && part.width != value.width {
+                value.ragged = true
+            }
+            if part.width > value.width {
+                value.width = part.width
+            }
+            value.kind = text.REG_BLOCKWISE
+            value.ragged = value.ragged || part.ragged
+            for source in part.rows {
+                let lo = value.bytes.len
+                var k = source.lo
+                while k < source.hi {
+                    (mut value.bytes).push(part.bytes[k])
+                    k += 1
+                }
+                (mut value.rows).push(text.span(lo, value.bytes.len))
+            }
+        }
+    } else {
+        for c in ed.wins[w].cs.curs {
+            let part = text.regval_from_span(
+                ed.bufs[b].ec.tb,
+                sel_span(ed.bufs[b].ec.tb, ed.wins[w].h.kind, c),
+                kind,
+                ed.bufs[b].ec.meta,
+                true,
+            )
+            for byte_value in part.bytes {
+                (mut value.bytes).push(byte_value)
+            }
+            value.kind = kind
+        }
+    }
+    value
 }
 
-// stub until the fork lands.
-fn sc_rect_insert(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.rect_insert (yw03-hmode)")
-    CMD_ERR_DEFERRED
+/// `ed.sel.yank` (`yew_sel_cmd_yank`, `sel_actions.c:334-349`): the
+/// selections into the unnamed register.
+pub fn sc_yank(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, _, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let value = capture_selection(ed, w)
+    text.reg_yank(mut ed.regs, 0, value)
+    CMD_OK
 }
 
-// stub until the fork lands.
-fn sc_rect_append(mut ed: Ed, cx: CmdCtx) -> int {
+const CLIP_ACT: int = 0
+
+const CLIP_INERT: int = 1
+
+const CLIP_REFUSE: int = 2
+
+// `yew_cmdline_selection` (`cmdline.c:1229-1251`): the prompt target's
+// primary cursor, when it selects.
+fn prompt_selection(ed: Ed) -> (bool, text.Span) {
+    if !ed.cmdline.active || ed.cmdline.target_win < 0 {
+        return (false, text.span(0, 0))
+    }
+    let t = ed.cmdline.target_win
+    if ed.wins[t].cs.primary >= ed.wins[t].cs.curs.len {
+        return (false, text.span(0, 0))
+    }
+    let c = copy ed.wins[t].cs.curs[ed.wins[t].cs.primary]
+    if c.anchor == c.pos {
+        return (false, text.span(0, 0))
+    }
+    if c.pos < c.anchor {
+        return (true, text.span(c.pos, c.anchor))
+    }
+    (true, text.span(c.anchor, c.pos))
+}
+
+// `clip_scope` (`sel_actions.c:351-375`, Sprint 57.29 §4): the prompt
+// acts on its selection (none: inert); H acts; I is inert; the rest
+// refuse.
+fn clip_scope(ed: Ed, cx: CmdCtx) -> int {
+    if ed.cmdline.active && cx.win == cmdline_target(ed) {
+        let (has, _) = prompt_selection(ed)
+        return if has then CLIP_ACT else CLIP_INERT
+    }
+    if ed.mode == MODE_H {
+        return CLIP_ACT
+    }
+    if ed.mode == MODE_I then CLIP_INERT else CLIP_REFUSE
+}
+
+/// `ed.clip.copy` (`yew_sel_cmd_clip_copy`, `sel_actions.c:377-397`):
+/// the selections into `+` (and the unnamed register).
+pub fn sc_clip_copy(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, _, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let reach = clip_scope(ed, cx)
+    if reach != CLIP_ACT {
+        return if reach == CLIP_INERT then CMD_OK else CMD_ERR_STATE
+    }
+    let value = capture_selection(ed, w)
+    text.reg_yank(mut ed.regs, '+' as int, value)
+    CMD_OK
+}
+
+// `delete_or_change` (`sel_actions.c:399-452`): capture, delete every
+// selection, record the delete; a rectangular change keeps one insertion
+// caret per affected row.
+fn delete_or_change(mut ed: Ed, cx: CmdCtx, change: bool, reg_name: int) -> int {
+    let (ok, w, b, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let value = capture_selection(ed, w)
+    let spans = all_selection_spans(ed, w)
+    var edits = List[SelEdit]()
+    for sp in spans {
+        let _ = sel_edit_push(mut edits, sp)
+    }
+    let (applied, first) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    text.reg_delete(mut ed.regs, reg_name, value)
+    if ed.wins[w].h.kind == SEL_RECT && change {
+        text.cset_remove_all_but_primary(mut ed.wins[w].cs)
+        ed.wins[w].cs.curs[0] = text.Cursor { pos: first, goal_col: 0, anchor: first }
+        var removed = 0
+        var i = 1
+        while i < spans.len {
+            removed += spans[i - 1].hi - spans[i - 1].lo
+            let p = spans[i].lo - removed
+            let _ = text.cset_add(mut ed.wins[w].cs, text.Cursor { pos: p, goal_col: 0, anchor: p })
+            i += 1
+        }
+        text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+        return mode_enter(mut ed, MODE_I)
+    }
+    finish_action(mut ed, w, first, change)
+}
+
+/// `ed.sel.delete` (`yew_sel_cmd_delete`, `sel_actions.c:454-457`).
+pub fn sc_delete(mut ed: Ed, cx: CmdCtx) -> int {
+    delete_or_change(mut ed, cx, false, 0)
+}
+
+/// `ed.sel.change` (`yew_sel_cmd_change`, `sel_actions.c:476-479`): the
+/// delete, then I.
+pub fn sc_change(mut ed: Ed, cx: CmdCtx) -> int {
+    delete_or_change(mut ed, cx, true, 0)
+}
+
+// `prompt_cut` (`sel_actions.c:481-511`): the prompt's cut keeps the
+// prompt open and E.
+fn prompt_cut(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = cx.win
+    let (has, sp) = prompt_selection(ed)
+    if !has {
+        return CMD_OK
+    }
+    let value = capture_selection(ed, w)
+    var edits = List[SelEdit]()
+    let _ = sel_edit_push(mut edits, sp)
+    let (ok, first) = sel_apply_edits(mut ed, cx, edits)
+    if ok {
+        text.reg_delete(mut ed.regs, '+' as int, value)
+        sa_cursor_place(mut ed, w, first)
+        collapse_all(mut ed, w)
+    }
+    if ok then CMD_OK else CMD_ERR_IO
+}
+
+/// `ed.clip.cut` (`yew_sel_cmd_clip_cut`, `sel_actions.c:513-527`): yank
+/// to `+`, then delete — the two steps, never a third capture path.
+pub fn sc_clip_cut(mut ed: Ed, cx: CmdCtx) -> int {
+    var here = copy cx
+    if here.win < 0 {
+        here.win = ed.win
+    }
+    let reach = clip_scope(ed, here)
+    if reach != CLIP_ACT {
+        return if reach == CLIP_INERT then CMD_OK else CMD_ERR_STATE
+    }
+    if ed.mode != MODE_H {
+        return prompt_cut(mut ed, here)
+    }
+    delete_or_change(mut ed, here, false, '+' as int)
+}
+
+// `yew_cmdline_clean` (`cmdline.c:297-312`) over `sanitize_bytes`
+// (`cmdline.c:262-277`): into the prompt a NUL refuses and every run of
+// newlines is one space; anywhere else the bytes pass as they are.
+fn prompt_clean(mut ed: Ed, w: int, bytes: List[byte]) -> (bool, List[byte]) {
+    if !ed.cmdline.active || w != cmdline_target(ed) {
+        return (true, copy bytes)
+    }
+    for b in bytes {
+        if b as int == 0 {
+            ed_msg(mut ed, MSG_ERROR, "NUL byte is not valid in a command line")
+            return (false, List[byte]())
+        }
+    }
+    var out = List[byte]()
+    var newline_run = false
+    for b in bytes {
+        let c = b as int
+        if c == 10 || c == 13 {
+            if !newline_run {
+                (mut out).push(32 as byte)
+            }
+            newline_run = true
+        } else {
+            (mut out).push(b)
+            newline_run = false
+        }
+    }
+    (true, out)
+}
+
+/// `ed.clip.paste` (`yew_sel_cmd_clip_paste`, `sel_actions.c:529-597`):
+/// the system clipboard replaces every H selection, or is inserted at
+/// every caret.
+pub fn sc_clip_paste(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, _, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let read_max = ed.regs.clip_read_max
+    text.clip_set_read_max(mut ed.regs.clip, read_max)
+    var value = text.regval_new()
+    let readable = text.clip_read(mut ed.regs.clip, mut value, '+' as int)
+    if readable {
+        ed.regs.system = value
+    }
+    if !readable {
+        ed_msg(mut ed, MSG_ERROR, "system clipboard is not readable")
+        return CMD_ERR_STATE
+    }
+    if ed.regs.system.bytes.len == 0 {
+        ed_msg(mut ed, MSG_WARN, "system clipboard is empty")
+        return CMD_ERR_STATE
+    }
+    let source = copy ed.regs.system.bytes
+    let (clean_ok, bytes) = prompt_clean(mut ed, w, source)
+    if !clean_ok {
+        return CMD_ERR_ARG
+    }
+    let replace = ed.mode == MODE_H
+    var spans = List[text.Span]()
+    if replace {
+        spans = all_selection_spans(ed, w)
+    } else {
+        for c in ed.wins[w].cs.curs {
+            (mut spans).push(text.span(c.pos, c.pos))
+        }
+    }
+    var edits = List[SelEdit]()
+    for sp in spans {
+        let at = sel_edit_push(mut edits, sp)
+        for byte_value in bytes {
+            (mut edits[at].replacement).push(byte_value)
+        }
+    }
+    let (applied, first) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    if replace {
+        return finish_action(mut ed, w, first, false)
+    }
+    collapse_all(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.sel.all` (`yew_sel_cmd_all`, `sel_actions.c:599-638`): H over the
+/// character unit, ONE selection of the whole buffer.
+pub fn sc_all(mut ed: Ed, cx: CmdCtx) -> int {
     let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: ed.sel.rect_append (yw03-hmode)")
-    CMD_ERR_DEFERRED
+    if ed.win < 0 || ed.wins[ed.win].cs.curs.len == 0 || !ed.bufs[ed.wins[ed.win].buf].resident {
+        return CMD_ERR_STATE
+    }
+    let status = mode_enter_highlight(mut ed, MODE_I, false)
+    if status != CMD_OK {
+        return status
+    }
+    let w = ed.win
+    let b = ed.wins[w].buf
+    ed.wins[w].h.kind = SEL_CHAR
+    text.cset_remove_all_but_primary(mut ed.wins[w].cs)
+    ed.wins[w].cs.curs[0].anchor = 0
+    ed.wins[w].cs.curs[0].pos = text.textbuf_len(ed.bufs[b].ec.tb)
+    ed.wins[w].cs.curs[0].goal_col = text.CCOL_EOL
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    ed_damage_document(mut ed)
+    CMD_OK
+}
+
+// `change_case` (`sel_actions.c:640-679`): every selection's codepoints
+// through the locale-neutral full mapping.
+fn change_case(mut ed: Ed, cx: CmdCtx, kind: int) -> int {
+    let (ok, w, b, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let spans = all_selection_spans(ed, w)
+    var edits = List[SelEdit]()
+    for sp in spans {
+        let at = sel_edit_push(mut edits, sp)
+        let source = sel_copy_span(ed.bufs[b].ec.tb, sp)
+        var i = 0
+        while i < source.len {
+            let (cp, used) = unicode.utf8_decode(source, i, source.len)
+            let _ = unicode.case_map_utf8(cp, kind, mut edits[at].replacement)
+            i += used
+        }
+    }
+    let (applied, first) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    finish_action(mut ed, w, first, false)
+}
+
+/// `ed.sel.case_upper` (`sel_actions.c:681-684`).
+pub fn sc_case_upper(mut ed: Ed, cx: CmdCtx) -> int {
+    change_case(mut ed, cx, unicode.CASE_UPPER)
+}
+
+/// `ed.sel.case_lower` (`sel_actions.c:686-689`).
+pub fn sc_case_lower(mut ed: Ed, cx: CmdCtx) -> int {
+    change_case(mut ed, cx, unicode.CASE_LOWER)
+}
+
+/// `ed.sel.case_toggle` (`sel_actions.c:691-694`).
+pub fn sc_case_toggle(mut ed: Ed, cx: CmdCtx) -> int {
+    change_case(mut ed, cx, unicode.CASE_TOGGLE)
+}
+
+// `covered_lines` (`sel_actions.c:696-707`).
+fn covered_lines(tb: text.TextBuf, c: text.Cursor) -> (int, int) {
+    let lo = if c.pos < c.anchor then c.pos else c.anchor
+    let hi = if c.pos > c.anchor then c.pos else c.anchor
+    (
+        text.textbuf_line_of(tb, lo as text.ByteOff) as int,
+        text.textbuf_line_of(tb, hi as text.ByteOff) as int,
+    )
+}
+
+// `indent_action` (`sel_actions.c:709-795`): one indent unit added at, or
+// removed from, the start of every covered line, once per line however
+// many cursors cover it; a tab-led line gains or loses a tab.
+fn indent_action(mut ed: Ed, cx: CmdCtx, dedent: bool) -> int {
+    let (ok, w, b, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let line_count = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    var covered = List[bool]()
+    var k = 0
+    while k < line_count {
+        (mut covered).push(false)
+        k += 1
+    }
+    var first = line_count
+    var last = 0
+    for c in ed.wins[w].cs.curs {
+        let (lo, hi) = covered_lines(ed.bufs[b].ec.tb, c)
+        if lo < first {
+            first = lo
+        }
+        if hi > last {
+            last = hi
+        }
+        var line = lo
+        while line <= hi {
+            covered[line] = true
+            line += 1
+        }
+    }
+    let tabwidth = if ed.bufs[b].tabwidth == 0 then 4 else ed.bufs[b].tabwidth
+    var edits = List[SelEdit]()
+    var line = first
+    while line <= last {
+        if covered[line] {
+            let sp = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+            if dedent {
+                var end = sp.lo
+                if end < sp.hi && text_byte(ed.bufs[b].ec.tb, end) == 9 {
+                    end += 1
+                } else {
+                    var n = 0
+                    while end < sp.hi && n < tabwidth && text_byte(ed.bufs[b].ec.tb, end) == 32 {
+                        end += 1
+                        n += 1
+                    }
+                }
+                if end != sp.lo {
+                    let _ = sel_edit_push(mut edits, text.span(sp.lo, end))
+                }
+            } else {
+                let at = sel_edit_push(mut edits, text.span(sp.lo, sp.lo))
+                if sp.lo < sp.hi && text_byte(ed.bufs[b].ec.tb, sp.lo) == 9 {
+                    (mut edits[at].replacement).push(9 as byte)
+                } else {
+                    var left = tabwidth
+                    while left != 0 {
+                        (mut edits[at].replacement).push(32 as byte)
+                        left -= 1
+                    }
+                }
+            }
+        }
+        line += 1
+    }
+    let collapse = text.textbuf_line_start(ed.bufs[b].ec.tb, first as text.LineNo) as int
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    finish_action(mut ed, w, collapse, false)
+}
+
+/// `ed.sel.indent` (`sel_actions.c:797-800`).
+pub fn sc_indent(mut ed: Ed, cx: CmdCtx) -> int {
+    indent_action(mut ed, cx, false)
+}
+
+/// `ed.sel.dedent` (`sel_actions.c:802-805`).
+pub fn sc_dedent(mut ed: Ed, cx: CmdCtx) -> int {
+    indent_action(mut ed, cx, true)
+}
+
+// `line_content_end` (`sel_actions.c:807-818`): a line's end before its
+// LF or CRLF.
+fn sa_line_content_end(tb: text.TextBuf, line: int) -> int {
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    var end = sp.hi
+    if end != sp.lo && text_byte(tb, end - 1) == 10 {
+        end -= 1
+        if end != sp.lo && text_byte(tb, end - 1) == 13 {
+            end -= 1
+        }
+    }
+    end
+}
+
+// `join_punct` (`sel_actions.c:820-824`).
+fn join_punct(byte_value: int) -> bool {
+    byte_value == 41 || byte_value == 46 || byte_value == 44 || byte_value == 59
+}
+
+/// `ed.sel.join` (`yew_sel_cmd_join`, `sel_actions.c:826-876`): each
+/// multi-line selection's lines as one, every whitespace run one space
+/// (none before `)` `.` `,` `;`).
+pub fn sc_join(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    var edits = List[SelEdit]()
+    var collapse = 0
+    for c in ed.wins[w].cs.curs {
+        let (first, last) = covered_lines(ed.bufs[b].ec.tb, c)
+        if first == last {
+            continue
+        }
+        let lo = text.textbuf_line_start(ed.bufs[b].ec.tb, first as text.LineNo) as int
+        let hi = sa_line_content_end(ed.bufs[b].ec.tb, last)
+        if edits.len != 0 && lo < edits[edits.len - 1].span.hi {
+            continue
+        }
+        let source = sel_copy_span(ed.bufs[b].ec.tb, text.span(lo, hi))
+        let at = sel_edit_push(mut edits, text.span(lo, hi))
+        var pending_space = false
+        for byte_value in source {
+            let c8 = byte_value as int
+            if c8 == 32 || c8 == 9 || c8 == 13 || c8 == 10 {
+                pending_space = edits[at].replacement.len != 0
+                continue
+            }
+            if pending_space && !join_punct(c8) {
+                (mut edits[at].replacement).push(32 as byte)
+            }
+            pending_space = false
+            (mut edits[at].replacement).push(byte_value)
+        }
+        if edits.len == 1 {
+            collapse = lo
+        }
+    }
+    if edits.len == 0 {
+        collapse = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    }
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    finish_action(mut ed, w, collapse, false)
+}
+
+/// `ed.sel.replace_char` (`yew_sel_cmd_replace_char`,
+/// `sel_actions.c:878-912`): every grapheme of every selection becomes
+/// `sarg`, which must be one grapheme.
+pub fn sc_replace_char(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, _) = action_context(ed, cx)
+    let with = cx.sarg.bytes()
+    if !ok ||
+        !cx.has_sarg ||
+        with.len == 0 ||
+        unicode.gb_next_bytes(with, with.len, 0) != with.len {
+        return CMD_ERR_ARG
+    }
+    let spans = all_selection_spans(ed, w)
+    var edits = List[SelEdit]()
+    for sp in spans {
+        let at = sel_edit_push(mut edits, sp)
+        let source = sel_copy_span(ed.bufs[b].ec.tb, sp)
+        var i = 0
+        while i < source.len {
+            let next = unicode.gb_next_bytes(source, source.len, i)
+            for byte_value in with {
+                (mut edits[at].replacement).push(byte_value)
+            }
+            i = next
+        }
+    }
+    let (applied, first) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    finish_action(mut ed, w, first, false)
+}
+
+// `shift_char_or_line` (`sel_actions.c:914-994`): each selection swapped
+// with the grapheme (character) or the line (line) beside it.
+fn shift_char_or_line(mut ed: Ed, cx: CmdCtx, right: bool) -> int {
+    let (ok, w, b, _) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    var edits = List[SelEdit]()
+    var collapse = 0
+    let kind = ed.wins[w].h.kind
+    let cursors = copy ed.wins[w].cs.curs
+    for item in cursors {
+        let selected = sel_span(ed.bufs[b].ec.tb, kind, item)
+        if selected.lo == selected.hi {
+            continue
+        }
+        var neighbor = text.span(0, 0)
+        if kind == SEL_LINE {
+            let (first, last) = covered_lines(ed.bufs[b].ec.tb, item)
+            let line_count = text.textbuf_line_count(ed.bufs[b].ec.tb)
+            if !right && first == 0 || right && last + 1 >= line_count {
+                continue
+            }
+            neighbor = if right {
+                text.textbuf_line_span(ed.bufs[b].ec.tb, (last + 1) as text.LineNo)
+            } else {
+                text.textbuf_line_span(ed.bufs[b].ec.tb, (first - 1) as text.LineNo)
+            }
+        } else if right {
+            if selected.hi >= text.textbuf_len(ed.bufs[b].ec.tb) {
+                continue
+            }
+            neighbor = text.span(
+                selected.hi,
+                text.grapheme_next_boundary(ed.bufs[b].ec.tb, selected.hi as text.ByteOff) as int,
+            )
+        } else {
+            if selected.lo == 0 {
+                continue
+            }
+            neighbor = text.span(
+                text.grapheme_prev_boundary(
+                    mut ed.bufs[b].ec.tb,
+                    selected.lo as text.ByteOff,
+                ) as int,
+                selected.lo,
+            )
+        }
+        let whole = if right {
+            text.span(selected.lo, neighbor.hi)
+        } else {
+            text.span(neighbor.lo, selected.hi)
+        }
+        if edits.len != 0 && whole.lo < edits[edits.len - 1].span.hi {
+            continue
+        }
+        let at = sel_edit_push(mut edits, whole)
+        if right {
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, neighbor)
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, selected)
+        } else {
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, selected)
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, neighbor)
+        }
+        if edits.len == 1 {
+            collapse = if right then selected.lo + (neighbor.hi - neighbor.lo) else neighbor.lo
+        }
+    }
+    if edits.len == 0 {
+        collapse = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    }
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    finish_action(mut ed, w, collapse, false)
+}
+
+// `shift_rect` (`sel_actions.c:996-1052`): each rectangle row swapped
+// with the grapheme beside it, within its line.
+fn shift_rect(mut ed: Ed, cx: CmdCtx, right: bool) -> int {
+    let (ok, w, b, ci) = action_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let spans = all_selection_spans(ed, w)
+    var edits = List[SelEdit]()
+    for selected in spans {
+        let line = text.textbuf_line_of(ed.bufs[b].ec.tb, selected.lo as text.ByteOff) as int
+        let end = sa_line_content_end(ed.bufs[b].ec.tb, line)
+        if selected.lo == selected.hi {
+            continue
+        }
+        var neighbor = text.span(0, 0)
+        var whole = text.span(0, 0)
+        if right {
+            if selected.hi >= end {
+                continue
+            }
+            neighbor = text.span(
+                selected.hi,
+                text.grapheme_next_boundary(ed.bufs[b].ec.tb, selected.hi as text.ByteOff) as int,
+            )
+            whole = text.span(selected.lo, neighbor.hi)
+        } else {
+            let start = text.textbuf_line_start(ed.bufs[b].ec.tb, line as text.LineNo) as int
+            if selected.lo <= start {
+                continue
+            }
+            neighbor = text.span(
+                text.grapheme_prev_boundary(
+                    mut ed.bufs[b].ec.tb,
+                    selected.lo as text.ByteOff,
+                ) as int,
+                selected.lo,
+            )
+            whole = text.span(neighbor.lo, selected.hi)
+        }
+        let at = sel_edit_push(mut edits, whole)
+        if right {
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, neighbor)
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, selected)
+        } else {
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, selected)
+            append_span(mut edits[at].replacement, ed.bufs[b].ec.tb, neighbor)
+        }
+    }
+    let first = if spans.len == 0 then ed.wins[w].cs.curs[ci].pos else spans[0].lo
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    finish_action(mut ed, w, first, false)
+}
+
+/// `ed.sel.shift_left` (`sel_actions.c:1054-1059`).
+pub fn sc_shift_left(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win >= 0 && cx.win < ed.wins.len && ed.wins[cx.win].h.kind == SEL_RECT {
+        return shift_rect(mut ed, cx, false)
+    }
+    shift_char_or_line(mut ed, cx, false)
+}
+
+/// `ed.sel.shift_right` (`sel_actions.c:1061-1066`).
+pub fn sc_shift_right(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win >= 0 && cx.win < ed.wins.len && ed.wins[cx.win].h.kind == SEL_RECT {
+        return shift_rect(mut ed, cx, true)
+    }
+    shift_char_or_line(mut ed, cx, true)
+}
+
+// `rect_carets` (`sel_actions.c:1068-1154`): one I-mode caret per
+// rectangle row at its left (insert) or right (append) column, a short
+// row padded with spaces out to it.
+fn rect_carets(mut ed: Ed, cx: CmdCtx, append: bool) -> int {
+    let (ok, w, b, _) = action_context(ed, cx)
+    if !ok || ed.wins[w].h.kind != SEL_RECT {
+        return CMD_ERR_STATE
+    }
+    let tabwidth = if ed.bufs[b].tabwidth == 0 then 4 else ed.bufs[b].tabwidth
+    var pads = List[SelEdit]()
+    var carets = List[text.Cursor]()
+    var delta = 0
+    let kind = ed.wins[w].h.kind
+    let cursors = copy ed.wins[w].cs.curs
+    for item in cursors {
+        let start = if item.pos < item.anchor then item.pos else item.anchor
+        let first_line = text.textbuf_line_of(ed.bufs[b].ec.tb, start as text.ByteOff) as int
+        let spans = sel_rect_spans(ed.bufs[b].ec.tb, kind, buf_tabw(ed, b), item)
+        let (covered, _, c0, c1) = sel_rect_row(
+            ed.bufs[b].ec.tb,
+            kind,
+            buf_tabw(ed, b),
+            item,
+            first_line,
+        )
+        if !covered {
+            continue
+        }
+        let target = if append then c1 else c0
+        var i = 0
+        while i < spans.len {
+            let line = first_line + i
+            let row = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+            let end = sa_line_content_end(ed.bufs[b].ec.tb, line)
+            let end_col = text.off_to_ccol(
+                ed.bufs[b].ec.tb,
+                row,
+                end as text.ByteOff,
+                tabwidth,
+            ) as int
+            let pad = if target > end_col then target - end_col else 0
+            var pos = 0
+            if pad != 0 {
+                let at = sel_edit_push(mut pads, text.span(end, end))
+                var left = pad
+                while left != 0 {
+                    (mut pads[at].replacement).push(32 as byte)
+                    left -= 1
+                }
+                pos = end + delta + pad
+                delta += pad
+            } else {
+                let at = if append then spans[i].hi else spans[i].lo
+                pos = at + delta
+            }
+            (mut carets).push(text.Cursor { pos: pos, goal_col: 0, anchor: pos })
+            i += 1
+        }
+    }
+    let (applied, _) = sel_apply_edits(mut ed, cx, pads)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    if carets.len == 0 {
+        return CMD_ERR_STATE
+    }
+    text.cset_remove_all_but_primary(mut ed.wins[w].cs)
+    ed.wins[w].cs.curs[0] = copy carets[0]
+    var i = 1
+    while i < carets.len {
+        let _ = text.cset_add(mut ed.wins[w].cs, copy carets[i])
+        i += 1
+    }
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    mode_enter(mut ed, MODE_I)
+}
+
+/// `ed.edit.rect.insert` (`sel_actions.c:1156-1159`).
+pub fn sc_rect_insert(mut ed: Ed, cx: CmdCtx) -> int {
+    rect_carets(mut ed, cx, false)
+}
+
+/// `ed.edit.rect.append` (`sel_actions.c:1161-1164`).
+pub fn sc_rect_append(mut ed: Ed, cx: CmdCtx) -> int {
+    rect_carets(mut ed, cx, true)
 }
