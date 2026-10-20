@@ -1,0 +1,1655 @@
+//! edit.cmdparse — the E-mode command grammar: tokens, expansions,
+//! quoting, ranges, the policies, name resolution and the point parser
+//! completion reads.
+//!
+//! Ports sagitta `src/ui/cmdparse.c` (1,375 lines) and `cmdparse.h` (90)
+//! at 9ace98c2, under `s18-cmdline.md` §5-§7 (the grammar, ranges,
+//! errors with the offending token), Sprint 19's `:!` (a bang body is ONE
+//! verbatim argument), Sprint 21's `:s`/`:g` bodies and `'a`/`/re/`
+//! addresses, and Sprint 57.18's point parser for bang bodies; and
+//! `yew_ed_invoke_parsed` (`edit/ed.c:1878-1925`), the bridge from a
+//! parse to an invocation. It lives in `edit` (it reads the `Ed`: the
+//! active buffer's path, cursor, selection and marks, and the registry).
+//!
+//! The wolf shapes, and why:
+//!
+//! - **The line is bytes** (`List[byte]`): C parses `const char *`, any
+//!   byte but NUL, and an argument or an error message may carry bytes
+//!   that are not UTF-8 (`:w \xff`, a `%s` selection), so `CmdParse.argv`
+//!   and `CmdErr.msg` are bytes too. `ed_invoke_parsed` hands a string
+//!   argument to `CmdCtx.sarg`, a `str` (yw03's registry): a non-UTF-8
+//!   argument is refused there by name until the context carries bytes.
+//! - **C's `Parser.err == NULL`** (errors no longer recorded, set by
+//!   `loose_name` after a failed range) is `Parser.err_on == false`; a
+//!   recorded error is `err.set`. Only `parse_range` reads the latter.
+//! - **The `/re/` and `?re?` addresses** search through Sprint 20's
+//!   engine (`cmdparse.c:412-487`). They go through ONE seam,
+//!   `cp_pattern_line`, which the regex and search halves of yw04 wire;
+//!   until then it refuses by name ("not yet ported: pattern addresses"),
+//!   never a guess at a line.
+//! - **A bang body's point** (Sprint 57.23 §5, `bang_point`,
+//!   `cmdparse.c:1199-1245`) is the shell context lexer's answer
+//!   (`ui/shctx.c`), the shell half of yw04. Until it is wired the point
+//!   says `bang_body` with the body's start and `has_shell == false`,
+//!   and `shell_refusal` names the lexer's sprint: a completer reading it
+//!   refuses rather than guesses.
+//! - C's line arithmetic is `i64` saturating at its ends; the port keeps
+//!   the same saturation with a `big` flag for a number past `int`'s
+//!   range (`parse_u64` saturates at `UINT64_MAX`).
+
+use text
+use util
+
+/// No range (`YEW_RANGE_NONE`, `cmd.h:17-23`).
+pub const RANGE_NONE: int = 0
+
+/// Lines `lo..hi`, inclusive.
+pub const RANGE_LINES: int = 1
+
+/// The whole buffer.
+pub const RANGE_BUFFER: int = 2
+
+/// The primary selection's lines (`'<,'>`).
+pub const RANGE_SELECTION: int = 3
+
+/// A range is refused (`YEW_RP_FORBID`, `cmd.h:40-47`).
+pub const RP_FORBID: int = 0
+
+/// A range is optional and none means none.
+pub const RP_OPT: int = 1
+
+/// None means the cursor's line.
+pub const RP_LINE: int = 2
+
+/// None means the whole buffer.
+pub const RP_BUFFER: int = 3
+
+/// A range is required.
+pub const RP_REQUIRED: int = 4
+
+// `INT64_MAX`, `INT64_MIN`.
+fn cp_i64_max() -> int {
+    9223372036854775807
+}
+
+fn cp_i64_min() -> int {
+    -9223372036854775807 - 1
+}
+
+// `UINT32_MAX`: an unbounded argument count (`argspec_bounds`).
+const CP_UNBOUNDED: int = 4294967295
+
+/// A parse error (`CmdErr`, `cmdparse.h:12-16`): the offending token's
+/// span and C's message (at most 127 bytes, `char msg[128]`); `set` is
+/// C's `msg[0] != '\0'`.
+pub struct CmdErr {
+    tok_lo: int,
+    tok_hi: int,
+    msg: List[byte],
+    set: bool,
+}
+
+/// No error.
+pub fn cmderr_new() -> CmdErr {
+    CmdErr { tok_lo: 0, tok_hi: 0, msg: List[byte](), set: false }
+}
+
+/// The message as text, for the message line: C draws the bytes; a byte
+/// that is not UTF-8 shows as U+FFFD here (the message line takes a
+/// `str`).
+pub fn cmderr_text(e: CmdErr) -> str {
+    cp_lossy(e.msg)
+}
+
+/// A parsed line (`CmdParse`, `cmdparse.h:18-26`): `argv[0]` is the
+/// command's full name, its arguments from 1; `arg_tok` their spans;
+/// `range_tok` is C's `CmdRange.tok`.
+pub struct CmdParse {
+    range: CmdRange,
+    range_tok: text.Span,
+    name_tok: text.Span,
+    argv: List[List[byte]],
+    arg_tok: List[text.Span],
+    command: int,
+    bang: bool,
+    err: CmdErr,
+}
+
+fn cp_parse_new() -> CmdParse {
+    CmdParse {
+        range: cp_range_none(),
+        range_tok: text.span(0, 0),
+        name_tok: text.span(0, 0),
+        argv: List[List[byte]](),
+        arg_tok: List[text.Span](),
+        command: 0,
+        bang: false,
+        err: cmderr_new(),
+    }
+}
+
+/// Where the caret is, for completion (`CmdParsePoint`,
+/// `cmdparse.h:28-75`). `body` is where a bang body starts (the port's:
+/// what the shell lexer is handed); `has_shell` says the shell context is
+/// attached, and `shell_refusal` why not.
+pub struct CmdParsePoint {
+    token: text.Span,
+    stem: List[byte],
+    token_index: int,
+    command: int,
+    command_known: bool,
+    name_tok: text.Span,
+    name: List[byte],
+    bang_body: bool,
+    body: int,
+    has_shell: bool,
+    shell_refusal: str,
+    range: CmdRange,
+    range_tok: text.Span,
+}
+
+/// An empty point (the shape `cmd_parse_point` fills).
+pub fn cmdparsepoint_new() -> CmdParsePoint {
+    CmdParsePoint {
+        token: text.span(0, 0),
+        stem: List[byte](),
+        token_index: 0,
+        command: 0,
+        command_known: false,
+        name_tok: text.span(0, 0),
+        name: List[byte](),
+        bang_body: false,
+        body: 0,
+        has_shell: false,
+        shell_refusal: "",
+        range: cp_range_none(),
+        range_tok: text.span(0, 0),
+    }
+}
+
+/// What `ed_invoke_parsed` runs (`YewCmdInvoke`, `edit/ed.h`).
+pub struct CmdInvoke {
+    range: CmdRange,
+    argv: List[List[byte]],
+    count: int,
+    bang: bool,
+    win: int,
+}
+
+fn cp_range_none() -> CmdRange {
+    CmdRange { kind: RANGE_NONE, lo: 0, hi: 0, given: false }
+}
+
+// `Parser` (`cmdparse.c:18-25`).
+struct CpParser {
+    line: List[byte],
+    len: int,
+    at: int,
+    err_on: bool,
+    err: CmdErr,
+}
+
+fn cp_parser(line: List[byte], len: int) -> CpParser {
+    CpParser { line: copy line, len: len, at: 0, err_on: true, err: cmderr_new() }
+}
+
+// `PartKind` (`cmdparse.c:27-31`).
+const PART_BARE: int = 0
+
+const PART_DOUBLE: int = 2
+
+fn cp_bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+    out
+}
+
+fn cp_cat(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn cp_cat_bytes(mut out: List[byte], b: List[byte]) {
+    for x in b {
+        (mut out).push(x)
+    }
+}
+
+fn cp_slice(s: List[byte], lo: int, hi: int) -> List[byte] {
+    if hi <= lo {
+        return List[byte]()
+    }
+    s[lo..hi]
+}
+
+fn cp_eq_str(b: List[byte], s: str) -> bool {
+    if b.len != s.len {
+        return false
+    }
+    var i = 0
+    while i < b.len {
+        if b[i] != s.bytes()[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `strncmp(candidate, name, strlen(name)) == 0`: `name` is a prefix.
+fn cp_str_has_prefix(candidate: str, name: List[byte]) -> bool {
+    if name.len > candidate.len {
+        return false
+    }
+    var i = 0
+    while i < name.len {
+        if candidate.bytes()[i] != name[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// The bytes as text: each byte that does not begin a valid UTF-8
+// sequence becomes U+FFFD (EF BF BD).
+fn cp_lossy(b: List[byte]) -> str {
+    var valid = true
+    let whole = str_from_utf8(b) else {
+        valid = false
+        ""
+    }
+    if valid {
+        return whole
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < b.len {
+        let c = b[i] as int
+        var n = 0
+        if c < 128 {
+            n = 1
+        } else if c >= 194 && c <= 223 {
+            n = 2
+        } else if c >= 224 && c <= 239 {
+            n = 3
+        } else if c >= 240 && c <= 244 {
+            n = 4
+        }
+        var ok = n != 0 && i + n <= b.len
+        if ok && n > 1 {
+            let piece = b[i..i + n]
+            let _ = str_from_utf8(piece) else {
+                ok = false
+                ""
+            }
+        }
+        if ok {
+            var k = 0
+            while k < n {
+                (mut out).push(b[i + k])
+                k += 1
+            }
+            i += n
+        } else {
+            (mut out).push(239 as byte)
+            (mut out).push(191 as byte)
+            (mut out).push(189 as byte)
+            i += 1
+        }
+    }
+    str_from_utf8(out) else ""
+}
+
+// `vsnprintf` into `char msg[128]`: at most 127 bytes.
+fn cp_cap_msg(msg: List[byte]) -> List[byte] {
+    if msg.len <= 127 {
+        return copy msg
+    }
+    msg[0..127]
+}
+
+// `set_error` (`cmdparse.c:33-55`): the first error wins; the span is
+// clamped inside the line (both 0 on an empty line).
+fn cp_set_error_b(mut p: CpParser, lo_in: int, hi_in: int, msg: List[byte]) {
+    if !p.err_on || p.err.set {
+        return
+    }
+    var lo = lo_in
+    var hi = hi_in
+    if p.len != 0 {
+        if lo >= p.len {
+            lo = p.len - 1
+        }
+        if hi <= lo {
+            hi = lo + 1
+        }
+        if hi > p.len {
+            hi = p.len
+        }
+    } else {
+        lo = 0
+        hi = 0
+    }
+    p.err.tok_lo = lo
+    p.err.tok_hi = hi
+    p.err.msg = cp_cap_msg(msg)
+    p.err.set = true
+}
+
+fn cp_set_error(mut p: CpParser, lo: int, hi: int, msg: str) {
+    cp_set_error_b(mut p, lo, hi, cp_bytes(msg))
+}
+
+fn cp_is_ws(c: int) -> bool {
+    c == 32 || c == 9
+}
+
+fn cp_skip_ws(mut p: CpParser) {
+    while p.at < p.len && cp_is_ws(p.line[p.at] as int) {
+        p.at += 1
+    }
+}
+
+fn cp_is_digit(c: int) -> bool {
+    c >= 48 && c <= 57
+}
+
+fn cp_is_alpha(c: int) -> bool {
+    c >= 65 && c <= 90 || c >= 97 && c <= 122
+}
+
+// The window a parse reads (`active_win`): the focused one; -1 none.
+fn cp_win(ed: Ed) -> int {
+    if ed.win >= 0 && ed.win < ed.wins.len then ed.win else -1
+}
+
+// The buffer a parse reads (`active_buffer`, `active_text`): the focused
+// window's, else the document's; -1 when the editor has none.
+fn cp_buf(ed: Ed) -> int {
+    let w = cp_win(ed)
+    if w >= 0 {
+        return ed.wins[w].buf
+    }
+    ed_doc(ed)
+}
+
+// The primary cursor of the parse's window, if there is one.
+fn cp_primary(ed: Ed) -> text.Cursor ! {none} {
+    let w = cp_win(ed)
+    if w < 0 || cp_buf(ed) < 0 {
+        return none
+    }
+    let n = ed.wins[w].cs.curs.len
+    let primary = ed.wins[w].cs.primary
+    if n == 0 || primary >= n {
+        return none
+    }
+    copy ed.wins[w].cs.curs[primary]
+}
+
+// `textbuf_line_count`, or 1 with no text (`tb == NULL ? 1U`).
+fn cp_line_count(ed: Ed) -> int {
+    let b = cp_buf(ed)
+    if b < 0 {
+        return 1
+    }
+    text.textbuf_line_count(ed.bufs[b].ec.tb)
+}
+
+// `display_name` (`cmdparse.c:116-124`).
+fn cp_display_name(ed: Ed, b: int) -> str {
+    if b < 0 || !ed.bufs[b].has_path || ed.bufs[b].path.len == 0 {
+        return "[No Name]"
+    }
+    let path = ed.bufs[b].path
+    let cut = path.rfind("/") else -1
+    if cut < 0 then path else path[cut + 1..]
+}
+
+// `append_dirname` (`cmdparse.c:126-142`).
+fn cp_append_dirname(mut out: List[byte], path: str) {
+    let cut = path.rfind("/") else -1
+    if cut < 0 {
+        (mut out).push(46 as byte)
+        return
+    }
+    var n = cut
+    while n > 1 && path.bytes()[n - 1] as int == 47 {
+        n -= 1
+    }
+    if n == 0 {
+        n = 1
+    }
+    cp_cat(mut out, path[0..n])
+}
+
+fn cp_has_path(ed: Ed, b: int) -> bool {
+    b >= 0 && ed.bufs[b].has_path && ed.bufs[b].path.len != 0
+}
+
+// `append_expansion` (`cmdparse.c:144-243`): `%` with its code at `at`
+// (the `%`); answers (ok, the next `at`).
+fn cp_append_expansion(mut ed: Ed, mut p: CpParser, at_in: int, mut out: List[byte]) -> (
+    bool,
+    int,
+) {
+    let b = cp_buf(ed)
+    let lo = at_in
+    var at = at_in + 1
+    if at >= p.len || cp_is_ws(p.line[at] as int) || p.line[at] as int == 34 {
+        if !cp_has_path(ed, b) {
+            cp_set_error(mut p, lo, lo + 1, "buffer has no file name")
+            return (false, at)
+        }
+        cp_cat(mut out, ed.bufs[b].path)
+        return (true, at)
+    }
+    let code = p.line[at] as int
+    at += 1
+    if code == 37 {
+        (mut out).push(37 as byte)
+        return (true, at)
+    }
+    if code == 104 {
+        let root = if ed.ws_dir.len != 0 then ed.ws_dir else "."
+        cp_cat(mut out, root)
+        return (true, at)
+    }
+    if code == 98 {
+        cp_cat(mut out, cp_display_name(ed, b))
+        return (true, at)
+    }
+    if code == 108 || code == 99 {
+        var value = 1
+        let cur = cp_primary(ed) else text.cursor_at(0 as text.ByteOff)
+        if cp_primary_valid(ed) {
+            let line = text.textbuf_line_of(ed.bufs[b].ec.tb, cur.pos as text.ByteOff)
+            if code == 108 {
+                value = line as int + 1
+            } else {
+                let span = text.textbuf_line_span(ed.bufs[b].ec.tb, line)
+                value = text.off_to_gcol(
+                    mut ed.bufs[b].ec.tb,
+                    span,
+                    cur.pos as text.ByteOff,
+                ) as int +
+                    1
+            }
+        }
+        cp_cat(mut out, "{value}")
+        return (true, at)
+    }
+    if code == 115 {
+        let before = out.len
+        let cur = cp_primary(ed) else text.cursor_at(0 as text.ByteOff)
+        if !cp_primary_valid(ed) || cur.anchor == cur.pos {
+            cp_set_error(mut p, lo, at, "%s needs a selection")
+            return (false, at)
+        }
+        let w = cp_win(ed)
+        let span = sel_span(ed.bufs[b].ec.tb, ed.wins[w].h.kind, cur)
+        let bytes = text.textbuf_bytes(ed.bufs[b].ec.tb)
+        var i = span.lo
+        while i < span.hi {
+            (mut out).push(bytes[i])
+            i += 1
+        }
+        var k = before
+        while k < out.len {
+            if out[k] as int == 0 {
+                cp_set_error(mut p, lo, at, "NUL byte is not valid in a command line")
+                return (false, at)
+            }
+            k += 1
+        }
+        return (true, at)
+    }
+    if code == 112 {
+        if !cp_has_path(ed, b) {
+            cp_set_error(mut p, lo, at, "buffer has no file name")
+            return (false, at)
+        }
+        let real = ed.bufs[b].ec.meta.realpath
+        if !ed.bufs[b].ec.has_meta || !ed.bufs[b].ec.meta.has_realpath || real.len == 0 {
+            cp_set_error(mut p, lo, at, "buffer has no file name")
+            return (false, at)
+        }
+        cp_cat(mut out, real)
+        return (true, at)
+    }
+    if code == 100 {
+        if !cp_has_path(ed, b) {
+            cp_set_error(mut p, lo, at, "buffer has no file name")
+            return (false, at)
+        }
+        cp_append_dirname(mut out, ed.bufs[b].path)
+        return (true, at)
+    }
+    var msg = cp_bytes("unknown expansion '%")
+    (mut msg).push(code as byte)
+    cp_cat(mut msg, "'")
+    cp_set_error_b(mut p, lo, at, msg)
+    (false, at)
+}
+
+fn cp_primary_valid(ed: Ed) -> bool {
+    let _ = cp_primary(ed) else {
+        return false
+    }
+    true
+}
+
+// `append_escape` (`cmdparse.c:245-283`): a backslash at `at`; answers
+// (ok, the next `at`).
+fn cp_append_escape(
+    mut p: CpParser,
+    at_in: int,
+    part: int,
+    tolerant: bool,
+    mut out: List[byte],
+) -> (bool, int) {
+    let lo = at_in
+    var at = at_in + 1
+    if at >= p.len {
+        if tolerant {
+            (mut out).push(92 as byte)
+            return (true, at)
+        }
+        cp_set_error(mut p, lo, lo + 1, "unknown escape '\\\\'")
+        return (false, at)
+    }
+    let c = p.line[at] as int
+    at += 1
+    if part == PART_BARE {
+        (mut out).push(c as byte)
+        return (true, at)
+    }
+    if c == 92 || c == 34 || c == 37 {
+        (mut out).push(c as byte)
+        return (true, at)
+    }
+    if c == 110 {
+        (mut out).push(10 as byte)
+        return (true, at)
+    }
+    if c == 116 {
+        (mut out).push(9 as byte)
+        return (true, at)
+    }
+    var msg = cp_bytes("unknown escape '\\")
+    (mut msg).push(c as byte)
+    cp_cat(mut msg, "'")
+    cp_set_error_b(mut p, lo, at, msg)
+    (false, at)
+}
+
+// `parse_token` (`cmdparse.c:285-370`): one argument up to whitespace or
+// `stop`; answers (ok, value, its span). False with no error when there
+// is nothing to take.
+fn cp_parse_token(mut ed: Ed, mut p: CpParser, tolerant: bool, stop: int) -> (
+    bool,
+    List[byte],
+    text.Span,
+) {
+    var out = List[byte]()
+    let start = p.at
+    var any = false
+    while p.at < stop && !cp_is_ws(p.line[p.at] as int) {
+        let c = p.line[p.at] as int
+        any = true
+        if c == 39 {
+            let quote = p.at
+            p.at += 1
+            while p.at < stop && p.line[p.at] as int != 39 {
+                (mut out).push(p.line[p.at])
+                p.at += 1
+            }
+            if p.at == stop {
+                if !tolerant {
+                    cp_set_error(mut p, quote, quote + 1, "unterminated '")
+                    return (false, List[byte](), text.span(0, 0))
+                }
+            } else {
+                p.at += 1
+            }
+        } else if c == 34 {
+            let quote = p.at
+            p.at += 1
+            while p.at < stop && p.line[p.at] as int != 34 {
+                let d = p.line[p.at] as int
+                if d == 92 {
+                    let (ok, next) = cp_append_escape(mut p, p.at, PART_DOUBLE, tolerant, mut out)
+                    p.at = next
+                    if !ok {
+                        return (false, List[byte](), text.span(0, 0))
+                    }
+                } else if d == 37 {
+                    let (ok, next) = cp_append_expansion(mut ed, mut p, p.at, mut out)
+                    p.at = next
+                    if !ok && !tolerant {
+                        return (false, List[byte](), text.span(0, 0))
+                    }
+                } else {
+                    (mut out).push(p.line[p.at])
+                    p.at += 1
+                }
+            }
+            if p.at == stop {
+                if !tolerant {
+                    cp_set_error(mut p, quote, quote + 1, "unterminated \"")
+                    return (false, List[byte](), text.span(0, 0))
+                }
+            } else {
+                p.at += 1
+            }
+        } else if c == 92 {
+            let (ok, next) = cp_append_escape(mut p, p.at, PART_BARE, tolerant, mut out)
+            p.at = next
+            if !ok {
+                return (false, List[byte](), text.span(0, 0))
+            }
+        } else if c == 37 {
+            let (ok, next) = cp_append_expansion(mut ed, mut p, p.at, mut out)
+            p.at = next
+            if !ok && !tolerant {
+                return (false, List[byte](), text.span(0, 0))
+            }
+        } else {
+            (mut out).push(p.line[p.at])
+            p.at += 1
+        }
+    }
+    if !any {
+        return (false, List[byte](), text.span(0, 0))
+    }
+    (true, out, text.span(start, p.at))
+}
+
+// `parse_u64` (`cmdparse.c:372-390`): digits at `at`; answers (ok, the
+// value, big, the next `at`), `big` when the value is past `INT64_MAX`
+// (C saturates at `UINT64_MAX`; every reader treats past `INT64_MAX`
+// alike).
+fn cp_parse_u64(s: List[byte], len: int, at_in: int) -> (bool, int, bool, int) {
+    var at = at_in
+    var n = 0
+    var big = false
+    while at < len && cp_is_digit(s[at] as int) {
+        let d = s[at] as int - 48
+        if !big {
+            if n > (cp_i64_max() - d) / 10 {
+                big = true
+            } else {
+                n = n * 10 + d
+            }
+        }
+        at += 1
+    }
+    if at == at_in {
+        return (false, 0, false, at)
+    }
+    (true, n, big, at)
+}
+
+// `cursor_line` (`cmdparse.c:392-404`): the primary cursor's line, 0
+// with none.
+fn cp_cursor_line(ed: Ed) -> int {
+    let cur = cp_primary(ed) else {
+        return 0
+    }
+    text.textbuf_line_of(ed.bufs[cp_buf(ed)].ec.tb, cur.pos as text.ByteOff) as int
+}
+
+// The line a pattern address names, or why there is none.
+fn cp_pattern_line(ed: Ed, pat: List[byte], close: int, from_line: int) -> int ! {
+    bad,
+    missing,
+    unported,
+} {
+    // THE seam for Sprint 21's pattern addresses (`cmdparse.c:412-487`):
+    // compile with the search options (`yew_search_compile`), search
+    // forward from the line after `from_line` (wrapping to 0) for `/`,
+    // backward from `from_line`'s start (wrapping from the end) for `?`,
+    // and answer the match's line. The regex engine is Sprint 20's and
+    // the search options Sprint 21's (yw04's regex and search halves);
+    // until they are wired here the address refuses by name.
+    let _ = ed.win
+    let _ = pat.len + close + from_line
+    unported
+}
+
+// `parse_address` (`cmdparse.c:406-532`): one address at `p.at`;
+// answers (ok, the line, its span). False with no error when no address
+// starts here.
+fn cp_parse_address(ed: Ed, mut p: CpParser) -> (bool, int, text.Span) {
+    let start = p.at
+    let count = cp_line_count(ed)
+    var line = 0
+    var relative = false
+    if p.at >= p.len {
+        return (false, 0, text.span(0, 0))
+    }
+    let c = p.line[p.at] as int
+    if cp_is_digit(c) {
+        let (ok, display, big, next) = cp_parse_u64(p.line, p.len, p.at)
+        p.at = next
+        if !ok {
+            return (false, 0, text.span(0, 0))
+        }
+        line = if big then cp_i64_max() else if display == 0 then -1 else display - 1
+    } else if c == 46 {
+        p.at += 1
+        line = cp_cursor_line(ed)
+    } else if c == 36 {
+        p.at += 1
+        line = if count == 0 then 0 else count - 1
+    } else if c == 43 || c == 45 {
+        line = cp_cursor_line(ed)
+        relative = true
+    } else if c == 39 &&
+        p.at + 1 < p.len &&
+        p.line[p.at + 1] as int >= 97 &&
+        p.line[p.at + 1] as int <= 122 {
+        // Sprint 21 §7: `'a` through the buffer's 26-slot name table; an
+        // unset name is an error naming the mark, never a silent line 0.
+        let name = p.line[p.at + 1] as int
+        let b = cp_buf(ed)
+        p.at += 2
+        let at = ed_mark_get(ed, b, name) else {
+            cp_set_error(mut p, start, p.at, "mark not set")
+            return (false, 0, text.span(0, 0))
+        }
+        line = text.textbuf_line_of(ed.bufs[b].ec.tb, at as text.ByteOff) as int
+    } else if c == 47 || c == 63 {
+        let close = c
+        p.at += 1
+        let pat_lo = p.at
+        while p.at < p.len && p.line[p.at] as int != close {
+            if p.line[p.at] as int == 92 && p.at + 1 < p.len {
+                p.at += 1
+            }
+            p.at += 1
+        }
+        let pat_hi = p.at
+        if p.at < p.len {
+            p.at += 1
+        }
+        if cp_buf(ed) < 0 || pat_hi <= pat_lo {
+            cp_set_error(mut p, start, p.at, "empty pattern address")
+            return (false, 0, text.span(0, 0))
+        }
+        let from_line = cp_cursor_line(ed)
+        line = cp_pattern_line(
+            ed,
+            cp_slice(p.line, pat_lo, pat_hi),
+            close,
+            from_line,
+        ) else |e| match e {
+            bad => {
+                cp_set_error(mut p, start, p.at, "bad pattern in address")
+                return (false, 0, text.span(0, 0))
+            },
+            missing => {
+                cp_set_error(mut p, start, p.at, "pattern not found")
+                return (false, 0, text.span(0, 0))
+            },
+            unported => {
+                cp_set_error(
+                    mut p,
+                    start,
+                    p.at,
+                    "not yet ported: pattern addresses: sagitta Sprint 21 (search) (yw04)",
+                )
+                return (false, 0, text.span(0, 0))
+            },
+        }
+    } else {
+        return (false, 0, text.span(0, 0))
+    }
+    let base_end = p.at
+    loop {
+        var sign = 0
+        if relative {
+            sign = p.line[p.at] as int
+            p.at += 1
+            relative = false
+        } else if p.at < p.len && (p.line[p.at] as int == 43 || p.line[p.at] as int == 45) {
+            sign = p.line[p.at] as int
+            p.at += 1
+        } else {
+            break
+        }
+        var amount = 1
+        var big = false
+        if p.at < p.len && cp_is_digit(p.line[p.at] as int) {
+            let (_, n, b, next) = cp_parse_u64(p.line, p.len, p.at)
+            amount = n
+            big = b
+            p.at = next
+        }
+        if big {
+            line = if sign == 43 then cp_i64_max() else cp_i64_min()
+        } else if sign == 43 {
+            line = if line > cp_i64_max() - amount then cp_i64_max() else line + amount
+        } else {
+            line = if line < cp_i64_min() + amount then cp_i64_min() else line - amount
+        }
+        if p.at >= p.len {
+            break
+        }
+    }
+    if p.at == start {
+        p.at = base_end
+    }
+    let tok = text.span(start, p.at)
+    if line < 0 || line >= count {
+        let shown = if line < 0 {
+            "0"
+        } else if line == cp_i64_max() {
+            "9223372036854775808"
+        } else {
+            "{line + 1}"
+        }
+        cp_set_error(mut p, start, p.at, "line {shown} past end of buffer ({count} lines)")
+        return (false, 0, tok)
+    }
+    (true, line, tok)
+}
+
+// `parse_range` (`cmdparse.c:534-633`): answers (ok, the range, its span).
+fn cp_parse_range(ed: Ed, mut p: CpParser) -> (bool, CmdRange, text.Span) {
+    let start = p.at
+    var range = cp_range_none()
+    if p.at >= p.len {
+        return (true, range, text.span(0, 0))
+    }
+    let count = cp_line_count(ed)
+    if p.line[p.at] as int == 37 {
+        p.at += 1
+        range.kind = RANGE_BUFFER
+        range.lo = 0
+        range.hi = if count == 0 then 0 else count - 1
+        range.given = true
+        return (true, range, text.span(start, p.at))
+    }
+    if p.at + 5 <= p.len && cp_has_lit(p.line, p.at, "'<,'>") {
+        p.at += 5
+        let cur = cp_primary(ed) else text.cursor_at(0 as text.ByteOff)
+        if !cp_primary_valid(ed) || cur.anchor == cur.pos {
+            cp_set_error(mut p, start, p.at, "'<,'> needs a selection")
+            return (false, range, text.span(0, 0))
+        }
+        let bi = cp_buf(ed)
+        let a = text.textbuf_line_of(ed.bufs[bi].ec.tb, cur.anchor as text.ByteOff) as int
+        let b = text.textbuf_line_of(ed.bufs[bi].ec.tb, cur.pos as text.ByteOff) as int
+        range.kind = RANGE_SELECTION
+        range.lo = if a < b then a else b
+        range.hi = if a > b then a else b
+        range.given = true
+        return (true, range, text.span(start, p.at))
+    }
+    let (ok_lo, lo, _) = cp_parse_address(ed, mut p)
+    if !ok_lo {
+        if p.err_on && p.err.set {
+            return (false, range, text.span(0, 0))
+        }
+        p.at = start
+        return (true, range, text.span(0, 0))
+    }
+    range.lo = lo
+    range.hi = lo
+    range.kind = RANGE_LINES
+    range.given = true
+    if p.at < p.len && p.line[p.at] as int == 44 {
+        p.at += 1
+        let (ok_hi, hi, _) = cp_parse_address(ed, mut p)
+        if !ok_hi {
+            if p.err_on && !p.err.set {
+                let lo_at = if p.at == p.len then p.at - 1 else p.at
+                cp_set_error(mut p, lo_at, p.at, "missing range address")
+            }
+            return (false, range, text.span(0, 0))
+        }
+        range.hi = hi
+    }
+    let tok = text.span(start, p.at)
+    if range.lo > range.hi {
+        cp_set_error(mut p, start, p.at, "backwards range ({range.lo + 1},{range.hi + 1})")
+        return (false, range, tok)
+    }
+    (true, range, tok)
+}
+
+fn cp_has_lit(s: List[byte], at: int, lit: str) -> bool {
+    if at + lit.len > s.len {
+        return false
+    }
+    var k = 0
+    while k < lit.len {
+        if s[at + k] != lit.bytes()[k] {
+            return false
+        }
+        k += 1
+    }
+    true
+}
+
+// `short_name` (`cmdparse.c:635-638`).
+fn cp_short_name(name: str) -> str {
+    if name.starts_with("ed.") then name[3..] else name
+}
+
+// "ambiguous: a, b, …" over at most six names.
+fn cp_ambiguous(names: List[str]) -> List[byte] {
+    var msg = cp_bytes("ambiguous: ")
+    var i = 0
+    while i < names.len && i < 6 {
+        if i != 0 {
+            cp_cat(mut msg, ", ")
+        }
+        cp_cat(mut msg, names[i])
+        i += 1
+    }
+    msg
+}
+
+// `resolve_name` (`cmdparse.c:640-723`): an abbreviation (exactly one),
+// then a full name (short or with `ed.`), then a unique prefix of a
+// short name; internal commands never. Answers the id, 0 with an error.
+fn cp_resolve_name(ed: Ed, mut p: CpParser, name: List[byte], tok: text.Span) -> int {
+    var exact_abbrev = 0
+    var exact_full = 0
+    var prefix = 0
+    var abbrev_matches = List[str]()
+    var matches = List[str]()
+    var i = 0
+    while i < ed.reg.entries.len {
+        let id = i + 1
+        if !ed.reg.entries[i].active || ed.reg.entries[i].flags & CMD_INTERNAL != 0 {
+            i += 1
+            continue
+        }
+        let full = ed.reg.entries[i].name
+        let candidate = cp_short_name(full)
+        if ed.reg.entries[i].has_abbrev && cp_eq_str(name, ed.reg.entries[i].abbrev) {
+            (mut abbrev_matches).push(candidate)
+            exact_abbrev = id
+        }
+        if (cp_eq_str(name, candidate) || cp_eq_str(name, full)) && exact_full == 0 {
+            exact_full = id
+        }
+        if cp_str_has_prefix(candidate, name) {
+            (mut matches).push(candidate)
+            prefix = id
+        }
+        i += 1
+    }
+    if abbrev_matches.len == 1 {
+        return exact_abbrev
+    }
+    if abbrev_matches.len > 1 {
+        cp_set_error_b(mut p, tok.lo, tok.hi, cp_ambiguous(abbrev_matches))
+        return 0
+    }
+    if exact_full != 0 {
+        return exact_full
+    }
+    if matches.len == 1 {
+        return prefix
+    }
+    if matches.len > 1 {
+        cp_set_error_b(mut p, tok.lo, tok.hi, cp_ambiguous(matches))
+    } else {
+        var msg = cp_bytes("unknown command '")
+        cp_cat_bytes(mut msg, name)
+        cp_cat(mut msg, "' (try Tab)")
+        cp_set_error_b(mut p, tok.lo, tok.hi, msg)
+    }
+    0
+}
+
+// `apply_policy` (`cmdparse.c:730-764`).
+fn cp_apply_policy(
+    ed: Ed,
+    mut p: CpParser,
+    e: CmdEntry,
+    mut range: CmdRange,
+    range_tok: text.Span,
+    name_tok: text.Span,
+) -> bool {
+    let count = cp_line_count(ed)
+    let name = cp_short_name(e.name)
+    if range.given {
+        if e.range_policy == RP_FORBID {
+            cp_set_error(mut p, range_tok.lo, range_tok.hi, ":{name} takes no range")
+            return false
+        }
+        return true
+    }
+    if e.range_policy == RP_REQUIRED {
+        cp_set_error(mut p, name_tok.lo, name_tok.hi, ":{name} requires a range")
+        return false
+    }
+    if e.range_policy == RP_LINE {
+        let current = cp_cursor_line(ed)
+        range.kind = RANGE_LINES
+        range.lo = current
+        range.hi = current
+    } else if e.range_policy == RP_BUFFER {
+        range.kind = RANGE_BUFFER
+        range.lo = 0
+        range.hi = if count == 0 then 0 else count - 1
+    }
+    true
+}
+
+// `argspec_bounds` (`cmdparse.c:766-795`): (min, max), max
+// `CP_UNBOUNDED` for a repeating spec.
+fn cp_argspec_bounds(e: CmdEntry) -> (int, int) {
+    let spec = e.argspec
+    let n = spec.len
+    if n == 0 {
+        return (0, 0)
+    }
+    let last_star = spec.bytes()[n - 1] as int == 42
+    if n > 1 || last_star {
+        let lo = if last_star then n - 1 else n
+        let hi = if last_star then CP_UNBOUNDED else n
+        return (lo, hi)
+    }
+    match e.arity {
+        0 => (0, 0),
+        3 => (0, 1),
+        4 => (0, 1),
+        _ => (1, 1),
+    }
+}
+
+// `validate_arity` (`cmdparse.c:797-822`).
+fn cp_validate_arity(
+    mut p: CpParser,
+    e: CmdEntry,
+    nargs: int,
+    tokens: List[text.Span],
+    name_tok: text.Span,
+) -> bool {
+    let (least, most) = cp_argspec_bounds(e)
+    let name = cp_short_name(e.name)
+    if nargs < least {
+        let s = if least == 1 then "" else "s"
+        cp_set_error(mut p, name_tok.lo, name_tok.hi, ":{name} requires {least} argument{s}")
+        return false
+    }
+    if nargs > most {
+        let tok = copy tokens[most + 1]
+        if most == 0 {
+            cp_set_error(mut p, tok.lo, tok.hi, ":{name} takes no arguments")
+        } else {
+            let s = if most == 1 then "" else "s"
+            cp_set_error(mut p, tok.lo, tok.hi, ":{name} takes {most} argument{s}")
+        }
+        return false
+    }
+    true
+}
+
+// `finish_bang` (`cmdparse.c:824-861`): `:!cmd` and `:<range>!cmd`;
+// everything after the bang is ONE verbatim argument.
+fn cp_finish_bang(ed: Ed, mut p: CpParser, mut out: CmdParse, cmdname: str) -> bool {
+    var rest = p.at + 1
+    var n = p.len - rest
+    out.command = cmd_lookup(ed.reg, cmdname)
+    if out.command == 0 {
+        cp_set_error(mut p, p.at, p.at + 1, "{cmdname} is not registered")
+        return false
+    }
+    out.name_tok = text.span(p.at, p.at + 1)
+    while n != 0 && cp_is_ws(p.line[rest] as int) {
+        rest += 1
+        n -= 1
+    }
+    if n == 0 {
+        cp_set_error(mut p, p.at, p.at + 1, "{cmdname} needs a command")
+        return false
+    }
+    out.argv = List[List[byte]]()
+    (mut out.argv).push(cp_bytes(cmdname))
+    (mut out.argv).push(cp_slice(p.line, rest, p.len))
+    out.arg_tok = List[text.Span]()
+    (mut out.arg_tok).push(copy out.name_tok)
+    (mut out.arg_tok).push(text.span(rest, p.len))
+    true
+}
+
+// `finish_body` (`cmdparse.c:863-893`): `:s/pat/rep/flags` and `:g`, the
+// body from the delimiter on as one opaque argument.
+fn cp_finish_body(
+    ed: Ed,
+    mut p: CpParser,
+    mut out: CmdParse,
+    cmdname: str,
+    name_tok: text.Span,
+) -> bool {
+    let rest = p.at
+    out.command = cmd_lookup(ed.reg, cmdname)
+    if out.command == 0 {
+        cp_set_error(mut p, name_tok.lo, name_tok.hi, "{cmdname} is not registered")
+        return false
+    }
+    out.name_tok = copy name_tok
+    out.argv = List[List[byte]]()
+    (mut out.argv).push(cp_bytes(cmdname))
+    (mut out.argv).push(cp_slice(p.line, rest, p.len))
+    out.arg_tok = List[text.Span]()
+    (mut out.arg_tok).push(copy name_tok)
+    (mut out.arg_tok).push(text.span(rest, p.len))
+    true
+}
+
+// `finish_rest` (`cmdparse.c:895-909`): `:fl` owns the rest of the line.
+fn cp_finish_rest(
+    ed: Ed,
+    mut p: CpParser,
+    mut out: CmdParse,
+    cmdname: str,
+    name_tok: text.Span,
+) -> bool {
+    cp_skip_ws(mut p)
+    if p.at == p.len {
+        cp_set_error(mut p, name_tok.lo, name_tok.hi, ":fl needs Fletch source")
+        return false
+    }
+    cp_finish_body(ed, mut p, mut out, cmdname, name_tok)
+}
+
+fn cp_first_nul(line: List[byte]) -> int {
+    var i = 0
+    while i < line.len {
+        if line[i] as int == 0 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn cp_is_name_char(c: int) -> bool {
+    cp_is_alpha(c) || cp_is_digit(c) || c == 95 || c == 46
+}
+
+/// `yew_cmd_parse` (`cmdparse.c:911-1069`): parse one E-mode line. The
+/// answer's `err` is set exactly when it fails.
+pub fn cmd_parse(mut ed: Ed, line: List[byte]) -> CmdParse {
+    var out = cp_parse_new()
+    var p = cp_parser(line, line.len)
+    let ok = cp_parse_into(mut ed, mut p, mut out)
+    if !ok {
+        out.err = copy p.err
+        if !out.err.set {
+            // Every refusal above names itself; an unnamed one is a bug.
+            util.bug("cmd_parse", "a refused line carries no error")
+        }
+    }
+    out
+}
+
+/// `yew_cmd_parse` over a `str` line.
+pub fn cmd_parse_str(mut ed: Ed, line: str) -> CmdParse {
+    cmd_parse(mut ed, cp_bytes(line))
+}
+
+/// Did the parse succeed?
+pub fn cmd_parse_ok(r: CmdParse) -> bool {
+    !r.err.set
+}
+
+fn cp_parse_into(mut ed: Ed, mut p: CpParser, mut out: CmdParse) -> bool {
+    let len = p.len
+    let nul = cp_first_nul(p.line)
+    if nul >= 0 {
+        cp_set_error(mut p, nul, nul + 1, "NUL byte is not valid in a command line")
+        return false
+    }
+    cp_skip_ws(mut p)
+    if p.at < len && p.line[p.at] as int == 58 {
+        p.at += 1
+        cp_skip_ws(mut p)
+    }
+    if p.at < len && p.line[p.at] as int == 33 {
+        return cp_finish_bang(ed, mut p, mut out, "ed.shell.run")
+    }
+    let (rok, range, rtok) = cp_parse_range(ed, mut p)
+    if !rok {
+        return false
+    }
+    // G28: a struct of scalars answered beside a `mut` parameter is
+    // "from its region" (E1004); a fresh literal of its fields is not.
+    out.range = CmdRange { kind: range.kind, lo: range.lo, hi: range.hi, given: range.given }
+    out.range_tok = text.span(rtok.lo, rtok.hi)
+    cp_skip_ws(mut p)
+    if p.at < len && p.line[p.at] as int == 33 {
+        return cp_finish_bang(ed, mut p, mut out, "ed.shell.run")
+    }
+    let name_start = p.at
+    if p.at >= len || !(cp_is_alpha(p.line[p.at] as int) || p.line[p.at] as int == 95) {
+        cp_set_error(mut p, p.at, p.at + 1, "unknown command '' (try Tab)")
+        return false
+    }
+    p.at += 1
+    while p.at < len && cp_is_name_char(p.line[p.at] as int) {
+        p.at += 1
+    }
+    out.name_tok = text.span(name_start, p.at)
+    let typed = cp_slice(p.line, name_start, p.at)
+    var name = str_from_utf8(typed) else ""
+    if p.at < len && p.line[p.at] as int == 33 {
+        out.bang = true
+        p.at += 1
+        out.name_tok.hi = p.at
+    }
+    if p.at < len && !cp_is_ws(p.line[p.at] as int) {
+        if name == "s" {
+            let nt = copy out.name_tok
+            return cp_finish_body(ed, mut p, mut out, "ed.search.replace", nt)
+        }
+        if name == "g" {
+            let nt = copy out.name_tok
+            return cp_finish_body(ed, mut p, mut out, "ed.search.global", nt)
+        }
+        cp_set_error(mut p, name_start, p.at + 1, "unknown command '{name}' (try Tab)")
+        return false
+    }
+    if name == "fl" {
+        let nt = copy out.name_tok
+        return cp_finish_rest(ed, mut p, mut out, "ed.fl.eval", nt)
+    }
+    if name == "macro" {
+        cp_skip_ws(mut p)
+        if p.at == len {
+            cp_set_error(mut p, name_start, p.at, "macro requires edit, name, or reload")
+            return false
+        }
+        let (vok, verb, verb_tok) = cp_parse_token(mut ed, mut p, false, len)
+        if !vok {
+            cp_set_error(mut p, name_start, p.at, "macro requires edit, name, or reload")
+            return false
+        }
+        if !cp_eq_str(verb, "edit") && !cp_eq_str(verb, "name") && !cp_eq_str(verb, "reload") {
+            var msg = cp_bytes("unknown macro action '")
+            cp_cat_bytes(mut msg, verb)
+            cp_cat(mut msg, "'")
+            cp_set_error_b(mut p, verb_tok.lo, verb_tok.hi, msg)
+            return false
+        }
+        name = "ed.macro.{str_from_utf8(verb) else ""}"
+        out.name_tok.hi = verb_tok.hi
+    }
+    if name == "prof" {
+        cp_skip_ws(mut p)
+        if p.at == len {
+            name = "ed.prof.report"
+        } else {
+            let (pok, verb, verb_tok) = cp_parse_token(mut ed, mut p, false, len)
+            if !pok {
+                return false
+            }
+            let action = cp_prof_action(verb)
+            if action.len == 0 {
+                var msg = cp_bytes("unknown prof action '")
+                cp_cat_bytes(mut msg, verb)
+                cp_cat(mut msg, "'")
+                cp_set_error_b(mut p, verb_tok.lo, verb_tok.hi, msg)
+                return false
+            }
+            name = action
+            out.name_tok.hi = verb_tok.hi
+        }
+    }
+    if name == "r" {
+        var bang = p.at
+        while bang < len && cp_is_ws(p.line[bang] as int) {
+            bang += 1
+        }
+        if bang < len && p.line[bang] as int == 33 {
+            p.at = bang
+            return cp_finish_bang(ed, mut p, mut out, "ed.shell.read")
+        }
+    }
+    // The traditional spelling is an alias for Fletch's complete config
+    // reload; it takes no legacy file operand (`cmdparse.c:1043-1046`).
+    if name == "source" {
+        name = "config.reload"
+    }
+    let nt = copy out.name_tok
+    let id = cp_resolve_name(ed, mut p, cp_bytes(name), nt)
+    if id == 0 {
+        return false
+    }
+    out.command = id
+    let e = copy ed.reg.entries[id - 1]
+    var values = List[List[byte]]()
+    var tokens = List[text.Span]()
+    (mut values).push(cp_bytes(e.name))
+    (mut tokens).push(copy out.name_tok)
+    loop {
+        cp_skip_ws(mut p)
+        if p.at == len {
+            break
+        }
+        let (aok, arg, tok) = cp_parse_token(mut ed, mut p, false, len)
+        if !aok {
+            return false
+        }
+        (mut values).push(arg)
+        (mut tokens).push(tok)
+    }
+    let nt2 = copy out.name_tok
+    if !cp_validate_arity(mut p, e, values.len - 1, tokens, nt2) {
+        return false
+    }
+    let rt = copy out.range_tok
+    if !cp_apply_policy(ed, mut p, e, mut out.range, rt, nt2) {
+        return false
+    }
+    out.argv = values
+    out.arg_tok = tokens
+    true
+}
+
+// The `:prof` verbs (`cmdparse.c:999-1009`).
+fn cp_prof_action(verb: List[byte]) -> str {
+    if cp_eq_str(verb, "report") {
+        return "ed.prof.report"
+    }
+    if cp_eq_str(verb, "reset") {
+        return "ed.prof.reset"
+    }
+    if cp_eq_str(verb, "dump") {
+        return "ed.prof.dump"
+    }
+    if cp_eq_str(verb, "mark") {
+        return "ed.prof.mark"
+    }
+    if cp_eq_str(verb, "frames") {
+        return "ed.prof.frames"
+    }
+    ""
+}
+
+// `loose_name` (`cmdparse.c:1071-1104`): the command-name token up to the
+// caret, past a range when one parses (errors silenced when it does not);
+// answers (non-empty, the name, its span, the range, the range's span).
+fn cp_loose_name(ed: Ed, mut p: CpParser, cursor_in: int) -> (
+    bool,
+    List[byte],
+    text.Span,
+    CmdRange,
+    text.Span,
+) {
+    cp_skip_ws(mut p)
+    if p.at < p.len && p.line[p.at] as int == 58 {
+        p.at += 1
+        cp_skip_ws(mut p)
+    }
+    let (rok, range0, rtok0) = cp_parse_range(ed, mut p)
+    var range = range0
+    var rtok = rtok0
+    if !rok {
+        p.err_on = false
+        p.at = 0
+        range = cp_range_none()
+        rtok = text.span(0, 0)
+        cp_skip_ws(mut p)
+        if p.at < p.len && p.line[p.at] as int == 58 {
+            p.at += 1
+            cp_skip_ws(mut p)
+        }
+    }
+    cp_skip_ws(mut p)
+    let start = p.at
+    while p.at < p.len && !cp_is_ws(p.line[p.at] as int) && p.line[p.at] as int != 33 {
+        p.at += 1
+    }
+    var cursor = cursor_in
+    if cursor < start {
+        cursor = start
+    }
+    if cursor < p.at {
+        p.at = cursor
+    }
+    let tok = text.span(start, p.at)
+    let name = cp_slice(p.line, start, p.at)
+    (p.at > start, name, tok, range, rtok)
+}
+
+// `bang_body_start` (`cmdparse.c:1106-1167`): where a `:!` body starts —
+// `:!cmd`, `:%!cmd` (one `!` only after a range), `:!!cmd` (both `!`s
+// the prefix), `:r !cmd` and `:r! !cmd`; `:w! file` is the bang FLAG.
+fn cp_bang_body_start(
+    p: CpParser,
+    name: List[byte],
+    name_tok: text.Span,
+    range_given: bool,
+) -> int ! {none} {
+    var at = name_tok.hi
+    if name.len == 0 {
+        if at >= p.len || p.line[at] as int != 33 {
+            return none
+        }
+        at += 1
+        if !range_given && at < p.len && p.line[at] as int == 33 {
+            at += 1
+        }
+        return at
+    }
+    if !cp_eq_str(name, "r") {
+        return none
+    }
+    if at < p.len && p.line[at] as int == 33 {
+        at += 1
+    }
+    while at < p.len && cp_is_ws(p.line[at] as int) {
+        at += 1
+    }
+    if at >= p.len || p.line[at] as int != 33 {
+        return none
+    }
+    at + 1
+}
+
+// `bang_point` (`cmdparse.c:1199-1245`): the caret inside a bang body is
+// the shell context lexer's (Sprint 57.23 §5, `yew_shctx_at_env` over the
+// body with the job environment and the session's cwd, its span rebased
+// to prompt offsets). Not wired yet: the point names the body's start and
+// refuses by name, so a completer never guesses at a shell word.
+fn cp_bang_point(body: int, cursor: int, mut out: CmdParsePoint) {
+    out.bang_body = true
+    out.body = body
+    out.has_shell = false
+    out.shell_refusal = "not yet ported: the shell context lexer: sagitta Sprint 57.23 (yw04)"
+    out.token = text.span(cursor, cursor)
+    out.stem = List[byte]()
+    out.token_index = 0
+}
+
+/// `yew_cmd_bang_body` (`cmdparse.c:1247-1266`): where the `:!` body of a
+/// WHOLE line starts, by the point parser's routes; `none` when the line
+/// is not a bang command.
+pub fn cmd_bang_body(ed: Ed, line: List[byte]) -> int ! {none} {
+    if cp_first_nul(line) >= 0 {
+        return none
+    }
+    var p = cp_parser(line, line.len)
+    let (_, name, name_tok, range, _) = cp_loose_name(ed, mut p, line.len)
+    cp_bang_body_start(p, name, name_tok, range.given)?
+}
+
+/// `yew_cmd_parse_point` (`cmdparse.c:1268-1362`): the token under the
+/// caret at `cursor_in` (clamped to the line), with the command it
+/// belongs to; `none` for a line with a NUL.
+pub fn cmd_parse_point(mut ed: Ed, line: List[byte], cursor_in: int) -> CmdParsePoint ! {none} {
+    if cp_first_nul(line) >= 0 {
+        return none
+    }
+    let len = line.len
+    let cursor = if cursor_in > len then len else if cursor_in < 0 then 0 else cursor_in
+    var out = cmdparsepoint_new()
+    var p = cp_parser(line, len)
+    let (_, name, name_tok, range, rtok) = cp_loose_name(ed, mut p, cursor)
+    out.range = range
+    out.range_tok = rtok
+    out.name = copy name
+    out.name_tok = copy name_tok
+    var command = 0
+    if name.len != 0 {
+        // Its error is not this point's (C saves and restores `ignored`).
+        let was_on = p.err_on
+        let saved = copy p.err
+        p.err = cmderr_new()
+        command = cp_resolve_name(ed, mut p, name, name_tok)
+        p.err = saved
+        p.err_on = was_on
+    }
+    let body = cp_bang_body_start(p, name, name_tok, out.range.given) else -1
+    if body >= 0 && cursor >= body {
+        cp_bang_point(body, cursor, mut out)
+        out.command = command
+        out.command_known = command != 0
+        return out
+    }
+    if cursor <= name_tok.hi || p.at >= cursor {
+        out.token = copy name_tok
+        out.stem = copy name
+        out.token_index = 0
+        out.command = command
+        out.command_known = command != 0
+        return out
+    }
+    p.at = name_tok.hi
+    if p.at < len && p.line[p.at] as int == 33 {
+        p.at += 1
+    }
+    var index = 0
+    loop {
+        let before_ws = p.at
+        cp_skip_ws(mut p)
+        let token_start = p.at
+        if cursor <= token_start {
+            index += 1
+            out.token = text.span(cursor, cursor)
+            out.stem = List[byte]()
+            break
+        }
+        let (tok_ok, value, tok) = cp_parse_token(mut ed, mut p, true, cursor)
+        if !tok_ok {
+            out.token = text.span(cursor, cursor)
+            out.stem = List[byte]()
+            break
+        }
+        index += 1
+        if cursor <= p.at || p.at == len {
+            out.token = tok
+            out.stem = value
+            break
+        }
+        if p.at == before_ws {
+            break
+        }
+    }
+    out.token_index = if index == 0 then 1 else index
+    out.command = command
+    out.command_known = command != 0
+    out
+}
+
+/// `yew_range_span` (`cmdparse.c:1364-1375`): an already validated
+/// inclusive line range as bytes, the last line's EOL included.
+pub fn range_span(tb: text.TextBuf, range: CmdRange) -> text.Span {
+    if range.kind == RANGE_NONE || text.textbuf_len(tb) == 0 {
+        return text.span(0, 0)
+    }
+    let n = text.textbuf_line_count(tb)
+    if range.lo >= n || range.hi >= n || range.lo > range.hi {
+        return text.span(0, 0)
+    }
+    let last = text.textbuf_line_span(tb, range.hi as text.LineNo)
+    text.span(text.textbuf_line_start(tb, range.lo as text.LineNo) as int, last.hi)
+}
+
+// `strtoll(arg, &end, 10)` with C's acceptance: leading white space, a
+// sign, digits, nothing after; out of range is an error (ERANGE).
+fn cp_strtoll(b: List[byte]) -> int ! {invalid} {
+    var i = 0
+    while i < b.len && (b[i] as int == 32 || b[i] as int >= 9 && b[i] as int <= 13) {
+        i += 1
+    }
+    var neg = false
+    if i < b.len && (b[i] as int == 43 || b[i] as int == 45) {
+        neg = b[i] as int == 45
+        i += 1
+    }
+    let first = i
+    var n = 0
+    while i < b.len && cp_is_digit(b[i] as int) {
+        let d = b[i] as int - 48
+        if neg {
+            if n < (cp_i64_min() + d) / 10 {
+                return invalid
+            }
+            n = n * 10 - d
+        } else {
+            if n > (cp_i64_max() - d) / 10 {
+                return invalid
+            }
+            n = n * 10 + d
+        }
+        i += 1
+    }
+    if i == first || i != b.len {
+        return invalid
+    }
+    n
+}
+
+/// `yew_ed_invoke_parsed` (`ed.c:1878-1925`): run a parsed line's
+/// command with its argument read per the command's arity; the source is
+/// the command line.
+pub fn ed_invoke_parsed(mut ed: Ed, id: int, inv: CmdInvoke) -> int {
+    if !cmd_active(ed.reg, id) || inv.argv.len == 0 {
+        return CMD_ERR_ARG
+    }
+    let e = copy ed.reg.entries[id - 1]
+    var cx = cmdctx_new(inv.win, SRC_CMDLINE)
+    cx.range = copy inv.range
+    for a in inv.argv {
+        (mut cx.argv).push(cp_lossy(a))
+    }
+    cx.count = if inv.count > 0 && inv.count <= CP_UNBOUNDED then inv.count else 1
+    cx.count_given = inv.count > 0
+    cx.bang = inv.bang
+    let has_arg = inv.argv.len > 1
+    if e.arity == ARITY_STR || e.arity == ARITY_OPT_STR {
+        if has_arg {
+            let s = str_from_utf8(inv.argv[1]) else {
+                ed_msg(
+                    mut ed,
+                    MSG_ERROR,
+                    "not yet ported: a command argument that is not UTF-8 (CmdCtx.sarg is a str): sagitta Sprint 18 (the command line) (yw04)",
+                )
+                return CMD_ERR_DEFERRED
+            }
+            cx.sarg = s
+            cx.has_sarg = true
+        }
+    } else if e.arity == ARITY_INT || e.arity == ARITY_OPT_INT {
+        if has_arg {
+            cx.iarg = cp_strtoll(inv.argv[1]) else {
+                return CMD_ERR_ARG
+            }
+        }
+    }
+    ed_cmd_invoke(mut ed, id, mut cx)
+}
