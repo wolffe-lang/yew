@@ -1,0 +1,178 @@
+//! edit.job — the child-process layer (Sprint 19), as far as wolf 0.2.33
+//! lets it run.
+//!
+//! Ports sagitta `src/edit/job.c` (1,961 lines) and `job.h` (379) at
+//! 9ace98c2. This file holds the leaf half that needs no job pipe:
+//! `yew_shell_quote` (§9, `job.c:214-235`), the byte-boundary safety rule
+//! a streamed read obeys (§3, `job.c:125-210`), the state names and the
+//! shell's choice (`job.c:390-429`). The table, the spawn and the three
+//! consumption modes are `edit.jobs` (R-yw04-1).
+
+use unicode
+
+/// Concurrent jobs (`YEW_JOB_MAX`, `job.h:94-96`).
+pub const JOB_MAX: int = 32
+
+/// Max bytes drained per job per loop turn (`YEW_JOB_READ_BUDGET`,
+/// `job.h:97-113`).
+pub const JOB_READ_BUDGET: int = 65536
+
+/// One output line longer than this is split (`YEW_JOB_LINE_MAX`).
+pub const JOB_LINE_MAX: int = 1048576
+
+/// Max bytes held back for a cluster (`YEW_JOB_HOLD_MAX`).
+pub const JOB_HOLD_MAX: int = 64
+
+/// The region filter's deadline (`YEW_FILTER_TIMEOUT_MS`).
+pub const FILTER_TIMEOUT_MS: int = 5000
+
+/// SIGTERM → SIGKILL (`YEW_JOB_TERM_GRACE_MS`).
+pub const JOB_TERM_GRACE_MS: int = 200
+
+/// Mode (c)'s collection ceiling (`YEW_JOB_COLLECT_MAX`).
+pub const JOB_COLLECT_MAX: int = 67108864
+
+/// `YewJobState` (`job.h:121-128`).
+pub const JOB_RUNNING: int = 0
+
+/// The job exited with a status.
+pub const JOB_EXITED: int = 1
+
+/// The job ended by a signal.
+pub const JOB_SIGNALED: int = 2
+
+/// The job the program never started (exec failed: not exit 127, s19 DoD 3).
+pub const JOB_EXECFAIL: int = 3
+
+/// The job killed at its deadline.
+pub const JOB_TIMEOUT: int = 4
+
+/// The job cancelled by the user.
+pub const JOB_CANCELLED: int = 5
+
+/// `yew_job_state_name` (`job.c:390-409`).
+pub fn job_state_name(state: int) -> str {
+    match state {
+        0 => "running",
+        1 => "exited",
+        2 => "signaled",
+        3 => "exec-fail",
+        4 => "timeout",
+        5 => "cancelled",
+        _ => "?",
+    }
+}
+
+/// `yew_shell_quote` (`job.c:217-235`): the POSIX-sh single-quoted form
+/// of `s[at, end)` appended to `out`; every byte survives, invalid UTF-8
+/// too. Inside `'...'` sh takes every byte but `'` literally, so a quote
+/// closes, escapes and reopens.
+pub fn shell_quote_into(mut out: List[byte], s: List[byte], at: int, end: int) {
+    (mut out).push(39 as byte)
+    var i = at
+    while i < end {
+        if s[i] as int == 39 {
+            (mut out).push(39 as byte)
+            (mut out).push(92 as byte)
+            (mut out).push(39 as byte)
+            (mut out).push(39 as byte)
+        } else {
+            (mut out).push(s[i])
+        }
+        i += 1
+    }
+    (mut out).push(39 as byte)
+}
+
+/// `yew_shell_quote` of all of `s`, as a fresh buffer.
+pub fn shell_quote(s: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    shell_quote_into(mut out, s, 0, s.len)
+    out
+}
+
+fn jb_utf8_seq_len(b: int) -> int {
+    if b & 128 == 0 {
+        return 1
+    }
+    if b & 224 == 192 {
+        return 2
+    }
+    if b & 240 == 224 {
+        return 3
+    }
+    if b & 248 == 240 {
+        return 4
+    }
+    0
+}
+
+/// `last_lead` (`job.c:152-164`).
+fn jb_last_lead(b: List[byte], n: int) -> int {
+    var back = 0
+    while back < 4 && back < n {
+        let at = n - 1 - back
+        if b[at] as int & 192 != 128 {
+            return at
+        }
+        back += 1
+    }
+    n
+}
+
+/// `yew_job_safe_prefix` (`job.c:166-210`): the bytes of `b[0, n)` safe
+/// to append now; the tail waits for more or for EOF (§3's four rules).
+pub fn job_safe_prefix(b: List[byte], n: int, at_eof: bool) -> int {
+    if n == 0 {
+        return 0
+    }
+    if at_eof {
+        return n
+    }
+    var cut = n
+    let lead = jb_last_lead(b, n)
+    if lead < n {
+        let need = jb_utf8_seq_len(b[lead] as int)
+        if need > 1 && lead + need > n {
+            cut = lead
+        }
+    }
+    if cut == n && b[n - 1] as int == 10 {
+        return n
+    }
+    if cut != 0 {
+        let prev = unicode.gb_prev_bytes_exact(b, cut, cut)
+        if prev < cut {
+            cut = prev
+        }
+    }
+    if n - cut > JOB_HOLD_MAX {
+        return n
+    }
+    cut
+}
+
+/// `yew_job_shell` (`job.c:415-429`): `$SHELL`, the user database's
+/// shell, `/bin/sh`. C asks `getpwuid(getuid())`; wolf 0.2.33 has the uid
+/// (`os_uid`) but no user database (G37), so the port reads `/etc/passwd`
+/// by uid, named here.
+pub fn job_shell() -> str {
+    let sh = env_get("SHELL") else ""
+    if sh.len != 0 {
+        return sh
+    }
+    let uid = os_uid() else -1
+    if uid >= 0 {
+        let text = fs_read_text("/etc/passwd") else ""
+        for line in text.lines() {
+            let f = line.split(":")
+            if f.len >= 7 {
+                let u = f[2].to_int() else -1
+                if u == uid && f[6].len != 0 {
+                    return f[6]
+                }
+            }
+        }
+    }
+    "/bin/sh"
+}
