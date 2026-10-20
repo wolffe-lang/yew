@@ -469,8 +469,9 @@ buy and the one the port does not claim.
   child, the replica three ways, `osc52_frame`, the text fuzz at two
   seeds), and on macOS too: there the driver interposes the fault shim
   with `DYLD_INSERT_LIBRARIES` over the wolf binary and answers exactly
-  the linux lines (the step ran recorded in that run and is gated from
-  `789db88`'s successor on). The final run is the PR's.
+  the linux lines (the step runs RECORDED on macOS; no plant has seen it
+  red there, so the next lane that plants on macOS promotes it). The
+  final run is the PR's.
 - The plants (RULES §7, draft PRs closed unmerged, each on `a8f9236`):
   yew#8 (`da7eafb`, the journal record never written) seen red in run
   39393453647, oracle linux, "sagitta's kill9 driver over the port's
