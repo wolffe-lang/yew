@@ -1,0 +1,223 @@
+//! edit.invoke — THE invoke: every key, E-mode line, Fletch call and
+//! replay reaches a command through `ed_cmd_invoke`.
+//!
+//! Ports `yew_ed_invoke` (`ed.c:1699-1876`), `yew_ed_dispatch_resolved`
+//! (`ed.c:1678-1697`) and `yew_cmd_invoke` (`cmd.c:2200-2216`) at
+//! 9ace98c2, under `s13-keymap-engine.md` §3 and `s14-modes-L-I.md` §3:
+//! the undo law — a typing run in I mode is one transaction opened by its
+//! first insert and closed by the barrier (a newline, a paste, a motion,
+//! leaving I); every other buffer-changing command is one transaction of
+//! the reason that describes it; a failed command aborts what it opened —
+//! the multi-cursor fan-out for a buffer-changing command over a cursor
+//! set (`yew_mc_run`), and the `REPEATABLE` loop. The shadow (yw11), the
+//! readline keys' undo reasons (s57.21, yw04: their commands refuse by
+//! name, so no transaction of theirs is ever opened), the prompt's
+//! selection rule (s57.29, yw04) and the record tap (yw09) are later
+//! campaigns'.
+
+use text
+use util
+
+fn starts(s: str, p: str) -> bool {
+    s.starts_with(p)
+}
+
+/// `yew_ed_invoke` (`ed.c:1699-1876`).
+pub fn ed_cmd_invoke(mut ed: Ed, id: int, mut cx: CmdCtx) -> int {
+    if !cmd_active(ed.reg, id) {
+        return CMD_ERR_ARG
+    }
+    if cx.win < 0 {
+        cx.win = ed.win
+    }
+    ed.invoke_seq += 1
+    let name = ed.reg.entries[id - 1].name
+    let flags = ed.reg.entries[id - 1].flags
+    let changes = flags & CMD_CHANGES_BUFFER != 0
+    let edits_text = changes || name == "ed.edit.undo" || name == "ed.edit.redo"
+    let document_target = cx.win == ed.win
+    let multiple = changes && ed.model_ready && cx.win >= 0 && ed.wins[cx.win].cs.curs.len > 1
+    let durability_command = document_target && edits_text
+    let newline = ed.undo_break_on_newline && name == "ed.edit.insert.newline"
+    let shadow_accept = starts(name, "ed.shadow.accept_") || name == "ed.compl.accept"
+    let clipboard_paste = name == "ed.clip.paste"
+    let clipboard_cut = name == "ed.clip.cut"
+    let readline_yank = name == "ed.edit.kill.yank" || name == "ed.edit.kill.yank_pop"
+    let readline_kill = starts(name, "ed.edit.kill.") && !readline_yank
+    let readline_op = readline_yank ||
+        readline_kill ||
+        starts(name, "ed.edit.case.") ||
+        starts(name, "ed.edit.transpose.")
+    let started_in_insert = ed.mode == MODE_I
+    if durability_command && ed.durability_failed {
+        ed_msg(mut ed, MSG_ERROR, "crash journal failed; save or q! before continuing")
+        return CMD_ERR_IO
+    }
+    if started_in_insert &&
+        (!changes || newline || shadow_accept || clipboard_paste || readline_op) {
+        ed_insert_barrier(mut ed)
+    }
+    var opened = false
+    if changes && ed.model_ready {
+        if started_in_insert && !newline && !shadow_accept && !clipboard_paste && !readline_op {
+            if !ed.insert_txn {
+                ed_undo_begin(mut ed, cx.win, if multiple then text.TXN_MULTI else text.TXN_TYPE)
+                ed.insert_txn = true
+                opened = true
+            }
+        } else {
+            var why = text.TXN_TYPE
+            if shadow_accept || clipboard_paste || readline_yank {
+                why = text.TXN_PASTE
+            } else if clipboard_cut {
+                why = text.TXN_CUT
+            } else if multiple {
+                why = text.TXN_MULTI
+            } else if name == "ed.search.replace" {
+                why = text.TXN_REPLACE
+            } else if name.contains(".delete.") || readline_kill || name == "ed.edit.line.delete" {
+                why = text.TXN_ERASE
+            }
+            ed_undo_begin(mut ed, cx.win, why)
+            opened = true
+        }
+    }
+    let status = ed_dispatch_resolved(mut ed, id, mut cx)
+    if status == CMD_OK &&
+        document_target &&
+        ed.win >= 0 &&
+        (changes || durability_command || starts(name, "ed.move.") || starts(name, "ed.view.")) {
+        selstack_clear(mut ed.wins[ed.win])
+    }
+    if changes && ed.model_ready {
+        if status != CMD_OK && (opened || started_in_insert && ed.insert_txn) {
+            ed_undo_abort(mut ed, cx.win)
+            if started_in_insert {
+                ed.insert_txn = false
+            }
+        } else if !started_in_insert && ed.mode == MODE_I && !newline && opened {
+            if ed.win >= 0 && ed.wins[ed.win].cs.curs.len > 1 {
+                ed_undo_promote_multi(mut ed, cx.win)
+            }
+            ed.insert_txn = true
+        } else if (
+            !started_in_insert || newline || shadow_accept || clipboard_paste || readline_op
+        ) &&
+            opened {
+            ed_undo_end(mut ed, cx.win)
+        }
+        ed_finish_edit(mut ed, cx.win)
+    }
+    if durability_command && status == CMD_ERR_IO {
+        ed.durability_failed = true
+        ed_msg(mut ed, MSG_ERROR, "crash journal failed; save or q! before continuing")
+    }
+    ed.footer_dirty = true
+    status
+}
+
+/// `yew_ed_dispatch_resolved` (`ed.c:1678-1697`): a buffer-changing
+/// command over a cursor set runs once per cursor as one batch.
+pub fn ed_dispatch_resolved(mut ed: Ed, id: int, mut cx: CmdCtx) -> int {
+    if !cmd_active(ed.reg, id) {
+        return CMD_ERR_ARG
+    }
+    if cx.win < 0 {
+        cx.win = ed.win
+    }
+    let flags = ed.reg.entries[id - 1].flags
+    let multi = flags & CMD_CHANGES_BUFFER != 0 &&
+        ed.model_ready &&
+        cx.win >= 0 &&
+        ed.wins[cx.win].cs.curs.len > 1 &&
+        !cx.cursor_given &&
+        cx.range.kind == 0 &&
+        flags & CMD_MULTI_AGGREGATE == 0
+    if multi {
+        return mc_run(mut ed, cx.win, id, mut cx)
+    }
+    cmd_invoke(mut ed, id, mut cx)
+}
+
+/// `yew_cmd_invoke` (`cmd.c:2200-2216`): prepare, then run `count` times
+/// for a `REPEATABLE` command, stopping at the first failure.
+pub fn cmd_invoke(mut ed: Ed, id: int, mut cx: CmdCtx) -> int {
+    cx.invoked_id = id
+    let prep = cmd_prepare(mut ed.reg, id, cx)
+    if prep != CMD_OK {
+        return prep
+    }
+    let e_flags = ed.reg.entries[id - 1].flags
+    let n = if e_flags & CMD_REPEATABLE != 0 then cx.count else 1
+    var status = CMD_OK
+    var i = 0
+    while i < n && status == CMD_OK {
+        status = run_entry(mut ed, id, cx)
+        i += 1
+    }
+    status
+}
+
+// The handler kinds (`cmd.lu`).
+fn run_entry(mut ed: Ed, id: int, cx: CmdCtx) -> int {
+    let handler = ed.reg.entries[id - 1].handler
+    if handler == HANDLER_PROBE {
+        ed.reg.probe_calls += 1
+        ed.reg.probe_count = cx.count
+        ed.reg.probe_invoked_id = cx.invoked_id
+        return CMD_OK
+    }
+    if handler == HANDLER_PLUGIN {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            "not yet ported: {ed.reg.entries[id - 1].name}: sagitta Sprint 54 (plugins) (yw14)",
+        )
+        return CMD_ERR_DEFERRED
+    }
+    run_impl(mut ed, ed.reg.entries[id - 1].impl_id, id, cx)
+}
+
+/// The port's refusal for a command whose handler is not ported yet:
+/// the message, the log, C's deferred status.
+pub fn run_unported(mut ed: Ed, id: int) -> int {
+    let message = cmd_unported_message(ed.reg.entries[id - 1])
+    util.log_at(util.LOG_ERROR, message)
+    ed_msg(mut ed, MSG_ERROR, message)
+    CMD_ERR_DEFERRED
+}
+
+/// `ed.nop` (`cmd_nop`, `cmd.c:70-74`).
+pub fn cmd_nop_run(ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let _ = ed.mode
+    CMD_OK
+}
+
+/// `ed.shadow.dismiss` (`shadow_cmds.c:76-90`): no shadow is live before
+/// yw11, so it is the mode escape, as C's is with none live.
+pub fn shadow_dismiss_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let escape = cmd_lookup(ed.reg, "ed.mode.escape")
+    if escape == 0 {
+        bug("shadow dismiss: mode escape command is missing")
+    }
+    var again = copy cx
+    ed_cmd_invoke(mut ed, escape, mut again)
+}
+
+/// `ed.cmdline.accept`.
+pub fn cmdline_accept_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    cmdline_accept(mut ed)
+}
+
+/// `ed.cmdline.cancel` (`cmdline.c:3555-3600`): with no menu (yw04), the
+/// prompt closes.
+pub fn cmdline_cancel_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    cmdline_close(mut ed, false)
+    CMD_OK
+}
