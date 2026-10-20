@@ -1,0 +1,643 @@
+//! edit.keymap — the key trie with stacked layers.
+//!
+//! Ports sagitta `src/edit/keymap.c` (602 lines) and `keymap.h` (112) at
+//! 9ace98c2, under `s13-keymap-engine.md` §2. A key is a `KeyId` (`code
+//! << 16 | mods`); a binding row (`BindRow`) is a sequence of key atoms
+//! and a command NAME, built into a sorted-edge trie (`Keymap`): nodes,
+//! edges sorted by key for the binary-search step, bindings. The rows are
+//! DATA — the panic floor (`keys_default.c`), the H motions
+//! (`keys_highlight.c`), `runtime/init.fl`'s `bind` rows — through the
+//! one builder Fletch's `bind()` will reach in s36 (yw09).
+//!
+//! C's `KeyStack` holds pointers to keymaps owned by the `Ed`; the port's
+//! stack is a list of indices into a keymap pool (`List[Keymap]`) the
+//! caller owns, and C's visitor callback (`yew_keymap_visit`) is a listing
+//! the caller iterates (no function value, G19/G20).
+
+use term
+use unicode
+
+/// `YEW_CHORD_MAX` (`keymap.h:9`): the longest sequence.
+pub const CHORD_MAX: int = 8
+
+/// `YEW_LAYER_MAX` (`keymap.h:10`).
+pub const LAYER_MAX: int = 32
+
+const KEY_MODS: int = 15
+
+/// A bound command (`Binding`, `keymap.h:16-20`); C's `NULL` sarg is
+/// `has_sarg == false`.
+pub struct Binding {
+    cmd: int,
+    iarg: int,
+    sarg: str,
+    has_sarg: bool,
+}
+
+/// A trie edge (`KeyEdge`).
+pub struct KeyEdge {
+    key: int,
+    child: int,
+}
+
+/// A trie node (`KeyNode`): its edges `[edge_lo, edge_lo + edge_n)` and
+/// its binding (0: none; binding 0 is reserved).
+pub struct KeyNode {
+    edge_lo: int,
+    edge_n: int,
+    bind: int,
+}
+
+/// A built keymap (`Keymap`, `keymap.h:39-44`).
+pub struct Keymap {
+    nodes: List[KeyNode],
+    edges: List[KeyEdge],
+    binds: List[Binding],
+    name: str,
+}
+
+/// A row to build from (`BindRow`, `keymap.h:46-51`).
+pub struct BindRow {
+    seq: str,
+    cmd: str,
+    iarg: int,
+    sarg: str,
+    has_sarg: bool,
+}
+
+/// A row binding `seq` to `cmd` with no argument.
+pub fn bindrow(seq: str, cmd: str) -> BindRow {
+    BindRow { seq: seq, cmd: cmd, iarg: 0, sarg: "", has_sarg: false }
+}
+
+/// A row with a string argument.
+pub fn bindrow_s(seq: str, cmd: str, sarg: str) -> BindRow {
+    BindRow { seq: seq, cmd: cmd, iarg: 0, sarg: sarg, has_sarg: true }
+}
+
+/// A row with an integer argument.
+pub fn bindrow_i(seq: str, cmd: str, iarg: int) -> BindRow {
+    BindRow { seq: seq, cmd: cmd, iarg: iarg, sarg: "", has_sarg: false }
+}
+
+/// No error (`YewKeymapError`, `keymap.h:53-61`).
+pub const KEYMAP_ERR_NONE: int = 0
+
+/// A sequence that does not parse.
+pub const KEYMAP_ERR_SEQUENCE: int = 1
+
+/// A command the registry does not know.
+pub const KEYMAP_ERR_COMMAND: int = 2
+
+/// A sequence bound twice.
+pub const KEYMAP_ERR_DUPLICATE: int = 3
+
+/// Arguments that do not fit the command's arity.
+pub const KEYMAP_ERR_ARITY: int = 4
+
+/// `<esc>` before the last key.
+pub const KEYMAP_ERR_ESCAPE_PREFIX: int = 5
+
+/// More than eight keys.
+pub const KEYMAP_ERR_TOO_LONG: int = 6
+
+/// No match (`KeyMatch`, `keymap.h:71-76`).
+pub const MATCH_NONE: int = 0
+
+/// A prefix of a bound sequence.
+pub const MATCH_PREFIX: int = 1
+
+/// A bound sequence.
+pub const MATCH_FULL: int = 2
+
+/// Both a bound sequence and a prefix of a longer one.
+pub const MATCH_FULL_PREFIX: int = 3
+
+/// An empty keymap (C's zeroed `Keymap`).
+pub fn keymap_empty() -> Keymap {
+    Keymap {
+        nodes: List[KeyNode](),
+        edges: List[KeyEdge](),
+        binds: List[Binding](),
+        name: "",
+    }
+}
+
+fn key_name_code(name: str) -> int {
+    match name {
+        "left" => term.KEY_LEFT,
+        "right" => term.KEY_RIGHT,
+        "up" => term.KEY_UP,
+        "down" => term.KEY_DOWN,
+        "esc" => term.KEY_ESCAPE,
+        "cr" => term.KEY_ENTER,
+        "tab" => term.KEY_TAB,
+        "bs" => term.KEY_BACKSPACE,
+        "del" => term.KEY_DELETE,
+        "space" => 32,
+        "home" => term.KEY_HOME,
+        "end" => term.KEY_END,
+        "pgup" => term.KEY_PAGE_UP,
+        "pgdn" => term.KEY_PAGE_DOWN,
+        "ins" => term.KEY_INSERT,
+        "f1" => term.KEY_F1,
+        "f2" => term.KEY_F1 + 1,
+        "f3" => term.KEY_F1 + 2,
+        "f4" => term.KEY_F1 + 3,
+        "f5" => term.KEY_F1 + 4,
+        "f6" => term.KEY_F1 + 5,
+        "f7" => term.KEY_F1 + 6,
+        "f8" => term.KEY_F1 + 7,
+        "f9" => term.KEY_F1 + 8,
+        "f10" => term.KEY_F1 + 9,
+        "f11" => term.KEY_F1 + 10,
+        "f12" => term.KEY_F1 + 11,
+        "lt" => 60,
+        _ => -1,
+    }
+}
+
+// `key_name_format` (`keymap.c:93-102`): the first name in C's table
+// order whose code is `code`, or "".
+fn key_code_name(code: int) -> str {
+    let names = "left right up down esc cr tab bs del space home end pgup pgdn ins f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 lt"
+    for n in names.words() {
+        if key_name_code(n) == code {
+            return n
+        }
+    }
+    ""
+}
+
+fn code_control(code: int) -> bool {
+    code < 32 || code == 127
+}
+
+/// `yew_keyid` (`keymap.c:57-82`): a decoded key as a `KeyId`; a release
+/// is 0; a key's own text wins its code; C0 controls fold onto C-letter;
+/// shift is dropped from a printable that produced text.
+pub fn keyid(key: term.Key) -> int {
+    if key.ev == term.KEY_RELEASE {
+        return 0
+    }
+    var code = key.code
+    var mods = key.mods & KEY_MODS
+    if key.text.len != 0 {
+        let (cp, used) = unicode.utf8_decode(key.text, 0, key.text.len)
+        if used == key.text.len && !unicode.utf8_is_escape(cp) {
+            code = cp
+        }
+    }
+    if code >= 1 && code <= 26 {
+        code = 97 + code - 1
+        mods = mods | term.MOD_CTRL
+    }
+    if mods & term.MOD_CTRL != 0 && code >= 65 && code <= 90 {
+        code += 32
+    }
+    if key.text.len != 0 && !code_control(code) {
+        mods = mods - (mods & term.MOD_SHIFT)
+    }
+    code * 65536 + mods
+}
+
+/// The `KeyId` of a code and modifier set.
+pub fn keyid_of(code: int, mods: int) -> int {
+    code * 65536 + mods
+}
+
+/// A `KeyId`'s code.
+pub fn keyid_code(id: int) -> int {
+    id / 65536
+}
+
+/// A `KeyId`'s modifiers.
+pub fn keyid_mods(id: int) -> int {
+    id % 65536
+}
+
+// `parse_atom` (`keymap.c:104-161`): one key atom — modifier prefixes in
+// canonical C-A-S-M order, then `<name>` or one printable scalar.
+fn parse_atom(atom: str) -> (bool, int) {
+    let n = atom.len
+    var pos = 0
+    var mods = 0
+    let letters = "CASM"
+    var li = 0
+    while li < 4 {
+        let letter = letters.bytes()[li] as int
+        if pos + 2 <= n &&
+            atom.bytes()[pos] as int == letter &&
+            atom.bytes()[pos + 1] as int == 45 {
+            let bit = match li {
+                0 => term.MOD_CTRL,
+                1 => term.MOD_ALT,
+                2 => term.MOD_SHIFT,
+                _ => term.MOD_SUPER,
+            }
+            mods = mods | bit
+            pos += 2
+        }
+        li += 1
+    }
+    if pos == n {
+        return (false, 0)
+    }
+    if pos + 2 <= n && atom.bytes()[pos + 1] as int == 45 {
+        let c = atom.bytes()[pos] as int
+        if c == 67 || c == 65 || c == 83 || c == 77 {
+            return (false, 0)
+        }
+    }
+    var code = 0
+    var named = false
+    if atom.bytes()[pos] as int == 60 {
+        if n - pos < 3 || atom.bytes()[n - 1] as int != 62 {
+            return (false, 0)
+        }
+        code = key_name_code(atom[pos + 1..n - 1])
+        if code < 0 {
+            return (false, 0)
+        }
+        named = true
+    } else {
+        var bytes = List[byte]()
+        for b in atom[pos..].bytes() {
+            (mut bytes).push(b)
+        }
+        let (cp, used) = unicode.utf8_decode(bytes, 0, bytes.len)
+        if used != n - pos || unicode.utf8_is_escape(cp) || cp < 33 || cp == 127 || cp == 60 {
+            return (false, 0)
+        }
+        code = cp
+    }
+    if !named && code < term.KEY_BASE && mods & term.MOD_SHIFT != 0 {
+        if code >= 97 && code <= 122 {
+            code -= 32
+            mods = mods - (mods & term.MOD_SHIFT)
+        } else if mods & (term.MOD_CTRL | term.MOD_ALT | term.MOD_SUPER) == 0 {
+            mods = mods - (mods & term.MOD_SHIFT)
+        }
+    }
+    if mods & term.MOD_CTRL != 0 && code >= 65 && code <= 90 {
+        code += 32
+    }
+    (true, code * 65536 + mods)
+}
+
+/// `yew_key_parse_seq` (`keymap.c:163-185`): the atoms of `s`, separated
+/// by spaces, at most `max`; an empty list on any error.
+pub fn key_parse_seq(s: str, max: int) -> List[int] {
+    var out = List[int]()
+    if s.len == 0 || max <= 0 {
+        return out
+    }
+    var p = 0
+    let bytes_n = s.len
+    while p < bytes_n {
+        while p < bytes_n && s.bytes()[p] as int == 32 {
+            p += 1
+        }
+        if p == bytes_n {
+            return List[int]()
+        }
+        let start = p
+        while p < bytes_n && s.bytes()[p] as int != 32 {
+            p += 1
+        }
+        if out.len == max {
+            return List[int]()
+        }
+        let (ok, id) = parse_atom(s[start..p])
+        if !ok {
+            return List[int]()
+        }
+        (mut out).push(id)
+    }
+    out
+}
+
+/// `yew_key_format_seq` (`keymap.c:200-234`): `seq[0..n)` as text, the
+/// modifiers as `C-A-S-M-` prefixes, a named key in brackets.
+pub fn key_format_seq(seq: List[int], n: int, mut out: List[byte]) {
+    var i = 0
+    while i < n {
+        let mods = keyid_mods(seq[i])
+        let code = keyid_code(seq[i])
+        if i != 0 {
+            (mut out).push(32 as byte)
+        }
+        if mods & term.MOD_CTRL != 0 {
+            push_str(mut out, "C-")
+        }
+        if mods & term.MOD_ALT != 0 {
+            push_str(mut out, "A-")
+        }
+        if mods & term.MOD_SHIFT != 0 {
+            push_str(mut out, "S-")
+        }
+        if mods & term.MOD_SUPER != 0 {
+            push_str(mut out, "M-")
+        }
+        let name = key_code_name(code)
+        if name.len != 0 {
+            (mut out).push(60 as byte)
+            push_str(mut out, name)
+            (mut out).push(62 as byte)
+        } else {
+            let _ = unicode.utf8_encode_into(mut out, code)
+        }
+        i += 1
+    }
+}
+
+fn push_str(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+/// The format of a whole sequence as a `str`.
+pub fn key_format_str(seq: List[int]) -> str {
+    var out = List[byte]()
+    key_format_seq(seq, seq.len, mut out)
+    str_from_utf8(out) else ""
+}
+
+// `binding_arity_ok` (`keymap.c:265-283`).
+fn binding_arity_ok(e: CmdEntry, row: BindRow) -> bool {
+    match e.arity {
+        0 => row.iarg == 0 && !row.has_sarg,
+        1 => !row.has_sarg,
+        3 => !row.has_sarg,
+        2 => row.iarg == 0 && (row.has_sarg || e.flags & CMD_CAPTURES_TEXT != 0),
+        4 => row.iarg == 0,
+        _ => false,
+    }
+}
+
+/// `yew_keymap_validate_row` (`keymap.c:285-319`): the row's error, the
+/// parsed sequence when it has none.
+pub fn keymap_validate_row(reg: CmdReg, row: BindRow) -> (int, List[int]) {
+    let seq = key_parse_seq(row.seq, CHORD_MAX + 1)
+    if seq.len == 0 {
+        return (KEYMAP_ERR_SEQUENCE, seq)
+    }
+    if seq.len > CHORD_MAX {
+        return (KEYMAP_ERR_TOO_LONG, seq)
+    }
+    let id = cmd_lookup(reg, row.cmd)
+    if id == 0 {
+        return (KEYMAP_ERR_COMMAND, seq)
+    }
+    if !binding_arity_ok(reg.entries[id - 1], row) {
+        return (KEYMAP_ERR_ARITY, seq)
+    }
+    var i = 0
+    while i < seq.len {
+        if keyid_code(seq[i]) == term.KEY_ESCAPE && i + 1 < seq.len {
+            return (KEYMAP_ERR_ESCAPE_PREFIX, seq)
+        }
+        i += 1
+    }
+    (KEYMAP_ERR_NONE, seq)
+}
+
+/// `yew_keymap_error_string` (`keymap.c:383-397`).
+pub fn keymap_error_string(e: int) -> str {
+    match e {
+        1 => "invalid key sequence",
+        2 => "unknown command",
+        3 => "duplicate key sequence",
+        4 => "command arguments do not match its arity",
+        5 => "<esc> may not be a chord prefix",
+        6 => "key sequence exceeds eight keys",
+        0 => "no keymap error",
+        _ => "unknown keymap error",
+    }
+}
+
+// The scratch trie (`ScratchNode`, `keymap.c:20-25`): per node, its edges
+// unsorted.
+struct ScratchNode {
+    keys: List[int],
+    children: List[int],
+    bind: int,
+}
+
+fn scratch_child(mut nodes: List[ScratchNode], parent: int, key: int) -> int {
+    var i = 0
+    while i < nodes[parent].keys.len {
+        if nodes[parent].keys[i] == key {
+            return nodes[parent].children[i]
+        }
+        i += 1
+    }
+    (mut nodes).push(ScratchNode { keys: List[int](), children: List[int](), bind: 0 })
+    let child = nodes.len - 1
+    (mut nodes[parent].keys).push(key)
+    (mut nodes[parent].children).push(child)
+    child
+}
+
+/// `yew_keymap_build_diag` (`keymap.c:399-441`): `rows` built into a new
+/// keymap named `name`. Answers (ok, keymap, failing row, error); on a
+/// failure the keymap is empty and the row index and error say why.
+pub fn keymap_build_diag(reg: CmdReg, name: str, rows: List[BindRow]) -> (bool, Keymap, int, int) {
+    var binds = List[Binding]()
+    (mut binds).push(Binding { cmd: 0, iarg: 0, sarg: "", has_sarg: false })
+    var scratch = List[ScratchNode]()
+    (mut scratch).push(ScratchNode { keys: List[int](), children: List[int](), bind: 0 })
+    var r = 0
+    while r < rows.len {
+        let (err, seq) = keymap_validate_row(reg, rows[r])
+        if err != KEYMAP_ERR_NONE {
+            return (false, keymap_empty(), r, err)
+        }
+        var node = 0
+        for k in seq {
+            node = scratch_child(mut scratch, node, k)
+        }
+        if scratch[node].bind != 0 {
+            return (false, keymap_empty(), r, KEYMAP_ERR_DUPLICATE)
+        }
+        (mut binds).push(Binding {
+            cmd: cmd_lookup(reg, rows[r].cmd),
+            iarg: rows[r].iarg,
+            sarg: rows[r].sarg,
+            has_sarg: rows[r].has_sarg,
+        })
+        scratch[node].bind = binds.len - 1
+        r += 1
+    }
+    // `flatten` (`keymap.c:351-381`): each node's edges sorted by key
+    // (the stable sort; keys within a node are distinct).
+    var nodes = List[KeyNode]()
+    var edges = List[KeyEdge]()
+    var i = 0
+    while i < scratch.len {
+        var order = List[int]()
+        var j = 0
+        while j < scratch[i].keys.len {
+            (mut order).push(j)
+            j += 1
+        }
+        // insertion sort by key: few edges per node
+        var a = 1
+        while a < order.len {
+            var b = a
+            while b > 0 && scratch[i].keys[order[b - 1]] > scratch[i].keys[order[b]] {
+                let t = order[b - 1]
+                order[b - 1] = order[b]
+                order[b] = t
+                b -= 1
+            }
+            a += 1
+        }
+        (mut nodes).push(KeyNode { edge_lo: edges.len, edge_n: order.len, bind: scratch[i].bind })
+        for o in order {
+            (mut edges).push(KeyEdge { key: scratch[i].keys[o], child: scratch[i].children[o] })
+        }
+        i += 1
+    }
+    (true, Keymap { nodes: nodes, edges: edges, binds: binds, name: name }, 0, KEYMAP_ERR_NONE)
+}
+
+/// `yew_keymap_build` (`keymap.c:443-447`): the keymap, or an empty one
+/// and false.
+pub fn keymap_build(reg: CmdReg, name: str, rows: List[BindRow]) -> (bool, Keymap) {
+    let (ok, km, _, _) = keymap_build_diag(reg, name, rows)
+    (ok, km)
+}
+
+/// `yew_keymap_step` (`keymap.c:461-485`): the child of `node` along
+/// `key`, by binary search over its sorted edges.
+pub fn keymap_step(km: Keymap, node: int, key: int) -> (bool, int) {
+    if node < 0 || node >= km.nodes.len {
+        return (false, 0)
+    }
+    var lo = km.nodes[node].edge_lo
+    var hi = lo + km.nodes[node].edge_n
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        let found = km.edges[mid].key
+        if found < key {
+            lo = mid + 1
+        } else if found > key {
+            hi = mid
+        } else {
+            return (true, km.edges[mid].child)
+        }
+    }
+    (false, 0)
+}
+
+/// `yew_keymap_node_match` (`keymap.c:487-509`): the match at `node` and
+/// its binding index (0: none).
+pub fn keymap_node_match(km: Keymap, node: int) -> (int, int) {
+    if node < 0 || node >= km.nodes.len {
+        return (MATCH_NONE, 0)
+    }
+    let full = km.nodes[node].bind != 0
+    let prefix = km.nodes[node].edge_n != 0
+    let b = km.nodes[node].bind
+    if full && prefix {
+        return (MATCH_FULL_PREFIX, b)
+    }
+    if full {
+        return (MATCH_FULL, b)
+    }
+    if prefix {
+        return (MATCH_PREFIX, 0)
+    }
+    (MATCH_NONE, 0)
+}
+
+/// `yew_keymap_lookup` (`keymap.c:511-530`): walk `seq[0..n)`; answers
+/// (match, node, binding index).
+pub fn keymap_lookup(km: Keymap, seq: List[int], n: int) -> (int, int, int) {
+    if km.nodes.len == 0 || n == 0 {
+        return (MATCH_NONE, 0, 0)
+    }
+    var at = 0
+    var i = 0
+    while i < n {
+        let (ok, child) = keymap_step(km, at, seq[i])
+        if !ok {
+            return (MATCH_NONE, 0, 0)
+        }
+        at = child
+        i += 1
+    }
+    let (m, b) = keymap_node_match(km, at)
+    (m, at, b)
+}
+
+/// `yew_keystack_lookup` (`keymap.c:532-552`): the highest layer of
+/// `stack` (indices into `maps`) with any match; answers (match, layer,
+/// node, binding index), layer -1 when none.
+pub fn keystack_lookup(maps: List[Keymap], stack: List[int], seq: List[int], n: int) -> (
+    int,
+    int,
+    int,
+    int,
+) {
+    var i = stack.len
+    while i != 0 {
+        let (m, node, b) = keymap_lookup(maps[stack[i - 1]], seq, n)
+        if m != MATCH_NONE {
+            return (m, i - 1, node, b)
+        }
+        i -= 1
+    }
+    (MATCH_NONE, -1, 0, 0)
+}
+
+/// `yew_keymap_binding_count` (`keymap.c:554-557`).
+pub fn keymap_binding_count(km: Keymap) -> int {
+    if km.binds.len != 0 then km.binds.len - 1 else 0
+}
+
+/// One row of a keymap's listing: its sequence and binding.
+pub struct KeymapEntry {
+    seq: List[int],
+    bind: Binding,
+}
+
+// `visit_node` (`keymap.c:566-587`): depth first, a node's binding before
+// its children, children in key order.
+fn visit_node(km: Keymap, node: int, mut seq: List[int], mut out: List[KeymapEntry]) -> bool {
+    if km.nodes[node].bind != 0 {
+        var s = List[int]()
+        for k in seq {
+            (mut s).push(k)
+        }
+        (mut out).push(KeymapEntry { seq: s, bind: copy km.binds[km.nodes[node].bind] })
+    }
+    var i = 0
+    while i < km.nodes[node].edge_n {
+        let e = copy km.edges[km.nodes[node].edge_lo + i]
+        if seq.len >= CHORD_MAX {
+            return false
+        }
+        (mut seq).push(e.key)
+        if !visit_node(km, e.child, mut seq, mut out) {
+            return false
+        }
+        let _ = (mut seq).pop() else 0
+        i += 1
+    }
+    true
+}
+
+/// `yew_keymap_visit` (`keymap.c:589-602`) as a listing: every binding
+/// with its sequence, in C's visit order; false on an empty keymap.
+pub fn keymap_list(km: Keymap) -> (bool, List[KeymapEntry]) {
+    var out = List[KeymapEntry]()
+    if km.nodes.len == 0 {
+        return (false, out)
+    }
+    var seq = List[int]()
+    let ok = visit_node(km, 0, mut seq, mut out)
+    (ok, out)
+}
