@@ -1,0 +1,332 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_undo_trim.c` (332 lines), one test
+//! per C test in registry order (`tests/unit/registry.c:459-464`). C's
+//! fixture holds a buffer, a cursor set (no marks) and an undo tree by
+//! pointer inside an `EditCtx` with a 4096-byte budget; the port's
+//! `EditCtx` owns them and the injected clock is the tree's fake clock
+//! (`undo.fake_mono`, `undo.fake_wall`).
+
+use text
+
+fn cursor(pos: int, anchor: int, goal: int) -> text.Cursor {
+    text.Cursor { pos: pos, goal_col: goal, anchor: anchor }
+}
+
+// `trim_fixture_init`, `test_undo_trim.c:24-41`.
+fn fixture(min_nodes: int) -> text.EditCtx {
+    let tb = text.textbuf_new()
+    let undo = text.undo_new(tb)
+    var ec = text.editctx_new(take tb)
+    ec.cset = text.cset_init(cursor(0, 0, 0))
+    ec.has_cset = true
+    ec.undo = undo
+    ec.has_undo = true
+    ec.win_id = 0
+    text.undo_set_clock(mut ec.undo, 1000, 100)
+    text.undo_set_limits(mut ec.undo, 4096, min_nodes, text.UNDO_PERSIST_BYTES_MAX)
+    ec
+}
+
+// `trim_random`, `test_undo_trim.c:49-58`: xorshift64*, the state and the
+// output separate.
+fn trim_random(s: wrapping[u64]) -> (wrapping[u64], wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    (x, x * 2685821657736338717)
+}
+
+fn below(x: wrapping[u64], n: int) -> int {
+    (x % n as wrapping[u64]) as int
+}
+
+fn filled(b: int, n: int) -> List[byte] {
+    var out = List[byte]()
+    var i = 0
+    while i < n {
+        (mut out).push(b as byte)
+        i += 1
+    }
+    out
+}
+
+// `trim_append`, `test_undo_trim.c:60-68`.
+fn trim_append(mut f: text.EditCtx, bytes: List[byte]) -> int {
+    f.undo.fake_mono += text.UNDO_BURST_MS
+    f.undo.fake_wall += 1
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = text.edit_insert(mut f, text.byteoff(text.textbuf_len(f.tb)), bytes)
+    text.undo_end(mut f)
+    text.undo_current(f.undo)
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn assert_bytes(tb: text.TextBuf, want: List[byte]) {
+    assert(text.textbuf_len(tb) == want.len, "length {want.len}")
+    assert(same(text.textbuf_bytes(tb), want), "bytes")
+}
+
+// `trim_live`, `test_undo_trim.c:91-95`.
+fn trim_live(ut: text.UndoTree, id: int) -> bool {
+    id != 0 && id <= ut.nodes.len && ut.nodes[id - 1].flags & text.TXN_DEAD == 0
+}
+
+fn trim_live_count(ut: text.UndoTree) -> int {
+    var count = 0
+    var i = 0
+    while i < ut.nodes.len {
+        if ut.nodes[i].flags & text.TXN_DEAD == 0 {
+            count += 1
+        }
+        i += 1
+    }
+    count
+}
+
+fn t_undo_trim_prunes_oldest_unprotected_branch_first() {
+    let payload = filled(112, 1024)
+    var f = fixture(100)
+    let old_branch = trim_append(mut f, payload)
+    var i = 0
+    while i < 14 {
+        let _ = trim_append(mut f, payload)
+        i += 1
+    }
+    assert(text.undo_to(mut f, f.undo.root), "back to root")
+    let newer_branch = trim_append(mut f, payload)
+    i = 0
+    while i < 14 {
+        let _ = trim_append(mut f, payload)
+        i += 1
+    }
+    assert(text.undo_to(mut f, f.undo.root), "back to root again")
+    text.undo_set_limits(mut f.undo, 4096, 2, text.UNDO_PERSIST_BYTES_MAX)
+    let protected_cur = trim_append(mut f, payload)
+    i = 0
+    while i < 14 {
+        let _ = trim_append(mut f, payload)
+        i += 1
+    }
+    assert(!trim_live(f.undo, old_branch), "the oldest branch is pruned")
+    assert(
+        !trim_live(f.undo, newer_branch) || newer_branch < protected_cur,
+        "the newer branch goes or is older",
+    )
+    assert(trim_live(f.undo, protected_cur), "the current path survives")
+    assert(trim_live(f.undo, f.undo.cur), "current live")
+    assert(trim_live(f.undo, f.undo.root), "root live")
+    assert(
+        f.undo.bytes_live <= f.undo.bytes_max || f.undo.over_budget_logged,
+        "within budget or said so",
+    )
+}
+
+fn t_undo_trim_never_prunes_current_or_saved_paths() {
+    let payload = filled(115, 768)
+    var f = fixture(100)
+    let saved = trim_append(mut f, payload)
+    text.undo_mark_saved(mut f.undo, f.tb)
+    let current = trim_append(mut f, payload)
+    var i = 0
+    while i < 30 {
+        let _ = trim_append(mut f, payload)
+        i += 1
+    }
+    text.undo_set_limits(mut f.undo, 4096, 3, text.UNDO_PERSIST_BYTES_MAX)
+    let _ = trim_append(mut f, payload)
+    assert(trim_live(f.undo, saved), "saved survives")
+    assert(trim_live(f.undo, current), "its child survives")
+    assert(trim_live(f.undo, f.undo.cur), "current survives")
+    var id = f.undo.cur
+    while id != 0 {
+        assert(trim_live(f.undo, id), "current path {id} live")
+        id = f.undo.nodes[id - 1].parent
+    }
+    id = f.undo.saved
+    while id != 0 {
+        assert(trim_live(f.undo, id), "saved path {id} live")
+        id = f.undo.nodes[id - 1].parent
+    }
+}
+
+fn t_undo_trim_min_nodes_keeps_soft_budget_history() {
+    let payload = filled(109, 2048)
+    var f = fixture(40)
+    var i = 0
+    while i < 39 {
+        let _ = trim_append(mut f, payload)
+        i += 1
+    }
+    assert(trim_live_count(f.undo) == 40, "forty live nodes")
+    assert(f.undo.bytes_live > f.undo.bytes_max, "over budget")
+    assert(f.undo.over_budget_logged, "and said so")
+    assert(f.undo.root == 1, "root kept")
+    assert(f.undo.nodes[0].flags & text.TXN_DEAD == 0, "root live")
+    assert(text.undo(mut f), "undo")
+    assert(text.redo(mut f), "redo")
+}
+
+fn t_undo_trim_reroot_stops_undo_at_oldest_survivor() {
+    let payload = filled(114, 1536)
+    var f = fixture(2)
+    let original_root = f.undo.root
+    var i = 0
+    while i < 40 {
+        let _ = trim_append(mut f, payload)
+        i += 1
+    }
+    assert(f.undo.root != original_root, "re-rooted")
+    assert(!trim_live(f.undo, original_root), "old root dead")
+    let r = f.undo.root
+    assert(f.undo.nodes[r - 1].parent == 0, "root has no parent")
+    assert(f.undo.nodes[r - 1].depth == 0, "root depth 0")
+    assert(f.undo.nodes[r - 1].flags & text.TXN_TRIMMED != 0, "root trimmed")
+    assert(text.undo_to(mut f, f.undo.root), "to root")
+    assert(!text.undo(mut f), "nothing below the survivor")
+    assert(text.undo_current(f.undo) == f.undo.root, "at root")
+}
+
+fn t_undo_trim_compaction_preserves_delete_payloads() {
+    var initial = List[byte]()
+    var i = 0
+    while i < 8192 {
+        (mut initial).push((i * 17 + 3) as byte)
+        i += 1
+    }
+    var before = copy initial
+    (mut before).push(120 as byte)
+    var after = List[byte]()
+    i = 0
+    while i < 100 {
+        (mut after).push(before[i])
+        i += 1
+    }
+    i = 356
+    while i < before.len {
+        (mut after).push(before[i])
+        i += 1
+    }
+    assert(after.len == 8193 - 256, "after length")
+    var f = fixture(1)
+    text.undo_set_limits(mut f.undo, 1048576, 1, text.UNDO_PERSIST_BYTES_MAX)
+    let _ = trim_append(mut f, initial)
+    text.undo_mark_saved(mut f.undo, f.tb)
+    text.undo_begin(mut f, text.TXN_CUT)
+    let _ = text.edit_delete(mut f, text.span(0, 6144))
+    text.undo_end(mut f)
+    assert(text.undo(mut f), "undo the big cut")
+    let x = filled(120, 1)
+    let _ = trim_append(mut f, x)
+    let old_gen = f.undo.gen
+    text.undo_set_limits(mut f.undo, 2048, 1, text.UNDO_PERSIST_BYTES_MAX)
+    text.undo_begin(mut f, text.TXN_CUT)
+    let _ = text.edit_delete(mut f, text.span(100, 356))
+    text.undo_end(mut f)
+    assert(f.undo.gen > old_gen, "compacted")
+    assert(f.undo.blobs.len == 256, "one blob left (have {f.undo.blobs.len})")
+    assert(f.undo.ops.len == 3, "three ops (have {f.undo.ops.len})")
+    assert(f.undo.repair_runs.len == 3, "three runs")
+    assert(f.undo.replay_spans.len == 3, "three replay spans")
+    assert(f.undo.cursors.len == 6, "six cursor records (have {f.undo.cursors.len})")
+    let current = copy f.undo.nodes[f.undo.cur - 1]
+    assert(current.n_ops == 1, "one op in the cut")
+    let op = copy f.undo.ops[current.ops_at]
+    assert(op.kind == text.OP_DEL, "a delete")
+    assert(op.payload == 0, "its blob at 0")
+    assert_bytes(f.tb, after)
+    assert(text.undo(mut f), "undo")
+    assert_bytes(f.tb, before)
+    assert(text.redo(mut f), "redo")
+    assert_bytes(f.tb, after)
+    text.textbuf_check(f.tb)
+}
+
+fn t_undo_trim_random_edits_keep_live_parent_chains() {
+    let edits = 10000
+    var f = fixture(32)
+    var state: wrapping[u64] = 11400714819323198485
+    var i = 0
+    while i < edits {
+        let len = text.textbuf_len(f.tb)
+        let (s1, choice) = trim_random(state)
+        state = s1
+        f.undo.fake_mono += 1
+        let reason = if (choice & 1) as int != 0 then text.TXN_PASTE else text.TXN_CUT
+        text.undo_begin(mut f, reason)
+        if len == 0 || (choice & 3) as int != 0 {
+            var one = List[byte]()
+            (mut one).push((choice >> 8 & 255) as int as byte)
+            var at = 0
+            if len != 0 {
+                let (s2, v) = trim_random(state)
+                state = s2
+                at = below(v, len + 1)
+            }
+            let _ = text.edit_insert(mut f, text.byteoff(at), one)
+        } else {
+            let (s2, v) = trim_random(state)
+            state = s2
+            let at = below(v, len)
+            let _ = text.edit_delete(mut f, text.span(at, at + 1))
+        }
+        text.undo_end(mut f)
+        if i % 19 == 0 {
+            let _ = text.undo(mut f)
+        }
+        if i % 31 == 0 {
+            let _ = text.redo(mut f)
+        }
+        i += 1
+    }
+    var checked = 0
+    var id = 1
+    while id <= f.undo.nodes.len {
+        if !trim_live(f.undo, id) {
+            id += 1
+            continue
+        }
+        let n = copy f.undo.nodes[id - 1]
+        assert(n.parent == 0 || trim_live(f.undo, n.parent), "live parent of {id}")
+        if n.parent == 0 {
+            assert(n.depth == 0, "root depth of {id}")
+        } else {
+            assert(n.depth == f.undo.nodes[n.parent - 1].depth + 1, "depth of {id}")
+        }
+        assert(text.undo_to(mut f, id), "reach {id}")
+        assert(text.undo_current(f.undo) == id, "at {id}")
+        checked += 1
+        id += 1
+    }
+    assert(checked != 0, "checked some")
+    assert(trim_live(f.undo, f.undo.root), "root live")
+    assert(trim_live(f.undo, f.undo.cur), "current live")
+    assert(f.undo.ops.len < 512, "ops compacted (have {f.undo.ops.len})")
+    assert(f.undo.cursors.len < 1024, "cursors compacted (have {f.undo.cursors.len})")
+    text.textbuf_check(f.tb)
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    t_undo_trim_prunes_oldest_unprotected_branch_first()
+    t_undo_trim_never_prunes_current_or_saved_paths()
+    t_undo_trim_min_nodes_keeps_soft_budget_history()
+    t_undo_trim_reroot_stops_undo_at_oldest_survivor()
+    t_undo_trim_compaction_preserves_delete_payloads()
+    t_undo_trim_random_edits_keep_live_parent_chains()
+    print("undo_trim_test: 6 cases pass")
+}
