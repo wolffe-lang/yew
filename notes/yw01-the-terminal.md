@@ -146,12 +146,27 @@ scene hard-errors naming yw02. `tools/goldens-selftest`: ok — green on
 the oracle, red on both plants.
 
 **The restore, proven by sagitta's cases**: `restore_quit` (the tail is
-the restore blob, termios unchanged), `restore_crash` (`--crash` raises
-SIGSEGV through `os_exit_signal`; the tail is the crash blob and `yew:
-fatal signal, terminal restored`, written by the guard), `restore_bus`
-and `restore_abrt` (the harness signals the demo; the restore blob
-follows, the terminal is back), `restore_suspend` (SIGTSTP/SIGCONT; the
-alternate screen re-entered).
+the restore blob, termios unchanged), `restore_crash` (`--crash` dies
+through `term.tty_fatal` — the restore blob, the saved mode, the note,
+then SIGSEGV by `os_exit_signal`, the order of C's `fatal_handler`,
+`tty.c:214-241`; the tail is the crash blob and `yew: fatal signal,
+terminal restored`), `restore_bus`
+and `restore_abrt` (the harness signals the demo; the GUARD writes the
+restore blob after the death, the terminal is back), `restore_suspend`
+(SIGTSTP/SIGCONT; the alternate screen re-entered). **A finding on
+interim B**: sagitta's harness checks `restore_crash`'s tail once, at the
+reap (`ptc_expect_tail`; `wait_for_exit` pumps until `waitpid` reports
+the child and stops), so a restore written by the guard AFTER the death
+races the check. Linux won the race (kasumi, CI's ubuntu leg); macOS
+lost it (run 39346772578, `restore_crash: child output did not end in
+expected restore bytes`). A crash the program raises itself can restore
+first, as C's handler does, and `--crash` now does (7e8f746); a signal
+from outside (`restore_bus`, `restore_abrt`) can only reach the guard —
+green on Linux, and the macOS leg of the final run is the measurement
+(the harness's `ptc_expect_output` is one-shot too). If macOS loses that
+race, it is #93 R1's interim meeting the oracle's reap-time check, for
+the orchestrator: the fix is the runtime's own restore (wolf-lang#794),
+not a slower harness.
 
 **The 2× gate** (`tools/run-perf-latency --cpus 0-3`, C first, the
 port, C again; 20 cold starts and 300 keys each, `target/perf/`):
