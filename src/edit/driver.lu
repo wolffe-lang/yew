@@ -1,0 +1,249 @@
+//! edit.driver — the editor's startup and its one run.
+//!
+//! Ports `yew_ed_driver_files_opts`, `ed_driver_inner`,
+//! `yew_start_plan_resolve` and `ed_apply_start_files` (`ed.c:2823-3142`)
+//! at 9ace98c2, under `s14-modes-L-I.md` §1. The order is C's: the
+//! workspace root, the terminal (open, raw, the alternate screen, the
+//! probe started — not awaited), the bootstrap scratch tab, the grid and
+//! the renderer, the configuration (`runtime/init.fl`, `edit.config`)
+//! and its theme, then the startup files as tabs (each registered, only
+//! the last read), the bootstrap tab closed, the first layout and paint,
+//! the loop. What C does between those steps for later campaigns — the
+//! user and workspace configuration (`$XDG_CONFIG_HOME/yew/init.fl`,
+//! `.yew.fl`; yw09), `theme_auto`, the workspace state and its restore
+//! (yw06), plugins (yw14), the symbol walk (yw11), the Fletch hooks
+//! (yw09) — refuses by name where a user reaches it, and is absent
+//! otherwise (a user `init.fl` that needs the VM is reported on the
+//! message line, as C reports a configuration error, and the built-in
+//! configuration stands).
+
+use std.fs
+use term
+use text
+use util
+
+/// `YewEdStartup` (`ed.h:94-108`), the fields campaign 03 honours.
+pub struct Startup {
+    clean: bool,
+    config_path: str,
+    theme: str,
+    has_theme: bool,
+    workspace: str,
+    has_workspace: bool,
+}
+
+/// A default startup.
+pub fn startup_default() -> Startup {
+    Startup {
+        clean: false,
+        config_path: "",
+        theme: "",
+        has_theme: false,
+        workspace: "",
+        has_workspace: false,
+    }
+}
+
+fn is_dir(path: str) -> bool {
+    fs.is_dir(path)
+}
+
+// `user_path` (`flconf.c:146-159`): `--config PATH`, else
+// `$XDG_CONFIG_HOME/yew/init.fl`; "" when neither resolves.
+fn user_config_path(s: Startup) -> str {
+    if s.config_path.len != 0 {
+        return s.config_path
+    }
+    let dir = util.xdg_config_dir() else ""
+    if dir.len == 0 then "" else "{dir}/init.fl"
+}
+
+/// Load the configuration and its theme (`yew_config_load_all`,
+/// `flconf.c:599-627`, then the `theme` option's `yew_theme_apply`,
+/// `theme_cmds.c:227-245`): the built-in `runtime/init.fl` (required),
+/// the user's `init.fl` (optional; `--config` names it), one option
+/// store and one bind ledger across both, each mode's keymap rebuilt
+/// from the ledger. `--clean` loads none of them (`source_enabled`,
+/// `flconf.c:372-386`). The workspace's `.yew.fl` is trust-gated and
+/// campaign 06's (yw06, the trust database): never read here.
+pub fn ed_load_config(mut ed: Ed, s: Startup) {
+    var c = config_new(opts_default())
+    if !s.clean {
+        let (found, src, path) = runtime_read("init.fl")
+        if !found {
+            util.log_at(
+                util.LOG_ERROR,
+                "config missing: {path} (set YEW_RUNTIME_DIR to the shipped runtime directory)",
+            )
+        } else {
+            config_apply(mut c, src)
+            if c.error.len != 0 {
+                config_report(mut ed, path, c.error)
+            }
+        }
+        let user = user_config_path(s)
+        if user.len != 0 {
+            let bytes = fs_read_bytes(user) else |_| List[byte]()
+            if bytes.len == 0 {
+                util.log_at(util.LOG_INFO, "config missing: {user}")
+            } else {
+                config_apply(mut c, bytes)
+                if c.error.len != 0 {
+                    config_report(mut ed, user, c.error)
+                }
+            }
+        }
+    }
+    ed.config_globals = c.globals
+    ed.opts = c.opts
+    var m = 0
+    while m < MODE_N {
+        let (ok, km, row, err) = keymap_build_diag(ed.reg, "config", c.binds[m])
+        if ok {
+            ed.keymaps[km_bind(m)] = km
+        } else {
+            let rows = copy c.binds[m]
+            config_report(mut ed, "bind {mode_name(m)} {rows[row].seq}", keymap_error_string(err))
+        }
+        m += 1
+    }
+    ed.chord_timeout_ms = ed.opts.chord_timeout_ms
+    ed.undo_break_on_newline = ed.opts.undo_break_on_newline
+    ed.errorbells = ed.opts.errorbells
+    ed_theme_set(mut ed, ed.opts.theme)
+    var i = 0
+    while i < ed.wins.len {
+        apply_win_opts(ed.opts, mut ed.wins[i])
+        i += 1
+    }
+}
+
+// A configuration the reader refuses: C's VM would run it, so the port
+// names the gap (invariant 3) on the message line and in the log; the
+// statements before the refusal stand, as C's would have run.
+fn config_report(mut ed: Ed, where: str, what: str) {
+    ed.config_error = "not yet ported: {where}: {what}: sagitta Sprint 36 (yw09)"
+    util.log_at(util.LOG_ERROR, ed.config_error)
+    ed_msg(mut ed, MSG_ERROR, ed.config_error)
+}
+
+/// `yew_theme_set` (`theme_cmds.c:247-273`): select and compile `name`;
+/// on failure the message names why and the old theme stays.
+pub fn ed_theme_set(mut ed: Ed, name: str) {
+    if !theme_valid_name(name) {
+        ed_msg(mut ed, MSG_ERROR, "invalid theme name '{name}'")
+        return
+    }
+    let (found, src, path) = runtime_theme(name)
+    if !found {
+        ed_msg(mut ed, MSG_ERROR, "theme '{name}' was not found")
+        return
+    }
+    let (ok, t, err) = theme_compile(src)
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "{path}: {err}")
+        return
+    }
+    if t.name != name {
+        ed_msg(mut ed, MSG_ERROR, "theme file '{name}' declares name '{t.name}'")
+        return
+    }
+    ed.theme = t
+    theme_sync_surfaces(mut ed)
+}
+
+/// `ed_driver_inner` (`ed.c:2919-3101`) over `paths`.
+pub fn ed_run(paths: List[str], s: Startup) -> int {
+    var ed = ed_new()
+    ed.clean = s.clean
+    let ws = if s.has_workspace then s.workspace else "."
+    if !is_dir(ws) {
+        eprint("yew: error: workspace is not a directory: {ws}")
+        return util.EXIT_ERR
+    }
+    for p in paths {
+        if is_dir(p) {
+            if paths.len != 1 || s.has_workspace {
+                eprint(
+                    "yew: error: directory argument cannot be combined with files or --workspace: {p}",
+                )
+                return util.EXIT_ERR
+            }
+            eprint(
+                "yew: error: not yet ported: a directory argument (F mode): sagitta Sprint 51 (FUSS and git) (yw13)",
+            )
+            return util.EXIT_ERR
+        }
+    }
+    if paths.len > 1 {
+        eprint(
+            "yew: error: not yet ported: more than one startup file: sagitta Sprint 23 (tabs) (yw05)",
+        )
+        return util.EXIT_ERR
+    }
+    if paths.len == 0 {
+        eprint(
+            "yew: error: not yet ported: starting with no file (the workspace resume): sagitta Sprint 25 (workspace state) (yw06)",
+        )
+        return util.EXIT_ERR
+    }
+    ed.ws_dir = text.file_realpath(ws) else ws
+    term.tty_open(mut ed.tty) else |e| {
+        term.tty_close(mut ed.tty)
+        return if "{e}" == "not_tty" then util.EXIT_ERR else util.EXIT_IO
+    }
+    ed.tty_ready = true
+    term.tty_raw(mut ed.tty) else |_| {
+        term.tty_close(mut ed.tty)
+        return util.EXIT_IO
+    }
+    term.tty_altscreen(mut ed.tty, true)
+    if !term.tty_is_alt(ed.tty) {
+        term.tty_close(mut ed.tty)
+        return util.EXIT_IO
+    }
+    term.tty_probe_start(mut ed.tty, now_ms())
+    let caps = term.tty_caps(ed.tty)
+    term.input_enable(caps)
+    ed.input = term.input_new(caps)
+    ed.input_ready = true
+    ed_open_scratch(mut ed)
+    let bootstrap = ed.tabs[0].tab_id
+    let rows = if term.tty_rows(ed.tty) > 0 then term.tty_rows(ed.tty) else 24
+    let cols = if term.tty_cols(ed.tty) > 0 then term.tty_cols(ed.tty) else 80
+    ed.grid = term.grid_new(rows, cols)
+    ed.grid_ready = true
+    ed.render = term.render_new(term.tty_caps(ed.tty), term.env_process())
+    ed.render_ready = true
+    ed_load_config(mut ed, s)
+    if s.has_theme {
+        ed_theme_set(mut ed, s.theme)
+    } else {
+        let (env_theme, present) = term.env_getv("YEW_THEME")
+        if present {
+            ed_theme_set(mut ed, env_theme)
+        }
+    }
+    // `ed_apply_start_files` (`ed.c:2885-2917`).
+    let idx = tab_open(mut ed, paths[0])
+    if idx < 0 || tab_hydrate(mut ed, idx) != 0 {
+        term.tty_close(mut ed.tty)
+        eprint("yew: error: cannot open tab: {paths[0]}")
+        return util.EXIT_IO
+    }
+    tab_switch(mut ed, idx)
+    if ed.tabs.len > 1 {
+        let b = tab_index_of_id(ed, bootstrap)
+        if b >= 0 {
+            let _ = tab_close(mut ed, b)
+        }
+    }
+    ed_layout(mut ed)
+    ed_render(mut ed)
+    let result = if ed.quit then ed.exit_code else loop_run(mut ed)
+    text.clip_shutdown(mut ed.regs.clip)
+    term.input_disable()
+    term.tty_altscreen(mut ed.tty, false)
+    term.tty_close(mut ed.tty)
+    result
+}
