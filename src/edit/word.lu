@@ -1,60 +1,611 @@
-//! edit.word — STUB until the word fork lands (yw03-word): the W unit
-//! engine (`src/edit/word.c`) with UAX #29 word boundaries.
+//! edit.word — the W unit engine: UAX #29 word boundaries, the editor's
+//! word motions (the `word` and `WORD` variants) and subwords.
+//!
+//! Ports sagitta `src/edit/word.c` (569 lines) and `word.h` (15) at
+//! 9ace98c2, under `s16-modes-W-B.md` §2–§3. `word_boundary` is the
+//! UAX #29 oracle (WB3–WB999 over codepoints, ignored-character
+//! normalization by WB4), checked against Unicode 16.0.0's
+//! `WordBreakTest.txt` (`src/edit_wordbreak_test.lu`); the motions only
+//! ever answer grapheme boundaries. The engine's five operations are the
+//! `UNIT_WORD` arms of `edit.motion`'s `match` (C's `yew_unit_word`
+//! `UnitOps`, `word.c:567-569`): C's `UnitCtx` gives them the text alone
+//! (`u->tb`), and so does the port's.
+//!
+//! C decodes a codepoint by copying at most four bytes out of the piece
+//! tree into a stack array and calling `yew_utf8_decode` (`copy_bytes`,
+//! `cp_next`, `cp_prev`, `word.c:23-97`). A `List` would allocate per
+//! codepoint in the caller's region — the editor's session — so the port
+//! feeds the same bytes, read in place with `text.textbuf_byte_at`, to
+//! the incremental decoder (`unicode.utf8_push`), whose first result and
+//! its length are exactly `yew_utf8_decode`'s answer over those bytes:
+//! an accepted scalar after byte `i` consumed `i + 1` bytes, and any
+//! rejection or an incomplete run answers the first byte's escape, one
+//! byte long.
 
 use text
+use unicode
 
-fn word_stub_touch(mut tb: text.TextBuf, p: int) -> int {
-    let at = motion_clamp(tb, p)
-    if at > 0 {
-        return text.grapheme_prev_boundary(mut tb, at as text.ByteOff) as int + at - at
+// `WordCp` (`word.c:9-14`): a codepoint, its byte range, its Word_Break.
+struct WordCp {
+    lo: int,
+    hi: int,
+    cp: int,
+    prop: int,
+}
+
+fn wordcp_none() -> WordCp {
+    WordCp { lo: 0, hi: 0, cp: 0, prop: unicode.WB_OTHER }
+}
+
+// `SubClass` (`word.c:16-21`).
+const SUB_OTHER: int = 0
+
+const SUB_LOWER: int = 1
+
+const SUB_UPPER: int = 2
+
+const SUB_DIGIT: int = 3
+
+// `yew_utf8_decode` over the buffer's bytes `[at, end)`, read in place
+// (the header says why this is the same answer).
+fn buf_decode(tb: text.TextBuf, at: int, end: int) -> (int, int) {
+    if at >= end {
+        return (0, 0)
     }
-    at
-}
-
-fn word_stub(u: UnitCtx, alt: bool) {
-    if u.has_win && alt {
-        bug("unreachable")
+    let avail = end - at
+    let limit = if avail < unicode.UTF8_MAX then avail else unicode.UTF8_MAX
+    var d = unicode.utf8_dec_new()
+    var i = 0
+    while i < limit {
+        let n = unicode.utf8_push(mut d, text.textbuf_byte_at(tb, at + i))
+        if n > 0 {
+            let cp = unicode.utf8_dec_out(d, 0)
+            if unicode.utf8_is_escape(cp) {
+                return (cp, 1)
+            }
+            return (cp, i + 1)
+        }
+        i += 1
     }
-    bug("not yet ported: the word unit engine (yw03-word)")
+    (unicode.utf8_escape_of(text.textbuf_byte_at(tb, at)), 1)
 }
 
-// stub: `word_next` until the fork lands.
-fn word_next(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    word_stub(u, alt)
-    let at = word_stub_touch(mut tb, p)
-    at
+// `cp_next` (`word.c:50-66`): the codepoint starting at `at`.
+fn cp_next(tb: text.TextBuf, at: int) -> (bool, WordCp) {
+    let len = text.textbuf_len(tb)
+    if at >= len {
+        return (false, wordcp_none())
+    }
+    let end = if len - at < unicode.UTF8_MAX then len else at + unicode.UTF8_MAX
+    let (cp, used) = buf_decode(tb, at, end)
+    if used == 0 {
+        return (false, wordcp_none())
+    }
+    (true, WordCp { lo: at, hi: at + used, cp: cp, prop: unicode.wb_prop(cp) })
 }
 
-// stub: `word_prev` until the fork lands.
-fn word_prev(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    word_stub(u, alt)
-    let at = word_stub_touch(mut tb, p)
-    at
+// `cp_prev` (`word.c:68-97`): the codepoint ending at `at` — the longest
+// of the one- to four-byte windows that decodes whole.
+fn cp_prev(tb: text.TextBuf, at: int) -> (bool, WordCp) {
+    if at == 0 {
+        return (false, wordcp_none())
+    }
+    var best = 0
+    var best_cp = 0
+    var back = 1
+    while back <= unicode.UTF8_MAX && back <= at {
+        let (cp, used) = buf_decode(tb, at - back, at)
+        if used == back {
+            best = back
+            best_cp = cp
+        }
+        back += 1
+    }
+    if best == 0 {
+        return (false, wordcp_none())
+    }
+    (true, WordCp { lo: at - best, hi: at, cp: best_cp, prop: unicode.wb_prop(best_cp) })
 }
 
-// stub: `word_home` until the fork lands.
+// `prev_significant` (`word.c:99-107`): skipping WB4's ignored codepoints.
+fn prev_significant(tb: text.TextBuf, at_in: int) -> (bool, WordCp) {
+    var at = at_in
+    loop {
+        let (ok, c) = cp_prev(tb, at)
+        if !ok {
+            return (false, wordcp_none())
+        }
+        if !unicode.wb_is_ignored(c.prop) {
+            return (true, c)
+        }
+        at = c.lo
+    }
+    (false, wordcp_none())
+}
+
+// `next_significant` (`word.c:109-117`).
+fn next_significant(tb: text.TextBuf, at_in: int) -> (bool, WordCp) {
+    var at = at_in
+    loop {
+        let (ok, c) = cp_next(tb, at)
+        if !ok {
+            return (false, wordcp_none())
+        }
+        if !unicode.wb_is_ignored(c.prop) {
+            return (true, c)
+        }
+        at = c.hi
+    }
+    (false, wordcp_none())
+}
+
+fn is_newline(p: int) -> bool {
+    p == unicode.WB_CR || p == unicode.WB_LF || p == unicode.WB_NEWLINE
+}
+
+fn is_ah(p: int) -> bool {
+    p == unicode.WB_ALETTER || p == unicode.WB_HEBREW_LETTER
+}
+
+fn is_mid_letter(p: int) -> bool {
+    p == unicode.WB_MIDLETTER || p == unicode.WB_MIDNUMLET || p == unicode.WB_SINGLE_QUOTE
+}
+
+fn is_mid_num(p: int) -> bool {
+    p == unicode.WB_MIDNUM || p == unicode.WB_MIDNUMLET || p == unicode.WB_SINGLE_QUOTE
+}
+
+fn is_ext_glue_left(p: int) -> bool {
+    is_ah(p) || p == unicode.WB_NUMERIC || p == unicode.WB_KATAKANA || p == unicode.WB_EXTENDNUMLET
+}
+
+fn is_ext_glue_right(p: int) -> bool {
+    is_ah(p) || p == unicode.WB_NUMERIC || p == unicode.WB_KATAKANA
+}
+
+/// The UAX #29 word-boundary oracle at byte `pos` (`yew_word_boundary`,
+/// `word.c:152-263`): codepoint boundaries, invalid-byte escapes
+/// included; true at the buffer's ends.
+pub fn word_boundary(tb: text.TextBuf, pos: int) -> bool {
+    let len = text.textbuf_len(tb)
+    if pos == 0 || pos >= len {
+        return true
+    }
+    let (have_il, immediate_left) = cp_prev(tb, pos)
+    let (have_ir, immediate_right) = cp_next(tb, pos)
+    if !have_il || !have_ir {
+        return true
+    }
+
+    // WB3, WB3a, WB3b, WB3c and WB3d precede ignored-character
+    // normalization and therefore use the adjacent codepoints.
+    if immediate_left.prop == unicode.WB_CR && immediate_right.prop == unicode.WB_LF {
+        return false
+    }
+    if is_newline(immediate_left.prop) || is_newline(immediate_right.prop) {
+        return true
+    }
+    if immediate_left.prop == unicode.WB_ZWJ &&
+        unicode.unicode_is_extended_pictographic(immediate_right.cp) {
+        return false
+    }
+    if immediate_left.prop == unicode.WB_WSEGSPACE && immediate_right.prop == unicode.WB_WSEGSPACE {
+        return false
+    }
+
+    // WB4: ignored codepoints attach to the codepoint before them.
+    if unicode.wb_is_ignored(immediate_right.prop) {
+        return false
+    }
+
+    let (have_left, left) = prev_significant(tb, pos)
+    let (have_right, right) = next_significant(tb, pos)
+    if !have_left || !have_right {
+        return true
+    }
+    let (have_left2, left2) = prev_significant(tb, left.lo)
+    let (have_right2, right2) = next_significant(tb, right.hi)
+
+    // WB5-WB7: alphabetic and Hebrew punctuation sequences.
+    if is_ah(left.prop) && is_ah(right.prop) {
+        return false
+    }
+    if is_ah(left.prop) && is_mid_letter(right.prop) && have_right2 && is_ah(right2.prop) {
+        return false
+    }
+    if have_left2 && is_ah(left2.prop) && is_mid_letter(left.prop) && is_ah(right.prop) {
+        return false
+    }
+    if left.prop == unicode.WB_HEBREW_LETTER && right.prop == unicode.WB_SINGLE_QUOTE {
+        return false
+    }
+    if left.prop == unicode.WB_HEBREW_LETTER &&
+        right.prop == unicode.WB_DOUBLE_QUOTE &&
+        have_right2 &&
+        right2.prop == unicode.WB_HEBREW_LETTER {
+        return false
+    }
+    if have_left2 &&
+        left2.prop == unicode.WB_HEBREW_LETTER &&
+        left.prop == unicode.WB_DOUBLE_QUOTE &&
+        right.prop == unicode.WB_HEBREW_LETTER {
+        return false
+    }
+
+    // WB8-WB13: numbers, letters, and Katakana.
+    if left.prop == unicode.WB_NUMERIC && right.prop == unicode.WB_NUMERIC {
+        return false
+    }
+    if is_ah(left.prop) && right.prop == unicode.WB_NUMERIC {
+        return false
+    }
+    if left.prop == unicode.WB_NUMERIC && is_ah(right.prop) {
+        return false
+    }
+    if have_left2 &&
+        left2.prop == unicode.WB_NUMERIC &&
+        is_mid_num(left.prop) &&
+        right.prop == unicode.WB_NUMERIC {
+        return false
+    }
+    if left.prop == unicode.WB_NUMERIC &&
+        is_mid_num(right.prop) &&
+        have_right2 &&
+        right2.prop == unicode.WB_NUMERIC {
+        return false
+    }
+    if left.prop == unicode.WB_KATAKANA && right.prop == unicode.WB_KATAKANA {
+        return false
+    }
+    if is_ext_glue_left(left.prop) && right.prop == unicode.WB_EXTENDNUMLET {
+        return false
+    }
+    if left.prop == unicode.WB_EXTENDNUMLET && is_ext_glue_right(right.prop) {
+        return false
+    }
+
+    // WB15/WB16: pair regional indicators from the start of their run.
+    if left.prop == unicode.WB_REGIONAL_INDICATOR && right.prop == unicode.WB_REGIONAL_INDICATOR {
+        var scan = left.lo
+        var count = 1
+        loop {
+            let (ok, prior) = prev_significant(tb, scan)
+            if !ok || prior.prop != unicode.WB_REGIONAL_INDICATOR {
+                break
+            }
+            count += 1
+            scan = prior.lo
+        }
+        if count % 2 != 0 {
+            return false
+        }
+    }
+    true
+}
+
+// `word_motion_boundary` (`word.c:265-276`): the motion vocabulary keeps
+// punctuation reachable where WB6/WB7 absorb it — a `.` next to a letter.
+fn word_motion_boundary(tb: text.TextBuf, pos: int) -> bool {
+    if word_boundary(tb, pos) {
+        return true
+    }
+    let (have_left, left) = cp_prev(tb, pos)
+    let (have_right, right) = cp_next(tb, pos)
+    if !have_left || !have_right {
+        return true
+    }
+    left.cp == 46 && is_ah(right.prop) || right.cp == 46 && is_ah(left.prop)
+}
+
+// `clamp_grapheme` (`word.c:278-287`).
+fn clamp_grapheme(tb: text.TextBuf, p_in: int) -> int {
+    let len = text.textbuf_len(tb)
+    var p = p_in
+    if p > len {
+        p = len
+    }
+    if !text.is_grapheme_boundary(tb, p as text.ByteOff) {
+        p = text.grapheme_prev(tb, p as text.ByteOff) as int
+    }
+    p
+}
+
+// `cluster_white` (`word.c:289-299`): the cluster at `p` begins with a
+// White_Space codepoint.
+fn cluster_white(tb: text.TextBuf, p: int) -> bool {
+    let (ok, c) = cp_next(tb, p)
+    ok && unicode.unicode_is_white_space(c.cp)
+}
+
+fn next_boundary(tb: text.TextBuf, p: int) -> int {
+    text.grapheme_next_boundary(tb, p as text.ByteOff) as int
+}
+
+fn prev_boundary(mut tb: text.TextBuf, p: int) -> int {
+    text.grapheme_prev_boundary(mut tb, p as text.ByteOff) as int
+}
+
+// `uax_span` (`word.c:301-319`): the motion unit around `p`.
+fn uax_span(mut tb: text.TextBuf, p_in: int) -> text.Span {
+    let len = text.textbuf_len(tb)
+    var p = clamp_grapheme(tb, p_in)
+    if len == 0 {
+        return text.span(0, 0)
+    }
+    if p == len {
+        p = prev_boundary(mut tb, p)
+    }
+    var lo = p
+    while lo > 0 && !word_motion_boundary(tb, lo) {
+        lo = prev_boundary(mut tb, lo)
+    }
+    var hi = next_boundary(tb, p)
+    while hi < len && !word_motion_boundary(tb, hi) {
+        hi = next_boundary(tb, hi)
+    }
+    text.span(lo, hi)
+}
+
+// `word_span` (`word.c:321-349`): the `word` unit, or with `alt` the
+// `WORD` unit — a maximal run of white or of non-white clusters.
+fn word_span(mut tb: text.TextBuf, p_in: int, alt: bool) -> text.Span {
+    if !alt {
+        return uax_span(mut tb, p_in)
+    }
+    let len = text.textbuf_len(tb)
+    var p = clamp_grapheme(tb, p_in)
+    if len == 0 {
+        return text.span(0, 0)
+    }
+    if p == len {
+        p = prev_boundary(mut tb, p)
+    }
+    let white = cluster_white(tb, p)
+    var lo = p
+    while lo > 0 {
+        let prior = prev_boundary(mut tb, lo)
+        if cluster_white(tb, prior) != white {
+            break
+        }
+        lo = prior
+    }
+    var hi = next_boundary(tb, p)
+    while hi < len && cluster_white(tb, hi) == white {
+        hi = next_boundary(tb, hi)
+    }
+    text.span(lo, hi)
+}
+
+// `linebreaks_in` (`word.c:351-369`): CRLF counts once.
+fn linebreaks_in(tb: text.TextBuf, sp: text.Span) -> int {
+    var at = sp.lo
+    var count = 0
+    var after_cr = false
+    while at < sp.hi {
+        let (ok, c) = cp_next(tb, at)
+        if !ok {
+            break
+        }
+        if c.prop == unicode.WB_LF {
+            if !after_cr {
+                count += 1
+            }
+        } else if c.prop == unicode.WB_CR || c.prop == unicode.WB_NEWLINE {
+            count += 1
+        }
+        after_cr = c.prop == unicode.WB_CR
+        at = c.hi
+    }
+    count
+}
+
+// `word_next` (`word.c:371-397`): the next non-white unit, or the white
+// run that holds a second line break (a blank line stops the motion).
+// C's `UnitCtx` gives the engine only `u->tb`, so `u` is unread here.
+fn word_next(mut tb: text.TextBuf, u: UnitCtx, p_in: int, alt: bool) -> int {
+    let len = text.textbuf_len(tb)
+    let p = clamp_grapheme(tb, p_in)
+    if p >= len {
+        return len
+    }
+    let current = word_span(mut tb, p, alt)
+    var breaks = if cluster_white(tb, current.lo) then linebreaks_in(tb, current) else 0
+    var at = current.hi
+    while at < len {
+        let candidate = word_span(mut tb, at, alt)
+        if !cluster_white(tb, candidate.lo) {
+            return candidate.lo
+        }
+        breaks += linebreaks_in(tb, candidate)
+        if breaks >= 2 {
+            return candidate.lo
+        }
+        at = candidate.hi
+    }
+    len
+}
+
+// `word_prev` (`word.c:399-427`).
+fn word_prev(mut tb: text.TextBuf, u: UnitCtx, p_in: int, alt: bool) -> int {
+    let len = text.textbuf_len(tb)
+    let p = clamp_grapheme(tb, p_in)
+    if p == 0 || len == 0 {
+        return 0
+    }
+    if p < len {
+        let current = word_span(mut tb, p, alt)
+        if current.lo < p {
+            return current.lo
+        }
+    }
+    var breaks = 0
+    var at = p
+    while at > 0 {
+        let prior = prev_boundary(mut tb, at)
+        let candidate = word_span(mut tb, prior, alt)
+        if !cluster_white(tb, candidate.lo) {
+            return candidate.lo
+        }
+        breaks += linebreaks_in(tb, candidate)
+        if breaks >= 2 {
+            return candidate.lo
+        }
+        at = candidate.lo
+    }
+    0
+}
+
+// `word_home`, `word_end`, `word_unit_span` (`word.c:429-442`).
 fn word_home(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    word_stub(u, alt)
-    let at = word_stub_touch(mut tb, p)
-    at
+    word_span(mut tb, p, alt).lo
 }
 
-// stub: `word_end` until the fork lands.
 fn word_end(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    word_stub(u, alt)
-    let at = word_stub_touch(mut tb, p)
-    at
+    word_span(mut tb, p, alt).hi
 }
 
-// stub: `word_unit_span` until the fork lands.
 fn word_unit_span(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> text.Span {
-    word_stub(u, alt)
-    let at = word_stub_touch(mut tb, p)
-    text.span(at, at)
+    word_span(mut tb, p, alt)
 }
 
-// `yew_unicode_is_white_space` (`unicode/wordbreak.c`), until the fork.
-fn unicode_is_white_space(cp: int) -> bool {
-    word_stub(unitctx_text(), false)
-    cp == 32
+// `sub_class` (`word.c:444-453`).
+fn sub_class(cp: int) -> int {
+    if cp >= 97 && cp <= 122 {
+        return SUB_LOWER
+    }
+    if cp >= 65 && cp <= 90 {
+        return SUB_UPPER
+    }
+    if cp >= 48 && cp <= 57 {
+        return SUB_DIGIT
+    }
+    SUB_OTHER
+}
+
+// `sub_separator` (`word.c:455-459`).
+fn sub_separator(cp: int) -> bool {
+    cp == 95 || cp == 45 || unicode.unicode_is_white_space(cp)
+}
+
+// `sub_split` (`word.c:461-470`): camelCase, a digit before a letter,
+// and an acronym's last capital before a lowercase run.
+fn sub_split(before: int, after: int, after2: int) -> bool {
+    if before == SUB_LOWER && after == SUB_UPPER {
+        return true
+    }
+    if before == SUB_DIGIT && (after == SUB_LOWER || after == SUB_UPPER) {
+        return true
+    }
+    before == SUB_UPPER && after == SUB_UPPER && after2 == SUB_LOWER
+}
+
+/// The next subword start after `p` (`yew_word_sub_next`,
+/// `word.c:472-530`): camelCase humps, acronyms, digit runs, `_`/`-`
+/// and white space as separators. `u` as C's (`u->tb` alone is read).
+pub fn word_sub_next(tb: text.TextBuf, u: UnitCtx, p_in: int) -> int {
+    let len = text.textbuf_len(tb)
+    let p = clamp_grapheme(tb, p_in)
+    if p >= len {
+        return len
+    }
+    var at = p
+    let (have, cp0) = cp_next(tb, at)
+    if !have {
+        return len
+    }
+    var c = cp0
+    while sub_separator(c.cp) {
+        at = next_boundary(tb, at)
+        if at >= len {
+            return len
+        }
+        let (ok, next_c) = cp_next(tb, at)
+        if !ok {
+            return len
+        }
+        c = next_c
+    }
+    if at > p {
+        return at
+    }
+    var before = sub_class(c.cp)
+    loop {
+        let next = next_boundary(tb, at)
+        if next >= len {
+            return len
+        }
+        let (have_after, after_cp) = cp_next(tb, next)
+        if !have_after {
+            return len
+        }
+        if sub_separator(after_cp.cp) {
+            at = next
+            loop {
+                at = next_boundary(tb, at)
+                if at >= len {
+                    return len
+                }
+                let (ok, sep) = cp_next(tb, at)
+                if !ok {
+                    return len
+                }
+                if !sub_separator(sep.cp) {
+                    break
+                }
+            }
+            return at
+        }
+        if word_boundary(tb, next) {
+            return next
+        }
+        let after = sub_class(after_cp.cp)
+        var after2 = SUB_OTHER
+        let after_at = next_boundary(tb, next)
+        if after_at < len {
+            let (ok2, after2_cp) = cp_next(tb, after_at)
+            if ok2 && !sub_separator(after2_cp.cp) && !word_boundary(tb, after_at) {
+                after2 = sub_class(after2_cp.cp)
+            }
+        }
+        if sub_split(before, after, after2) {
+            return next
+        }
+        before = after
+        at = next
+    }
+    len
+}
+
+/// The subword start before `p` (`yew_word_sub_prev`, `word.c:532-565`):
+/// the next-boundary decisions replayed from the containing UAX unit, so
+/// acronym splitting is identical in both directions.
+pub fn word_sub_prev(mut tb: text.TextBuf, u: UnitCtx, p_in: int) -> int {
+    let len = text.textbuf_len(tb)
+    let p = clamp_grapheme(tb, p_in)
+    if p == 0 || len == 0 {
+        return 0
+    }
+    let target = p
+    var at = prev_boundary(mut tb, target)
+    loop {
+        let (ok, c) = cp_next(tb, at)
+        if !ok || !sub_separator(c.cp) {
+            break
+        }
+        if at == 0 {
+            return 0
+        }
+        at = prev_boundary(mut tb, at)
+    }
+    at = uax_span(mut tb, at).lo
+    var last = at
+    while at < target {
+        let next = word_sub_next(tb, u, at)
+        if next >= target || next <= at {
+            break
+        }
+        last = next
+        at = next
+    }
+    last
 }
