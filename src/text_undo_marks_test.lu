@@ -1,0 +1,277 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_undo_marks.c` (267 lines), one test
+//! per C test in registry order (`tests/unit/registry.c:479-483`). C's
+//! `MarkFixture` holds a buffer, a mark set, a one-cursor set and an undo
+//! tree behind an `EditCtx` on window 0 (`test_undo_marks.c:31-48`); the
+//! port's `EditCtx` owns them, and C's injected clock is the tree's fake
+//! clock (`undo.fake_mono`, `undo.fake_wall`).
+
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+// `marks_fixture_init`, `test_undo_marks.c:31-48`.
+fn fixture(initial: List[byte]) -> text.EditCtx {
+    let tb = text.textbuf_from_bytes(initial, 0, initial.len)
+    let undo = text.undo_new(tb)
+    var ec = text.editctx_new(take tb)
+    ec.marks = text.marks_new()
+    ec.has_marks = true
+    ec.cset = text.cset_init(text.Cursor { pos: 0, goal_col: 0, anchor: 0 })
+    ec.has_cset = true
+    ec.undo = undo
+    ec.has_undo = true
+    ec.win_id = 0
+    text.undo_set_clock(mut ec.undo, 1000, 100)
+    ec
+}
+
+fn pos(f: text.EditCtx, id: text.MarkId) -> int {
+    text.mark_pos(f.marks, id) as int
+}
+
+fn current(f: text.EditCtx) -> text.UndoNode {
+    copy f.undo.nodes[f.undo.cur - 1]
+}
+
+// `marks_random`, `test_undo_marks.c:57-66`: xorshift64*, the state and
+// the output separate.
+fn marks_random(s: wrapping[u64]) -> (wrapping[u64], wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    (x, x * 2685821657736338717)
+}
+
+fn below(x: wrapping[u64], n: int) -> int {
+    (x % n as wrapping[u64]) as int
+}
+
+struct OracleMark {
+    id: text.MarkId,
+    pos: int,
+    bias: int,
+}
+
+// `marks_oracle_adjust`, `test_undo_marks.c:68-85`.
+fn oracle_adjust(mut marks: List[OracleMark], op: int, at: int, len: int) {
+    var i = 0
+    while i < marks.len {
+        if op == text.JOURNAL_INS {
+            if marks[i].pos > at || marks[i].pos == at && marks[i].bias == text.BIAS_RIGHT {
+                marks[i].pos += len
+            }
+        } else if marks[i].pos < at {
+            i += 1
+            continue
+        } else if marks[i].pos < at + len {
+            marks[i].pos = at
+        } else {
+            marks[i].pos -= len
+        }
+        i += 1
+    }
+}
+
+fn t_undo_marks_repairs_each_delete_run_in_transaction() {
+    var f = fixture(bytes_of("abcdefghij"))
+    let first = text.mark_add(mut f.marks, text.byteoff(2), text.BIAS_LEFT)
+    let second = text.mark_add(mut f.marks, text.byteoff(7), text.BIAS_RIGHT)
+    text.undo_begin(mut f, text.TXN_CUT)
+    let _ = text.edit_delete(mut f, text.span(1, 4))
+    let _ = text.edit_delete(mut f, text.span(3, 5))
+    text.undo_end(mut f)
+    let node = current(f)
+    assert(node.n_ops == 2, "two ops")
+    assert(node.n_rep == 2, "two repairs")
+    assert(f.undo.repair_runs.len == f.undo.ops.len, "a run per op")
+    let run0 = copy f.undo.repair_runs[node.ops_at]
+    let run1 = copy f.undo.repair_runs[node.ops_at + 1]
+    assert(run0.len == 1, "run 0 holds one")
+    assert(run1.len == 1, "run 1 holds one")
+    assert(run0.at != run1.at, "separate runs")
+    assert(pos(f, first) == 1, "first collapsed")
+    assert(pos(f, second) == 3, "second shifted")
+    assert(text.undo(mut f), "undo")
+    assert(pos(f, first) == 2, "first repaired")
+    assert(pos(f, second) == 7, "second repaired")
+}
+
+fn t_undo_marks_stale_generation_skips_repair() {
+    var f = fixture(bytes_of("abcdef"))
+    let stale = text.mark_add(mut f.marks, text.byteoff(3), text.BIAS_LEFT)
+    text.undo_begin(mut f, text.TXN_CUT)
+    let _ = text.edit_delete(mut f, text.span(2, 5))
+    text.undo_end(mut f)
+    text.mark_del(mut f.marks, stale)
+    let fresh = text.mark_add(mut f.marks, text.byteoff(0), text.BIAS_LEFT)
+    assert(fresh.id == stale.id, "slot reused")
+    assert(fresh.gen != stale.gen, "new generation")
+    assert(text.undo(mut f), "undo")
+    assert(pos(f, fresh) == 0, "fresh not repaired")
+    assert(text.textbuf_len(f.tb) == 6, "text restored")
+    assert(f.undo.cur == f.undo.root, "at root")
+}
+
+fn t_undo_marks_insert_records_empty_repair_run() {
+    var f = fixture(bytes_of("ab"))
+    let left = text.mark_add(mut f.marks, text.byteoff(1), text.BIAS_LEFT)
+    let right = text.mark_add(mut f.marks, text.byteoff(1), text.BIAS_RIGHT)
+    let _ = text.edit_insert(mut f, text.byteoff(1), bytes_of("X"))
+    let node = current(f)
+    let run = copy f.undo.repair_runs[node.ops_at]
+    assert(run.len == 0, "empty run")
+    assert(node.n_rep == 0, "no repairs")
+    assert(pos(f, left) == 1, "left stays")
+    assert(pos(f, right) == 2, "right moves")
+    assert(text.undo(mut f), "undo")
+    assert(pos(f, left) == 1, "left back")
+    assert(pos(f, right) == 1, "right back")
+}
+
+fn t_undo_marks_redo_recollapses_repaired_marks() {
+    var f = fixture(bytes_of("0123456789"))
+    let a = text.mark_add(mut f.marks, text.byteoff(3), text.BIAS_LEFT)
+    let b = text.mark_add(mut f.marks, text.byteoff(6), text.BIAS_RIGHT)
+    text.undo_begin(mut f, text.TXN_CUT)
+    let _ = text.edit_delete(mut f, text.span(2, 8))
+    text.undo_end(mut f)
+    assert(pos(f, a) == 2, "a collapsed")
+    assert(pos(f, b) == 2, "b collapsed")
+    assert(text.undo(mut f), "undo")
+    assert(pos(f, a) == 3, "a repaired")
+    assert(pos(f, b) == 6, "b repaired")
+    assert(text.redo(mut f), "redo")
+    assert(pos(f, a) == 2, "a recollapsed")
+    assert(pos(f, b) == 2, "b recollapsed")
+}
+
+fn all_at(f: text.EditCtx, oracle: List[OracleMark], want: List[int]) -> bool {
+    var j = 0
+    while j < oracle.len {
+        if pos(f, oracle[j].id) != want[j] {
+            return false
+        }
+        j += 1
+    }
+    true
+}
+
+fn positions(oracle: List[OracleMark]) -> List[int] {
+    var out = List[int]()
+    var j = 0
+    while j < oracle.len {
+        (mut out).push(oracle[j].pos)
+        j += 1
+    }
+    out
+}
+
+fn t_undo_marks_randomized_oracle_restores_1000_marks() {
+    let mark_count = 1000
+    let edit_count = 1000
+    var oracle = List[OracleMark]()
+    var state: wrapping[u64] = 15111065706836454659
+    var text_len = 4096
+    var initial = List[byte]()
+    var i = 0
+    while i < text_len {
+        (mut initial).push(120 as byte)
+        i += 1
+    }
+    var f = fixture(initial)
+    i = 0
+    while i < mark_count {
+        let (s1, v1) = marks_random(state)
+        let (s2, v2) = marks_random(s1)
+        state = s2
+        let at = below(v1, text_len + 1)
+        let bias = if (v2 & 1) as int != 0 then text.BIAS_RIGHT else text.BIAS_LEFT
+        let id = text.mark_add(mut f.marks, text.byteoff(at), bias)
+        (mut oracle).push(OracleMark { id: id, pos: at, bias: bias })
+        i += 1
+    }
+    i = 0
+    while i < edit_count {
+        var inserting = true
+        if text_len != 0 {
+            let (s1, v1) = marks_random(state)
+            state = s1
+            inserting = (v1 & 1) as int != 0
+        }
+        var at = 0
+        var len = 0
+        let before = positions(oracle)
+        f.undo.fake_mono += text.UNDO_BURST_MS
+        text.undo_begin(mut f, if inserting then text.TXN_PASTE else text.TXN_CUT)
+        if inserting {
+            let (s2, v2) = marks_random(state)
+            let (s3, v3) = marks_random(s2)
+            state = s3
+            at = below(v2, text_len + 1)
+            len = 1 + below(v3, 8)
+            var bytes = List[byte]()
+            var k = 0
+            while k < len {
+                (mut bytes).push((i & 255) as byte)
+                k += 1
+            }
+            let _ = text.edit_insert(mut f, text.byteoff(at), bytes)
+            oracle_adjust(mut oracle, text.JOURNAL_INS, at, len)
+            text_len += len
+        } else {
+            let (s2, v2) = marks_random(state)
+            let (s3, v3) = marks_random(s2)
+            state = s3
+            at = below(v2, text_len)
+            len = 1 + below(v3, text_len - at)
+            if len > 8 {
+                len = 8
+            }
+            let _ = text.edit_delete(mut f, text.span(at, at + len))
+            oracle_adjust(mut oracle, text.JOURNAL_DEL, at, len)
+            text_len -= len
+        }
+        text.undo_end(mut f)
+        assert(all_at(f, oracle, positions(oracle)), "marks follow the edit {i}")
+        assert(text.undo(mut f), "undo {i}")
+        var j = 0
+        while j < mark_count {
+            oracle[j].pos = before[j]
+            j += 1
+        }
+        assert(all_at(f, oracle, before), "undo restores the marks {i}")
+        if inserting {
+            text_len -= len
+        } else {
+            text_len += len
+            assert(text.redo(mut f), "redo {i}")
+            assert(text.undo(mut f), "undo again {i}")
+            assert(all_at(f, oracle, before), "redo-undo restores the marks {i}")
+        }
+        assert(text.textbuf_len(f.tb) == text_len, "length {i}")
+        i += 1
+    }
+    i = 0
+    while i < mark_count {
+        assert(pos(f, oracle[i].id) <= text_len, "inside the text")
+        i += 1
+    }
+}
+
+fn main() {
+    t_undo_marks_repairs_each_delete_run_in_transaction()
+    t_undo_marks_stale_generation_skips_repair()
+    t_undo_marks_insert_records_empty_repair_run()
+    t_undo_marks_redo_recollapses_repaired_marks()
+    t_undo_marks_randomized_oracle_restores_1000_marks()
+    print("undo_marks_test: 5 cases pass")
+}
