@@ -1,0 +1,260 @@
+//! edit.dispatch — keys to commands: counts, chords and their timeout.
+//!
+//! Ports sagitta `src/edit/dispatch.c` (383 lines) and `dispatch.h` (37)
+//! at 9ace98c2, under `s13-keymap-engine.md` §4. A key is looked up in
+//! the layer stack (the mode's floor, the user layer, the config layer —
+//! highest first); a full match fires; a prefix arms the chord timeout
+//! (milliseconds: the clock's own resolution, G8, is enough for a 500 ms
+//! chord); a key that breaks a chord fires the longest full match and is
+//! re-dispatched; digits are a count in the unit modes and H. The
+//! campaign-05 dialogs that sit ahead of the keymap (the dirty-tab and
+//! workspace-forget prompts, `dispatch.c:179-213`) and the search confirm
+//! run (yw04) are not in campaign 03.
+
+use term
+
+/// `YEW_COUNT_MAX` (`dispatch.h:9`).
+pub const COUNT_MAX: int = 99999
+
+/// `YEW_CHORD_TIMEOUT_DEFAULT_MS` (`dispatch.h:10`).
+pub const CHORD_TIMEOUT_DEFAULT_MS: int = 500
+
+fn reset_chord(mut ed: Ed) {
+    ed.chord.n = 0
+    ed.chord.layer = -1
+    ed.chord.count = 0
+    ed.chord.count_given = false
+    ed.chord.deadline = 0
+}
+
+fn reset_capture(mut ed: Ed) {
+    ed.capture_cmd = 0
+    ed.capture_count = 0
+    ed.capture_count_given = false
+}
+
+fn chord_seq(ed: Ed) -> List[int] {
+    var s = List[int]()
+    var i = 0
+    while i < ed.chord.n {
+        (mut s).push(ed.chord.seq[i])
+        i += 1
+    }
+    s
+}
+
+fn chord_set(mut ed: Ed, i: int, id: int) {
+    while ed.chord.seq.len <= i {
+        (mut ed.chord.seq).push(0)
+    }
+    ed.chord.seq[i] = id
+}
+
+fn set_seq_message(mut ed: Ed, prefix: str) {
+    ed.dispatch_message = "{prefix}{key_format_str(chord_seq(ed))}"
+}
+
+/// `dispatch_timeout_from_env` (`dispatch.c:62-78`).
+pub fn dispatch_timeout_from_env() -> int {
+    let v = env_get("YEW_CHORD_TIMEOUT_MS") else ""
+    if v.len == 0 {
+        return CHORD_TIMEOUT_DEFAULT_MS
+    }
+    let n = v.to_int() else -1
+    if n <= 0 || n > 4294967295 {
+        return CHORD_TIMEOUT_DEFAULT_MS
+    }
+    n
+}
+
+fn arm(mut ed: Ed, now: int) {
+    ed.chord.deadline = now + ed.chord_timeout_ms
+}
+
+// `dispatch_current_match` (`dispatch.c:89-99`): (match, binding).
+fn current_match(ed: Ed) -> (int, int) {
+    if ed.chord.layer < 0 || ed.chord.layer >= ed.keys.len {
+        return (MATCH_NONE, 0)
+    }
+    let km = ed.keys[ed.chord.layer]
+    let (m, _, b) = keymap_lookup(ed.keymaps[km], chord_seq(ed), ed.chord.n)
+    (m, b)
+}
+
+// `dispatch_fire` (`dispatch.c:101-130`).
+fn fire(mut ed: Ed, layer: int, bind: int) {
+    let km = ed.keys[layer]
+    let binding = copy ed.keymaps[km].binds[bind]
+    let flags = ed.reg.entries[binding.cmd - 1].flags
+    if flags & CMD_CAPTURES_TEXT != 0 && !binding.has_sarg {
+        ed.capture_cmd = binding.cmd
+        ed.capture_count = if ed.chord.count_given then ed.chord.count else 1
+        ed.capture_count_given = ed.chord.count_given
+        reset_chord(mut ed)
+        ed.dispatch_message = "argument: "
+        return
+    }
+    var cx = cmdctx_new(cmdline_target(ed), SRC_KEY)
+    cx.count = if ed.chord.count_given then ed.chord.count else 1
+    cx.count_given = ed.chord.count_given
+    cx.iarg = binding.iarg
+    cx.sarg = binding.sarg
+    cx.has_sarg = binding.has_sarg
+    reset_chord(mut ed)
+    ed.last_cmd = binding.cmd
+    ed.last_status = ed_cmd_invoke(mut ed, binding.cmd, mut cx)
+    ed.dispatch_count += 1
+}
+
+// `dispatch_take_count` (`dispatch.c:132-156`).
+fn take_count(mut ed: Ed, id: int) -> bool {
+    let code = keyid_code(id)
+    let mods = keyid_mods(id)
+    if !mode_takes_count(ed.mode) || ed.chord.n != 0 || mods != 0 || code < 48 || code > 57 {
+        return false
+    }
+    let digit = code - 48
+    if !ed.chord.count_given && digit == 0 {
+        return false
+    }
+    ed.chord.count_given = true
+    if ed.chord.count > (COUNT_MAX - digit) / 10 {
+        ed.chord.count = COUNT_MAX
+        ed.dispatch_message = "count limited to 99999"
+    } else {
+        ed.chord.count = ed.chord.count * 10 + digit
+    }
+    true
+}
+
+/// `yew_dispatch_key` (`dispatch.c:178-320`).
+pub fn dispatch_key(mut ed: Ed, key: term.Key, now: int) {
+    if key.ev == term.KEY_RELEASE {
+        return
+    }
+    if ed.capture_cmd != 0 {
+        let cmd = ed.capture_cmd
+        if key.code == term.KEY_ESCAPE {
+            reset_capture(mut ed)
+            ed.dispatch_message = ""
+            return
+        }
+        var cx = cmdctx_new(cmdline_target(ed), SRC_KEY)
+        cx.count = ed.capture_count
+        cx.count_given = ed.capture_count_given
+        reset_capture(mut ed)
+        if key.text.len == 0 {
+            ed.dispatch_message = "argument needs text"
+            ed.last_cmd = cmd
+            ed.last_status = CMD_ERR_ARG
+            ed.dispatch_count += 1
+            return
+        }
+        cx.sarg = str_from_utf8(key.text) else ""
+        cx.has_sarg = true
+        ed.dispatch_message = ""
+        ed.last_cmd = cmd
+        ed.last_status = ed_cmd_invoke(mut ed, cmd, mut cx)
+        ed.dispatch_count += 1
+        return
+    }
+    let id = keyid(key)
+    if keyid_code(id) == term.KEY_ESCAPE && (ed.chord.n != 0 || ed.chord.count_given) {
+        reset_chord(mut ed)
+        return
+    }
+    if take_count(mut ed, id) {
+        return
+    }
+    if ed.chord.n == 0 {
+        var one = List[int]()
+        (mut one).push(id)
+        let (m, layer, _, bind) = keystack_lookup(ed.keymaps, ed.keys, one, 1)
+        chord_set(mut ed, 0, id)
+        ed.chord.n = 1
+        if m == MATCH_NONE {
+            set_seq_message(mut ed, "unbound: ")
+            reset_chord(mut ed)
+            return
+        }
+        ed.chord.layer = layer
+        if m == MATCH_FULL {
+            fire(mut ed, layer, bind)
+            return
+        }
+        arm(mut ed, now)
+        return
+    }
+    if ed.chord.n >= CHORD_MAX {
+        set_seq_message(mut ed, "unbound sequence: ")
+        reset_chord(mut ed)
+        return
+    }
+    chord_set(mut ed, ed.chord.n, id)
+    ed.chord.n += 1
+    let (m, b) = current_match(ed)
+    if m == MATCH_FULL {
+        fire(mut ed, ed.chord.layer, b)
+        return
+    }
+    if m == MATCH_PREFIX || m == MATCH_FULL_PREFIX {
+        arm(mut ed, now)
+        return
+    }
+    ed.chord.n -= 1
+    let (m2, b2) = current_match(ed)
+    if m2 == MATCH_FULL || m2 == MATCH_FULL_PREFIX {
+        fire(mut ed, ed.chord.layer, b2)
+        dispatch_key(mut ed, key, now)
+        return
+    }
+    chord_set(mut ed, ed.chord.n, id)
+    ed.chord.n += 1
+    set_seq_message(mut ed, "unbound sequence: ")
+    reset_chord(mut ed)
+}
+
+/// `yew_dispatch_tick` (`dispatch.c:322-336`): a chord whose timeout has
+/// passed fires its full match or is reported unbound.
+pub fn dispatch_tick(mut ed: Ed, now: int) {
+    if ed.chord.n == 0 || ed.chord.deadline == 0 || now < ed.chord.deadline {
+        return
+    }
+    let (m, b) = current_match(ed)
+    if m == MATCH_FULL || m == MATCH_FULL_PREFIX {
+        fire(mut ed, ed.chord.layer, b)
+    } else {
+        set_seq_message(mut ed, "unbound sequence: ")
+        reset_chord(mut ed)
+    }
+}
+
+/// `yew_dispatch_deadline` (`dispatch.c:338-342`): the chord's absolute
+/// deadline, or -1.
+pub fn dispatch_deadline(ed: Ed) -> int {
+    if ed.chord.n == 0 || ed.chord.deadline == 0 then -1 else ed.chord.deadline
+}
+
+/// `yew_dispatch_owner` (`dispatch.c:349-354`): the name of the layer a
+/// pending chord belongs to.
+pub fn dispatch_owner(ed: Ed) -> str {
+    if ed.chord.layer < 0 || ed.chord.layer >= ed.keys.len {
+        return ""
+    }
+    ed.keymaps[ed.keys[ed.chord.layer]].name
+}
+
+/// `yew_dispatch_set_mode` (`dispatch.c:366-383`): the mode and its two
+/// layers (the floor at 0, the config at 2) swapped in.
+pub fn dispatch_set_mode(mut ed: Ed, mode: int) {
+    if mode < 0 || mode >= MODE_N {
+        bug("invalid editor mode {mode}")
+    }
+    reset_chord(mut ed)
+    reset_capture(mut ed)
+    ed.mode = mode
+    ed.keys[0] = km_mode(mode)
+    if ed.keys.len >= 3 {
+        ed.keys[2] = km_bind(mode)
+    }
+}
