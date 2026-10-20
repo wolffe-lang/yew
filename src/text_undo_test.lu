@@ -1,0 +1,690 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_undo.c` (776 lines), one test per C
+//! test in registry order (`tests/unit/registry.c:417-447`). C's fixture
+//! holds a buffer, marks, a cursor set and an undo tree by pointer inside
+//! an `EditCtx`; the port's `EditCtx` owns them, so a C copy of the context
+//! (`ec = f.edit`, `enlist.cset = NULL`) is the one context with a flag or
+//! a field swapped for the same calls, and the injected clock is the
+//! tree's fake clock (`undo.fake_mono`, `undo.fake_wall`). The one bug case
+//! re-executes this binary (`--bug 0`) and reads its stderr.
+
+use std.fs
+use std.process
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn cursor(pos: int, anchor: int, goal: int) -> text.Cursor {
+    text.Cursor { pos: pos, goal_col: goal, anchor: anchor }
+}
+
+// `undo_fixture_init`, `test_undo.c:46-59`.
+fn fixture(s: str) -> text.EditCtx {
+    let tb = text.textbuf_from_str(s)
+    let undo = text.undo_new(tb)
+    var ec = text.editctx_new(take tb)
+    ec.has_marks = true
+    ec.cset = text.cset_init(cursor(0, 0, 0))
+    ec.has_cset = true
+    ec.undo = undo
+    ec.has_undo = true
+    ec.win_id = 7
+    text.undo_set_clock(mut ec.undo, 1000, 100)
+    ec
+}
+
+fn assert_text(tb: text.TextBuf, want: str) {
+    assert(same(text.textbuf_bytes(tb), bytes_of(want)), "text is {want}")
+}
+
+fn cur_node(f: text.EditCtx) -> text.UndoNode {
+    assert(f.undo.cur != 0 && f.undo.cur <= f.undo.nodes.len, "a current node")
+    copy f.undo.nodes[f.undo.cur - 1]
+}
+
+fn ins(mut f: text.EditCtx, at: int, s: str) -> bool {
+    text.edit_insert_str(mut f, text.byteoff(at), s)
+}
+
+fn del(mut f: text.EditCtx, lo: int, hi: int) -> bool {
+    text.edit_delete(mut f, text.span(lo, hi))
+}
+
+fn t_undo_type_merges_when_all_predicates_hold() {
+    var f = fixture("")
+    let _ = ins(mut f, 0, "a")
+    f.undo.fake_mono += text.UNDO_BURST_MS - 1
+    let _ = ins(mut f, 1, "b")
+    let n = cur_node(f)
+    assert(f.undo.nodes.len == 2, "two nodes")
+    assert(n.n_ops == 2, "two ops")
+    assert(n.reason == text.TXN_TYPE, "typed")
+    assert(n.t_last_ms == f.undo.fake_mono, "last time")
+    assert_text(f.tb, "ab")
+}
+
+fn t_undo_identity_hash_is_piece_independent() {
+    var block = List[byte]()
+    var even = List[byte]()
+    var i = 0
+    while i < 64 {
+        (mut block).push(i as byte)
+        if i & 1 == 0 {
+            (mut even).push(i as byte)
+        }
+        i += 1
+    }
+    let flat = text.textbuf_from_str("abc")
+    var fragmented = text.textbuf_from_str("ac")
+    text.textbuf_insert_str(mut fragmented, text.byteoff(1), "b")
+    let block_tb = text.textbuf_from_bytes(block, 0, block.len)
+    var frag_block = text.textbuf_from_bytes(even, 0, even.len)
+    i = 0
+    while i < even.len {
+        var odd = List[byte]()
+        (mut odd).push((i * 2 + 1) as byte)
+        text.textbuf_insert(mut frag_block, text.byteoff(i * 2 + 1), odd)
+        i += 1
+    }
+    let flat_undo = text.undo_new(flat)
+    let fragmented_undo = text.undo_new(fragmented)
+    let block_undo = text.undo_new(block_tb)
+    let frag_block_undo = text.undo_new(frag_block)
+    assert(flat_undo.identity_version == 2, "block identity")
+    let want_flat: wrapping[u64] = 4952883123889572249
+    let want_block: wrapping[u64] = 17854084224570037232
+    assert(flat_undo.root_hash == want_flat, "0x44bc2cf5ad770999")
+    assert(fragmented_undo.root_hash == flat_undo.root_hash, "piece independent")
+    assert(block_undo.root_hash == want_block, "0xf7c67301db6713f0")
+    assert(frag_block_undo.root_hash == block_undo.root_hash, "piece independent block")
+}
+
+fn t_undo_initial_save_reuses_root_identity() {
+    text.undo_hash_count_reset()
+    var f = fixture("root")
+    assert(text.undo_hash_count() == 1, "one scan at creation")
+    text.undo_mark_saved(mut f.undo, f.tb)
+    assert(text.undo_hash_count() == 1, "the save reuses it")
+    assert(f.undo.saved_hash == f.undo.root_hash, "saved is root")
+    text.undo_begin(mut f, text.TXN_TYPE)
+    assert(ins(mut f, 4, "!"), "insert")
+    text.undo_end(mut f)
+    text.undo_mark_saved(mut f.undo, f.tb)
+    assert(text.undo_hash_count() == 2, "a changed buffer scans")
+    assert(f.undo.saved_len == 5, "saved length")
+}
+
+fn t_undo_merge_rejects_different_reason() {
+    var f = fixture("abc")
+    let _ = ins(mut f, 3, "d")
+    f.undo.pending_reason = text.TXN_ERASE
+    let _ = del(mut f, 3, 4)
+    assert(f.undo.nodes.len == 3, "three nodes")
+    assert(f.undo.nodes[1].reason == text.TXN_TYPE, "typed")
+    assert(f.undo.nodes[2].reason == text.TXN_ERASE, "erased")
+    assert(f.undo.nodes[2].n_ops == 1, "one op")
+}
+
+fn t_undo_merge_rejects_elapsed_burst() {
+    var f = fixture("")
+    let _ = ins(mut f, 0, "a")
+    f.undo.fake_mono += text.UNDO_BURST_MS
+    let _ = ins(mut f, 1, "b")
+    assert(f.undo.nodes.len == 3, "three nodes")
+    assert(f.undo.nodes[1].n_ops == 1 && f.undo.nodes[2].n_ops == 1, "one op each")
+}
+
+fn t_undo_merge_rejects_noncontiguous_type() {
+    var f = fixture("--")
+    let _ = ins(mut f, 0, "a")
+    let _ = ins(mut f, 3, "b")
+    assert(f.undo.nodes.len == 3, "three nodes")
+    assert(f.undo.ops[0].off == 0 && f.undo.ops[1].off == 3, "offsets")
+}
+
+fn t_undo_erase_merges_backspace_and_forward_delete() {
+    var back = fixture("abcd")
+    back.undo.pending_reason = text.TXN_ERASE
+    let _ = del(mut back, 3, 4)
+    back.undo.pending_reason = text.TXN_ERASE
+    let _ = del(mut back, 2, 3)
+    assert(back.undo.nodes.len == 2, "one erase node")
+    assert(cur_node(back).n_ops == 2, "two ops")
+    assert_text(back.tb, "ab")
+    var forward = fixture("abcd")
+    forward.undo.pending_reason = text.TXN_ERASE
+    let _ = del(mut forward, 1, 2)
+    forward.undo.pending_reason = text.TXN_ERASE
+    let _ = del(mut forward, 1, 2)
+    assert(forward.undo.nodes.len == 2, "one erase node")
+    assert(cur_node(forward).n_ops == 2, "two ops")
+    assert_text(forward.tb, "ad")
+}
+
+fn t_undo_merge_rejects_payload_limit() {
+    var f = fixture("")
+    var bytes = List[byte]()
+    var i = 0
+    while i < text.UNDO_BURST_BYTES {
+        (mut bytes).push(120 as byte)
+        i += 1
+    }
+    let _ = text.edit_insert(mut f, text.byteoff(0), bytes)
+    let _ = ins(mut f, bytes.len, "y")
+    assert(f.undo.nodes.len == 3, "three nodes")
+    assert(f.undo.nodes[1].n_ops == 1 && f.undo.nodes[2].n_ops == 1, "one op each")
+    assert(text.textbuf_len(f.tb) == bytes.len + 1, "length")
+}
+
+fn assert_boundary_splits_burst() {
+    var f = fixture("")
+    let _ = ins(mut f, 0, "a")
+    text.undo_boundary(mut f.undo)
+    let _ = ins(mut f, 1, "b")
+    assert(f.undo.nodes.len == 3, "three nodes")
+    assert(!f.undo.boundary, "boundary consumed")
+    assert(f.undo.nodes[2].parent == f.undo.nodes[1].id, "a child")
+}
+
+fn t_undo_boundary_forces_new_node() {
+    assert_boundary_splits_burst()
+}
+
+fn t_undo_boundary_leave_insert_splits_burst() {
+    assert_boundary_splits_burst()
+}
+
+fn t_undo_boundary_cursor_motion_splits_burst() {
+    assert_boundary_splits_burst()
+}
+
+fn t_undo_boundary_newline_splits_burst() {
+    assert_boundary_splits_burst()
+}
+
+fn t_undo_boundary_window_focus_splits_burst() {
+    assert_boundary_splits_burst()
+}
+
+fn t_undo_explicit_depth_prevents_implicit_merge() {
+    var f = fixture("")
+    let _ = ins(mut f, 0, "a")
+    text.undo_begin(mut f, text.TXN_TYPE)
+    let _ = ins(mut f, 1, "b")
+    text.undo_end(mut f)
+    assert(f.undo.nodes.len == 3, "three nodes")
+    assert(f.undo.depth == 0, "closed")
+    assert(f.undo.nodes[2].n_ops == 1, "one op")
+}
+
+fn t_undo_explicit_type_coalesces_contiguous_insert_ops() {
+    var f = fixture("")
+    text.undo_begin(mut f, text.TXN_TYPE)
+    assert(ins(mut f, 0, "ab"), "ab")
+    assert(ins(mut f, 2, "cd"), "cd")
+    text.undo_end(mut f)
+    let n = cur_node(f)
+    assert(n.n_ops == 1, "one op")
+    assert(f.undo.ops[n.ops_at].off == 0 && f.undo.ops[n.ops_at].len == 4, "coalesced")
+    assert_text(f.tb, "abcd")
+    assert(text.undo(mut f), "undo")
+    assert_text(f.tb, "")
+    assert(text.redo(mut f), "redo")
+    assert_text(f.tb, "abcd")
+}
+
+fn t_undo_explicit_type_keeps_noncontiguous_insert_ops() {
+    var f = fixture("--")
+    text.undo_begin(mut f, text.TXN_TYPE)
+    assert(ins(mut f, 0, "a"), "a")
+    assert(ins(mut f, 3, "b"), "b")
+    text.undo_end(mut f)
+    assert(cur_node(f).n_ops == 2, "two ops")
+    assert_text(f.tb, "a--b")
+    assert(text.undo(mut f), "undo")
+    assert_text(f.tb, "--")
+    assert(text.redo(mut f), "redo")
+    assert_text(f.tb, "a--b")
+}
+
+fn t_undo_nesting_depth_three_commits_once() {
+    var f = fixture("")
+    text.undo_begin(mut f, text.TXN_PASTE)
+    text.undo_begin(mut f, text.TXN_PASTE)
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = ins(mut f, 0, "a")
+    let _ = ins(mut f, 1, "b")
+    assert(f.undo.depth == 3 && f.undo.open != 0, "depth three, open")
+    text.undo_end(mut f)
+    text.undo_end(mut f)
+    assert(f.undo.depth == 1 && f.undo.open != 0, "depth one, open")
+    text.undo_end(mut f)
+    assert(f.undo.depth == 0 && f.undo.open == 0, "closed")
+    assert(f.undo.nodes.len == 2, "one node")
+    assert(cur_node(f).n_ops == 2, "two ops")
+}
+
+fn t_undo_atomic_supported_reasons_each_commit_one_node() {
+    let reasons = [text.TXN_PASTE, text.TXN_CUT, text.TXN_EXTERNAL]
+    var f = fixture("")
+    var i = 0
+    while i < 3 {
+        text.undo_begin(mut f, reasons[i])
+        let _ = ins(mut f, text.textbuf_len(f.tb), "xy")
+        text.undo_end(mut f)
+        assert(f.undo.nodes.len == i + 2, "a node per reason")
+        assert(cur_node(f).reason == reasons[i], "the reason")
+        assert(cur_node(f).n_ops == 1, "one op")
+        i += 1
+    }
+}
+
+fn t_undo_multi_transaction_commits_one_node() {
+    var f = fixture("ab")
+    assert(text.cset_add(mut f.cset, cursor(2, 2, 2)), "a second cursor")
+    text.undo_begin(mut f, text.TXN_MULTI)
+    assert(ins(mut f, 0, "X"), "X")
+    assert(ins(mut f, f.cset.curs[1].pos, "Y"), "Y")
+    text.undo_end(mut f)
+    let n = cur_node(f)
+    assert(n.reason == text.TXN_MULTI && n.n_ops == 2, "one MULTI node of two ops")
+    assert(f.undo.depth == 0 && f.cset.curs.len == 2, "closed, two cursors")
+    assert_text(f.tb, "XabY")
+    assert(text.undo(mut f), "undo")
+    assert_text(f.tb, "ab")
+    assert(f.cset.curs.len == 2, "two cursors")
+    assert(f.cset.curs[0].pos == 0 && f.cset.curs[1].pos == 2, "restored")
+}
+
+fn t_undo_filter_reason_names_sprint19() {
+    var f = fixture("alpha\nbeta\n")
+    text.undo_begin(mut f, text.TXN_FILTER)
+    assert(del(mut f, 0, 6), "delete")
+    assert(ins(mut f, 0, "ALPHA\n"), "insert")
+    text.undo_end(mut f)
+    assert(text.undo(mut f), "undo")
+    assert(text.textbuf_len(f.tb) == 11, "restored")
+}
+
+fn t_undo_replace_reason_is_live() {
+    var f = fixture("hello")
+    text.undo_begin(mut f, text.TXN_REPLACE)
+    assert(ins(mut f, 0, "X"), "insert")
+    text.undo_end(mut f)
+    assert(text.undo(mut f), "undo")
+    assert(text.textbuf_len(f.tb) == 5, "restored")
+}
+
+fn t_undo_macro_reason_is_live() {
+    var f = fixture("hello")
+    text.undo_begin(mut f, text.TXN_MACRO)
+    assert(ins(mut f, 5, "!"), "insert")
+    text.undo_end(mut f)
+    assert(text.undo(mut f), "undo")
+    assert(text.textbuf_len(f.tb) == 5, "restored")
+}
+
+fn t_undo_macro_aggregates_live_cursor_set() {
+    var f = fixture("abcd")
+    f.cset.curs[0] = cursor(1, 1, 1)
+    assert(text.cset_add(mut f.cset, cursor(3, 3, 3)), "a second cursor")
+    // C opens the boundary through a copy of the context with no cursor
+    // set (`enlist.cset = NULL`); the port's one context withholds it.
+    f.has_cset = false
+    text.undo_begin(mut f, text.TXN_MACRO)
+    f.has_cset = true
+    assert(del(mut f, 1, 2), "delete")
+    assert(ins(mut f, 1, "ZZ"), "insert")
+    text.undo_end(mut f)
+    let n = cur_node(f)
+    assert(n.reason == text.TXN_MACRO && n.n_ops == 2, "one MACRO node")
+    assert(n.n_before == 2 && n.n_after == 2, "both snapshots of the live set")
+    assert_text(f.tb, "aZZcd")
+    assert(f.cset.curs[0].pos == 3 && f.cset.curs[1].pos == 4, "after")
+    assert(text.undo(mut f), "undo")
+    assert_text(f.tb, "abcd")
+    assert(f.cset.curs.len == 2, "two cursors")
+    assert(f.cset.curs[0].pos == 1 && f.cset.curs[1].pos == 3, "before")
+    assert(text.redo(mut f), "redo")
+    assert_text(f.tb, "aZZcd")
+    assert(f.cset.curs[0].pos == 3 && f.cset.curs[1].pos == 4, "after again")
+}
+
+fn t_undo_lsp_reason_names_sprint47() {
+    var f = fixture("old")
+    text.undo_begin(mut f, text.TXN_LSP)
+    assert(del(mut f, 0, 3), "delete")
+    assert(ins(mut f, 0, "new"), "insert")
+    text.undo_end(mut f)
+    assert(f.undo.nodes.len == 2, "one node")
+    assert(cur_node(f).reason == text.TXN_LSP && cur_node(f).n_ops == 2, "LSP node")
+    assert_text(f.tb, "new")
+    assert(text.undo(mut f), "undo")
+    assert_text(f.tb, "old")
+    assert(text.undo_prune_redo(mut f.undo, text.TXN_LSP), "pruned")
+    assert(!text.redo(mut f), "no redo")
+    assert(!text.undo_prune_redo(mut f.undo, text.TXN_LSP), "nothing left to prune")
+}
+
+fn bug_scenario() {
+    var f = fixture("")
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = ins(mut f, 0, "x")
+    f.meta = text.filemeta_new()
+    f.has_meta = true
+    let _ = text.edit_save(mut f, "/tmp/yew-save-open-transaction")
+    os_exit(0)
+}
+
+fn self_reexecutes() -> bool {
+    let exe = os_exe() else {
+        return false
+    }
+    var c = process.command(exe)
+    process.push_arg(mut c, "--self-check")
+    let sink = fs.open_append("/dev/null") else |_| {
+        return false
+    }
+    process.set_stderr(mut c, sink)
+    process.set_stdout(mut c, sink)
+    let child = process.start(c) else |_| {
+        return false
+    }
+    let status = process.wait_status(take child) else -1
+    fs.close(take sink) else |_| {}
+    status == 7
+}
+
+fn t_undo_save_rejects_open_transaction() {
+    if !self_reexecutes() {
+        print(
+            "undo_test: SKIP undo_save_rejects_open_transaction: os_exe() does not re-run this test here (the checked machine)",
+        )
+        eprint(
+            "undo_test: SKIP undo_save_rejects_open_transaction: os_exe() does not re-run this test here (the checked machine)",
+        )
+        return
+    }
+    let exe = os_exe() else ""
+    let err_path = "target/tests/undo-test-bug.err"
+    fs_create_dir_all("target/tests") else {}
+    fs_remove(err_path) else |_| {}
+    var c = process.command(exe)
+    process.push_arg(mut c, "--bug")
+    process.push_arg(mut c, "0")
+    let sink = fs.open_append(err_path) else |_| {
+        assert(false, "stderr capture")
+        return
+    }
+    process.set_stderr(mut c, sink)
+    let child = process.start(c) else |_| {
+        assert(false, "spawn")
+        return
+    }
+    let status = process.wait_status(take child) else -1
+    fs.close(take sink) else |_| {}
+    assert(status == 4, "exits 4 (status {status})")
+    let err = fs_read_text(err_path) else ""
+    assert(err.contains("edit save: open undo transaction"), "names the open transaction")
+    fs_remove(err_path) else |_| {}
+}
+
+fn t_undo_abort_restores_content_and_single_cursor() {
+    var f = fixture("base")
+    f.cset.curs[0] = cursor(2, 1, 9)
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = ins(mut f, 2, "XYZ")
+    let _ = del(mut f, 0, 1)
+    f.cset.selstacks[0].n = 2
+    assert(f.undo.depth == 1 && f.undo.open != 0, "open")
+    text.undo_abort(mut f)
+    assert_text(f.tb, "base")
+    assert(f.cset.curs.len == 1, "one cursor")
+    assert(
+        f.cset.curs[0].pos == 2 && f.cset.curs[0].anchor == 1 && f.cset.curs[0].goal_col == 9,
+        "restored",
+    )
+    assert(f.cset.selstacks[0].n == 0, "selection stack cleared")
+    assert(f.undo.depth == 0 && f.undo.open == 0, "closed")
+    assert(f.undo.nodes.len == 1, "the node is gone")
+}
+
+fn t_undo_restores_eight_cursor_after_snapshot() {
+    var f = fixture("0123456789")
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = ins(mut f, 10, "x")
+    var i = 1
+    while i < 8 {
+        assert(text.cset_add(mut f.cset, cursor(i, i, i + 3)), "cursor {i}")
+        i += 1
+    }
+    text.undo_end(mut f)
+    assert(cur_node(f).n_after == 8, "eight after")
+    assert(text.undo(mut f), "undo")
+    assert(f.cset.curs.len == 1, "one before")
+    assert(text.redo(mut f), "redo")
+    assert(f.cset.curs.len == 8, "eight again")
+    i = 0
+    while i < 8 {
+        assert(f.cset.curs[i].pos == (if i == 0 then 0 else i), "pos {i}")
+        assert(f.cset.curs[i].anchor == i, "anchor {i}")
+        i += 1
+    }
+}
+
+fn t_undo_window_gone_restores_into_focused_cursor_set() {
+    var f = fixture("abc")
+    f.cset.curs[0] = cursor(1, 0, 5)
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = ins(mut f, 3, "X")
+    f.cset.curs[0] = cursor(4, 4, 8)
+    text.undo_end(mut f)
+    assert(cur_node(f).win_id == 7, "window 7")
+    // C points the context at another window's set; the port swaps the
+    // owned set in and out.
+    let original = copy f.cset
+    f.cset = text.cset_init(cursor(2, 2, 2))
+    f.win_id = 99
+    assert(text.undo(mut f), "undo")
+    assert(
+        f.cset.curs[0].pos == 1 && f.cset.curs[0].anchor == 0 && f.cset.curs[0].goal_col == 5,
+        "focused restored",
+    )
+    assert(original.curs[0].pos == 4, "the gone window's set untouched")
+    assert(text.redo(mut f), "redo")
+    assert(
+        f.cset.curs[0].pos == 4 && f.cset.curs[0].anchor == 4 && f.cset.curs[0].goal_col == 8,
+        "focused redone",
+    )
+    assert(original.curs[0].pos == 4, "still untouched")
+}
+
+fn t_undo_redo_cycles_do_not_grow_add_store() {
+    var f = fixture("")
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = ins(mut f, 0, "payload")
+    text.undo_end(mut f)
+    let stable = f.tb.add.bytes.len
+    assert(stable == 7, "seven bytes")
+    var i = 0
+    while i < 100000 {
+        assert(text.undo(mut f), "undo")
+        assert(text.redo(mut f), "redo")
+        i += 1
+    }
+    assert(f.tb.add.bytes.len == stable, "the add store did not grow")
+    assert(f.undo.nodes.len == 2, "two nodes")
+    assert_text(f.tb, "payload")
+}
+
+fn t_undo_to_root_reproduces_loaded_bytes() {
+    var original = List[byte]()
+    for x in [97, 0, 255, 10, 122] {
+        (mut original).push(x as byte)
+    }
+    let tb = text.textbuf_from_bytes(original, 0, original.len)
+    let undo = text.undo_new(tb)
+    var f = text.editctx_new(take tb)
+    f.has_marks = true
+    f.cset = text.cset_init(cursor(0, 0, 0))
+    f.has_cset = true
+    f.undo = undo
+    f.has_undo = true
+    f.win_id = 7
+    text.undo_set_clock(mut f.undo, 1000, 100)
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = del(mut f, 1, 4)
+    let _ = ins(mut f, 1, "other")
+    text.undo_end(mut f)
+    assert(f.undo.nodes.len == 2, "one node")
+    assert(text.undo_to(mut f, f.undo.root), "to root")
+    assert(same(text.textbuf_bytes(f.tb), original), "the loaded bytes")
+    assert(text.undo_current(f.undo) == f.undo.root, "at root")
+    assert(!text.undo(mut f), "nothing below root")
+}
+
+fn fresh_dir(prefix: str) -> str {
+    var tries = 0
+    while tries < 100 {
+        var suffix = ""
+        for r in os_random(6) {
+            suffix = suffix + "{r % 10}"
+        }
+        let dir = "/tmp/{prefix}-{suffix}"
+        fs_create_dir_mode(dir, 448) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            denied => { assert(false, "mkdtemp denied") },
+            invalid => { assert(false, "mkdtemp invalid") },
+            not_found => { assert(false, "mkdtemp not found") },
+            unsupported => { assert(false, "mkdtemp unsupported") },
+            io => { assert(false, "mkdtemp io") },
+        }
+        return dir
+    }
+    assert(false, "mkdtemp exhausted")
+    ""
+}
+
+fn t_undo_save_reopens_journal_on_navigation() {
+    let made = fresh_dir("yew-undo-save")
+    let state = text.file_realpath(made) else made
+    let source = "{state}/base.txt"
+    fs_write_bytes(source, bytes_of("base")) else {
+        assert(false, "write source")
+    }
+    env_set("XDG_STATE_HOME", state) else {}
+    var (rc, tb, meta) = text.file_load(source)
+    assert(rc == text.LOAD_OK, "load")
+    let undo = text.undo_new(tb)
+    var e = text.editctx_new(take tb)
+    e.cset = text.cset_init(cursor(0, 0, 0))
+    e.has_cset = true
+    e.undo = undo
+    e.has_undo = true
+    e.meta = meta
+    e.has_meta = true
+    let _ = ins(mut e, 4, "X")
+    assert(e.has_jrnl && text.journal_ok(e.jrnl), "the edit opened a journal")
+    assert(text.edit_save(mut e, source) == text.SAVE_OK, "save")
+    assert(!e.has_jrnl, "the save discarded it")
+    assert(text.undo_at_save_point(e.undo), "at the save point")
+    assert(text.undo(mut e), "undo")
+    assert(e.has_jrnl && text.journal_ok(e.jrnl), "navigation reopened it")
+    assert_text(e.tb, "base")
+    text.journal_close(mut e.journals, mut e.jrnl)
+    e.has_jrnl = false
+    var (rc2, recovered, recovered_meta) = text.file_load(source)
+    assert(rc2 == text.LOAD_OK, "reload")
+    let reg = text.journalset_new()
+    assert(text.journal_replay(reg, source, mut recovered, mut recovered_meta), "replay")
+    assert_text(recovered, "base")
+    var reg2 = text.journalset_new()
+    let (adopted0, _) = text.journal_open(mut reg2, source, mut recovered_meta)
+    var adopted = adopted0
+    assert(adopted.open, "adopted")
+    let _ = text.journal_discard(mut reg2, mut adopted)
+    text.filemeta_dispose(mut recovered_meta, mut recovered)
+    text.textbuf_free(mut recovered)
+    text.filemeta_dispose(mut e.meta, mut e.tb)
+    text.textbuf_free(mut e.tb)
+    fs_remove(source) else {
+        assert(false, "unlink source")
+    }
+    fs_remove_dir("{state}/yew/journal") else {
+        assert(false, "rmdir journal")
+    }
+    fs_remove_dir("{state}/yew") else {
+        assert(false, "rmdir yew")
+    }
+    fs_remove_dir(state) else {
+        assert(false, "rmdir state")
+    }
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let args = env_args()
+    if args.len == 1 && args[0] == "--self-check" {
+        os_exit(7)
+    }
+    if args.len == 2 && args[0] == "--bug" {
+        bug_scenario()
+        return
+    }
+    t_undo_type_merges_when_all_predicates_hold()
+    t_undo_identity_hash_is_piece_independent()
+    t_undo_initial_save_reuses_root_identity()
+    t_undo_merge_rejects_different_reason()
+    t_undo_merge_rejects_elapsed_burst()
+    t_undo_merge_rejects_noncontiguous_type()
+    t_undo_erase_merges_backspace_and_forward_delete()
+    t_undo_merge_rejects_payload_limit()
+    t_undo_boundary_forces_new_node()
+    t_undo_boundary_leave_insert_splits_burst()
+    t_undo_boundary_cursor_motion_splits_burst()
+    t_undo_boundary_newline_splits_burst()
+    t_undo_boundary_window_focus_splits_burst()
+    t_undo_explicit_depth_prevents_implicit_merge()
+    t_undo_explicit_type_coalesces_contiguous_insert_ops()
+    t_undo_explicit_type_keeps_noncontiguous_insert_ops()
+    t_undo_nesting_depth_three_commits_once()
+    t_undo_atomic_supported_reasons_each_commit_one_node()
+    t_undo_multi_transaction_commits_one_node()
+    t_undo_filter_reason_names_sprint19()
+    t_undo_replace_reason_is_live()
+    t_undo_macro_reason_is_live()
+    t_undo_macro_aggregates_live_cursor_set()
+    t_undo_lsp_reason_names_sprint47()
+    t_undo_save_rejects_open_transaction()
+    t_undo_abort_restores_content_and_single_cursor()
+    t_undo_restores_eight_cursor_after_snapshot()
+    t_undo_window_gone_restores_into_focused_cursor_set()
+    t_undo_redo_cycles_do_not_grow_add_store()
+    t_undo_to_root_reproduces_loaded_bytes()
+    t_undo_save_reopens_journal_on_navigation()
+    print("undo_test: 31 cases pass")
+}
