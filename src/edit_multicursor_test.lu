@@ -1,0 +1,1022 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_multicursor.c` (1,477 lines), one
+//! test per C test in registry order (`tests/unit/registry.c:330-360`).
+//! The set tests drive `text.cset` (yw02's port of the set half); the
+//! editor tests drive `edit.mc_run` and THE invoke over a headless editor:
+//! C's `mc_ed_init` zeroes an `Ed`, gives it one buffer with undo and
+//! marks and one window, and sets `model_ready`; the port's is
+//! `edit.ed_new()` over a memory buffer (`ed_open_memory`). C's probe
+//! commands are C functions; the port registers `HANDLER_PROBE` under the
+//! same names and `edit.probe` runs them by name.
+//!
+//! **What does not port, by name.** `cset_free`'s three emptiness asserts
+//! (wolf frees by region; there is no free to observe).
+//! `multicursor_batches_symbol_rebuild_and_damage`'s symbol-index and
+//! syntax-splice assertions need `ws/symidx` (yw11) and the syntax engine
+//! (yw10): the case runs its damage-batch half and is counted SKIP for
+//! the rest. The two fault-shim cases (`200_insert…`, `1000_failure…`)
+//! run their child's whole body in process — the multicursor law — and
+//! the shim's "one `fsync-file pass`" is KNOWN-RED by name: the port's
+//! journal barrier syncs nothing at wolf 0.2.33 (G3, wolf-lang#796), so
+//! there is no fsync to count. The two bug-guard cases re-run this binary
+//! as their child (`--role`), as C's `yew_test_spawn_child` does; under
+//! `wolf test` (the checked machine) `os_exe()` is `wolf`, so they SKIP
+//! there loudly and run in `tools/check-test --native`.
+
+use edit
+use std.fs
+use std.process
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn say(line: str) {
+    print(line)
+    eprint(line)
+}
+
+fn skip(what: str) -> int {
+    say("multicursor_test: SKIP {what}")
+    1
+}
+
+// `test_cursor` (`test_multicursor.c:24-32`).
+fn tc(pos: int, anchor: int, goal: int) -> text.Cursor {
+    text.Cursor { pos: pos, goal_col: goal, anchor: anchor }
+}
+
+// `assert_cursor` (`test_multicursor.c:34-40`).
+fn assert_cursor(c: text.Cursor, pos: int, anchor: int, goal: int, what: str) {
+    assert(
+        c.pos == pos && c.anchor == anchor && c.goal_col == goal,
+        "{what}: cursor ({c.pos}, {c.anchor}, {c.goal_col}), want ({pos}, {anchor}, {goal})",
+    )
+}
+
+// `assert_mc_text` (`test_multicursor.c:42-62`).
+fn assert_text(tb: text.TextBuf, want: List[byte], what: str) {
+    let got = text.textbuf_bytes(tb)
+    assert(got.len == want.len, "{what}: {got.len} bytes, want {want.len}")
+    var i = 0
+    while i < got.len {
+        assert(got[i] == want[i], "{what}: byte {i} differs")
+        i += 1
+    }
+}
+
+fn assert_str(tb: text.TextBuf, want: str, what: str) {
+    assert_text(tb, bytes_of(want), what)
+}
+
+// `mc_ed_init` (`test_multicursor.c:226-243`): one buffer with undo and
+// marks over `bytes`, one window, one caret at 0.
+fn mc_ed(bytes: str) -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_memory(mut ed, bytes_of(bytes), "mc")
+    ed
+}
+
+fn buf_of(ed: edit.Ed) -> int {
+    ed.wins[ed.win].buf
+}
+
+fn probe(mut ed: edit.Ed, name: str) -> int {
+    let existing = edit.cmd_lookup(ed.reg, name)
+    if existing != 0 {
+        return existing
+    }
+    edit.cmd_register(
+        mut ed.reg,
+        edit.CmdDesc {
+            name: name,
+            handler: edit.HANDLER_PROBE,
+            impl_id: 0,
+            arity: edit.ARITY_NONE,
+            flags: edit.CMD_NEEDS_WIN | edit.CMD_CHANGES_BUFFER,
+            help: "a multicursor test probe",
+            word: "",
+            has_word: false,
+        },
+    )
+}
+
+fn invoke(mut ed: edit.Ed, id: int, count: int) -> int {
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = count
+    cx.count_given = true
+    edit.ed_cmd_invoke(mut ed, id, mut cx)
+}
+
+fn undo_step(mut ed: edit.Ed) -> bool {
+    let w = ed.win
+    let b = ed.wins[w].buf
+    edit.edit_take(mut ed, w)
+    let ok = text.undo(mut ed.bufs[b].ec)
+    edit.edit_give(mut ed, w)
+    ok
+}
+
+// `test_multicursor_lifecycle_and_point_dedupe`.
+fn t_multicursor_lifecycle_and_point_dedupe() {
+    var set = text.cset_init(tc(10, 10, 4))
+    assert(set.curs.len == 1 && set.primary == 0, "one primary")
+    assert(text.cset_add(mut set, tc(5, 5, 2)), "add 5")
+    assert(set.curs.len == 2 && set.primary == 1, "two, primary moved to 1")
+    assert_cursor(copy set.curs[0], 5, 5, 2, "c0")
+    assert_cursor(copy set.curs[1], 10, 10, 4, "c1")
+    assert(!text.cset_add(mut set, tc(10, 10, 99)), "a duplicate point is refused")
+    assert(set.curs.len == 2 && set.primary == 1, "unchanged")
+    assert_cursor(copy set.curs[1], 10, 10, 4, "the primary keeps its goal")
+    assert(!text.cset_add(mut set, tc(5, 5, 77)), "a second duplicate")
+    assert_cursor(copy set.curs[0], 5, 5, 2, "the first keeps its goal")
+    text.cset_check(set)
+}
+
+// `test_multicursor_latest_cap_and_active_tracking`.
+fn t_multicursor_latest_cap_and_active_tracking() {
+    var set = text.cset_init(tc(10, 10, 10))
+    assert(text.cset_add(mut set, tc(5, 5, 5)), "add 5")
+    assert(text.cset_add(mut set, tc(15, 15, 15)), "add 15")
+    assert(text.cset_drop_latest(mut set), "drop the latest")
+    assert(set.curs.len == 2, "two left")
+    assert_cursor(copy set.curs[0], 5, 5, 5, "c0")
+    assert_cursor(copy set.curs[1], 10, 10, 10, "c1")
+    var refused = List[text.Cursor]()
+    var i = 0
+    while i < text.MC_MAX {
+        (mut refused).push(tc(20, 20, 20))
+        i += 1
+    }
+    assert(!text.cset_add_many(mut set, refused), "past the cap is refused")
+    assert(set.curs.len == 2, "still two")
+    assert(text.cset_add(mut set, tc(6, 6, 6)), "add 6")
+    set.active = 1
+    text.cset_adjust(mut set, text.JOURNAL_DEL, 5 as text.ByteOff, 2)
+    assert(set.curs.len == 2, "6 merged into 5")
+    assert(set.active == 0, "active follows the merge, at {set.active}")
+    assert_cursor(copy set.curs[0], 5, 5, 5, "c0")
+    assert_cursor(copy set.curs[1], 8, 8, 10, "c1")
+    set.active = text.MC_ACTIVE_NONE
+    text.cset_check(set)
+}
+
+// `test_multicursor_reseed_uses_fresh_identity_space`.
+fn t_multicursor_reseed_uses_fresh_identity_space() {
+    var set = text.cset_init(tc(10, 10, 10))
+    assert(text.cset_add(mut set, tc(5, 5, 5)), "add")
+    assert(set.next_stamp == 3, "next stamp 3")
+    text.cset_reseed(mut set)
+    assert(set.stamps[0] == 3 && set.stamps[1] == 4 && set.next_stamp == 5, "monotonic reseed")
+    // Exhaustion is the one path that recycles the namespace (C's
+    // `UINT64_MAX` is the port's `text.STAMP_MAX`).
+    set.next_stamp = text.STAMP_MAX
+    text.cset_reseed(mut set)
+    assert(set.stamps[0] == 1 && set.stamps[1] == 2 && set.next_stamp == 3, "exhausted reseed restarts at 1")
+    set.next_stamp = text.STAMP_MAX
+    assert(text.cset_add(mut set, tc(20, 20, 20)), "add at exhaustion")
+    assert(
+        set.stamps[0] == 1 && set.stamps[1] == 2 && set.stamps[2] == 3 && set.next_stamp == 4,
+        "an exhausted add reseeds first, stamps {set.stamps[0]} {set.stamps[1]} {set.stamps[2]} next {set.next_stamp}",
+    )
+}
+
+// `test_multicursor_run_commits_one_undo_transaction`.
+fn t_multicursor_run_commits_one_undo_transaction() {
+    var ed = mc_ed("ab")
+    let w = ed.win
+    let b = buf_of(ed)
+    assert(text.cset_add(mut ed.wins[w].cs, tc(2, 2, 2)), "add 2")
+    let id = probe(mut ed, "ed.edit.mc.insert")
+    var cx = edit.cmdctx_new(w, edit.SRC_KEY)
+    assert(edit.mc_run(mut ed, w, id, mut cx) == edit.CMD_ERR_STATE, "no transaction: refused")
+    assert_str(ed.bufs[b].ec.tb, "ab", "unchanged")
+    edit.ed_undo_begin(mut ed, w, text.TXN_MULTI)
+    assert(edit.mc_run(mut ed, w, id, mut cx) == edit.CMD_OK, "one run")
+    assert(ed.damage_batch_finalizations == 1, "one batch finalization, at {ed.damage_batch_finalizations}")
+    assert(!ed.damage_batching, "batch closed")
+    assert_str(ed.bufs[b].ec.tb, "XabX", "both cursors inserted")
+    assert(ed.bufs[b].ec.undo.depth == 1, "one open transaction")
+    assert(ed.bufs[b].ec.undo.nodes.len == 2, "one node")
+    assert(ed.bufs[b].ec.undo.open != 0, "the node is open")
+    assert(ed.bufs[b].ec.undo.nodes[1].n_ops == 2, "two ops")
+    edit.ed_undo_end(mut ed, w)
+    edit.ed_finish_edit(mut ed, w)
+    assert(ed.bufs[b].ec.undo.nodes.len == 2, "still one node")
+    assert(ed.bufs[b].ec.undo.nodes[1].reason == text.TXN_MULTI, "a MULTI node")
+    assert(ed.bufs[b].ec.undo.nodes[1].n_ops == 2, "two ops")
+    assert(undo_step(mut ed), "undo")
+    assert_str(ed.bufs[b].ec.tb, "ab", "one undo reverts both")
+    assert(ed.wins[w].cs.curs.len == 2, "two cursors back")
+}
+
+// `test_multicursor_run_rolls_back_every_cursor`.
+fn t_multicursor_run_rolls_back_every_cursor() {
+    var ed = mc_ed("ab")
+    let w = ed.win
+    let b = buf_of(ed)
+    assert(text.cset_add(mut ed.wins[w].cs, tc(2, 2, 2)), "add 2")
+    let id = probe(mut ed, "ed.edit.mc.cancel")
+    var cx = edit.cmdctx_new(w, edit.SRC_KEY)
+    edit.ed_undo_begin(mut ed, w, text.TXN_MULTI)
+    assert(edit.mc_run(mut ed, w, id, mut cx) == edit.CMD_ERR_STATE, "the second cursor fails")
+    assert(ed.damage_batch_finalizations == 1, "one finalization")
+    assert(!ed.damage_batching, "batch closed")
+    assert_str(ed.bufs[b].ec.tb, "Xab", "the first insert stands until the abort")
+    assert(ed.bufs[b].ec.undo.depth == 1, "open")
+    edit.ed_undo_abort(mut ed, w)
+    edit.ed_finish_edit(mut ed, w)
+    assert_str(ed.bufs[b].ec.tb, "ab", "aborted")
+    assert(ed.bufs[b].ec.undo.nodes.len == 1 && ed.bufs[b].ec.undo.depth == 0, "no node, closed")
+    assert(ed.wins[w].cs.curs.len == 2, "two cursors")
+    assert_cursor(copy ed.wins[w].cs.curs[0], 0, 0, 0, "c0 restored")
+    assert_cursor(copy ed.wins[w].cs.curs[1], 2, 2, 2, "c1 restored")
+}
+
+// `test_multicursor_batches_symbol_rebuild_and_damage`: the damage-batch
+// half (one invoke over 40 cursors is one batch, a whole-window repaint)
+// runs; the symbol-index and syntax-splice assertions SKIP by name.
+fn t_multicursor_batches_symbol_rebuild_and_damage() -> int {
+    var body = ""
+    var line = 0
+    while line < 40 {
+        let two = if line < 10 then "0{line}" else "{line}"
+        body = "{body}symbol_{two} value_{two}\n"
+        line += 1
+    }
+    var ed = edit.ed_new()
+    edit.ed_open_memory(mut ed, bytes_of(body), "mc-symbols.txt")
+    let w = ed.win
+    let b = buf_of(ed)
+    line = 1
+    while line < 40 {
+        let sp = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+        assert(text.cset_add(mut ed.wins[w].cs, tc(sp.lo, sp.lo, 0)), "add line {line}")
+        line += 1
+    }
+    ed.wins[w].rect.h = 24
+    let id = probe(mut ed, "ed.edit.mc.insert")
+    assert(invoke(mut ed, id, 1) == edit.CMD_OK, "one invoke")
+    assert(ed.damage_batch_finalizations == 1, "one finalization")
+    assert(!ed.damage_batching, "batch closed")
+    assert(ed.doc_damage_lo == 0 && ed.doc_damage_hi == 24, "the whole window, {ed.doc_damage_lo}..{ed.doc_damage_hi}")
+    let undo = edit.cmd_lookup(ed.reg, "ed.edit.undo")
+    let redo = edit.cmd_lookup(ed.reg, "ed.edit.redo")
+    assert(undo != 0 && redo != 0, "undo and redo")
+    assert(invoke(mut ed, undo, 1) == edit.CMD_OK, "undo")
+    assert(text.textbuf_len(ed.bufs[b].ec.tb) == body.len, "undone")
+    assert(invoke(mut ed, redo, 1) == edit.CMD_OK, "redo")
+    assert(text.textbuf_len(ed.bufs[b].ec.tb) == body.len + 40, "redone")
+    skip(
+        "multicursor_batches_symbol_rebuild_and_damage: its symbol-index rebuild (ws/symidx, yw11) and syntax-splice (syn, yw10) assertions; the damage-batch half ran",
+    )
+}
+
+// `test_multicursor_same_line_batch_keeps_row_damage` (YEW-F-072).
+fn t_multicursor_same_line_batch_keeps_row_damage() {
+    var ed = mc_ed("00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n")
+    let w = ed.win
+    let b = buf_of(ed)
+    ed.wins[w].rect = edit.rect(0, 0, 80, 20)
+    ed.wins[w].vp.rows = 20
+    ed.wins[w].vp.cols = 80
+    let five = text.textbuf_line_span(ed.bufs[b].ec.tb, 5 as text.LineNo).lo
+    ed.wins[w].cs.curs[0] = tc(five, five, 0)
+    let seven = text.textbuf_line_span(ed.bufs[b].ec.tb, 7 as text.LineNo).lo
+    assert(text.cset_add(mut ed.wins[w].cs, tc(seven, seven, 0)), "add line 7")
+    let id = probe(mut ed, "ed.edit.mc.insert")
+    assert(invoke(mut ed, id, 1) == edit.CMD_OK, "invoke")
+    assert(ed.doc_damage_lo == 5 && ed.doc_damage_hi == 8, "rows 5..8, got {ed.doc_damage_lo}..{ed.doc_damage_hi}")
+    assert(ed.cursor_overlay_damage_complete, "the overlay damage is complete")
+    assert(ed.damage_batch_finalizations == 1, "one finalization")
+    let undo = edit.cmd_lookup(ed.reg, "ed.edit.undo")
+    let redo = edit.cmd_lookup(ed.reg, "ed.edit.redo")
+    ed.doc_damage_lo = 20
+    ed.doc_damage_hi = 0
+    ed.cursor_overlay_damage_complete = false
+    assert(invoke(mut ed, undo, 1) == edit.CMD_OK, "undo")
+    assert(ed.doc_damage_lo == 5 && ed.doc_damage_hi == 8, "undo: rows 5..8, got {ed.doc_damage_lo}..{ed.doc_damage_hi}")
+    assert(ed.cursor_overlay_damage_complete, "undo: overlay complete")
+    ed.doc_damage_lo = 20
+    ed.doc_damage_hi = 0
+    ed.cursor_overlay_damage_complete = false
+    assert(invoke(mut ed, redo, 1) == edit.CMD_OK, "redo")
+    assert(ed.doc_damage_lo == 5 && ed.doc_damage_hi == 8, "redo: rows 5..8, got {ed.doc_damage_lo}..{ed.doc_damage_hi}")
+    assert(ed.cursor_overlay_damage_complete, "redo: overlay complete")
+    ed.doc_damage_lo = 20
+    ed.doc_damage_hi = 0
+    ed.cursor_overlay_damage_complete = false
+    edit.ed_damage_batch_begin(mut ed, w)
+    edit.ed_damage_line(mut ed, 5, true)
+    edit.ed_damage_batch_end(mut ed)
+    assert(ed.doc_damage_lo == 0 && ed.doc_damage_hi == 20, "a line-count change is the whole window")
+    assert(!ed.cursor_overlay_damage_complete, "and not complete")
+}
+
+// `test_multicursor_editor_invoke_rolls_back_on_per_cursor_failure`.
+fn t_multicursor_editor_invoke_rolls_back_on_per_cursor_failure() {
+    var ed = mc_ed("ab")
+    let w = ed.win
+    let b = buf_of(ed)
+    assert(text.cset_add(mut ed.wins[w].cs, tc(2, 2, 2)), "add 2")
+    let id = probe(mut ed, "ed.edit.mc.cancel")
+    assert(invoke(mut ed, id, 1) == edit.CMD_ERR_STATE, "the invoke fails")
+    assert_str(ed.bufs[b].ec.tb, "ab", "rolled back")
+    assert(ed.bufs[b].ec.undo.nodes.len == 1, "no node")
+    assert(text.undo_current(ed.bufs[b].ec.undo) == ed.bufs[b].ec.undo.root, "at the root")
+    assert(ed.wins[w].cs.curs.len == 2, "two cursors")
+    assert_cursor(copy ed.wins[w].cs.curs[0], 0, 0, 0, "c0")
+    assert_cursor(copy ed.wins[w].cs.curs[1], 2, 2, 2, "c1")
+}
+
+// `test_multicursor_count_repeats_per_cursor`.
+fn t_multicursor_count_repeats_per_cursor() {
+    var ed = mc_ed("abcdefghij")
+    let w = ed.win
+    let b = buf_of(ed)
+    assert(text.cset_add(mut ed.wins[w].cs, tc(5, 5, 5)), "add 5")
+    let id = edit.cmd_lookup(ed.reg, "ed.edit.delete.grapheme")
+    assert(id != 0, "delete.grapheme")
+    assert(invoke(mut ed, id, 2) == edit.CMD_OK, "2x at both")
+    assert_str(ed.bufs[b].ec.tb, "cdehij", "two clusters at each cursor")
+    assert(ed.wins[w].cs.curs.len == 2, "two cursors")
+    assert_cursor(copy ed.wins[w].cs.curs[0], 0, 0, 0, "c0")
+    assert_cursor(copy ed.wins[w].cs.curs[1], 3, 3, 5, "c1")
+}
+
+// `test_multicursor_adjacent_edit_ranges_both_run`.
+fn t_multicursor_adjacent_edit_ranges_both_run() {
+    var ed = mc_ed("abcdef")
+    let w = ed.win
+    let b = buf_of(ed)
+    assert(text.cset_add(mut ed.wins[w].cs, tc(3, 3, 3)), "add 3")
+    let id = edit.cmd_lookup(ed.reg, "ed.edit.delete.grapheme")
+    assert(invoke(mut ed, id, 3) == edit.CMD_OK, "3x at both")
+    assert_str(ed.bufs[b].ec.tb, "", "everything")
+    assert(ed.wins[w].cs.curs.len == 1, "merged to one")
+    assert_cursor(copy ed.wins[w].cs.curs[0], 0, 0, 0, "c0")
+    assert(ed.msg.text == "1 cursor merged", "message '{ed.msg.text}'")
+}
+
+// `test_multicursor_overlapping_edit_skips_later_and_reports_merge`.
+fn t_multicursor_overlapping_edit_skips_later_and_reports_merge() {
+    var ed = mc_ed("abcdef")
+    let w = ed.win
+    let b = buf_of(ed)
+    assert(text.cset_add(mut ed.wins[w].cs, tc(1, 1, 1)), "add 1")
+    assert(text.cset_add(mut ed.wins[w].cs, tc(2, 2, 2)), "add 2")
+    assert(text.cset_add(mut ed.wins[w].cs, tc(3, 3, 3)), "add 3")
+    let id = edit.cmd_lookup(ed.reg, "ed.edit.delete.grapheme")
+    assert(invoke(mut ed, id, 4) == edit.CMD_OK, "4x at four")
+    assert_str(ed.bufs[b].ec.tb, "ef", "the first cursor's four, the rest skipped")
+    assert(ed.wins[w].cs.curs.len == 1, "one cursor")
+    assert(ed.msg.active, "a message")
+    assert(ed.msg.text == "3 cursors merged", "message '{ed.msg.text}'")
+}
+
+// `test_multicursor_backward_overlap_uses_original_edit_ranges`.
+fn t_multicursor_backward_overlap_uses_original_edit_ranges() {
+    var ed = mc_ed("abcdef")
+    let w = ed.win
+    let b = buf_of(ed)
+    let id = edit.cmd_lookup(ed.reg, "ed.edit.delete.grapheme_left")
+    assert(id != 0, "delete.grapheme_left")
+    ed.wins[w].cs.curs[0] = tc(2, 2, 20)
+    assert(text.cset_add(mut ed.wins[w].cs, tc(3, 3, 30)), "add 3")
+    assert(invoke(mut ed, id, 2) == edit.CMD_OK, "2x backward")
+    assert_str(ed.bufs[b].ec.tb, "cdef", "the overlap ran once")
+    assert(ed.wins[w].cs.curs.len == 1, "one cursor")
+    assert_cursor(copy ed.wins[w].cs.curs[0], 0, 0, 20, "the primary's goal survives")
+    assert(ed.msg.text == "1 cursor merged", "message '{ed.msg.text}'")
+}
+
+fn scratch_root(name: str) -> str {
+    let cwd = os_cwd() else "."
+    let root = "{cwd}/target/tests/{name}"
+    fs_remove_dir_all(root) else |_| {}
+    fs_create_dir_all("{root}/state") else {}
+    root
+}
+
+// The two fault-shim children's shared fixture (`mc_sync_child`,
+// `mc_audit_1000_child`): `lines` lines of `a\n` journaled at
+// `<root>/source.txt`, the scratch buffer holding them, a caret on every
+// line start with goal `goal(i)`.
+fn journaled_ed(root: str, lines: int, goals: bool) -> (edit.Ed, List[byte]) {
+    let saved = env_get("XDG_STATE_HOME") else ""
+    env_set("YEW_MC_SAVED_STATE", saved) else |_| {}
+    env_set("XDG_STATE_HOME", "{root}/state") else |_| {}
+    var initial = List[byte]()
+    var i = 0
+    while i < lines {
+        (mut initial).push(97 as byte)
+        (mut initial).push(10 as byte)
+        i += 1
+    }
+    var meta = text.filemeta_new()
+    meta.exists = true
+    meta.size_on_disk = initial.len
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let (j, err) = text.journal_open(mut ed.journals, "{root}/source.txt", mut meta)
+    assert(err == 0 && j.open, "the journal opens ({err})")
+    let w = ed.win
+    let b = buf_of(ed)
+    ed.bufs[b].ec.tb = text.textbuf_from_bytes(initial, 0, initial.len)
+    ed.bufs[b].ec.undo = text.undo_new(ed.bufs[b].ec.tb)
+    ed.bufs[b].ec.jrnl = j
+    ed.bufs[b].ec.has_jrnl = true
+    ed.wins[w].cs.curs[0] = tc(0, 0, 0)
+    i = 1
+    while i < lines {
+        assert(text.cset_add(mut ed.wins[w].cs, tc(i * 2, i * 2, if goals then i else 0)), "add {i}")
+        i += 1
+    }
+    assert(ed.wins[w].cs.curs.len == lines, "{lines} cursors")
+    (ed, initial)
+}
+
+fn journaled_done(mut ed: edit.Ed, root: str) {
+    let b = buf_of(ed)
+    var j = text.journal_none()
+    let held = ed.bufs[b].ec.jrnl
+    ed.bufs[b].ec.jrnl = j
+    j = held
+    ed.bufs[b].ec.has_jrnl = false
+    let _ = text.journal_discard(mut ed.journals, mut j)
+    let saved = env_get("YEW_MC_SAVED_STATE") else ""
+    if saved.len == 0 {
+        env_unset("XDG_STATE_HOME") else |_| {}
+    } else {
+        env_set("XDG_STATE_HOME", saved) else |_| {}
+    }
+    fs_remove_dir_all(root) else |_| {}
+}
+
+fn known_red_g3(what: str) -> int {
+    say(
+        "multicursor_test: KNOWN-RED {what}: the shim's one `fsync-file pass` per transaction (G3, wolf-lang#796: no fsync at wolf 0.2.33; the journal barrier is no_sync_g3)",
+    )
+    1
+}
+
+// `test_multicursor_200_insert_is_one_undo_and_one_journal_sync`.
+fn t_multicursor_200_insert_is_one_undo_and_one_journal_sync() -> int {
+    let root = scratch_root("mc-sync")
+    var (ed, initial) = journaled_ed(root, 200, false)
+    let b = buf_of(ed)
+    let insert = edit.cmd_lookup(ed.reg, "ed.edit.insert.text")
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.sarg = "X"
+    cx.has_sarg = true
+    assert(edit.ed_cmd_invoke(mut ed, insert, mut cx) == edit.CMD_OK, "200 inserts")
+    assert(text.textbuf_len(ed.bufs[b].ec.tb) == 600, "600 bytes")
+    assert(ed.bufs[b].ec.undo.nodes.len == 2, "one node")
+    assert(ed.bufs[b].ec.undo.nodes[1].reason == text.TXN_MULTI, "a MULTI node")
+    assert(ed.bufs[b].ec.undo.nodes[1].n_ops == 200, "200 ops, at {ed.bufs[b].ec.undo.nodes[1].n_ops}")
+    assert(undo_step(mut ed), "undo")
+    assert_text(ed.bufs[b].ec.tb, initial, "one undo restores the text")
+    journaled_done(mut ed, root)
+    known_red_g3("multicursor_200_insert_is_one_undo_and_one_journal_sync")
+}
+
+// `test_multicursor_1000_failure_at_700_rolls_back_and_syncs_once`.
+fn t_multicursor_1000_failure_at_700_rolls_back_and_syncs_once() -> int {
+    let root = scratch_root("mc-audit")
+    var (ed, initial) = journaled_ed(root, 1000, true)
+    let w = ed.win
+    let b = buf_of(ed)
+    let id = probe(mut ed, "ed.edit.mc.toggle")
+    ed.reg.probe_calls = 0
+    assert(invoke(mut ed, id, 1) == edit.CMD_ERR_STATE, "cursor 700 fails (CMD_ERR_IO: visited out of order)")
+    assert(ed.reg.probe_calls == 701, "701 calls, at {ed.reg.probe_calls}")
+    assert_text(ed.bufs[b].ec.tb, initial, "rolled back")
+    assert(ed.bufs[b].ec.undo.nodes.len == 1, "no node")
+    assert(text.undo_current(ed.bufs[b].ec.undo) == ed.bufs[b].ec.undo.root, "at the root")
+    assert(ed.wins[w].cs.curs.len == 1000, "1000 cursors")
+    var i = 0
+    while i < 1000 {
+        assert_cursor(copy ed.wins[w].cs.curs[i], i * 2, i * 2, i, "cursor {i}")
+        i += 1
+    }
+    journaled_done(mut ed, root)
+    known_red_g3("multicursor_1000_failure_at_700_rolls_back_and_syncs_once")
+}
+
+// `test_multicursor_selection_union_semantics`.
+fn t_multicursor_selection_union_semantics() {
+    var primary_union = text.cset_init(tc(8, 2, 80))
+    assert(!text.cset_add(mut primary_union, tc(5, 10, 50)), "absorbed")
+    assert(primary_union.curs.len == 1 && primary_union.primary == 0, "one")
+    assert_cursor(copy primary_union.curs[0], 10, 2, 80, "primary union")
+    var earlier_union = text.cset_init(tc(100, 100, 100))
+    assert(text.cset_add(mut earlier_union, tc(8, 2, 80)), "add")
+    assert(!text.cset_add(mut earlier_union, tc(5, 12, 50)), "absorbed")
+    assert(earlier_union.curs.len == 2 && earlier_union.primary == 1, "two")
+    assert_cursor(copy earlier_union.curs[0], 2, 12, 50, "earlier union")
+    assert_cursor(copy earlier_union.curs[1], 100, 100, 100, "the primary")
+    var chained_union = text.cset_init(tc(200, 200, 200))
+    assert(text.cset_add(mut chained_union, tc(5, 5, 5)), "add 5")
+    assert(text.cset_add(mut chained_union, tc(10, 100, 10)), "add 10..100")
+    assert(!text.cset_add(mut chained_union, tc(50, 0, 50)), "chained")
+    assert(chained_union.curs.len == 2, "two")
+    assert_cursor(copy chained_union.curs[0], 100, 0, 5, "chained union")
+    assert_cursor(copy chained_union.curs[1], 200, 200, 200, "the primary")
+}
+
+// `test_multicursor_touch_and_adjacency`.
+fn t_multicursor_touch_and_adjacency() {
+    var touching = text.cset_init(tc(2, 0, 2))
+    assert(!text.cset_add(mut touching, tc(4, 2, 4)), "touching merges")
+    assert_cursor(copy touching.curs[0], 4, 0, 2, "touching")
+    var adjacent = text.cset_init(tc(1, 0, 1))
+    assert(text.cset_add(mut adjacent, tc(3, 2, 3)), "adjacent stays")
+    assert(adjacent.curs.len == 2, "two")
+    assert_cursor(copy adjacent.curs[0], 1, 0, 1, "a0")
+    assert_cursor(copy adjacent.curs[1], 3, 2, 3, "a1")
+    var edge_point = text.cset_init(tc(0, 0, 7))
+    assert(!text.cset_add(mut edge_point, tc(4, 0, 4)), "an edge point merges")
+    assert(edge_point.curs.len == 1, "one")
+    assert_cursor(copy edge_point.curs[0], 4, 0, 7, "edge point")
+}
+
+// `test_multicursor_deleted_cursor_collapses_and_merges`.
+fn t_multicursor_deleted_cursor_collapses_and_merges() {
+    var set = text.cset_init(tc(7, 7, 70))
+    assert(text.cset_add(mut set, tc(9, 9, 90)), "add")
+    text.cset_adjust(mut set, text.JOURNAL_DEL, 6 as text.ByteOff, 4)
+    assert(set.curs.len == 1, "merged")
+    assert_cursor(copy set.curs[0], 6, 6, 70, "collapsed")
+}
+
+// `test_multicursor_coincident_after_edit_keeps_lower_goal`.
+fn t_multicursor_coincident_after_edit_keeps_lower_goal() {
+    var set = text.cset_init(tc(20, 20, 200))
+    assert(text.cset_add(mut set, tc(2, 2, 20)), "add 2")
+    assert(text.cset_add(mut set, tc(4, 4, 40)), "add 4")
+    text.cset_adjust(mut set, text.JOURNAL_DEL, 2 as text.ByteOff, 3)
+    assert(set.curs.len == 2 && set.primary == 1, "two, primary 1")
+    assert_cursor(copy set.curs[0], 2, 2, 20, "the lower goal")
+    assert_cursor(copy set.curs[1], 17, 17, 200, "the primary")
+}
+
+// `test_multicursor_coincident_after_edit_primary_wins`.
+fn t_multicursor_coincident_after_edit_primary_wins() {
+    var set = text.cset_init(tc(4, 4, 40))
+    assert(text.cset_add(mut set, tc(2, 2, 20)), "add 2")
+    text.cset_adjust(mut set, text.JOURNAL_DEL, 2 as text.ByteOff, 3)
+    assert(set.curs.len == 1 && set.primary == 0, "one")
+    assert_cursor(copy set.curs[0], 2, 2, 40, "the primary's goal")
+}
+
+// `test_multicursor_touching_selections_merge_to_union`.
+fn t_multicursor_touching_selections_merge_to_union() {
+    var set = text.cset_init(tc(2, 0, 20))
+    assert(!text.cset_add(mut set, tc(5, 2, 50)), "merged")
+    assert(set.curs.len == 1, "one")
+    assert_cursor(copy set.curs[0], 5, 0, 20, "the union")
+}
+
+// `test_multicursor_adjacent_selections_remain_distinct`.
+fn t_multicursor_adjacent_selections_remain_distinct() {
+    var set = text.cset_init(tc(1, 0, 10))
+    assert(text.cset_add(mut set, tc(3, 2, 30)), "distinct")
+    assert(set.curs.len == 2, "two")
+    assert_cursor(copy set.curs[0], 1, 0, 10, "s0")
+    assert_cursor(copy set.curs[1], 3, 2, 30, "s1")
+}
+
+// `test_multicursor_all_merged_set_remains_valid_at_one`.
+fn t_multicursor_all_merged_set_remains_valid_at_one() {
+    var ed = mc_ed("abcdefg")
+    let w = ed.win
+    let b = buf_of(ed)
+    ed.wins[w].cs.curs[0] = tc(2, 0, 20)
+    assert(!text.cset_add(mut ed.wins[w].cs, tc(4, 2, 40)), "merged")
+    assert(!text.cset_add(mut ed.wins[w].cs, tc(6, 4, 60)), "merged again")
+    assert(ed.wins[w].cs.curs.len == 1 && ed.wins[w].cs.primary == 0, "one")
+    text.cset_check(ed.wins[w].cs)
+    ed.mode = edit.MODE_L
+    ed.bufs[b].ec.meta.eol = text.EOL_LF
+    ed.wins[w].vp.rows = 10
+    let status = edit.statusline_build(mut ed, w, 80)
+    var i = 0
+    while i + 1 < status.body.len {
+        assert(!(status.body[i] as int == 195 && status.body[i + 1] as int == 151), "no x-count in the body")
+        i += 1
+    }
+}
+
+// `build_permutation` (`test_multicursor.c:1092-1107`).
+fn build_permutation(reverse: bool) -> text.CursorSet {
+    var set = text.cset_init(tc(30, 30, 30))
+    if reverse {
+        let _ = text.cset_add(mut set, tc(40, 40, 40))
+        let _ = text.cset_add(mut set, tc(10, 15, 10))
+        let _ = text.cset_add(mut set, tc(12, 4, 12))
+    } else {
+        let _ = text.cset_add(mut set, tc(12, 4, 12))
+        let _ = text.cset_add(mut set, tc(10, 15, 10))
+        let _ = text.cset_add(mut set, tc(40, 40, 40))
+    }
+    set
+}
+
+// `test_multicursor_permutation_determinism`.
+fn t_multicursor_permutation_determinism() {
+    let forward = build_permutation(false)
+    let reverse = build_permutation(true)
+    assert(forward.curs.len == reverse.curs.len, "same length")
+    assert(forward.primary == reverse.primary, "same primary")
+    var i = 0
+    while i < forward.curs.len {
+        let r = copy reverse.curs[i]
+        assert_cursor(copy forward.curs[i], r.pos, r.anchor, r.goal_col, "cursor {i}")
+        i += 1
+    }
+}
+
+// `test_multicursor_adjust_bias_and_merge`.
+fn t_multicursor_adjust_bias_and_merge() {
+    var insert = text.cset_init(tc(5, 5, 5))
+    text.cset_adjust(mut insert, text.JOURNAL_INS, 5 as text.ByteOff, 3)
+    assert_cursor(copy insert.curs[0], 8, 8, 5, "insert at the caret")
+    text.cset_adjust(mut insert, text.JOURNAL_INS, 4 as text.ByteOff, 2)
+    assert_cursor(copy insert.curs[0], 10, 10, 5, "insert before")
+    var before = text.cset_init(tc(3, 2, 3))
+    text.cset_adjust(mut before, text.JOURNAL_INS, 4 as text.ByteOff, 9)
+    assert_cursor(copy before.curs[0], 3, 2, 3, "insert after")
+    var deletion = text.cset_init(tc(12, 5, 12))
+    text.cset_adjust(mut deletion, text.JOURNAL_DEL, 6 as text.ByteOff, 3)
+    assert_cursor(copy deletion.curs[0], 9, 5, 12, "delete inside")
+    text.cset_adjust(mut deletion, text.JOURNAL_DEL, 4 as text.ByteOff, 3)
+    assert_cursor(copy deletion.curs[0], 6, 4, 12, "delete over the anchor")
+    text.cset_adjust(mut deletion, text.JOURNAL_DEL, 20 as text.ByteOff, 2)
+    assert_cursor(copy deletion.curs[0], 6, 4, 12, "delete after")
+    var collapse = text.cset_init(tc(9, 9, 90))
+    assert(text.cset_add(mut collapse, tc(7, 7, 70)), "add")
+    text.cset_adjust(mut collapse, text.JOURNAL_DEL, 6 as text.ByteOff, 4)
+    assert(collapse.curs.len == 1 && collapse.primary == 0, "collapsed to one")
+    assert_cursor(copy collapse.curs[0], 6, 6, 90, "the primary's goal")
+}
+
+// `multicursor_random` (`test_multicursor.c:1159-1168`): xorshift64*.
+fn mc_random(s: wrapping[u64]) -> (wrapping[u64], wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    (x, x * 2685821657736338717)
+}
+
+fn below(x: wrapping[u64], n: int) -> int {
+    (x % n as wrapping[u64]) as int
+}
+
+// `multicursor_oracle_adjust` (`test_multicursor.c:1170-1182`).
+fn oracle_adjust(pos: int, right_bias: bool, op: int, at: int, len: int) -> int {
+    if op == text.JOURNAL_INS {
+        if pos > at || pos == at && right_bias {
+            return pos + len
+        }
+        return pos
+    }
+    if pos >= at + len {
+        return pos - len
+    }
+    if pos >= at {
+        return at
+    }
+    pos
+}
+
+// `test_multicursor_adjust_random_oracle`.
+fn t_multicursor_adjust_random_oracle() {
+    var state: wrapping[u64] = 15111065706836454659
+    var text_len = 1000
+    var pos = 750
+    var anchor = 250
+    var set = text.cset_init(tc(pos, anchor, 17))
+    var i = 0
+    while i < 10000 {
+        let collapsed = pos == anchor
+        var op = text.JOURNAL_INS
+        var at = 0
+        var len = 0
+        let (s1, r1) = mc_random(state)
+        state = s1
+        if text_len == 0 || below(r1, 2) == 0 {
+            let (s2, r2) = mc_random(state)
+            let (s3, r3) = mc_random(s2)
+            state = s3
+            at = below(r2, text_len + 1)
+            len = below(r3, 9)
+            text_len += len
+        } else {
+            op = text.JOURNAL_DEL
+            let (s2, r2) = mc_random(state)
+            state = s2
+            at = below(r2, text_len)
+            let (s3, r3) = mc_random(state)
+            state = s3
+            len = 1 + below(r3, text_len - at)
+            if len > 8 {
+                len = 8
+            }
+            text_len -= len
+        }
+        pos = oracle_adjust(pos, true, op, at, len)
+        anchor = if collapsed then pos else oracle_adjust(anchor, false, op, at, len)
+        text.cset_adjust(mut set, op, at as text.ByteOff, len)
+        assert(set.curs.len == 1 && set.primary == 0, "one cursor")
+        assert_cursor(copy set.curs[0], pos, anchor, 17, "step {i}")
+        i += 1
+    }
+}
+
+// `integrated_move` (`test_multicursor.c:1217-1235`).
+fn integrated_move(mut tb: text.TextBuf, mut set: text.CursorSet, motion: int) {
+    var i = 0
+    while i < set.curs.len {
+        if motion == 0 {
+            text.cursor_left(mut tb, mut set.curs[i])
+        } else if motion == 1 {
+            text.cursor_right(tb, mut set.curs[i])
+        } else if motion == 2 {
+            text.cursor_up(tb, mut set.curs[i], 4)
+        } else if motion == 3 {
+            text.cursor_down(tb, mut set.curs[i], 4)
+        } else if motion == 4 {
+            text.cursor_line_home(tb, mut set.curs[i])
+        } else {
+            text.cursor_line_end(mut tb, mut set.curs[i])
+        }
+        i += 1
+    }
+    text.cset_normalize(tb, mut set)
+}
+
+// `integrated_assert` (`test_multicursor.c:1237-1253`).
+fn integrated_assert(tb: text.TextBuf, set: text.CursorSet, marks: text.MarkSet, ids: List[text.MarkId]) {
+    text.cset_check(set)
+    assert(set.curs.len != 0 && set.primary < set.curs.len, "a valid set")
+    for c in set.curs {
+        assert(text.is_grapheme_boundary(tb, c.pos as text.ByteOff), "pos on a boundary")
+        assert(text.is_grapheme_boundary(tb, c.anchor as text.ByteOff), "anchor on a boundary")
+    }
+    for id in ids {
+        let p = text.mark_pos(marks, copy id) as int
+        assert(p <= text.textbuf_len(tb), "mark inside")
+        assert(text.is_grapheme_boundary(tb, p as text.ByteOff), "mark on a boundary")
+    }
+}
+
+// `test_multicursor_integrated_edit_motion_fuzz`.
+fn t_multicursor_integrated_edit_motion_fuzz() {
+    var seeds = List[wrapping[u64]]()
+    (mut seeds).push(1)
+    (mut seeds).push(2611923443488327891)
+    (mut seeds).push(11400714819323198485)
+    (mut seeds).push(15111065706836454659)
+    for seed in seeds {
+        var tb = text.textbuf_from_str("alpha\nbeta\ngamma\n")
+        var marks = text.marks_new()
+        var ids = List[text.MarkId]()
+        var set = text.cset_init(tc(0, 0, 0))
+        var state = seed
+        assert(text.cset_add(mut set, tc(6, 6, 0)), "add 6")
+        assert(text.cset_add(mut set, tc(11, 11, 0)), "add 11")
+        var k = 0
+        while k < 24 {
+            let p = k % (text.textbuf_len(tb) + 1)
+            (mut ids).push(text.mark_add(mut marks, p as text.ByteOff, if k & 1 == 0 then text.BIAS_LEFT else text.BIAS_RIGHT))
+            k += 1
+        }
+        var i = 0
+        while i < 10000 {
+            let (s1, r1) = mc_random(state)
+            state = s1
+            let action = below(r1, 12)
+            if action < 6 {
+                integrated_move(mut tb, mut set, action)
+            } else if action == 6 || action == 7 {
+                let at = set.curs[set.primary].pos
+                var payload = List[byte]()
+                (mut payload).push((if action == 6 then 120 else 10) as byte)
+                text.textbuf_insert(mut tb, at as text.ByteOff, payload)
+                text.marks_adjust(mut marks, text.JOURNAL_INS, at as text.ByteOff, 1)
+                text.cset_adjust(mut set, text.JOURNAL_INS, at as text.ByteOff, 1)
+                text.cset_normalize(tb, mut set)
+            } else if action == 8 {
+                let at = set.curs[set.primary].pos
+                if at < text.textbuf_len(tb) {
+                    let end = text.grapheme_next_boundary(tb, at as text.ByteOff) as int
+                    text.textbuf_delete(mut tb, text.span(at, end))
+                    text.marks_adjust(mut marks, text.JOURNAL_DEL, at as text.ByteOff, end - at)
+                    text.cset_adjust(mut set, text.JOURNAL_DEL, at as text.ByteOff, end - at)
+                    text.cset_normalize(tb, mut set)
+                }
+            } else if action == 9 && set.curs.len < 16 {
+                let (s2, r2) = mc_random(state)
+                state = s2
+                let p = below(r2, text.textbuf_len(tb) + 1)
+                let line = text.textbuf_line_of(tb, p as text.ByteOff)
+                let goal = text.off_to_gcol(mut tb, text.textbuf_line_span(tb, line), p as text.ByteOff) as int
+                let _ = text.cset_add(mut set, tc(p, p, goal))
+            } else if action == 10 && set.curs.len > 1 {
+                text.cset_remove_all_but_primary(mut set)
+            } else {
+                let (s2, r2) = mc_random(state)
+                state = s2
+                integrated_move(mut tb, mut set, below(r2, 6))
+            }
+            integrated_assert(tb, set, marks, ids)
+            i += 1
+        }
+    }
+}
+
+// `test_multicursor_remove_and_normalize_clamp`.
+fn t_multicursor_remove_and_normalize_clamp() {
+    let tb = text.textbuf_from_str("abcd")
+    var set = text.cset_init(tc(99, 99, 9))
+    assert(text.cset_add(mut set, tc(1, 1, 1)), "add 1")
+    assert(text.cset_add(mut set, tc(3, 3, 3)), "add 3")
+    text.cset_normalize(tb, mut set)
+    assert(set.curs.len == 3 && set.primary == 2, "three, primary last")
+    assert_cursor(copy set.curs[2], 4, 4, 9, "clamped")
+    text.cset_remove_all_but_primary(mut set)
+    assert(set.curs.len == 1 && set.primary == 0, "one")
+    assert_cursor(copy set.curs[0], 4, 4, 9, "the primary")
+}
+
+// `test_multicursor_normalize_preserves_sticky_motion`.
+fn t_multicursor_normalize_preserves_sticky_motion() {
+    let tb = text.textbuf_from_str("abcdef\nxy")
+    var cursor = tc(5, 5, 5)
+    text.cursor_down(tb, mut cursor, 4)
+    // The final line has no newline to rest on, so an overflowing goal
+    // clamps AFTER the `y`.
+    assert_cursor(copy cursor, 9, 9, 5, "down")
+    var set = text.cset_init(cursor)
+    text.cset_normalize(tb, mut set)
+    text.cursor_right(tb, mut set.curs[0])
+    assert(set.curs[0].pos == 9 && set.curs[0].anchor == 9, "right at the end")
+    assert(text.cursor_goal(tb, copy set.curs[0], 4) as int == 2, "the goal resolves to 2")
+}
+
+// The children the two bug-guard cases run (`yew_test_spawn_child`).
+fn child_role(role: str) {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var set = text.cset_init(tc(1, 1, 1))
+    assert(text.cset_add(mut set, tc(2, 2, 2)), "add")
+    if role == "bug" {
+        text.cset_require_single_edit(set)
+    } else if role == "regex-lift" {
+        edit.mc_require_literal_lift(true)
+    } else if role == "completion" {
+        edit.mc_require_single_completion(set)
+    } else if role == "lsp-edit" {
+        edit.mc_require_single_lsp_edit(set)
+    }
+    os_exit(0)
+}
+
+// Does `os_exe()` re-run THIS test? (`term_render_test.lu`'s probe.)
+fn self_reexecutes() -> bool {
+    let exe = os_exe() else {
+        return false
+    }
+    var c = process.command(exe)
+    process.push_arg(mut c, "--self-check")
+    let sink = fs.open_append("/dev/null") else |_| {
+        return false
+    }
+    process.set_stderr(mut c, sink)
+    process.set_stdout(mut c, sink)
+    let child = process.start(c) else |_| {
+        return false
+    }
+    let status = process.wait_status(take child) else -1
+    fs.close(take sink) else |_| {}
+    status == 7
+}
+
+// Run the child for `role`; answers (exit status, its stderr).
+fn spawn_role(role: str) -> (int, str) {
+    let exe = os_exe() else {
+        return (-1, "")
+    }
+    fs_create_dir_all("target/tests") else {}
+    let log = "target/tests/mc-guard-{role}.err"
+    fs_remove(log) else |_| {}
+    var c = process.command(exe)
+    process.push_arg(mut c, "--role")
+    process.push_arg(mut c, role)
+    let sink = fs.open_append(log) else |_| {
+        return (-1, "")
+    }
+    process.set_stderr(mut c, sink)
+    let child = process.start(c) else |_| {
+        return (-1, "")
+    }
+    let status = process.wait_status(take child) else -1
+    fs.close(take sink) else |_| {}
+    let err = fs_read_text(log) else ""
+    fs_remove(log) else |_| {}
+    (status, err)
+}
+
+// `test_multicursor_edit_guard_requires_multi_transaction`.
+fn t_multicursor_edit_guard_requires_multi_transaction() -> int {
+    if !self_reexecutes() {
+        return skip("multicursor_edit_guard_requires_multi_transaction: os_exe() does not re-run this test here (the checked machine)")
+    }
+    let (status, err) = spawn_role("bug")
+    assert(status == 4, "the guard exits 4, at {status}")
+    assert(err.contains("MULTI transaction"), "it names the MULTI transaction: {err}")
+    0
+}
+
+// `test_multicursor_boundary_guards_name_their_constraints`.
+fn t_multicursor_boundary_guards_name_their_constraints() -> int {
+    if !self_reexecutes() {
+        return skip("multicursor_boundary_guards_name_their_constraints: os_exe() does not re-run this test here (the checked machine)")
+    }
+    let (s1, e1) = spawn_role("regex-lift")
+    assert(s1 == 4 && e1.contains("cursor lift requires literal matches"), "regex lift: {s1} {e1}")
+    let (s2, e2) = spawn_role("completion")
+    assert(s2 == 4 && e2.contains("completion requires one primary cursor"), "completion: {s2} {e2}")
+    let (s3, e3) = spawn_role("lsp-edit")
+    assert(s3 == 4 && e3.contains("LSP edits require one primary cursor"), "lsp edit: {s3} {e3}")
+    0
+}
+
+// `test_multicursor_vertical_goals_are_per_cursor_over_tabs`.
+fn t_multicursor_vertical_goals_are_per_cursor_over_tabs() {
+    let tb = text.textbuf_from_str("    fn total\n\tvar acc = zero\n  \tmixed")
+    var set = text.cset_init(tc(4, 4, 4))
+    assert(text.cset_add(mut set, tc(8, 8, 8)), "add 8")
+    text.cset_normalize(tb, mut set)
+    assert(set.curs.len == 2, "two")
+    text.cursor_down(tb, mut set.curs[0], 4)
+    text.cursor_down(tb, mut set.curs[1], 4)
+    assert_cursor(copy set.curs[0], 14, 14, 4, "c0 on the tab line")
+    assert_cursor(copy set.curs[1], 18, 18, 8, "c1 on the tab line")
+    text.cursor_down(tb, mut set.curs[0], 4)
+    text.cursor_down(tb, mut set.curs[1], 4)
+    assert_cursor(copy set.curs[0], 32, 32, 4, "c0 on the mixed line")
+    assert_cursor(copy set.curs[1], 36, 36, 8, "c1 on the mixed line")
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let args = env_args()
+    if args.len == 1 && args[0] == "--self-check" {
+        os_exit(7)
+    }
+    if args.len == 2 && args[0] == "--role" {
+        child_role(args[1])
+        return
+    }
+    var skips = 0
+    var known_red = 0
+    t_multicursor_lifecycle_and_point_dedupe()
+    t_multicursor_latest_cap_and_active_tracking()
+    t_multicursor_reseed_uses_fresh_identity_space()
+    t_multicursor_run_commits_one_undo_transaction()
+    t_multicursor_run_rolls_back_every_cursor()
+    skips += t_multicursor_batches_symbol_rebuild_and_damage()
+    t_multicursor_same_line_batch_keeps_row_damage()
+    t_multicursor_editor_invoke_rolls_back_on_per_cursor_failure()
+    t_multicursor_count_repeats_per_cursor()
+    t_multicursor_adjacent_edit_ranges_both_run()
+    t_multicursor_overlapping_edit_skips_later_and_reports_merge()
+    t_multicursor_backward_overlap_uses_original_edit_ranges()
+    known_red += t_multicursor_200_insert_is_one_undo_and_one_journal_sync()
+    known_red += t_multicursor_1000_failure_at_700_rolls_back_and_syncs_once()
+    t_multicursor_selection_union_semantics()
+    t_multicursor_touch_and_adjacency()
+    t_multicursor_deleted_cursor_collapses_and_merges()
+    t_multicursor_coincident_after_edit_keeps_lower_goal()
+    t_multicursor_coincident_after_edit_primary_wins()
+    t_multicursor_touching_selections_merge_to_union()
+    t_multicursor_adjacent_selections_remain_distinct()
+    t_multicursor_all_merged_set_remains_valid_at_one()
+    t_multicursor_permutation_determinism()
+    t_multicursor_adjust_bias_and_merge()
+    t_multicursor_adjust_random_oracle()
+    t_multicursor_integrated_edit_motion_fuzz()
+    t_multicursor_remove_and_normalize_clamp()
+    t_multicursor_normalize_preserves_sticky_motion()
+    skips += t_multicursor_edit_guard_requires_multi_transaction()
+    skips += t_multicursor_boundary_guards_name_their_constraints()
+    t_multicursor_vertical_goals_are_per_cursor_over_tabs()
+    print("multicursor_test: 31 cases run, {skips} SKIP by name, {known_red} KNOWN-RED by name (G3)")
+}
