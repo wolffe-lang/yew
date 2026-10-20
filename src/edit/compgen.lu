@@ -1,0 +1,763 @@
+//! edit.compgen — completion generators (Sprint 57.24 §5).
+//!
+//! Ports sagitta `src/ui/compgen.c` (837 lines) and `compgen.h` (84) at
+//! 9ace98c2. The built-ins (hosts, signals, users, make_targets) are
+//! synchronous: they read a file and never run anything — `make_targets`
+//! PARSES the Makefile, because `make -p` would evaluate `$(shell ...)`
+//! (`compgen.h:4-26`). A spec generator is a subprocess run through the
+//! job layer, ASYNCHRONOUSLY, its answer cached per key; at wolf 0.2.33
+//! the job layer cannot read a child's pipe while the loop runs (G2,
+//! wolf-lang#795), so `compgen_rows`' spawn takes C's spawn-failure path
+//! (§5.6, `compgen.c:785-795`): the empty answer cached for `cache_ms`
+//! and the reason in the log — never the footer — naming the STOP
+//! (ruling R-yw04-1). The cache, the key and the output parser are
+//! C's, ready for the pin that has `os_signal_wait_fds`.
+//!
+//! The port's shape: C's cache and flights are module state (`gen`,
+//! `compgen.c:480-490`); here they are the value `CompGen`, owned by the
+//! editor (`Ed.gen`). A row is `GenItem` — C's `CompItem` with `kind`
+//! `YEW_COMP_GEN`, `text` == `match` — which the completion engine's
+//! shell source turns into its items (`edit.cmdcomp_shell`).
+//!
+//! `users` enumerates the user database with `getpwent(3)`; wolf 0.2.33
+//! has no user-database surface (G37), so the port reads `/etc/passwd`'s
+//! files source, named in `cg_builtin_users`.
+
+use util
+
+/// At most four generator jobs in flight (`YEW_COMPGEN_MAX_INFLIGHT`).
+pub const COMPGEN_MAX_INFLIGHT: int = 4
+
+/// A generator's deadline (`YEW_COMPGEN_TIMEOUT_MS`).
+pub const COMPGEN_TIMEOUT_MS: int = 1500
+
+/// At most this many output lines (`YEW_COMPGEN_MAX_LINES`).
+pub const COMPGEN_MAX_LINES: int = 5000
+
+/// The default freshness (`YEW_COMPGEN_DEFAULT_CACHE_MS`).
+pub const COMPGEN_DEFAULT_CACHE_MS: int = 2000
+
+/// The collection ceiling (`YEW_COMPGEN_COLLECT_MAX`).
+pub const COMPGEN_COLLECT_MAX: int = 1048576
+
+/// One generator row (C's `CompItem` of kind `YEW_COMP_GEN`).
+pub struct GenItem {
+    text: str,
+    detail: str,
+    has_detail: bool,
+}
+
+/// A generator's identity (`YewCompGenKey`, `compgen.h:43-52`).
+pub struct GenKey {
+    name: str,
+    argv: List[str],
+    cwd: str,
+    has_cwd: bool,
+    cache_ms: int,
+    ps_columns: bool,
+}
+
+struct CgRow {
+    text: str,
+    desc: str,
+    has_desc: bool,
+}
+
+struct CgEntry {
+    key: str,
+    stamp: int,
+    cache_ms: int,
+    rows: List[CgRow],
+}
+
+struct CgFlight {
+    key: str,
+    job_id: int,
+}
+
+/// The cache and the flights (C's `gen`, `compgen.c:480-490`).
+pub struct CompGen {
+    entries: List[CgEntry],
+    flights: List[CgFlight],
+    timeout_ms: int,
+    spawns: int,
+}
+
+/// An empty cache.
+pub fn compgen_new() -> CompGen {
+    CompGen { entries: List[CgEntry](), flights: List[CgFlight](), timeout_ms: 0, spawns: 0 }
+}
+
+/// `push_row` (`compgen.c:28-39`).
+fn cg_push(mut out: List[GenItem], text: str, detail: str, has: bool) {
+    (mut out).push(GenItem { text: text, detail: detail, has_detail: has })
+}
+
+/// `row_seen` (`compgen.c:41-52`).
+fn cg_seen(out: List[GenItem], from: int, text: str) -> bool {
+    var i = from
+    while i < out.len {
+        if out[i].text == text {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+/// `read_small_file` (`compgen.c:54-78`): a regular file, at most 4 MiB.
+fn cg_read_small(path: str) -> List[byte] {
+    if !fs_is_file(path) {
+        return List[byte]()
+    }
+    let b = fs_read_bytes(path) else List[byte]()
+    if b.len > 4194304 {
+        var cut = List[byte]()
+        var i = 0
+        while i < 4194304 {
+            (mut cut).push(b[i])
+            i += 1
+        }
+        return cut
+    }
+    b
+}
+
+/// `path_join` (`compgen.c:80-92`).
+fn cg_path_join(dir: str, name: str) -> str {
+    if dir.len != 0 && !dir.ends_with("/") then "{dir}/{name}" else "{dir}{name}"
+}
+
+fn cg_blank(c: int) -> bool {
+    c == 32 || c == 9 || c == 13
+}
+
+/// `host_pattern` (`compgen.c:98-102`).
+fn cg_host_pattern(s: List[byte], at: int, end: int) -> bool {
+    var i = at
+    while i < end {
+        let c = s[i] as int
+        if c == 42 || c == 63 || c == 33 {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+/// Bytes as C's `char *` text: the port's rows are `str`, so a name that
+/// is not UTF-8 is dropped (it could name no host the pager can draw).
+fn cg_text(s: List[byte], at: int, end: int) -> (bool, str) {
+    var b = List[byte]()
+    var i = at
+    while i < end {
+        (mut b).push(s[i])
+        i += 1
+    }
+    let t = str_from_utf8(b) else |_| { return (false, "") }
+    (true, t)
+}
+
+fn cg_lower(c: int) -> int {
+    if c >= 65 && c <= 90 then c + 32 else c
+}
+
+/// `hosts_from_config` (`compgen.c:109-146`).
+fn cg_hosts_from_config(home: str, mut out: List[GenItem]) {
+    let buf = cg_read_small(cg_path_join(home, ".ssh/config"))
+    var at = 0
+    while at < buf.len {
+        var e = at
+        while e < buf.len && buf[e] as int != 10 {
+            e += 1
+        }
+        let line = at
+        let len = e - at
+        at = e + 1
+        var i = 0
+        while i < len && cg_blank(buf[line + i] as int) {
+            i += 1
+        }
+        if len - i < 5 {
+            continue
+        }
+        let h = cg_lower(buf[line + i] as int) == 104 &&
+            cg_lower(buf[line + i + 1] as int) == 111 &&
+            cg_lower(buf[line + i + 2] as int) == 115 &&
+            cg_lower(buf[line + i + 3] as int) == 116
+        let after = buf[line + i + 4] as int
+        if !h || !(cg_blank(after) || after == 61) {
+            continue
+        }
+        i += 4
+        while i < len && (cg_blank(buf[line + i] as int) || buf[line + i] as int == 61) {
+            i += 1
+        }
+        while i < len {
+            let start = i
+            if buf[line + i] as int == 35 {
+                break
+            }
+            while i < len && !cg_blank(buf[line + i] as int) {
+                i += 1
+            }
+            if !cg_host_pattern(buf, line + start, line + i) {
+                let (ok, t) = cg_text(buf, line + start, line + i)
+                if ok && !cg_seen(out, 0, t) {
+                    cg_push(mut out, t, "ssh config", true)
+                }
+            }
+            while i < len && cg_blank(buf[line + i] as int) {
+                i += 1
+            }
+        }
+    }
+}
+
+/// `hosts_from_known` (`compgen.c:148-210`).
+fn cg_hosts_from_known(home: str, mut out: List[GenItem]) {
+    let buf = cg_read_small(cg_path_join(home, ".ssh/known_hosts"))
+    var at = 0
+    while at < buf.len {
+        var e = at
+        while e < buf.len && buf[e] as int != 10 {
+            e += 1
+        }
+        let line = at
+        let len = e - at
+        at = e + 1
+        var i = 0
+        while i < len && cg_blank(buf[line + i] as int) {
+            i += 1
+        }
+        if i < len && buf[line + i] as int == 64 {
+            while i < len && !cg_blank(buf[line + i] as int) {
+                i += 1
+            }
+            while i < len && cg_blank(buf[line + i] as int) {
+                i += 1
+            }
+        }
+        if i >= len || buf[line + i] as int == 35 || buf[line + i] as int == 124 {
+            continue
+        }
+        var end = i
+        while end < len && !cg_blank(buf[line + end] as int) {
+            end += 1
+        }
+        while i < end {
+            var start = i
+            while i < end && buf[line + i] as int != 44 {
+                i += 1
+            }
+            var stop = i
+            if stop > start && buf[line + start] as int == 91 {
+                var close = start
+                while close < stop && buf[line + close] as int != 93 {
+                    close += 1
+                }
+                if close < stop {
+                    start += 1
+                    stop = close
+                }
+            }
+            if stop > start && !cg_host_pattern(buf, line + start, line + stop) {
+                let (ok, t) = cg_text(buf, line + start, line + stop)
+                if ok && !cg_seen(out, 0, t) {
+                    cg_push(mut out, t, "known host", true)
+                }
+            }
+            if i < end {
+                i += 1
+            }
+        }
+    }
+}
+
+/// `signal_table` (`compgen.c:216-226`) and `builtin_signals` (`:228-241`).
+fn cg_builtin_signals(mut out: List[GenItem]) {
+    var names = List[str]()
+    var acts = List[str]()
+    for row in [
+        "HUP terminate",
+        "INT terminate",
+        "QUIT core dump",
+        "KILL terminate, uncatchable",
+        "TERM terminate",
+        "USR1 terminate",
+        "USR2 terminate",
+        "STOP stop, uncatchable",
+        "CONT continue",
+        "TSTP stop",
+        "WINCH ignore",
+    ] {
+        let sp = row.find(" ") else 0
+        (mut names).push(row[0..sp])
+        (mut acts).push(row[sp + 1..])
+    }
+    var i = 0
+    while i < names.len {
+        cg_push(mut out, names[i], acts[i], true)
+        i += 1
+    }
+    i = 0
+    while i < names.len {
+        cg_push(mut out, "SIG{names[i]}", acts[i], true)
+        i += 1
+    }
+}
+
+/// `builtin_users` (`compgen.c:243-261`): C walks `getpwent(3)`; the port
+/// reads `/etc/passwd` (G37: no user database in wolf 0.2.33).
+fn cg_builtin_users(mut out: List[GenItem]) {
+    let text = fs_read_text("/etc/passwd") else ""
+    for line in text.lines() {
+        let f = line.split(":")
+        if f.len < 7 || f[0].len == 0 || f[0].starts_with("#") {
+            continue
+        }
+        if cg_seen(out, 0, f[0]) {
+            continue
+        }
+        cg_push(mut out, f[0], f[5], true)
+    }
+}
+
+/// `make_name_char` (`compgen.c:267-272`).
+fn cg_make_name_char(c: int) -> bool {
+    c >= 65 && c <= 90 ||
+        c >= 97 && c <= 122 ||
+        c >= 48 && c <= 57 ||
+        c == 95 ||
+        c == 46 ||
+        c == 47 ||
+        c == 45
+}
+
+/// `starts_word` (`compgen.c:274-280`).
+fn cg_starts_word(s: List[byte], at: int, len: int, word: str) -> bool {
+    let n = word.len
+    if len < n {
+        return false
+    }
+    var i = 0
+    for b in word.bytes() {
+        if s[at + i] != b {
+            return false
+        }
+        i += 1
+    }
+    len == n || cg_blank(s[at + n] as int)
+}
+
+/// `make_line` (`compgen.c:289-339`).
+fn cg_make_line(s: List[byte], line: int, len: int, mut out: List[GenItem]) {
+    var starts = List[int]()
+    var lens = List[int]()
+    if len == 0 || !cg_make_name_char(s[line] as int) {
+        return
+    }
+    var i = 0
+    loop {
+        let start = i
+        while i < len && cg_make_name_char(s[line + i] as int) {
+            i += 1
+        }
+        if i == start {
+            return
+        }
+        if starts.len < 64 {
+            (mut starts).push(start)
+            (mut lens).push(i - start)
+        }
+        while i < len && cg_blank(s[line + i] as int) {
+            i += 1
+        }
+        if i >= len {
+            return
+        }
+        if s[line + i] as int == 58 {
+            break
+        }
+        if !cg_make_name_char(s[line + i] as int) {
+            return
+        }
+    }
+    var j = i
+    while j < len && s[line + j] as int == 58 {
+        j += 1
+    }
+    if j < len && s[line + j] as int == 61 {
+        return
+    }
+    var k = 0
+    while k < starts.len {
+        let a = line + starts[k]
+        let b = a + lens[k]
+        var pct = false
+        var p = a
+        while p < b {
+            if s[p] as int == 37 {
+                pct = true
+            }
+            p += 1
+        }
+        if s[a] as int != 46 && !pct {
+            let (ok, t) = cg_text(s, a, b)
+            if ok && !cg_seen(out, 0, t) {
+                cg_push(mut out, t, "make target", true)
+            }
+        }
+        k += 1
+    }
+}
+
+/// `make_targets_from` (`compgen.c:341-376`).
+fn cg_make_targets_from(path: str, mut out: List[GenItem]) {
+    let buf = cg_read_small(path)
+    var at = 0
+    var continued = false
+    var in_define = false
+    while at < buf.len {
+        var e = at
+        while e < buf.len && buf[e] as int != 10 {
+            e += 1
+        }
+        let line = at
+        var len = e - at
+        let cont_next = len != 0 && buf[line + len - 1] as int == 92
+        at = e + 1
+        if len != 0 && buf[line + len - 1] as int == 13 {
+            len -= 1
+        }
+        if in_define {
+            var i = 0
+            while i < len && cg_blank(buf[line + i] as int) {
+                i += 1
+            }
+            if cg_starts_word(buf, line + i, len - i, "endef") {
+                in_define = false
+            }
+            continued = false
+            continue
+        }
+        if !continued {
+            if cg_starts_word(buf, line, len, "define") ||
+                cg_starts_word(buf, line, len, "override") &&
+                    len > 9 &&
+                    cg_starts_word(buf, line + 9, len - 9, "define") {
+                in_define = true
+            } else {
+                cg_make_line(buf, line, len, mut out)
+            }
+        }
+        continued = cont_next
+    }
+}
+
+/// `builtin_make_targets` (`compgen.c:378-405`).
+fn cg_builtin_make_targets(cwd: str, makefile: str, has_makefile: bool, mut out: List[GenItem]) {
+    if has_makefile {
+        let path = if makefile.starts_with("/") then makefile else cg_path_join(cwd, makefile)
+        cg_make_targets_from(path, mut out)
+        return
+    }
+    for name in ["GNUmakefile", "makefile", "Makefile"] {
+        let path = cg_path_join(cwd, name)
+        if fs_is_file(path) {
+            cg_make_targets_from(path, mut out)
+            return
+        }
+    }
+}
+
+/// `yew_compgen_builtin` (`compgen.c:407-436`): false for a name that is
+/// not a built-in. `cwd` "" is C's NULL (`.`); `has_makefile` false is
+/// make's own search.
+pub fn compgen_builtin(
+    name: str,
+    cwd: str,
+    makefile: str,
+    has_makefile: bool,
+    mut out: List[GenItem],
+) -> bool {
+    if name == "hosts" {
+        let home = env_get("HOME") else ""
+        if home.len != 0 {
+            cg_hosts_from_config(home, mut out)
+            cg_hosts_from_known(home, mut out)
+        }
+        return true
+    }
+    if name == "signals" {
+        cg_builtin_signals(mut out)
+        return true
+    }
+    if name == "users" {
+        cg_builtin_users(mut out)
+        return true
+    }
+    if name == "make_targets" {
+        cg_builtin_make_targets(if cwd.len == 0 then "." else cwd, makefile, has_makefile, mut out)
+        return true
+    }
+    false
+}
+
+// ------------------------------------------------------------------
+// Subprocess generators: the cache and the flights
+// ------------------------------------------------------------------
+
+/// `yew_compgen_test_set_timeout_ms` (`compgen.c:492-495`).
+pub fn compgen_set_timeout_ms(mut g: CompGen, ms: int) {
+    g.timeout_ms = ms
+}
+
+/// `yew_compgen_test_spawns` (`compgen.c:497-500`).
+pub fn compgen_spawns(g: CompGen) -> int {
+    g.spawns
+}
+
+/// `yew_compgen_inflight` (`compgen.c:502-505`).
+pub fn compgen_inflight(g: CompGen) -> int {
+    g.flights.len
+}
+
+/// `yew_compgen_cache_clear` (`compgen.c:519-529`).
+pub fn compgen_cache_clear(mut g: CompGen) {
+    g.entries = List[CgEntry]()
+    g.spawns = 0
+}
+
+fn cg_entry_find(g: CompGen, key: str) -> int {
+    var i = 0
+    while i < g.entries.len {
+        if g.entries[i].key == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn cg_flight_find(g: CompGen, key: str) -> int {
+    var i = 0
+    while i < g.flights.len {
+        if g.flights[i].key == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `flight_drop` (`compgen.c:551-562`).
+fn cg_flight_drop(mut g: CompGen, key: str) {
+    let at = cg_flight_find(g, key)
+    if at < 0 {
+        return
+    }
+    var keep = List[CgFlight]()
+    var i = 0
+    while i < g.flights.len {
+        if i != at {
+            (mut keep).push(copy g.flights[i])
+        }
+        i += 1
+    }
+    g.flights = keep
+}
+
+/// `yew_compgen_awaiting` (`compgen.c:564-568`).
+pub fn compgen_awaiting(g: CompGen, key: str) -> bool {
+    cg_flight_find(g, key) >= 0 && cg_entry_find(g, key) < 0
+}
+
+/// `entry_store` (`compgen.c:570-594`).
+fn cg_entry_store(mut g: CompGen, key: str, now: int, cache_ms: int, take rows: List[CgRow]) {
+    let e = cg_entry_find(g, key)
+    let entry = CgEntry { key: key, stamp: now, cache_ms: cache_ms, rows: rows }
+    if e < 0 {
+        (mut g.entries).push(entry)
+    } else {
+        g.entries[e] = entry
+    }
+}
+
+/// `clean_field` (`compgen.c:596-620`): control bytes drawn as `·`,
+/// trailing blanks trimmed.
+fn cg_clean_field(s: List[byte], at: int, n0: int) -> str {
+    var n = n0
+    while n > 0 &&
+        (s[at + n - 1] as int == 32 || s[at + n - 1] as int == 9 || s[at + n - 1] as int == 13) {
+        n -= 1
+    }
+    var b = List[byte]()
+    var i = 0
+    while i < n {
+        let c = s[at + i] as int
+        if c < 32 || c == 127 {
+            (mut b).push(194 as byte)
+            (mut b).push(183 as byte)
+        } else {
+            (mut b).push(s[at + i])
+        }
+        i += 1
+    }
+    // C's field is bytes; the port's rows are text, invalid UTF-8 kept as
+    // U+FFFD is not a byte-exact answer — such a field is dropped to "".
+    str_from_utf8(b) else ""
+}
+
+/// `parse_output` (`compgen.c:622-693`): `candidate` or
+/// `candidate<TAB>description`, blank lines skipped, at most
+/// `COMPGEN_MAX_LINES`, order kept; `ps` the `ps -o pid=,comm=` columns.
+fn cg_parse_output(data: List[byte], ps: bool) -> List[CgRow] {
+    var rows = List[CgRow]()
+    var at = 0
+    let len = data.len
+    while at < len && rows.len < COMPGEN_MAX_LINES {
+        var e = at
+        while e < len && data[e] as int != 10 {
+            e += 1
+        }
+        let line = at
+        let ll = e - at
+        at = e + 1
+        var text = line
+        var tn = 0
+        var desc = -1
+        var dn = 0
+        if ps {
+            var i = 0
+            while i < ll && cg_blank(data[line + i] as int) {
+                i += 1
+            }
+            text = line + i
+            while i < ll && !cg_blank(data[line + i] as int) {
+                i += 1
+            }
+            tn = line + i - text
+            while i < ll && cg_blank(data[line + i] as int) {
+                i += 1
+            }
+            if i < ll {
+                var cmd = line + i
+                var cn = ll - i
+                var slash = -1
+                var k = 0
+                while k < cn {
+                    if data[cmd + k] as int == 47 {
+                        slash = cmd + k
+                    }
+                    k += 1
+                }
+                if slash >= 0 && slash + 1 < cmd + cn {
+                    cn -= slash + 1 - cmd
+                    cmd = slash + 1
+                }
+                desc = cmd
+                dn = cn
+            }
+        } else {
+            var tab = -1
+            var k = 0
+            while k < ll {
+                if data[line + k] as int == 9 {
+                    tab = line + k
+                    break
+                }
+                k += 1
+            }
+            tn = if tab < 0 then ll else tab - line
+            if tab >= 0 {
+                desc = tab + 1
+                dn = ll - tn - 1
+            }
+        }
+        while tn > 0 && cg_blank(data[text + tn - 1] as int) {
+            tn -= 1
+        }
+        if tn == 0 {
+            continue
+        }
+        let t = cg_clean_field(data, text, tn)
+        var row = CgRow { text: t, desc: "", has_desc: false }
+        if desc >= 0 {
+            let d = cg_clean_field(data, desc, dn)
+            if d.len != 0 {
+                row.desc = d
+                row.has_desc = true
+            }
+        }
+        (mut rows).push(row)
+    }
+    rows
+}
+
+/// `yew_compgen_key_string` (`compgen.c:723-743`): name, each argv word
+/// after 0x1F, 0x1E, the cwd.
+pub fn compgen_key_string(key: GenKey) -> str {
+    var s = key.name
+    for a in key.argv {
+        s += "\u{1F}{a}"
+    }
+    s += "\u{1E}"
+    if key.has_cwd {
+        s += key.cwd
+    }
+    s
+}
+
+/// `spawn_for` (`compgen.c:745-806`). C spawns the generator as an
+/// internal, evictable, callback job; at 0.2.33 the job layer cannot read
+/// its pipe while the loop runs (G2), so the spawn fails as C's does when
+/// `yew_job_spawn` answers 0: the empty answer cached for `cache_ms`, the
+/// reason in the log (§5.6), the footer silent. `others` is the help and
+/// fish flights that share the four slots (Sprints 57.25/57.26).
+fn cg_spawn_for(mut g: CompGen, key: GenKey, ks: str, now: int, others: int) {
+    if g.flights.len + others >= COMPGEN_MAX_INFLIGHT {
+        return
+    }
+    g.spawns += 1
+    let err = job_stop_g2("the completion generator job")
+    util.log_info("completion generator {key.name}: {err}")
+    cg_entry_store(mut g, ks, now, key.cache_ms, take List[CgRow]())
+}
+
+/// `yew_compgen_rows` (`compgen.c:808-837`): the rows for `key` now
+/// (possibly stale, possibly empty) and whether a job is in flight.
+/// Never blocks. `(answered, pending)`.
+pub fn compgen_rows(mut g: CompGen, key: GenKey, now: int, others: int, mut out: List[GenItem]) -> (
+    bool,
+    bool,
+) {
+    if key.argv.len == 0 {
+        return (false, false)
+    }
+    let ks = compgen_key_string(key)
+    var e = cg_entry_find(g, ks)
+    if e < 0 || now - g.entries[e].stamp >= g.entries[e].cache_ms {
+        if cg_flight_find(g, ks) < 0 {
+            cg_spawn_for(mut g, key, ks, now, others)
+        }
+        e = cg_entry_find(g, ks)
+    }
+    if e >= 0 {
+        for r in g.entries[e].rows {
+            cg_push(mut out, r.text, r.desc, r.has_desc)
+        }
+    }
+    (true, cg_flight_find(g, ks) >= 0)
+}
+
+/// The parser `gen_complete` runs over a finished job's output
+/// (`compgen.c:695-713`), exposed for the pin whose job layer delivers
+/// it, and for the tests.
+pub fn compgen_parse(data: List[byte], ps: bool) -> List[GenItem] {
+    var out = List[GenItem]()
+    for r in cg_parse_output(data, ps) {
+        cg_push(mut out, r.text, r.desc, r.has_desc)
+    }
+    out
+}

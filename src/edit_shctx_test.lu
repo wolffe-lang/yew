@@ -1,0 +1,994 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_shctx.c` (943 lines), one test per
+//! C test in registry order (`tests/unit/registry.c`). The corpora
+//! (`shctx_corpus.h`'s `sh_corpus` and `sh_cwd_corpus`) are data:
+//! `tests/fixtures/shell/shctx_corpus.txt` and `shctx_cwd.txt`, generated
+//! from sagitta's header by `tools/gen-shell-fixtures` and checked against
+//! the pin by `tools/check-shell-fixtures`; the fuzz seeds are sagitta's
+//! `tests/fuzz/corpus/fuzz_shctx/`, copied verbatim.
+//!
+//! Two shapes differ from C's, each for a wolf reason. C hands its round
+//! trip script to a shell as `-c` ARGV (`test_shctx.c:502-507`); a wolf
+//! argv is a `str`, which cannot carry the invalid UTF-8 the script holds,
+//! so the port writes the script to a file and runs `SHELL FILE` — the
+//! same parser reading the same bytes. C captures stdout through a pipe;
+//! the port's child writes to a scratch file (a pipe read while the child
+//! runs is the job layer's G2 row, and a file needs none). This file
+//! spawns shells: it runs inside the container (RULES §5).
+
+use edit
+use std.fs
+use std.process
+use term
+use util
+
+const SCRATCH: str = "target/tests/shctx"
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn show(b: List[byte]) -> str {
+    var out = ""
+    for x in b {
+        let c = x as int
+        if c >= 32 && c < 127 && c != 92 {
+            out += c as char
+        } else {
+            out += "\\x{hex2(c)}"
+        }
+    }
+    out
+}
+
+fn hex2(c: int) -> str {
+    let h = "0123456789abcdef"
+    "{h[(c >> 4)..(c >> 4) + 1]}{h[(c & 15)..(c & 15) + 1]}"
+}
+
+// ------------------------------------------------------------------
+// The fixtures
+// ------------------------------------------------------------------
+
+struct Field {
+    is_null: bool,
+    bytes: List[byte],
+}
+
+fn hexv(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    c - 55
+}
+
+/// One fixture field: `\N` is NULL; `\\` and `\xNN` escapes.
+fn field_of(s: List[byte], at: int, end: int) -> Field {
+    if end - at == 2 && s[at] as int == 92 && s[at + 1] as int == 78 {
+        return Field { is_null: true, bytes: List[byte]() }
+    }
+    var out = List[byte]()
+    var i = at
+    while i < end {
+        let c = s[i] as int
+        if c == 92 && i + 1 < end && s[i + 1] as int == 120 {
+            (mut out).push((hexv(s[i + 2] as int) * 16 + hexv(s[i + 3] as int)) as byte)
+            i += 4
+        } else if c == 92 && i + 1 < end && s[i + 1] as int == 92 {
+            (mut out).push(92 as byte)
+            i += 2
+        } else {
+            (mut out).push(s[i])
+            i += 1
+        }
+    }
+    Field { is_null: false, bytes: out }
+}
+
+/// The rows of fixture `name`: each a list of fields.
+fn fixture(name: str) -> List[List[Field]] {
+    let text = fs.read_bytes("tests/fixtures/shell/{name}") else |_| {
+        assert(false, "fixture {name} missing")
+        return List[List[Field]]()
+    }
+    var rows = List[List[Field]]()
+    var at = 0
+    while at < text.len {
+        var e = at
+        while e < text.len && text[e] as int != 10 {
+            e += 1
+        }
+        if e > at && text[at] as int != 35 {
+            var row = List[Field]()
+            var f = at
+            var i = at
+            while i <= e {
+                if i == e || text[i] as int == 9 {
+                    (mut row).push(field_of(text, f, i))
+                    f = i + 1
+                }
+                i += 1
+            }
+            (mut rows).push(row)
+        }
+        at = e + 1
+    }
+    rows
+}
+
+fn fint(f: Field) -> int {
+    let s = str_from_utf8(f.bytes) else "0"
+    s.to_int() else 0
+}
+
+/// `corpus_line` (`test_shctx.c:27-48`): the line with its caret marker
+/// (U+2038) removed, and the caret.
+fn corpus_line(inp: List[byte]) -> (List[byte], int) {
+    var i = 0
+    while i + 3 <= inp.len {
+        if inp[i] as int == 226 && inp[i + 1] as int == 128 && inp[i + 2] as int == 184 {
+            var line = List[byte]()
+            var k = 0
+            while k < inp.len {
+                if k < i || k >= i + 3 {
+                    (mut line).push(inp[k])
+                }
+                k += 1
+            }
+            return (line, i)
+        }
+        i += 1
+    }
+    (copy inp, inp.len)
+}
+
+fn corpus_line_str(s: str) -> (List[byte], int) {
+    corpus_line(bytes_of(s))
+}
+
+// ------------------------------------------------------------------
+// The corpus
+// ------------------------------------------------------------------
+
+fn pos_name(p: int) -> str {
+    match p {
+        0 => "COMMAND",
+        1 => "ARGUMENT",
+        2 => "REDIRECT",
+        3 => "ASSIGN",
+        4 => "VARIABLE",
+        5 => "NONE",
+        _ => "?",
+    }
+}
+
+/// `corpus_row_ok` (`test_shctx.c:57-111`).
+fn corpus_row_ok(
+    index: int,
+    row: List[Field],
+    line: List[byte],
+    caret: int,
+    ctx: edit.ShCtx,
+) -> bool {
+    let raw = copy row[5].bytes
+    var ok = true
+    if ctx.pos != fint(row[1]) || ctx.quote != fint(row[2]) {
+        ok = false
+    }
+    if ctx.replace_hi != caret || caret < raw.len || ctx.replace_lo != caret - raw.len {
+        ok = false
+    } else {
+        var i = 0
+        while i < raw.len {
+            if line[ctx.replace_lo + i] != raw[i] {
+                ok = false
+            }
+            i += 1
+        }
+    }
+    if !same(ctx.stem, row[6].bytes) {
+        ok = false
+    }
+    if row[3].is_null {
+        if ctx.argc != 0 || ctx.arg_index != 0 {
+            ok = false
+        }
+    } else if ctx.argc == 0 ||
+        !same(ctx.argv[0], row[3].bytes) ||
+        ctx.arg_index != fint(row[4]) ||
+        ctx.argc != fint(row[4]) + 1 ||
+        !same(ctx.argv[ctx.arg_index], ctx.stem) {
+        ok = false
+    }
+    let flags = fint(row[7])
+    if ctx.dashdash != (flags & 1 != 0) ||
+        ctx.brace_var != (flags & 2 != 0) ||
+        ctx.tilde != (flags & 4 != 0) ||
+        ctx.expands != (flags & 8 != 0) ||
+        ctx.depth != fint(row[8]) {
+        ok = false
+    }
+    if !ok {
+        let argv0 = if ctx.argc == 0 then "(none)" else show(ctx.argv[0])
+        eprint(
+            "shctx corpus row {index} `{show(row[0].bytes)}`: pos={pos_name(ctx.pos)} quote={ctx.quote} replace=[{ctx.replace_lo},{ctx.replace_hi}) stem=`{show(ctx.stem)}` argc={ctx.argc} arg_index={ctx.arg_index} argv0=`{argv0}` dashdash={ctx.dashdash} brace={ctx.brace_var} tilde={ctx.tilde} expands={ctx.expands} depth={ctx.depth}",
+        )
+    }
+    ok
+}
+
+// DoD 2: ≥ 150 rows, each pinning pos, quote, replace, stem, argv.
+fn t_shctx_corpus_rows() {
+    let rows = fixture("shctx_corpus.txt")
+    assert(rows.len >= 150, "corpus has ≥ 150 rows")
+    var failures = 0
+    var i = 0
+    while i < rows.len {
+        let (line, caret) = corpus_line(rows[i][0].bytes)
+        let (ok, ctx) = edit.shctx_at(line, caret)
+        assert(ok, "lexes")
+        if !corpus_row_ok(i, rows[i], line, caret, ctx) {
+            failures += 1
+        }
+        i += 1
+    }
+    assert(failures == 0, "corpus failures: {failures}")
+}
+
+// §1: the lexer runs to the CARET.
+fn t_shctx_text_after_caret_is_ignored() {
+    let rows = fixture("shctx_corpus.txt")
+    var tails = List[str]()
+    for t in ["'", "\"", " | x", "$(", "`", "\\", "# c", ") ;", "\n}}"] {
+        (mut tails).push(t)
+    }
+    for row in rows {
+        let (line, caret) = corpus_line(row[0].bytes)
+        let (ok, base) = edit.shctx_at(line, caret)
+        assert(ok, "base lexes")
+        for t in tails {
+            var mixed = List[byte]()
+            var k = 0
+            while k < caret {
+                (mut mixed).push(line[k])
+                k += 1
+            }
+            for b in t.bytes() {
+                (mut mixed).push(b)
+            }
+            while k < line.len {
+                (mut mixed).push(line[k])
+                k += 1
+            }
+            let (ok2, ctx) = edit.shctx_at(mixed, caret)
+            assert(ok2, "mixed lexes")
+            assert(ctx.pos == base.pos, "tail `{t}` changed pos of `{show(row[0].bytes)}`")
+            assert(ctx.quote == base.quote, "tail changed quote")
+            assert(ctx.replace_lo == base.replace_lo, "tail changed replace.lo")
+            assert(ctx.replace_hi == base.replace_hi, "tail changed replace.hi")
+            assert(same(ctx.stem, base.stem), "tail changed stem")
+            assert(ctx.arg_index == base.arg_index, "tail changed arg_index")
+        }
+    }
+}
+
+// §1 pitfall: the nesting stack is bounded at 64.
+fn t_shctx_depth_is_capped() {
+    var line = List[byte]()
+    var i = 0
+    while i < edit.SH_DEPTH_MAX {
+        (mut line).push(36 as byte)
+        (mut line).push(40 as byte)
+        i += 1
+    }
+    (mut line).push(103 as byte)
+    (mut line).push(105 as byte)
+    let (ok, ctx) = edit.shctx_at(line, line.len)
+    assert(ok, "lexes")
+    assert(ctx.depth == edit.SH_DEPTH_MAX, "depth {ctx.depth}")
+    assert(ctx.pos == edit.SH_POS_COMMAND, "pos")
+    assert(same(ctx.stem, bytes_of("gi")), "stem")
+
+    line = List[byte]()
+    i = 0
+    while i < 4 * edit.SH_DEPTH_MAX {
+        if i % 2 == 0 {
+            (mut line).push(36 as byte)
+            (mut line).push(40 as byte)
+        } else {
+            (mut line).push(34 as byte)
+        }
+        i += 1
+    }
+    let (ok2, ctx2) = edit.shctx_at(line, line.len)
+    assert(ok2, "lexes")
+    assert(ctx2.pos == edit.SH_POS_NONE, "past the cap is NONE")
+    assert(ctx2.depth <= edit.SH_DEPTH_MAX, "depth bounded")
+
+    line = List[byte]()
+    i = 0
+    while i < 1000 {
+        (mut line).push(40 as byte)
+        i += 1
+    }
+    let (ok3, ctx3) = edit.shctx_at(line, line.len)
+    assert(ok3, "lexes")
+    assert(ctx3.pos == edit.SH_POS_NONE, "1000 parens is NONE")
+    assert(ctx3.depth <= edit.SH_DEPTH_MAX, "depth bounded")
+}
+
+/// `rng_next` (`test_shctx.c:214-223`): xorshift64.
+fn rng_next(s: wrapping[u64]) -> wrapping[u64] {
+    var x = s
+    x = x ^ x << 13
+    x = x ^ x >> 7
+    x = x ^ x << 17
+    x
+}
+
+// "Never fails on any byte sequence" (`test_shctx.c:230-273`).
+fn t_shctx_every_caret_of_random_bytes() {
+    let alphabet = "abc -$(){{}}[]'\"`\\|&;<>#=~\n\t!*?21"
+    let alen = alphabet.len
+    var seed: wrapping[u64] = 6279050402725162838
+    var round = 0
+    while round < 400 {
+        seed = rng_next(seed)
+        let len = (seed % 48) as int
+        var line = List[byte]()
+        var i = 0
+        while i < len {
+            seed = rng_next(seed)
+            let r = seed
+            if r & 7 == 0 {
+                (mut line).push((r >> 8 & 255) as int as byte)
+            } else {
+                (mut line).push(alphabet.bytes()[((r >> 8) % alen as wrapping[u64]) as int])
+            }
+            i += 1
+        }
+        var caret = 0
+        while caret <= len {
+            let (ok, ctx) = edit.shctx_at(line, caret)
+            assert(ok, "lexes")
+            assert(ctx.replace_lo <= ctx.replace_hi, "replace ordered")
+            assert(ctx.replace_hi == caret, "replace ends at the caret")
+            assert(ctx.arg_index <= ctx.argc, "arg_index in range")
+            assert(ctx.depth <= edit.SH_DEPTH_MAX, "depth bounded")
+            assert(ctx.argv.len == ctx.argc, "argv has argc words")
+            caret += 1
+        }
+        round += 1
+    }
+    let (bad, _) = edit.shctx_at(bytes_of("ls"), 3)
+    assert(!bad, "caret past the line refused")
+    let (ok, ctx) = edit.shctx_at(List[byte](), 0)
+    assert(ok, "empty line lexes")
+    assert(ctx.pos == edit.SH_POS_COMMAND, "empty line is COMMAND")
+}
+
+struct QRow {
+    text: List[byte],
+    q: int,
+    want: List[byte],
+    closing: str,
+}
+
+fn qrow(text: List[byte], q: int, want: List[byte], closing: str) -> QRow {
+    QRow { text: copy text, q: q, want: copy want, closing: closing }
+}
+
+fn raw(xs: List[int]) -> List[byte] {
+    var v = List[byte]()
+    for x in xs {
+        (mut v).push(x as byte)
+    }
+    v
+}
+
+fn cat(a: List[byte], b: List[byte]) -> List[byte] {
+    var v = copy a
+    for x in b {
+        (mut v).push(x)
+    }
+    v
+}
+
+// §6's table, row by row (`test_shctx.c:276-341`).
+fn t_shq_quote_rules() {
+    let n = edit.SH_Q_NONE
+    let sq = edit.SH_Q_SINGLE
+    let dq = edit.SH_Q_DOUBLE
+    let dl = edit.SH_Q_DOLLAR
+    var rows = List[QRow]()
+    (mut rows).push(qrow(bytes_of("plain"), n, bytes_of("plain"), ""))
+    (mut rows).push(qrow(bytes_of("a b"), n, bytes_of("a\\ b"), ""))
+    (mut rows).push(qrow(bytes_of("$HOME"), n, bytes_of("\\$HOME"), ""))
+    (mut rows).push(qrow(bytes_of("a*b"), n, bytes_of("a\\*b"), ""))
+    (mut rows).push(qrow(bytes_of("a$b c"), n, bytes_of("a\\$b\\ c"), ""))
+    (mut rows).push(qrow(bytes_of("#x"), n, bytes_of("\\#x"), ""))
+    (mut rows).push(qrow(bytes_of("~x"), n, bytes_of("\\~x"), ""))
+    (mut rows).push(qrow(bytes_of("a=~b"), n, bytes_of("a=\\~b"), ""))
+    (mut rows).push(qrow(bytes_of("=ls"), n, bytes_of("\\=ls"), ""))
+    (mut rows).push(qrow(bytes_of("it's"), n, bytes_of("it\\'s"), ""))
+    (mut rows).push(qrow(bytes_of("a\nb"), n, bytes_of("'a\nb'"), ""))
+    (mut rows).push(qrow(bytes_of("it's\t"), n, bytes_of("'it'\\''s\t'"), ""))
+    (mut rows).push(qrow(raw([255, 254]), n, raw([39, 255, 254, 39]), ""))
+    (mut rows).push(
+        qrow(
+            raw([32, 62, 37, 160, 237, 45, 64]),
+            n,
+            raw([39, 32, 62, 37, 160, 237, 45, 64, 39]),
+            "",
+        ),
+    )
+    (mut rows).push(
+        qrow(
+            cat(bytes_of("caf"), raw([195, 169, 32, 120])),
+            n,
+            cat(bytes_of("caf"), raw([195, 169, 92, 32, 120])),
+            "",
+        ),
+    )
+    (mut rows).push(qrow(bytes_of("it's"), sq, bytes_of("it'\\''s"), "'"))
+    (mut rows).push(qrow(bytes_of("$x `y` \\z"), sq, bytes_of("$x `y` \\z"), "'"))
+    (mut rows).push(qrow(bytes_of("a\"$`\\b"), dq, bytes_of("a\\\"\\$\\`\\\\b"), "\""))
+    (mut rows).push(qrow(bytes_of("it's"), dq, bytes_of("it's"), "\""))
+    (mut rows).push(qrow(bytes_of("it's\\"), dl, bytes_of("it\\'s\\\\"), "'"))
+    (mut rows).push(qrow(raw([97, 10, 98, 127]), dl, bytes_of("a\\x0ab\\x7f"), "'"))
+    (mut rows).push(qrow(raw([1, 102]), dl, bytes_of("\\x01f"), "'"))
+    for r in rows {
+        let (got, closing) = edit.shq_quote(r.text, 0, r.text.len, r.q)
+        assert(
+            same(got, r.want),
+            "quote `{show(r.text)}` state {r.q}: got `{show(got)}` want `{show(r.want)}`",
+        )
+        assert(closing == r.closing, "closing for `{show(r.text)}`")
+    }
+    let (a, ca) = edit.shq_insert(bytes_of("my dir/"), 0, dq)
+    assert(same(a, bytes_of("\"my dir/")), "insert double")
+    assert(ca == "\"", "insert double closing")
+    let (b, cb) = edit.shq_insert(bytes_of("~/a b"), 2, n)
+    assert(same(b, bytes_of("~/a\\ b")), "insert ~/ prefix")
+    assert(cb == "", "insert none closing")
+    let (c, _) = edit.shq_insert(bytes_of("~root/x y"), 6, sq)
+    assert(same(c, bytes_of("~root/'x y")), "insert ~root/ prefix")
+    let (d, _) = edit.shq_insert(bytes_of("x"), 0, dl)
+    assert(same(d, bytes_of("$'x")), "insert dollar")
+}
+
+// ------------------------------------------------------------------
+// §6 proof: the quoting round trip through real shells
+// ------------------------------------------------------------------
+
+/// Run `argv` with stdin from the null device (std.process's default) and
+/// stdout into a scratch file: `(ok, stdout)`. `ok` is an exit of 0.
+fn shell_capture(argv: List[str], out_path: str) -> (bool, List[byte]) {
+    fs.remove(out_path) else |_| {}
+    var c = process.from_argv(argv)
+    let sink = fs.create(out_path) else |_| {
+        assert(false, "scratch output {out_path}")
+        return (false, List[byte]())
+    }
+    process.set_stdout(mut c, sink)
+    let ch = process.start(c) else |_| {
+        fs.close(take sink) else |_| {}
+        return (false, List[byte]())
+    }
+    let status = process.wait_status(take ch) else -1
+    fs.close(take sink) else |_| {}
+    let out = fs.read_bytes(out_path) else List[byte]()
+    (status == 0, out)
+}
+
+struct RtShell {
+    label: str,
+    path: str,
+    opt: str,
+}
+
+/// `rt_make` (`test_shctx.c:419-452`): the hand-picked hazards, then
+/// random draws biased toward them. `(next seed, string)`.
+fn rt_make(seed0: wrapping[u64], index: int, fixed: List[List[byte]]) -> (
+    wrapping[u64],
+    List[byte],
+) {
+    let hazard = "$`*'\"\\\n\t ?[]{{}}()<>|&;~#^=!%,-@:"
+    let hlen = hazard.len as wrapping[u64]
+    let plain = "abcXYZ019._/"
+    var seed = seed0
+    if index < fixed.len {
+        return (seed, copy fixed[index])
+    }
+    seed = rng_next(seed)
+    let len = 1 + (seed % 39) as int
+    var buf = List[byte]()
+    var i = 0
+    while i < len {
+        seed = rng_next(seed)
+        let r = seed
+        let cls = (r % 10) as int
+        if cls < 4 {
+            (mut buf).push(hazard.bytes()[((r >> 8) % hlen) as int])
+        } else if cls < 6 {
+            (mut buf).push((128 + ((r >> 8) % 128) as int) as byte)
+        } else if cls < 7 {
+            (mut buf).push((1 + ((r >> 8) % 31) as int) as byte)
+        } else {
+            (mut buf).push(plain.bytes()[((r >> 8) % 12) as int])
+        }
+        i += 1
+    }
+    (seed, buf)
+}
+
+fn rt_fixed() -> List[List[byte]] {
+    var v = List[List[byte]]()
+    for s in [
+        "$HOME",
+        "a*b",
+        "a$b c",
+        "'",
+        "\"",
+        "\\",
+        "\n",
+        "\t",
+        "~root",
+        "=ls",
+        "-n",
+        "a b",
+        "#x",
+    ] {
+        (mut v).push(bytes_of(s))
+    }
+    (mut v).push(raw([255, 254]))
+    for s in [
+        "x",
+        "`id`",
+        "$(id)",
+        "!!",
+        "a\\\nb",
+        "~",
+        "=",
+        "^x",
+        "a~b",
+        "a=~b",
+        "*",
+        "?",
+        "[a]",
+        "{{a,b}}",
+    ] {
+        (mut v).push(bytes_of(s))
+    }
+    (mut v).push(raw([127]))
+    (mut v).push(raw([1, 2]))
+    for s in ["it's", "\"$x\"", "%s", "\\x41"] {
+        (mut v).push(bytes_of(s))
+    }
+    (mut v).push(raw([195, 169, 116, 195, 169]))
+    v
+}
+
+fn shell_argv(sh: RtShell, tail: List[str]) -> List[str] {
+    var argv = List[str]()
+    (mut argv).push(sh.path)
+    if sh.opt.len != 0 {
+        (mut argv).push(sh.opt)
+    }
+    for t in tail {
+        (mut argv).push(t)
+    }
+    argv
+}
+
+/// `rt_has_dollar` (`test_shctx.c:456-476`).
+fn rt_has_dollar(sh: RtShell) -> bool {
+    var tail = List[str]()
+    (mut tail).push("-c")
+    (mut tail).push("printf %s $'a\\x41'")
+    let (ok, out) = shell_capture(shell_argv(sh, tail), "{SCRATCH}/rt-probe.out")
+    ok && same(out, bytes_of("aA"))
+}
+
+/// `rt_run` (`test_shctx.c:483-543`): one shell, one state, every string
+/// in ONE script; stdout split on NUL must be the strings.
+fn rt_run(sh: RtShell, q: int, strings: List[List[byte]]) -> int {
+    var script = List[byte]()
+    for s in strings {
+        let (word, closing) = edit.shq_insert(s, 0, q)
+        for b in "printf '%s\\0' ".bytes() {
+            (mut script).push(b)
+        }
+        for b in word {
+            (mut script).push(b)
+        }
+        for b in closing.bytes() {
+            (mut script).push(b)
+        }
+        (mut script).push(10 as byte)
+    }
+    let path = "{SCRATCH}/rt-script.sh"
+    fs.write_bytes(path, script) else |_| {
+        assert(false, "write the script")
+        return 1
+    }
+    var tail = List[str]()
+    (mut tail).push(path)
+    let (ok, out) = shell_capture(shell_argv(sh, tail), "{SCRATCH}/rt-out.bin")
+    var bad = 0
+    if !ok {
+        eprint("shq round trip: {sh.label} exited non-zero, state {q}")
+        bad += 1
+    }
+    var off = 0
+    var i = 0
+    while i < strings.len {
+        var nul = off
+        while nul < out.len && out[nul] as int != 0 {
+            nul += 1
+        }
+        let found = nul < out.len
+        let got = if found then nul - off else 0
+        var match_ok = found && got == strings[i].len
+        if match_ok {
+            var k = 0
+            while k < got {
+                if out[off + k] != strings[i][k] {
+                    match_ok = false
+                    break
+                }
+                k += 1
+            }
+        }
+        if !match_ok {
+            let (word, _) = edit.shq_insert(strings[i], 0, q)
+            eprint(
+                "shq round trip: {sh.label} state {q} string {i} differs: want `{show(strings[i])}` inserted `{show(word)}`",
+            )
+            bad += 1
+            break
+        }
+        off += got + 1
+        i += 1
+    }
+    bad
+}
+
+// DoD 3: 500 seeded strings in every quote state through /bin/sh and
+// every zsh and bash installed (`test_shctx.c:552-608`).
+fn t_shq_roundtrip_real_shells() {
+    fs.create_dir_all(SCRATCH) else |_| {}
+    let fixed = rt_fixed()
+    var strings = List[List[byte]]()
+    var seed: wrapping[u64] = 6278862305484627969
+    var i = 0
+    while i < 500 {
+        let (next, s) = rt_make(seed, i, fixed)
+        seed = next
+        (mut strings).push(s)
+        i += 1
+    }
+    var shells = List[RtShell]()
+    (mut shells).push(RtShell { label: "/bin/sh", path: "/bin/sh", opt: "" })
+    for z in ["/bin/zsh", "/usr/bin/zsh", "/usr/local/bin/zsh", "/opt/homebrew/bin/zsh"] {
+        if fs.is_file(z) {
+            (mut shells).push(RtShell { label: "zsh -f", path: z, opt: "-f" })
+            (mut shells).push(RtShell {
+                label: "zsh -o extendedglob",
+                path: z,
+                opt: "-oextendedglob",
+            })
+            break
+        }
+    }
+    for b in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"] {
+        if fs.is_file(b) {
+            (mut shells).push(RtShell { label: "bash", path: b, opt: "" })
+            break
+        }
+    }
+    var bad = 0
+    var runs = 0
+    for sh in shells {
+        var q = edit.SH_Q_NONE
+        while q <= edit.SH_Q_DOLLAR {
+            if q == edit.SH_Q_DOLLAR && !rt_has_dollar(sh) {
+                eprint("shq round trip: {sh.label} has no $'...'; state skipped")
+            } else {
+                bad += rt_run(sh, q, strings)
+                runs += 1
+            }
+            q += 1
+        }
+    }
+    eprint("shq round trip: {runs} shell/state runs x 500 strings")
+    assert(runs >= 3, "at least three shell/state runs")
+    assert(bad == 0, "round trip mismatches: {bad}")
+}
+
+fn secret(name: str) -> bool {
+    let b = bytes_of(name)
+    util.secret_name(b, 0, b.len)
+}
+
+// §4: the core redaction predicate (`test_shctx.c:611-624`). C's
+// `yew_secret_name(NULL)` has no port: the name is bytes, never absent.
+fn t_shctx_secret_name_is_core() {
+    assert(secret("GITHUB_TOKEN"), "token")
+    assert(secret("aws_secret_access_key"), "secret")
+    assert(secret("MyApiKey"), "apikey")
+    assert(secret("DB_PASSWD"), "passwd")
+    assert(secret("x_private_key_y"), "private key")
+    assert(secret("NPM_CREDENTIALS"), "credential")
+    assert(!secret("EDITOR"), "editor")
+    assert(!secret("PATH"), "path")
+    assert(!secret("TOKE"), "toke")
+    assert(!secret(""), "empty")
+}
+
+fn read_seed(path: str) -> (bool, List[byte]) {
+    let b = fs.read_bytes(path) else |_| { return (false, List[byte]()) }
+    (true, b)
+}
+
+// The fuzz harness's seed corpus IS this corpus (`test_shctx.c:628-652`).
+fn t_shctx_fuzz_seeds_match_the_corpus() {
+    let rows = fixture("shctx_corpus.txt")
+    var i = 0
+    while i < rows.len {
+        let n = if i < 10 then "00{i}" else if i < 100 then "0{i}" else "{i}"
+        let path = "tests/fuzz/corpus/fuzz_shctx/row-{n}"
+        let (ok, got) = read_seed(path)
+        if !ok {
+            eprint("missing fuzz seed {path}")
+        }
+        assert(ok, "seed {path}")
+        assert(same(got, rows[i][0].bytes), "seed {path} matches row {i}")
+        i += 1
+    }
+}
+
+// ------------------------------------------------------------------
+// Sprint 57.32 §1: the effective directory
+// ------------------------------------------------------------------
+
+fn vars_of(rows: List[str]) -> term.Env {
+    var m = Map[str, str]()
+    for r in rows {
+        let eq = r.find("=") else -1
+        if eq > 0 {
+            m[r[0..eq]] = r[eq + 1..]
+        }
+    }
+    term.env_of(m)
+}
+
+fn cwd_vars() -> List[str] {
+    var v = List[str]()
+    (mut v).push("HOME=/home/fix")
+    (mut v).push("OLDPWD=/prev/dir")
+    v
+}
+
+/// `cwd_lex` (`test_shctx.c:675-694`).
+fn cwd_lex(inp: List[byte], vars: List[str], base: str, has_base: bool) -> edit.ShCtx {
+    let (line, caret) = corpus_line(inp)
+    let env = edit.shenv_of(vars_of(vars), base, has_base)
+    var none = edit.compspecs_new()
+    let (ok, ctx) = edit.shctx_at_env(line, caret, mut none, false, env)
+    assert(ok, "lexes")
+    ctx
+}
+
+fn cwd_lex_str(inp: str, vars: List[str], base: str, has_base: bool) -> edit.ShCtx {
+    cwd_lex(bytes_of(inp), vars, base, has_base)
+}
+
+/// `cwd_is` (`test_shctx.c:696-701`): `known` false is UNKNOWN.
+fn cwd_is(ctx: edit.ShCtx, known: bool, want: List[byte]) -> bool {
+    if !known {
+        return !ctx.cwd_known && ctx.cwd.len == 0
+    }
+    ctx.cwd_known && same(ctx.cwd, want)
+}
+
+// DoD 2: every row of both reference tables (`test_shctx.c:704-731`).
+fn t_shctx_cwd_corpus_rows() {
+    let rows = fixture("shctx_cwd.txt")
+    assert(rows.len >= 40, "≥ 40 cwd rows")
+    var failures = 0
+    var i = 0
+    while i < rows.len {
+        let ctx = cwd_lex(rows[i][0].bytes, cwd_vars(), "/base", true)
+        if !cwd_is(ctx, !rows[i][1].is_null, rows[i][1].bytes) {
+            let want = if rows[i][1].is_null then "UNKNOWN" else "`{show(rows[i][1].bytes)}`"
+            let got = if ctx.cwd_known then "`{show(ctx.cwd)}`" else "UNKNOWN"
+            eprint("shctx cwd row {i} `{show(rows[i][0].bytes)}`: want {want} got {got}")
+            failures += 1
+        }
+        i += 1
+    }
+    assert(failures == 0, "cwd failures: {failures}")
+}
+
+// Without an environment nothing it would name is known
+// (`test_shctx.c:735-757`).
+fn t_shctx_cwd_without_env() {
+    let none = List[str]()
+    var ctx = cwd_lex_str("cd && x‸", none, "", false)
+    assert(cwd_is(ctx, false, List[byte]()), "cd alone unknown")
+    ctx = cwd_lex_str("cd ~/x && y‸", none, "", false)
+    assert(cwd_is(ctx, false, List[byte]()), "cd ~ unknown")
+    let (line, caret) = corpus_line_str("cd a && cd b && x‸")
+    let (ok, c2) = edit.shctx_at(line, caret)
+    assert(ok, "lexes")
+    assert(cwd_is(c2, true, bytes_of("a/b")), "a/b")
+    ctx = cwd_lex_str("cd a; ls # x‸", none, "", false)
+    assert(ctx.pos == edit.SH_POS_NONE, "comment is NONE")
+    assert(cwd_is(ctx, true, bytes_of("a")), "NONE still says where")
+}
+
+/// The current user's name and home, from the files source (G37).
+fn current_user() -> (str, str) {
+    let uid = os_uid() else -1
+    let text = fs.read_text("/etc/passwd") else ""
+    for line in text.lines() {
+        let f = line.split(":")
+        if f.len >= 7 {
+            let u = f[2].to_int() else -2
+            if u == uid {
+                return (f[0], f[5])
+            }
+        }
+    }
+    ("", "")
+}
+
+// `~user` is the user database's answer (`test_shctx.c:760-791`).
+fn t_shctx_cwd_tilde_user() {
+    let none = List[str]()
+    let (user, home) = current_user()
+    assert(user.len != 0, "the current user is in the user database")
+    let want = if home == "/" then "/sub" else "{home}/sub"
+    var ctx = cwd_lex_str("cd ~{user}/sub && x‸", none, "", false)
+    assert(cwd_is(ctx, true, bytes_of(want)), "~user/sub is {want}, got `{show(ctx.cwd)}`")
+    ctx = cwd_lex_str("cd \"~{user}\" && x‸", none, "", false)
+    assert(ctx.cwd.len != 0 && ctx.cwd[0] as int == 126, "quoted ~user is literal")
+}
+
+// CDPATH (bash's rule) (`test_shctx.c:796-869`).
+fn t_shctx_cwd_cdpath() {
+    let pid = os_pid()
+    let root = "/tmp/yew-cdpath-{pid}"
+    fs.remove_dir_all(root) else |_| {}
+    fs.create_dir_all("{root}/lib/pkg") else |_| { assert(false, "mkdir lib/pkg") }
+    fs.create_dir_all("{root}/far/pkg") else |_| { assert(false, "mkdir far/pkg") }
+    var vars = List[str]()
+    (mut vars).push("CDPATH=nope:lib:{root}/far")
+    (mut vars).push("HOME=/home/fix")
+    var ctx = cwd_lex_str("cd pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("lib/pkg")), "relative entry: got `{show(ctx.cwd)}`")
+    vars[0] = "CDPATH={root}/far:lib"
+    ctx = cwd_lex_str("cd pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("{root}/far/pkg")), "absolute entry")
+    vars[0] = "CDPATH=:lib"
+    ctx = cwd_lex_str("cd pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("lib/pkg")), "empty entry first")
+    ctx = cwd_lex_str("cd ghost && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("ghost")), "none exists")
+    ctx = cwd_lex_str("cd ./pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("pkg")), "./ never searches")
+    ctx = cwd_lex_str("cd ../pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("../pkg")), "../ never searches")
+    ctx = cwd_lex_str("cd ~/pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("/home/fix/pkg")), "an expansion is not searched")
+    ctx = cwd_lex_str("cd lib && cd pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, true, bytes_of("lib/pkg")), "searched from where the shell is")
+    ctx = cwd_lex_str("cd pkg && x‸", vars, "", false)
+    assert(cwd_is(ctx, false, List[byte]()), "no start directory: unknown")
+    ctx = cwd_lex_str("CDPATH=/x; cd pkg && x‸", vars, root, true)
+    assert(cwd_is(ctx, false, List[byte]()), "a changed CDPATH: unknown")
+    fs.remove_dir_all(root) else |_| { assert(false, "remove the tree") }
+}
+
+// `dirv` and the consumers' half (`test_shctx.c:873-907`).
+fn t_shctx_cwd_dirv_and_join() {
+    var ctx = cwd_lex_str("git -C ~/r -C $X -C 'q d' -C a* x‸", cwd_vars(), "/b", true)
+    assert(ctx.arg_index == 9, "arg_index {ctx.arg_index}")
+    assert(ctx.dirv_known[2] && same(ctx.dirv[2], bytes_of("/home/fix/r")), "dirv[2]")
+    assert(!ctx.dirv_known[4], "dirv[4] NULL")
+    assert(ctx.dirv_known[6] && same(ctx.dirv[6], bytes_of("q d")), "dirv[6]")
+    assert(!ctx.dirv_known[8], "dirv[8] NULL")
+    assert(!ctx.dirv_known[9], "dirv[9] NULL")
+    assert(ctx.dirv.len == 10, "dirv has argc entries (C's dirv[10] is the NULL end)")
+
+    assert(same(edit.sh_dir_join(bytes_of("a/b"), bytes_of("../c")), bytes_of("a/c")), "join 1")
+    assert(same(edit.sh_dir_join(List[byte](), bytes_of("..")), bytes_of("..")), "join 2")
+    assert(
+        same(edit.sh_dir_join(bytes_of(".."), bytes_of("../x/./")), bytes_of("../../x")),
+        "join 3",
+    )
+    assert(
+        same(edit.sh_dir_join(bytes_of("/r"), bytes_of("/abs//y/")), bytes_of("/abs/y")),
+        "join 4",
+    )
+    assert(same(edit.sh_dir_join(bytes_of("/"), bytes_of("..")), bytes_of("/")), "join 5")
+    assert(same(edit.sh_dir_join(bytes_of("a"), bytes_of("..")), List[byte]()), "join 6")
+
+    ctx = cwd_lex_str("cd sub && x‸", cwd_vars(), "/b", true)
+    let (d1, k1) = edit.shctx_dir(ctx, "/ws/root")
+    assert(k1 && same(d1, bytes_of("/ws/root/sub")), "dir sub")
+    ctx = cwd_lex_str("cd .. && x‸", cwd_vars(), "/b", true)
+    let (d2, k2) = edit.shctx_dir(ctx, "/ws/root")
+    assert(k2 && same(d2, bytes_of("/ws")), "dir ..")
+    ctx = cwd_lex_str("x‸", cwd_vars(), "/b", true)
+    let (d3, k3) = edit.shctx_dir(ctx, "/ws/root")
+    assert(k3 && same(d3, bytes_of("/ws/root")), "dir unchanged")
+    let (d4, k4) = edit.shctx_dir(ctx, "")
+    assert(k4 && same(d4, bytes_of(".")), "dir NULL base")
+    ctx = cwd_lex_str("cd /t && x‸", cwd_vars(), "/b", true)
+    let (d5, k5) = edit.shctx_dir(ctx, "/ws/root")
+    assert(k5 && same(d5, bytes_of("/t")), "dir absolute")
+    ctx = cwd_lex_str("cd $Q && x‸", cwd_vars(), "/b", true)
+    let (_, k6) = edit.shctx_dir(ctx, "/ws/root")
+    assert(!k6, "dir unknown")
+}
+
+// Ten cd shapes seed the fuzzer (`test_shctx.c:911-943`).
+fn t_shctx_cwd_fuzz_seeds_match() {
+    let rows = fixture("shctx_cwd.txt")
+    assert(rows.len >= 10, "≥ 10 cwd rows")
+    var i = 0
+    while i < 10 {
+        let path = "tests/fuzz/corpus/fuzz_shctx/cd-0{i}"
+        let (ok, got) = read_seed(path)
+        if !ok {
+            eprint("missing fuzz seed {path}")
+        }
+        assert(ok, "seed {path}")
+        assert(same(got, rows[i][0].bytes), "seed {path} matches cwd row {i}")
+        i += 1
+    }
+}
+
+fn main() {
+    fs.create_dir_all(SCRATCH) else |_| {}
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    t_shctx_corpus_rows()
+    t_shctx_cwd_corpus_rows()
+    t_shctx_cwd_without_env()
+    t_shctx_cwd_tilde_user()
+    t_shctx_cwd_cdpath()
+    t_shctx_cwd_dirv_and_join()
+    t_shctx_cwd_fuzz_seeds_match()
+    t_shctx_text_after_caret_is_ignored()
+    t_shctx_depth_is_capped()
+    t_shctx_every_caret_of_random_bytes()
+    t_shctx_secret_name_is_core()
+    t_shctx_fuzz_seeds_match_the_corpus()
+    t_shq_quote_rules()
+    t_shq_roundtrip_real_shells()
+    print("shctx_test: 14 cases pass")
+}
