@@ -406,7 +406,7 @@ buy and the one the port does not claim.
   falls back to native and says `ok` (the `[native]` detail is the only
   trace — print it in the human output, or count it); G30 no
   non-blocking pipe write / write-readiness wait (the clipboard writer,
-  the fork's `probe/rg1`); G31 no host OS/arch query (`probe/rg0`);
+  `witness/clip-pipe-write-blocks`, `clip-no-fork`; the reader's `clip-wait-no-deadline`, `clip-no-wait-fds`); G31 no host OS/arch query (`witness/host-os`);
   G32 no `access(2)`, no `O_NOFOLLOW`, no advisory lock, `fs_fstat`'s
   three words (no dev/ino on a handle), no `mkfifo` — each met as a
   prelude absence and worked around by name; G33 a `List` that replaces
