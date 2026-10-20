@@ -18,6 +18,13 @@ sagitta's driver, and says so in every line it prints.
 
     tools/torture-replica.py --child BIN --checker BIN --shim SO
                              [--iters 500] [--lanes eintr,enospc,determinism,sigkill]
+                             [--live]
+
+`--live` (yw04) is kill9's `YEW_TORTURE_LANE=live-editor`: the child is
+sagitta's `yew-live-torture` driving an editor binary (`YEW_TORTURE_YEW`
+in the environment), which reports a failed save in-session and then
+quits on the feeder's `:ed.quit_force`, so the ENOSPC lane expects exit 0
+where the API child exits 3 (`kill9.c:951`); every other lane is the same.
 
 Exit 0 when every requested lane holds. Signals go only to the children
 it starts; run it inside a container (sprints/RULES.md §5).
@@ -125,9 +132,10 @@ def lane_enospc(a, root, serial):
         exact = f.read() == OLD
     with open(log, "rb") as f:
         injected = b"errno=ENOSPC" in f.read()
-    ok = code == 3 and injected and oracle and exact
+    expected = 0 if a.live else 3
+    ok = code == expected and injected and oracle and exact
     print(f"replica: storage ENOSPC preserves old+journal {'ok' if ok else 'FAILED'} "
-          f"(exit={code} expected=3 injected={int(injected)} oracle={int(oracle)} exact={int(exact)})")
+          f"(exit={code} expected={expected} injected={int(injected)} oracle={int(oracle)} exact={int(exact)})")
     return ok
 
 
@@ -244,12 +252,14 @@ def main():
     ap.add_argument("--shim", required=True)
     ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--lanes", default="eintr,enospc,determinism,sigkill")
+    ap.add_argument("--live", action="store_true")
     a = ap.parse_args()
     root = tempfile.mkdtemp(prefix="yew-torture-replica-")
     state = os.path.join(root, "state")
     os.mkdir(state, 0o700)
     os.environ["XDG_STATE_HOME"] = state
-    print(f"replica: the port's replica of kill9.c's late lanes; child={a.child} checker={a.checker}")
+    print(f"replica: the port's replica of kill9.c's late lanes; child={a.child} checker={a.checker}"
+          + (f" live-editor={os.environ.get('YEW_TORTURE_YEW', '')}" if a.live else ""))
     ok = True
     serial = 0
     for lane in a.lanes.split(","):
