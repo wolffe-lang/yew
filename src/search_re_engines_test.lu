@@ -1,0 +1,354 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_re_engines.c` (379 lines), one
+//! test per C test in registry order (`tests/unit/registry.c:1614-1616`
+//! and `:2591-2595`): the DFA and the VM agree on match-or-not over the
+//! pattern × input cross product, over piece trees and from every
+//! offset; the dispatcher's DFA-assisted skip moves no span; the cache
+//! survives pressure, flushes twice and hands off under a lowered cap;
+//! pathological patterns stay linear in the DFA; the BOL skip keeps the
+//! next line's match. Disagreement is a hard failure, never a tolerance.
+
+use search
+use text
+
+struct Tally {
+    n: int,
+}
+
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    assert(cond, what)
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn hexv(c: int) -> int {
+    if c >= 48 && c <= 57 then c - 48 else (if c >= 97 && c <= 102 then c - 87 else c - 55)
+}
+
+fn unhex(h: str) -> List[byte] {
+    var v = List[byte]()
+    let b = h.bytes()
+    var i = 0
+    while i + 1 < b.len {
+        (mut v).push((hexv(b[i] as int) * 16 + hexv(b[i + 1] as int)) as byte)
+        i += 2
+    }
+    v
+}
+
+fn at(n: int) -> text.ByteOff {
+    n as text.ByteOff
+}
+
+fn compile(pat: List[byte]) -> search.Re {
+    var err = search.re_err_new()
+    let re = search.re_compile(pat, 0, mut err) else {
+        assert(false, "compile failed: {err.msg}")
+        return search.re_empty()
+    }
+    re
+}
+
+// Patterns spanning every construct the DFA reasons about
+// (`test_re_engines.c:22-31`), space-separated; `()` and the empty
+// pattern are the last two.
+fn patterns() -> List[List[byte]] {
+    var out = List[List[byte]]()
+    let list = "abc a.c a* a+ a? a|b ab|a a|ab [a-z]+ [^a-z]+ \\d+ \\w+ \\s+ \\W ^abc abc$ ^$ ^ $ \\Aabc abc\\z \\bfoo\\b \\Bfoo \\bfoo foo\\b \\b \\B (a)(b) (?:ab)+ (a|b)*c a{{2,3}} a{{3}} a{{0,2}} a*? a+? <.+?> (a*)* (|a)* ()"
+    for w in list.words() {
+        (mut out).push(pb(w))
+    }
+    (mut out).push(List[byte]())
+    for w in "\\d{{4}}-\\d{{2}} [A-Z][a-z]+ x+y+z+ zzz q a.*c a.*?c .* . [[:alpha:]]+ [[:digit:]]+".
+        words() {
+        (mut out).push(pb(w))
+    }
+    out
+}
+
+// The inputs (`test_re_engines.c:33-41`), as hex.
+fn inputs() -> List[List[byte]] {
+    var out = List[List[byte]]()
+    (mut out).push(List[byte]())
+    for s in "a b abc aaa aab abab xxabcxx foo".words() {
+        (mut out).push(pb(s))
+    }
+    (mut out).push(pb("a foo b"))
+    (mut out).push(pb("afoob"))
+    (mut out).push(pb(" foo "))
+    (mut out).push(pb("foo\n"))
+    (mut out).push(pb("\nfoo"))
+    (mut out).push(pb("a\nb"))
+    (mut out).push(pb("a\r\nb"))
+    (mut out).push(pb("\n"))
+    (mut out).push(pb("\r\n"))
+    (mut out).push(pb("  "))
+    (mut out).push(pb("\t x"))
+    (mut out).push(pb("hello World"))
+    for s in "2026-08-04 A1b2C3 ... !!! aaaaaaaaaaaaaaaaaaaa abcabcabcabc zzz q".words() {
+        (mut out).push(pb(s))
+    }
+    for h in "e6bca2e5ad97 636166c3a9 65cc81 f09f9880 78f09f988079 61ff62".words() {
+        (mut out).push(unhex(h))
+    }
+    out
+}
+
+// The same content as a piece tree, interleaved inserts
+// (`tb_of`, `test_re_engines.c:44-58`).
+fn tb_of(s: List[byte]) -> text.TextBuf {
+    var tb = text.textbuf_new()
+    var i = 0
+    while i < s.len {
+        text.textbuf_insert_part(mut tb, at(i / 2), s, i, i + 1)
+        i += 2
+    }
+    i = 1
+    while i < s.len {
+        text.textbuf_insert_part(mut tb, at(i), s, i, i + 1)
+        i += 2
+    }
+    tb
+}
+
+fn t_re_engines_agree_on_match_or_not(mut t: Tally) {
+    let tb0 = text.textbuf_new()
+    let ins = inputs()
+    var checked = 0
+    var gave_up = 0
+    for p in patterns() {
+        let re = compile(p)
+        for input in ins {
+            let inp = search.re_input_bytes(input.len)
+            let vm = search.re_search_any(re, tb0, input, inp, at(0))
+            let dfa = search.re_dfa_test(re, tb0, input, inp, 0)
+            if dfa == search.DFA_GIVE_UP {
+                // Legal — "use the VM" — but counted.
+                gave_up += 1
+                continue
+            }
+            ok(mut t, (dfa == search.DFA_YES) == vm, "VM says {vm}, DFA says {dfa}")
+            checked += 1
+        }
+    }
+    // The cross product is the point.
+    ok(mut t, checked > 1000, "{checked} pairs checked")
+    ok(mut t, gave_up == 0, "{gave_up} gave up")
+}
+
+fn t_re_engines_agree_over_piece_trees(mut t: Tally) {
+    let empty = List[byte]()
+    let ins = inputs()
+    for p in patterns() {
+        let re = compile(p)
+        for input in ins {
+            let tb = tb_of(input)
+            let inp = search.re_input_textbuf(tb)
+            let vm = search.re_search_any(re, tb, empty, inp, at(0))
+            let dfa = search.re_dfa_test(re, tb, empty, inp, 0)
+            if dfa != search.DFA_GIVE_UP {
+                ok(mut t, (dfa == search.DFA_YES) == vm, "piece tree: VM says {vm}, DFA says {dfa}")
+            }
+        }
+    }
+}
+
+fn t_re_engines_agree_from_offsets(mut t: Tally) {
+    // From every start offset: the DFA rebuilds its context at each entry.
+    let tb0 = text.textbuf_new()
+    let s = pb("abc abc abc")
+    let re = compile(pb("\\babc\\b"))
+    let inp = search.re_input_bytes(s.len)
+    var from = 0
+    while from <= s.len {
+        let vm = search.re_search_any(re, tb0, s, inp, at(from))
+        let dfa = search.re_dfa_test(re, tb0, s, inp, from)
+        if dfa != search.DFA_GIVE_UP {
+            ok(mut t, (dfa == search.DFA_YES) == vm, "from {from}: VM says {vm}, DFA says {dfa}")
+        }
+        from += 1
+    }
+}
+
+fn t_re_dfa_survives_cache_pressure(mut t: Tally) {
+    // DoD 12: whatever the cache does — cache, flush or give up — never a
+    // wrong answer.
+    var pat = List[byte]()
+    var i = 0
+    while i < 60 {
+        let lo = 97 + i % 20
+        (mut pat).push(91 as byte)
+        (mut pat).push(lo as byte)
+        (mut pat).push(45 as byte)
+        (mut pat).push((lo + 3) as byte)
+        (mut pat).push(93 as byte)
+        (mut pat).push(63 as byte)
+        i += 1
+    }
+    let re = compile(pat)
+    var hay = List[byte]()
+    i = 0
+    while i < 4096 {
+        (mut hay).push((97 + i % 26) as byte)
+        i += 1
+    }
+    let tb0 = text.textbuf_new()
+    let inp = search.re_input_bytes(hay.len)
+    let vm = search.re_search_any(re, tb0, hay, inp, at(0))
+    let dfa = search.re_dfa_test(re, tb0, hay, inp, 0)
+    ok(
+        mut t,
+        dfa == search.DFA_GIVE_UP || (dfa == search.DFA_YES) == vm,
+        "pressure: VM {vm}, DFA {dfa}",
+    )
+}
+
+fn t_re_dfa_two_flush_fallback(mut t: Tally) {
+    var hay = List[byte]()
+    var i = 0
+    while i < 128 {
+        for b in "abc".bytes() {
+            (mut hay).push(b)
+        }
+        i += 1
+    }
+    (mut hay).push(90 as byte)
+    let tb0 = text.textbuf_new()
+    let inp = search.re_input_bytes(hay.len)
+    let re = compile(pb("a[b]cZ"))
+    // YEW-F-090: a two-state cap makes this four-state cycle flush twice
+    // and hand off.
+    var stats = search.re_dfa_stats_new()
+    let v = search.re_dfa_test_limits(re, tb0, hay, inp, 0, 2, 0, mut stats)
+    ok(mut t, v == search.DFA_GIVE_UP, "gave up ({v})")
+    ok(mut t, stats.flushes == 2, "two flushes ({stats.flushes})")
+    ok(mut t, stats.max_states == 2, "two states ({stats.max_states})")
+    ok(mut t, stats.max_states <= 2, "never more than two")
+    stats = search.re_dfa_stats_new()
+    ok(
+        mut t,
+        search.re_test_limits(re, tb0, hay, inp, at(0), 2, 0, mut stats),
+        "the VM finishes it",
+    )
+    ok(mut t, stats.flushes == 2, "after two flushes")
+    ok(mut t, stats.max_states == 2, "and two states")
+}
+
+fn t_re_dfa_handles_pathological_patterns(mut t: Tally) {
+    // The DFA must be linear too: no 'b', so the answer is no, and it
+    // must arrive.
+    var hay = List[byte]()
+    var i = 0
+    while i < 2048 {
+        (mut hay).push(97 as byte)
+        i += 1
+    }
+    let tb0 = text.textbuf_new()
+    let inp = search.re_input_bytes(hay.len)
+    for p in "a(a*)*b (a|a)*b (a+)+b (a*)*b".words() {
+        let re = compile(pb(p))
+        let dfa = search.re_dfa_test(re, tb0, hay, inp, 0)
+        ok(mut t, dfa == search.DFA_NO || dfa == search.DFA_GIVE_UP, "/{p}/: {dfa}")
+    }
+}
+
+fn t_re_dfa_bol_skip_preserves_next_line_match(mut t: Tally) {
+    var text_ = List[byte]()
+    var i = 0
+    while i < 8192 {
+        (mut text_).push(120 as byte)
+        i += 1
+    }
+    for b in "\nstatic value\n".bytes() {
+        (mut text_).push(b)
+    }
+    let tb0 = text.textbuf_new()
+    let re = compile(pb("^static "))
+    let inp = search.re_input_bytes(text_.len)
+    ok(
+        mut t,
+        search.re_dfa_test(re, tb0, text_, inp, 17) == search.DFA_YES,
+        "^static on the next line",
+    )
+    let (v, end) = search.re_dfa_find_end(re, tb0, text_, inp, 17)
+    ok(mut t, v == search.DFA_YES, "find_end says yes")
+    ok(mut t, end == 8192 + 8, "the end is {end}")
+    let short = search.re_input_window(inp, 0, 8192)
+    let (v2, _e2) = search.re_dfa_find_end(re, tb0, text_, short, 17)
+    ok(mut t, v2 == search.DFA_NO, "not inside the shorter window")
+}
+
+// DoD 5's span half: the dispatcher's DFA-assisted skip moves no span;
+// the reference is the Pike VM straight from the start offset.
+fn t_re_engines_agree_on_spans(mut t: Tally) {
+    let tb0 = text.textbuf_new()
+    let ins = inputs()
+    var checked = 0
+    var skipped_ahead = 0
+    var fast = search.re_match_new()
+    var slow = search.re_match_new()
+    for p in patterns() {
+        let re = compile(p)
+        if search.re_max_len(re) != search.RE_UNBOUNDED {
+            skipped_ahead += 1
+        }
+        for input in ins {
+            let inp = search.re_input_bytes(input.len)
+            var from = 0
+            while from <= input.len {
+                let fast_hit = search.re_search(re, tb0, input, inp, at(from), mut fast)
+                let slow_hit = search.re_pike_run_ex(re, tb0, input, inp, from, false, mut slow)
+                ok(
+                    mut t,
+                    fast_hit == slow_hit,
+                    "from {from}: search says {fast_hit}, VM says {slow_hit}",
+                )
+                if slow_hit {
+                    ok(
+                        mut t,
+                        fast.lo[0] == slow.lo[0] && fast.hi[0] == slow.hi[0],
+                        "from {from}: search span {fast.lo[0]}..{fast.hi[0]}, VM {slow.lo[0]}..{slow.hi[0]}",
+                    )
+                    ok(mut t, fast.ngroups == slow.ngroups, "the group counts agree")
+                    var g = 0
+                    while g < slow.ngroups {
+                        ok(
+                            mut t,
+                            fast.lo[g] == slow.lo[g] && fast.hi[g] == slow.hi[g],
+                            "group {g} agrees",
+                        )
+                        g += 1
+                    }
+                }
+                checked += 1
+                from += 1
+            }
+        }
+    }
+    ok(mut t, checked > 5000, "{checked} spans checked")
+    // Unless the corpus held length-bounded patterns the skip would never
+    // run.
+    ok(mut t, skipped_ahead > 5, "{skipped_ahead} bounded patterns")
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var t = Tally { n: 0 }
+    t_re_engines_agree_on_match_or_not(mut t)
+    t_re_engines_agree_over_piece_trees(mut t)
+    t_re_engines_agree_on_spans(mut t)
+    t_re_engines_agree_from_offsets(mut t)
+    t_re_dfa_survives_cache_pressure(mut t)
+    t_re_dfa_two_flush_fallback(mut t)
+    t_re_dfa_handles_pathological_patterns(mut t)
+    t_re_dfa_bol_skip_preserves_next_line_match(mut t)
+    print("re_engines_test: 8 cases pass, {t.n} assertions")
+}
