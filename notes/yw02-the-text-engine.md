@@ -461,8 +461,28 @@ buy and the one the port does not claim.
 - The per-case checked run: `notes/yw02-evidence/checked/`.
 - The differential fuzz: `notes/yw02-evidence/fuzz/` (two seeds, the
   4×3 matrix port beside C, the planted red).
-- CI: the kill9 driver step and the containerised replica in the oracle
-  job, `osc52_frame` gated; the PR's runs are cited in the PR.
+- CI (yew#7): run 39388476890 at `56ce65b` — the linux port job lost
+  to the runner's shutdown signal mid-`wolf test` (the 12 GB above) and
+  the oracle's driver step red on a missing `YEW_ROOT` export, both
+  fixed (`055de26`, `5c1beaa`, `02806d4`, `9e3e62e`); run 39393219720 at
+  `a8f9236` green on linux in both jobs (the driver over the port's
+  child, the replica three ways, `osc52_frame`, the text fuzz at two
+  seeds). The final run is the PR's.
+- The plants (RULES §7, draft PRs closed unmerged, each on `a8f9236`):
+  yew#8 (`da7eafb`, the journal record never written) seen red in run
+  39393453647, oracle linux, "sagitta's kill9 driver over the port's
+  torture child" (`wolf-trap: assert at src/text_save_paths_test.lu:451`,
+  the every-lane-holds assertion; the driver's own line on kasumi:
+  `torture: atomic invariant failed seed=1 at=0`); yew#9 (`65d3572`, a
+  failed save write taken for a whole one — the driver's kill sweeps
+  stay green) seen red in run 39393461050, oracle linux, "kill9's late
+  lanes in a container" (`storage ENOSPC preserves old+journal FAILED
+  (exit=0 expected=3 …)`); yew#10 (`0f52f69` the demo's osc52 scene
+  reverted, `b4161d9` the fuzz step with `--plant-at=50`) seen red in
+  run 39393467096 at port linux, "the differential fuzz of the text
+  engine" (`divergence seed=0x…01 mix=typing op=50 check=1`), and at
+  oracle linux, "goldens, campaign 01" (`osc52_frame: child exited
+  before synchronized frame`).
 
 ## Done-when
 
