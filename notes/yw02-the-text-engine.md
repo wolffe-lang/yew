@@ -138,8 +138,8 @@ The contract's:
   twelve cells of sagitta's `make fuzz-textbuf` matrix (4 seeds × 3
   mixes × 200,000 ops), every cell exit 0 on both sides; the smoke trace
   replays to C's `final=4a5adab78b64d0b6` (§4).
-- **The 100 MB load within 2× of C's: HIT** — 1.60–1.80 on
-  `100m-code`, 1.34–1.57 on `100m-utf8` (§4).
+- **The 100 MB load within 2× of C's: HIT** — 1.60–1.83 on
+  `100m-code`, 1.34–1.60 on `100m-utf8` (§4).
 - **`test_undo`'s serialization round-trips byte for byte: HIT after two
   fixes.** `test_undo_serial`'s CRC-valid out-of-bounds op crashed the
   port (yew internal error "delete range [-1,6)") because a forged
@@ -272,15 +272,19 @@ oracle's gcc build.
 **The ratios** (`tools/run-perf-text --taskset 0-3`, sagitta's own
 `perf_piece` and `perf_textbuf` beside the port's twin
 `tools/perf-text/main.lu`, sagitta's fixtures from its own `gen-bigfile`
-verified against `fixtures.sha`; two runs, the second while another
-job of the lane shared the pinned cpus — `notes/yw02-evidence/perf/`):
+verified against `fixtures.sha`; three runs — the first quiet, the
+second (`--huge`) while a fork's fuzz shared the pinned cpus, the third
+quiet after every fix; the first run's output was not kept as a file
+(the second run's staging replaced it) and its numbers are quoted here,
+the other two are `notes/yw02-evidence/perf/run-perf-text-huge-1.log`
+and `run-perf-text-quick-2.log`):
 
 | metric | C | wolf | ratio |
 |---|---|---|---|
-| `piece.insert` (1M random inserts, best of 3) | 1,294 / 2,102 ms | 1,579 / 2,416 ms | **1.22 / 1.15** |
-| `open.100m-code` (median-run p50) | 71.1 / 79.8 ms | 128 / 128 ms | **1.80 / 1.60** |
-| `open.100m-utf8` | 36.2 / 41.9 ms | 57 / 56 ms | **1.57 / 1.34** |
-| `open.100m-allnl` (informational in C) | 614.7 / 666.6 ms | 1,060 / 993 ms | 1.72 / 1.49 |
+| `piece.insert` (1M random inserts, best of 3) | 1,294 / 2,102 / 1,228 ms | 1,579 / 2,416 / 1,522 ms | **1.22 / 1.15 / 1.24** |
+| `open.100m-code` (median-run p50) | 71.1 / 79.8 / 70.0 ms | 128 / 128 / 128 ms | **1.80 / 1.60 / 1.83** |
+| `open.100m-utf8` | 36.2 / 41.9 / 35.6 ms | 57 / 56 / 57 ms | **1.57 / 1.34 / 1.60** |
+| `open.100m-allnl` (informational in C) | 614.7 / 666.6 / 622.5 ms | 1,060 / 993 / 999 ms | 1.72 / 1.49 / 1.60 |
 | `line_of.1g-code` (C per-query p50, wolf batch mean) | 319 ns | 370 ns | 1.16 |
 | `line_start.1g-code` (the same) | 82 ns | 20 ns | 0.24 |
 

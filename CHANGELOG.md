@@ -27,8 +27,8 @@ The format follows Keep a Changelog; the port has no release yet.
   (`tools/torture-replica.py`); journals cross between C and the port
   both ways. `osc52_frame` gated against the demo's new `osc52` scene.
 - The ratios beside C's own harnesses (`tools/run-perf-text`,
-  `tools/perf-text`): piece inserts 1.15–1.22×, the 100 MB load
-  1.34–1.80×; `tools/oracle` builds `perf_piece`, `perf_textbuf` and
+  `tools/perf-text`): piece inserts 1.15–1.24×, the 100 MB load
+  1.34–1.83×; `tools/oracle` builds `perf_piece`, `perf_textbuf` and
   `gen-bigfile` too.
 - The differential fuzz (`tools/fuzz-textbuf`, `tools/run-fuzz-textbuf`):
   `fuzz_textbuf.c` ported whole, the same trace and final hashes as C's
