@@ -5,6 +5,40 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw02 — the text engine (2026-10-20)
+
+- Campaign 02 ported into `text`: the piece tree with its snapshots,
+  iterators, checker and grapheme index (`text.piece`); byte-exact load
+  and the save decision table (`text.file`); the crash journal and the
+  edit choke point (`text.journal`, `text.edit`); typed coordinates, the
+  cursor, UTF-16 columns and the cursor set's core (`text.coords`,
+  `text.cursor`, `text.u16`, `text.cset` — in `text`, a module cycle
+  otherwise); the undo tree with transactions, trimming and the `.yewu`
+  sidecar, marks with gravity (`text.undo`, `text.mark`); registers, the
+  kill ring and the OSC 52 clipboard (`text.register`, `text.yankstack`,
+  `text.clipboard`); sagitta's unit tests one for one (20 files).
+- The save has no fsync at wolf 0.2.33 (G3, wolf-lang#796): every sync
+  is a named call that syncs nothing, and the fault shim's log of one
+  save is the witness. `realpath` is a component walk (G4).
+- The torture gate: sagitta's `kill9` driver and fault shim over the
+  port's torture child (`tools/yew-torture`, `tools/build-torture`),
+  green through every sweep and red only at G3's line, accepted by
+  name; kill9.c's later lanes in a container through the port's replica
+  (`tools/torture-replica.py`); journals cross between C and the port
+  both ways. `osc52_frame` gated against the demo's new `osc52` scene.
+- The ratios beside C's own harnesses (`tools/run-perf-text`,
+  `tools/perf-text`): piece inserts 1.15–1.22×, the 100 MB load
+  1.34–1.80×; `tools/oracle` builds `perf_piece`, `perf_textbuf` and
+  `gen-bigfile` too.
+- The differential fuzz (`tools/fuzz-textbuf`, `tools/run-fuzz-textbuf`):
+  `fuzz_textbuf.c` ported whole, the same trace and final hashes as C's
+  in all twelve cells of sagitta's matrix; CI runs two seeds.
+- Two `.yewu` reader fixes (a negative offset refused as C's unsigned
+  compare does; the end-of-line goal as C's UINT64_MAX); the grapheme
+  index rebuilds into a spare pair instead of leaking a list per edit
+  (G33), `undo_dump` into one buffer; the tests and tools keep their log
+  and state off the host's.
+
 ### yw01 — the terminal and the first paint (2026-10-19)
 
 - The toolchain pin moved to wolf 0.2.33 / wolf-std `cceda63`.
