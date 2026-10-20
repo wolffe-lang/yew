@@ -1,0 +1,1805 @@
+//! text.file — byte-exact load and the atomic save: the no-corruption
+//! contract (invariant 1).
+//!
+//! Ports sagitta `src/text/file.c` (1698 lines) and `file.h` (145) at
+//! 9ace98c2, under `s08-file-io-no-corruption.md`. The load reads the
+//! whole file (no mmap), detects binary (a NUL in the first 8 KiB), CRLF
+//! against bare LF (dominance, MIXED), a UTF-8 BOM (stripped, re-emitted)
+//! and invalid UTF-8 (recorded, the bytes kept); the buffer is the file's
+//! bytes verbatim but the BOM. The save follows `s08`'s decision table:
+//! a symlink is resolved and its target saved; a target with other hard
+//! links, or in a directory this process cannot write, is saved IN PLACE
+//! after a byte-exact backup under `$XDG_STATE_HOME/yew/backup/`; anything
+//! else is written to a temporary in the same directory, owner, group and
+//! mode copied, and renamed over the target; EXDEV and a refused chown of
+//! a foreign-owned file fall back to in place.
+//!
+//! **What wolf 0.2.33 cannot do, named where the code meets it:**
+//! - **G3, no `fsync` (wolf-lang#796).** C syncs the temporary before the
+//!   rename, the directory after it, the backup before it is published,
+//!   and the target after an in-place write. 0.2.33 has no sync call, so
+//!   the port makes NONE of them: `no_sync_g3` is where each would be, and
+//!   it syncs nothing. The rename is still atomic — a crash leaves the old
+//!   bytes or the new, never a mix — but durability across a power loss is
+//!   the host's write-back alone. sagitta's torture driver sees it: its
+//!   determinism check wants `fsync-file` before the rename and
+//!   `fsync-dir` after, and its in-place rollback check is armed by a
+//!   directory sync (notes/yw02-the-text-engine.md).
+//! - **G4, no `realpath` (wolf-lang#797).** The journal and the backup are
+//!   keyed by the realpath's hash; `realpath_walk` resolves a path a
+//!   component at a time with `fs_lstat` and `fs_read_link`.
+//! - **G5, no `xattr` (wolf-lang#685).** C's atomic save copies the
+//!   target's extended attributes to the temporary, best effort, on Linux
+//!   (`copy_xattrs`, `file.c:1300-1335`); the port cannot read or write
+//!   one, so an atomic save drops them. No test or torture lane carries
+//!   an attribute.
+//! - **No full stat on a handle.** `fs_fstat` answers three words; C's
+//!   identity checks `fstat` the descriptor it holds. The port `fs_stat`s
+//!   the PATH it just opened, a window C does not have.
+//! - **No `O_NOFOLLOW`, no `access(2)`, no write-only open without
+//!   truncation.** A final symlink is refused by an `fs_lstat` before the
+//!   open; directory writability is the mode bits against this process's
+//!   ids (`directory_writable`); an in-place write opens read-write (open
+//!   mode 3), which C's `O_WRONLY` does not need.
+
+use unicode
+use util
+
+/// `YewEol`: LF.
+pub const EOL_LF: int = 0
+
+/// CRLF.
+pub const EOL_CRLF: int = 1
+
+/// Both, the dominant one recorded beside.
+pub const EOL_MIXED: int = 2
+
+/// `YewLoadErr`: loaded.
+pub const LOAD_OK: int = 0
+
+/// A missing file: an empty new buffer.
+pub const LOAD_ENOENT: int = 1
+
+/// Permission refused.
+pub const LOAD_EACCES: int = 2
+
+/// A directory.
+pub const LOAD_EISDIR: int = 3
+
+/// Over 2 GiB.
+pub const LOAD_TOO_LARGE: int = 4
+
+/// Any other failure.
+pub const LOAD_IO: int = 5
+
+/// `YewSaveErr`: saved.
+pub const SAVE_OK: int = 0
+
+/// An I/O failure; the target untouched.
+pub const SAVE_IO: int = 1
+
+/// Permission refused.
+pub const SAVE_PERM: int = 2
+
+/// The target changed since it was loaded.
+pub const SAVE_CHANGED_ON_DISK: int = 3
+
+/// The document is saved but backup retention did not commit.
+pub const SAVE_BACKUP_FAILED: int = 4
+
+/// `YewSaveStrategy`: choose by the decision table.
+pub const SAVE_STRATEGY_AUTO: int = 0
+
+/// Always temp-and-rename.
+pub const SAVE_STRATEGY_ATOMIC: int = 1
+
+/// Always in place after a backup.
+pub const SAVE_STRATEGY_INPLACE: int = 2
+
+/// `YewSaveCheck`: no on-disk check.
+pub const SAVE_CHECK_OFF: int = 0
+
+/// Identity, size and mtime.
+pub const SAVE_CHECK_MTIME: int = 1
+
+/// The bytes, when the metadata moved.
+pub const SAVE_CHECK_CONTENT: int = 2
+
+/// `YEW_SAVE_CHECK_DISK_MAX_DEFAULT`: 8 MiB.
+pub const SAVE_CHECK_DISK_MAX_DEFAULT: int = 8388608
+
+/// `YEW_SAVE_CHECK_DISK_MAX_LIMIT`: 4 GiB.
+pub const SAVE_CHECK_DISK_MAX_LIMIT: int = 4294967296
+
+/// `YEW_SAVE_BACKUP_KEEP_DEFAULT`.
+pub const SAVE_BACKUP_KEEP_DEFAULT: int = 1
+
+/// `YEW_SAVE_BACKUP_KEEP_MAX`.
+pub const SAVE_BACKUP_KEEP_MAX: int = 64
+
+const FILE_NORMAL_MAX: int = 268435456
+
+const FILE_MAX: int = 2147483648
+
+const BINARY_SCAN_MAX: int = 8192
+
+/// What a load learned and a save keeps (`FileMeta`, `file.h:17-44`); C's
+/// `NULL` realpath is `has_realpath` false.
+pub struct FileMeta {
+    eol: int,
+    dominant_eol: int,
+    crlf_count: int,
+    lf_count: int,
+    had_bom: bool,
+    binary: bool,
+    had_invalid_utf8: bool,
+    missing_final_nl: bool,
+    mode: int,
+    uid: int,
+    gid: int,
+    nlink: int,
+    dev: int,
+    ino: int,
+    exists: bool,
+    via_symlink: bool,
+    realpath: str,
+    has_realpath: bool,
+    mtime_s: int,
+    mtime_ns: int,
+    size_on_disk: int,
+    disk_snapshot: TextSnap,
+    disk_snapshot_valid: bool,
+    journal_pinned: bool,
+}
+
+/// The save's options (`YewSaveOpts`); an empty `backup_dir` is
+/// `$XDG_STATE_HOME/yew/backup/`.
+pub struct SaveOpts {
+    strategy: int,
+    check_disk: int,
+    check_disk_max: int,
+    backup_keep: int,
+    backup_dir: str,
+}
+
+/// `YewAtomicWriteResult`: `committed` once the rename landed.
+pub struct AtomicWriteResult {
+    error: int,
+    committed: bool,
+}
+
+// The words of a `fs_stat` record this unit reads (`[os.fs.stat]`).
+struct Stat {
+    ok: bool,
+    missing: bool,
+    denied: bool,
+    kind: int,
+    size: int,
+    mode: int,
+    nlink: int,
+    uid: int,
+    gid: int,
+    dev: int,
+    ino: int,
+    mtime_s: int,
+    mtime_ns: int,
+}
+
+const KIND_FILE: int = 0
+
+const KIND_DIR: int = 1
+
+const KIND_LINK: int = 3
+
+fn stat_none(missing: bool, denied: bool) -> Stat {
+    Stat {
+        ok: false,
+        missing: missing,
+        denied: denied,
+        kind: 2,
+        size: 0,
+        mode: 0,
+        nlink: 0,
+        uid: 0,
+        gid: 0,
+        dev: 0,
+        ino: 0,
+        mtime_s: 0,
+        mtime_ns: 0,
+    }
+}
+
+fn stat_of(w: List[int]) -> Stat {
+    Stat {
+        ok: true,
+        missing: false,
+        denied: false,
+        kind: w[0],
+        size: w[1],
+        mode: w[4],
+        nlink: w[5],
+        uid: w[6],
+        gid: w[7],
+        dev: w[9],
+        ino: w[10],
+        mtime_s: w[14],
+        mtime_ns: w[15],
+    }
+}
+
+fn path_stat(path: str) -> Stat {
+    let w = fs_stat(path) else |e| match e {
+        not_found => { return stat_none(true, false) },
+        denied => { return stat_none(false, true) },
+        io => { return stat_none(false, false) },
+    }
+    stat_of(w)
+}
+
+fn path_lstat(path: str) -> Stat {
+    let w = fs_lstat(path) else |e| match e {
+        not_found => { return stat_none(true, false) },
+        denied => { return stat_none(false, true) },
+        io => { return stat_none(false, false) },
+    }
+    stat_of(w)
+}
+
+// `unsafe` census: C's `static u64 temp_counter` (`file.c:33`), the
+// in-process uniqueness of temporary, pending and recovery names.
+var temp_counter: int = 0
+
+fn next_temp_counter() -> int {
+    // # Safety: invariant 8 — the editor's core is single-threaded; one
+    // task names temporaries, and the counter is read and bumped in this
+    // one place.
+    unsafe {
+        temp_counter += 1
+        temp_counter
+    }
+}
+
+// G3 (wolf-lang#796): wolf 0.2.33 has no fsync of a file or a directory.
+// Every sync sagitta's save makes is a call here, and this call SYNCS
+// NOTHING: it answers true so the decision table runs as C's does. The
+// module doc says what that costs. When the pin has `fs_sync`/
+// `fs_sync_dir`, these two are the only lines that change.
+fn no_sync_g3(fd: int) -> bool {
+    fd >= 0
+}
+
+fn no_sync_dir_g3(path: str) -> bool {
+    path.len >= 0
+}
+
+/// An empty metadata record (`yew_filemeta_init`).
+pub fn filemeta_new() -> FileMeta {
+    FileMeta {
+        eol: EOL_LF,
+        dominant_eol: EOL_LF,
+        crlf_count: 0,
+        lf_count: 0,
+        had_bom: false,
+        binary: false,
+        had_invalid_utf8: false,
+        missing_final_nl: false,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        nlink: 0,
+        dev: 0,
+        ino: 0,
+        exists: false,
+        via_symlink: false,
+        realpath: "",
+        has_realpath: false,
+        mtime_s: 0,
+        mtime_ns: 0,
+        size_on_disk: 0,
+        disk_snapshot: textsnap_none(),
+        disk_snapshot_valid: false,
+        journal_pinned: false,
+    }
+}
+
+fn filemeta_snapshot_set(mut meta: FileMeta, mut tb: TextBuf) {
+    if meta.disk_snapshot_valid {
+        textsnap_release(mut tb, mut meta.disk_snapshot)
+    }
+    let s = textbuf_snap(mut tb)
+    meta.disk_snapshot = TextSnap {
+        root: s.root,
+        bid: s.bid,
+        len: s.len,
+        gen: s.gen,
+        active: s.active,
+    }
+    meta.disk_snapshot_valid = true
+}
+
+/// Release the exact-content baseline (`yew_filemeta_content_forget`);
+/// `tb` is the buffer the snapshot was taken of, released or not.
+pub fn filemeta_content_forget(mut meta: FileMeta, mut tb: TextBuf) {
+    if !meta.disk_snapshot_valid {
+        return
+    }
+    textsnap_release(mut tb, mut meta.disk_snapshot)
+    meta.disk_snapshot_valid = false
+}
+
+/// Release everything the record holds (`yew_filemeta_dispose`).
+pub fn filemeta_dispose(mut meta: FileMeta, mut tb: TextBuf) {
+    filemeta_content_forget(mut meta, mut tb)
+    meta = filemeta_new()
+}
+
+/// The EOL bytes future edits insert (`yew_filemeta_eol_bytes`).
+pub fn filemeta_eol_bytes(meta: FileMeta) -> List[byte] {
+    let style = if meta.eol == EOL_MIXED then meta.dominant_eol else meta.eol
+    var out = List[byte]()
+    if style == EOL_CRLF {
+        (mut out).push(13 as byte)
+    }
+    (mut out).push(10 as byte)
+    out
+}
+
+/// The default options (`yew_file_save_opts_default`).
+pub fn save_opts_default() -> SaveOpts {
+    SaveOpts {
+        strategy: SAVE_STRATEGY_AUTO,
+        check_disk: SAVE_CHECK_MTIME,
+        check_disk_max: SAVE_CHECK_DISK_MAX_DEFAULT,
+        backup_keep: SAVE_BACKUP_KEEP_DEFAULT,
+        backup_dir: "",
+    }
+}
+
+/// Whether the requested bytes are now the destination's
+/// (`yew_save_committed`).
+pub fn save_committed(error: int) -> bool {
+    error == SAVE_OK || error == SAVE_BACKUP_FAILED
+}
+
+/// The directory part of `path` (`path_dirname`, `file.c:672-686`).
+pub fn path_dirname(path: str) -> str {
+    let slash = path.rfind("/") else {
+        return "."
+    }
+    if slash == 0 {
+        return "/"
+    }
+    path[0..slash]
+}
+
+/// The last component of `path` (`path_basename`).
+pub fn path_basename(path: str) -> str {
+    let slash = path.rfind("/") else {
+        return path
+    }
+    path[slash + 1..]
+}
+
+// G4 (wolf-lang#797): `realpath(3)` a component at a time — `.` and `..`
+// lexically after each link is expanded, a final component that is
+// missing is `not_found`, more than 40 links `io` (ELOOP).
+fn realpath_walk(path: str) -> str ! {not_found, denied, io} {
+    if path.len == 0 {
+        return not_found
+    }
+    var resolved = List[str]()
+    if !path.starts_with("/") {
+        let cwd = os_cwd() else {
+            return io
+        }
+        for c in cwd.split("/") {
+            if c.len != 0 {
+                (mut resolved).push(c)
+            }
+        }
+    }
+    var queue = List[str]()
+    for c in path.split("/") {
+        (mut queue).push(c)
+    }
+    var qi = 0
+    var links = 0
+    while qi < queue.len {
+        let c = queue[qi]
+        qi += 1
+        if c.len == 0 || c == "." {
+            continue
+        }
+        if c == ".." {
+            if resolved.len != 0 {
+                let _ = (mut resolved).pop() else ""
+            }
+            continue
+        }
+        var candidate = ""
+        for r in resolved {
+            candidate = candidate + "/" + r
+        }
+        candidate = candidate + "/" + c
+        let st = path_lstat(candidate)
+        if !st.ok {
+            if st.missing {
+                return not_found
+            }
+            if st.denied {
+                return denied
+            }
+            return io
+        }
+        if st.kind == KIND_LINK {
+            links += 1
+            if links > 40 {
+                return io
+            }
+            let raw = fs_read_link(candidate) else |e| match e {
+                not_found => { return not_found },
+                denied => { return denied },
+                invalid => { return io },
+                io => { return io },
+            }
+            let target = str_from_utf8(raw) else {
+                return io
+            }
+            var rest = List[str]()
+            for t in target.split("/") {
+                (mut rest).push(t)
+            }
+            while qi < queue.len {
+                (mut rest).push(queue[qi])
+                qi += 1
+            }
+            queue = rest
+            qi = 0
+            if target.starts_with("/") {
+                resolved = List[str]()
+            }
+            continue
+        }
+        if qi < queue.len && st.kind != KIND_DIR {
+            var later = false
+            var k = qi
+            while k < queue.len {
+                if queue[k].len != 0 {
+                    later = true
+                }
+                k += 1
+            }
+            if later {
+                return io
+            }
+        }
+        (mut resolved).push(c)
+    }
+    var out = ""
+    for r in resolved {
+        out = out + "/" + r
+    }
+    if out.len == 0 {
+        return "/"
+    }
+    out
+}
+
+/// `realpath(3)` through the G4 walk (`yew_xrealpath`): `none` when the
+/// path does not resolve.
+pub fn file_realpath(path: str) -> str ! {none} {
+    let r = realpath_walk(path) else {
+        return none
+    }
+    r
+}
+
+// `canonical_new_path`, `file.c:180-199`: a path that does not exist yet,
+// under its parent's realpath.
+fn canonical_new_path(path: str) -> str {
+    let dir = path_dirname(path)
+    let resolved_dir = file_realpath(dir) else {
+        return path
+    }
+    let base = path_basename(path)
+    if resolved_dir == "/" {
+        return "/" + base
+    }
+    "{resolved_dir}/{base}"
+}
+
+// `resolve_save_target_at`, `file.c:201-252`: a link's target, a dangling
+// link's included, resolved without requiring it to exist.
+fn resolve_save_target_at(path: str, depth: int) -> str ! {none} {
+    let r = file_realpath(path) else {
+        if depth >= 40 {
+            return none
+        }
+        let st = path_lstat(path)
+        if !st.ok {
+            if st.missing {
+                return canonical_new_path(path)
+            }
+            return none
+        }
+        if st.kind != KIND_LINK {
+            return none
+        }
+        let raw = fs_read_link(path) else {
+            return none
+        }
+        let link_text = str_from_utf8(raw) else {
+            return none
+        }
+        if link_text.starts_with("/") {
+            return resolve_save_target_at(link_text, depth + 1)?
+        }
+        let dir = path_dirname(path)
+        return resolve_save_target_at("{dir}/{link_text}", depth + 1)?
+    }
+    r
+}
+
+fn resolve_save_target(path: str) -> str ! {none} {
+    resolve_save_target_at(path, 0)?
+}
+
+// `warn_temp_leftovers`, `file.c:254-277`: a crashed save's temporary is
+// reported at the next load of its directory, never deleted.
+fn warn_temp_leftovers(path: str) {
+    let dir = path_dirname(path)
+    let prefix = ".yew-{path_basename(path)}-"
+    let entries = fs_read_dir_entries(dir) else {
+        return
+    }
+    for e in entries {
+        if e.len < 1 + prefix.len {
+            continue
+        }
+        var matches = true
+        var i = 0
+        for b in prefix.bytes() {
+            if e[1 + i] != b {
+                matches = false
+                break
+            }
+            i += 1
+        }
+        if matches {
+            let name = str_from_utf8(e[1..e.len]) else "(not UTF-8)"
+            util.log_warn("save temporary remains: {dir}/{name}")
+        }
+    }
+}
+
+// `classify_bytes`, `file.c:130-177`: answers (content_at, simple_ascii).
+fn classify_bytes(bytes: List[byte], mut meta: FileMeta) -> (int, bool) {
+    let len = bytes.len
+    let binary_len = if len < BINARY_SCAN_MAX then len else BINARY_SCAN_MAX
+    var i = 0
+    meta.binary = false
+    while i < binary_len {
+        if bytes[i] as int == 0 {
+            meta.binary = true
+            break
+        }
+        i += 1
+    }
+    if meta.binary {
+        meta.eol = EOL_LF
+        meta.dominant_eol = EOL_LF
+        meta.missing_final_nl = len != 0 && bytes[len - 1] as int != 10
+        return (0, false)
+    }
+    var content_at = 0
+    if len >= 3 && bytes[0] as int == 239 && bytes[1] as int == 187 && bytes[2] as int == 191 {
+        meta.had_bom = true
+        content_at = 3
+    }
+    var crlf_count = 0
+    var bare_lf_count = 0
+    var at = content_at
+    while at < len {
+        let nl = bytes_find(bytes, 10 as byte, at) else {
+            break
+        }
+        if nl != content_at && bytes[nl - 1] as int == 13 {
+            crlf_count += 1
+        } else {
+            bare_lf_count += 1
+        }
+        at = nl + 1
+    }
+    meta.crlf_count = crlf_count
+    meta.lf_count = bare_lf_count
+    meta.dominant_eol = if crlf_count > bare_lf_count then EOL_CRLF else EOL_LF
+    if crlf_count != 0 && bare_lf_count != 0 {
+        meta.eol = EOL_MIXED
+    } else {
+        meta.eol = meta.dominant_eol
+    }
+    let (valid_end, simple) = unicode.utf8_validate_simple(bytes, content_at, len)
+    meta.had_invalid_utf8 = valid_end != len
+    meta.missing_final_nl = len != content_at && bytes[len - 1] as int != 10
+    (content_at, simple)
+}
+
+fn meta_accept_stat(mut meta: FileMeta, st: Stat) {
+    meta.exists = true
+    meta.mode = st.mode
+    meta.uid = st.uid
+    meta.gid = st.gid
+    meta.nlink = st.nlink
+    meta.dev = st.dev
+    meta.ino = st.ino
+    meta.mtime_s = st.mtime_s
+    meta.mtime_ns = st.mtime_ns
+    meta.size_on_disk = st.size
+}
+
+fn same_file_state(a: Stat, b: Stat) -> bool {
+    a.dev == b.dev &&
+        a.ino == b.ino &&
+        a.size == b.size &&
+        a.mtime_s == b.mtime_s &&
+        a.mtime_ns == b.mtime_ns
+}
+
+/// Load `path` (`yew_file_load`, `file.c:333-433`): the buffer and its
+/// metadata. A missing file answers `LOAD_ENOENT` with an empty new
+/// buffer and the realpath it will be saved at.
+pub fn file_load(path: str) -> (int, TextBuf, FileMeta) {
+    var meta = filemeta_new()
+    warn_temp_leftovers(path)
+    let link_st = path_lstat(path)
+    if link_st.ok {
+        meta.via_symlink = link_st.kind == KIND_LINK
+        if link_st.kind == KIND_DIR {
+            return (LOAD_EISDIR, textbuf_new(), meta)
+        }
+        if link_st.kind != KIND_FILE && link_st.kind != KIND_LINK {
+            return (LOAD_IO, textbuf_new(), meta)
+        }
+    } else if !link_st.missing {
+        return (if link_st.denied then LOAD_EACCES else LOAD_IO, textbuf_new(), meta)
+    }
+    let st = path_stat(path)
+    if !st.ok {
+        if st.missing {
+            var tb = textbuf_new()
+            if meta.via_symlink {
+                let r = resolve_save_target(path) else {
+                    return (LOAD_IO, tb, meta)
+                }
+                meta.realpath = r
+            } else {
+                meta.realpath = canonical_new_path(path)
+            }
+            meta.has_realpath = true
+            meta.mode = 438
+            filemeta_snapshot_set(mut meta, mut tb)
+            return (LOAD_ENOENT, tb, meta)
+        }
+        return (if st.denied then LOAD_EACCES else LOAD_IO, textbuf_new(), meta)
+    }
+    if st.kind == KIND_DIR {
+        return (LOAD_EISDIR, textbuf_new(), meta)
+    }
+    if st.kind != KIND_FILE {
+        return (LOAD_IO, textbuf_new(), meta)
+    }
+    if st.size < 0 || st.size > FILE_MAX {
+        return (LOAD_TOO_LARGE, textbuf_new(), meta)
+    }
+    let bytes = fs_read_bytes(path) else |e| match e {
+        denied => { return (LOAD_EACCES, textbuf_new(), meta) },
+        not_found => { return (LOAD_IO, textbuf_new(), meta) },
+        io => { return (LOAD_IO, textbuf_new(), meta) },
+    }
+    let after = path_stat(path)
+    if bytes.len != st.size || !after.ok || !same_file_state(st, after) {
+        return (LOAD_IO, textbuf_new(), meta)
+    }
+    if bytes.len > FILE_NORMAL_MAX {
+        util.log_info("loading large file: {bytes.len} bytes")
+    }
+    meta_accept_stat(mut meta, st)
+    meta.realpath = file_realpath(path) else path
+    meta.has_realpath = true
+    let (content_at, simple) = classify_bytes(bytes, mut meta)
+    var tb = if content_at == 0 {
+        textbuf_from_owned_bytes_simple(take bytes, simple)
+    } else {
+        textbuf_from_owned_bytes_simple(take bytes[content_at..bytes.len], simple)
+    }
+    filemeta_snapshot_set(mut meta, mut tb)
+    (LOAD_OK, tb, meta)
+}
+
+// Write `bytes[lo..hi)` whole (`write_full`): wolf's chunk write loops on
+// short writes and EINTR itself.
+fn write_full(fd: int, bytes: List[byte], lo: int, hi: int) -> bool {
+    if lo >= hi {
+        return true
+    }
+    if lo == 0 && hi == bytes.len {
+        fs_write_chunk(fd, bytes) else {
+            return false
+        }
+        return true
+    }
+    fs_write_chunk(fd, bytes[lo..hi]) else {
+        return false
+    }
+    true
+}
+
+const WRITE_SLICE: int = 1048576
+
+// The buffer's bytes, piece by piece (`write_text`, `file.c:648-670`), a
+// piece longer than 1 MiB in 1 MiB slices (a wolf write takes a list, and
+// a slice of a store is a copy).
+fn write_text(fd: int, tb: TextBuf, had_bom: bool) -> bool {
+    if had_bom {
+        var bom = List[byte]()
+        (mut bom).push(239 as byte)
+        (mut bom).push(187 as byte)
+        (mut bom).push(191 as byte)
+        if !write_full(fd, bom, 0, 3) {
+            return false
+        }
+    }
+    var it = textiter_new()
+    if !textiter_begin(mut it, tb, 0 as ByteOff) {
+        return true
+    }
+    loop {
+        let c = textiter_chunk(it, tb)
+        if !c.ok {
+            return false
+        }
+        var at = c.at
+        let end = c.at + c.len
+        while at < end {
+            let stop = if end - at > WRITE_SLICE then at + WRITE_SLICE else end
+            let ok = if c.src == STORE_ORIG {
+                write_full(fd, tb.orig.bytes, at, stop)
+            } else {
+                write_full(fd, tb.add.bytes, at, stop)
+            }
+            if !ok {
+                return false
+            }
+            at = stop
+        }
+        if !textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    true
+}
+
+// `read_matches`, `file.c:528-549`: the next `want[lo..hi)` bytes of `fd`.
+fn read_matches(fd: int, want: List[byte], lo: int, hi: int) -> (bool, bool) {
+    var at = lo
+    while at < hi {
+        let ask = if hi - at < 65536 then hi - at else 65536
+        let block = fs_read_chunk(fd, ask) else |e| match e {
+            eof => { return (false, false) },
+            io => { return (false, true) },
+        }
+        var i = 0
+        while i < block.len {
+            if block[i] != want[at + i] {
+                return (false, false)
+            }
+            i += 1
+        }
+        at += block.len
+    }
+    (true, false)
+}
+
+// `content_matches_disk`, `file.c:551-605`: answers (matches, io_error).
+fn content_matches_disk(meta: FileMeta, tb: TextBuf, path: str, before: Stat) -> (bool, bool) {
+    if !meta.disk_snapshot_valid {
+        return (false, false)
+    }
+    let lst = path_lstat(path)
+    if !lst.ok || lst.kind == KIND_LINK {
+        return (false, true)
+    }
+    let fd = fs_open(path) else {
+        return (false, true)
+    }
+    var ok = true
+    var io_error = false
+    if meta.had_bom {
+        var bom = List[byte]()
+        (mut bom).push(239 as byte)
+        (mut bom).push(187 as byte)
+        (mut bom).push(191 as byte)
+        let (m, e) = read_matches(fd, bom, 0, 3)
+        ok = m
+        io_error = e
+    }
+    if ok {
+        let want = textsnap_bytes(tb, meta.disk_snapshot)
+        let (m, e) = read_matches(fd, want, 0, want.len)
+        ok = m
+        io_error = io_error || e
+    }
+    if ok {
+        let extra = fs_read_chunk(fd, 1) else |e| match e {
+            eof => List[byte](),
+            io => {
+                io_error = true
+                List[byte]()
+            },
+        }
+        if extra.len != 0 || io_error {
+            ok = false
+        }
+    }
+    let after = path_stat(path)
+    if !after.ok {
+        io_error = true
+        ok = false
+    } else if !same_file_state(before, after) {
+        ok = false
+    }
+    fs_close(fd) else {
+        io_error = true
+        ok = false
+    }
+    (ok, io_error)
+}
+
+// `destination_matches`, `file.c:607-651`: answers (error, accepted,
+// needs_inplace).
+fn destination_matches(meta: FileMeta, tb: TextBuf, path: str, opts: SaveOpts) -> (
+    int,
+    FileMeta,
+    bool,
+) {
+    var accepted = copy meta
+    let st = path_stat(path)
+    if st.ok {
+        if st.kind != KIND_FILE || st.size < 0 {
+            return (SAVE_CHANGED_ON_DISK, accepted, false)
+        }
+        let metadata_matches = meta.exists &&
+            st.dev == meta.dev &&
+            st.ino == meta.ino &&
+            st.size == meta.size_on_disk &&
+            st.mtime_s == meta.mtime_s &&
+            st.mtime_ns == meta.mtime_ns
+        if !metadata_matches && opts.check_disk == SAVE_CHECK_MTIME {
+            return (SAVE_CHANGED_ON_DISK, accepted, false)
+        }
+        if !metadata_matches && opts.check_disk == SAVE_CHECK_CONTENT {
+            if st.size > opts.check_disk_max {
+                util.log_info(
+                    "content save check degraded to mtime: {st.size} bytes exceeds {opts.check_disk_max}",
+                )
+                return (SAVE_CHANGED_ON_DISK, accepted, false)
+            }
+            let (m, io_error) = content_matches_disk(meta, tb, path, st)
+            if !m {
+                return (if io_error then SAVE_IO else SAVE_CHANGED_ON_DISK, accepted, false)
+            }
+        }
+        if !metadata_matches {
+            meta_accept_stat(mut accepted, st)
+        }
+        // The journal pins this inode with one internal recovery link:
+        // discount exactly that one.
+        let limit = if meta.journal_pinned then 2 else 1
+        return (SAVE_OK, accepted, st.nlink > limit)
+    }
+    if st.missing {
+        if meta.exists && opts.check_disk != SAVE_CHECK_OFF {
+            return (SAVE_CHANGED_ON_DISK, accepted, false)
+        }
+        accepted.exists = false
+        accepted.mode = 438
+        accepted.nlink = 0
+        accepted.size_on_disk = 0
+        return (SAVE_OK, accepted, false)
+    }
+    (if st.denied then SAVE_PERM else SAVE_IO, accepted, false)
+}
+
+fn stat_matches_meta(st: Stat, meta: FileMeta) -> bool {
+    st.ok &&
+        st.kind == KIND_FILE &&
+        meta.exists &&
+        st.size >= 0 &&
+        st.dev == meta.dev &&
+        st.ino == meta.ino &&
+        st.size == meta.size_on_disk &&
+        st.mtime_s == meta.mtime_s &&
+        st.mtime_ns == meta.mtime_ns
+}
+
+// No `access(2)` in wolf 0.2.33: a directory is writable when its mode has
+// a write bit and the bit that applies to this process's effective ids is
+// set (root writes anywhere). ACLs and a read-only mount are not seen.
+fn directory_writable(path: str) -> bool {
+    let st = path_stat(path)
+    if !st.ok {
+        return false
+    }
+    if st.mode & 146 == 0 {
+        return false
+    }
+    let euid = os_euid() else -1
+    if euid == 0 {
+        return true
+    }
+    if st.uid == euid {
+        return st.mode & 128 != 0
+    }
+    let egid = os_egid() else -1
+    var in_group = st.gid == egid
+    if !in_group {
+        let groups = os_groups() else List[int]()
+        for g in groups {
+            if g == st.gid {
+                in_group = true
+            }
+        }
+    }
+    if in_group {
+        return st.mode & 16 != 0
+    }
+    st.mode & 2 != 0
+}
+
+fn make_dir_0700(path: str) -> bool {
+    util.mkdirs(path, 448)
+}
+
+// `state_backup_dir`, `file.c:736-767`.
+fn state_backup_dir(configured: str) -> str ! {none} {
+    if configured.len != 0 {
+        if !make_dir_0700(configured) {
+            return none
+        }
+        return configured
+    }
+    let state = env_get("XDG_STATE_HOME") else ""
+    var dir = ""
+    if state.len != 0 {
+        dir = "{state}/yew/backup"
+    } else {
+        let home = env_get("HOME") else ""
+        if home.len == 0 {
+            return none
+        }
+        dir = "{home}/.local/state/yew/backup"
+    }
+    if !make_dir_0700(dir) {
+        return none
+    }
+    dir
+}
+
+/// FNV-1a 64 over a path's bytes (`fnv64`, `file.c:769-778`): the backup's
+/// and the journal's name.
+pub fn path_fnv64(text: str) -> wrapping[u64] {
+    var hash: wrapping[u64] = 14695981039346656037
+    for b in text.bytes() {
+        hash = hash ^ b as int as wrapping[u64]
+        hash = hash * 1099511628211
+    }
+    hash
+}
+
+/// Sixteen lowercase hex digits of a 64-bit hash (`%016llx`).
+pub fn hex16(h: wrapping[u64]) -> str {
+    let digits = "0123456789abcdef"
+    var nibbles = List[int]()
+    var v = h
+    var k: int = 0
+    while k < 16 {
+        (mut nibbles).push((v & 15) as int)
+        v = v >> 4
+        k += 1
+    }
+    var out = ""
+    k = 15
+    while k >= 0 {
+        let d = nibbles[k]
+        out = out + digits[d..d + 1]
+        k -= 1
+    }
+    out
+}
+
+// `backup_path`, `file.c:780-797`.
+fn backup_path(dst: str, opts: SaveOpts) -> str ! {none} {
+    let dir = state_backup_dir(opts.backup_dir)?
+    let key = file_realpath(dst) else dst
+    "{dir}/{hex16(path_fnv64(key))}.bak"
+}
+
+fn backup_stem(base: str) -> str {
+    base[0..base.len - 4]
+}
+
+fn numbered_backup_path(base: str, number: int) -> str {
+    "{backup_stem(base)}.{number}.bak"
+}
+
+fn pending_backup_path(base: str, primary: bool) -> str {
+    if primary {
+        return "{backup_stem(base)}.pending.bak"
+    }
+    let serial = next_temp_counter()
+    "{backup_stem(base)}.pending-{os_pid()}-{serial}.bak"
+}
+
+fn remove_quiet(path: str) -> bool {
+    fs_remove(path) else |e| match e {
+        not_found => { return true },
+        denied => { return false },
+        io => { return false },
+    }
+    true
+}
+
+// `rotate_backups`, `file.c:829-850`.
+fn rotate_backups(base: str, keep: int) -> bool {
+    if keep <= 1 {
+        return true
+    }
+    var number = keep - 1
+    while number != 0 {
+        let from = if number == 1 then base else numbered_backup_path(base, number - 1)
+        let to = numbered_backup_path(base, number)
+        fs_rename(from, to) else |e| match e {
+            not_found => {},
+            cross_device => { return false },
+            denied => { return false },
+            exists => { return false },
+            io => { return false },
+        }
+        number -= 1
+    }
+    true
+}
+
+// `prune_backups`, `file.c:852-867`.
+fn prune_backups(base: str, keep: int) -> bool {
+    var ok = true
+    if keep == 0 && !remove_quiet(base) {
+        ok = false
+    }
+    var number = if keep == 0 then 1 else keep
+    while number < SAVE_BACKUP_KEEP_MAX {
+        if !remove_quiet(numbered_backup_path(base, number)) {
+            ok = false
+        }
+        number += 1
+    }
+    ok
+}
+
+fn discard_backup(path: str) -> bool {
+    remove_quiet(path) && no_sync_dir_g3(path_dirname(path))
+}
+
+// `link_recovery_unique`, `file.c:887-913`: a hard link that keeps a backup
+// generation alive across the rotation.
+fn link_recovery_unique(source: str) -> str ! {exists, io} {
+    var tries = 0
+    while tries < 1000 {
+        var recovery = "{source}.recover.bak"
+        if tries != 0 {
+            recovery = "{source}.recover-{os_pid()}-{next_temp_counter()}.bak"
+        }
+        fs_link(source, recovery) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            cross_device => { return io },
+            denied => { return io },
+            not_found => { return io },
+            io => { return io },
+        }
+        return recovery
+    }
+    exists
+}
+
+// `preserve_rotation_history`, `file.c:915-973`: answers the recovery links
+// made, or none on failure (each one removed).
+fn preserve_rotation_history(base: str, keep: int, dir: str) -> (bool, List[str]) {
+    var recoveries = List[str]()
+    var number = 0
+    while number < keep {
+        let source = if number == 0 then base else numbered_backup_path(base, number)
+        number += 1
+        let st = path_lstat(source)
+        if !st.ok {
+            if st.missing {
+                continue
+            }
+            for r in recoveries {
+                let _ = remove_quiet(r)
+            }
+            let _ = no_sync_dir_g3(dir)
+            return (false, List[str]())
+        }
+        if st.kind != KIND_FILE {
+            if st.kind == KIND_LINK {
+                if !remove_quiet(source) {
+                    for r in recoveries {
+                        let _ = remove_quiet(r)
+                    }
+                    let _ = no_sync_dir_g3(dir)
+                    return (false, List[str]())
+                }
+                continue
+            }
+            for r in recoveries {
+                let _ = remove_quiet(r)
+            }
+            let _ = no_sync_dir_g3(dir)
+            return (false, List[str]())
+        }
+        let rec = link_recovery_unique(source) else {
+            for r in recoveries {
+                let _ = remove_quiet(r)
+            }
+            let _ = no_sync_dir_g3(dir)
+            return (false, List[str]())
+        }
+        (mut recoveries).push(rec)
+    }
+    if !no_sync_dir_g3(dir) {
+        return (false, recoveries)
+    }
+    (true, recoveries)
+}
+
+// `commit_backup_rotation`, `file.c:975-1007`.
+fn commit_backup_rotation(pending: str, base: str, keep: int) -> bool {
+    let dir = path_dirname(base)
+    var ok = true
+    var recoveries = List[str]()
+    if keep == 0 {
+        ok = remove_quiet(pending)
+    } else {
+        let (preserved, recs) = preserve_rotation_history(base, keep, dir)
+        recoveries = recs
+        ok = preserved
+        if ok && !rotate_backups(base, keep) {
+            ok = false
+        }
+        if ok {
+            fs_rename(pending, base) else {
+                ok = false
+            }
+        }
+    }
+    if ok {
+        let pruned = prune_backups(base, keep)
+        let synced = no_sync_dir_g3(dir)
+        ok = pruned && synced
+    }
+    if ok && recoveries.len != 0 {
+        for r in recoveries {
+            if !remove_quiet(r) {
+                ok = false
+            }
+        }
+        recoveries = List[str]()
+        if !no_sync_dir_g3(dir) {
+            ok = false
+        }
+    }
+    ok
+}
+
+// `copy_fd`, `file.c:1009-1024`.
+fn copy_fd(src: int, dst: int) -> bool {
+    loop {
+        let block = fs_read_chunk(src, 65536) else |e| match e {
+            eof => { return true },
+            io => { return false },
+        }
+        fs_write_chunk(dst, block) else {
+            return false
+        }
+    }
+    true
+}
+
+// The reason a backup copy failed, for the caller's errno tests.
+const COPY_OK: int = 0
+
+const COPY_EXISTS: int = 1
+
+const COPY_STALE: int = 2
+
+const COPY_PERM: int = 3
+
+const COPY_IO: int = 4
+
+// `open_temp`, `file.c:1337-1366`: `.yew-<base>-<pid>-<n>` beside its
+// target, created exclusively (open mode 4) with `mode`.
+fn open_temp(dir: str, base: str, mode: int) -> (int, str, int) {
+    var tries = 0
+    while tries < 1000 {
+        let counter = next_temp_counter()
+        let path = "{dir}/.yew-{base}-{os_pid()}-{counter}"
+        let fd = fs_open_perm(path, 4, mode & 511) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            denied => { return (-1, "", COPY_PERM) },
+            not_found => { return (-1, "", COPY_IO) },
+            invalid => { return (-1, "", COPY_IO) },
+            unsupported => { return (-1, "", COPY_IO) },
+            io => { return (-1, "", COPY_IO) },
+        }
+        return (fd, path, COPY_OK)
+    }
+    (-1, "", COPY_EXISTS)
+}
+
+// `copy_path_to_backup`, `file.c:1026-1118`: answers COPY_*.
+fn copy_path_to_backup(src_path: str, bak_path: str, meta: FileMeta) -> int {
+    let dir = path_dirname(bak_path)
+    let lst = path_lstat(src_path)
+    if !lst.ok || lst.kind == KIND_LINK {
+        return if lst.denied then COPY_PERM else COPY_IO
+    }
+    let src = fs_open(src_path) else |e| match e {
+        denied => { return COPY_PERM },
+        not_found => { return COPY_IO },
+        io => { return COPY_IO },
+    }
+    let src_st = path_stat(src_path)
+    if !stat_matches_meta(src_st, meta) {
+        fs_close(src) else {}
+        return COPY_STALE
+    }
+    let (bak, tmp, why) = open_temp(dir, path_basename(bak_path), 384)
+    if bak < 0 {
+        fs_close(src) else {}
+        return why
+    }
+    var ok = true
+    let bak_st = path_stat(tmp)
+    if !bak_st.ok ||
+        bak_st.kind != KIND_FILE ||
+        bak_st.dev == src_st.dev && bak_st.ino == src_st.ino {
+        ok = false
+    }
+    if ok && (!copy_fd(src, bak) || !no_sync_g3(bak)) {
+        ok = false
+    }
+    fs_close(bak) else {
+        ok = false
+    }
+    fs_close(src) else {
+        ok = false
+    }
+    if !ok {
+        let _ = remove_quiet(tmp)
+        return COPY_IO
+    }
+    // Publish without replacing stale recovery evidence from a reused pid.
+    fs_link(tmp, bak_path) else |e| match e {
+        exists => {
+            let _ = remove_quiet(tmp)
+            return COPY_EXISTS
+        },
+        denied => {
+            let _ = remove_quiet(tmp)
+            return COPY_PERM
+        },
+        cross_device => {
+            let _ = remove_quiet(tmp)
+            return COPY_IO
+        },
+        not_found => {
+            let _ = remove_quiet(tmp)
+            return COPY_IO
+        },
+        io => {
+            let _ = remove_quiet(tmp)
+            return COPY_IO
+        },
+    }
+    if !remove_quiet(tmp) {
+        return COPY_IO
+    }
+    if !no_sync_dir_g3(dir) {
+        return COPY_IO
+    }
+    COPY_OK
+}
+
+// `restore_backup`, `file.c:1120-1150`.
+fn restore_backup(bak_path: str, dst_path: str) -> bool {
+    let bl = path_lstat(bak_path)
+    let dl = path_lstat(dst_path)
+    if !bl.ok || bl.kind == KIND_LINK || !dl.ok || dl.kind == KIND_LINK {
+        return false
+    }
+    let bak = fs_open(bak_path) else {
+        return false
+    }
+    let dst = fs_open_mode(dst_path, 3) else {
+        fs_close(bak) else {}
+        return false
+    }
+    var ok = copy_fd(bak, dst)
+    if ok {
+        let end = fs_tell(dst) else -1
+        if end < 0 {
+            ok = false
+        } else {
+            fs_truncate(dst, end) else {
+                ok = false
+            }
+            if ok && !no_sync_g3(dst) {
+                ok = false
+            }
+        }
+    }
+    fs_close(dst) else {
+        ok = false
+    }
+    fs_close(bak) else {
+        ok = false
+    }
+    ok
+}
+
+// Write the whole buffer at the start of `fd` and cut the file there
+// (C's write_text + lseek + ftruncate + fsync).
+fn write_and_cut(fd: int, tb: TextBuf, had_bom: bool) -> bool {
+    if !write_text(fd, tb, had_bom) {
+        return false
+    }
+    let end = fs_tell(fd) else -1
+    if end < 0 {
+        return false
+    }
+    fs_truncate(fd, end) else {
+        return false
+    }
+    no_sync_g3(fd)
+}
+
+// `inplace_save`, `file.c:1152-1260`: answers (error, saved stat).
+fn inplace_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts) -> (int, Stat) {
+    if !meta.exists {
+        let fd = fs_open_perm(dst, 4, 438) else |e| match e {
+            denied => { return (SAVE_PERM, stat_none(false, false)) },
+            exists => { return (SAVE_IO, stat_none(false, false)) },
+            invalid => { return (SAVE_IO, stat_none(false, false)) },
+            not_found => { return (SAVE_IO, stat_none(false, false)) },
+            unsupported => { return (SAVE_IO, stat_none(false, false)) },
+            io => { return (SAVE_IO, stat_none(false, false)) },
+        }
+        var ok = write_and_cut(fd, tb, meta.had_bom)
+        let saved = path_stat(dst)
+        if !saved.ok {
+            ok = false
+        }
+        fs_close(fd) else {
+            ok = false
+        }
+        if ok && !no_sync_dir_g3(path_dirname(dst)) {
+            ok = false
+        }
+        if !ok {
+            let _ = remove_quiet(dst)
+            return (SAVE_IO, saved)
+        }
+        return (SAVE_OK, saved)
+    }
+    let bak = backup_path(dst, opts) else {
+        return (SAVE_IO, stat_none(false, false))
+    }
+    var pending = ""
+    var copied = false
+    var why = COPY_IO
+    var tries = 0
+    while tries < 1000 {
+        pending = pending_backup_path(bak, tries == 0)
+        why = copy_path_to_backup(dst, pending, meta)
+        if why == COPY_OK {
+            copied = true
+            break
+        }
+        if why != COPY_EXISTS {
+            break
+        }
+        tries += 1
+    }
+    if !copied {
+        if why == COPY_STALE {
+            return (SAVE_CHANGED_ON_DISK, stat_none(false, false))
+        }
+        return (if why == COPY_PERM then SAVE_PERM else SAVE_IO, stat_none(false, false))
+    }
+    let dl = path_lstat(dst)
+    if !dl.ok || dl.kind == KIND_LINK {
+        let _ = discard_backup(pending)
+        return (if dl.denied then SAVE_PERM else SAVE_IO, stat_none(false, false))
+    }
+    let fd = fs_open_mode(dst, 3) else |e| match e {
+        denied => {
+            let _ = discard_backup(pending)
+            return (SAVE_PERM, stat_none(false, false))
+        },
+        exists => {
+            let _ = discard_backup(pending)
+            return (SAVE_IO, stat_none(false, false))
+        },
+        invalid => {
+            let _ = discard_backup(pending)
+            return (SAVE_IO, stat_none(false, false))
+        },
+        not_found => {
+            let _ = discard_backup(pending)
+            return (SAVE_IO, stat_none(false, false))
+        },
+        io => {
+            let _ = discard_backup(pending)
+            return (SAVE_IO, stat_none(false, false))
+        },
+    }
+    let st = path_stat(dst)
+    if !stat_matches_meta(st, meta) {
+        fs_close(fd) else {}
+        let _ = discard_backup(pending)
+        return (SAVE_CHANGED_ON_DISK, stat_none(false, false))
+    }
+    var ok = write_and_cut(fd, tb, meta.had_bom)
+    let saved = path_stat(dst)
+    if !saved.ok {
+        ok = false
+    }
+    fs_close(fd) else {
+        ok = false
+    }
+    if !ok {
+        if restore_backup(pending, dst) {
+            let _ = discard_backup(pending)
+        }
+        return (SAVE_IO, saved)
+    }
+    if !commit_backup_rotation(pending, bak, opts.backup_keep) {
+        util.log_warn(
+            "save completed but backup retention failed; recovery evidence was preserved where possible",
+        )
+        return (SAVE_BACKUP_FAILED, saved)
+    }
+    (SAVE_OK, saved)
+}
+
+/// Write `bytes` to `path` through a temporary and a rename
+/// (`yew_file_write_atomic_result`, `file.c:1374-1424`).
+pub fn file_write_atomic_result(path: str, bytes: List[byte], mode: int) -> AtomicWriteResult {
+    let dir = path_dirname(path)
+    let (fd, tmp, why) = open_temp(dir, path_basename(path), mode)
+    if fd < 0 {
+        return AtomicWriteResult {
+            error: if why == COPY_PERM then SAVE_PERM else SAVE_IO,
+            committed: false,
+        }
+    }
+    var ok = write_full(fd, bytes, 0, bytes.len) && no_sync_g3(fd)
+    fs_close(fd) else {
+        ok = false
+    }
+    if !ok {
+        let _ = remove_quiet(tmp)
+        return AtomicWriteResult { error: SAVE_IO, committed: false }
+    }
+    fs_rename(tmp, path) else |e| match e {
+        denied => {
+            let _ = remove_quiet(tmp)
+            return AtomicWriteResult { error: SAVE_PERM, committed: false }
+        },
+        cross_device => {
+            let _ = remove_quiet(tmp)
+            return AtomicWriteResult { error: SAVE_IO, committed: false }
+        },
+        exists => {
+            let _ = remove_quiet(tmp)
+            return AtomicWriteResult { error: SAVE_IO, committed: false }
+        },
+        not_found => {
+            let _ = remove_quiet(tmp)
+            return AtomicWriteResult { error: SAVE_IO, committed: false }
+        },
+        io => {
+            let _ = remove_quiet(tmp)
+            return AtomicWriteResult { error: SAVE_IO, committed: false }
+        },
+    }
+    if !no_sync_dir_g3(dir) {
+        return AtomicWriteResult { error: SAVE_IO, committed: true }
+    }
+    AtomicWriteResult { error: SAVE_OK, committed: true }
+}
+
+/// The same, answering only the error (`yew_file_write_atomic`).
+pub fn file_write_atomic(path: str, bytes: List[byte], mode: int) -> int {
+    file_write_atomic_result(path, bytes, mode).error
+}
+
+/// Move `from` to `to`, refusing to replace an existing `to`: a link then
+/// an unlink, never a rename (`yew_file_move_aside`, `file.c:1435-1462`).
+pub fn file_move_aside(from: str, to: str) -> int {
+    fs_link(from, to) else |e| match e {
+        denied => { return SAVE_PERM },
+        exists => { return SAVE_IO },
+        cross_device => { return SAVE_IO },
+        not_found => { return SAVE_IO },
+        io => { return SAVE_IO },
+    }
+    if !remove_quiet(from) {
+        return SAVE_IO
+    }
+    SAVE_OK
+}
+
+/// Two existing paths name one file (`yew_file_same_identity`).
+pub fn file_same_identity(left: str, right: str) -> bool {
+    if left == right {
+        return true
+    }
+    let a = path_stat(left)
+    let b = path_stat(right)
+    a.ok && b.ok && a.dev == b.dev && a.ino == b.ino
+}
+
+// `atomic_save`, `file.c:1464-1560`: answers (error, saved stat).
+fn atomic_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts, force_atomic: bool) -> (
+    int,
+    Stat,
+) {
+    let dir = path_dirname(dst)
+    let mode = if meta.exists then meta.mode & 4095 else 438
+    let (fd, tmp, why) = open_temp(dir, path_basename(dst), mode)
+    if fd < 0 {
+        return (if why == COPY_PERM then SAVE_PERM else SAVE_IO, stat_none(false, false))
+    }
+    if !write_text(fd, tb, meta.had_bom) || !no_sync_g3(fd) {
+        fs_close(fd) else {}
+        let _ = remove_quiet(tmp)
+        return (SAVE_IO, stat_none(false, false))
+    }
+    if meta.exists {
+        let euid = os_euid() else -1
+        let egid = os_egid() else -1
+        let foreign_owner = meta.uid != euid || meta.gid != egid
+        var chown_failed = false
+        fs_set_owner_fd(fd, meta.uid, meta.gid) else {
+            chown_failed = true
+        }
+        if chown_failed && foreign_owner {
+            fs_close(fd) else {}
+            let _ = remove_quiet(tmp)
+            if force_atomic {
+                return (SAVE_IO, stat_none(false, false))
+            }
+            return inplace_save(tb, meta, dst, opts)
+        }
+        var mode_failed = false
+        fs_set_mode(tmp, meta.mode & 4095) else {
+            mode_failed = true
+        }
+        if mode_failed {
+            fs_close(fd) else {}
+            let _ = remove_quiet(tmp)
+            return (SAVE_IO, stat_none(false, false))
+        }
+        // G5 (wolf-lang#685): C copies the target's extended attributes
+        // here (`copy_xattrs`); wolf 0.2.33 has no xattr call.
+    }
+    let saved = path_stat(tmp)
+    if !saved.ok {
+        fs_close(fd) else {}
+        let _ = remove_quiet(tmp)
+        return (SAVE_IO, saved)
+    }
+    var closed = true
+    fs_close(fd) else {
+        closed = false
+    }
+    if !closed {
+        let _ = remove_quiet(tmp)
+        return (SAVE_IO, saved)
+    }
+    let (match_err, accepted, needs_inplace) = destination_matches(meta, tb, dst, opts)
+    if match_err != SAVE_OK {
+        let _ = remove_quiet(tmp)
+        return (match_err, saved)
+    }
+    if needs_inplace && !force_atomic {
+        let _ = remove_quiet(tmp)
+        return inplace_save(tb, accepted, dst, opts)
+    }
+    var exdev = false
+    var perm = false
+    var renamed = true
+    fs_rename(tmp, dst) else |e| match e {
+        cross_device => {
+            exdev = true
+            renamed = false
+        },
+        denied => {
+            perm = true
+            renamed = false
+        },
+        exists => { renamed = false },
+        not_found => { renamed = false },
+        io => { renamed = false },
+    }
+    if !renamed {
+        let _ = remove_quiet(tmp)
+        if exdev && !force_atomic {
+            return inplace_save(tb, accepted, dst, opts)
+        }
+        return (if perm then SAVE_PERM else SAVE_IO, saved)
+    }
+    if !no_sync_dir_g3(dir) {
+        return (SAVE_IO, saved)
+    }
+    (SAVE_OK, saved)
+}
+
+// `refresh_saved_meta`, `file.c:1562-1585`.
+fn refresh_saved_meta(mut meta: FileMeta, st: Stat, saved_path: str, via_symlink: bool) {
+    let journal_pinned = meta.journal_pinned && meta.dev == st.dev && meta.ino == st.ino
+    meta.realpath = saved_path
+    meta.has_realpath = true
+    meta.exists = true
+    meta.via_symlink = via_symlink
+    meta.mode = st.mode
+    meta.uid = st.uid
+    meta.gid = st.gid
+    meta.nlink = st.nlink
+    meta.dev = st.dev
+    meta.ino = st.ino
+    meta.mtime_s = st.mtime_s
+    meta.mtime_ns = st.mtime_ns
+    meta.size_on_disk = st.size
+    meta.journal_pinned = journal_pinned
+}
+
+// `accept_destination`, `file.c:1587-1623`.
+fn accept_destination(mut accepted: FileMeta, path: str) -> int {
+    let st = path_stat(path)
+    if st.ok {
+        if st.kind != KIND_FILE || st.size < 0 {
+            return SAVE_IO
+        }
+        meta_accept_stat(mut accepted, st)
+        return SAVE_OK
+    }
+    if !st.missing {
+        return if st.denied then SAVE_PERM else SAVE_IO
+    }
+    accepted.exists = false
+    accepted.mode = 438
+    accepted.uid = 0
+    accepted.gid = 0
+    accepted.nlink = 0
+    accepted.dev = 0
+    accepted.ino = 0
+    accepted.mtime_s = 0
+    accepted.mtime_ns = 0
+    accepted.size_on_disk = 0
+    SAVE_OK
+}
+
+// `file_save`, `file.c:1625-1698`.
+fn file_save_impl(
+    mut tb: TextBuf,
+    mut meta: FileMeta,
+    path: str,
+    requested: SaveOpts,
+    force: bool,
+) -> int {
+    var opts = copy requested
+    if opts.strategy < 0 ||
+        opts.strategy > SAVE_STRATEGY_INPLACE ||
+        opts.check_disk < 0 ||
+        opts.check_disk > SAVE_CHECK_CONTENT ||
+        opts.check_disk_max > SAVE_CHECK_DISK_MAX_LIMIT ||
+        opts.backup_keep > SAVE_BACKUP_KEEP_MAX {
+        return SAVE_IO
+    }
+    if force {
+        opts.check_disk = SAVE_CHECK_OFF
+    }
+    var is_symlink = false
+    let link_st = path_lstat(path)
+    if link_st.ok {
+        is_symlink = link_st.kind == KIND_LINK
+    } else if !link_st.missing {
+        return if link_st.denied then SAVE_PERM else SAVE_IO
+    }
+    var dst = path
+    if is_symlink {
+        let resolved = resolve_save_target(path) else {
+            return SAVE_IO
+        }
+        if !force && meta.has_realpath && resolved != meta.realpath {
+            return SAVE_CHANGED_ON_DISK
+        }
+        dst = resolved
+    }
+    var expected = copy meta
+    if force {
+        let err = accept_destination(mut expected, dst)
+        if err != SAVE_OK {
+            return err
+        }
+    }
+    let (match_err, accepted, needs_inplace) = destination_matches(expected, tb, dst, opts)
+    if match_err != SAVE_OK {
+        return match_err
+    }
+    let saved_realpath = file_realpath(dst) else canonical_new_path(dst)
+    let dir = path_dirname(dst)
+    var result = SAVE_IO
+    var saved = stat_none(false, false)
+    if opts.strategy == SAVE_STRATEGY_INPLACE {
+        let (r, s) = inplace_save(tb, accepted, dst, opts)
+        result = r
+        saved = s
+    } else if opts.strategy == SAVE_STRATEGY_ATOMIC {
+        let (r, s) = atomic_save(tb, accepted, dst, opts, true)
+        result = r
+        saved = s
+    } else if needs_inplace || !directory_writable(dir) {
+        let (r, s) = inplace_save(tb, accepted, dst, opts)
+        result = r
+        saved = s
+    } else {
+        let (r, s) = atomic_save(tb, accepted, dst, opts, false)
+        result = r
+        saved = s
+    }
+    if save_committed(result) {
+        refresh_saved_meta(mut meta, saved, saved_realpath, is_symlink)
+        filemeta_snapshot_set(mut meta, mut tb)
+    }
+    result
+}
+
+/// Save `tb` to `path` by the decision table (`yew_file_save`).
+pub fn file_save(mut tb: TextBuf, mut meta: FileMeta, path: str) -> int {
+    file_save_impl(mut tb, mut meta, path, save_opts_default(), false)
+}
+
+/// The same with options (`yew_file_save_opts`).
+pub fn file_save_opts(mut tb: TextBuf, mut meta: FileMeta, path: str, opts: SaveOpts) -> int {
+    file_save_impl(mut tb, mut meta, path, opts, false)
+}
+
+/// Overwrite after accepting the destination as it is now
+/// (`yew_file_save_force`).
+pub fn file_save_force(mut tb: TextBuf, mut meta: FileMeta, path: str) -> int {
+    file_save_impl(mut tb, mut meta, path, save_opts_default(), true)
+}
+
+/// The same with options (`yew_file_save_force_opts`).
+pub fn file_save_force_opts(mut tb: TextBuf, mut meta: FileMeta, path: str, opts: SaveOpts) -> int {
+    file_save_impl(mut tb, mut meta, path, opts, true)
+}
