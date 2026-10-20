@@ -1,0 +1,1866 @@
+//! edit.edit_cmds — the editing and motion commands.
+//!
+//! Ports sagitta `src/edit/edit_cmds.c` (2,248 lines) and `edit_cmds.h`
+//! (94) at 9ace98c2, under `s14`–`s17`. C's handlers resolve `cx->win`,
+//! its buffer's `TextBuf` and a cursor POINTER (`edit_window_at`,
+//! `edit_cmds.c:26-56`); the port resolves the window, buffer and cursor
+//! INDICES (`ew`) and reaches the cursor as `ed.wins[w].cs.curs[c]`, so a
+//! command that edits and then moves its caret re-reads it by index, as C
+//! re-fetches its pointer. Every edit goes through the seam
+//! (`ed_edit_insert`/`ed_edit_delete`, `ed.lu`). The options C reads from
+//! the option store (`autoindent`, `autopair`, `expandtab`, `tabwidth`)
+//! come from `ed.opts` until the store lands (yw09).
+
+use text
+
+// `edit_window_at` (`edit_cmds.c:26-56`): (ok, window, buffer, cursor).
+fn ew(ed: Ed, cx: CmdCtx) -> (bool, int, int, int) {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len {
+        return (false, 0, 0, 0)
+    }
+    let b = ed.wins[w].buf
+    if b < 0 ||
+        !ed.bufs[b].resident ||
+        ed.wins[w].cs.curs.len == 0 ||
+        ed.wins[w].cs.primary >= ed.wins[w].cs.curs.len {
+        return (false, 0, 0, 0)
+    }
+    var ci = if cx.cursor_given then cx.cursor_index else ed.wins[w].cs.primary
+    if cx.cursor_given {
+        if ci >= ed.wins[w].cs.curs.len {
+            return (false, 0, 0, 0)
+        }
+    } else if ed.wins[w].cs.active != text.MC_ACTIVE_NONE {
+        if cx.cursor_index >= ed.wins[w].cs.curs.len || cx.cursor_index != ed.wins[w].cs.active {
+            return (false, 0, 0, 0)
+        }
+        ci = cx.cursor_index
+    }
+    (true, w, b, ci)
+}
+
+fn tabw(ed: Ed, b: int) -> int {
+    if ed.bufs[b].tabwidth != 0 then ed.bufs[b].tabwidth else VP_TABWIDTH
+}
+
+// `damage_offsets` (`edit_cmds.c:63-101`): the FOCUSED window's rows
+// between two offsets, as C's reads `ed->win`.
+fn damage_offsets(mut ed: Ed, first: int, second: int) {
+    if ed.win < 0 {
+        return
+    }
+    if ed.damage_batching {
+        ed_damage_document(mut ed)
+        return
+    }
+    let w = ed.win
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident {
+        return
+    }
+    var lo = text.textbuf_line_of(
+        ed.bufs[b].ec.tb,
+        (if first < second then first else second) as text.ByteOff,
+    ) as int
+    var hi = text.textbuf_line_of(
+        ed.bufs[b].ec.tb,
+        (if first > second then first else second) as text.ByteOff,
+    ) as int
+    if ed.wins[w].vp.wrap {
+        ed_damage_document(mut ed)
+        return
+    }
+    let top = ed.wins[w].vp.top
+    let bottom = vp_last_visible_line(mut ed.wins[w], ed.bufs[b].ec.tb)
+    if hi < top || lo > bottom {
+        return
+    }
+    if lo < top {
+        lo = top
+    }
+    if hi > bottom {
+        hi = bottom
+    }
+    let (ok1, rlo) = vp_row_of_line(mut ed.wins[w], ed.bufs[b].ec.tb, lo, 0)
+    let (ok2, rhi) = vp_row_of_line(mut ed.wins[w], ed.bufs[b].ec.tb, hi, 0)
+    if !ok1 || !ok2 {
+        return
+    }
+    ed_damage_rows(mut ed, rlo, rhi + 1)
+}
+
+// `cursor_set_bounds` (`edit_cmds.c:103-123`).
+fn cursor_set_bounds(cs: text.CursorSet) -> (int, int) {
+    var lo = cs.curs[0].pos
+    var hi = cs.curs[0].pos
+    for c in cs.curs {
+        if c.pos < lo {
+            lo = c.pos
+        }
+        if c.anchor < lo {
+            lo = c.anchor
+        }
+        if c.pos > hi {
+            hi = c.pos
+        }
+        if c.anchor > hi {
+            hi = c.anchor
+        }
+    }
+    (lo, hi)
+}
+
+// `cursor_place` (`edit_cmds.c:133-139`).
+fn place(mut ed: Ed, w: int, c: int, pos: int) {
+    ed.wins[w].cs.curs[c].pos = pos
+    ed.wins[w].cs.curs[c].anchor = pos
+    ed.wins[w].cs.curs[c].goal_col = text.CCOL_HERE
+}
+
+// `finish_direct_motion` (`edit_cmds.c:141-151`): H keeps its anchor.
+fn finish_direct(mut ed: Ed, w: int, c: int, anchor: int, old_pos: int) {
+    if ed.mode != MODE_H {
+        return
+    }
+    ed.wins[w].cs.curs[c].anchor = anchor
+    let pos = ed.wins[w].cs.curs[c].pos
+    damage_offsets(mut ed, anchor, if old_pos < pos then old_pos else pos)
+    damage_offsets(mut ed, anchor, if old_pos > pos then old_pos else pos)
+}
+
+fn follow(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+}
+
+fn ascii_blank_cluster(tb: text.TextBuf, at: int, next: int) -> bool {
+    if next != at + 1 {
+        return false
+    }
+    let b = text.textbuf_byte_at(tb, at)
+    b == 32 || b == 9
+}
+
+// `move_vertical` (`edit_cmds.c:185-225`).
+fn move_vertical(mut ed: Ed, cx: CmdCtx, down: bool, rows: int) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    if ed.wins[w].vp.wrap {
+        let amount = if down then rows else -rows
+        let _ = vp_move_display(mut ed.wins[w], mut ed.bufs[b].ec.tb, amount)
+    } else {
+        let t = tabw(ed, b)
+        var i = 0
+        while i < rows {
+            if down {
+                text.cursor_down(ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c], t)
+            } else {
+                text.cursor_up(ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c], t)
+            }
+            i += 1
+        }
+    }
+    if ed.mode == MODE_H {
+        ed.wins[w].cs.curs[c].anchor = anchor
+        let pos = ed.wins[w].cs.curs[c].pos
+        damage_offsets(mut ed, anchor, if old_pos < pos then old_pos else pos)
+        damage_offsets(mut ed, anchor, if old_pos > pos then old_pos else pos)
+    }
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.buf.home` (`edit_cmds.c:227-239`).
+pub fn ec_move_buf_home(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, _, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    text.cursor_buf_home(mut ed.wins[w].cs.curs[c])
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.buf.end` (`edit_cmds.c:241-261`): with a count, that line.
+pub fn ec_move_buf_end(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    if cx.count_given {
+        let lines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+        let requested = if cx.count == 0 then 0 else cx.count - 1
+        let line = if requested < lines then requested else lines - 1
+        let start = text.textbuf_line_start(ed.bufs[b].ec.tb, line as text.LineNo) as int
+        place(mut ed, w, c, start)
+    } else {
+        text.cursor_buf_end(ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c])
+    }
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.line.home` (`edit_cmds.c:263-279`).
+pub fn ec_move_line_home(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    text.cursor_line_home(ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c])
+    finish_direct(mut ed, w, c, anchor, old_pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.line.home_toggle` (`edit_cmds.c:312-338`): the first
+/// non-blank, then column 0, then back; no memory of the last press.
+pub fn ec_move_line_home_toggle(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let pos = ed.wins[w].cs.curs[c].pos
+    let ls = text.textbuf_line_span(
+        ed.bufs[b].ec.tb,
+        text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff),
+    )
+    let info = indent_info(ed.bufs[b].ec.tb, ls, tabw(ed, b))
+    let target = if info.blank || pos == info.first then ls.lo else info.first
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    place(mut ed, w, c, target)
+    finish_direct(mut ed, w, c, anchor, pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.line.end` (`edit_cmds.c:340-357`).
+pub fn ec_move_line_end(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    text.cursor_line_end(mut ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c])
+    finish_direct(mut ed, w, c, anchor, old_pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.line.up` (`edit_cmds.c:359-362`).
+pub fn ec_move_line_up(mut ed: Ed, cx: CmdCtx) -> int {
+    move_vertical(mut ed, cx, false, 1)
+}
+
+/// `ed.move.line.down` (`edit_cmds.c:364-367`).
+pub fn ec_move_line_down(mut ed: Ed, cx: CmdCtx) -> int {
+    move_vertical(mut ed, cx, true, 1)
+}
+
+/// `ed.move.line.first_nonblank` (`edit_cmds.c:369-394`).
+pub fn ec_move_line_first_nonblank(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let line = text.textbuf_line_of(
+        ed.bufs[b].ec.tb,
+        ed.wins[w].cs.curs[c].pos as text.ByteOff,
+    ) as int
+    var pos = text.textbuf_line_start(ed.bufs[b].ec.tb, line as text.LineNo) as int
+    let end = line_content_end(mut ed.bufs[b].ec.tb, line)
+    while pos < end {
+        let next = text.grapheme_next_boundary(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+        if !ascii_blank_cluster(ed.bufs[b].ec.tb, pos, next) {
+            break
+        }
+        pos = next
+    }
+    place(mut ed, w, c, pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.line.last_nonblank` (`edit_cmds.c:396-423`).
+pub fn ec_move_line_last_nonblank(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let line = text.textbuf_line_of(
+        ed.bufs[b].ec.tb,
+        ed.wins[w].cs.curs[c].pos as text.ByteOff,
+    ) as int
+    var pos = text.textbuf_line_start(ed.bufs[b].ec.tb, line as text.LineNo) as int
+    let end = line_content_end(mut ed.bufs[b].ec.tb, line)
+    var last = pos
+    while pos < end {
+        let next = text.grapheme_next_boundary(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+        if !ascii_blank_cluster(ed.bufs[b].ec.tb, pos, next) {
+            last = pos
+        }
+        pos = next
+    }
+    place(mut ed, w, c, last)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.line.half_page_up` (`edit_cmds.c:425-433`).
+pub fn ec_move_line_half_page_up(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let rows = ed.wins[cx.win].vp.rows / 2
+    move_vertical(mut ed, cx, false, if rows == 0 then 1 else rows)
+}
+
+/// `ed.move.line.half_page_down` (`edit_cmds.c:435-443`).
+pub fn ec_move_line_half_page_down(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let rows = ed.wins[cx.win].vp.rows / 2
+    move_vertical(mut ed, cx, true, if rows == 0 then 1 else rows)
+}
+
+fn view_page(mut ed: Ed, cx: CmdCtx, pages: int) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    vp_page(mut ed.wins[w], ed.bufs[b].ec.tb, pages)
+    vp_push_cursor(mut ed.wins[w], mut ed.bufs[b].ec.tb, tabw(ed, b))
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.page_up` (`edit_cmds.c:445-453`).
+pub fn ec_view_page_up(mut ed: Ed, cx: CmdCtx) -> int {
+    view_page(mut ed, cx, -1)
+}
+
+/// `ed.view.page_down` (`edit_cmds.c:455-463`).
+pub fn ec_view_page_down(mut ed: Ed, cx: CmdCtx) -> int {
+    view_page(mut ed, cx, 1)
+}
+
+// `view_scroll` (`edit_cmds.c:465-473`).
+fn view_scroll(mut ed: Ed, cx: CmdCtx, rows: int) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    vp_scroll(mut ed.wins[w], ed.bufs[b].ec.tb, rows)
+    vp_push_cursor(mut ed.wins[w], mut ed.bufs[b].ec.tb, tabw(ed, b))
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.scroll_up`.
+pub fn ec_view_scroll_up(mut ed: Ed, cx: CmdCtx) -> int {
+    view_scroll(mut ed, cx, -1)
+}
+
+/// `ed.view.scroll_down`.
+pub fn ec_view_scroll_down(mut ed: Ed, cx: CmdCtx) -> int {
+    view_scroll(mut ed, cx, 1)
+}
+
+/// `ed.view.half_page_up` (`edit_cmds.c:485-493`).
+pub fn ec_view_half_page_up(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let rows = ed.wins[cx.win].vp.rows / 2
+    view_scroll(mut ed, cx, if rows == 0 then -1 else -rows)
+}
+
+/// `ed.view.half_page_down` (`edit_cmds.c:495-503`).
+pub fn ec_view_half_page_down(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let rows = ed.wins[cx.win].vp.rows / 2
+    view_scroll(mut ed, cx, if rows == 0 then 1 else rows)
+}
+
+/// `ed.view.center` (`edit_cmds.c:505-512`).
+pub fn ec_view_center(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let b = ed.wins[cx.win].buf
+    vp_center(mut ed.wins[cx.win], ed.bufs[b].ec.tb)
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.top` (`edit_cmds.c:514-521`).
+pub fn ec_view_top(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let b = ed.wins[cx.win].buf
+    vp_top(mut ed.wins[cx.win], ed.bufs[b].ec.tb)
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.bottom` (`edit_cmds.c:523-530`).
+pub fn ec_view_bottom(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let b = ed.wins[cx.win].buf
+    vp_bottom(mut ed.wins[cx.win], ed.bufs[b].ec.tb)
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.goto_line` (`edit_cmds.c:532-551`): the count's line,
+/// centered.
+pub fn ec_view_goto_line(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let lines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    var requested = if cx.count == 0 then 0 else cx.count - 1
+    if requested >= lines {
+        requested = lines - 1
+    }
+    let start = text.textbuf_line_start(ed.bufs[b].ec.tb, requested as text.LineNo) as int
+    place(mut ed, w, c, start)
+    ed.wins[w].wrap_goal_valid = false
+    vp_center(mut ed.wins[w], ed.bufs[b].ec.tb)
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.toggle_wrap` (`edit_cmds.c:553-566`).
+pub fn ec_view_toggle_wrap(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    ed.wins[w].vp.wrap = !ed.wins[w].vp.wrap
+    ed.wins[w].vp.left = 0
+    ed.wins[w].vp.top_sub = 0
+    ed.wins[w].wrap_goal_valid = false
+    vp_invalidate(mut ed.wins[w])
+    vp_clamp(mut ed.wins[w], ed.bufs[b].ec.tb)
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.number_style` (`edit_cmds.c:568-598`).
+pub fn ec_view_number_style(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || !cx.has_sarg {
+        return CMD_ERR_ARG
+    }
+    let style = match cx.sarg {
+        "none" => NUM_NONE,
+        "abs" => NUM_ABS,
+        "rel" => NUM_REL,
+        "hybrid" => NUM_HYBRID,
+        _ => -1,
+    }
+    if style < 0 {
+        return CMD_ERR_ARG
+    }
+    ed.wins[cx.win].number_style = style
+    ed.layout_dirty = true
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.view.number_cycle` (`edit_cmds.c:600-610`): none, abs, rel, hybrid.
+pub fn ec_view_number_cycle(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    ed.wins[cx.win].number_style = (ed.wins[cx.win].number_style + 1) % (NUM_HYBRID + 1)
+    ed.layout_dirty = true
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.ui.message_expand` (`edit_cmds.c:612-620`).
+pub fn ec_message_expand(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed_msg_expand(mut ed) {
+        return CMD_ERR_STATE
+    }
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.ui.cancel` (`edit_cmds.c:622-630`).
+pub fn ec_ui_cancel(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let _ = ed_msg_dismiss_overlay(mut ed)
+    if ed.prompt != PROMPT_NONE {
+        ed_prompt(mut ed, PROMPT_NONE)
+    }
+    CMD_OK
+}
+
+/// `ed.move.char.prev` (`edit_cmds.c:632-649`).
+pub fn ec_move_char_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    text.cursor_left(mut ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c])
+    finish_direct(mut ed, w, c, anchor, old_pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.char.next` (`edit_cmds.c:651-668`).
+pub fn ec_move_char_next(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    text.cursor_right(ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c])
+    finish_direct(mut ed, w, c, anchor, old_pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+// `shift_highlight_begin` (`edit_cmds.c:670-692`).
+fn shift_highlight_begin(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].cs.curs.len == 0 {
+        return CMD_ERR_STATE
+    }
+    if ed.mode == MODE_H {
+        return CMD_OK
+    }
+    var i = 0
+    while i < ed.wins[cx.win].cs.curs.len {
+        ed.wins[cx.win].cs.curs[i].anchor = ed.wins[cx.win].cs.curs[i].pos
+        i += 1
+    }
+    mode_enter_highlight(mut ed, MODE_I, false)
+}
+
+// The motions `sel_extend` wraps (`edit_cmds.c:694-750`), by kind: C
+// passes a function pointer.
+fn extend_move(mut ed: Ed, cx: CmdCtx, which: int) -> int {
+    match which {
+        0 => ec_move_char_prev(mut ed, cx),
+        1 => ec_move_char_next(mut ed, cx),
+        2 => ec_move_line_up(mut ed, cx),
+        3 => ec_move_line_down(mut ed, cx),
+        4 => ec_move_word_prev(mut ed, cx),
+        5 => ec_move_word_next(mut ed, cx),
+        6 => ec_move_line_home(mut ed, cx),
+        _ => ec_move_line_end(mut ed, cx),
+    }
+}
+
+// `sel_extend` (`edit_cmds.c:694-711`): in the prompt the anchor is put
+// back after the motion; elsewhere Shift enters H by character.
+fn sel_extend(mut ed: Ed, cx: CmdCtx, which: int) -> int {
+    if ed.cmdline.active &&
+        cx.win == cmdline_target(ed) &&
+        ed.wins[cx.win].cs.primary < ed.wins[cx.win].cs.curs.len {
+        let p = ed.wins[cx.win].cs.primary
+        let anchor = ed.wins[cx.win].cs.curs[p].anchor
+        let status = extend_move(mut ed, cx, which)
+        if p < ed.wins[cx.win].cs.curs.len {
+            ed.wins[cx.win].cs.curs[p].anchor = anchor
+        }
+        return status
+    }
+    let status = shift_highlight_begin(mut ed, cx)
+    if status == CMD_OK then extend_move(mut ed, cx, which) else status
+}
+
+/// `ed.sel.extend.left`.
+pub fn ec_sel_extend_left(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 0)
+}
+
+/// `ed.sel.extend.right`.
+pub fn ec_sel_extend_right(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 1)
+}
+
+/// `ed.sel.extend.up`.
+pub fn ec_sel_extend_up(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 2)
+}
+
+/// `ed.sel.extend.down`.
+pub fn ec_sel_extend_down(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 3)
+}
+
+/// `ed.sel.extend.word_prev`.
+pub fn ec_sel_extend_word_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 4)
+}
+
+/// `ed.sel.extend.word_next`.
+pub fn ec_sel_extend_word_next(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 5)
+}
+
+/// `ed.sel.extend.line_home`.
+pub fn ec_sel_extend_line_home(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 6)
+}
+
+/// `ed.sel.extend.line_end`.
+pub fn ec_sel_extend_line_end(mut ed: Ed, cx: CmdCtx) -> int {
+    sel_extend(mut ed, cx, 7)
+}
+
+fn unitctx_of(ed: Ed, b: int) -> UnitCtx {
+    UnitCtx { has_buf: true, tabwidth: ed.bufs[b].tabwidth, has_lang: false, has_win: true }
+}
+
+// `move_unit` (`edit_cmds.c:762-859`): 0 next, 1 prev, 2 home, 3 end.
+fn move_unit(mut ed: Ed, cx: CmdCtx, motion: int, alt: bool) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    var kind = UNIT_NONE
+    if ed.mode == MODE_H {
+        kind = ed.wins[w].h.unit
+    } else if ed.prev_unit == MODE_I && motion != 0 && motion != 1 {
+        kind = UNIT_CHAR
+    } else {
+        kind = unit_of_mode(ed.mode)
+    }
+    if kind == UNIT_NONE {
+        return CMD_ERR_STATE
+    }
+    let line_vertical = kind == UNIT_LINE && (motion == 0 || motion == 1)
+    let t = tabw(ed, b)
+    if line_vertical && !ed.wins[w].vp.wrap {
+        ed.wins[w].cs.curs[c].goal_col = text.cursor_goal(
+            ed.bufs[b].ec.tb,
+            ed.wins[w].cs.curs[c],
+            t,
+        ) as int
+    }
+    let vertical_goal = ed.wins[w].cs.curs[c].goal_col
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    let unselected = ed.wins[w].cs.curs[c].anchor == old_pos
+    if line_vertical && ed.wins[w].vp.wrap && !ed.wins[w].wrap_goal_valid {
+        ed.wins[w].wrap_goal = vp_display_col(ed.wins[w], ed.bufs[b].ec.tb, old_pos)
+        ed.wins[w].wrap_goal_valid = true
+    }
+    let u = unitctx_of(ed, b)
+    var pos = 0
+    if motion == 0 {
+        pos = unit_next(kind, mut ed.bufs[b].ec.tb, u, ed.wins[w], old_pos, alt)
+    } else if motion == 1 {
+        pos = unit_prev(kind, mut ed.bufs[b].ec.tb, u, ed.wins[w], old_pos, alt)
+    } else if motion == 2 {
+        pos = unit_home(kind, mut ed.bufs[b].ec.tb, u, old_pos, alt)
+    } else {
+        pos = unit_end(kind, mut ed.bufs[b].ec.tb, u, old_pos, alt)
+    }
+    if ed.mode == MODE_H {
+        ed.wins[w].cs.curs[c].pos = pos
+        ed.wins[w].cs.curs[c].goal_col = if line_vertical then vertical_goal else text.CCOL_HERE
+        ed.wins[w].wrap_goal_valid = false
+        let anchor = ed.wins[w].cs.curs[c].anchor
+        damage_offsets(mut ed, anchor, if old_pos < pos then old_pos else pos)
+        damage_offsets(mut ed, anchor, if old_pos > pos then old_pos else pos)
+    } else if line_vertical {
+        ed.wins[w].cs.curs[c].pos = pos
+        if unselected {
+            ed.wins[w].cs.curs[c].anchor = pos
+        }
+        ed.wins[w].cs.curs[c].goal_col = vertical_goal
+        if !ed.wins[w].vp.wrap {
+            ed.wins[w].wrap_goal_valid = false
+        }
+    } else {
+        place(mut ed, w, c, pos)
+        ed.wins[w].wrap_goal_valid = false
+    }
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.unit.next`.
+pub fn ec_move_unit_next(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 0, false)
+}
+
+/// `ed.move.unit.prev`.
+pub fn ec_move_unit_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 1, false)
+}
+
+/// `ed.move.unit.home`.
+pub fn ec_move_unit_home(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 2, false)
+}
+
+/// `ed.move.unit.end`.
+pub fn ec_move_unit_end(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 3, false)
+}
+
+/// `ed.move.unit.next_alt`.
+pub fn ec_move_unit_next_alt(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 0, true)
+}
+
+/// `ed.move.unit.prev_alt`.
+pub fn ec_move_unit_prev_alt(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 1, true)
+}
+
+/// `ed.move.unit.home_alt`.
+pub fn ec_move_unit_home_alt(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 2, true)
+}
+
+/// `ed.move.unit.end_alt`.
+pub fn ec_move_unit_end_alt(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 3, true)
+}
+
+/// `ed.move.unit.up` (`edit_cmds.c:901-904`).
+pub fn ec_move_unit_up(mut ed: Ed, cx: CmdCtx) -> int {
+    ec_move_line_up(mut ed, cx)
+}
+
+/// `ed.move.unit.down`.
+pub fn ec_move_unit_down(mut ed: Ed, cx: CmdCtx) -> int {
+    ec_move_line_down(mut ed, cx)
+}
+
+/// `ed.move.unit.up_alt` (`edit_cmds.c:911-914`).
+pub fn ec_move_unit_up_alt(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 1, true)
+}
+
+/// `ed.move.unit.down_alt`.
+pub fn ec_move_unit_down_alt(mut ed: Ed, cx: CmdCtx) -> int {
+    move_unit(mut ed, cx, 0, true)
+}
+
+/// `ed.edit.delete.unit` (`edit_cmds.c:921-943`).
+pub fn ec_delete_unit(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    if ed.mode == MODE_H {
+        return sc_delete(mut ed, cx)
+    }
+    let kind = if ed.prev_unit == MODE_I then UNIT_CHAR else unit_of_mode(ed.mode)
+    if kind == UNIT_NONE {
+        return CMD_ERR_STATE
+    }
+    if kind == UNIT_LINE {
+        return ec_delete_line(mut ed, cx)
+    }
+    let u = unitctx_of(ed, b)
+    let sp = unit_span(kind, mut ed.bufs[b].ec.tb, u, ed.wins[w].cs.curs[c].pos, false)
+    delete_span(mut ed, cx, sp)
+}
+
+// `move_block_match` (`edit_cmds.c:945-969`).
+fn move_block_match(mut ed: Ed, cx: CmdCtx, next: bool) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let u = unitctx_of(ed, b)
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    let (found, pos) = block_match(ed.bufs[b].ec.tb, u, old_pos, next)
+    if !found {
+        ed_msg(mut ed, MSG_INFO, "no enclosing delimiter")
+        return CMD_OK
+    }
+    place(mut ed, w, c, pos)
+    finish_direct(mut ed, w, c, anchor, old_pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.block.match_prev`.
+pub fn ec_move_block_match_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    move_block_match(mut ed, cx, false)
+}
+
+/// `ed.move.block.match_next`.
+pub fn ec_move_block_match_next(mut ed: Ed, cx: CmdCtx) -> int {
+    move_block_match(mut ed, cx, true)
+}
+
+// `move_word_sub` (`edit_cmds.c:981-1011`).
+fn move_word_sub(mut ed: Ed, cx: CmdCtx, next: bool) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let u = unitctx_of(ed, b)
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    let pos = if next {
+        word_sub_next(ed.bufs[b].ec.tb, u, old_pos)
+    } else {
+        word_sub_prev(mut ed.bufs[b].ec.tb, u, old_pos)
+    }
+    place(mut ed, w, c, pos)
+    finish_direct(mut ed, w, c, anchor, old_pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+// `move_word` (`edit_cmds.c:1013-1035`): the word unit whatever the mode.
+fn move_word(mut ed: Ed, cx: CmdCtx, next: bool) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let u = unitctx_of(ed, b)
+    let anchor = ed.wins[w].cs.curs[c].anchor
+    let old_pos = ed.wins[w].cs.curs[c].pos
+    let pos = if next {
+        unit_next(UNIT_WORD, mut ed.bufs[b].ec.tb, u, ed.wins[w], old_pos, false)
+    } else {
+        unit_prev(UNIT_WORD, mut ed.bufs[b].ec.tb, u, ed.wins[w], old_pos, false)
+    }
+    place(mut ed, w, c, pos)
+    finish_direct(mut ed, w, c, anchor, old_pos)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.move.word.prev`.
+pub fn ec_move_word_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    move_word(mut ed, cx, false)
+}
+
+/// `ed.move.word.next`.
+pub fn ec_move_word_next(mut ed: Ed, cx: CmdCtx) -> int {
+    move_word(mut ed, cx, true)
+}
+
+/// `ed.move.word.sub_prev`.
+pub fn ec_move_word_sub_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    move_word_sub(mut ed, cx, false)
+}
+
+/// `ed.move.word.sub_next`.
+pub fn ec_move_word_sub_next(mut ed: Ed, cx: CmdCtx) -> int {
+    move_word_sub(mut ed, cx, true)
+}
+
+fn select_span(mut ed: Ed, w: int, i: int, sp: text.Span) {
+    ed.wins[w].cs.curs[i].anchor = sp.lo
+    ed.wins[w].cs.curs[i].pos = sp.hi
+    ed.wins[w].cs.curs[i].goal_col = text.CCOL_HERE
+}
+
+/// `ed.sel.unit.expand` (`edit_cmds.c:1064-1103`): each cursor's
+/// selection one structural level out, its stack remembering the way.
+pub fn ec_sel_unit_expand(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, _) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let u = unitctx_of(ed, b)
+    var changed = false
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let n = ed.wins[w].cs.selstacks[i].n
+        let seed = if n == 0 then ed.wins[w].cs.curs[i].pos else ed.wins[w].cs.selstacks[i].s[0].lo
+        if n != SEL_DEPTH {
+            let sp = block_level(ed.bufs[b].ec.tb, u, seed, n)
+            let found = true
+            let same = n != 0 &&
+                sp.lo == ed.wins[w].cs.selstacks[i].s[n - 1].lo &&
+                sp.hi == ed.wins[w].cs.selstacks[i].s[n - 1].hi
+            if found && !same {
+                selstack_push(mut ed.wins[w].cs.selstacks[i], copy sp)
+                select_span(mut ed, w, i, sp)
+                changed = true
+            }
+        }
+        i += 1
+    }
+    if !changed {
+        ed_msg(mut ed, MSG_INFO, "selection is already at buffer level")
+        return CMD_OK
+    }
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.sel.unit.contract` (`edit_cmds.c:1105-1138`).
+pub fn ec_sel_unit_contract(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, _) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    var changed = false
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        if ed.wins[w].cs.selstacks[i].n != 0 {
+            ed.wins[w].cs.selstacks[i].n -= 1
+            let n = ed.wins[w].cs.selstacks[i].n
+            if n == 0 {
+                ed.wins[w].cs.curs[i].anchor = ed.wins[w].cs.curs[i].pos
+            } else {
+                let sp = copy ed.wins[w].cs.selstacks[i].s[n - 1]
+                select_span(mut ed, w, i, sp)
+            }
+            changed = true
+        }
+        i += 1
+    }
+    if !changed {
+        ed_msg(mut ed, MSG_INFO, "selection stack is empty")
+        return CMD_OK
+    }
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.sel.kind` (`edit_cmds.c:1140-1177`): char, line or rectangle.
+pub fn ec_sel_kind(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.mode != MODE_H || !cx.has_sarg || cx.sarg.len != 1 {
+        return CMD_ERR_ARG
+    }
+    let k = match cx.sarg {
+        "c" => SEL_CHAR,
+        "C" => SEL_CHAR,
+        "l" => SEL_LINE,
+        "L" => SEL_LINE,
+        "r" => SEL_RECT,
+        "R" => SEL_RECT,
+        _ => -1,
+    }
+    if k < 0 {
+        return CMD_ERR_ARG
+    }
+    let w = cx.win
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let a = ed.wins[w].cs.curs[i].anchor
+        let p = ed.wins[w].cs.curs[i].pos
+        damage_offsets(mut ed, a, p)
+        i += 1
+    }
+    ed.wins[w].h.kind = k
+    var j = 0
+    while j < ed.wins[w].cs.curs.len {
+        let a = ed.wins[w].cs.curs[j].anchor
+        let p = ed.wins[w].cs.curs[j].pos
+        damage_offsets(mut ed, a, p)
+        j += 1
+    }
+    CMD_OK
+}
+
+/// `ed.sel.swap_ends` (`edit_cmds.c:1179-1205`).
+pub fn ec_sel_swap_ends(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.mode != MODE_H {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let old_pos = ed.wins[w].cs.curs[i].pos
+        ed.wins[w].cs.curs[i].pos = ed.wins[w].cs.curs[i].anchor
+        ed.wins[w].cs.curs[i].anchor = old_pos
+        ed.wins[w].cs.curs[i].goal_col = text.CCOL_HERE
+        i += 1
+    }
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    follow(mut ed, w)
+    let (lo, hi) = cursor_set_bounds(ed.wins[w].cs)
+    damage_offsets(mut ed, lo, hi)
+    CMD_OK
+}
+
+fn caret(pos: int) -> text.Cursor {
+    text.Cursor { pos: pos, goal_col: text.CCOL_HERE, anchor: pos }
+}
+
+// `finish_lift` (`edit_cmds.c:1224-1245`): the lifted set has replaced
+// the window's (the caller's store: a set built in the caller's frame
+// lands in the window without a copy); damage the union, follow, L mode.
+fn finish_lift(mut ed: Ed, cx: CmdCtx, lo: int, hi: int) -> int {
+    let w = cx.win
+    selstack_clear(mut ed.wins[w])
+    damage_offsets(mut ed, lo, hi)
+    follow(mut ed, w)
+    mode_enter(mut ed, MODE_L)
+}
+
+// `finish_lift`'s refusal: no targets, the window's set unchanged.
+fn no_lift_targets(mut ed: Ed) -> int {
+    ed_msg(mut ed, MSG_INFO, "selection contains no lift targets")
+    CMD_OK
+}
+
+/// `ed.cursor.lift.lines` (`edit_cmds.c:1247-1285`): a cursor on every
+/// selected line, at the selection start's grapheme column.
+pub fn ec_cursor_lift_lines(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].cs.curs.len == 0 || ed.mode != MODE_H {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    let sel = copy ed.wins[w].cs.curs[ed.wins[w].cs.primary]
+    let start = if sel.pos < sel.anchor then sel.pos else sel.anchor
+    let first = text.textbuf_line_of(ed.bufs[b].ec.tb, start as text.ByteOff) as int
+    let fsp = text.textbuf_line_span(ed.bufs[b].ec.tb, first as text.LineNo)
+    let col = text.off_to_gcol(mut ed.bufs[b].ec.tb, fsp, start as text.ByteOff) as int
+    let rows = sel_rows(ed.bufs[b].ec.tb, sel)
+    if rows > text.MC_MAX {
+        ed_msg(mut ed, MSG_ERROR, "selection exceeds 10000 cursors")
+        return CMD_ERR_STATE
+    }
+    let p0 = text.gcol_to_off(mut ed.bufs[b].ec.tb, fsp, col as text.GCol) as int
+    var lifted = text.cset_init(caret(p0))
+    var i = 1
+    while i < rows {
+        let sp = text.textbuf_line_span(ed.bufs[b].ec.tb, (first + i) as text.LineNo)
+        let p = text.gcol_to_off(mut ed.bufs[b].ec.tb, sp, col as text.GCol) as int
+        let _ = text.cset_add(mut lifted, caret(p))
+        i += 1
+    }
+    if lifted.curs.len == 0 {
+        return no_lift_targets(mut ed)
+    }
+    let (olo, ohi) = cursor_set_bounds(ed.wins[cx.win].cs)
+    let (nlo, nhi) = cursor_set_bounds(lifted)
+    ed.wins[cx.win].cs = lifted
+    finish_lift(mut ed, cx, if olo < nlo then olo else nlo, if ohi > nhi then ohi else nhi)
+}
+
+// `add_matches_in_span` (`edit_cmds.c:1314-1344`): answers false at the
+// cursor cap.
+fn add_matches(
+    tb: text.TextBuf,
+    hay: text.Span,
+    pat: List[byte],
+    mut matches: text.CursorSet,
+    mut have: bool,
+) -> bool {
+    let hay_len = hay.hi - hay.lo
+    if hay_len < pat.len {
+        return true
+    }
+    let bytes = text.textbuf_copy_range(tb, hay.lo, hay.hi)
+    var i = 0
+    while i <= hay_len - pat.len {
+        var same = true
+        var k = 0
+        while k < pat.len {
+            if bytes[i + k] as int != pat[k] as int {
+                same = false
+                break
+            }
+            k += 1
+        }
+        if same {
+            let at = hay.lo + i
+            if text.is_grapheme_boundary(tb, at as text.ByteOff) {
+                if !have {
+                    matches = text.cset_init(caret(at))
+                    have = true
+                } else if !text.cset_add(mut matches, caret(at)) &&
+                    matches.curs.len >= text.MC_MAX {
+                    return false
+                }
+            }
+        }
+        i += 1
+    }
+    true
+}
+
+/// `ed.cursor.lift.matches` (`edit_cmds.c:1346-1399`): a cursor at every
+/// literal match of the argument, or of the word under the caret, inside
+/// the selection.
+pub fn ec_cursor_lift_matches(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].cs.curs.len == 0 || ed.mode != MODE_H {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    let sel = copy ed.wins[w].cs.curs[ed.wins[w].cs.primary]
+    var pat = List[byte]()
+    if cx.has_sarg && cx.sarg.len != 0 {
+        for x in cx.sarg.bytes() {
+            (mut pat).push(x)
+        }
+    } else {
+        let u = unitctx_of(ed, b)
+        let word = unit_span(UNIT_WORD, mut ed.bufs[b].ec.tb, u, sel.pos, false)
+        if word.lo == word.hi {
+            return CMD_ERR_ARG
+        }
+        pat = text.textbuf_copy_range(ed.bufs[b].ec.tb, word.lo, word.hi)
+    }
+    var matches = text.cset_init(caret(0))
+    var have = false
+    var ok = true
+    if ed.wins[w].h.kind == SEL_RECT {
+        let spans = sel_rect_spans(
+            ed.bufs[b].ec.tb,
+            ed.wins[w].h.kind,
+            sel_tabwidth(ed.bufs[b].tabwidth),
+            sel,
+        )
+        for sp in spans {
+            if ok {
+                ok = add_matches(ed.bufs[b].ec.tb, copy sp, pat, mut matches, mut have)
+            }
+        }
+    } else {
+        let sp = sel_span(ed.bufs[b].ec.tb, ed.wins[w].h.kind, sel)
+        ok = add_matches(ed.bufs[b].ec.tb, sp, pat, mut matches, mut have)
+    }
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "match lift exceeds 10000 cursors")
+        return CMD_ERR_STATE
+    }
+    if !have || matches.curs.len == 0 {
+        return no_lift_targets(mut ed)
+    }
+    let (olo, ohi) = cursor_set_bounds(ed.wins[cx.win].cs)
+    let (nlo, nhi) = cursor_set_bounds(matches)
+    ed.wins[cx.win].cs = matches
+    finish_lift(mut ed, cx, if olo < nlo then olo else nlo, if ohi > nhi then ohi else nhi)
+}
+
+/// `ed.cursor.lift.ends` (`edit_cmds.c:1401-1428`): a cursor at both ends
+/// of every selection.
+pub fn ec_cursor_lift_ends(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].cs.curs.len == 0 || ed.mode != MODE_H {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    if ed.wins[w].cs.curs.len > text.MC_MAX / 2 {
+        ed_msg(mut ed, MSG_ERROR, "selection ends exceed 10000 cursors")
+        return CMD_ERR_STATE
+    }
+    let primary_pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    var lifted = text.cset_init(caret(primary_pos))
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let a = ed.wins[w].cs.curs[i].anchor
+        let p = ed.wins[w].cs.curs[i].pos
+        let _ = text.cset_add(mut lifted, caret(a))
+        let _ = text.cset_add(mut lifted, caret(p))
+        i += 1
+    }
+    if lifted.curs.len == 0 {
+        return no_lift_targets(mut ed)
+    }
+    let (olo, ohi) = cursor_set_bounds(ed.wins[cx.win].cs)
+    let (nlo, nhi) = cursor_set_bounds(lifted)
+    ed.wins[cx.win].cs = lifted
+    finish_lift(mut ed, cx, if olo < nlo then olo else nlo, if ohi > nhi then ohi else nhi)
+}
+
+// `cursor_add_vertical` (`edit_cmds.c:1430-1462`).
+fn cursor_add_vertical(mut ed: Ed, cx: CmdCtx, below: bool) -> int {
+    if cx.win < 0 || ed.wins[cx.win].cs.curs.len == 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    let (lo0, hi0) = cursor_set_bounds(ed.wins[w].cs)
+    var lo = lo0
+    var hi = hi0
+    var c = copy ed.wins[w].cs.curs[ed.wins[w].cs.primary]
+    c.anchor = c.pos
+    let before = c.pos
+    if below {
+        text.cursor_down(ed.bufs[b].ec.tb, mut c, tabw(ed, b))
+    } else {
+        text.cursor_up(ed.bufs[b].ec.tb, mut c, tabw(ed, b))
+    }
+    let pos = c.pos
+    if pos != before &&
+        !text.cset_add(mut ed.wins[w].cs, c) &&
+        ed.wins[w].cs.curs.len >= text.MC_MAX {
+        ed_msg(mut ed, MSG_ERROR, "cursor limit is 10000")
+        return CMD_ERR_STATE
+    }
+    if pos < lo {
+        lo = pos
+    }
+    if pos > hi {
+        hi = pos
+    }
+    damage_offsets(mut ed, lo, hi)
+    CMD_OK
+}
+
+/// `ed.cursor.add.above`.
+pub fn ec_cursor_add_above(mut ed: Ed, cx: CmdCtx) -> int {
+    cursor_add_vertical(mut ed, cx, false)
+}
+
+/// `ed.cursor.add.below`.
+pub fn ec_cursor_add_below(mut ed: Ed, cx: CmdCtx) -> int {
+    cursor_add_vertical(mut ed, cx, true)
+}
+
+/// `ed.cursor.drop` (`edit_cmds.c:1474-1485`).
+pub fn ec_cursor_drop(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let (lo, hi) = cursor_set_bounds(ed.wins[w].cs)
+    let _ = text.cset_drop_latest(mut ed.wins[w].cs)
+    damage_offsets(mut ed, lo, hi)
+    CMD_OK
+}
+
+/// `ed.cursor.collapse` (`edit_cmds.c:1487-1501`).
+pub fn ec_cursor_collapse(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].cs.curs.len == 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let (lo, hi) = cursor_set_bounds(ed.wins[w].cs)
+    text.cset_remove_all_but_primary(mut ed.wins[w].cs)
+    ed.wins[w].cs.curs[0].anchor = ed.wins[w].cs.curs[0].pos
+    selstack_clear(mut ed.wins[w])
+    damage_offsets(mut ed, lo, hi)
+    CMD_OK
+}
+
+// `insert_bytes_at` (`edit_cmds.c:1503-1534`).
+fn insert_bytes_at(mut ed: Ed, cx: CmdCtx, at: int, bytes: List[byte], lo: int, hi: int) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let _ = c
+    let _ = b
+    if !ed_edit_insert(mut ed, w, at, bytes, lo, hi) {
+        ed_finish_edit(mut ed, w)
+        ed_msg(mut ed, MSG_ERROR, "cannot persist edit to crash journal")
+        return CMD_ERR_IO
+    }
+    ed_finish_edit(mut ed, w)
+    ed.wins[w].wrap_goal_valid = false
+    ed.cursor_follow_pending = true
+    CMD_OK
+}
+
+fn insert_bytes(mut ed: Ed, cx: CmdCtx, bytes: List[byte]) -> int {
+    let (ok, w, _, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let at = ed.wins[w].cs.curs[c].pos
+    insert_bytes_at(mut ed, cx, at, bytes, 0, bytes.len)
+}
+
+fn sarg_bytes(cx: CmdCtx) -> List[byte] {
+    var v = List[byte]()
+    for x in cx.sarg.bytes() {
+        (mut v).push(x)
+    }
+    v
+}
+
+fn edit_is_cmdline(ed: Ed, cx: CmdCtx) -> bool {
+    ed.cmdline.active && cx.win == cmdline_target(ed)
+}
+
+/// `ed.edit.insert.text` (`edit_cmds.c:1554-1596`): the argument at the
+/// caret; an opener pairs, a remembered closer is stepped over.
+pub fn ec_insert_text(mut ed: Ed, cx: CmdCtx) -> int {
+    if !cx.has_sarg {
+        return CMD_ERR_ARG
+    }
+    let bytes = sarg_bytes(cx)
+    if bytes.len != 1 || edit_is_cmdline(ed, cx) || !pairs_interesting(bytes[0] as int) {
+        return insert_bytes(mut ed, cx, bytes)
+    }
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let at = ed.wins[w].cs.curs[c].pos
+    let (action, closer) = pairs_decide(mut ed.bufs[b], ed.opts.autopair, at, bytes[0] as int)
+    if action == PAIR_SKIP {
+        ed.wins[w].cs.curs[c].pos = at + 1
+        ed.wins[w].cs.curs[c].anchor = at + 1
+        ed.wins[w].wrap_goal_valid = false
+        ed.cursor_follow_pending = true
+        return CMD_OK
+    }
+    if action == PAIR_CLOSE {
+        var both = List[byte]()
+        (mut both).push(bytes[0])
+        (mut both).push(closer as byte)
+        let status = insert_bytes_at(mut ed, cx, at, both, 0, 2)
+        if status != CMD_OK {
+            return status
+        }
+        ed.wins[w].cs.curs[c].pos = at + 1
+        ed.wins[w].cs.curs[c].anchor = at + 1
+        pairs_remember(mut ed.bufs[b], at + 1, closer)
+        return CMD_OK
+    }
+    insert_bytes(mut ed, cx, bytes)
+}
+
+/// `ed.edit.insert.at` (`edit_cmds.c:1598-1615`): the argument at offset
+/// `iarg`.
+pub fn ec_insert_at(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || !cx.has_sarg {
+        return CMD_ERR_ARG
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident || cx.iarg < 0 || cx.iarg > text.textbuf_len(ed.bufs[b].ec.tb) {
+        return CMD_ERR_ARG
+    }
+    let bytes = sarg_bytes(cx)
+    if !ed_edit_insert(mut ed, w, cx.iarg, bytes, 0, bytes.len) {
+        ed_finish_edit(mut ed, w)
+        return CMD_ERR_IO
+    }
+    ed_finish_edit(mut ed, w)
+    ed_damage_document(mut ed)
+    CMD_OK
+}
+
+/// `ed.edit.delete.span` (`edit_cmds.c:1617-1633`): the range's span, or
+/// the empty span at `iarg`.
+pub fn ec_delete_span_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident {
+        return CMD_ERR_STATE
+    }
+    let lo = if cx.range.given then cx.range.lo else cx.iarg
+    let hi = if cx.range.given then cx.range.hi else cx.iarg
+    if lo > hi || hi > text.textbuf_len(ed.bufs[b].ec.tb) || lo < 0 {
+        return CMD_ERR_ARG
+    }
+    if !ed_edit_delete(mut ed, w, lo, hi) {
+        ed_finish_edit(mut ed, w)
+        return CMD_ERR_IO
+    }
+    ed_finish_edit(mut ed, w)
+    ed_damage_document(mut ed)
+    CMD_OK
+}
+
+/// `ed.edit.replace.span` (`edit_cmds.c:1635-1656`).
+pub fn ec_replace_span(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || !cx.has_sarg {
+        return CMD_ERR_ARG
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident {
+        return CMD_ERR_ARG
+    }
+    let lo = if cx.range.given then cx.range.lo else cx.iarg
+    let hi = if cx.range.given then cx.range.hi else cx.iarg
+    if lo > hi || hi > text.textbuf_len(ed.bufs[b].ec.tb) || lo < 0 {
+        return CMD_ERR_ARG
+    }
+    let bytes = sarg_bytes(cx)
+    if !ed_edit_delete(mut ed, w, lo, hi) || !ed_edit_insert(mut ed, w, lo, bytes, 0, bytes.len) {
+        ed_finish_edit(mut ed, w)
+        return CMD_ERR_IO
+    }
+    ed_finish_edit(mut ed, w)
+    ed_damage_document(mut ed)
+    CMD_OK
+}
+
+/// `ed.cursor.set` (`edit_cmds.c:1658-1677`): the cursor to offset `iarg`.
+pub fn ec_cursor_set(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_ARG
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    let n = ed.wins[w].cs.curs.len
+    let bad_index = if cx.cursor_given then cx.cursor_index >= n else ed.wins[w].cs.primary >= n
+    if !ed.bufs[b].resident ||
+        n == 0 ||
+        bad_index ||
+        cx.iarg < 0 ||
+        cx.iarg > text.textbuf_len(ed.bufs[b].ec.tb) {
+        return CMD_ERR_ARG
+    }
+    let c = if cx.cursor_given then cx.cursor_index else ed.wins[w].cs.primary
+    place(mut ed, w, c, cx.iarg)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    ed_damage_document(mut ed)
+    CMD_OK
+}
+
+fn pair_closer(opener: int) -> int {
+    match opener {
+        123 => 125,
+        91 => 93,
+        40 => 41,
+        _ => 0,
+    }
+}
+
+fn byte_or(tb: text.TextBuf, off: int) -> int {
+    if off < 0 || off >= text.textbuf_len(tb) then -1 else text.textbuf_byte_at(tb, off)
+}
+
+// `insert_newline_indent` (`edit_cmds.c:1725-1807`): the EOL and the
+// carried indent as ONE insert; a block opener adds an indent level and,
+// before its closer, a second line.
+fn insert_newline_indent(mut ed: Ed, cx: CmdCtx, eol: List[byte]) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let pos = ed.wins[w].cs.curs[c].pos
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    let sp = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+    let info = indent_info(ed.bufs[b].ec.tb, sp, tabw(ed, b))
+    let carry_hi = if info.first < pos then info.first else pos
+    let strip = carry_hi == pos && pos > sp.lo
+    let at = if strip then sp.lo else pos
+    var payload = List[byte]()
+    for x in eol {
+        (mut payload).push(x)
+    }
+    indent_lead_append(ed.bufs[b].ec.tb, text.span(sp.lo, carry_hi), mut payload)
+    var block = false
+    let (has_last, last) = indent_last_nonwhite(ed.bufs[b].ec.tb, text.span(sp.lo, pos))
+    if has_last && pair_closer(last) != 0 {
+        indent_unit_append(ed.opts.expandtab, tabw(ed, b), mut payload)
+        block = byte_or(ed.bufs[b].ec.tb, pos) == pair_closer(last)
+    }
+    let caret_at = at + payload.len
+    if block {
+        for x in eol {
+            (mut payload).push(x)
+        }
+        indent_lead_append(ed.bufs[b].ec.tb, text.span(sp.lo, carry_hi), mut payload)
+    }
+    var good = true
+    if strip {
+        good = ed_edit_delete(mut ed, w, sp.lo, pos)
+    }
+    if good {
+        good = ed_edit_insert(mut ed, w, at, payload, 0, payload.len)
+    }
+    if !good {
+        ed_finish_edit(mut ed, w)
+        ed_msg(mut ed, MSG_ERROR, "cannot persist edit to crash journal")
+        return CMD_ERR_IO
+    }
+    ed_finish_edit(mut ed, w)
+    ed.wins[w].cs.curs[c].pos = caret_at
+    ed.wins[w].cs.curs[c].anchor = caret_at
+    ed.wins[w].wrap_goal_valid = false
+    ed.cursor_follow_pending = true
+    CMD_OK
+}
+
+/// `ed.edit.insert.newline` (`edit_cmds.c:1809-1832`): the buffer's own
+/// EOL; with autoindent, the indent comfort.
+pub fn ec_insert_newline(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let b = ed.wins[cx.win].buf
+    let eol = text.filemeta_eol_bytes(ed.bufs[b].ec.meta)
+    if edit_is_cmdline(ed, cx) || !ed.opts.autoindent {
+        return insert_bytes(mut ed, cx, eol)
+    }
+    insert_newline_indent(mut ed, cx, eol)
+}
+
+/// `ed.edit.insert.tab` (`edit_cmds.c:1834-1933`).
+pub fn ec_insert_tab(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let pos = ed.wins[w].cs.curs[c].pos
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    let sp = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+    let t = tabw(ed, b)
+    let info = indent_info(ed.bufs[b].ec.tb, sp, t)
+    var unit = List[byte]()
+    indent_unit_append(ed.opts.expandtab, t, mut unit)
+    if unit.len == 0 {
+        return CMD_ERR_STATE
+    }
+    if edit_is_cmdline(ed, cx) || !ed.opts.autoindent {
+        return insert_bytes(mut ed, cx, unit)
+    }
+    if !info.blank && pos < info.first {
+        ed.wins[w].cs.curs[c].pos = info.first
+        ed.wins[w].cs.curs[c].anchor = info.first
+        ed.wins[w].wrap_goal_valid = false
+        ed.cursor_follow_pending = true
+        return CMD_OK
+    }
+    if !info.blank && pos == info.first {
+        let status = insert_bytes_at(mut ed, cx, sp.lo, unit, 0, unit.len)
+        if status == CMD_OK {
+            ed.wins[w].cs.curs[c].pos = info.first + unit.len
+            ed.wins[w].cs.curs[c].anchor = info.first + unit.len
+        }
+        return status
+    }
+    if info.blank && line != 0 {
+        var probe = line
+        var found = false
+        var anchor = copy sp
+        while probe != 0 {
+            probe -= 1
+            anchor = text.textbuf_line_span(ed.bufs[b].ec.tb, probe as text.LineNo)
+            let above = indent_info(ed.bufs[b].ec.tb, copy anchor, t)
+            if !above.blank {
+                found = above.width > info.width
+                break
+            }
+        }
+        if found {
+            let above = indent_info(ed.bufs[b].ec.tb, copy anchor, t)
+            var lead = List[byte]()
+            indent_lead_append(ed.bufs[b].ec.tb, text.span(anchor.lo, above.first), mut lead)
+            let status = insert_bytes_at(mut ed, cx, sp.lo, lead, 0, lead.len)
+            if status == CMD_OK {
+                ed.wins[w].cs.curs[c].pos = sp.lo + lead.len
+                ed.wins[w].cs.curs[c].anchor = sp.lo + lead.len
+            }
+            return status
+        }
+    }
+    insert_bytes(mut ed, cx, unit)
+}
+
+/// `ed.edit.insert.after` (`edit_cmds.c:1935-1950`): one grapheme right,
+/// then I.
+pub fn ec_insert_after(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let pos = ed.wins[w].cs.curs[c].pos
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    let end = line_content_end(mut ed.bufs[b].ec.tb, line)
+    if pos < end {
+        text.cursor_right(ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[c])
+    }
+    mode_enter(mut ed, MODE_I)
+}
+
+// `open_line` (`edit_cmds.c:1952-1990`).
+fn open_line(mut ed: Ed, cx: CmdCtx, below: bool) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let _ = c
+    let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    let sp = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+    let lines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    let eol = text.filemeta_eol_bytes(ed.bufs[b].ec.meta)
+    let at = if below then sp.hi else sp.lo
+    var placed = at
+    if below && line + 1 == lines {
+        placed = at + eol.len
+    }
+    if !ed_edit_insert(mut ed, w, at, eol, 0, eol.len) {
+        ed_finish_edit(mut ed, w)
+        ed_msg(mut ed, MSG_ERROR, "cannot persist edit to crash journal")
+        return CMD_ERR_IO
+    }
+    ed_finish_edit(mut ed, w)
+    let p = ed.wins[w].cs.primary
+    place(mut ed, w, p, placed)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    ed_damage_line(mut ed, line, true)
+    mode_enter(mut ed, MODE_I)
+}
+
+/// `ed.edit.line.open_below`.
+pub fn ec_open_below(mut ed: Ed, cx: CmdCtx) -> int {
+    open_line(mut ed, cx, true)
+}
+
+/// `ed.edit.line.open_above`.
+pub fn ec_open_above(mut ed: Ed, cx: CmdCtx) -> int {
+    open_line(mut ed, cx, false)
+}
+
+// `delete_span` (`edit_cmds.c:2002-2030`).
+fn delete_span(mut ed: Ed, cx: CmdCtx, sp: text.Span) -> int {
+    let (ok, w, b, _) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    if sp.lo > sp.hi || sp.hi > text.textbuf_len(ed.bufs[b].ec.tb) {
+        return CMD_ERR_ARG
+    }
+    if !ed_edit_delete(mut ed, w, sp.lo, sp.hi) {
+        ed_finish_edit(mut ed, w)
+        ed_msg(mut ed, MSG_ERROR, "cannot persist edit to crash journal")
+        return CMD_ERR_IO
+    }
+    ed_finish_edit(mut ed, w)
+    ed.wins[w].wrap_goal_valid = false
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.edit.delete.grapheme_left` (`edit_cmds.c:2032-2064`): an empty
+/// pair whole; one indent level inside leading whitespace.
+pub fn ec_delete_grapheme_left(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let pos = ed.wins[w].cs.curs[c].pos
+    if edit_is_cmdline(ed, cx) {
+        let prev = text.grapheme_prev_boundary(mut ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+        return delete_span(mut ed, cx, text.span(prev, pos))
+    }
+    let (pair, both) = pairs_backspace(mut ed.bufs[b], ed.opts.autopair, pos)
+    if pair {
+        return delete_span(mut ed, cx, both)
+    }
+    var prev = 0
+    if ed.opts.autoindent {
+        let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
+        let ls = text.textbuf_line_span(ed.bufs[b].ec.tb, line)
+        prev = indent_back(mut ed.bufs[b].ec.tb, ls, tabw(ed, b), pos)
+    } else {
+        prev = text.grapheme_prev_boundary(mut ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    }
+    delete_span(mut ed, cx, text.span(prev, pos))
+}
+
+/// `ed.edit.delete.grapheme` (`edit_cmds.c:2066-2077`).
+pub fn ec_delete_grapheme(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let pos = ed.wins[w].cs.curs[c].pos
+    let next = text.grapheme_next_boundary(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    delete_span(mut ed, cx, text.span(pos, next))
+}
+
+/// `ed.edit.line.delete` (`edit_cmds.c:2079-2096`): the caret's line with
+/// its newline (the last line takes the newline before it).
+pub fn ec_delete_line(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b, c) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    if cx.range.kind != 0 {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            "not yet ported: command ranges: sagitta Sprint 18 (the command line) (yw04)",
+        )
+        return CMD_ERR_DEFERRED
+    }
+    let pos = ed.wins[w].cs.curs[c].pos
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+    var sp = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+    if line + 1 == text.textbuf_line_count(ed.bufs[b].ec.tb) && line != 0 {
+        sp = text.span(
+            text.grapheme_prev_boundary(mut ed.bufs[b].ec.tb, sp.lo as text.ByteOff) as int,
+            sp.hi,
+        )
+    }
+    delete_span(mut ed, cx, sp)
+}
+
+// `yew_edit_cmd_undo`/`_redo` (`edit_cmds.c:2098-2180`).
+fn undo_redo(mut ed: Ed, cx: CmdCtx, redo: bool) -> int {
+    let (ok, w, b, _) = ew(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let jr_bad = ed.bufs[b].ec.has_jrnl && !text.journal_ok(ed.bufs[b].ec.jrnl)
+    var needs = false
+    if redo {
+        let cur = ed.bufs[b].ec.undo.cur
+        needs = cur != 0 &&
+            cur <= ed.bufs[b].ec.undo.nodes.len &&
+            ed.bufs[b].ec.undo.nodes[cur - 1].redo_child != 0
+    } else {
+        needs = text.undo_current(ed.bufs[b].ec.undo) != ed.bufs[b].ec.undo.root
+    }
+    var ensured = true
+    if needs && !jr_bad {
+        edit_take(mut ed, w)
+        ensured = text.edit_ensure_journal(mut ed.bufs[b].ec)
+        edit_give(mut ed, w)
+    }
+    if jr_bad || !ensured {
+        ed_finish_edit(mut ed, w)
+        ed_msg(mut ed, MSG_ERROR, "cannot persist edit to crash journal")
+        return CMD_ERR_IO
+    }
+    let batch = ed.wins[w].cs.curs.len > 1
+    if batch {
+        ed_damage_batch_begin(mut ed, w)
+    }
+    edit_take(mut ed, w)
+    let _ = if redo then text.redo(mut ed.bufs[b].ec) else text.undo(mut ed.bufs[b].ec)
+    edit_give(mut ed, w)
+    ed_finish_edit(mut ed, w)
+    if batch {
+        ed_damage_batch_end(mut ed)
+    }
+    if ed.bufs[b].ec.has_jrnl && !text.journal_ok(ed.bufs[b].ec.jrnl) {
+        ed_msg(mut ed, MSG_ERROR, "cannot persist edit to crash journal")
+        return CMD_ERR_IO
+    }
+    ed.wins[w].wrap_goal_valid = false
+    vp_invalidate(mut ed.wins[w])
+    ed.layout_dirty = true
+    follow(mut ed, w)
+    if !batch {
+        ed_damage_document(mut ed)
+    }
+    CMD_OK
+}
+
+/// `ed.edit.undo`.
+pub fn ec_undo(mut ed: Ed, cx: CmdCtx) -> int {
+    undo_redo(mut ed, cx, false)
+}
+
+/// `ed.edit.redo`.
+pub fn ec_redo(mut ed: Ed, cx: CmdCtx) -> int {
+    undo_redo(mut ed, cx, true)
+}
+
+/// `ed.edit.undo_barrier` (`edit_cmds.c:2182-2188`).
+pub fn ec_undo_barrier(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    ed_insert_barrier(mut ed)
+    CMD_OK
+}
+
+/// `ed.mode.enter` (`edit_cmds.c:2190-2234`): a mode letter; `H X` for H
+/// over unit X; `C` for the char unit.
+pub fn ec_mode_enter(mut ed: Ed, cx: CmdCtx) -> int {
+    if !cx.has_sarg {
+        return CMD_ERR_ARG
+    }
+    let s = cx.sarg
+    if s.len == 3 && s.starts_with("H ") {
+        let unit = match s[2..] {
+            "L" => MODE_L,
+            "W" => MODE_W,
+            "B" => MODE_B,
+            "C" => MODE_I,
+            _ => -1,
+        }
+        if unit < 0 {
+            return CMD_ERR_ARG
+        }
+        return mode_enter_highlight(mut ed, unit, true)
+    }
+    if s.len != 1 {
+        return CMD_ERR_ARG
+    }
+    if s == "C" {
+        ed.prev_unit = MODE_I
+        if ed.mode == MODE_H {
+            return mode_enter_highlight(mut ed, MODE_I, ed.wins[ed.win].h.sticky)
+        }
+        ed.footer_dirty = true
+        return CMD_OK
+    }
+    let m = mode_of_name(s)
+    if m < 0 {
+        return CMD_ERR_ARG
+    }
+    mode_enter(mut ed, m)
+}
+
+/// `ed.shell.open` (`edit_cmds.c:2236-2241`): `:` seeded with `!`.
+pub fn ec_shell_prompt(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    mode_enter_execute(mut ed, "!")
+}
+
+/// `ed.mode.escape` (`edit_cmds.c:2243-2248`).
+pub fn ec_mode_escape(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    mode_escape(mut ed)
+}
+
+fn selstack_push(mut s: text.SelStack, sp: text.Span) {
+    if s.n < s.s.len {
+        s.s[s.n] = sp
+    } else {
+        (mut s.s).push(sp)
+    }
+    s.n += 1
+}
