@@ -254,18 +254,21 @@ fn feed_bytes(mut ed: Ed, bytes: List[byte]) {
     loop_seed_probe(mut ed)
 }
 
-// `loop_read_input` (`loop.c:377-424`): the bytes the wait said are there,
-// then everything else already queued (the drain), up to the burst cap,
-// so a burst of typeahead is ONE dispatch pass and ONE frame. Answers
-// (ok, eof, burst_cap).
-fn loop_read_input(mut ed: Ed) -> (bool, bool, bool) {
+// `loop_read_input` (`loop.c:377-424`), first half: the bytes the wait
+// said are there (at 0.2.33 in the `VTIME` tick, a read that may block up
+// to 100 ms; `hangup` at the end of input). Answers (ok, eof, bytes).
+fn loop_read_first(ed: Ed) -> (bool, bool, List[byte]) {
     let first = term.tty_read(ed.tty) else |e| match e {
-        hangup => { return (true, true, false) },
-        io => { return (false, false, false) },
+        hangup => { return (true, true, List[byte]()) },
+        io => { return (false, false, List[byte]()) },
     }
-    if first.len == 0 {
-        return (true, false, false)
-    }
+    (true, false, first)
+}
+
+// `loop_read_input`'s second half: `first`, then everything else already
+// queued (the drain), up to the burst cap, so a burst of typeahead is ONE
+// dispatch pass and ONE frame. Answers whether the cap was reached.
+fn loop_read_rest(mut ed: Ed, first: List[byte]) -> bool {
     var drained = first.len
     feed_bytes(mut ed, first)
     term.tty_drain_begin(mut ed.tty)
@@ -278,7 +281,20 @@ fn loop_read_input(mut ed: Ed) -> (bool, bool, bool) {
         feed_bytes(mut ed, more)
     }
     term.tty_drain_end(mut ed.tty)
-    (true, false, drained >= INPUT_BURST_MAX)
+    drained >= INPUT_BURST_MAX
+}
+
+/// Whether bytes a `VTIME` read returned at `t` arrived after the wait's
+/// deadline (`deadline_ms` from `waited`): C's `poll(2)` with that deadline
+/// as its timeout would have returned at the deadline with nothing to read
+/// and run that turn first (`loop.c:568-640`) — a lone ESC expiring to
+/// Escape, a chord timing out, a timer firing — and read these bytes on the
+/// next turn. At 0.2.33 the wait cannot time out below the tick (G2,
+/// wolf-lang#795), so the loop orders the two itself; bytes already queued
+/// when the wait began return at once (`t == waited`) and are fed in the
+/// same turn, as C's `poll` answers them.
+pub fn loop_deadline_passed_first(waited: int, deadline_ms: int, t: int) -> bool {
+    deadline_ms > 0 && t > waited && t - waited >= deadline_ms
 }
 
 /// `yew_loop_dispatch_event` (`loop.c:426-473`): one decoded event.
@@ -319,6 +335,28 @@ fn handle_signal(mut ed: Ed, m: int) {
     }
 }
 
+// The turn after the read (`loop.c:568-757`): the probe, every decoded
+// event, the chord's timeout, the timers, layout and one render. Answers
+// whether the editor quits.
+fn loop_turn(mut ed: Ed, mut key: term.Key, now: int) -> bool {
+    ed.now_ms = now
+    term.probe_tick(mut ed.tty, now)
+    loop_seed_probe(mut ed)
+    while term.input_next(mut ed.input, now, mut key) {
+        loop_dispatch_event(mut ed, key, now)
+    }
+    dispatch_tick(mut ed, now)
+    ed_timers_fire(mut ed, now)
+    if ed.quit {
+        return true
+    }
+    if ed.layout_dirty {
+        ed_layout(mut ed)
+    }
+    ed_render(mut ed)
+    ed.quit
+}
+
 /// `yew_loop_run` (`loop.c:509-757`): wait, read, drain signals, decode
 /// and dispatch every event, fire deadlines, lay out, render once.
 pub fn loop_run(mut ed: Ed) -> int {
@@ -326,38 +364,37 @@ pub fn loop_run(mut ed: Ed) -> int {
     loop {
         var now = now_ms()
         loop_seed_probe(mut ed)
-        let m = term.tty_wait(mut ed.tty, loop_deadline(ed, now)) else |_| {
+        let d = loop_deadline(ed, now)
+        let m = term.tty_wait(mut ed.tty, d) else |_| {
             return util.EXIT_IO
         }
+        let waited = now
         now = now_ms()
         ed.now_ms = now
         if m != 0 {
             handle_signal(mut ed, m)
         } else {
-            let (ok, eof, _) = loop_read_input(mut ed)
+            let (ok, eof, first) = loop_read_first(ed)
             if !ok {
                 return util.EXIT_IO
+            }
+            if first.len > 0 {
+                let t = now_ms()
+                if loop_deadline_passed_first(waited, d, t) {
+                    if loop_turn(mut ed, mut key, waited + d) {
+                        return ed.exit_code
+                    }
+                }
+                now = t
+                ed.now_ms = now
+                let _ = loop_read_rest(mut ed, first)
             }
             if eof {
                 term.input_eof(mut ed.input)
                 ed.quit = true
             }
         }
-        term.probe_tick(mut ed.tty, now)
-        loop_seed_probe(mut ed)
-        while term.input_next(mut ed.input, now, mut key) {
-            loop_dispatch_event(mut ed, key, now)
-        }
-        dispatch_tick(mut ed, now)
-        ed_timers_fire(mut ed, now)
-        if ed.quit {
-            return ed.exit_code
-        }
-        if ed.layout_dirty {
-            ed_layout(mut ed)
-        }
-        ed_render(mut ed)
-        if ed.quit {
+        if loop_turn(mut ed, mut key, now) {
             return ed.exit_code
         }
     }
