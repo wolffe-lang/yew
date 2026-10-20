@@ -1,11 +1,302 @@
-//! edit.multicursor — STUB while the H/multi-cursor fork ports the
-//! editor half of `src/edit/multicursor.c` (yw03-hmode).
+//! edit.multicursor — the fan-out: one buffer-changing command run once
+//! per cursor, as one batch inside the one transaction the dispatcher
+//! opened.
+//!
+//! Ports the command half of sagitta `src/edit/multicursor.c` (lines
+//! 462-507, 601-760 and 881-965 of 965) at 9ace98c2, under
+//! `s17-mode-H-multicursor.md` §3; the cursor set itself (sorting,
+//! merging, `cset_adjust`'s deferred batch delta) is `text.cset`'s (yw02).
+//! `mc_run` visits the cursors in ascending order with `cs.active` naming
+//! the one a handler acts on (`edit_cmds.lu`'s `ew` refuses any other);
+//! the cursors not yet visited carry the batch's running delta unapplied,
+//! so each edit costs one cursor update, not one per cursor, and each
+//! visited cursor is materialized exactly when its turn comes. A delete
+//! that two cursors' ranges would both take (two Backspaces over one
+//! cluster) is run once: the skip plan, computed over the ORIGINAL text,
+//! drops the later cursor into its owner instead of deleting twice. The
+//! symbol index C invalidates first (`yew_symidx_invalidate_buffer`) is
+//! campaign 09's (yw11) and has no instance before it.
 
-// stub until the fork lands: `yew_mc_run`.
-fn mc_run(mut ed: Ed, w: int, id: int, mut cx: CmdCtx) -> int {
-    let _ = w
-    let _ = id
-    cx.win = w
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: multi-cursor editing (yw03-hmode)")
-    CMD_ERR_DEFERRED
+use text
+
+// `add_delta` (`multicursor.c:446-460`): an offset moved by the batch's
+// running delta; a result below zero is the internal error.
+fn add_delta(position: int, delta: int) -> int {
+    let moved = position + delta
+    if moved < 0 {
+        bug("cursor batch: offset underflow")
+    }
+    moved
+}
+
+// `materialize_from` (`multicursor.c:462-476`): every cursor from `first`
+// on takes the pending delta.
+fn mc_materialize_from(mut cs: text.CursorSet, first: int) {
+    if !cs.batching {
+        return
+    }
+    var i = first
+    while i < cs.curs.len {
+        cs.curs[i].pos = add_delta(cs.curs[i].pos, cs.batch_delta)
+        cs.curs[i].anchor = add_delta(cs.curs[i].anchor, cs.batch_delta)
+        i += 1
+    }
+    cs.batch_delta = 0
+    cs.batch_next = cs.curs.len
+}
+
+// `batch_materialize_active` (`multicursor.c:478-492`): the cursor whose
+// turn it is takes the pending delta, once.
+fn mc_materialize_active(mut cs: text.CursorSet) {
+    if !cs.batching || cs.active == text.MC_ACTIVE_NONE {
+        return
+    }
+    if cs.active < cs.batch_next {
+        return
+    }
+    if cs.active != cs.batch_next {
+        bug("cursor batch visited out of order")
+    }
+    let a = cs.active
+    cs.curs[a].pos = add_delta(cs.curs[a].pos, cs.batch_delta)
+    cs.curs[a].anchor = add_delta(cs.curs[a].anchor, cs.batch_delta)
+    cs.batch_next += 1
+}
+
+// One planned skip (`McSkip`, `multicursor.c:596-599`): the cursor whose
+// range an earlier cursor's already covers, and that earlier cursor.
+struct McSkip {
+    stamp: int,
+    owner_stamp: int,
+}
+
+// `command_original_range` (`multicursor.c:601-654`): the span the
+// deleting commands would take at `c` in the unedited text.
+fn command_original_range(name: str, mut tb: text.TextBuf, c: text.Cursor, repeats: int) -> (
+    bool,
+    text.Span,
+) {
+    if name == "ed.edit.delete.grapheme" || name == "ed.edit.delete.next" {
+        var at = c.pos
+        let lo = at
+        var i = 0
+        while i < repeats {
+            at = text.grapheme_next_boundary(tb, at as text.ByteOff) as int
+            i += 1
+        }
+        return (lo != at, text.span(lo, at))
+    }
+    if name == "ed.edit.delete.grapheme_left" || name == "ed.edit.delete.prev" {
+        var at = c.pos
+        let hi = at
+        var i = 0
+        while i < repeats {
+            at = text.grapheme_prev_boundary(mut tb, at as text.ByteOff) as int
+            i += 1
+        }
+        return (at != hi, text.span(at, hi))
+    }
+    if name == "ed.edit.line.delete" {
+        let line = text.textbuf_line_of(tb, c.pos as text.ByteOff) as int
+        let lines = text.textbuf_line_count(tb)
+        let forward = lines - line
+        let count = repeats
+        var lo = 0
+        var hi = 0
+        if count < forward {
+            lo = text.textbuf_line_start(tb, line as text.LineNo) as int
+            hi = text.textbuf_line_start(tb, (line + count) as text.LineNo) as int
+        } else {
+            let extra = count - forward
+            hi = text.textbuf_len(tb)
+            if line == 0 {
+                lo = 0
+            } else if extra == 0 {
+                lo = text.grapheme_prev_boundary(
+                    mut tb,
+                    text.textbuf_line_start(tb, line as text.LineNo),
+                ) as int
+            } else {
+                let first = if extra >= line then 0 else line - extra
+                lo = text.textbuf_line_start(tb, first as text.LineNo) as int
+            }
+        }
+        return (lo != hi, text.span(lo, hi))
+    }
+    (false, text.span(0, 0))
+}
+
+// `build_skip_plan` (`multicursor.c:656-692`): a cursor whose original
+// range overlaps the last accepted one is skipped into that one's owner.
+fn build_skip_plan(
+    name: str,
+    mut tb: text.TextBuf,
+    cs: text.CursorSet,
+    repeats: int,
+) -> List[McSkip] {
+    var skips = List[McSkip]()
+    var acc_lo = 0
+    var acc_hi = 0
+    var owner_stamp = 0
+    var have_accepted = false
+    var i = 0
+    while i < cs.curs.len {
+        let (has, range) = command_original_range(name, mut tb, copy cs.curs[i], repeats)
+        if has {
+            if have_accepted && range.lo < acc_hi && acc_lo < range.hi {
+                (mut skips).push(McSkip { stamp: cs.stamps[i], owner_stamp: owner_stamp })
+            } else {
+                acc_lo = range.lo
+                acc_hi = range.hi
+                owner_stamp = cs.stamps[i]
+                have_accepted = true
+            }
+        }
+        i += 1
+    }
+    skips
+}
+
+// `skip_owner` (`multicursor.c:694-706`).
+fn skip_owner(skips: List[McSkip], stamp: int) -> (bool, int) {
+    for s in skips {
+        if s.stamp == stamp {
+            return (true, s.owner_stamp)
+        }
+    }
+    (false, 0)
+}
+
+// `batch_remove_active` (`multicursor.c:708-754`): the skipped cursor
+// leaves the set; the primary passes to its owner with its goal column
+// and selection stack.
+fn batch_remove_active(mut cs: text.CursorSet, owner_stamp: int) {
+    let active = cs.active
+    if !cs.batching ||
+        cs.active == text.MC_ACTIVE_NONE ||
+        active >= cs.curs.len ||
+        cs.batch_next != active + 1 {
+        bug("cursor batch: cannot remove inactive cursor")
+    }
+    var owner = 0
+    while owner < cs.stamps.len {
+        if cs.stamps[owner] == owner_stamp {
+            break
+        }
+        owner += 1
+    }
+    if owner == cs.stamps.len {
+        bug("cursor batch: overlap owner stamp {owner_stamp} disappeared at {active}")
+    }
+    if owner >= active {
+        bug("cursor batch: overlap owner {owner} was not before active {active}")
+    }
+    if cs.primary == active {
+        cs.curs[owner].goal_col = cs.curs[active].goal_col
+        cs.selstacks[owner] = copy cs.selstacks[active]
+        cs.primary = owner
+    } else if cs.primary > active {
+        cs.primary -= 1
+    }
+    var c = List[text.Cursor]()
+    var s = List[int]()
+    var st = List[text.SelStack]()
+    var i = 0
+    while i < cs.curs.len {
+        if i != active {
+            (mut c).push(copy cs.curs[i])
+            (mut s).push(cs.stamps[i])
+            (mut st).push(copy cs.selstacks[i])
+        }
+        i += 1
+    }
+    cs.curs = c
+    cs.stamps = s
+    cs.selstacks = st
+    cs.batch_next -= 1
+    if active >= cs.curs.len {
+        cs.active = text.MC_ACTIVE_NONE
+    }
+}
+
+/// `yew_mc_run` (`multicursor.c:881-965`): run buffer-changing command
+/// `id` once per cursor of window `w` (`count` times each for a
+/// `REPEATABLE` one), in ascending order, inside the `TXN_MULTI` (or
+/// macro) transaction the dispatcher opened, as one damage batch; then
+/// the set normalized and the merge count reported.
+pub fn mc_run(mut ed: Ed, w: int, id: int, mut cx: CmdCtx) -> int {
+    if w < 0 || w >= ed.wins.len || cx.win != w || ed.wins[w].cs.curs.len < 2 {
+        return CMD_ERR_STATE
+    }
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident {
+        return CMD_ERR_STATE
+    }
+    let prep = cmd_prepare(mut ed.reg, id, cx)
+    if prep != CMD_OK {
+        return prep
+    }
+    let name = ed.reg.entries[id - 1].name
+    let flags = ed.reg.entries[id - 1].flags
+    if flags & CMD_CHANGES_BUFFER == 0 {
+        return CMD_ERR_ARG
+    }
+    text.cset_check_text(ed.bufs[b].ec.tb, ed.wins[w].cs)
+    // C's read-only context check: the caller already opened a multi
+    // transaction (`multicursor.c:903-917`).
+    if !ed.bufs[b].ec.has_undo ||
+        ed.bufs[b].ec.undo.depth == 0 ||
+        ed.bufs[b].ec.undo.pending_reason != text.TXN_MULTI &&
+            ed.bufs[b].ec.undo.pending_reason != text.TXN_MACRO {
+        return CMD_ERR_STATE
+    }
+    let before_count = ed.wins[w].cs.curs.len
+    let repeats = if flags & CMD_REPEATABLE != 0 then cx.count else 1
+    let skips = build_skip_plan(name, mut ed.bufs[b].ec.tb, ed.wins[w].cs, repeats)
+    ed_damage_batch_begin(mut ed, w)
+    ed.wins[w].cs.active = 0
+    ed.wins[w].cs.batching = true
+    ed.wins[w].cs.batch_delta = 0
+    ed.wins[w].cs.batch_next = 1
+    var status = CMD_OK
+    while ed.wins[w].cs.active != text.MC_ACTIVE_NONE &&
+        ed.wins[w].cs.active < ed.wins[w].cs.curs.len &&
+        status == CMD_OK {
+        mc_materialize_active(mut ed.wins[w].cs)
+        let a = ed.wins[w].cs.active
+        let (skip, owner_stamp) = skip_owner(skips, ed.wins[w].cs.stamps[a])
+        if skip {
+            batch_remove_active(mut ed.wins[w].cs, owner_stamp)
+            continue
+        }
+        var r = 0
+        while r < repeats && status == CMD_OK {
+            if ed.wins[w].cs.active == text.MC_ACTIVE_NONE ||
+                ed.wins[w].cs.active >= ed.wins[w].cs.curs.len {
+                break
+            }
+            cx.cursor_index = ed.wins[w].cs.active
+            status = run_entry(mut ed, id, cx)
+            r += 1
+        }
+        if status == CMD_OK {
+            ed.wins[w].cs.active += 1
+        }
+    }
+    let next = ed.wins[w].cs.batch_next
+    mc_materialize_from(mut ed.wins[w].cs, next)
+    ed.wins[w].cs.batching = false
+    ed.wins[w].cs.batch_delta = 0
+    ed.wins[w].cs.batch_next = 0
+    ed.wins[w].cs.active = text.MC_ACTIVE_NONE
+    if status == CMD_OK {
+        text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+        let merged = before_count - ed.wins[w].cs.curs.len
+        if merged != 0 {
+            let plural = if merged == 1 then "" else "s"
+            ed_msg(mut ed, MSG_INFO, "{merged} cursor{plural} merged")
+        }
+    }
+    ed_damage_batch_end(mut ed)
+    status
 }
