@@ -1,0 +1,389 @@
+//! edit.message — the timed message line.
+//!
+//! Ports sagitta `src/ui/message.c` (475 lines) and `ui/message.h` (48)
+//! at 9ace98c2, under `s15-viewport-statusline.md` §5: an info message
+//! expires after 4 s, a warning after 8 s, an error and a prompt never; a
+//! prompt is not displaced by a later message, an error not by a later
+//! info; the message replaces the statusline body and keeps the mode chip
+//! (in the mode's BUILT-IN style, `yew_statusline_mode_style`, not the
+//! theme's — C's own draw reads it unthemed); a message too long for the
+//! row is clipped at a grapheme boundary with an ellipsis and can expand
+//! to an overlay of up to five rows. C formats with `printf`; the port's
+//! callers pass the finished text.
+
+use term
+use unicode
+
+const MESSAGE_INFO_MS: int = 4000
+
+const MESSAGE_WARN_MS: int = 8000
+
+const MESSAGE_OVERLAY_ROWS: int = 5
+
+const MESSAGE_WARN_COLOR: int = 214
+
+const MESSAGE_ERROR_COLOR: int = 196
+
+const MESSAGE_PROMPT_COLOR: int = 81
+
+fn visible_is_msg(ed: Ed) -> bool {
+    ed.msg.active
+}
+
+/// Whether a message or hint shows (`yew_msg_visible`).
+pub fn msg_visible(ed: Ed) -> bool {
+    ed.msg.active || ed.msg_hint.active
+}
+
+// `message_damage` (`message.c:51-64`).
+fn message_damage(mut ed: Ed) {
+    ed.footer_dirty = true
+    if ed.msg.expanded {
+        ed.full_damage = true
+    }
+}
+
+/// The expiry timer's firing (`message_expire`, `message.c:66-80`).
+pub fn msg_expire(mut ed: Ed) {
+    let expanded = ed.msg.expanded
+    message_damage(mut ed)
+    ed.msg = msg_none()
+    ed.footer_dirty = true
+    if expanded {
+        ed.full_damage = true
+    }
+}
+
+/// `yew_msg_clear` (`message.c:82-97`).
+pub fn ed_msg_clear(mut ed: Ed) {
+    let expanded = ed.msg.expanded
+    message_damage(mut ed)
+    if ed.msg.expiry != TIMER_NONE {
+        let _ = timer_cancel(mut ed.timers, ed.msg.expiry)
+    }
+    ed.msg = msg_none()
+    ed.footer_dirty = true
+    if expanded {
+        ed.full_damage = true
+    }
+}
+
+/// `yew_msg_hint_clear` (`message.c:99-106`).
+pub fn ed_msg_hint_clear(mut ed: Ed) {
+    ed.msg_hint = msg_none()
+    ed.footer_dirty = true
+}
+
+/// `yew_msg_hint` (`message.c:108-147`): low-priority persistent text a
+/// real message displaces for a while.
+pub fn ed_msg_hint(mut ed: Ed, sev: int, text: str) {
+    ed_msg_hint_clear(mut ed)
+    ed.msg_hint = Msg {
+        text: text,
+        sev: sev,
+        expiry: TIMER_NONE,
+        active: true,
+        prompt: false,
+        truncated: false,
+        expanded: false,
+    }
+    ed.footer_dirty = true
+}
+
+/// `yew_msg_at` (`message_vset`, `message.c:154-201`) at clock `now`.
+pub fn ed_msg_at(mut ed: Ed, sev: int, now: int, text: str) {
+    let prompt = ed.prompt != PROMPT_NONE
+    if ed.msg.active && ed.msg.prompt && !prompt {
+        return
+    }
+    if ed.msg.active && ed.msg.sev == MSG_ERROR && sev == MSG_INFO && !prompt {
+        return
+    }
+    ed_msg_clear(mut ed)
+    ed.msg = Msg {
+        text: text,
+        sev: sev,
+        expiry: TIMER_NONE,
+        active: true,
+        prompt: prompt,
+        truncated: false,
+        expanded: false,
+    }
+    if sev == MSG_ERROR && ed.errorbells && ed.tty_ready {
+        term.tty_write_str("\x07") else |_| {}
+    }
+    let duration = if prompt || sev == MSG_ERROR {
+        -1
+    } else if sev == MSG_INFO {
+        MESSAGE_INFO_MS
+    } else {
+        MESSAGE_WARN_MS
+    }
+    if duration >= 0 {
+        ed.msg.expiry = timer_add(mut ed.timers, now + duration, TIMER_MSG_EXPIRE, 0)
+    }
+    message_damage(mut ed)
+}
+
+/// `yew_msg` (`message.c:219-228`): at the loop's clock.
+pub fn ed_msg(mut ed: Ed, sev: int, text: str) {
+    ed_msg_at(mut ed, sev, now_ms(), text)
+}
+
+/// `yew_msg_expand` (`message.c:230-238`).
+pub fn ed_msg_expand(mut ed: Ed) -> bool {
+    if !ed.msg.active || !ed.msg.truncated || ed.msg.expanded {
+        return false
+    }
+    ed.msg.expanded = true
+    message_damage(mut ed)
+    true
+}
+
+/// `yew_msg_dismiss_overlay` (`message.c:240-247`).
+pub fn ed_msg_dismiss_overlay(mut ed: Ed) -> bool {
+    if !ed.msg.expanded {
+        return false
+    }
+    ed.msg.expanded = false
+    ed.full_damage = true
+    true
+}
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+/// `yew_message_clip` (`message.c:249-300`): `text` clipped to
+/// `max_cells` at a grapheme boundary, one cell kept for the ellipsis when
+/// it is cut. Answers (bytes, cut).
+pub fn message_clip(text: List[byte], max_cells: int) -> (List[byte], bool) {
+    let (take0, _) = unicode.str_clip(text, 0, text.len, max_cells)
+    var n_take = take0
+    let cut = n_take < text.len
+    if cut && max_cells != 0 {
+        let (t1, _) = unicode.str_clip(text, 0, text.len, max_cells - 1)
+        n_take = t1
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < n_take {
+        (mut out).push(text[i])
+        i += 1
+    }
+    if cut && max_cells != 0 {
+        for b in "\u{2026}".bytes() {
+            (mut out).push(b)
+        }
+    }
+    (out, cut)
+}
+
+/// The mode chip and row colours (`YewUiStyle`, `statusline.h:12-18`).
+pub struct UiStyle {
+    chip_fg: term.Color,
+    chip_bg: term.Color,
+    row_fg: term.Color,
+    row_bg: term.Color,
+    attrs: int,
+}
+
+/// `yew_message_style` (`message.c:314-335`).
+pub fn message_style(ed: Ed) -> UiStyle {
+    var style = statusline_mode_style(ed.mode)
+    let prompt = if ed.msg.active {
+        ed.msg.prompt
+    } else if ed.msg_hint.active {
+        ed.msg_hint.prompt
+    } else {
+        ed.msg.prompt
+    }
+    let sev = if ed.msg.active {
+        ed.msg.sev
+    } else if ed.msg_hint.active {
+        ed.msg_hint.sev
+    } else {
+        ed.msg.sev
+    }
+    if prompt {
+        style.row_fg = term.color_indexed(MESSAGE_PROMPT_COLOR)
+        style.attrs = term.ATTR_BOLD
+    } else if sev == MSG_WARN {
+        style.row_fg = term.color_indexed(MESSAGE_WARN_COLOR)
+        style.attrs = term.ATTR_BOLD
+    } else if sev == MSG_ERROR {
+        style.row_fg = term.color_indexed(MESSAGE_ERROR_COLOR)
+        style.attrs = term.ATTR_BOLD
+    } else {
+        style.attrs = 0
+    }
+    style
+}
+
+fn styled_blank(fg: term.Color, bg: term.Color, attrs: int) -> term.Cell {
+    var c = term.cell_blank()
+    c.fg = fg
+    c.bg = bg
+    c.attrs = attrs
+    c
+}
+
+fn row_take(text: List[byte], at: int, cells: int) -> int {
+    let (n_take, _) = unicode.str_clip(text, at, text.len, cells)
+    n_take
+}
+
+/// `yew_message_draw` (`message.c:365-475`).
+pub fn message_draw(mut ed: Ed, w: int) {
+    if !msg_visible(ed) {
+        return
+    }
+    let rows_total = ed.grid.rows
+    let cols = ed.grid.cols
+    if rows_total == 0 || cols == 0 {
+        return
+    }
+    let footer = if ed.footer_rect.h != 0 && ed.footer_rect.y < rows_total {
+        ed.footer_rect.y
+    } else {
+        rows_total - 1
+    }
+    let st = statusline_build(mut ed, w, cols)
+    let mode_style = statusline_mode_style(ed.mode)
+    let recording_style = statusline_mode_style(MODE_H)
+    let style = message_style(ed)
+    var chip_cells = unicode.str_width(st.chip, 0, st.chip.len, 1)
+    if chip_cells > cols {
+        chip_cells = cols
+    }
+    var prefix_cells = chip_cells
+    if st.recording_cells > cols - prefix_cells {
+        prefix_cells = cols
+    } else {
+        prefix_cells += st.recording_cells
+    }
+    let available = cols - prefix_cells
+    let text = bytes_of(if ed.msg.active then ed.msg.text else ed.msg_hint.text)
+    let truncated = row_take(text, 0, available) < text.len
+    if ed.msg.active {
+        ed.msg.truncated = truncated
+    } else {
+        ed.msg_hint.truncated = truncated
+    }
+    let expanded = ed.msg.active && ed.msg.expanded
+    var rows = 1
+    if expanded && truncated && available != 0 {
+        var scan = 0
+        rows = 0
+        while scan < text.len && rows < MESSAGE_OVERLAY_ROWS {
+            let n_take = row_take(text, scan, available)
+            if n_take == 0 {
+                break
+            }
+            scan += n_take
+            rows += 1
+        }
+        if rows == 0 {
+            rows = 1
+        }
+        if rows > footer + 1 {
+            rows = footer + 1
+        }
+    }
+    let first = footer + 1 - rows
+    var pos = 0
+    var i = 0
+    while i < rows {
+        let row = first + i
+        term.grid_fill(
+            mut ed.grid,
+            row,
+            0,
+            cols,
+            styled_blank(copy style.row_fg, copy style.row_bg, style.attrs),
+        )
+        let n_take = row_take(text, pos, available)
+        let remainder = pos + n_take < text.len
+        if i + 1 == rows && remainder {
+            var rest = List[byte]()
+            var k = pos
+            while k < text.len {
+                (mut rest).push(text[k])
+                k += 1
+            }
+            let (clipped, _) = message_clip(rest, cols - prefix_cells)
+            let col = term.grid_puts(
+                mut ed.grid,
+                row,
+                prefix_cells,
+                clipped,
+                0,
+                clipped.len,
+                copy style.row_fg,
+                copy style.row_bg,
+                style.attrs,
+            )
+            if col < cols {
+                term.grid_fill(
+                    mut ed.grid,
+                    row,
+                    col,
+                    cols,
+                    styled_blank(copy style.row_fg, copy style.row_bg, style.attrs),
+                )
+            }
+            pos = text.len
+        } else {
+            let col = term.grid_puts(
+                mut ed.grid,
+                row,
+                prefix_cells,
+                text,
+                pos,
+                pos + n_take,
+                copy style.row_fg,
+                copy style.row_bg,
+                style.attrs,
+            )
+            if col < cols {
+                term.grid_fill(
+                    mut ed.grid,
+                    row,
+                    col,
+                    cols,
+                    styled_blank(copy style.row_fg, copy style.row_bg, style.attrs),
+                )
+            }
+            pos += n_take
+        }
+        i += 1
+    }
+    let col = term.grid_puts(
+        mut ed.grid,
+        footer,
+        0,
+        st.chip,
+        0,
+        st.chip.len,
+        copy mode_style.chip_fg,
+        copy mode_style.chip_bg,
+        mode_style.attrs,
+    )
+    if col < cols && st.recording.len != 0 {
+        let _ = term.grid_puts(
+            mut ed.grid,
+            footer,
+            col,
+            st.recording,
+            0,
+            st.recording.len,
+            copy recording_style.chip_fg,
+            copy recording_style.chip_bg,
+            term.ATTR_BOLD,
+        )
+    }
+}
