@@ -1,0 +1,302 @@
+//! yew-torture — the headless torture child sagitta's `kill9` driver runs:
+//! the port's twin of `tests/torture/yew-torture.c` (354 lines) at
+//! 9ace98c2, the same command line and the same exit codes, so
+//! sagitta's own driver and fault shim (`tests/torture/kill9.c`,
+//! `faultshim.c`) run against the wolf text engine unchanged.
+//!
+//!   yew-torture --save PATH POST        load PATH, journal a whole-buffer
+//!                                       replace with POST's bytes, save
+//!   yew-torture --save-insert PATH      journal and save a one-byte insert
+//!   yew-torture --check PATH OLD POST   exit 0 iff PATH is POST, or is OLD
+//!                                       and its journal replays to POST
+//!   yew-torture --check-batch PATH OLD POST
+//!                                       the batch variant: the replayed
+//!                                       buffer is POST or OLD, or undoes to
+//!                                       OLD
+//!   yew-torture --atomic-result PATH    one atomic write, its commit state
+//!
+//! Exit codes are C's: 0 done, 3 an I/O failure (the durable journal kept
+//! for the checker), 4 the document saved but backup retention failed
+//! with the journal discarded and the save point current, 5 the same
+//! with the journal or the save point wrong, 2 usage. The fault window
+//! opens where C's does: `YEW_FAULT_ENABLE=1` is set after the journal is
+//! synced (the shim reads it on every intercepted call). G3: the port's
+//! syncs make none (text.file), which this child inherits.
+
+use text
+
+fn slurp(path: str) -> List[byte] ! {io} {
+    let b = fs_read_bytes(path) else {
+        return io
+    }
+    b
+}
+
+fn file_equals(path: str, want: List[byte]) -> bool {
+    let got = fs_read_bytes(path) else {
+        return false
+    }
+    if got.len != want.len {
+        return false
+    }
+    var i = 0
+    while i < got.len {
+        if got[i] != want[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn buffer_equals(tb: text.TextBuf, want: List[byte]) -> bool {
+    let got = text.textbuf_bytes(tb)
+    if got.len != want.len {
+        return false
+    }
+    var i = 0
+    while i < got.len {
+        if got[i] != want[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// The ready byte for the external-kill lane (`YEW_TORTURE_READY_FD`): C
+// writes it to the inherited descriptor and closes it. A descriptor the
+// program did not open is not a wolf handle (`fs_write_chunk(N, ..)` is
+// `io` for N >= 3, the fs table's rule; the gap is in the lane's note),
+// so the port reopens the same pipe through `/dev/fd/N` — the route the
+// standard streams take (wolf-lang#405) — writes the byte there and
+// closes that handle.
+fn signal_ready() -> bool {
+    let v = env_get("YEW_TORTURE_READY_FD") else {
+        return true
+    }
+    let fd = v.to_int() else {
+        return true
+    }
+    if fd < 0 {
+        return true
+    }
+    let h = fs_open_mode("/dev/fd/{fd}", 2) else {
+        return false
+    }
+    var r = List[byte]()
+    (mut r).push(82 as byte)
+    fs_write_chunk(h, r) else {
+        return false
+    }
+    fs_close(h) else {
+        return false
+    }
+    true
+}
+
+// C's `getenv(name) != NULL`: set, even to the empty string.
+fn env_present(name: str) -> bool {
+    let _ = env_get(name) else |e| match e {
+        missing => { return false },
+        utf8 => { return true },
+    }
+    true
+}
+
+// `save_case`, `yew-torture.c:107-200`.
+fn save_case(path: str, post_path: str) -> int {
+    let old = slurp(path) else {
+        return 3
+    }
+    let post = slurp(post_path) else {
+        return 3
+    }
+    var (rc, tb, meta) = text.file_load(path)
+    if rc != text.LOAD_OK {
+        return 3
+    }
+    var ec = text.editctx_new(take tb)
+    let (j, _) = text.journal_open(mut ec.journals, meta.realpath, mut meta)
+    if !j.open {
+        return 3
+    }
+    ec.jrnl = j
+    ec.has_jrnl = true
+    let _ = text.journal_record(mut ec.jrnl, text.JOURNAL_DEL, 0, old, 0, old.len)
+    text.textbuf_delete(mut ec.tb, text.span(0, text.textbuf_len(ec.tb)))
+    let _ = text.journal_record(mut ec.jrnl, text.JOURNAL_INS, 0, post, 0, post.len)
+    text.textbuf_insert(mut ec.tb, text.byteoff(0), post)
+    let _ = text.journal_sync(mut ec.jrnl)
+    if !text.journal_ok(ec.jrnl) || !signal_ready() {
+        text.journal_close(mut ec.journals, mut ec.jrnl)
+        return 3
+    }
+    env_set("YEW_FAULT_ENABLE", "1") else {
+        text.journal_close(mut ec.journals, mut ec.jrnl)
+        return 3
+    }
+    if env_present("YEW_TORTURE_FOREIGN_OWNER") {
+        meta.uid = if meta.uid == -1 then 1 else meta.uid + 1
+    }
+    var save_err = text.SAVE_OK
+    if env_present("YEW_TORTURE_INPLACE") {
+        var opts = text.save_opts_default()
+        opts.strategy = text.SAVE_STRATEGY_INPLACE
+        opts.backup_keep = 10
+        opts.backup_dir = env_get("YEW_TORTURE_BACKUP_DIR") else ""
+        ec.undo = text.undo_new(ec.tb)
+        ec.has_undo = true
+        ec.undo.saved = 4294967295
+        ec.meta = meta
+        ec.has_meta = true
+        save_err = text.edit_save_opts(mut ec, path, opts)
+    } else {
+        save_err = text.file_save(mut ec.tb, mut meta, path)
+    }
+    if save_err == text.SAVE_BACKUP_FAILED {
+        if ec.has_jrnl || !ec.has_undo || ec.undo.saved != ec.undo.cur {
+            os_exit(5)
+        }
+        os_exit(4)
+    }
+    if save_err != text.SAVE_OK {
+        // Retain the durable journal for the parent checker.
+        os_exit(3)
+    }
+    if ec.has_jrnl {
+        let _ = text.journal_discard(mut ec.journals, mut ec.jrnl)
+    }
+    0
+}
+
+// `save_insert_case`, `yew-torture.c:209-240`.
+fn save_insert_case(path: str) -> int {
+    var (rc, tb, meta) = text.file_load(path)
+    if rc != text.LOAD_OK {
+        return 3
+    }
+    var reg = text.journalset_new()
+    let (j0, _) = text.journal_open(mut reg, meta.realpath, mut meta)
+    var j = j0
+    if !j.open {
+        return 3
+    }
+    var x = List[byte]()
+    (mut x).push(88 as byte)
+    let _ = text.journal_record(mut j, text.JOURNAL_INS, 0, x, 0, 1)
+    text.textbuf_insert(mut tb, text.byteoff(0), x)
+    let _ = text.journal_sync(mut j)
+    if !text.journal_ok(j) {
+        text.journal_close(mut reg, mut j)
+        return 3
+    }
+    env_set("YEW_FAULT_ENABLE", "1") else {
+        text.journal_close(mut reg, mut j)
+        return 3
+    }
+    if text.file_save(mut tb, mut meta, path) != text.SAVE_OK {
+        os_exit(3)
+    }
+    let _ = text.journal_discard(mut reg, mut j)
+    0
+}
+
+// `check_case`, `yew-torture.c:242-272`.
+fn check_case(path: str, old_path: str, post_path: str) -> int {
+    let old = slurp(old_path) else {
+        return 1
+    }
+    let post = slurp(post_path) else {
+        return 1
+    }
+    if file_equals(path, post) {
+        return 0
+    }
+    if !file_equals(path, old) {
+        return 1
+    }
+    var (rc, tb, meta) = text.file_load(path)
+    if rc != text.LOAD_OK {
+        return 1
+    }
+    let reg = text.journalset_new()
+    if text.journal_replay(reg, path, mut tb, mut meta) && buffer_equals(tb, post) {
+        return 0
+    }
+    1
+}
+
+// `check_batch_case`, `yew-torture.c:282-325`.
+fn check_batch_case(path: str, old_path: str, post_path: str) -> int {
+    let old = slurp(old_path) else {
+        return 1
+    }
+    let post = slurp(post_path) else {
+        return 1
+    }
+    if file_equals(path, post) {
+        return 0
+    }
+    if !file_equals(path, old) {
+        return 1
+    }
+    var (rc, tb, meta) = text.file_load(path)
+    if rc != text.LOAD_OK {
+        return 1
+    }
+    let undo = text.undo_new(tb)
+    var ec = text.editctx_new(take tb)
+    ec.undo = undo
+    ec.has_undo = true
+    if !text.journal_replay_edit(path, mut ec, mut meta) {
+        return 1
+    }
+    var ok = buffer_equals(ec.tb, post) || buffer_equals(ec.tb, old)
+    if !ok && text.undo(mut ec) && buffer_equals(ec.tb, old) {
+        ok = true
+    }
+    if ec.has_jrnl {
+        text.journal_close(mut ec.journals, mut ec.jrnl)
+    }
+    if ok then 0 else 1
+}
+
+// `atomic_result_case`, `yew-torture.c:327-340`.
+fn atomic_result_case(path: str) -> int {
+    env_set("YEW_FAULT_ENABLE", "1") else {
+        return 3
+    }
+    var bytes = List[byte]()
+    for b in "atomic result\n".bytes() {
+        (mut bytes).push(b)
+    }
+    let r = text.file_write_atomic_result(path, bytes, 384)
+    if r.error == text.SAVE_OK {
+        return if r.committed then 0 else 5
+    }
+    if r.committed then 4 else 3
+}
+
+fn main() -> int {
+    let a = env_args()
+    if a.len == 3 && a[0] == "--save" {
+        return save_case(a[1], a[2])
+    }
+    if a.len == 2 && a[0] == "--save-insert" {
+        return save_insert_case(a[1])
+    }
+    if a.len == 4 && a[0] == "--check" {
+        return check_case(a[1], a[2], a[3])
+    }
+    if a.len == 4 && a[0] == "--check-batch" {
+        return check_batch_case(a[1], a[2], a[3])
+    }
+    if a.len == 2 && a[0] == "--atomic-result" {
+        return atomic_result_case(a[1])
+    }
+    eprint(
+        "usage: yew-torture --save PATH POST | --save-insert PATH | --check PATH OLD POST | --check-batch PATH OLD POST | --atomic-result PATH",
+    )
+    2
+}
