@@ -1,0 +1,1044 @@
+//! text.register — the register file: the named, unnamed, numbered,
+//! small-delete and owner-written registers, the kill ring, and paste.
+//!
+//! Ports sagitta `src/text/register.c` (873 lines) and `register.h` (106)
+//! at 9ace98c2, under `s11-registers-and-clipboard.md`. The wolf shapes:
+//!  - a register name is an `int` (C's `u8`; a literal is `'a' as int`),
+//!    0 for "no explicit name"; C's `RegVal.type` is `kind` (`type` is a
+//!    keyword).
+//!  - `reg_get` answers a COPY (`RegVal ! {none}` for C's NULL); every
+//!    write goes through the routing doors below, and the fields
+//!    (`r.unnamed`, `r.numbered[1]`, `r.ring[r.ring_head]`) are C's.
+//!    `reg_slot` is the dispatch C's pointer answers, so `*` and `+` are
+//!    one register by name.
+//!  - C binds the active buffer's undo tree and file metadata by pointer
+//!    (`yew_reg_bind_context`, `bound_undo`, `bound_meta`); a wolf value
+//!    cannot be shared, and the `EditCtx` owns both (`text.edit`), so the
+//!    bound read is `reg_get_in(mut r, name, ec)`: `.` from `ec.undo`,
+//!    `%` from `ec.meta`, each only when the context has it, as C's NULL
+//!    binding reads empty. `reg_get` is the unbound read.
+//!  - the system clipboard (C's process-global `yew_clip`) is a value the
+//!    register file owns, `r.clip` (`text.clipboard`): a yank queues into
+//!    it and the editor loop delivers with `clip_after_render(mut r.clip,
+//!    ...)`. No module state, no `unsafe`.
+//!  - the paste owner (C's `const TextBuf *` identity) is the buffer's
+//!    `bid`; C's `find_ring_value` compares a value's address with the
+//!    ring's slots, and `yew_reg_get` never answers a ring slot, so a
+//!    paste's ring index is always `ring_head` (kept as C computes it).
+//!  - `time(NULL)` is `wall_secs` (`time_unix_ms` floored to seconds).
+
+use util
+
+/// `YEW_KILL_RING_MAX`.
+pub const KILL_RING_MAX: int = 256
+
+/// `YEW_KILL_RING_DEPTH_DEFAULT`.
+pub const KILL_RING_DEPTH_DEFAULT: int = 32
+
+/// `YEW_KILL_RING_BYTES_DEFAULT` (8 MiB).
+pub const KILL_RING_BYTES_DEFAULT: int = 8388608
+
+/// `YEW_REG_CHARWISE`.
+pub const REG_CHARWISE: int = 0
+
+/// `YEW_REG_LINEWISE`.
+pub const REG_LINEWISE: int = 1
+
+/// `YEW_REG_BLOCKWISE`.
+pub const REG_BLOCKWISE: int = 2
+
+/// `YEW_CLIP_SYNC_OFF`: only `"+` and `"*` reach the system clipboard.
+pub const CLIP_SYNC_OFF: int = 0
+
+/// `YEW_CLIP_SYNC_YANK` (the default): yanks reach it too.
+pub const CLIP_SYNC_YANK: int = 1
+
+/// `YEW_CLIP_SYNC_ALL`: yanks and deletes.
+pub const CLIP_SYNC_ALL: int = 2
+
+/// `YEW_CLIP_SYNC_UNNAMED`: as ALL, and an unnamed paste reads it.
+pub const CLIP_SYNC_UNNAMED: int = 3
+
+/// A register value (`RegVal`, `register.h:22-29`): blockwise values carry
+/// one row span into `bytes` per row and their cell width.
+pub struct RegVal {
+    kind: int,
+    ragged: bool,
+    width: int,
+    bytes: List[byte],
+    rows: List[Span],
+    t_wall: int,
+}
+
+/// One ring entry's shape (`RegInfo`, `register.h:31-38`).
+pub struct RegInfo {
+    kind: int,
+    ragged: bool,
+    width: int,
+    rows: int,
+    bytes: int,
+    t_wall: int,
+}
+
+/// The register file (`Registers`, `register.h:49-79`).
+pub struct Registers {
+    named: List[RegVal],
+    unnamed: RegVal,
+    numbered: List[RegVal],
+    small_del: RegVal,
+    last_insert: RegVal,
+    search: RegVal,
+    cmdline: RegVal,
+    file: RegVal,
+    alt_file: RegVal,
+    system: RegVal,
+    ring: List[RegVal],
+    ring_head: int,
+    ring_len: int,
+    ring_depth: int,
+    ring_bytes: int,
+    ring_bytes_max: int,
+    clip_read_max: int,
+    clipboard_sync: int,
+    clip: Clipboard,
+    paste_spans: List[Span],
+    paste_owner: int,
+    paste_origin: Cursor,
+    paste_win_id: int,
+    paste_ring_index: int,
+    paste_tabw: int,
+    paste_before: bool,
+    paste_live: bool,
+}
+
+fn wall_secs() -> int {
+    let ms = time_unix_ms()
+    if ms >= 0 {
+        return ms / 1000
+    }
+    -((999 - ms) / 1000)
+}
+
+/// The empty charwise value (`yew_regval_init`).
+pub fn regval_new() -> RegVal {
+    RegVal {
+        kind: REG_CHARWISE,
+        ragged: false,
+        width: 0,
+        bytes: List[byte](),
+        rows: List[Span](),
+        t_wall: 0,
+    }
+}
+
+// `regval_clear`, `register.c:12-20`.
+fn regval_clear(mut v: RegVal) {
+    v.kind = REG_CHARWISE
+    v.ragged = false
+    v.width = 0
+    v.bytes = List[byte]()
+    v.rows = List[Span]()
+    v.t_wall = 0
+}
+
+/// Release a value and leave it empty (`yew_regval_free`).
+pub fn regval_free(mut v: RegVal) {
+    regval_clear(mut v)
+}
+
+fn ends_in_lf(bytes: List[byte]) -> bool {
+    bytes.len != 0 && bytes[bytes.len - 1] as int == 10
+}
+
+/// Capture `range` of `tb` (`yew_regval_from_span`, `register.c:99-119`):
+/// a linewise capture missing its final newline gets the file's EOL
+/// (`has_meta` is C's non-NULL `meta`); blockwise needs per-row geometry.
+pub fn regval_from_span(
+    tb: TextBuf,
+    range: Span,
+    kind: int,
+    meta: FileMeta,
+    has_meta: bool,
+) -> RegVal {
+    if kind == REG_BLOCKWISE {
+        util.bug("text.register", "blockwise capture requires per-row geometry")
+    }
+    if range.lo < 0 || range.lo > range.hi || range.hi > textbuf_len(tb) {
+        util.bug("text.register", "register: source span out of bounds")
+    }
+    var out = regval_new()
+    out.kind = kind
+    textbuf_append_range(mut out.bytes, tb, range.lo, range.hi)
+    if kind == REG_LINEWISE && !ends_in_lf(out.bytes) {
+        if !has_meta {
+            util.bug("text.register", "linewise register capture requires file metadata")
+        }
+        for b in filemeta_eol_bytes(meta) {
+            (mut out.bytes).push(b)
+        }
+    }
+    out.t_wall = wall_secs()
+    out
+}
+
+fn regs_of(n: int) -> List[RegVal] {
+    var out = List[RegVal]()
+    var i = 0
+    while i < n {
+        (mut out).push(regval_new())
+        i += 1
+    }
+    out
+}
+
+/// A fresh register file (`yew_reg_init`, `register.c:135-155`): ring depth
+/// 32, an 8 MiB ring, a 64 MiB clipboard read cap, yanks synced.
+pub fn reg_new() -> Registers {
+    Registers {
+        named: regs_of(26),
+        unnamed: regval_new(),
+        numbered: regs_of(10),
+        small_del: regval_new(),
+        last_insert: regval_new(),
+        search: regval_new(),
+        cmdline: regval_new(),
+        file: regval_new(),
+        alt_file: regval_new(),
+        system: regval_new(),
+        ring: regs_of(KILL_RING_MAX),
+        ring_head: 0,
+        ring_len: 0,
+        ring_depth: KILL_RING_DEPTH_DEFAULT,
+        ring_bytes: 0,
+        ring_bytes_max: KILL_RING_BYTES_DEFAULT,
+        clip_read_max: CLIPBOARD_READ_MAX_DEFAULT,
+        clipboard_sync: CLIP_SYNC_YANK,
+        clip: clip_new(),
+        paste_spans: List[Span](),
+        paste_owner: 0,
+        paste_origin: cursor_at(0 as ByteOff),
+        paste_win_id: 0,
+        paste_ring_index: 0,
+        paste_tabw: 0,
+        paste_before: false,
+        paste_live: false,
+    }
+}
+
+/// Release every value (`yew_reg_free`, `register.c:157-174`): C zeroes
+/// the file, ring depth and caps included. The clipboard is not the
+/// register file's to stop (C's outlives it); `clip_shutdown` does.
+pub fn reg_free(mut r: Registers) {
+    let clip = copy r.clip
+    r = reg_new()
+    r.ring_depth = 0
+    r.ring_bytes_max = 0
+    r.clip_read_max = 0
+    r.clipboard_sync = CLIP_SYNC_OFF
+    r.clip = clip
+}
+
+/// The register `name` reads and writes (`yew_reg_get`'s dispatch,
+/// `register.c:185-220`): the lower-case letter for `a`-`z` and `A`-`Z`,
+/// `"` for 0 and `"`, `+` for `*` and `+`, the name itself for the digits
+/// and `- . / : % #`; -1 for `_` and every other name.
+pub fn reg_slot(name: int) -> int {
+    if name == 0 || name == '"' as int {
+        return '"' as int
+    }
+    if name >= 'a' as int && name <= 'z' as int {
+        return name
+    }
+    if name >= 'A' as int && name <= 'Z' as int {
+        return name - 'A' as int + 'a' as int
+    }
+    if name >= '0' as int && name <= '9' as int {
+        return name
+    }
+    if name == '*' as int || name == '+' as int {
+        return '+' as int
+    }
+    if name == '-' as int || name == '.' as int || name == '/' as int {
+        return name
+    }
+    if name == ':' as int || name == '%' as int || name == '#' as int {
+        return name
+    }
+    -1
+}
+
+fn slot_read(r: Registers, s: int) -> RegVal {
+    if s >= 'a' as int && s <= 'z' as int {
+        return copy r.named[s - 'a' as int]
+    }
+    if s >= '0' as int && s <= '9' as int {
+        return copy r.numbered[s - '0' as int]
+    }
+    if s == '"' as int {
+        return copy r.unnamed
+    }
+    if s == '-' as int {
+        return copy r.small_del
+    }
+    if s == '.' as int {
+        return copy r.last_insert
+    }
+    if s == '/' as int {
+        return copy r.search
+    }
+    if s == ':' as int {
+        return copy r.cmdline
+    }
+    if s == '%' as int {
+        return copy r.file
+    }
+    if s == '#' as int {
+        return copy r.alt_file
+    }
+    copy r.system
+}
+
+// `reg_set_raw`, `register.c:222-228`: a copy stamped now.
+fn stamped(v: RegVal) -> RegVal {
+    var out = copy v
+    out.t_wall = wall_secs()
+    out
+}
+
+fn slot_set_raw(mut r: Registers, s: int, v: RegVal) {
+    if s >= 'a' as int && s <= 'z' as int {
+        r.named[s - 'a' as int] = stamped(v)
+    } else if s >= '0' as int && s <= '9' as int {
+        r.numbered[s - '0' as int] = stamped(v)
+    } else if s == '"' as int {
+        r.unnamed = stamped(v)
+    } else if s == '-' as int {
+        r.small_del = stamped(v)
+    } else if s == '+' as int {
+        r.system = stamped(v)
+    } else {
+        util.bug("text.register", "register {name_text(s)} has no raw store")
+    }
+}
+
+fn name_text(name: int) -> str {
+    var b = List[byte]()
+    if name > 32 && name < 127 {
+        (mut b).push(name as byte)
+    }
+    util.buf_to_str(b) else "?"
+}
+
+fn hex2(n: int) -> str {
+    let digits = "0123456789abcdef"
+    var b = List[byte]()
+    (mut b).push(digits.bytes()[n / 16 % 16])
+    (mut b).push(digits.bytes()[n % 16])
+    util.buf_to_str(b) else "??"
+}
+
+/// The value under `name` (`yew_reg_get`, `register.c:185-220`), unbound:
+/// `.` and `%` read empty, as C's before a context is bound; `none` for
+/// `_` and every unknown name.
+pub fn reg_get(mut r: Registers, name: int) -> RegVal ! {none} {
+    let s = reg_slot(name)
+    if s < 0 {
+        return none
+    }
+    if s == '.' as int {
+        regval_clear(mut r.last_insert)
+    } else if s == '%' as int {
+        regval_clear(mut r.file)
+    }
+    slot_read(r, s)
+}
+
+/// The value under `name` with `ec` bound (`yew_reg_bind_context` then
+/// `yew_reg_get`): `.` is the text the latest live typing transaction of
+/// `ec`'s undo tree left (`yew_undo_last_insert`), `%` the realpath of
+/// `ec`'s file, each computed on the read.
+pub fn reg_get_in(mut r: Registers, name: int, ec: EditCtx) -> RegVal ! {none} {
+    let s = reg_slot(name)
+    if s < 0 {
+        return none
+    }
+    if s == '.' as int {
+        regval_clear(mut r.last_insert)
+        if ec.has_undo {
+            let (found, bytes, t_wall) = undo_last_insert(ec.undo, ec.tb)
+            if found {
+                r.last_insert.bytes = bytes
+                r.last_insert.t_wall = t_wall
+            }
+        }
+    } else if s == '%' as int {
+        regval_clear(mut r.file)
+        if ec.has_meta && ec.meta.has_realpath {
+            for b in ec.meta.realpath.bytes() {
+                (mut r.file.bytes).push(b)
+            }
+        }
+    }
+    slot_read(r, s)
+}
+
+// `reg_set`, `register.c:230-256` (YEW-F-058: private, so production
+// callers cannot bypass the yank/delete/macro routing front doors).
+fn reg_set(mut r: Registers, name: int, v: RegVal) {
+    if name == '_' as int || name == 0 {
+        return
+    }
+    if name == '.' as int ||
+        name == '/' as int ||
+        name == ':' as int ||
+        name == '%' as int ||
+        name == '#' as int {
+        util.bug(
+            "text.register",
+            "register {name_text(name)} is written by its owning subsystem, not by reg_set",
+        )
+    }
+    if name >= 'A' as int && name <= 'Z' as int {
+        reg_append(mut r, name, v)
+        return
+    }
+    let s = reg_slot(name)
+    if s < 0 {
+        util.bug("text.register", "unknown register name 0x{hex2(name)}")
+    }
+    slot_set_raw(mut r, s, v)
+}
+
+/// A macro recording's store (`yew_reg_set_macro`, `register.c:258-268`):
+/// `a`-`z` only; `append` routes to the upper-case append.
+pub fn reg_set_macro(mut r: Registers, name: int, v: RegVal, append: bool) {
+    if name < 'a' as int || name > 'z' as int {
+        util.bug("text.register", "invalid macro register name 0x{hex2(name)}")
+    }
+    if append {
+        reg_append(mut r, name - 'a' as int + 'A' as int, v)
+    } else {
+        reg_set(mut r, name, v)
+    }
+}
+
+/// The last command line, `:` (`yew_reg_set_cmdline`, `register.c:270-281`).
+pub fn reg_set_cmdline(mut r: Registers, bytes: List[byte]) {
+    regval_clear(mut r.cmdline)
+    r.cmdline.bytes = copy bytes
+    r.cmdline.kind = REG_CHARWISE
+    r.cmdline.t_wall = wall_secs()
+}
+
+/// The last accepted search pattern, `/` (`yew_reg_set_search`,
+/// `register.c:280-291`, Sprint 21 §6): `:s//` and `^R /` read it here.
+pub fn reg_set_search(mut r: Registers, bytes: List[byte]) {
+    regval_clear(mut r.search)
+    r.search.bytes = copy bytes
+    r.search.kind = REG_CHARWISE
+    r.search.t_wall = wall_secs()
+}
+
+fn eol_len_at_end(v: RegVal) -> int {
+    if !ends_in_lf(v.bytes) {
+        return 0
+    }
+    if v.bytes.len >= 2 && v.bytes[v.bytes.len - 2] as int == 13 {
+        return 2
+    }
+    1
+}
+
+fn append_eol(mut dst: List[byte], style: RegVal) {
+    let len = eol_len_at_end(style)
+    if len == 0 {
+        (mut dst).push(10 as byte)
+        return
+    }
+    var i = style.bytes.len - len
+    while i < style.bytes.len {
+        (mut dst).push(style.bytes[i])
+        i += 1
+    }
+}
+
+// One part of `append_block` (`register.c:323-347`): its rows, each padded
+// to `result_width` cells unless the part is ragged.
+fn append_block_part(
+    mut rebuilt: List[byte],
+    mut rows: List[Span],
+    part: RegVal,
+    result_width: int,
+) {
+    var i = 0
+    while i < part.rows.len {
+        let row = copy part.rows[i]
+        if row.lo < 0 || row.lo > row.hi || row.hi > part.bytes.len {
+            util.bug("text.register", "register: invalid block row span")
+        }
+        let lo = rebuilt.len
+        var k = row.lo
+        while k < row.hi {
+            (mut rebuilt).push(part.bytes[k])
+            k += 1
+        }
+        if !part.ragged {
+            var padding = ccol_shortfall(result_width as CCol, part.width as CCol)
+            while padding != 0 {
+                (mut rebuilt).push(32 as byte)
+                padding -= 1
+            }
+        }
+        (mut rows).push(Span { lo: lo, hi: rebuilt.len })
+        i += 1
+    }
+}
+
+// `append_block`, `register.c:314-357`.
+fn append_block(mut dst: RegVal, src: RegVal) {
+    let result_width = ccol_max(dst.width as CCol, src.width as CCol) as int
+    let result_ragged = dst.ragged || src.ragged
+    var rebuilt = List[byte]()
+    var rows = List[Span]()
+    append_block_part(mut rebuilt, mut rows, dst, result_width)
+    append_block_part(mut rebuilt, mut rows, src, result_width)
+    dst.bytes = rebuilt
+    dst.rows = rows
+    dst.width = result_width
+    dst.ragged = result_ragged
+    dst.kind = REG_BLOCKWISE
+    dst.t_wall = wall_secs()
+}
+
+/// Append `v` to the named register `name` names in upper case
+/// (`yew_reg_append`, `register.c:359-402`): an empty register takes `v`;
+/// blockwise joins only blockwise (else refused, logged, untouched);
+/// charwise onto linewise keeps the destination's EOL, linewise onto
+/// charwise joins with the line's.
+pub fn reg_append(mut r: Registers, name: int, v: RegVal) {
+    if name < 'A' as int || name > 'Z' as int {
+        util.bug("text.register", "register append requires A-Z")
+    }
+    let i = name - 'A' as int
+    if r.named[i].bytes.len == 0 && r.named[i].rows.len == 0 {
+        r.named[i] = stamped(v)
+        return
+    }
+    var dst = copy r.named[i]
+    if dst.kind == REG_BLOCKWISE || v.kind == REG_BLOCKWISE {
+        if dst.kind == REG_BLOCKWISE && v.kind == REG_BLOCKWISE {
+            append_block(mut dst, v)
+            r.named[i] = dst
+        } else {
+            util.log_warn("register: refused blockwise/non-blockwise append")
+        }
+        return
+    }
+    if dst.kind == REG_CHARWISE && v.kind == REG_LINEWISE {
+        append_eol(mut dst.bytes, v)
+        for b in v.bytes {
+            (mut dst.bytes).push(b)
+        }
+        dst.kind = REG_LINEWISE
+    } else if dst.kind == REG_LINEWISE && v.kind == REG_CHARWISE {
+        let eol_len = eol_len_at_end(dst)
+        if eol_len == 0 {
+            util.bug("text.register", "linewise register payload lacks trailing EOL")
+        }
+        let eol = dst.bytes[dst.bytes.len - eol_len..dst.bytes.len]
+        for b in v.bytes {
+            (mut dst.bytes).push(b)
+        }
+        for b in eol {
+            (mut dst.bytes).push(b)
+        }
+    } else {
+        for b in v.bytes {
+            (mut dst.bytes).push(b)
+        }
+    }
+    dst.t_wall = wall_secs()
+    r.named[i] = dst
+}
+
+// `ring_drop_oldest`, `register.c:403-415`.
+fn ring_drop_oldest(mut r: Registers) {
+    if r.ring_len == 0 {
+        return
+    }
+    let index = (r.ring_head + KILL_RING_MAX - (r.ring_len - 1)) % KILL_RING_MAX
+    r.ring_bytes -= r.ring[index].bytes.len
+    r.ring[index] = regval_new()
+    r.ring_len -= 1
+}
+
+/// Bound the ring at `depth` entries, dropping the oldest
+/// (`yew_reg_ring_set_depth`, `register.c:417-427`); a live paste dies.
+pub fn reg_ring_set_depth(mut r: Registers, depth: int) {
+    if depth > KILL_RING_MAX {
+        util.bug("text.register", "yew_reg_ring_set_depth: depth exceeds maximum")
+    }
+    r.paste_live = false
+    while r.ring_len > depth {
+        ring_drop_oldest(mut r)
+    }
+    r.ring_depth = depth
+}
+
+/// Push `v` as the ring's newest entry (`yew_reg_ring_push`,
+/// `register.c:429-456`): depth 0 records nothing; past the byte cap the
+/// oldest go, and an entry alone over the cap drops every other.
+pub fn reg_ring_push(mut r: Registers, v: RegVal) {
+    r.paste_live = false
+    let depth = if r.ring_depth > KILL_RING_MAX then KILL_RING_MAX else r.ring_depth
+    if depth == 0 {
+        return
+    }
+    while r.ring_len >= depth {
+        ring_drop_oldest(mut r)
+    }
+    let index = if r.ring_len == 0 then r.ring_head else (r.ring_head + 1) % KILL_RING_MAX
+    r.ring_head = index
+    r.ring[index] = stamped(v)
+    r.ring_len += 1
+    r.ring_bytes += r.ring[index].bytes.len
+    if r.ring[index].bytes.len > r.ring_bytes_max {
+        while r.ring_len > 1 {
+            ring_drop_oldest(mut r)
+        }
+    } else {
+        while r.ring_len > 1 && r.ring_bytes > r.ring_bytes_max {
+            ring_drop_oldest(mut r)
+        }
+    }
+}
+
+fn set_unnamed(mut r: Registers, v: RegVal) {
+    r.unnamed = stamped(v)
+    reg_ring_push(mut r, v)
+}
+
+// `set_explicit`, `register.c:464-477`: the digits and `-` are histories,
+// never written by name.
+fn set_explicit(mut r: Registers, name: int, v: RegVal) {
+    if name == 0 {
+        return
+    }
+    if name >= 'A' as int && name <= 'Z' as int {
+        reg_append(mut r, name, v)
+        return
+    }
+    if name >= '0' as int && name <= '9' as int {
+        return
+    }
+    if name == '-' as int {
+        return
+    }
+    reg_set(mut r, name, v)
+}
+
+fn clip_target(name: int) -> int {
+    if name == '*' as int then '*' as int else '+' as int
+}
+
+/// A yank (`yew_reg_yank`, `register.c:479-497`): the explicit register,
+/// the unnamed one and the ring, `0`, and the system clipboard when the
+/// name is `+`/`*` or the sync mode is not OFF; `_` discards.
+pub fn reg_yank(mut r: Registers, explicit_name: int, v: RegVal) {
+    if explicit_name == '_' as int {
+        return
+    }
+    let system = explicit_name == '+' as int || explicit_name == '*' as int
+    set_explicit(mut r, explicit_name, v)
+    set_unnamed(mut r, v)
+    r.numbered[0] = stamped(v)
+    if system ||
+        r.clipboard_sync == CLIP_SYNC_YANK ||
+        r.clipboard_sync == CLIP_SYNC_ALL ||
+        r.clipboard_sync == CLIP_SYNC_UNNAMED {
+        r.system = stamped(v)
+        let _ = clip_write(mut r.clip, v, clip_target(explicit_name))
+    }
+}
+
+fn contains_lf(v: RegVal) -> bool {
+    for b in v.bytes {
+        if b as int == 10 {
+            return true
+        }
+    }
+    false
+}
+
+/// A delete (`yew_reg_delete`, `register.c:505-529`): a linewise value or
+/// one holding a newline shifts `1`-`9` (the oldest falls off) into `1`,
+/// anything else is the small delete `-`; the clipboard only under
+/// `+`/`*` or sync ALL/UNNAMED.
+pub fn reg_delete(mut r: Registers, explicit_name: int, v: RegVal) {
+    if explicit_name == '_' as int {
+        return
+    }
+    let system = explicit_name == '+' as int || explicit_name == '*' as int
+    set_explicit(mut r, explicit_name, v)
+    set_unnamed(mut r, v)
+    if v.kind == REG_LINEWISE || contains_lf(v) {
+        var i = 9
+        while i > 1 {
+            r.numbered[i] = stamped(r.numbered[i - 1])
+            i -= 1
+        }
+        r.numbered[1] = stamped(v)
+    } else {
+        r.small_del = stamped(v)
+    }
+    if system || r.clipboard_sync == CLIP_SYNC_ALL || r.clipboard_sync == CLIP_SYNC_UNNAMED {
+        r.system = stamped(v)
+        let _ = clip_write(mut r.clip, v, clip_target(explicit_name))
+    }
+}
+
+// `text_byte`, `register.c:531-542`.
+fn text_byte(tb: TextBuf, off: int) -> int {
+    if off < 0 || off >= textbuf_len(tb) {
+        util.bug("text.register", "register: cannot read buffer byte")
+    }
+    textbuf_byte_at(tb, off)
+}
+
+fn line_eol_len(tb: TextBuf, line: Span) -> int {
+    if line.hi == line.lo || text_byte(tb, line.hi - 1) != 10 {
+        return 0
+    }
+    if line.hi - line.lo >= 2 && text_byte(tb, line.hi - 2) == 13 {
+        return 2
+    }
+    1
+}
+
+fn remember_insert(mut spans: List[Span], at: int, len: int) {
+    if len == 0 {
+        return
+    }
+    (mut spans).push(Span { lo: at, hi: at + len })
+}
+
+fn set_primary_cursor(mut ec: EditCtx, pos: int) {
+    if !ec.has_cset {
+        return
+    }
+    let p = ec.cset.primary
+    ec.cset.curs[p].pos = pos
+    ec.cset.curs[p].anchor = pos
+    ec.cset.curs[p].goal_col = 0
+}
+
+fn first_nonblank(tb: TextBuf, start: int) -> int {
+    var at = start
+    let len = textbuf_len(tb)
+    while at < len {
+        let b = text_byte(tb, at)
+        if b != 32 && b != 9 {
+            break
+        }
+        at += 1
+    }
+    at
+}
+
+// `paste_char`, `register.c:587-612`: after the caret's grapheme, but never
+// past the line's content end; the caret lands on the last pasted grapheme.
+fn paste_char(mut spans: List[Span], mut ec: EditCtx, v: RegVal, before: bool) -> bool {
+    let cursor = copy ec.cset.curs[ec.cset.primary]
+    let line = textbuf_line_of(ec.tb, cursor.pos as ByteOff)
+    let sp = textbuf_line_span(ec.tb, line)
+    let content_end = sp.hi - line_eol_len(ec.tb, sp)
+    if v.bytes.len == 0 {
+        return false
+    }
+    var at = 0
+    if before {
+        at = cursor.pos
+    } else if cursor.pos >= content_end {
+        at = content_end
+    } else {
+        at = grapheme_next(ec.tb, cursor.pos as ByteOff) as int
+    }
+    if !edit_insert(mut ec, at as ByteOff, v.bytes) {
+        return false
+    }
+    remember_insert(mut spans, at, v.bytes.len)
+    let end = at + v.bytes.len
+    let caret = grapheme_prev(ec.tb, end as ByteOff) as int
+    set_primary_cursor(mut ec, caret)
+    true
+}
+
+// `paste_line`, `register.c:614-658`: below (or above) the caret's line; a
+// last line with no EOL gets the destination's first, and the payload
+// then goes without its own.
+fn paste_line(mut spans: List[Span], mut ec: EditCtx, v: RegVal, before: bool) -> bool {
+    let cursor = copy ec.cset.curs[ec.cset.primary]
+    let line = textbuf_line_of(ec.tb, cursor.pos as ByteOff) as int
+    let sp = textbuf_line_span(ec.tb, line as LineNo)
+    let dst_eol_len = line_eol_len(ec.tb, sp)
+    var at = 0
+    if !ends_in_lf(v.bytes) {
+        util.bug("text.register", "linewise register payload lacks trailing EOL")
+    }
+    if before {
+        at = textbuf_line_start(ec.tb, line as LineNo) as int
+        if !edit_insert(mut ec, at as ByteOff, v.bytes) {
+            return false
+        }
+        remember_insert(mut spans, at, v.bytes.len)
+    } else if dst_eol_len != 0 {
+        at = sp.hi
+        if !edit_insert(mut ec, at as ByteOff, v.bytes) {
+            return false
+        }
+        remember_insert(mut spans, at, v.bytes.len)
+    } else {
+        let payload_eol = eol_len_at_end(v)
+        if !ec.has_meta {
+            util.bug("text.register", "linewise paste requires file metadata")
+        }
+        at = textbuf_len(ec.tb)
+        let eol = filemeta_eol_bytes(ec.meta)
+        if !edit_insert(mut ec, at as ByteOff, eol) {
+            return false
+        }
+        remember_insert(mut spans, at, eol.len)
+        if v.bytes.len > payload_eol {
+            let payload_at = at + eol.len
+            if !edit_insert_part(
+                mut ec,
+                payload_at as ByteOff,
+                v.bytes,
+                0,
+                v.bytes.len - payload_eol,
+            ) {
+                return false
+            }
+            remember_insert(mut spans, payload_at, v.bytes.len - payload_eol)
+        }
+        at = at + eol.len
+    }
+    let caret = first_nonblank(ec.tb, at)
+    set_primary_cursor(mut ec, caret)
+    true
+}
+
+// `block_target`, `register.c:660-668`.
+fn block_target(tb: TextBuf, cursor: Cursor, before: bool) -> int {
+    let line = textbuf_line_of(tb, cursor.pos as ByteOff)
+    let sp = textbuf_line_span(tb, line)
+    let end = sp.hi - line_eol_len(tb, sp)
+    if before || cursor.pos >= end {
+        return if cursor.pos > end then end else cursor.pos
+    }
+    grapheme_next(tb, cursor.pos as ByteOff) as int
+}
+
+// `insert_spaces`, `register.c:670-688`: 64 spaces an insert, as C's table.
+fn insert_spaces(mut spans: List[Span], mut ec: EditCtx, at: int, count: int) -> bool {
+    var spaces = List[byte]()
+    var i = 0
+    while i < 64 {
+        (mut spaces).push(32 as byte)
+        i += 1
+    }
+    var done = 0
+    while done < count {
+        let n = if count - done < 64 then count - done else 64
+        if !edit_insert_part(mut ec, (at + done) as ByteOff, spaces, 0, n) {
+            return false
+        }
+        remember_insert(mut spans, at + done, n)
+        done += n
+    }
+    true
+}
+
+// `paste_block`, `register.c:690-740`: row i at the target's cell column on
+// line first+i, lines added past the end with the file's EOL, short lines
+// padded with spaces to the column.
+fn paste_block(mut spans: List[Span], mut ec: EditCtx, v: RegVal, before: bool, tabw: int) -> bool {
+    let cursor = copy ec.cset.curs[ec.cset.primary]
+    let first_line = textbuf_line_of(ec.tb, cursor.pos as ByteOff) as int
+    let target = block_target(ec.tb, cursor, before)
+    let first_span = textbuf_line_span(ec.tb, first_line as LineNo)
+    let column = off_to_ccol(ec.tb, first_span, target as ByteOff, tabw) as int
+    var first_insert = target
+    if v.rows.len == 0 {
+        return false
+    }
+    var i = 0
+    while i < v.rows.len {
+        let line = first_line + i
+        let row = copy v.rows[i]
+        while line >= textbuf_line_count(ec.tb) {
+            let end = textbuf_len(ec.tb)
+            if !ec.has_meta {
+                util.bug("text.register", "blockwise line extension requires file metadata")
+            }
+            let eol = filemeta_eol_bytes(ec.meta)
+            if !edit_insert(mut ec, end as ByteOff, eol) {
+                return false
+            }
+            remember_insert(mut spans, end, eol.len)
+        }
+        if row.lo < 0 || row.lo > row.hi || row.hi > v.bytes.len {
+            util.bug("text.register", "register: invalid block row span")
+        }
+        let dst = textbuf_line_span(ec.tb, line as LineNo)
+        var off = ccol_to_off_padded(ec.tb, dst, column as CCol, tabw) as int
+        let landed = off_to_ccol(ec.tb, dst, off as ByteOff, tabw)
+        let pad = ccol_shortfall(column as CCol, landed)
+        if !insert_spaces(mut spans, mut ec, off, pad) {
+            return false
+        }
+        off += pad
+        if !edit_insert_part(mut ec, off as ByteOff, v.bytes, row.lo, row.hi) {
+            return false
+        }
+        remember_insert(mut spans, off, row.hi - row.lo)
+        if i == 0 {
+            first_insert = off
+        }
+        i += 1
+    }
+    set_primary_cursor(mut ec, first_insert)
+    true
+}
+
+fn paste_value(mut spans: List[Span], mut ec: EditCtx, v: RegVal, before: bool, tabw: int) -> bool {
+    if v.kind == REG_CHARWISE {
+        return paste_char(mut spans, mut ec, v, before)
+    }
+    if v.kind == REG_LINEWISE {
+        return paste_line(mut spans, mut ec, v, before)
+    }
+    if v.kind == REG_BLOCKWISE {
+        return paste_block(mut spans, mut ec, v, before, tabw)
+    }
+    util.bug("text.register", "register: invalid value type")
+    false
+}
+
+/// Paste register `name` at the primary caret as one undo node
+/// (`yew_reg_paste`, `register.c:766-809`): `+`/`*` read the system
+/// clipboard first, and so does the unnamed register under sync UNNAMED
+/// (the read becomes the unnamed value and a ring entry). The context
+/// must carry an undo tree and a cursor set.
+pub fn reg_paste(mut r: Registers, mut ec: EditCtx, name_in: int, before: bool, tabw: int) -> bool {
+    if !ec.has_undo || !ec.has_cset {
+        util.bug("text.register", "yew_reg_paste: incomplete context")
+    }
+    var name = name_in
+    if name == '+' as int || name == '*' as int {
+        clip_set_read_max(mut r.clip, r.clip_read_max)
+        var sys = copy r.system
+        if !clip_read(mut r.clip, mut sys, clip_target(name)) {
+            return false
+        }
+        r.system = sys
+        name = '+' as int
+    } else if (name == 0 || name == '"' as int) && r.clipboard_sync == CLIP_SYNC_UNNAMED {
+        clip_set_read_max(mut r.clip, r.clip_read_max)
+        var sys = copy r.system
+        if !clip_read(mut r.clip, mut sys, '+' as int) {
+            return false
+        }
+        r.system = copy sys
+        set_unnamed(mut r, sys)
+        name = '"' as int
+    }
+    let v = reg_get_in(mut r, name, ec) else {
+        return false
+    }
+    let origin = copy ec.cset.curs[ec.cset.primary]
+    var spans = List[Span]()
+    undo_begin(mut ec, TXN_PASTE)
+    let changed = paste_value(mut spans, mut ec, v, before, tabw)
+    undo_end(mut ec)
+    r.paste_spans = spans
+    if !changed {
+        r.paste_live = false
+        return false
+    }
+    r.paste_origin = origin
+    r.paste_owner = ec.tb.bid
+    r.paste_win_id = ec.win_id
+    r.paste_ring_index = r.ring_head
+    r.paste_tabw = tabw
+    r.paste_before = before
+    r.paste_live = true
+    true
+}
+
+/// Replace the live paste with the ring entry `delta` ranks older
+/// (`yew_reg_ring_cycle`, `register.c:811-849`), amending the paste's undo
+/// node; refused once another edit closed it, or from another buffer or
+/// window.
+pub fn reg_ring_cycle(mut r: Registers, mut ec: EditCtx, delta: int) -> bool {
+    if !r.paste_live ||
+        r.ring_len == 0 ||
+        !ec.has_undo ||
+        !ec.has_cset ||
+        r.paste_owner != ec.tb.bid ||
+        r.paste_win_id != ec.win_id {
+        return false
+    }
+    if !undo_reopen(mut ec, TXN_PASTE) {
+        r.paste_live = false
+        util.log_warn("register: ring cycle refused after edit")
+        return false
+    }
+    var i = r.paste_spans.len
+    while i != 0 {
+        i -= 1
+        let _ = edit_delete(mut ec, copy r.paste_spans[i])
+    }
+    set_primary_cursor(mut ec, r.paste_origin.pos)
+    var current_rank = (r.ring_head + KILL_RING_MAX - r.paste_ring_index) % KILL_RING_MAX
+    if current_rank >= r.ring_len {
+        current_rank = 0
+    }
+    var rank = current_rank + delta
+    while rank < 0 {
+        rank += r.ring_len
+    }
+    rank = rank % r.ring_len
+    r.paste_ring_index = (r.ring_head + KILL_RING_MAX - rank) % KILL_RING_MAX
+    let v = copy r.ring[r.paste_ring_index]
+    var spans = List[Span]()
+    let changed = paste_value(mut spans, mut ec, v, r.paste_before, r.paste_tabw)
+    r.paste_spans = spans
+    undo_end(mut ec)
+    if !changed {
+        r.paste_live = false
+    }
+    changed
+}
+
+/// The ring's newest `max` entries' shapes, newest first
+/// (`yew_reg_ring_list`, `register.c:851-873`); `r.ring_len` is C's count
+/// with a NULL `out`.
+pub fn reg_ring_list(r: Registers, max: int) -> List[RegInfo] {
+    let count = if r.ring_len < max then r.ring_len else max
+    var out = List[RegInfo]()
+    var i = 0
+    while i < count {
+        let index = (r.ring_head + KILL_RING_MAX - i) % KILL_RING_MAX
+        (mut out).push(RegInfo {
+            kind: r.ring[index].kind,
+            ragged: r.ring[index].ragged,
+            width: r.ring[index].width,
+            rows: r.ring[index].rows.len,
+            bytes: r.ring[index].bytes.len,
+            t_wall: r.ring[index].t_wall,
+        })
+        i += 1
+    }
+    out
+}

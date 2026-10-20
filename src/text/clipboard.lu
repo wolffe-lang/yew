@@ -1,0 +1,770 @@
+//! text.clipboard — the system clipboard: backend detection, the
+//! one-item coalescing write queue, demotion of a failed backend, the
+//! OSC 52 transport, and the subprocess backends.
+//!
+//! Ports sagitta `src/text/clipboard.c` (1135 lines) and `clipboard.h`
+//! (51) at 9ace98c2, under `s11-registers-and-clipboard.md`. A write is
+//! copied into a one-item queue (the latest wins); the editor loop calls
+//! `clip_after_render` once per input burst, which starts the queued
+//! write on the detected backend: OSC 52 is queued as out-of-band bytes
+//! behind the frame's end marker and flushed into the frame; a payload
+//! over the OSC 52 limit falls back to a local subprocess backend (never
+//! over SSH). Reads are subprocess-only and never OSC 52.
+//!
+//! The wolf shapes:
+//!  - C's process-global `YewClipboardState yew_clip` (`clipboard.c:31-
+//!    58`) is a value, `Clipboard`, which the register file owns
+//!    (`Registers.clip`) and threads to every call, as `JournalSet` is
+//!    threaded; initialized lazily on first use, as C's. No module
+//!    state, no `unsafe`.
+//!  - the environment is read live (`term.env_getv`, C's `getenv`), and
+//!    OSC 52's mode, target and limit are `term.osc52_*` over
+//!    `term.env_process()`; C's process-global terminal OOB queue is the
+//!    renderer's (`term.render_oob_*`, yw01), so `clip_after_render` and
+//!    `clip_pump` take the `term.Render`.
+//!  - `access(name, X_OK)` has no wolf call: `exec_ok` reads the mode
+//!    bits against the real uid, gid and supplementary groups as
+//!    access(2) does, root needing any execute bit (ACLs and noexec
+//!    mounts unread).
+//!  - `pbcopy` is gated in C at compile time (`__APPLE__ && aarch64`);
+//!    wolf 0.2.33 has no host probe, so the port gates on the PATH alone.
+//!  - **The subprocess writer and reader are not ported (a gap, reported,
+//!    never worked around).** The writer needs a non-blocking pipe write
+//!    (C's `O_NONBLOCK`; no wolf call sets it), a double fork so the tool
+//!    is no child of the editor (no fork at 0.2.33) and a write-readiness
+//!    wait; the reader needs a timed wait on its pipe (`os_signal_wait_fd`
+//!    takes no deadline; the deadline form, wolf-lang#795, is 0.2.34).
+//!    Detection, the commands, the queue, demotion and OSC 52 are whole;
+//!    reaching a subprocess spawn is a hard error naming the gap
+//!    (`writer_gap`, `reader_gap`: exit 4), never a silent fallback. The
+//!    writer's descriptors, tool pid and reap list keep C's fields and
+//!    stay empty until it lands.
+
+use std.env as std_env
+use std.fs
+use std.io as std_io
+use std.signal
+use term
+use util
+
+/// `YEW_CLIPBOARD_TIMEOUT_DEFAULT_MS`.
+pub const CLIPBOARD_TIMEOUT_DEFAULT_MS: int = 1000
+
+/// `YEW_CLIPBOARD_READ_MAX_DEFAULT` (64 MiB).
+pub const CLIPBOARD_READ_MAX_DEFAULT: int = 67108864
+
+/// `YEW_CLIP_NONE`.
+pub const CLIP_NONE: int = 0
+
+/// `YEW_CLIP_WL`: `wl-copy` / `wl-paste`.
+pub const CLIP_WL: int = 1
+
+/// `YEW_CLIP_XCLIP`.
+pub const CLIP_XCLIP: int = 2
+
+/// `YEW_CLIP_XSEL`.
+pub const CLIP_XSEL: int = 3
+
+/// `YEW_CLIP_PB`: `pbcopy` / `pbpaste`.
+pub const CLIP_PB: int = 4
+
+/// `YEW_CLIP_OSC52`: the terminal, write-only.
+pub const CLIP_OSC52: int = 5
+
+/// `YEW_CLIP_CUSTOM`: `YEW_CLIPBOARD=cmd:<write>[|<read>]`.
+pub const CLIP_CUSTOM: int = 6
+
+const CLIP_REAP_MAX: int = 512
+
+const CLIP_BACKEND_COUNT: int = 7
+
+/// The clipboard's state (`YewClipboardState`, `clipboard.c:31-56`).
+pub struct Clipboard {
+    queued: RegVal,
+    active: RegVal,
+    initialized: bool,
+    queued_valid: bool,
+    active_valid: bool,
+    write_cached: bool,
+    read_cached: bool,
+    write_backend: int,
+    read_backend: int,
+    active_backend: int,
+    demoted: int,
+    queued_target: int,
+    active_target: int,
+    write_fd: int,
+    pid_fd: int,
+    exec_fd: int,
+    tool_pid: int,
+    reap: List[int],
+    written: int,
+    deadline_ms: int,
+    timeout_ms: int,
+    read_max: int,
+    exec_ready: bool,
+}
+
+/// The state before first use (C's zeroed static).
+pub fn clip_new() -> Clipboard {
+    Clipboard {
+        queued: regval_new(),
+        active: regval_new(),
+        initialized: false,
+        queued_valid: false,
+        active_valid: false,
+        write_cached: false,
+        read_cached: false,
+        write_backend: CLIP_NONE,
+        read_backend: CLIP_NONE,
+        active_backend: CLIP_NONE,
+        demoted: 0,
+        queued_target: 0,
+        active_target: 0,
+        write_fd: -1,
+        pid_fd: -1,
+        exec_fd: -1,
+        tool_pid: 0,
+        reap: List[int](),
+        written: 0,
+        deadline_ms: 0,
+        timeout_ms: 0,
+        read_max: 0,
+        exec_ready: false,
+    }
+}
+
+// The subprocess writer at 0.2.33 (see the header): a hard error by name.
+fn writer_gap(what: str) {
+    util.bug(
+        "text.clipboard",
+        "not yet ported: {what}: the subprocess clipboard writer needs a non-blocking pipe write, a fork and a write-readiness wait, none of which wolf 0.2.33 has (yw02 [reg] gap)",
+    )
+}
+
+// The subprocess reader at 0.2.33 (see the header): a hard error by name.
+fn reader_gap(what: str) {
+    util.bug(
+        "text.clipboard",
+        "not yet ported: {what}: the subprocess clipboard reader needs a timed wait on its pipe, which wolf 0.2.33 does not have (os_signal_wait_fds, wolf-lang#795, is 0.2.34) (yw02 [reg] gap)",
+    )
+}
+
+fn is_space(b: int) -> bool {
+    b == 32 || b >= 9 && b <= 13
+}
+
+// `strtoll(text, &end, 10)` with `*end == '\0'` required: (ok, value);
+// out of range is not ok (C's ERANGE).
+fn parse_ll(text: str) -> (bool, int) {
+    let b = text.bytes()
+    var i = 0
+    while i < b.len && is_space(b[i] as int) {
+        i += 1
+    }
+    var negative = false
+    if i < b.len && (b[i] as int == 43 || b[i] as int == 45) {
+        negative = b[i] as int == 45
+        i += 1
+    }
+    let start = i
+    var value = 0
+    while i < b.len && b[i] as int >= 48 && b[i] as int <= 57 {
+        let d = b[i] as int - 48
+        if value > (9223372036854775807 - d) / 10 {
+            return (false, 0)
+        }
+        value = value * 10 + d
+        i += 1
+    }
+    if i == start || i != b.len {
+        return (false, 0)
+    }
+    if negative {
+        return (true, 0 - value)
+    }
+    (true, value)
+}
+
+// `clip_parse_positive_ms`, `clipboard.c:82-97`.
+fn clip_parse_positive_ms(name: str, fallback: int) -> int {
+    let (text, has) = term.env_getv(name)
+    if !has || text.len == 0 {
+        return fallback
+    }
+    let (ok, value) = parse_ll(text)
+    if !ok || value <= 0 {
+        util.log_warn("clipboard: ignoring invalid {name}")
+        return fallback
+    }
+    value
+}
+
+// `clip_ignore_sigpipe`, `clipboard.c:99-109`: SIGPIPE stays ignored
+// process-wide (clipboard.h).
+fn clip_ignore_sigpipe() {
+    signal.ignore(signal.broken_pipe()) else |_| {
+        util.log_warn("clipboard: cannot ignore SIGPIPE")
+    }
+}
+
+// `clip_init`, `clipboard.c:111-126`.
+fn clip_init(mut c: Clipboard) {
+    if c.initialized {
+        return
+    }
+    c = clip_new()
+    c.timeout_ms = clip_parse_positive_ms("YEW_CLIPBOARD_TIMEOUT_MS", CLIPBOARD_TIMEOUT_DEFAULT_MS)
+    c.read_max = CLIPBOARD_READ_MAX_DEFAULT
+    c.initialized = true
+    clip_ignore_sigpipe()
+}
+
+fn nonempty_env(name: str) -> bool {
+    let (value, has) = term.env_getv(name)
+    has && value.len != 0
+}
+
+fn clip_remote() -> bool {
+    nonempty_env("SSH_TTY") || nonempty_env("SSH_CONNECTION")
+}
+
+// access(2)'s X_OK over the stat record, by the real ids (see the header).
+fn access_x(info: fs.Info) -> bool {
+    let uid = std_env.uid() else -1
+    if uid == 0 {
+        return info.mode & 73 != 0
+    }
+    if info.uid == uid {
+        return info.mode & 64 != 0
+    }
+    var in_group = false
+    let gid = std_env.gid() else -1
+    if info.gid == gid {
+        in_group = true
+    } else {
+        let groups = std_env.groups() else List[int]()
+        for g in groups {
+            if g == info.gid {
+                in_group = true
+            }
+        }
+    }
+    if in_group {
+        return info.mode & 8 != 0
+    }
+    info.mode & 1 != 0
+}
+
+// `access(path, X_OK) == 0 && stat(path) == 0 && S_ISREG`.
+fn exec_ok(path: str) -> bool {
+    let info = fs.stat(path) else {
+        return false
+    }
+    info.kind == 0 && access_x(info)
+}
+
+// `clip_path_exec`, `clipboard.c:141-185`: a name with a slash is itself;
+// otherwise each PATH entry (an empty one is `.`, an unset PATH is
+// `/usr/local/bin:/usr/bin:/bin`).
+fn clip_path_exec(name: str) -> bool {
+    if name.len == 0 {
+        return false
+    }
+    if name.contains("/") {
+        return exec_ok(name)
+    }
+    let (path_env, has) = term.env_getv("PATH")
+    let path = if has then path_env else "/usr/local/bin:/usr/bin:/bin"
+    let b = path.bytes()
+    var at = 0
+    loop {
+        var end = at
+        while end < b.len && b[end] as int != 58 {
+            end += 1
+        }
+        var dir = "."
+        if end > at {
+            dir = util.buf_to_str(b[at..end]) else "."
+        }
+        if exec_ok("{dir}/{name}") {
+            return true
+        }
+        if end >= b.len {
+            return false
+        }
+        at = end + 1
+    }
+    false
+}
+
+fn clip_backend_bit(backend: int) -> int {
+    if backend < 32 then 1 << backend else 0
+}
+
+fn stdout_is_terminal() -> bool {
+    std_io.is_terminal(fs.stdout()) else false
+}
+
+// `clip_available`, `clipboard.c:192-218`.
+fn clip_available(c: Clipboard, backend: int) -> bool {
+    if c.demoted & clip_backend_bit(backend) != 0 {
+        return false
+    }
+    if backend == CLIP_WL {
+        return nonempty_env("WAYLAND_DISPLAY") && clip_path_exec("wl-copy")
+    }
+    if backend == CLIP_XCLIP {
+        return nonempty_env("DISPLAY") && clip_path_exec("xclip")
+    }
+    if backend == CLIP_XSEL {
+        return nonempty_env("DISPLAY") && clip_path_exec("xsel")
+    }
+    if backend == CLIP_PB {
+        return clip_path_exec("pbcopy")
+    }
+    if backend == CLIP_OSC52 {
+        return stdout_is_terminal() && term.osc52_mode(term.env_process()) != term.OSC52_OFF
+    }
+    false
+}
+
+// `clip_named_backend`, `clipboard.c:220-249`: (backend, recognized).
+fn clip_named_backend(value: str, read_side: bool) -> (int, bool) {
+    if value == "none" {
+        return (CLIP_NONE, true)
+    }
+    if value == "osc52" {
+        if read_side || term.osc52_mode(term.env_process()) == term.OSC52_OFF {
+            return (CLIP_NONE, true)
+        }
+        return (CLIP_OSC52, true)
+    }
+    if value == "wl" {
+        return (CLIP_WL, true)
+    }
+    if value == "xclip" {
+        return (CLIP_XCLIP, true)
+    }
+    if value == "xsel" {
+        return (CLIP_XSEL, true)
+    }
+    if value == "pb" {
+        return (CLIP_PB, true)
+    }
+    if value.starts_with("cmd:") {
+        let b = value.bytes()
+        var bar = 4
+        while bar < b.len && b[bar] as int != 124 {
+            bar += 1
+        }
+        if read_side {
+            if bar < b.len && bar + 1 < b.len {
+                return (CLIP_CUSTOM, true)
+            }
+            return (CLIP_NONE, true)
+        }
+        if b.len > 4 && bar != 4 {
+            return (CLIP_CUSTOM, true)
+        }
+        return (CLIP_NONE, true)
+    }
+    (CLIP_NONE, false)
+}
+
+// `clip_detect_direction`, `clipboard.c:251-283`: the override, then
+// OSC 52 alone over SSH (writes), then wl, xclip, xsel, pb, then OSC 52.
+fn clip_detect_direction(c: Clipboard, read_side: bool) -> int {
+    let (forced_name, has) = term.env_getv("YEW_CLIPBOARD")
+    if has && forced_name.len != 0 && forced_name != "auto" {
+        let (forced, recognized) = clip_named_backend(forced_name, read_side)
+        if recognized {
+            if c.demoted & clip_backend_bit(forced) != 0 {
+                return CLIP_NONE
+            }
+            return forced
+        }
+        util.log_warn("clipboard: ignoring invalid YEW_CLIPBOARD override")
+    }
+    if !read_side && clip_remote() {
+        return if clip_available(c, CLIP_OSC52) then CLIP_OSC52 else CLIP_NONE
+    }
+    if clip_available(c, CLIP_WL) {
+        return CLIP_WL
+    }
+    if clip_available(c, CLIP_XCLIP) {
+        return CLIP_XCLIP
+    }
+    if clip_available(c, CLIP_XSEL) {
+        return CLIP_XSEL
+    }
+    if clip_available(c, CLIP_PB) {
+        return CLIP_PB
+    }
+    if !read_side && clip_available(c, CLIP_OSC52) {
+        return CLIP_OSC52
+    }
+    CLIP_NONE
+}
+
+fn clip_detect_subprocess_write(c: Clipboard) -> int {
+    if clip_available(c, CLIP_WL) {
+        return CLIP_WL
+    }
+    if clip_available(c, CLIP_XCLIP) {
+        return CLIP_XCLIP
+    }
+    if clip_available(c, CLIP_XSEL) {
+        return CLIP_XSEL
+    }
+    if clip_available(c, CLIP_PB) {
+        return CLIP_PB
+    }
+    CLIP_NONE
+}
+
+/// The write backend, detected once and cached (`yew_clip_detect`,
+/// `clipboard.c:298-306`).
+pub fn clip_detect(mut c: Clipboard) -> int {
+    clip_init(mut c)
+    if !c.write_cached {
+        c.write_backend = clip_detect_direction(c, false)
+        c.write_cached = true
+    }
+    c.write_backend
+}
+
+/// The read backend: the same local order, never OSC 52
+/// (`yew_clip_detect_read`, `clipboard.c:308-316`).
+pub fn clip_detect_read(mut c: Clipboard) -> int {
+    clip_init(mut c)
+    if !c.read_cached {
+        c.read_backend = clip_detect_direction(c, true)
+        c.read_cached = true
+    }
+    c.read_backend
+}
+
+fn words(list: str) -> List[str] {
+    var out = List[str]()
+    for w in list.split(" ") {
+        if w.len != 0 {
+            (mut out).push(w)
+        }
+    }
+    out
+}
+
+// `clip_cmd_parse`, `clipboard.c:352-386`: words split on spaces.
+fn clip_cmd_parse(b: List[byte], lo: int, hi: int) -> List[str] {
+    let text = util.buf_to_str(b[lo..hi]) else ""
+    words(text)
+}
+
+// `clip_custom_cmd`, `clipboard.c:388-405`: the write half before `|`,
+// the read half after it.
+fn clip_custom_cmd(read_side: bool) -> List[str] {
+    let (value, has) = term.env_getv("YEW_CLIPBOARD")
+    if !has || !value.starts_with("cmd:") {
+        return List[str]()
+    }
+    let b = value.bytes()
+    var bar = 4
+    while bar < b.len && b[bar] as int != 124 {
+        bar += 1
+    }
+    if read_side {
+        if bar >= b.len {
+            return List[str]()
+        }
+        return clip_cmd_parse(b, bar + 1, b.len)
+    }
+    clip_cmd_parse(b, 4, bar)
+}
+
+// `clip_command`, `clipboard.c:407-480`: the argv for a backend and
+// direction (`*` is the primary selection); empty when there is none.
+fn clip_command(backend: int, read_side: bool, target: int) -> List[str] {
+    let primary = target == '*' as int
+    if backend == CLIP_WL {
+        if read_side {
+            return if primary {
+                words("wl-paste --primary --no-newline")
+            } else {
+                words("wl-paste --no-newline")
+            }
+        }
+        if primary {
+            return words("wl-copy --type text/plain;charset=utf-8 --primary")
+        }
+        return words("wl-copy --type text/plain;charset=utf-8")
+    }
+    if backend == CLIP_XCLIP {
+        let sel = if primary then "primary" else "clipboard"
+        let dir = if read_side then "-out" else "-in"
+        return words("xclip -selection {sel} {dir}")
+    }
+    if backend == CLIP_XSEL {
+        let sel = if primary then "--primary" else "--clipboard"
+        let dir = if read_side then "--output" else "--input"
+        return words("xsel {sel} {dir}")
+    }
+    if backend == CLIP_PB {
+        return if read_side then words("pbpaste") else words("pbcopy")
+    }
+    if backend == CLIP_CUSTOM {
+        return clip_custom_cmd(read_side)
+    }
+    List[str]()
+}
+
+/// Reap the writers' exited middle processes (`yew_clip_reap`,
+/// `clipboard.c:534-551`); the list stays empty until the writer lands,
+/// and a `waitpid(pid, WNOHANG)` on a tracked pid is the writer's gap.
+pub fn clip_reap(mut c: Clipboard) {
+    if !c.initialized {
+        return
+    }
+    var out = List[int]()
+    for pid in c.reap {
+        writer_gap("yew_clip_reap (clipboard.c:534-551) of pid {pid}")
+        (mut out).push(pid)
+    }
+    c.reap = out
+}
+
+/// How many writer processes are still unreaped (`yew_clip_owned_children`).
+pub fn clip_owned_children(c: Clipboard) -> int {
+    if c.initialized then c.reap.len else 0
+}
+
+// `clip_spawn_writer`, `clipboard.c:558-661`: the gap. C's success sets
+// the deadline `now_ms + timeout_ms`, saturating.
+fn clip_spawn_writer(mut c: Clipboard, backend: int, target: int, now_ms: int) -> bool {
+    let cmd = clip_command(backend, false, target)
+    if cmd.len == 0 {
+        return false
+    }
+    clip_reap(mut c)
+    if c.reap.len >= CLIP_REAP_MAX {
+        return false
+    }
+    writer_gap("clip_spawn_writer (clipboard.c:558-661) for {cmd[0]} at {now_ms} ms")
+    false
+}
+
+// `clip_close_active`, `clipboard.c:663-680`.
+fn clip_close_active(mut c: Clipboard) {
+    c.write_fd = -1
+    c.pid_fd = -1
+    c.exec_fd = -1
+    c.tool_pid = 0
+    c.written = 0
+    c.deadline_ms = 0
+    c.exec_ready = false
+    c.active_valid = false
+    regval_clear(mut c.active)
+}
+
+// `clip_retry_active`, `clipboard.c:682-692`: requeue the active write
+// unless a newer one is queued, and demote its backend.
+fn clip_retry_active(mut c: Clipboard) {
+    if !c.queued_valid {
+        c.queued = copy c.active
+        c.queued_target = c.active_target
+        c.queued_valid = true
+    }
+    c.demoted = c.demoted | clip_backend_bit(c.active_backend)
+    c.write_cached = false
+    clip_close_active(mut c)
+}
+
+/// Queue a copy of `v` for the system clipboard (`yew_clip_write`,
+/// `clipboard.c:740-751`): the latest write wins; `*` is the primary
+/// selection, every other target `+`. Nothing is detected or started
+/// until `clip_after_render`.
+pub fn clip_write(mut c: Clipboard, v: RegVal, target: int) -> bool {
+    clip_init(mut c)
+    c.queued = copy v
+    c.queued_target = if target != '*' as int then '+' as int else target
+    c.queued_valid = true
+    true
+}
+
+// `clip_start_queued`, `clipboard.c:753-807`.
+fn clip_start_queued(mut c: Clipboard, mut r: term.Render, now_ms: int) {
+    if !c.queued_valid || c.active_valid {
+        return
+    }
+    let backend = clip_detect(mut c)
+    if backend == CLIP_NONE {
+        util.log_warn("clipboard: no writable system clipboard backend")
+        c.queued_valid = false
+        regval_clear(mut c.queued)
+        return
+    }
+    c.active = copy c.queued
+    c.active_target = c.queued_target
+    c.active_backend = backend
+    c.active_valid = true
+    c.queued_valid = false
+    regval_clear(mut c.queued)
+    if backend == CLIP_OSC52 {
+        var frame = List[byte]()
+        if term.osc52_build_env(mut frame, c.active.bytes, term.env_process()) {
+            term.render_oob_queue(mut r, frame)
+            clip_close_active(mut c)
+            return
+        }
+        while !clip_remote() {
+            let fallback = clip_detect_subprocess_write(c)
+            if fallback == CLIP_NONE {
+                break
+            }
+            c.active_backend = fallback
+            if clip_spawn_writer(mut c, fallback, c.active_target, now_ms) {
+                return
+            }
+            util.log_warn("clipboard: cannot start fallback writer backend")
+            c.demoted = c.demoted | clip_backend_bit(fallback)
+            c.write_cached = false
+        }
+        util.log_warn("clipboard: payload exceeds OSC 52 limit; register + retains it")
+        clip_close_active(mut c)
+        return
+    }
+    if !clip_spawn_writer(mut c, backend, c.active_target, now_ms) {
+        util.log_warn("clipboard: cannot start writer backend")
+        clip_retry_active(mut c)
+    }
+}
+
+fn clip_start_available(mut c: Clipboard, mut r: term.Render, now_ms: int) {
+    var attempts = 0
+    while c.queued_valid && !c.active_valid && attempts < CLIP_BACKEND_COUNT {
+        attempts += 1
+        clip_start_queued(mut c, mut r, now_ms)
+    }
+}
+
+/// Once per input burst, after the frame is rendered
+/// (`yew_clip_after_render`, `clipboard.c:818-827`): reap, pump, start
+/// the queued write, pump, and flush the renderer's out-of-band bytes (an
+/// OSC 52 sequence) onto `terminal_out`, behind the frame's end marker.
+pub fn clip_after_render(
+    mut c: Clipboard,
+    mut r: term.Render,
+    mut terminal_out: List[byte],
+    now_ms: int,
+) {
+    clip_init(mut c)
+    clip_reap(mut c)
+    clip_pump(mut c, mut r, now_ms)
+    clip_start_available(mut c, mut r, now_ms)
+    clip_pump(mut c, mut r, now_ms)
+    let _ = term.render_oob_flush(mut r, mut terminal_out)
+}
+
+/// Drive the active subprocess write (`yew_clip_pump`, `clipboard.c:829-
+/// 893`): only a running writer is ever active, so with none it returns;
+/// the write loop is the gap.
+pub fn clip_pump(mut c: Clipboard, mut r: term.Render, now_ms: int) {
+    var fallbacks = 0
+    if !c.initialized {
+        return
+    }
+    clip_reap(mut c)
+    loop {
+        if !c.active_valid {
+            return
+        }
+        writer_gap("yew_clip_pump's write loop (clipboard.c:837-886)")
+        fallbacks += 1
+        if fallbacks >= CLIP_BACKEND_COUNT {
+            return
+        }
+        clip_start_available(mut c, mut r, now_ms)
+    }
+}
+
+/// The descriptor the loop polls for the writer: the pipe, else its exec
+/// status pipe, else -1 (`yew_clip_write_fd`).
+pub fn clip_write_fd(c: Clipboard) -> int {
+    if !c.initialized {
+        return -1
+    }
+    if c.write_fd >= 0 then c.write_fd else c.exec_fd
+}
+
+/// The active write's deadline, or -1 (`yew_clip_deadline`).
+pub fn clip_deadline(c: Clipboard) -> int {
+    if c.initialized && c.active_valid then c.deadline_ms else -1
+}
+
+/// A write is in flight (`yew_clip_busy`).
+pub fn clip_busy(c: Clipboard) -> bool {
+    c.initialized && c.active_valid
+}
+
+/// A write is queued (`yew_clip_pending`).
+pub fn clip_pending(c: Clipboard) -> bool {
+    c.initialized && c.queued_valid
+}
+
+// The bounded subprocess read (`clip_spawn_reader` and `yew_clip_read`'s
+// poll loop, `clipboard.c:918-1086`): the gap.
+fn clip_read_tool(cmd: List[str], timeout_ms: int, read_max: int) -> List[byte] {
+    reader_gap(
+        "yew_clip_read (clipboard.c:918-1086) for {cmd[0]}: {timeout_ms} ms, at most {read_max} bytes",
+    )
+    List[byte]()
+}
+
+/// Read the system clipboard into `out` (`yew_clip_read`,
+/// `clipboard.c:960-1099`): false, `out` untouched and a warning logged
+/// when no subprocess backend reads; on a clean exit `out` is the
+/// charwise bytes the tool printed.
+pub fn clip_read(mut c: Clipboard, mut out: RegVal, target: int) -> bool {
+    clip_init(mut c)
+    let backend = clip_detect_read(mut c)
+    if backend == CLIP_NONE || backend == CLIP_OSC52 {
+        util.log_warn("clipboard: no readable system clipboard backend")
+        return false
+    }
+    let cmd = clip_command(backend, true, if target == '*' as int then target else '+' as int)
+    if cmd.len == 0 {
+        util.log_warn("clipboard: selected backend has no read command")
+        return false
+    }
+    let bytes = clip_read_tool(cmd, c.timeout_ms, c.read_max)
+    regval_clear(mut out)
+    out.bytes = bytes
+    out.t_wall = wall_secs()
+    true
+}
+
+/// The read cap (`yew_clip_set_read_max`).
+pub fn clip_set_read_max(mut c: Clipboard, max_bytes: int) {
+    clip_init(mut c)
+    c.read_max = max_bytes
+}
+
+/// Stop: kill a running tool, close the writer's descriptors, wait for
+/// every tracked child, forget everything (`yew_clip_shutdown`,
+/// `clipboard.c:1107-1129`). With no writer there is none to stop.
+pub fn clip_shutdown(mut c: Clipboard) {
+    if !c.initialized {
+        return
+    }
+    if c.tool_pid > 0 || c.reap.len != 0 || c.write_fd >= 0 {
+        writer_gap("yew_clip_shutdown (clipboard.c:1107-1129)")
+    }
+    c = clip_new()
+}
+
+/// Shut down and start over: defaults restored, detection invalidated
+/// (`yew_clip_reset`); SIGPIPE stays ignored.
+pub fn clip_reset(mut c: Clipboard) {
+    clip_shutdown(mut c)
+    clip_init(mut c)
+}
