@@ -1,0 +1,356 @@
+//! perf-re — the regex engine's two performance harnesses: the
+//! no-backtracking proof (`--pathological`) and search throughput with
+//! the no-materialization ceiling (`--throughput`).
+//!
+//! Ports sagitta `tests/perf/re_pathological.c` (351 lines) and
+//! `re_throughput.c` (277) at 9ace98c2, under `s20-regex-engine.md` DoD 2
+//! and 3. C's are in-process (they link the engine), so this is the
+//! port's own harness, run beside C's from the same run by
+//! `tools/run-perf-re` for the 2x rule; its lines are C's lines so one
+//! parser reads both. Limits come from the oracle's own
+//! `tests/perf/component-limits.txt` (`--baseline FILE`).
+//!
+//! The port's runs go through `re_search_any_ws` with one `ReScratch`
+//! (the entry point an editor that searches per keystroke uses): C
+//! mallocs and frees its engine storage per call, a wolf allocation
+//! lives to its region's end (G33), so a per-call scratch would time the
+//! allocator's growth, not the engine.
+//!
+//! Two port shapes. wolf's clock is milliseconds (G8: `std.time`), so a
+//! timed sample is a BATCH of runs repeated until it spans at least
+//! 100 ms (C: 32 runs a sample, nanosecond clock) and divided; C's three
+//! interleaved small/large pairs and their median are kept. The RSS
+//! high-water mark is `VmHWM` from `/proc/self/status` (C's
+//! `getrusage`; no rusage builtin at 0.2.33), Linux only, and the 1 GiB
+//! buffer is built before the baseline is read, as C's is.
+//!
+//!   perf-re --pathological --baseline FILE
+//!   perf-re --throughput --baseline FILE      (YEW_RE_THROUGHPUT_BYTES overrides 1 GiB)
+
+use search
+use std.fs
+use std.time
+use text
+
+fn read_limit(path: str, name: str) -> int {
+    let body = fs.read_text(path) else ""
+    for line in body.lines() {
+        let w = line.words()
+        if w.len >= 2 && w[0] == name {
+            return w[1].to_int() else 0
+        }
+    }
+    0
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn compile_s(pat: str) -> search.Re {
+    var err = search.re_err_new()
+    let re = search.re_compile_str(pat, 0, mut err) else {
+        eprint("perf-re: /{pat}/ did not compile: {err.msg}")
+        os_exit(2)
+        return search.re_empty()
+    }
+    re
+}
+
+fn at0() -> text.ByteOff {
+    0 as text.ByteOff
+}
+
+/// `time_run` (`re_pathological.c:86-128`): `pat` against `n` copies of
+/// 'a'; answers (ns per search, matched). A sample is at least 32 runs
+/// and at least 100 ms.
+fn time_run(pat: str, n: int) -> (int, bool) {
+    let re = compile_s(pat)
+    var hay = List[byte]()
+    var i = 0
+    while i < n {
+        (mut hay).push(97 as byte)
+        i += 1
+    }
+    let tb0 = text.textbuf_new()
+    let inp = search.re_input_bytes(n)
+    var sc = search.re_scratch_new()
+    var any = false
+    var runs = 0
+    let start = time.now()
+    var elapsed = 0
+    while runs < 32 || elapsed < 100 {
+        if search.re_search_any_ws(mut sc, re, tb0, hay, inp, at0()) {
+            any = true
+        }
+        runs += 1
+        elapsed = time.as_millis(time.elapsed(start))
+    }
+    var ns = elapsed * 1000000 / runs
+    if ns == 0 {
+        ns = 1
+    }
+    (ns, any)
+}
+
+/// `median_ratio_index` (`:130-141`), over ratios as fixed-point.
+fn median_index(a: int, b: int, c: int) -> int {
+    if a <= b && b <= c || c <= b && b <= a {
+        return 1
+    }
+    if b <= a && a <= c || c <= a && a <= b {
+        return 0
+    }
+    2
+}
+
+fn fmt2(x100: int) -> str {
+    let frac = x100 % 100
+    if frac < 10 then "{x100 / 100}.0{frac}" else "{x100 / 100}.{frac}"
+}
+
+/// `scaling_case` (`:143-246`): three interleaved small/large pairs, the
+/// median ratio, the best large time against the hard limit.
+fn scaling_case(pat: str, hard_ns: int, ratio_limit: int) -> int {
+    var small = List[int]()
+    var large = List[int]()
+    var ratios = List[int]()
+    var best_large = 0
+    var t = 0
+    while t < 3 {
+        var s_ns = 0
+        var l_ns = 0
+        var s_m = false
+        var l_m = false
+        if t == 1 {
+            let (a, am) = time_run(pat, 100000)
+            let (b, bm) = time_run(pat, 10000)
+            l_ns = a
+            l_m = am
+            s_ns = b
+            s_m = bm
+        } else {
+            let (b, bm) = time_run(pat, 10000)
+            let (a, am) = time_run(pat, 100000)
+            s_ns = b
+            s_m = bm
+            l_ns = a
+            l_m = am
+        }
+        if s_m || l_m {
+            eprint("re_pathological: /{pat}/ unexpectedly matched")
+            os_exit(2)
+        }
+        if s_ns < 1000 {
+            s_ns = 1000
+        }
+        (mut small).push(s_ns)
+        (mut large).push(l_ns)
+        (mut ratios).push(l_ns * 100 / s_ns)
+        if t == 0 || l_ns < best_large {
+            best_large = l_ns
+        }
+        t += 1
+    }
+    let m = median_index(ratios[0], ratios[1], ratios[2])
+    let ratio = large[m] * 100 / small[m]
+    let verdict = if best_large <= hard_ns then "" else "  OVER"
+    print(
+        "re.pathological /{pat}/ 10^4={small[m]} ns  10^5={large[m]} ns{verdict}  ratio={fmt2(ratio)}",
+    )
+    var status = 0
+    if best_large > hard_ns {
+        eprint("re_pathological: /{pat}/ took {best_large} ns at 10^5, limit {hard_ns} ns (strict)")
+        status = 1
+    }
+    if ratio > ratio_limit * 100 {
+        eprint(
+            "re_pathological: /{pat}/ scaled {fmt2(ratio)}x from 10^4 to 10^5 (limit {ratio_limit}x) — that is super-linear, which means backtracking crept back in",
+        )
+        status = 1
+    }
+    status
+}
+
+fn pathological(limits: str) -> int {
+    let hard_ns = read_limit(limits, "re.pathological_100k_ns")
+    let ratio_limit = read_limit(limits, "re.pathological_scale_ratio")
+    if hard_ns <= 0 || ratio_limit <= 0 {
+        eprint("re_pathological: cannot read {limits}")
+        return 2
+    }
+    print("re.pathological mode strict")
+    var status = 0
+    for pat in "a(a*)*b (a|a)*b (a+)+b (a*)*b".words() {
+        if scaling_case(pat, hard_ns, ratio_limit) != 0 {
+            status = 1
+        }
+    }
+    // The classic exponential case: a?{25}a{25} against 25 a's.
+    var nested = ""
+    var i = 0
+    while i < 25 {
+        nested = "{nested}a?"
+        i += 1
+    }
+    i = 0
+    while i < 25 {
+        nested = "{nested}a"
+        i += 1
+    }
+    let (ns, m) = time_run(nested, 25)
+    if !m {
+        eprint("re_pathological: a?{{25}}a{{25}} did not match")
+        return 2
+    }
+    let v1 = if ns <= 5000000 then "" else "  OVER"
+    print("re.pathological /a?{{25}}a{{25}}/ {ns} ns{v1}")
+    if ns > 5000000 {
+        status = 1
+    }
+    // The .*.*.*=.* shape: a 10 KiB line with no '='.
+    let re = compile_s(".*.*.*.*=.*")
+    var hay = List[byte]()
+    i = 0
+    while i < 10240 {
+        (mut hay).push(120 as byte)
+        i += 1
+    }
+    let tb0 = text.textbuf_new()
+    let inp = search.re_input_bytes(hay.len)
+    var sc = search.re_scratch_new()
+    var runs = 0
+    let start = time.now()
+    var elapsed = 0
+    while runs < 32 || elapsed < 100 {
+        let _m = search.re_search_any_ws(mut sc, re, tb0, hay, inp, at0())
+        runs += 1
+        elapsed = time.as_millis(time.elapsed(start))
+    }
+    let one = elapsed * 1000000 / runs
+    let v2 = if one <= hard_ns then "" else "  OVER"
+    print("re.pathological /.*.*.*.*=.*/ {one} ns{v2}")
+    if one > hard_ns {
+        status = 1
+    }
+    status
+}
+
+// `VmHWM` from /proc/self/status, in bytes (0 when unreadable).
+fn peak_rss() -> int {
+    let body = fs.read_text("/proc/self/status") else ""
+    for line in body.lines() {
+        if line.starts_with("VmHWM:") {
+            let w = line.words()
+            if w.len >= 2 {
+                return (w[1].to_int() else 0) * 1024
+            }
+        }
+    }
+    0
+}
+
+fn mibs100(bytes: int, ms: int) -> int {
+    if ms <= 0 {
+        return 0
+    }
+    // MiB/s x100.
+    bytes * 100000 / ms / 1048576
+}
+
+fn fmt1(x100: int) -> str {
+    "{x100 / 100}.{x100 % 100 / 10}"
+}
+
+fn throughput(limits: str) -> int {
+    let lit_limit = read_limit(limits, "re.throughput_literal_mibs")
+    let dfa_limit = read_limit(limits, "re.throughput_dfa_mibs")
+    let rss_limit = read_limit(limits, "re.throughput_rss_bytes")
+    print("re.throughput mode strict")
+    if lit_limit <= 0 || dfa_limit <= 0 || rss_limit <= 0 {
+        eprint("re_throughput: cannot read {limits}")
+        return 2
+    }
+    var bytes = 1073741824
+    let env_bytes = env_get("YEW_RE_THROUGHPUT_BYTES") else ""
+    if env_bytes.len > 0 {
+        let v = env_bytes.to_int() else 0
+        if v > 0 {
+            bytes = v
+        }
+    }
+    // Deterministic, line-structured filler (`fill`, `re_throughput.c:108-
+    // 121`), the needle at the very end.
+    let row = "static int compute_value(int argument, int other) {{ return 0; }}\n"
+    var buf = List[byte]()
+    while buf.len < bytes {
+        for b in row.bytes() {
+            if buf.len < bytes {
+                (mut buf).push(b)
+            }
+        }
+    }
+    let needle = "ZQNEEDLEQZ\n"
+    var k = 0
+    while k < 11 {
+        buf[bytes - 16 + k] = needle.bytes()[k]
+        k += 1
+    }
+    let lit_re = compile_s("ZQNEEDLEQZ")
+    let dfa_re = compile_s("[qQ][0-9]+[zZ]")
+    let tb0 = text.textbuf_new()
+    let inp = search.re_input_bytes(bytes)
+    let rss_before = peak_rss()
+    var status = 0
+    var m = search.re_match_new()
+    let t0 = time.now()
+    let found = search.re_search(lit_re, tb0, buf, inp, at0(), mut m)
+    let lit_ms = time.as_millis(time.elapsed(t0))
+    if !found || m.lo[0] != bytes - 16 {
+        eprint("re_throughput: literal search did not find the needle at the end")
+        status = 1
+    }
+    let lit_rate = mibs100(bytes, lit_ms)
+    print("re.throughput literal      {fmt1(lit_rate)} MiB/s (limit {lit_limit})")
+    if lit_rate < lit_limit * 100 {
+        status = 1
+    }
+    let t1 = time.now()
+    let _t = search.re_test(dfa_re, tb0, buf, inp, at0())
+    let dfa_ms = time.as_millis(time.elapsed(t1))
+    let dfa_rate = mibs100(bytes, dfa_ms)
+    print("re.throughput non-literal  {fmt1(dfa_rate)} MiB/s (limit {dfa_limit})")
+    if dfa_rate < dfa_limit * 100 {
+        status = 1
+    }
+    let rss_after = peak_rss()
+    let delta = if rss_after > rss_before then rss_after - rss_before else 0
+    print("re.throughput rss delta    {delta} bytes (limit {rss_limit})")
+    if delta > rss_limit {
+        eprint(
+            "re_throughput: searching {bytes} bytes grew RSS by {delta} bytes — something materialized the input",
+        )
+        status = 1
+    }
+    status
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len != 3 || args[1] != "--baseline" {
+        eprint("usage: perf-re --pathological|--throughput --baseline FILE")
+        return 2
+    }
+    if args[0] == "--pathological" {
+        return pathological(args[2])
+    }
+    if args[0] == "--throughput" {
+        return throughput(args[2])
+    }
+    eprint("usage: perf-re --pathological|--throughput --baseline FILE")
+    2
+}

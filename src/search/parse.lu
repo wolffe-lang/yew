@@ -9,10 +9,11 @@
 //! - **The parser keeps its own stack.** C recurses `parse_alt` →
 //!   `parse_concat` → `parse_piece` → `parse_atom` → `parse_group` →
 //!   `parse_alt` once per nesting level; a 64 KiB pattern of `(?:` nests
-//!   16,384 deep, five C frames a level. A wolf native frame of that
-//!   recursion costs more than C's (a recursion probe on kasumi faulted
-//!   between 100,000 and 120,000 three-argument frames on the 8 MiB
-//!   stack), so the port parses with an explicit stack of open groups
+//!   16,384 deep, five C frames a level. A wolf stack overflow is a
+//!   plain SIGSEGV with no trap line, and a three-argument frame dies
+//!   between 50,000 and 100,000 deep natively and 150,000 and 200,000 on
+//!   the release tier on the 8 MiB stack (`notes/yw04-evidence/witness/
+//!   deep-recursion/`), so the port parses with an explicit stack of open groups
 //!   (`GroupFrame`) and visits the same constructs in the same order: the
 //!   AST and the first error are C's. The AST is a node pool (`ReAst`
 //!   rows, -1 for none), as the piece tree is.
@@ -102,9 +103,58 @@ struct ReParse {
     saw_upper_literal: bool,
     force_icase: bool,
     force_case: bool,
+    cache: ReCache,
+}
+
+/// What C keeps for the process's lifetime (`parse.c:208-215` the
+/// property runs, `:325-330` the fold table), as a VALUE its owner
+/// threads through `re_compile_cached` (module state of a `List` is
+/// refused, G15/G27): each property's runs and the fold table built on
+/// first use and reused by every later compile given the same cache. A
+/// caller that compiles many patterns (a syntax definition set, the
+/// incremental search) keeps one; `re_compile` makes a fresh one per
+/// compile.
+pub struct ReCache {
+    prop_ready: List[bool],
+    prop_lo: List[List[int]],
+    prop_hi: List[List[int]],
     fold_ready: bool,
     fold_canon: List[int],
     fold_cp: List[int],
+}
+
+/// An empty cache.
+pub fn re_cache_new() -> ReCache {
+    var ready = List[bool]()
+    var plo = List[List[int]]()
+    var phi = List[List[int]]()
+    var k = 0
+    while k < 13 {
+        (mut ready).push(false)
+        (mut plo).push(List[int]())
+        (mut phi).push(List[int]())
+        k += 1
+    }
+    ReCache {
+        prop_ready: ready,
+        prop_lo: plo,
+        prop_hi: phi,
+        fold_ready: false,
+        fold_canon: List[int](),
+        fold_cp: List[int](),
+    }
+}
+
+// A placeholder for the swap seam: no lists behind the flags.
+fn re_cache_new_empty() -> ReCache {
+    ReCache {
+        prop_ready: List[bool](),
+        prop_lo: List[List[int]](),
+        prop_hi: List[List[int]](),
+        fold_ready: false,
+        fold_canon: List[int](),
+        fold_cp: List[int](),
+    }
 }
 
 fn parse_new(len: int, flags: int) -> ReParse {
@@ -125,9 +175,7 @@ fn parse_new(len: int, flags: int) -> ReParse {
         saw_upper_literal: false,
         force_icase: false,
         force_case: false,
-        fold_ready: false,
-        fold_canon: List[int](),
-        fold_cp: List[int](),
+        cache: re_cache_new_empty(),
     }
 }
 
@@ -378,7 +426,36 @@ fn run_add(mut lo: List[int], mut hi: List[int], a: int, b: int) {
 /// `blank`, `print` and `xdigit` name ASCII codepoints), each distinct
 /// pair evaluated once; above it both tables are constant between their
 /// high ranges' edges.
+// A property's runs appended to `lo`/`hi`, from the cache or built and
+// cached (`build_prop_ranges`'s cache, `parse.c:217-252`).
+fn prop_runs_cached(mut p: ReParse, kind: int, mut lo: List[int], mut hi: List[int]) {
+    if !p.cache.prop_ready[kind] {
+        var clo = List[int]()
+        var chi = List[int]()
+        prop_runs(kind, mut clo, mut chi)
+        p.cache.prop_lo[kind] = clo
+        p.cache.prop_hi[kind] = chi
+        p.cache.prop_ready[kind] = true
+    }
+    var i = 0
+    while i < p.cache.prop_lo[kind].len {
+        (mut lo).push(p.cache.prop_lo[kind][i])
+        (mut hi).push(p.cache.prop_hi[kind][i])
+        i += 1
+    }
+}
+
 fn prop_runs(kind: int, mut lo: List[int], mut hi: List[int]) {
+    // Past block 0 a predicate reads only the category record, and the
+    // word-break record for the three White_Space kinds: a category-only
+    // kind is decided per palette entry and memoized per stage-2 block.
+    let needs_wb = kind == PROP_SPACE || kind == PROP_GRAPH || kind == PROP_PRINT
+    var pal_on = List[bool]()
+    var pi = 0
+    while pi < unicode.CAT_PAL_LEN {
+        (mut pal_on).push(prop_holds_rec(kind, 128, unicode.cat_pal(pi), 0))
+        pi += 1
+    }
     var memo = Map[int, int]()
     var memo_lo = List[int]()
     var memo_hi = List[int]()
@@ -397,7 +474,7 @@ fn prop_runs(kind: int, mut lo: List[int], mut hi: List[int]) {
             }
         } else {
             let cb = unicode.cat_stage1(b)
-            let wbb = unicode.wb_stage1(b)
+            let wbb = if needs_wb then unicode.wb_stage1(b) else 0
             let key = cb * 16384 + wbb
             var slot = memo[key] else -1
             if slot < 0 {
@@ -406,9 +483,14 @@ fn prop_runs(kind: int, mut lo: List[int], mut hi: List[int]) {
                 var s = 0
                 var run_from = -1
                 while s < 128 {
-                    let rec = unicode.cat_pal(unicode.cat_stage2(cb * 128 + s))
-                    let wb = unicode.wb_stage2(wbb * 128 + s)
-                    let on = prop_holds_rec(kind, base + s, rec, wb)
+                    var on = false
+                    if needs_wb {
+                        let rec = unicode.cat_pal(unicode.cat_stage2(cb * 128 + s))
+                        let wb = unicode.wb_stage2(wbb * 128 + s)
+                        on = prop_holds_rec(kind, base + s, rec, wb)
+                    } else {
+                        on = pal_on[unicode.cat_stage2(cb * 128 + s)]
+                    }
                     if on && run_from < 0 {
                         run_from = s
                     }
@@ -485,9 +567,9 @@ fn class_perl(mut p: ReParse, which: int) -> int {
     var lo = List[int]()
     var hi = List[int]()
     if base == 119 {
-        prop_runs(PROP_WORD, mut lo, mut hi)
+        prop_runs_cached(mut p, PROP_WORD, mut lo, mut hi)
     } else if base == 100 {
-        prop_runs(PROP_DIGIT, mut lo, mut hi)
+        prop_runs_cached(mut p, PROP_DIGIT, mut lo, mut hi)
     } else {
         let space = "\x09\x0d\x20\x20\u{85}\u{85}\u{a0}\u{a0}\u{1680}\u{1680}\u{2000}\u{200a}\u{2028}\u{2029}\u{202f}\u{202f}\u{205f}\u{205f}\u{3000}\u{3000}"
         for c in space.chars() {
@@ -515,21 +597,27 @@ fn fold_canon(cp: int) -> int {
 // scalar space; a codepoint without a case record maps to itself, so the
 // records are the same set (ascending, so the sort by canon is stable).
 fn fold_build(mut p: ReParse) {
-    if p.fold_ready {
+    if p.cache.fold_ready {
         return
     }
-    p.fold_ready = true
+    p.cache.fold_ready = true
     var i = 0
     while i < unicode.CASE_REC_LEN {
+        // `fold_canon` of the record's own codepoint, read off the record
+        // (the binary search would find this same record).
         let cp = unicode.case_rec_cp(i)
-        let canon = fold_canon(cp)
-        if canon != cp && p.fold_canon.len < 4096 {
-            (mut p.fold_canon).push(canon)
-            (mut p.fold_cp).push(cp)
+        let canon = if unicode.case_rec_upper_len(i) == 1 {
+            unicode.case_data_at(unicode.case_rec_upper_at(i))
+        } else {
+            cp
+        }
+        if canon != cp && p.cache.fold_canon.len < 4096 {
+            (mut p.cache.fold_canon).push(canon)
+            (mut p.cache.fold_cp).push(cp)
         }
         i += 1
     }
-    ranges_sort(mut p.fold_canon, mut p.fold_cp)
+    ranges_sort(mut p.cache.fold_canon, mut p.cache.fold_cp)
 }
 
 // `fold_push` (`parse.c:363-392`): THE ONLY WAY a partner enters the
@@ -549,17 +637,17 @@ fn fold_push(mut out: List[int], cp: int) {
 // `fold_class_members` (`parse.c:394-414`).
 fn fold_class_members(p: ReParse, canon: int, mut out: List[int]) {
     var lo = 0
-    var hi = p.fold_canon.len
+    var hi = p.cache.fold_canon.len
     while lo < hi {
         let mid = lo + (hi - lo) / 2
-        if p.fold_canon[mid] < canon {
+        if p.cache.fold_canon[mid] < canon {
             lo = mid + 1
         } else {
             hi = mid
         }
     }
-    while lo < p.fold_canon.len && p.fold_canon[lo] == canon && out.len < 4 {
-        fold_push(mut out, p.fold_cp[lo])
+    while lo < p.cache.fold_canon.len && p.cache.fold_canon[lo] == canon && out.len < 4 {
+        fold_push(mut out, p.cache.fold_cp[lo])
         lo += 1
     }
 }
@@ -844,7 +932,7 @@ fn parse_posix_class(
         if same {
             var rlo = List[int]()
             var rhi = List[int]()
-            prop_runs(posix_kind(k), mut rlo, mut rhi)
+            prop_runs_cached(mut p, posix_kind(k), mut rlo, mut rhi)
             let idx = class_intern(mut p, mut rlo, mut rhi, negate)
             cbuf_add_class(p, mut lo, mut hi, idx)
             p.at = end

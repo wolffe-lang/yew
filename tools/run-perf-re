@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# run-perf-re — the regex engine's performance gates (s20 DoD 2-3): C's
+# in-process harnesses (perf_re_pathological, perf_re_throughput, built
+# from the oracle tree) and the port's twins (tools/perf-re/main.lu,
+# release tier) from the same run, C first, the port, C again, with the
+# port/C ratio per row (the 2x rule, ruling #89 R3).
+#
+#   tools/run-perf-re [--taskset CPUS] [--prebuilt] [--bytes N]
+#
+# `--taskset 0-3` pins every run (the track's record is kasumi under
+# `taskset -c 0-3`); `--prebuilt` runs what the host built (the release
+# tier needs clang; a container without it runs the host's binaries);
+# `--bytes N` sets YEW_RE_THROUGHPUT_BYTES for both sides (default the
+# harnesses' 1 GiB). Prints each harness's own lines, then
+#
+#   perf-re: <row> C=<value> wolf=<value> ratio=<wolf/C, or C/wolf for a rate>
+#
+# Exit 0 when every harness's own gate held (their limits are sagitta's
+# tests/perf/component-limits.txt), else the first failing exit.
+set -eu
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export YEW_ROOT
+cd "$YEW_ROOT"
+
+pin=
+prebuilt=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --taskset) pin=$2; shift 2 ;;
+    --prebuilt) prebuilt=1; shift ;;
+    --bytes) export YEW_RE_THROUGHPUT_BYTES=$2; shift 2 ;;
+    *) echo "run-perf-re: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+tree=target/oracle/sagitta
+cbin=$tree/build
+limits=$tree/tests/perf/component-limits.txt
+if [ "$prebuilt" = 0 ]; then
+    . tools/lib-toolchain.sh
+    b=$(readlink "$tree/build")
+    make -C "$tree" --no-print-directory BUILD="$b" CC="${b#build-}" "$b/perf_re_pathological" "$b/perf_re_throughput" >/dev/null
+    stage=$YEW_ROOT/target/perf-re
+    rm -rf "$stage"
+    mkdir -p "$stage" target/tools
+    cp tools/perf-re/main.lu "$stage/main.lu"
+    for m in util unicode term text search; do
+        cp -R "src/$m" "$stage/$m"
+        rm -f "$stage/$m"/*_test.lu
+    done
+    "$WOLF" build --release --deny-warnings "$stage/main.lu" -o target/tools/perf-re
+fi
+run() {
+    if [ -n "$pin" ]; then taskset -c "$pin" "$@"; else "$@"; fi
+}
+out=target/perf-re-out
+mkdir -p "$out"
+status=0
+run "$cbin/perf_re_pathological" --baseline "$limits" >"$out/c1-path.txt" || status=$?
+run target/tools/perf-re --pathological --baseline "$limits" >"$out/w-path.txt" || status=$?
+run "$cbin/perf_re_pathological" --baseline "$limits" >"$out/c2-path.txt" || status=$?
+run "$cbin/perf_re_throughput" --baseline "$limits" >"$out/c1-thru.txt" || status=$?
+run target/tools/perf-re --throughput --baseline "$limits" >"$out/w-thru.txt" || status=$?
+run "$cbin/perf_re_throughput" --baseline "$limits" >"$out/c2-thru.txt" || status=$?
+for f in c1-path w-path c2-path c1-thru w-thru c2-thru; do
+    sed "s/^/$f: /" "$out/$f.txt"
+done
+python3 - "$out" <<'PY'
+import re, sys
+d = sys.argv[1]
+def rows(name):
+    out = {}
+    for line in open(f"{d}/{name}.txt"):
+        m = re.match(r"re\.pathological (/.*?/)\s+10\^4=\s*(\d+) ns\s+10\^5=\s*(\d+) ns", line)
+        if m:
+            out["path " + m.group(1).replace(" ", "") + " 10^5"] = int(m.group(3))
+            continue
+        m = re.match(r"re\.pathological (/.*?/) (\d+) ns", line)
+        if m:
+            out["path " + m.group(1)] = int(m.group(2))
+            continue
+        m = re.match(r"re\.throughput (literal|non-literal)\s+([\d.]+) MiB/s", line)
+        if m:
+            out["thru " + m.group(1)] = float(m.group(2))
+            continue
+        m = re.match(r"re\.throughput rss delta\s+(\d+) bytes", line)
+        if m:
+            out["thru rss"] = int(m.group(1))
+    return out
+c1 = {**rows("c1-path"), **rows("c1-thru")}
+c2 = {**rows("c2-path"), **rows("c2-thru")}
+w = {**rows("w-path"), **rows("w-thru")}
+for k in c1:
+    if k not in w or k not in c2:
+        continue
+    if k.startswith("thru rss"):
+        print(f"perf-re: {k} C={c1[k]},{c2[k]} wolf={w[k]}")
+        continue
+    if k.startswith("thru"):
+        best = max(c1[k], c2[k])
+        r = best / w[k] if w[k] else float("inf")
+        print(f"perf-re: {k} MiB/s C={c1[k]},{c2[k]} wolf={w[k]} ratio={r:.2f}")
+    else:
+        best = min(c1[k], c2[k])
+        r = w[k] / best if best else float("inf")
+        print(f"perf-re: {k} ns C={c1[k]},{c2[k]} wolf={w[k]} ratio={r:.2f}")
+PY
+exit "$status"
