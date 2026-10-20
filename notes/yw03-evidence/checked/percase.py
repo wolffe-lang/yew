@@ -27,7 +27,7 @@ for f in sys.argv[1:]:
     j = src.index("\n}\n", i) + 3
     main = src[i:j]
     body = src[:i] + "\n" + src[j:]
-    lines = main.splitlines()[1:-1]
+    lines = main.strip("\n").splitlines()[1:-1]
     first = next(k for k, l in enumerate(lines) if CALL.search(l))
     prologue = [l for l in lines[:first] if not l.strip().startswith("//")]
     calls = []
