@@ -1,11 +1,1099 @@
 //! text.journal — the crash journal: an append-only, CRC-checked op log
-//! per dirty buffer under `$XDG_STATE_HOME/yew/journal/`.
+//! per dirty buffer under `$XDG_STATE_HOME/yew/journal/`, and its replay.
 //!
 //! Ports sagitta `src/text/journal.c` (1504 lines) and `journal.h` (41)
-//! at 9ace98c2, under `s08-file-io-no-corruption.md` §4.
+//! at 9ace98c2, under `s08-file-io-no-corruption.md` §4, format v2
+//! (`YEWJ`): a 60-byte header (magic, version, path length, the realpath,
+//! size, mtime seconds and nanoseconds, device, inode, the base kind and
+//! its CRC) then records of `op u8, off u64, len u64, payload, crc32`
+//! (little-endian; a DEL carries the removed bytes). The journal is
+//! named by the FNV-1a hash of the file's realpath. Beside it a `.base`
+//! companion pins the loaded bytes — a hard link to the file, or a
+//! private copy — so a crash after an external replacement still
+//! recovers. Replay applies records until the first bad CRC or short
+//! tail (a crash mid-append is expected); a header that does not match
+//! the file on disk preserves the pair under `.stale` names, never
+//! applied, never deleted. The bytes are C's, so either side reads the
+//! other's journal (notes/yw02-the-text-engine.md, prediction 4).
+//!
+//! **What wolf 0.2.33 cannot do, named where the code meets it:** G3 —
+//! no `fsync`, so `journal_sync` and every directory barrier sync nothing
+//! (`no_sync_g3`, `text.file`); no module state of a run-time value, so
+//! C's process-global owner list is a value the caller threads
+//! (`JournalSet`); no advisory lock (`fcntl(F_SETLK)`,
+//! `lock_journal`, `journal.c:333-341`), so a second PROCESS editing the
+//! same file is not refused (the in-process owner check stands); no
+//! `writev` on a file, so a record is assembled in one list and written
+//! once; the CRC table C builds once (`crc32_init`) would be module state
+//! of a `List` (`[mem.static.3]`), so the CRC is computed bitwise, the
+//! same polynomial and the same answers.
+
+use util
 
 /// `YEW_JOURNAL_INS`: an insert record.
 pub const JOURNAL_INS: int = 1
 
 /// `YEW_JOURNAL_DEL`: a delete record (it carries the removed bytes).
 pub const JOURNAL_DEL: int = 2
+
+const JOURNAL_VERSION: int = 2
+
+const JOURNAL_RECORD_FIXED: int = 21
+
+const BASE_NONE: int = 0
+
+const BASE_LINK: int = 1
+
+const BASE_COPY: int = 2
+
+const OBSOLETE: int = -2
+
+/// Why `journal_open` answered no journal (C's errno): none.
+pub const JERR_OK: int = 0
+
+/// The journal is already open in this process (`EBUSY`).
+pub const JERR_BUSY: int = 1
+
+/// An invalid argument (`EINVAL`).
+pub const JERR_INVAL: int = 2
+
+/// Any other failure.
+pub const JERR_IO: int = 3
+
+/// An open journal (`Journal`, `journal.c:48-59`); `open` false is C's
+/// `NULL`. The `FileMeta` C borrows to clear `journal_pinned` is the
+/// caller's: `journal_discard` answers whether to clear it.
+pub struct Journal {
+    fd: int,
+    path: str,
+    base_path: str,
+    dir: str,
+    base_link: bool,
+    failed: bool,
+    open: bool,
+}
+
+/// No journal.
+pub fn journal_none() -> Journal {
+    Journal {
+        fd: -1,
+        path: "",
+        base_path: "",
+        dir: "",
+        base_link: false,
+        failed: false,
+        open: false,
+    }
+}
+
+struct JournalHeader {
+    ok: bool,
+    records_at: int,
+    size: int,
+    mtime_s: int,
+    mtime_ns: int,
+    dev: int,
+    ino: int,
+    base_kind: int,
+    base_crc: int,
+}
+
+/// The journals this process holds open (C's process-global
+/// `open_journals`, `journal.c:63`): module state of a run-time-built
+/// value is refused (`[mem.static.3]`, E1010), so the owner list is a
+/// value the editor keeps and threads — `EditCtx.journals`, one per
+/// editor in yw03's `Ed` — and every call that opens, closes or checks a
+/// journal takes it.
+pub struct JournalSet {
+    paths: List[str],
+}
+
+/// An empty owner list.
+pub fn journalset_new() -> JournalSet {
+    JournalSet { paths: List[str]() }
+}
+
+fn registry_has(reg: JournalSet, path: str) -> bool {
+    for p in reg.paths {
+        if p == path {
+            return true
+        }
+    }
+    false
+}
+
+fn registry_add(mut reg: JournalSet, path: str) {
+    (mut reg.paths).push(path)
+}
+
+fn registry_remove(mut reg: JournalSet, path: str) {
+    var rest = List[str]()
+    var removed = false
+    for p in reg.paths {
+        if !removed && p == path {
+            removed = true
+            continue
+        }
+        (mut rest).push(p)
+    }
+    reg.paths = rest
+}
+
+/// The CRC-32 starting state (`yew_crc32_begin`).
+pub fn crc32_begin() -> int {
+    4294967295
+}
+
+/// Absorb `bytes[lo..hi)` (`yew_crc32_add`, IEEE, reflected 0xedb88320).
+pub fn crc32_add(crc_in: int, bytes: List[byte], lo: int, hi: int) -> int {
+    var crc = crc_in
+    var i = lo
+    while i < hi {
+        crc = crc ^ bytes[i] as int
+        var bit = 0
+        while bit < 8 {
+            if crc & 1 != 0 {
+                crc = crc >> 1 ^ 3988292384
+            } else {
+                crc = crc >> 1
+            }
+            bit += 1
+        }
+        i += 1
+    }
+    crc
+}
+
+/// The final value (`yew_crc32_end`).
+pub fn crc32_end(crc: int) -> int {
+    crc ^ 4294967295
+}
+
+/// The CRC-32 of `bytes[lo..hi)` (`yew_crc32`).
+pub fn crc32_of(bytes: List[byte], lo: int, hi: int) -> int {
+    crc32_end(crc32_add(crc32_begin(), bytes, lo, hi))
+}
+
+/// Push `v`'s low 32 bits, little-endian.
+pub fn put_u32_le(mut out: List[byte], v: int) {
+    var i = 0
+    while i < 4 {
+        (mut out).push((v >> 8 * i & 255) as byte)
+        i += 1
+    }
+}
+
+/// Push `v`'s 64 bits, little-endian (two's complement for a negative).
+pub fn put_u64_le(mut out: List[byte], v: int) {
+    var i = 0
+    while i < 8 {
+        (mut out).push((v >> 8 * i & 255) as byte)
+        i += 1
+    }
+}
+
+/// Read 32 bits, little-endian, at `at`.
+pub fn u32_le_at(data: List[byte], at: int) -> int {
+    data[at] as int |
+        data[at + 1] as int << 8 |
+        data[at + 2] as int << 16 |
+        data[at + 3] as int << 24
+}
+
+/// Read 64 bits, little-endian, at `at` (the top bit as the sign, so a
+/// value past `int` reads as its two's-complement twin, as C's cast does).
+pub fn u64_le_at(data: List[byte], at: int) -> int {
+    var low: int = 0
+    var i = 6
+    while i >= 0 {
+        low = low << 8 | data[at + i] as int
+        i -= 1
+    }
+    let top = data[at + 7] as int
+    if top < 128 {
+        return low + (top << 56)
+    }
+    low + (top - 256 << 56)
+}
+
+fn journal_dir() -> str ! {none} {
+    let state = env_get("XDG_STATE_HOME") else ""
+    if state.len != 0 {
+        return "{state}/yew/journal"
+    }
+    let home = env_get("HOME") else ""
+    if home.len == 0 {
+        return none
+    }
+    "{home}/.local/state/yew/journal"
+}
+
+fn journal_path(dir: str, realpath: str) -> str {
+    "{dir}/{hex16(path_fnv64(realpath))}.yewj"
+}
+
+fn stat_matches_meta_j(st: Stat, meta: FileMeta) -> bool {
+    st.ok &&
+        st.kind == KIND_FILE &&
+        st.size >= 0 &&
+        st.size == meta.size_on_disk &&
+        st.dev == meta.dev &&
+        st.ino == meta.ino &&
+        st.mtime_s == meta.mtime_s &&
+        st.mtime_ns == meta.mtime_ns
+}
+
+// `create_empty_base`, `journal.c:355-396`.
+fn create_empty_base(base_path: str, dir: str) -> (bool, int, int) {
+    let fd = fs_open_perm(base_path, 4, 384) else {
+        return (false, BASE_NONE, 0)
+    }
+    var ok = no_sync_g3(fd)
+    fs_close(fd) else {
+        ok = false
+    }
+    if ok && !no_sync_dir_g3(dir) {
+        ok = false
+    }
+    if !ok {
+        let _ = remove_quiet(base_path)
+        return (false, BASE_NONE, 0)
+    }
+    let empty = List[byte]()
+    (true, BASE_COPY, crc32_of(empty, 0, 0))
+}
+
+// `copy_base`, `journal.c:398-476`: a private copy, CRC'd as it goes.
+fn copy_base(realpath: str, base_path: str, dir: str, meta: FileMeta) -> (bool, int, int) {
+    let lst = path_lstat(realpath)
+    if !lst.ok || lst.kind == KIND_LINK {
+        return (false, BASE_NONE, 0)
+    }
+    let in_fd = fs_open(realpath) else {
+        return (false, BASE_NONE, 0)
+    }
+    let before = path_stat(realpath)
+    if !stat_matches_meta_j(before, meta) {
+        fs_close(in_fd) else {}
+        return (false, BASE_NONE, 0)
+    }
+    let out_fd = fs_open_perm(base_path, 4, 384) else {
+        fs_close(in_fd) else {}
+        return (false, BASE_NONE, 0)
+    }
+    var ok = true
+    var crc = crc32_begin()
+    var left = meta.size_on_disk
+    while left != 0 {
+        let ask = if left < 65536 then left else 65536
+        let block = fs_read_chunk(in_fd, ask) else {
+            ok = false
+            break
+        }
+        fs_write_chunk(out_fd, block) else {
+            ok = false
+            break
+        }
+        crc = crc32_add(crc, block, 0, block.len)
+        left -= block.len
+    }
+    if ok {
+        let after = path_stat(realpath)
+        if !stat_matches_meta_j(after, meta) ||
+            before.dev != after.dev ||
+            before.ino != after.ino ||
+            !no_sync_g3(out_fd) {
+            ok = false
+        }
+    }
+    fs_close(out_fd) else {
+        ok = false
+    }
+    fs_close(in_fd) else {
+        ok = false
+    }
+    if !ok {
+        let _ = remove_quiet(base_path)
+        return (false, BASE_NONE, 0)
+    }
+    if !no_sync_dir_g3(dir) {
+        let _ = remove_quiet(base_path)
+        return (false, BASE_NONE, 0)
+    }
+    (true, BASE_COPY, crc32_end(crc))
+}
+
+// `create_base`, `journal.c:478-509`.
+fn create_base(realpath: str, base_path: str, dir: str, meta: FileMeta) -> (bool, int, int) {
+    if !meta.exists {
+        return create_empty_base(base_path, dir)
+    }
+    var linked = true
+    var already = false
+    fs_link(realpath, base_path) else |e| match e {
+        exists => {
+            linked = false
+            already = true
+        },
+        cross_device => { linked = false },
+        denied => { linked = false },
+        not_found => { linked = false },
+        io => { linked = false },
+    }
+    if linked {
+        let st = path_stat(base_path)
+        if stat_matches_meta_j(st, meta) && no_sync_dir_g3(dir) {
+            return (true, BASE_LINK, 0)
+        }
+        let _ = remove_quiet(base_path)
+        return (false, BASE_NONE, 0)
+    }
+    if already && stat_matches_meta_j(path_stat(base_path), meta) {
+        return (true, BASE_LINK, 0)
+    }
+    let (copied, kind, crc) = copy_base(realpath, base_path, dir, meta)
+    if copied {
+        return (true, kind, crc)
+    }
+    // Unit-only synthetic metadata predates a real source file: it can
+    // exercise the wire format but provides no replacement recovery.
+    if meta.dev == 0 && meta.ino == 0 && !meta.disk_snapshot_valid {
+        return (true, BASE_NONE, 0)
+    }
+    (false, BASE_NONE, 0)
+}
+
+// `preserve_stale_path`, `journal.c:511-566`: answers false on failure;
+// `want_ino` -1 for "any".
+fn preserve_stale_path(
+    path: str,
+    dir: str,
+    want_dev: int,
+    want_ino: int,
+    description: str,
+) -> bool {
+    let before = path_lstat(path)
+    if !before.ok {
+        return want_ino == -1 && before.missing
+    }
+    if before.kind != KIND_FILE ||
+        want_ino != -1 && (before.dev != want_dev || before.ino != want_ino) {
+        return false
+    }
+    var suffix = 0
+    var stale = ""
+    loop {
+        stale = if suffix == 0 then "{path}.stale" else "{path}.stale.{suffix}"
+        suffix += 1
+        var done = true
+        fs_link(path, stale) else |e| match e {
+            exists => { done = false },
+            cross_device => { return false },
+            denied => { return false },
+            not_found => { return false },
+            io => { return false },
+        }
+        if done {
+            break
+        }
+    }
+    let after = path_lstat(path)
+    let stale_st = path_lstat(stale)
+    if !after.ok ||
+        !stale_st.ok ||
+        after.dev != before.dev ||
+        after.ino != before.ino ||
+        stale_st.dev != before.dev ||
+        stale_st.ino != before.ino ||
+        !remove_quiet(path) {
+        let _ = remove_quiet(stale)
+        return false
+    }
+    if !no_sync_dir_g3(dir) {
+        return false
+    }
+    util.log_warn("preserved stale {description} as {stale}")
+    true
+}
+
+// `write_header`, `journal.c:568-592`: the 16 leading bytes, the path, the
+// 44 trailing — one list, one write.
+fn header_bytes(realpath: str, meta: FileMeta, base_kind: int, base_crc: int) -> List[byte] {
+    var out = List[byte]()
+    for b in "YEWJ".bytes() {
+        (mut out).push(b)
+    }
+    put_u32_le(mut out, JOURNAL_VERSION)
+    put_u64_le(mut out, realpath.len)
+    for b in realpath.bytes() {
+        (mut out).push(b)
+    }
+    put_u64_le(mut out, meta.size_on_disk)
+    put_u64_le(mut out, meta.mtime_s)
+    put_u32_le(mut out, meta.mtime_ns)
+    put_u64_le(mut out, meta.dev)
+    put_u64_le(mut out, meta.ino)
+    put_u32_le(mut out, base_kind)
+    put_u32_le(mut out, base_crc)
+    out
+}
+
+/// Open (create, or adopt a matching leftover of) the journal for
+/// `realpath` (`yew_journal_open`, `journal.c:594-749`). Answers the
+/// journal and, when none, why (`JERR_*`); sets `meta.journal_pinned`
+/// when the base is a hard link to the file.
+pub fn journal_open(mut reg: JournalSet, realpath: str, mut m: FileMeta) -> (Journal, int) {
+    if realpath.len == 0 {
+        return (journal_none(), JERR_INVAL)
+    }
+    let dir = journal_dir() else {
+        util.log_error("cannot create crash journal directory: no state directory")
+        return (journal_none(), JERR_IO)
+    }
+    if !util.mkdirs(dir, 448) {
+        util.log_error("cannot create crash journal directory: {dir}")
+        return (journal_none(), JERR_IO)
+    }
+    let path = journal_path(dir, realpath)
+    let base_path = "{path}.base"
+    if registry_has(reg, path) {
+        return (journal_none(), JERR_BUSY)
+    }
+    var created = true
+    var fd = fs_open_perm(path, 4, 384) else |e| match e {
+        exists => {
+            created = false
+            -1
+        },
+        denied => { -1 },
+        invalid => { -1 },
+        not_found => { -1 },
+        unsupported => { -1 },
+        io => { -1 },
+    }
+    if !created {
+        fd = adopt_existing_journal(path, realpath, base_path, dir, m)
+        if fd == OBSOLETE {
+            fd = fs_open_perm(path, 4, 384) else -1
+            created = fd >= 0
+            if created {
+                util.log_warn("replaced an obsolete crash journal for {realpath}")
+            }
+        }
+    }
+    if fd < 0 {
+        util.log_error("cannot open crash journal {path}")
+        return (journal_none(), JERR_IO)
+    }
+    // No advisory lock in wolf 0.2.33 (C `lock_journal` here): a second
+    // process is not refused. The in-process owner check above stands.
+    var base_kind = BASE_NONE
+    if created {
+        var ok = preserve_stale_path(base_path, dir, -1, -1, "orphaned journal base")
+        var base_crc = 0
+        if ok {
+            let (made, kind, crc) = create_base(realpath, base_path, dir, m)
+            ok = made
+            base_kind = kind
+            base_crc = crc
+        }
+        if ok {
+            fs_write_chunk(fd, header_bytes(realpath, m, base_kind, base_crc)) else {
+                ok = false
+            }
+        }
+        if ok && (!no_sync_g3(fd) || !no_sync_dir_g3(dir)) {
+            ok = false
+        }
+        if !ok {
+            fs_close(fd) else {}
+            let _ = remove_quiet(path)
+            if base_kind != BASE_NONE {
+                let _ = remove_quiet(base_path)
+            }
+            return (journal_none(), JERR_IO)
+        }
+    }
+    var base_link = false
+    if created {
+        base_link = base_kind == BASE_LINK
+    } else {
+        let bst = path_stat(base_path)
+        base_link = bst.ok && bst.dev == m.dev && bst.ino == m.ino
+    }
+    if base_link {
+        m.journal_pinned = true
+    }
+    registry_add(mut reg, path)
+    (
+        Journal {
+            fd: fd,
+            path: path,
+            base_path: base_path,
+            dir: dir,
+            base_link: base_link,
+            failed: false,
+            open: true,
+        },
+        JERR_OK,
+    )
+}
+
+/// Append one record (`yew_journal_record`, `journal.c:751-788`); a
+/// failure marks the journal failed.
+pub fn journal_record(mut j: Journal, op: int, off: int, b: List[byte], lo: int, hi: int) -> bool {
+    if !j.open || j.failed {
+        return false
+    }
+    if op != JOURNAL_INS && op != JOURNAL_DEL {
+        j.failed = true
+        util.log_error("invalid crash journal record")
+        return false
+    }
+    let n = hi - lo
+    var rec = List[byte]()
+    (mut rec).push(op as byte)
+    put_u64_le(mut rec, off)
+    put_u64_le(mut rec, n)
+    var i = lo
+    while i < hi {
+        (mut rec).push(b[i])
+        i += 1
+    }
+    put_u32_le(mut rec, crc32_of(rec, 0, rec.len))
+    fs_write_chunk(j.fd, rec) else {
+        j.failed = true
+        util.log_error("cannot append crash journal {j.path}")
+        return false
+    }
+    true
+}
+
+/// The transaction-commit barrier (`yew_journal_sync`): G3, no fsync at
+/// 0.2.33 — it SYNCS NOTHING (module doc) and answers the journal's state.
+pub fn journal_sync(mut j: Journal) -> bool {
+    if !j.open || j.failed {
+        return false
+    }
+    if !no_sync_g3(j.fd) {
+        j.failed = true
+        util.log_error("cannot sync crash journal {j.path}")
+        return false
+    }
+    true
+}
+
+/// Whether the journal is open and has not failed (`yew_journal_ok`).
+pub fn journal_ok(j: Journal) -> bool {
+    j.open && !j.failed
+}
+
+/// Close a dirty journal, keeping its recovery data (`yew_journal_close`).
+pub fn journal_close(mut reg: JournalSet, mut j: Journal) {
+    if !j.open {
+        return
+    }
+    registry_remove(mut reg, j.path)
+    fs_close(j.fd) else {
+        util.log_error("cannot close crash journal {j.path}")
+    }
+    j = journal_none()
+}
+
+/// Remove the journal and its base after a clean save
+/// (`yew_journal_discard`, `journal.c:821-852`); answers true when the
+/// caller's `FileMeta.journal_pinned` must clear.
+pub fn journal_discard(mut reg: JournalSet, mut j: Journal) -> bool {
+    if !j.open {
+        return false
+    }
+    registry_remove(mut reg, j.path)
+    var failed = false
+    let base_absent = remove_quiet(j.base_path)
+    if !base_absent {
+        failed = true
+    } else if !remove_quiet(j.path) {
+        failed = true
+    } else {
+        let _ = no_sync_dir_g3(j.dir)
+    }
+    fs_close(j.fd) else {
+        failed = true
+    }
+    if failed {
+        util.log_error("cannot discard crash journal {j.path}")
+    }
+    let unpin = j.base_link && base_absent
+    j = journal_none()
+    unpin
+}
+
+// `buffer_matches`, `journal.c:854-881`.
+fn buffer_matches(tb: TextBuf, off: int, data: List[byte], at: int, len: int) -> bool {
+    if off + len > textbuf_len(tb) {
+        return false
+    }
+    var it = textiter_new()
+    if !textiter_begin(mut it, tb, off as ByteOff) {
+        return len == 0
+    }
+    var left = len
+    var pos = at
+    while left != 0 {
+        let c = textiter_chunk(it, tb)
+        if !c.ok {
+            return false
+        }
+        let step = if c.len < left then c.len else left
+        var i = 0
+        while i < step {
+            if store_byte(tb, c.src, c.at + i) != data[pos + i] {
+                return false
+            }
+            i += 1
+        }
+        pos += step
+        left -= step
+        if left != 0 && !textiter_advance(mut it, tb) {
+            return false
+        }
+    }
+    true
+}
+
+// `apply_record`, `journal.c:883-900`.
+fn apply_record(mut ec: EditCtx, op: int, off: int, data: List[byte], at: int, len: int) -> bool {
+    let total = textbuf_len(ec.tb)
+    if off > total {
+        return false
+    }
+    if op == JOURNAL_INS {
+        return edit_insert_part(mut ec, off as ByteOff, data, at, at + len)
+    }
+    if op == JOURNAL_DEL && len <= total - off && buffer_matches(ec.tb, off, data, at, len) {
+        return edit_delete(mut ec, Span { lo: off, hi: off + len })
+    }
+    false
+}
+
+// `stale_journal`, `journal.c:902-916`.
+fn stale_journal(path: str, base_path: str, dir: str) -> bool {
+    let st = path_lstat(path)
+    if !st.ok ||
+        !preserve_stale_path(base_path, dir, -1, -1, "journal base") ||
+        !preserve_stale_path(path, dir, st.dev, st.ino, "crash journal") {
+        util.log_error("cannot preserve stale crash journal {path}")
+        return false
+    }
+    true
+}
+
+fn header_none() -> JournalHeader {
+    JournalHeader {
+        ok: false,
+        records_at: 0,
+        size: 0,
+        mtime_s: 0,
+        mtime_ns: 0,
+        dev: 0,
+        ino: 0,
+        base_kind: 0,
+        base_crc: 0,
+    }
+}
+
+// `header_decode`, `journal.c:918-955`.
+fn header_decode(data: List[byte], realpath: str) -> JournalHeader {
+    let size = data.len
+    if size < 16 ||
+        data[0] as int != 89 ||
+        data[1] as int != 69 ||
+        data[2] as int != 87 ||
+        data[3] as int != 74 ||
+        u32_le_at(data, 4) != JOURNAL_VERSION {
+        return header_none()
+    }
+    let path_len = u64_le_at(data, 8)
+    if path_len < 0 || 16 + path_len > size || size - (16 + path_len) < 44 {
+        return header_none()
+    }
+    if realpath.len != path_len {
+        return header_none()
+    }
+    var i = 0
+    for b in realpath.bytes() {
+        if data[16 + i] != b {
+            return header_none()
+        }
+        i += 1
+    }
+    let t = 16 + path_len
+    let h = JournalHeader {
+        ok: true,
+        records_at: t + 44,
+        size: u64_le_at(data, t),
+        mtime_s: u64_le_at(data, t + 8),
+        mtime_ns: u32_le_at(data, t + 16),
+        dev: u64_le_at(data, t + 20),
+        ino: u64_le_at(data, t + 28),
+        base_kind: u32_le_at(data, t + 36),
+        base_crc: u32_le_at(data, t + 40),
+    }
+    if h.mtime_ns >= 1000000000 || h.base_kind > BASE_COPY {
+        return header_none()
+    }
+    h
+}
+
+// YEW-F-078: size and mtime do not identify a file after replacement;
+// bind replay to the loaded device and inode too.
+fn header_matches_meta(h: JournalHeader, meta: FileMeta) -> bool {
+    h.size == meta.size_on_disk &&
+        h.mtime_s == meta.mtime_s &&
+        h.mtime_ns == meta.mtime_ns &&
+        h.dev == meta.dev &&
+        h.ino == meta.ino
+}
+
+fn private_regular(st: Stat) -> bool {
+    let euid = os_euid() else -1
+    st.ok && st.kind == KIND_FILE && st.uid == euid && st.nlink == 1 && st.mode & 63 == 0
+}
+
+// `base_matches_header`, `journal.c:968-1029`.
+fn base_matches_header(base_path: str, h: JournalHeader) -> bool {
+    if h.base_kind == BASE_NONE {
+        return false
+    }
+    let lst = path_lstat(base_path)
+    if !lst.ok || lst.kind == KIND_LINK {
+        return false
+    }
+    let before = path_stat(base_path)
+    if !before.ok || before.kind != KIND_FILE || before.size != h.size {
+        return false
+    }
+    if h.base_kind == BASE_LINK {
+        return before.dev == h.dev &&
+            before.ino == h.ino &&
+            before.mtime_s == h.mtime_s &&
+            before.mtime_ns == h.mtime_ns
+    }
+    if !private_regular(before) {
+        return false
+    }
+    let data = fs_read_bytes(base_path) else {
+        return false
+    }
+    let after = path_stat(base_path)
+    if data.len != h.size ||
+        !after.ok ||
+        before.dev != after.dev ||
+        before.ino != after.ino ||
+        before.size != after.size ||
+        before.mtime_s != after.mtime_s ||
+        before.mtime_ns != after.mtime_ns {
+        return false
+    }
+    crc32_of(data, 0, data.len) == h.base_crc
+}
+
+// `valid_record_prefix`, `journal.c:1043-1072`.
+fn valid_record_prefix(data: List[byte], at_in: int) -> int {
+    var at = at_in
+    let size = data.len
+    while size - at >= JOURNAL_RECORD_FIXED {
+        let op = data[at] as int
+        let payload_len = u64_le_at(data, at + 9)
+        if op != JOURNAL_INS && op != JOURNAL_DEL || payload_len < 0 {
+            break
+        }
+        let record_size = 17 + payload_len + 4
+        if record_size > size - at {
+            break
+        }
+        if u32_le_at(data, at + 17 + payload_len) != crc32_of(data, at, at + 17 + payload_len) {
+            break
+        }
+        at += record_size
+    }
+    at
+}
+
+// `adopt_existing_journal`, `journal.c:1074-1147`: the fd, OBSOLETE, or -1.
+fn adopt_existing_journal(
+    path: str,
+    realpath: str,
+    base_path: str,
+    dir: str,
+    meta: FileMeta,
+) -> int {
+    let lst = path_lstat(path)
+    if !lst.ok || lst.kind == KIND_LINK {
+        return -1
+    }
+    let fd = fs_open_mode(path, 2) else {
+        return -1
+    }
+    let st = path_stat(path)
+    if !private_regular(st) {
+        fs_close(fd) else {}
+        return -1
+    }
+    let data = fs_read_bytes(path) else {
+        fs_close(fd) else {}
+        return -1
+    }
+    let h = header_decode(data, realpath)
+    if !h.ok || !header_matches_meta(h, meta) {
+        // The leftover describes another version of this file: an
+        // obsolete journal is replaced, never obeyed and never fatal.
+        if !stale_journal(path, base_path, dir) {
+            fs_close(fd) else {}
+            return -1
+        }
+        fs_close(fd) else {}
+        return OBSOLETE
+    }
+    let prefix = valid_record_prefix(data, h.records_at)
+    if prefix != data.len {
+        var cut = true
+        fs_truncate(fd, prefix) else {
+            cut = false
+        }
+        if !cut || !no_sync_g3(fd) {
+            fs_close(fd) else {}
+            return -1
+        }
+        util.log_warn("discarded incomplete crash journal tail while adopting {path}")
+    }
+    fd
+}
+
+fn replay_realpath(path: str, meta: FileMeta) -> str {
+    if meta.has_realpath && meta.realpath.len != 0 {
+        return meta.realpath
+    }
+    file_realpath(path) else path
+}
+
+/// Whether a journal whose source identity still matches exists, read
+/// only (`yew_journal_probe`, `journal.c:1160-1210`).
+pub fn journal_probe(reg: JournalSet, path: str, m: FileMeta) -> bool {
+    let canonical = replay_realpath(path, m)
+    let dir = journal_dir() else {
+        return false
+    }
+    let jpath = journal_path(dir, canonical)
+    if registry_has(reg, jpath) {
+        return false
+    }
+    let lst = path_lstat(jpath)
+    if !lst.ok || lst.kind == KIND_LINK || !private_regular(path_stat(jpath)) {
+        return false
+    }
+    let data = fs_read_bytes(jpath) else {
+        return false
+    }
+    let h = header_decode(data, canonical)
+    h.ok && (header_matches_meta(h, m) || base_matches_header("{jpath}.base", h))
+}
+
+/// Remove the matching on-disk journal without adopting it
+/// (`yew_journal_discard_path`, `journal.c:1212-1271`).
+pub fn journal_discard_path(reg: JournalSet, path: str, m: FileMeta) -> bool {
+    let canonical = replay_realpath(path, m)
+    let dir = journal_dir() else {
+        return false
+    }
+    let jpath = journal_path(dir, canonical)
+    let base_path = "{jpath}.base"
+    if registry_has(reg, jpath) {
+        return false
+    }
+    let lst = path_lstat(jpath)
+    if !lst.ok || lst.kind == KIND_LINK {
+        return false
+    }
+    let st = path_stat(jpath)
+    if !private_regular(st) {
+        return false
+    }
+    let data = fs_read_bytes(jpath) else {
+        return false
+    }
+    let h = header_decode(data, canonical)
+    if !h.ok || !header_matches_meta(h, m) && !base_matches_header(base_path, h) {
+        return false
+    }
+    let again = path_lstat(jpath)
+    if !again.ok || again.dev != st.dev || again.ino != st.ino {
+        return false
+    }
+    if !remove_quiet(base_path) {
+        return false
+    }
+    fs_remove(jpath) else {
+        return false
+    }
+    no_sync_dir_g3(dir)
+}
+
+// `replace_text_from_base`, `journal.c:1273-1322`: the buffer becomes the
+// pinned base's bytes, the metadata the header's identity.
+fn replace_text_from_base(
+    mut ec: EditCtx,
+    mut meta: FileMeta,
+    base_path: str,
+    h: JournalHeader,
+) -> bool {
+    var (rc, base_tb, base_meta) = file_load(base_path)
+    if rc != LOAD_OK {
+        textbuf_free(mut base_tb)
+        return false
+    }
+    if textbuf_len(ec.tb) != 0 && !edit_delete(mut ec, Span { lo: 0, hi: textbuf_len(ec.tb) }) {
+        filemeta_dispose(mut base_meta, mut base_tb)
+        textbuf_free(mut base_tb)
+        return false
+    }
+    let bytes = textbuf_bytes(base_tb)
+    if bytes.len != 0 && !edit_insert_part(mut ec, 0 as ByteOff, bytes, 0, bytes.len) {
+        filemeta_dispose(mut base_meta, mut base_tb)
+        textbuf_free(mut base_tb)
+        return false
+    }
+    let canonical = meta.realpath
+    let has_canonical = meta.has_realpath
+    let via_symlink = meta.via_symlink
+    filemeta_content_forget(mut meta, mut ec.tb)
+    filemeta_content_forget(mut base_meta, mut base_tb)
+    var next = copy base_meta
+    next.realpath = canonical
+    next.has_realpath = has_canonical
+    next.via_symlink = via_symlink
+    next.size_on_disk = h.size
+    next.mtime_s = h.mtime_s
+    next.mtime_ns = h.mtime_ns
+    next.dev = h.dev
+    next.ino = h.ino
+    next.journal_pinned = h.base_kind == BASE_LINK
+    next.disk_snapshot = textsnap_none()
+    next.disk_snapshot_valid = false
+    meta = next
+    textbuf_free(mut base_tb)
+    true
+}
+
+// `journal_replay_edit`, `journal.c:1324-1468`.
+fn journal_replay_impl(
+    path: str,
+    mut ec: EditCtx,
+    mut m: FileMeta,
+    external_transaction: bool,
+) -> bool {
+    let canonical = replay_realpath(path, m)
+    let dir = journal_dir() else {
+        return false
+    }
+    let jpath = journal_path(dir, canonical)
+    let base_path = "{jpath}.base"
+    if registry_has(ec.journals, jpath) {
+        return false
+    }
+    let lst = path_lstat(jpath)
+    if !lst.ok || lst.kind == KIND_LINK {
+        return false
+    }
+    let fd = fs_open_mode(jpath, 3) else {
+        return false
+    }
+    let st = path_stat(jpath)
+    if !private_regular(st) {
+        fs_close(fd) else {}
+        return false
+    }
+    let data = fs_read_bytes(jpath) else {
+        fs_close(fd) else {}
+        return false
+    }
+    let h = header_decode(data, canonical)
+    if !h.ok {
+        let _ = stale_journal(jpath, base_path, dir)
+        fs_close(fd) else {}
+        return false
+    }
+    let current_base = header_matches_meta(h, m)
+    if !current_base && !base_matches_header(base_path, h) {
+        let _ = stale_journal(jpath, base_path, dir)
+        fs_close(fd) else {}
+        return false
+    }
+    if external_transaction && ec.has_undo {
+        undo_begin(mut ec, TXN_EXTERNAL)
+    }
+    if !current_base && !replace_text_from_base(mut ec, mut m, base_path, h) {
+        if external_transaction && ec.has_undo {
+            undo_abort(mut ec)
+        }
+        fs_close(fd) else {}
+        return false
+    }
+    var at = h.records_at
+    let size = data.len
+    while size - at >= JOURNAL_RECORD_FIXED {
+        let op = data[at] as int
+        let off = u64_le_at(data, at + 1)
+        let payload_len = u64_le_at(data, at + 9)
+        if payload_len < 0 || off < 0 {
+            break
+        }
+        let record_size = 17 + payload_len + 4
+        if record_size > size - at {
+            break
+        }
+        if u32_le_at(data, at + 17 + payload_len) != crc32_of(data, at, at + 17 + payload_len) ||
+            !apply_record(mut ec, op, off, data, at + 17, payload_len) {
+            break
+        }
+        at += record_size
+    }
+    if external_transaction && ec.has_undo {
+        undo_end(mut ec)
+    }
+    if at != size {
+        util.log_warn("ignored incomplete or corrupt crash journal tail in {jpath}")
+        var cut = true
+        fs_truncate(fd, at) else {
+            cut = false
+        }
+        if !cut || !no_sync_g3(fd) {
+            util.log_error("cannot discard crash journal tail in {jpath}")
+        }
+    }
+    fs_close(fd) else {}
+    true
+}
+
+/// Replay the journal for `path` into `tb` (`yew_journal_replay`); `m` is
+/// the loaded file's metadata.
+pub fn journal_replay(reg: JournalSet, path: str, mut tb: TextBuf, mut m: FileMeta) -> bool {
+    var ec = editctx_new(take tb)
+    ec.journals = copy reg
+    let ok = journal_replay_impl(path, mut ec, mut m, false)
+    tb = ec.tb
+    ok
+}
+
+/// Replay as one external undo transaction, without journaling the replay
+/// (`yew_journal_replay_edit`).
+pub fn journal_replay_edit(path: str, mut ec: EditCtx, mut m: FileMeta) -> bool {
+    let had_jrnl = ec.has_jrnl
+    let had_meta = ec.has_meta
+    ec.has_jrnl = false
+    ec.has_meta = false
+    let ok = journal_replay_impl(path, mut ec, mut m, true)
+    ec.has_jrnl = had_jrnl
+    ec.has_meta = had_meta
+    ok
+}

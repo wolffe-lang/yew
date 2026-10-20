@@ -1,0 +1,241 @@
+//! text.edit — the one edit choke point: every insert and delete goes
+//! through here, so the marks, the cursor set, the crash journal and the
+//! undo tree see every change in the same order.
+//!
+//! Ports sagitta `src/text/edit.c` (186 lines) and `edit.h` (47) at
+//! 9ace98c2, under `s10-undo-tree.md` §1. C's `EditCtx` holds pointers to
+//! a buffer, marks, a cursor set, a journal, an undo tree and file
+//! metadata owned elsewhere (by `Buffer`, campaign 03); a wolf value
+//! cannot be shared, so the port's `EditCtx` OWNS them, each with a
+//! `has_` flag where C has a `NULL`, and the editor's buffer (yw03) will
+//! own its `EditCtx`. `journals` is the owner list of the crash journals
+//! open in this editor (`text.journal`'s `JournalSet`, C's process-global
+//! list), which the editor moves into the context it edits through. What C's context carries for later campaigns — the
+//! change hook (`on_change`, Sprint 21's changelist and the Fletch
+//! observers), `ed` and `buffer` for `edit/notify.c`'s consumers (other
+//! windows' cursors, syntax, LSP, the symbol index) — lands with those
+//! consumers: the notify pair below keeps C's bookkeeping and has no
+//! consumer to call yet.
+
+use util
+
+/// The edit context (`EditCtx`, `edit.h:10-37`).
+pub struct EditCtx {
+    tb: TextBuf,
+    marks: MarkSet,
+    has_marks: bool,
+    cset: CursorSet,
+    has_cset: bool,
+    win_id: int,
+    jrnl: Journal,
+    has_jrnl: bool,
+    journals: JournalSet,
+    undo: UndoTree,
+    has_undo: bool,
+    meta: FileMeta,
+    has_meta: bool,
+    now_ms: int,
+    notify_line: int,
+    notify_old_lines: int,
+}
+
+/// A context over `tb` alone: no marks, cursors, journal, undo or file.
+pub fn editctx_new(take tb: TextBuf) -> EditCtx {
+    EditCtx {
+        tb: tb,
+        marks: marks_new(),
+        has_marks: false,
+        cset: cset_init(cursor_at(0 as ByteOff)),
+        has_cset: false,
+        win_id: 0,
+        jrnl: journal_none(),
+        has_jrnl: false,
+        journals: journalset_new(),
+        undo: undo_none(),
+        has_undo: false,
+        meta: filemeta_new(),
+        has_meta: false,
+        now_ms: 0,
+        notify_line: 0,
+        notify_old_lines: 0,
+    }
+}
+
+/// Open the crash journal a file-backed buffer needs before its first
+/// edit (`yew_edit_ensure_journal`, `edit.c:14-28`).
+pub fn edit_ensure_journal(mut ec: EditCtx) -> bool {
+    if !ec.has_meta {
+        return true
+    }
+    if ec.has_jrnl {
+        return journal_ok(ec.jrnl)
+    }
+    if !ec.meta.has_realpath {
+        util.bug("text.edit", "edit: file-backed buffer has no journal path")
+    }
+    let (j, _) = journal_open(mut ec.journals, ec.meta.realpath, mut ec.meta)
+    ec.jrnl = j
+    ec.has_jrnl = ec.jrnl.open
+    ec.has_jrnl
+}
+
+fn require_edit_wrapped(ec: EditCtx) {
+    if !ec.has_cset || ec.cset.curs.len <= 1 {
+        return
+    }
+    let aggregate = ec.has_undo &&
+        ec.undo.depth != 0 &&
+        (
+            ec.undo.pending_reason == TXN_MULTI ||
+                ec.undo.pending_reason == TXN_CUT ||
+                ec.undo.pending_reason == TXN_PASTE ||
+                ec.undo.pending_reason == TXN_MACRO
+        )
+    if !aggregate {
+        cset_require_single_edit(ec.cset)
+    }
+    if !ec.cset.batching {
+        cset_check_text(ec.tb, ec.cset)
+    }
+}
+
+/// `yew_edit_notify_pre` (`edit/notify.c:36-46`): the line and the line
+/// count before the edit, for the consumers campaign 03 adds.
+pub fn edit_notify_pre(mut ec: EditCtx, kind: int, at: ByteOff, len: int) {
+    if kind != JOURNAL_INS && kind != JOURNAL_DEL || len < 0 {
+        util.bug("text.edit", "edit notify pre: invalid edit")
+    }
+    ec.notify_line = textbuf_line_of(ec.tb, at) as int
+    ec.notify_old_lines = textbuf_line_count(ec.tb)
+}
+
+/// `yew_edit_notify_post` (`edit/notify.c:48-78`).
+pub fn edit_notify_post(ec: EditCtx, kind: int) {
+    if kind != JOURNAL_INS && kind != JOURNAL_DEL {
+        util.bug("text.edit", "edit notify post: invalid edit")
+    }
+}
+
+// `edit_apply`, `edit.c:80-117`: the order every consumer sees an edit in.
+fn edit_apply(mut ec: EditCtx, kind: int, at: int, bytes: List[byte], lo: int, hi: int) -> bool {
+    let len = hi - lo
+    edit_notify_pre(mut ec, kind, at as ByteOff, len)
+    var payload = 0
+    if kind == JOURNAL_INS {
+        payload = textbuf_insert_payload(mut ec.tb, at as ByteOff, bytes, lo, hi)
+    } else {
+        textbuf_delete(mut ec.tb, Span { lo: at, hi: at + len })
+    }
+    if ec.has_marks {
+        marks_adjust(mut ec.marks, kind, at as ByteOff, len)
+    }
+    if ec.has_cset {
+        cset_adjust(mut ec.cset, kind, at as ByteOff, len)
+    }
+    edit_notify_post(ec, kind)
+    if ec.has_jrnl {
+        let _ = journal_record(mut ec.jrnl, kind, at, bytes, lo, hi)
+    }
+    if ec.has_undo {
+        if kind == JOURNAL_INS {
+            undo_record_insert(mut ec, at, len, payload)
+        } else {
+            undo_record_delete(mut ec, Span { lo: at, hi: at + len })
+        }
+    }
+    !ec.has_jrnl || journal_ok(ec.jrnl)
+}
+
+/// Insert `bytes[lo..hi)` at `at` (`yew_edit_insert`, `edit.c:119-134`);
+/// false when the journal cannot record it.
+pub fn edit_insert_part(
+    mut ec: EditCtx,
+    at_off: ByteOff,
+    bytes: List[byte],
+    lo: int,
+    hi: int,
+) -> bool {
+    let at = at_off as int
+    if at < 0 || at > textbuf_len(ec.tb) {
+        util.bug("text.edit", "edit insert: offset out of bounds")
+    }
+    let len = hi - lo
+    if len == 0 {
+        return true
+    }
+    require_edit_wrapped(ec)
+    if !edit_ensure_journal(mut ec) {
+        return false
+    }
+    if ec.has_undo {
+        undo_prepare_insert(mut ec, at, len)
+    }
+    edit_apply(mut ec, JOURNAL_INS, at, bytes, lo, hi)
+}
+
+/// Insert all of `bytes` at `at`.
+pub fn edit_insert(mut ec: EditCtx, at: ByteOff, bytes: List[byte]) -> bool {
+    edit_insert_part(mut ec, at, bytes, 0, bytes.len)
+}
+
+/// Insert the bytes of `s` at `at` (the tests' literals).
+pub fn edit_insert_str(mut ec: EditCtx, at: ByteOff, s: str) -> bool {
+    var b = List[byte]()
+    for x in s.bytes() {
+        (mut b).push(x)
+    }
+    edit_insert_part(mut ec, at, b, 0, b.len)
+}
+
+/// Delete `range` (`yew_edit_delete`, `edit.c:136-158`): the removed bytes
+/// are copied first, for the journal's DEL record and the undo blob.
+pub fn edit_delete(mut ec: EditCtx, range: Span) -> bool {
+    if range.lo < 0 || range.lo > range.hi || range.hi > textbuf_len(ec.tb) {
+        util.bug("text.edit", "edit delete: range out of bounds")
+    }
+    let len = range.hi - range.lo
+    if len == 0 {
+        return true
+    }
+    require_edit_wrapped(ec)
+    let removed = textbuf_copy_range(ec.tb, range.lo, range.hi)
+    if !edit_ensure_journal(mut ec) {
+        return false
+    }
+    if ec.has_undo {
+        undo_prepare_delete(mut ec, range)
+    }
+    edit_apply(mut ec, JOURNAL_DEL, range.lo, removed, 0, len)
+}
+
+/// Save through the context (`yew_edit_save_opts`, `edit.c:160-181`): a
+/// committed save closes the undo group, marks the save point and
+/// discards the journal.
+pub fn edit_save_opts(mut ec: EditCtx, path: str, opts: SaveOpts) -> int {
+    if !ec.has_meta {
+        util.bug("text.edit", "edit save: scratch buffer has no file metadata")
+    }
+    if ec.has_undo && (ec.undo.depth != 0 || ec.undo.open != 0) {
+        util.bug("text.edit", "edit save: open undo transaction")
+    }
+    let result = file_save_opts(mut ec.tb, mut ec.meta, path, opts)
+    if !save_committed(result) {
+        return result
+    }
+    if ec.has_undo {
+        undo_boundary(mut ec.undo)
+        undo_mark_saved(mut ec.undo, ec.tb)
+    }
+    if ec.has_jrnl {
+        if journal_discard(mut ec.journals, mut ec.jrnl) {
+            ec.meta.journal_pinned = false
+        }
+        ec.has_jrnl = false
+    }
+    result
+}
+
+/// `yew_edit_save`: the default options.
+pub fn edit_save(mut ec: EditCtx, path: str) -> int {
+    edit_save_opts(mut ec, path, save_opts_default())
+}
