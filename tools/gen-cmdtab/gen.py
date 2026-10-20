@@ -6,19 +6,21 @@ descriptor table and the `builtin_meta[]` E-mode grammar rows) and emits
 `src/edit/cmdtab.lu`: one `str` constant of rows, one per command in C's
 registration order (so a command's id is C's id), and nothing else —
 the table is data, the lookups are hand-written (`edit.cmd`). A row is
-seven fields separated by 0x1f:
+eight fields separated by 0x1f:
 
-    name, impl, arity, flags, help, word, meta
+    name, impl, arity, flags, help, word, meta, file
 
 `impl` is C's handler NAME (`yew_edit_cmd_insert_at`): two descriptors
 with one handler are an alias pair (the registry test compares them), and
 `edit.cmd` maps the handler names it implements onto its `match`; `meta`
 is `argspec^range_policy^abbrev` when `builtin_meta[]` names the command,
-else empty. C's flag and arity enumerators are spelled out as numbers
+else empty; `file` is the `.c` file that declares the handler (its
+header normalized to the `.c` beside it). C's flag and arity enumerators are spelled out as numbers
 (`cmd.h:84-126`).
 
 Usage: gen.py SAGITTA_TREE OUT   (tools/check-cmdtab regenerates and diffs)
 """
+import os
 import re
 import sys
 
@@ -122,8 +124,29 @@ def text_of(field):
     return "".join(unquote(t) for t in field)
 
 
+HANDLER = re.compile(r"^(?:static )?CmdStatus ([a-z_0-9]+)\(CmdCtx", re.M)
+
+
+def handler_files(tree):
+    """Each handler's first declaration, as its `.c` file's path."""
+    found = {}
+    for root, _, files in sorted(os.walk(f"{tree}/src")):
+        for name in sorted(files):
+            if not name.endswith((".c", ".h")):
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, tree)
+            for m in HANDLER.finditer(open(path, encoding="utf-8").read()):
+                c_file = rel[:-2] + ".c"
+                prior = found.get(m.group(1))
+                if prior is None or (prior.endswith(".h") is False and rel.endswith(".c")):
+                    found.setdefault(m.group(1), c_file)
+    return found
+
+
 def main():
     tree, out = sys.argv[1], sys.argv[2]
+    files = handler_files(tree)
     src = open(f"{tree}/src/edit/cmd.c", encoding="utf-8").read()
     builtins = table(src, "static const CmdDesc builtins[] =")
     meta = {}
@@ -144,8 +167,10 @@ def main():
         for s in (name, help_, word or "", meta.get(name, "")):
             if "\x1f" in s or "\n" in s or '"' in s or "\\" in s:
                 raise SystemExit(f"gen-cmdtab: an unencodable byte in {name}")
+        if impl not in files:
+            raise SystemExit(f"gen-cmdtab: no declaration of {impl}")
         lines.append("\x1f".join([name, impl, str(arity), str(flags), help_,
-                                  word or "", meta.get(name, "")]))
+                                  word or "", meta.get(name, ""), files[impl]]))
     missing = sorted(set(meta) - {l.split("\x1f")[0] for l in lines})
     if missing:
         raise SystemExit(f"gen-cmdtab: builtin_meta names unknown commands: {missing}")
@@ -154,8 +179,9 @@ def main():
         f.write("//! `src/edit/cmd.c` at `sagitta.pin` (`builtins[]`, `builtin_meta[]`);\n")
         f.write("//! do not edit. `tools/check-cmdtab` regenerates it and diffs. One row\n")
         f.write("//! per command in C's registration order (a row's index + 1 is C's\n")
-        f.write("//! `CmdId`), seven fields separated by 0x1f: name, C handler, arity,\n")
-        f.write("//! flags, help, recorder word, E-mode meta (`argspec^range^abbrev`).\n\n")
+        f.write("//! `CmdId`), eight fields separated by 0x1f: name, C handler, arity,\n")
+        f.write("//! flags, help, recorder word, E-mode meta (`argspec^range^abbrev`),\n")
+        f.write("//! the handler's C file (where `edit.cmd` finds its sprint and lane).\n\n")
         f.write("/// The number of descriptor rows in `CMDTAB`.\n")
         f.write(f"pub const CMDTAB_ROWS: int = {len(lines)}\n\n")
         f.write("/// The descriptor rows, one per line, fields separated by 0x1f.\n")
