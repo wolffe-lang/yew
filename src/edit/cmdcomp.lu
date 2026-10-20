@@ -1,0 +1,2194 @@
+//! edit.cmdcomp — the command line's completion engine.
+//!
+//! Ports sagitta `src/ui/cmdcomp.c` (3,843 lines) and `cmdcomp.h` (415)
+//! at 9ace98c2: the completion kinds, the item and request shapes, the
+//! rank key over `ws.fuzzy` (Sprint 18.5 §2), the command, buffer,
+//! plugin, option and value sources, the path source with its quoting,
+//! its bounded best-500 heap and its sliced, cached directory listing
+//! (Sprint 18.5 §4, DoD 10), the source registry (§3), the live filter
+//! (§4), `yew_comp_kind_for`, the query at the cursor, the LCP and the
+//! sole-survivor predicate (Sprint 57.17 §1). The `:!` half of the file
+//! — the $PATH executable source (Sprint 57.18), the shell sources and
+//! the dispatcher (57.23), specs and generators (57.24), help (57.25),
+//! fish (57.26) and the cd-aware plan (57.32) — is routed from here to
+//! `edit.cmdcomp_shell`, which the shell work owns (`cmdcomp.c:1113-
+//! 1647`, `1686-3228`).
+//!
+//! **Kinds, not callbacks.** C's `CompSource.enumerate` is a function
+//! pointer per kind, and a test or a plugin replaces one by registering
+//! another (`cmdcomp.c:3277-3285`). No function value crosses a module
+//! boundary in the port (G19/G20, wolf-lang#806), so a source row names
+//! an IMPLEMENTATION id and `comp_request` is the one `match` over them
+//! (yw03's registry shape); a test's stub source is one more id.
+//!
+//! **State as a value.** C keeps the registry, the directory listing,
+//! the $PATH cache and the test hooks in file statics; module state of a
+//! run-time value is E1010 in wolf, so they live in `CompState`, owned
+//! by the editor (`Ed.comp`) and threaded through every call.
+//!
+//! **Bytes.** An item's text, ranked name and suffix are `List[byte]`
+//! (a file name need not be UTF-8, and the prompt inserts bytes); the
+//! detail column is a `str` ("" is C's NULL). C's arena that owns an
+//! enumeration's strings has no twin: the lists own their bytes.
+//!
+//! **The directory scan (gaps).** wolf 0.2.33 reads a directory whole
+//! (`fs_read_dir_entries`, `[os.fs.readdir]`): there is no
+//! `opendir`/`readdir` handle to hold across slices. The port reads the
+//! directory once — the one counted "opendir" — and SLICES the work C
+//! slices with it (the per-entry keep test and the push), resuming from
+//! the held rows on the idle tick; the read itself cannot be sliced (a
+//! gap, `docs/MAP.md`). The clock is milliseconds (G8): a slice budget
+//! below one tick is spent at the first check (`comp_slice_spent`).
+
+use text
+use unicode
+use util
+use ws
+
+// ------------------------------------------------------------------
+// The kinds and the shapes (`cmdcomp.h:20-325`)
+// ------------------------------------------------------------------
+
+/// The ranked set's cap (`YEW_COMP_MAX`).
+pub const COMP_MAX: int = 500
+
+/// How many directory entries the path source HOLDS
+/// (`YEW_COMP_LIST_MAX`, `cmdcomp.h:23-35`).
+pub const COMP_LIST_MAX: int = 50000
+
+/// The pager's `in ch7/` note's cap, bytes (`YEW_COMP_WHERE_MAX`).
+pub const COMP_WHERE_MAX: int = 160
+
+/// A command name (`YEW_COMP_CMD`).
+pub const COMP_CMD: int = 0
+
+/// A path (`YEW_COMP_PATH`).
+pub const COMP_PATH: int = 1
+
+/// A buffer (`YEW_COMP_BUFFER`).
+pub const COMP_BUFFER: int = 2
+
+/// An option name (`YEW_COMP_OPTION`).
+pub const COMP_OPTION: int = 3
+
+/// An option value (`YEW_COMP_VALUE`).
+pub const COMP_VALUE: int = 4
+
+/// A plugin (`YEW_COMP_PLUGIN`).
+pub const COMP_PLUGIN: int = 5
+
+/// An executable on $PATH (`YEW_COMP_EXEC`, Sprint 57.18 §2).
+pub const COMP_EXEC: int = 6
+
+/// The `:!` dispatcher (`YEW_COMP_SHELL`, Sprint 57.23 §5).
+pub const COMP_SHELL: int = 7
+
+/// An environment name (`YEW_COMP_VAR`).
+pub const COMP_VAR: int = 8
+
+/// `~name/` (`YEW_COMP_USER`).
+pub const COMP_USER: int = 9
+
+/// A shell builtin or reserved word (`YEW_COMP_BUILTIN`).
+pub const COMP_BUILTIN: int = 10
+
+/// A completion spec's row (`YEW_COMP_SPEC`, Sprint 57.24).
+pub const COMP_SPEC: int = 11
+
+/// A generator's row (`YEW_COMP_GEN`).
+pub const COMP_GEN: int = 12
+
+/// The number of kinds (`YEW_COMP_KIND__N`).
+pub const COMP_KIND_N: int = 13
+
+/// `CompReq.path_filter`: every entry (`YEW_PATH_ANY`).
+pub const PATH_ANY: int = 0
+
+/// Directories only (`YEW_PATH_DIRS`).
+pub const PATH_DIRS: int = 1
+
+/// Executables or directories (`YEW_PATH_EXEC_OR_DIR`).
+pub const PATH_EXEC_OR_DIR: int = 2
+
+/// A source whose answer is reusable while the stem's head is unchanged
+/// (`YEW_COMP_SRC_CACHEABLE`).
+pub const COMP_SRC_CACHEABLE: int = 1
+
+/// A source that may exceed its budget (`YEW_COMP_SRC_SLOW`).
+pub const COMP_SRC_SLOW: int = 2
+
+/// `match_off` when the ranked name cannot be aligned with the text
+/// (`YEW_COMP_NO_HIGHLIGHT`).
+pub const COMP_NO_HIGHLIGHT: int = 65535
+
+/// One completion (`CompItem`, `cmdcomp.h:73-125`); C's `match` is
+/// `ranked` (a keyword here).
+pub struct CompItem {
+    text: List[byte],
+    detail: str,
+    kind: int,
+    is_dir: bool,
+    deferred: bool,
+    score: int,
+    m: ws.FzMatch,
+    ranked: List[byte],
+    match_off: int,
+    suffix: List[byte],
+}
+
+/// An item showing `t` (a test's or a host's row): score 0, no detail.
+pub fn compitem_text(t: List[byte], kind: int) -> CompItem {
+    CompItem {
+        text: copy t,
+        detail: "",
+        kind: kind,
+        is_dir: false,
+        deferred: false,
+        score: 0,
+        m: ws.fzmatch_none(),
+        ranked: copy t,
+        match_off: 0,
+        suffix: List[byte](),
+    }
+}
+
+/// What a source is asked for (`CompReq`, `cmdcomp.h:132-206`). C's
+/// `ed`, `ud` and `arena` are the editor every call takes and the lists
+/// that own the answer; C's `shell` context pointer is the prompt line
+/// and caret it was lexed from (`shell_line`, `shell_cursor`), which the
+/// shell half re-lexes — the lexer is deterministic, so the hint and the
+/// menu still agree.
+pub struct CompReq {
+    kind: int,
+    stem: List[byte],
+    budget_us: int,
+    allow_cache: bool,
+    path_filter: int,
+    path_ext: List[str],
+    cwd: str,
+    has_cwd: bool,
+    cwd_moved: bool,
+    shell_line: List[byte],
+    shell_cursor: int,
+    has_shell: bool,
+}
+
+/// A fresh, unbudgeted request for `kind` at `stem`.
+pub fn compreq_new(kind: int, stem: List[byte]) -> CompReq {
+    CompReq {
+        kind: kind,
+        stem: copy stem,
+        budget_us: 0,
+        allow_cache: false,
+        path_filter: PATH_ANY,
+        path_ext: List[str](),
+        cwd: "",
+        has_cwd: false,
+        cwd_moved: false,
+        shell_line: List[byte](),
+        shell_cursor: 0,
+        has_shell: false,
+    }
+}
+
+/// The built-in command source (implementation ids of a source row).
+pub const SRCIMPL_NONE: int = 0
+
+const SRCIMPL_CMD: int = 1
+
+const SRCIMPL_PATH: int = 2
+
+const SRCIMPL_BUFFER: int = 3
+
+const SRCIMPL_OPTION: int = 4
+
+const SRCIMPL_VALUE: int = 5
+
+const SRCIMPL_PLUGIN: int = 6
+
+const SRCIMPL_EXEC: int = 7
+
+const SRCIMPL_SHELL: int = 8
+
+const SRCIMPL_VAR: int = 9
+
+const SRCIMPL_USER: int = 10
+
+const SRCIMPL_BUILTIN: int = 11
+
+const SRCIMPL_SPEC: int = 12
+
+const SRCIMPL_GEN: int = 13
+
+/// A unit test's stub (`stub_enumerate`, `test_cmdcomp.c:183-193`): one
+/// row, `stub`, of the request's kind.
+pub const SRCIMPL_TEST_STUB: int = 14
+
+/// A registered source (`CompSource`, `cmdcomp.h:216-221`): C's
+/// `enumerate` is `impl_id`.
+pub struct CompSource {
+    kind: int,
+    name: str,
+    impl_id: int,
+    flags: int,
+}
+
+fn source_none(kind: int) -> CompSource {
+    CompSource { kind: kind, name: "", impl_id: SRCIMPL_NONE, flags: 0 }
+}
+
+/// The query at the cursor (`YewCompQuery`, `cmdcomp.h:223-231`).
+pub struct CompQuery {
+    kind: int,
+    stem: List[byte],
+    replace: text.Span,
+    shell_line: List[byte],
+    shell_cursor: int,
+    has_shell: bool,
+}
+
+/// A query for `kind` at `stem` replacing `[lo, hi)`.
+pub fn compquery_new(kind: int, stem: List[byte], lo: int, hi: int) -> CompQuery {
+    CompQuery {
+        kind: kind,
+        stem: copy stem,
+        replace: text.Span { lo: lo, hi: hi },
+        shell_line: List[byte](),
+        shell_cursor: 0,
+        has_shell: false,
+    }
+}
+
+/// The live filter's cached set (`CompFilter`, `cmdcomp.h:240-280`).
+pub struct CompFilter {
+    base: List[CompItem],
+    kind: int,
+    head: List[byte],
+    pattern: List[byte],
+    ctx_key: str,
+    has_ctx_key: bool,
+    gen_key: str,
+    has_gen_key: bool,
+    gen_pending: bool,
+    total: int,
+    capped: bool,
+    valid: bool,
+    where: str,
+}
+
+/// `yew_comp_filter_init`.
+pub fn compfilter_new() -> CompFilter {
+    CompFilter {
+        base: List[CompItem](),
+        kind: COMP_CMD,
+        head: List[byte](),
+        pattern: List[byte](),
+        ctx_key: "",
+        has_ctx_key: false,
+        gen_key: "",
+        has_gen_key: false,
+        gen_pending: false,
+        total: 0,
+        capped: false,
+        valid: false,
+        where: "",
+    }
+}
+
+/// `yew_comp_filter_invalidate` (`cmdcomp.c:3364-3383`): drops the
+/// cached set; the next run re-enumerates.
+pub fn comp_filter_invalidate(mut f: CompFilter) {
+    f.base = List[CompItem]()
+    f.head = List[byte]()
+    f.pattern = List[byte]()
+    f.has_ctx_key = false
+    f.has_gen_key = false
+    f.gen_pending = false
+    f.valid = false
+    f.capped = false
+    f.total = 0
+}
+
+// ------------------------------------------------------------------
+// The directory listing (`cmdcomp.c:640-940`)
+// ------------------------------------------------------------------
+
+/// The listing's step answered: nothing cached, stream instead
+/// (`LISTING_UNUSABLE`).
+pub const LISTING_UNUSABLE: int = 0
+
+/// Usable as far as it goes, more to read (`LISTING_PARTIAL`).
+pub const LISTING_PARTIAL: int = 1
+
+/// Read to the end (`LISTING_COMPLETE`).
+pub const LISTING_COMPLETE: int = 2
+
+/// The keep test a scan applies (C's `ListingKeep`, `cmdcomp.c:709-710`,
+/// as a kind): every entry.
+pub const LISTING_KEEP_ALL: int = 0
+
+/// The $PATH source's: an executable this user may run (`exec_keep`).
+pub const LISTING_KEEP_EXEC: int = 1
+
+/// A cached directory scan (`DirListing`, `cmdcomp.c:662-694`). `rows`
+/// are the host's entries as `[os.fs.readdir]` hands them over (byte 0
+/// the kind, the rest the name), read at once; `idx` the rows kept so
+/// far, in order; `at` the next row the sliced step examines — C's held
+/// `DIR *` is `open`.
+pub struct DirListing {
+    dir: str,
+    has_dir: bool,
+    rows: List[List[byte]],
+    idx: List[int],
+    at: int,
+    checked: int,
+    open: bool,
+    overflow: bool,
+    complete: bool,
+}
+
+/// An empty listing.
+pub fn listing_new() -> DirListing {
+    DirListing {
+        dir: "",
+        has_dir: false,
+        rows: List[List[byte]](),
+        idx: List[int](),
+        at: 0,
+        checked: 0,
+        open: false,
+        overflow: false,
+        complete: false,
+    }
+}
+
+/// The completion engine's state, C's file statics (`cmdcomp.c:68-77`,
+/// `696-697`, `3229-3232`, `3345`): the source registry, the path
+/// listing and its opendir count, the test hooks, and the shell half's
+/// own state.
+pub struct CompState {
+    sources: List[CompSource],
+    initialized: bool,
+    listing: DirListing,
+    opendirs: int,
+    force_dtype_unknown: bool,
+    lstat_calls: int,
+    list_max: int,
+    enumerate_calls: int,
+    shell: CompShellState,
+}
+
+/// The engine before its first use.
+pub fn compstate_new() -> CompState {
+    var sources = List[CompSource]()
+    var k = 0
+    while k < COMP_KIND_N {
+        (mut sources).push(source_none(k))
+        k += 1
+    }
+    CompState {
+        sources: sources,
+        initialized: false,
+        listing: listing_new(),
+        opendirs: 0,
+        force_dtype_unknown: false,
+        lstat_calls: 0,
+        list_max: 0,
+        enumerate_calls: 0,
+        shell: compshell_new(),
+    }
+}
+
+/// `yew_comp_listing_opendirs`: how many directory reads the path and
+/// $PATH sources have made.
+pub fn comp_listing_opendirs(ed: Ed) -> int {
+    ed.comp.opendirs
+}
+
+/// `yew_comp_listing_invalidate` (`cmdcomp.c:735-745`): the "the prompt
+/// closed, start over" hook — the path listing and the $PATH cache die
+/// together.
+pub fn comp_listing_invalidate(mut ed: Ed) {
+    ed.comp.listing = listing_new()
+    comp_shell_cache_free(ed)
+}
+
+/// The name bytes of listing row `ri` are `rows[ri][1..]`.
+pub fn listing_kind_of(row: List[byte]) -> int {
+    row[0] as int
+}
+
+/// Has a slice budget run out? (`comp_now_us() - started >= slice_us`,
+/// `cmdcomp.c:880-885`.) The clock is milliseconds (G8): a budget below
+/// one tick cannot be measured, so it is spent at the first check — the
+/// mechanism C's 1 us test budget drives (`test_cmdcomp.c:740-752`).
+pub fn comp_slice_spent(started_ms: int, slice_us: int) -> bool {
+    if slice_us < 1000 {
+        return true
+    }
+    (time_now_ms() - started_ms) * 1000 >= slice_us
+}
+
+/// The listing's hold limit (`test_list_max` or `COMP_LIST_MAX`).
+pub fn comp_list_limit(ed: Ed) -> int {
+    if ed.comp.list_max != 0 then ed.comp.list_max else COMP_LIST_MAX
+}
+
+fn path_bytes(s: str) -> List[byte] {
+    bytes_of(s)
+}
+
+/// `scan_dir` joined with an entry name (`join2(with_slash, name)`), or
+/// none when the name is not UTF-8 — wolf's fs calls take `str` paths
+/// (a gap, `docs/MAP.md`), so such an entry cannot be stat'ed.
+pub fn comp_entry_path(scan_dir: str, row: List[byte]) -> str ! {none} {
+    var p = path_bytes(scan_dir)
+    if p.len == 0 || p[p.len - 1] as int != 47 {
+        (mut p).push(47 as byte)
+    }
+    var i = 1
+    while i < row.len {
+        (mut p).push(row[i])
+        i += 1
+    }
+    let s = str_from_utf8(p) else |_| {
+        return none
+    }
+    s
+}
+
+/// One slice of a scan of `scan_dir` into `l` (`listing_step`,
+/// `cmdcomp.c:826-895`): answers the state and whether this call opened
+/// (read) the directory, which the caller counts as C counts opendirs.
+/// `slice_us <= 0` is "no limit" (a Tab). `keep` is the kind of keep
+/// test; `limit` the hold limit; `force_unknown` the dtype test hook.
+pub fn listing_step(
+    mut l: DirListing,
+    scan_dir: str,
+    slice_us: int,
+    keep: int,
+    limit: int,
+    force_unknown: bool,
+) -> (int, bool) {
+    var opened = false
+    if l.has_dir && l.dir == scan_dir {
+        if l.overflow {
+            return (LISTING_UNUSABLE, false)
+        }
+        if l.complete {
+            return (LISTING_COMPLETE, false)
+        }
+    } else {
+        l = listing_new()
+        opened = true
+        let rows = fs_read_dir_entries(scan_dir) else |_| {
+            return (LISTING_UNUSABLE, true)
+        }
+        l.rows = rows
+        l.open = true
+        l.dir = scan_dir
+        l.has_dir = true
+    }
+    let started = if slice_us > 0 then time_now_ms() else 0
+    while l.at < l.rows.len {
+        let ri = l.at
+        l.at += 1
+        l.checked += 1
+        var kept = true
+        if keep == LISTING_KEEP_EXEC {
+            kept = comp_exec_keep(l.dir, l.rows[ri], force_unknown)
+        }
+        if kept {
+            if l.idx.len >= limit {
+                // Too big to hold: drop the partial set rather than let a
+                // PREFIX of the directory pass for all of it; the key stays.
+                let key = l.dir
+                l = listing_new()
+                l.dir = key
+                l.has_dir = true
+                l.overflow = true
+                l.complete = true
+                return (LISTING_UNUSABLE, opened)
+            }
+            (mut l.idx).push(ri)
+        }
+        // The clock is read every 256 entries READ (`cmdcomp.c:878-885`).
+        if slice_us > 0 && l.checked % 256 == 0 && comp_slice_spent(started, slice_us) {
+            return (LISTING_PARTIAL, opened)
+        }
+    }
+    l.open = false
+    l.complete = true
+    (LISTING_COMPLETE, opened)
+}
+
+/// Is a scan still reading? (`listing_pending`, `cmdcomp.c:897-900`)
+pub fn listing_pending(l: DirListing) -> bool {
+    l.open && !l.complete
+}
+
+/// `yew_comp_listing_pending` (`cmdcomp.c:905-908`): the path scan or the
+/// $PATH scan has more to read.
+pub fn comp_listing_pending(ed: Ed) -> bool {
+    listing_pending(ed.comp.listing) || comp_shell_scan_pending(ed)
+}
+
+/// `yew_comp_listing_advance` (`cmdcomp.c:910-929`): one more slice of
+/// whichever scan is pending; whether yet more remains. The one idle-tick
+/// driver of both sliced scans.
+pub fn comp_listing_advance(mut ed: Ed, slice_us: int) -> bool {
+    if listing_pending(ed.comp.listing) {
+        let dir = ed.comp.listing.dir
+        let limit = comp_list_limit(ed)
+        let force = ed.comp.force_dtype_unknown
+        let (state, opened) = listing_step(
+            mut ed.comp.listing,
+            dir,
+            slice_us,
+            LISTING_KEEP_ALL,
+            limit,
+            force,
+        )
+        if opened {
+            ed.comp.opendirs += 1
+        }
+        if state == LISTING_PARTIAL {
+            return true
+        }
+        return comp_shell_scan_pending(ed)
+    }
+    comp_shell_scan_advance(ed, slice_us)
+}
+
+// ------------------------------------------------------------------
+// The rank key and the candidate machinery (`cmdcomp.c:79-224`)
+// ------------------------------------------------------------------
+
+/// One candidate's rank key (`comp_key`, `cmdcomp.c:96-109`): the
+/// single-item form of `ws.fz_rank`'s tier rule. `record` fills `pos`
+/// (pushed, offsets from `m0`).
+pub fn comp_key(
+    stem: List[byte],
+    s0: int,
+    s1: int,
+    name: List[byte],
+    m0: int,
+    m1: int,
+    record: bool,
+    mut pos: List[int],
+) -> int {
+    if !record {
+        return comp_key_score(stem, s0, s1, name, m0, m1)
+    }
+    var m = ws.fzmatch_none()
+    let score = ws.fz_score_m(stem, s0, s1, name, m0, m1, mut m)
+    for p in m.pos {
+        (mut pos).push(p)
+    }
+    comp_tier(score)
+}
+
+/// `comp_key` without positions, allocation-free: the per-entry key the
+/// path scan ranks 10,000 names with.
+pub fn comp_key_score(
+    stem: List[byte],
+    s0: int,
+    s1: int,
+    name: List[byte],
+    m0: int,
+    m1: int,
+) -> int {
+    comp_tier(ws.fz_score(stem, s0, s1, name, m0, m1))
+}
+
+// The basename tier (`comp_key`'s second half, `cmdcomp.c:101-108`).
+fn comp_tier(score: int) -> int {
+    if score == ws.FZ_NO_MATCH {
+        return ws.FZ_NO_MATCH
+    }
+    if score >= 5000 {
+        return if score > 2147483647 - ws.FZ_BASENAME_TIER {
+            2147483647
+        } else {
+            score + ws.FZ_BASENAME_TIER
+        }
+    }
+    score
+}
+
+/// strcmp over bytes: negative, zero or positive.
+pub fn comp_bytes_cmp(a: List[byte], a0: int, a1: int, b: List[byte], b0: int, b1: int) -> int {
+    var i = 0
+    let na = a1 - a0
+    let nb = b1 - b0
+    while i < na && i < nb {
+        let x = a[a0 + i] as int
+        let y = b[b0 + i] as int
+        if x != y {
+            return x - y
+        }
+        i += 1
+    }
+    na - nb
+}
+
+/// Byte equality of two whole lists.
+pub fn comp_bytes_eq(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] as int != b[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// Byte equality with a `str`.
+pub fn comp_bytes_is(a: List[byte], s: str) -> bool {
+    if a.len != s.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] as int != s.bytes()[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn comp_slice(s: List[byte], lo: int, hi: int) -> List[byte] {
+    var out = List[byte]()
+    var i = lo
+    while i < hi {
+        (mut out).push(s[i])
+        i += 1
+    }
+    out
+}
+
+// A ranked candidate (`Candidate`, `cmdcomp.c:39-49`).
+struct Candidate {
+    ranked: List[byte],
+    text: List[byte],
+    detail: str,
+    is_dir: bool,
+    deferred: bool,
+    score: int,
+    pos: List[int],
+}
+
+// `candidate_cmp` (`cmdcomp.c:121-140`): descending by key, then the
+// shorter ranked name, then its bytes, then the text's.
+fn candidate_less(a: Candidate, b: Candidate) -> bool {
+    if a.score != b.score {
+        return a.score > b.score
+    }
+    if a.ranked.len != b.ranked.len {
+        return a.ranked.len < b.ranked.len
+    }
+    let by = comp_bytes_cmp(a.ranked, 0, a.ranked.len, b.ranked, 0, b.ranked.len)
+    if by != 0 {
+        return by < 0
+    }
+    comp_bytes_cmp(a.text, 0, a.text.len, b.text, 0, b.text.len) < 0
+}
+
+// A stable merge over INDICES, then one copy per row: a candidate owns
+// three lists, and merging the rows themselves copied each ~log n times.
+fn sort_candidates(mut xs: List[Candidate]) {
+    let n = xs.len
+    if n < 2 {
+        return
+    }
+    var src = List[int]()
+    var i = 0
+    while i < n {
+        (mut src).push(i)
+        i += 1
+    }
+    var width = 1
+    while width < n {
+        var dst = List[int]()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if lo + 2 * width < n then lo + 2 * width else n
+            var a = lo
+            var b = mid
+            while a < mid && b < hi {
+                if candidate_less(xs[src[b]], xs[src[a]]) {
+                    (mut dst).push(src[b])
+                    b += 1
+                } else {
+                    (mut dst).push(src[a])
+                    a += 1
+                }
+            }
+            while a < mid {
+                (mut dst).push(src[a])
+                a += 1
+            }
+            while b < hi {
+                (mut dst).push(src[b])
+                b += 1
+            }
+            lo = hi
+        }
+        src = dst
+        width *= 2
+    }
+    var out = List[Candidate]()
+    for k in src {
+        (mut out).push(copy xs[k])
+    }
+    xs = out
+}
+
+// `candidate_add` (`cmdcomp.c:154-182`): the candidate when it matches.
+fn candidate_add(
+    mut v: List[Candidate],
+    stem: List[byte],
+    ranked: List[byte],
+    txt: List[byte],
+    detail: str,
+    is_dir: bool,
+    deferred: bool,
+) -> bool {
+    var pos = List[int]()
+    let score = comp_key(stem, 0, stem.len, ranked, 0, ranked.len, true, mut pos)
+    if score == ws.FZ_NO_MATCH {
+        return false
+    }
+    (mut v).push(Candidate {
+        ranked: copy ranked,
+        text: copy txt,
+        detail: detail,
+        is_dir: is_dir,
+        deferred: deferred,
+        score: score,
+        pos: pos,
+    })
+    true
+}
+
+// `candidate_finish` (`cmdcomp.c:184-223`): sorted, capped at COMP_MAX,
+// a path's text quoted; answers the pre-cap total.
+fn candidate_finish(kind: int, mut matches: List[Candidate], mut out: List[CompItem]) -> int {
+    let total = matches.len
+    sort_candidates(mut matches)
+    var items = List[CompItem]()
+    let keep = if matches.len < COMP_MAX then matches.len else COMP_MAX
+    var i = 0
+    while i < keep {
+        let src = copy matches[i]
+        let shown = if kind == COMP_PATH then comp_quote(src.text) else copy src.text
+        let off = if comp_bytes_eq(shown, src.ranked) then 0 else COMP_NO_HIGHLIGHT
+        (mut items).push(CompItem {
+            text: shown,
+            detail: src.detail,
+            kind: kind,
+            is_dir: src.is_dir,
+            deferred: src.deferred,
+            score: src.score,
+            m: ws.FzMatch { pos: copy src.pos },
+            ranked: copy src.ranked,
+            match_off: off,
+            suffix: List[byte](),
+        })
+        i += 1
+    }
+    out = items
+    total
+}
+
+// ------------------------------------------------------------------
+// The command, plugin, buffer, option and value sources
+// ------------------------------------------------------------------
+
+// `enumerate_commands` (`cmdcomp.c:225-256`): every live `ed.` command not
+// INTERNAL, by its name without `ed.` and by its abbreviation.
+fn enumerate_commands(ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    var matches = List[Candidate]()
+    var i = 0
+    while i < ed.reg.entries.len {
+        if !ed.reg.entries[i].active {
+            i += 1
+            continue
+        }
+        let e = copy ed.reg.entries[i]
+        if !e.name.starts_with("ed.") || e.flags & CMD_INTERNAL != 0 {
+            i += 1
+            continue
+        }
+        let name = bytes_of(e.name[3..])
+        let deferred = e.flags & CMD_DEFERRED != 0
+        let _ = candidate_add(mut matches, req.stem, name, name, e.help, false, deferred)
+        if e.has_abbrev && e.abbrev != e.name[3..] {
+            let ab = bytes_of(e.abbrev)
+            let _ = candidate_add(mut matches, req.stem, ab, ab, e.name[3..], false, deferred)
+        }
+        i += 1
+    }
+    candidate_finish(COMP_CMD, mut matches, mut out)
+}
+
+// `enumerate_plugins` (`cmdcomp.c:258-281`): the winners' names. The
+// plugin system is Sprint 54's (yw14): none is ever loaded before it.
+fn enumerate_plugins(mut out: List[CompItem]) -> int {
+    var matches = List[Candidate]()
+    candidate_finish(COMP_PLUGIN, mut matches, mut out)
+}
+
+/// Is `ed.bufs[i]` a workspace buffer (C's `ed->ws.bufs`)? The prompt's
+/// own target buffer lives in `ed.bufs` in the port and is not one
+/// (`cmdline.c:463-540` embeds it in the command line).
+pub fn comp_ws_buffer(ed: Ed, i: int) -> bool {
+    if ed.cmdline.target_win >= 0 &&
+        ed.cmdline.target_win < ed.wins.len &&
+        ed.wins[ed.cmdline.target_win].buf == i {
+        return false
+    }
+    true
+}
+
+// `buffer_name` (`cmdcomp.c:283-291`).
+fn comp_buffer_name(b: Buffer) -> str {
+    if !b.has_path {
+        return "[No Name]"
+    }
+    let slash = b.path.rfind("/") else {
+        return b.path
+    }
+    b.path[slash + 1..]
+}
+
+// `enumerate_buffers` (`cmdcomp.c:293-312`): each buffer by its name and
+// by its 1-based number.
+fn enumerate_buffers(ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    var matches = List[Candidate]()
+    var n = 0
+    var i = 0
+    while i < ed.bufs.len {
+        if !comp_ws_buffer(ed, i) {
+            i += 1
+            continue
+        }
+        let name = comp_buffer_name(ed.bufs[i])
+        let path = if ed.bufs[i].has_path then ed.bufs[i].path else ""
+        let nb = bytes_of(name)
+        let _ = candidate_add(mut matches, req.stem, nb, nb, path, false, false)
+        n += 1
+        let number = bytes_of("{n}")
+        let _ = candidate_add(mut matches, req.stem, number, number, name, false, false)
+        i += 1
+    }
+    candidate_finish(COMP_BUFFER, mut matches, mut out)
+}
+
+// `yew_opts[]`'s names and help, in C's order (`src/edit/option.c:213-
+// 478`), one `name\x1fhelp` row each: the option source's list
+// (`builtin_list`, `option.c:1831-1851`) until the options model (Sprint
+// 36, yw09) owns it — every module's rows, the port being the full build
+// (#93 R4). Plugin-registered dynamic options (yw14) are none until then.
+const OPT_ROWS: str = """
+tabwidth\x1fIndent and tab display width (1..16)
+expandtab\x1fInsert spaces when indentation emits a tab
+autoindent\x1fCarry indentation onto the line Enter opens
+autopair\x1fClose brackets and quotes as they are typed
+wrap\x1fWrap long lines in this window
+scrolloff\x1fMinimum screen rows around the cursor
+number\x1fLine numbers: off, abs, rel, or both
+statusline.column\x1fShow grapheme column or grapheme and cell columns
+errorbells\x1fRing the terminal bell for editor errors
+ambiguous_wide\x1fRender document East Asian ambiguous characters as two cells
+subword\x1fUse subword boundaries for word navigation
+fortran_form\x1fFortran source form: auto, free, or fixed
+chord_timeout_ms\x1fMilliseconds to wait for a key chord
+undo.break_on_newline\x1fEnd an insert undo group at a newline
+undo.bytes_max\x1fMaximum in-memory undo bytes per buffer
+undo.min_nodes\x1fMinimum undo nodes retained per buffer
+undo.persist_bytes_max\x1fMaximum persisted undo bytes
+registers.ring_depth\x1fNumber of entries retained in the kill ring
+registers.ring_bytes_max\x1fMaximum bytes retained in the kill ring
+registers.clip_read_max\x1fMaximum bytes read from the system clipboard
+clipboard.sync\x1fSystem clipboard synchronization policy
+search.ignorecase\x1fIgnore case in searches
+search.smartcase\x1fRestore case sensitivity when a pattern has uppercase literals
+hooks.error_limit\x1fDisable a failing hook after this many errors
+save.strategy\x1fSave using auto, atomic, or in-place strategy
+save.check_disk\x1fExternal-change check: off, metadata, or exact content
+save.check_disk_max\x1fMaximum bytes compared by save.check_disk=content
+save.backup_keep\x1fIn-place save backups retained per file
+save.backup_dir\x1fDirectory for in-place save backups
+plug.error_limit\x1fDisable a failing plugin after this many errors
+plug.verify_on_load\x1fVerify installed plugin content before loading
+theme\x1fActive theme name
+theme_auto\x1fSelect a dark or light theme from the terminal background
+macro.dir\x1fMacro library directory
+shell.complete_help\x1fLearn :! completions from --help: native, all, or off
+shell.complete_fish\x1fAsk fish for :! completions when it is installed: auto or off
+shell.suggest_history\x1fHistory ghosts for :! from all shells' history, or yew's only
+shell.session\x1fRun :! in one persistent shell session, or each in a fresh shell
+shadow.enable\x1fEnable passive shadow suggestions
+shadow.providers\x1fOrdered passive suggestion providers
+shadow.max_lines\x1fMaximum overlaid suggestion lines
+shadow.midline\x1fAllow suggestions inside non-space text
+shadow.lsp_debounce_ms\x1fLSP suggestion idle delay
+shadow.ai_debounce_ms\x1fAI suggestion idle delay
+compl.auto_trigger\x1fOpen completion after configured trigger text
+compl.trigger_chars\x1fWhitespace-separated completion trigger text
+lsp.open_in\x1fOpen LSP navigation targets here, in a split, or in a tab
+git.ascii_glyphs\x1fUse ASCII-only FUSS tree and status glyphs
+ai.enable\x1fEnable AI features after disclosure
+ai.backend\x1fSelected AI backend name
+ai.default_workspace\x1fPolicy for workspaces without an explicit AI grant
+ai.context_bytes\x1fMaximum prefix and suffix context bytes
+ai.context_prefix_pct\x1fPercentage of AI context reserved for the prefix
+ai.max_tokens\x1fMaximum AI completion tokens
+ai.max_lines\x1fMaximum AI ghost lines
+ai.temperature\x1fAI temperature in thousandths (10 means 0.010)
+ai.frame_ms\x1fMinimum milliseconds between AI ghost deliveries
+ai.fim\x1fFill-in-the-middle policy: auto, on, or off
+ai.on_redact\x1fAction when AI context matches a secret deny rule
+ai.deny_replace\x1fReplace shipped AI deny rules instead of appending user rules
+ai.exclude_replace\x1fReplace shipped AI path exclusions instead of appending user rows
+ai.exclude_paths\x1fAdditional workspace-relative paths excluded from AI context
+ai.badge\x1fShow the AI statusline badge for local backends
+ai.badge_host_max\x1fMaximum remote AI hostname cells shown in the statusline badge
+ai.debug_bodies\x1fAllow AI prompt and completion logging with YEW_AI_DEBUG=1
+ai.allow_plain_remote\x1fAllow plain HTTP AI endpoints outside the local host
+ai.key_cache\x1fCache resolved AI keys for this session
+ai.connect_timeout_ms\x1fAI connection timeout in milliseconds
+ai.first_byte_timeout_ms\x1fAI first-response-byte timeout in milliseconds
+ai.stream_idle_timeout_ms\x1fAI streaming idle timeout in milliseconds
+ai.total_timeout_ms\x1fAI request wall-clock timeout in milliseconds
+ai.keepalive_ms\x1fAI idle connection lifetime in milliseconds
+ai.backoff_max_ms\x1fMaximum AI backend cooldown in milliseconds
+"""
+
+// `enumerate_options` (`cmdcomp.c:1648-1669`).
+fn enumerate_options(req: CompReq, mut out: List[CompItem]) -> int {
+    var matches = List[Candidate]()
+    for row in OPT_ROWS.lines() {
+        if row.len == 0 {
+            continue
+        }
+        let cut = row.find("\x1f") else 0
+        let name = bytes_of(row[0..cut])
+        let _ = candidate_add(mut matches, req.stem, name, name, row[cut + 1..], false, false)
+    }
+    candidate_finish(COMP_OPTION, mut matches, mut out)
+}
+
+// `enumerate_option_values` (`cmdcomp.c:1671-1684`).
+fn enumerate_option_values(req: CompReq, mut out: List[CompItem]) -> int {
+    var matches = List[Candidate]()
+    for v in "false true off abs rel both gcol gcol_ccol yank all unnamed".words() {
+        let b = bytes_of(v)
+        let _ = candidate_add(mut matches, req.stem, b, b, "option value", false, false)
+    }
+    candidate_finish(COMP_VALUE, mut matches, mut out)
+}
+
+// ------------------------------------------------------------------
+// The path source (`cmdcomp.c:314-640`, `942-1111`)
+// ------------------------------------------------------------------
+
+fn unsafe_path_byte(b: int) -> bool {
+    if b < 32 || b == 127 {
+        return true
+    }
+    // " \t\"'\\$&|;<>()*?[]%"
+    b == 32 ||
+        b == 9 ||
+        b == 34 ||
+        b == 39 ||
+        b == 92 ||
+        b == 36 ||
+        b == 38 ||
+        b == 124 ||
+        b == 59 ||
+        b == 60 ||
+        b == 62 ||
+        b == 40 ||
+        b == 41 ||
+        b == 42 ||
+        b == 63 ||
+        b == 91 ||
+        b == 93 ||
+        b == 37
+}
+
+/// `yew_comp_quote` (`cmdcomp.c:321-360`): `t` as ONE argv element of
+/// the Sprint 18 tokenizer — unchanged when no byte needs it, else
+/// double-quoted with `"`, `\`, `%` escaped, LF as `\n`, TAB as `\t` and
+/// CR as a space.
+pub fn comp_quote(t: List[byte]) -> List[byte] {
+    var unsafe_seen = false
+    for b in t {
+        if unsafe_path_byte(b as int) {
+            unsafe_seen = true
+            break
+        }
+    }
+    if !unsafe_seen {
+        return copy t
+    }
+    var q = List[byte]()
+    (mut q).push(34 as byte)
+    for b in t {
+        let c = b as int
+        if c == 34 || c == 92 {
+            (mut q).push(92 as byte)
+            (mut q).push(b)
+        } else if c == 10 {
+            push_str(mut q, "\\n")
+        } else if c == 13 {
+            (mut q).push(32 as byte)
+        } else if c == 9 {
+            push_str(mut q, "\\t")
+        } else if c == 37 {
+            push_str(mut q, "\\%")
+        } else {
+            (mut q).push(b)
+        }
+    }
+    (mut q).push(34 as byte)
+    q
+}
+
+/// `yew_comp_path_head_len` (`cmdcomp.c:627-635`): the bytes of `stem`
+/// that name the directory, the trailing `/` included — the ONE split
+/// rule the source and the filter's cache share.
+pub fn comp_path_head_len(stem: List[byte]) -> int {
+    var i = stem.len
+    while i > 0 {
+        if stem[i - 1] as int == 47 {
+            return i
+        }
+        i -= 1
+    }
+    0
+}
+
+/// The home directory of user `name` from the password database, or
+/// none. wolf has no `getpwnam`/`getpwuid` (a gap, `docs/MAP.md`): the
+/// port reads `/etc/passwd`'s `name:pw:uid:gid:gecos:home:shell` rows,
+/// which a host whose users live only in a directory service lacks.
+pub fn comp_passwd_home(name: str, by_uid: bool, uid: int) -> str ! {none} {
+    let raw = fs_read_bytes("/etc/passwd") else |_| {
+        return none
+    }
+    let txt = str_from_utf8(raw) else |_| {
+        return none
+    }
+    for line in txt.lines() {
+        let fields = line.split(":")
+        if fields.len < 6 {
+            continue
+        }
+        let hit = if by_uid then (fields[2].to_int() else -1) == uid else fields[0] == name
+        if hit {
+            return fields[5]
+        }
+    }
+    none
+}
+
+// `expand_home_head` (`cmdcomp.c:376-408`): a leading `~` or `~name`
+// expanded; none when the user is unknown.
+fn expand_home_head(head: List[byte]) -> List[byte] ! {none} {
+    if head.len == 0 || head[0] as int != 126 {
+        return copy head
+    }
+    var slash = -1
+    var i = 1
+    while i < head.len {
+        if head[i] as int == 47 {
+            slash = i
+            break
+        }
+        i += 1
+    }
+    let user_end = if slash < 0 then head.len else slash
+    var home = ""
+    if user_end == 1 {
+        home = env_get("HOME") else ""
+        if home.len == 0 {
+            let uid = os_uid() else -1
+            home = comp_passwd_home("", true, uid) else {
+                return none
+            }
+        }
+    } else {
+        let user = str_from_utf8(comp_slice(head, 1, user_end)) else |_| {
+            return none
+        }
+        home = comp_passwd_home(user, false, 0) else {
+            return none
+        }
+    }
+    var out = bytes_of(home)
+    if slash >= 0 {
+        var j = slash
+        while j < head.len {
+            (mut out).push(head[j])
+            j += 1
+        }
+    }
+    out
+}
+
+// `path_is_dir` (`cmdcomp.c:410-435`): a typed entry answers from its
+// kind (a link is not a directory); an untyped one is `lstat`ed.
+fn path_is_dir(force_unknown: bool, mut lstat_calls: int, scan_dir: str, row: List[byte]) -> bool {
+    let kind = if force_unknown then 2 else listing_kind_of(row)
+    if kind == 1 {
+        return true
+    }
+    if kind != 2 {
+        return false
+    }
+    lstat_calls += 1
+    let path = comp_entry_path(scan_dir, row) else {
+        return false
+    }
+    let w = fs_lstat(path) else |_| {
+        return false
+    }
+    w[0] == 1
+}
+
+// The words of `fs_stat` this unit reads (`[os.fs.stat]`): kind, mode,
+// uid, gid.
+fn stat_words(path: str) -> List[int] ! {none} {
+    let w = fs_stat(path) else |_| {
+        return none
+    }
+    w
+}
+
+/// access(2)'s `X_OK` over a stat record by the real ids (wolf has no
+/// `access`, G32): root runs anything with an x bit, an owner by the
+/// user bit, a group member by the group bit, anyone else by the other
+/// bit — `text.clipboard`'s `access_x`. ACLs are not seen.
+pub fn comp_access_x(mode: int, owner: int, group: int) -> bool {
+    let uid = os_uid() else -1
+    if uid == 0 {
+        return mode & 73 != 0
+    }
+    if owner == uid {
+        return mode & 64 != 0
+    }
+    var in_group = false
+    let gid = os_gid() else -1
+    if group == gid {
+        in_group = true
+    } else {
+        let groups = os_groups() else List[int]()
+        for g in groups {
+            if g == group {
+                in_group = true
+            }
+        }
+    }
+    if in_group {
+        return mode & 8 != 0
+    }
+    mode & 1 != 0
+}
+
+// `path_ext_match` (`cmdcomp.c:942-956`).
+fn path_ext_match(row: List[byte], ext: List[str]) -> bool {
+    let n = row.len - 1
+    for e in ext {
+        let el = e.len
+        if n > el + 1 && row[row.len - el - 1] as int == 46 {
+            var same = true
+            var i = 0
+            while i < el {
+                if row[row.len - el + i] as int != e.bytes()[i] as int {
+                    same = false
+                    break
+                }
+                i += 1
+            }
+            if same {
+                return true
+            }
+        }
+    }
+    false
+}
+
+// `path_mask_keep` (`cmdcomp.c:958-993`): does the entry pass the
+// request's PATH_* mask? A link is followed.
+fn path_mask_keep(
+    force_unknown: bool,
+    scan_dir: str,
+    row: List[byte],
+    mask_in: int,
+    ext: List[str],
+) -> bool {
+    let kind = if force_unknown then 2 else listing_kind_of(row)
+    var mask = mask_in
+    if ext.len != 0 && kind != 1 && !path_ext_match(row, ext) {
+        mask = PATH_DIRS
+    }
+    if mask == PATH_ANY || kind == 1 {
+        return true
+    }
+    if kind != 3 && kind != 2 && (mask == PATH_DIRS || kind != 0) {
+        return false
+    }
+    let path = comp_entry_path(scan_dir, row) else {
+        return false
+    }
+    let w = stat_words(path) else {
+        return false
+    }
+    if w[0] == 1 {
+        return true
+    }
+    mask == PATH_EXEC_OR_DIR && w[0] == 0 && comp_access_x(w[4], w[6], w[7])
+}
+
+// A heap row (`PathCandidate`, `cmdcomp.c:51-64`): the listing row it
+// names, not a copy of the name.
+struct PathCand {
+    row: int,
+    len: int,
+    score: int,
+    key: int,
+    key2: int,
+}
+
+// Seven name bytes from `from` packed big-endian (0-padded), so two names
+// of one length compare as integers before any byte loop — the first
+// fourteen bytes in two keys: C's `strcmp` is the order
+// (`path_candidate_cmp`), and the port's nested-list byte walk was 41% of
+// a keystroke's profile without them.
+fn name_key(row: List[byte], from: int) -> int {
+    var k = 0
+    var i = from
+    while i < from + 7 {
+        k = k * 256 + (if i < row.len then row[i] as int else 0)
+        i += 1
+    }
+    k
+}
+
+// `path_candidate_cmp` (`cmdcomp.c:437-455`).
+fn path_cmp(rows: List[List[byte]], a: PathCand, b: PathCand) -> int {
+    if a.score != b.score {
+        return if a.score > b.score then -1 else 1
+    }
+    if a.len != b.len {
+        return if a.len < b.len then -1 else 1
+    }
+    if a.key != b.key {
+        return if a.key < b.key then -1 else 1
+    }
+    if a.key2 != b.key2 {
+        return if a.key2 < b.key2 then -1 else 1
+    }
+    if a.len <= 14 {
+        return 0
+    }
+    comp_bytes_cmp(rows[a.row], 15, rows[a.row].len, rows[b.row], 15, rows[b.row].len)
+}
+
+// `path_heap_push` (`cmdcomp.c:475-499`): a worst-first heap.
+fn path_heap_push(mut heap: List[PathCand], rows: List[List[byte]], c: PathCand) {
+    (mut heap).push(copy c)
+    var at = heap.len - 1
+    while at != 0 {
+        let parent = (at - 1) / 2
+        if path_cmp(rows, heap[at], heap[parent]) <= 0 {
+            break
+        }
+        let t = copy heap[at]
+        heap[at] = copy heap[parent]
+        heap[parent] = t
+        at = parent
+    }
+}
+
+// `path_heap_replace_worst` (`cmdcomp.c:501-534`).
+fn path_heap_replace_worst(mut heap: List[PathCand], rows: List[List[byte]], c: PathCand) {
+    heap[0] = copy c
+    var at = 0
+    loop {
+        var worst = at
+        let left = at * 2 + 1
+        let right = left + 1
+        if left < heap.len && path_cmp(rows, heap[left], heap[worst]) > 0 {
+            worst = left
+        }
+        if right < heap.len && path_cmp(rows, heap[right], heap[worst]) > 0 {
+            worst = right
+        }
+        if worst == at {
+            break
+        }
+        let t = copy heap[at]
+        heap[at] = copy heap[worst]
+        heap[worst] = t
+        at = worst
+    }
+}
+
+// `path_rank_one` (`cmdcomp.c:995-1022`): one entry into the bounded
+// heap, dot files only for a dot pattern, the mask after the match.
+fn path_rank_one(
+    mut heap: List[PathCand],
+    rows: List[List[byte]],
+    ri: int,
+    tail: List[byte],
+    t0: int,
+    mut total: int,
+    scan_dir: str,
+    req: CompReq,
+    force_unknown: bool,
+) {
+    let rlen = rows[ri].len
+    if rlen > 1 && rows[ri][1] as int == 46 && (t0 >= tail.len || tail[t0] as int != 46) {
+        return
+    }
+    let score = comp_key_score(tail, t0, tail.len, rows[ri], 1, rlen)
+    if score == ws.FZ_NO_MATCH {
+        return
+    }
+    if !path_mask_keep(force_unknown, scan_dir, rows[ri], req.path_filter, req.path_ext) {
+        return
+    }
+    total += 1
+    let c = PathCand {
+        row: ri,
+        len: rlen - 1,
+        score: score,
+        key: name_key(rows[ri], 1),
+        key2: name_key(rows[ri], 8),
+    }
+    if heap.len >= COMP_MAX && path_cmp(rows, c, heap[0]) >= 0 {
+        return
+    }
+    if heap.len < COMP_MAX {
+        path_heap_push(mut heap, rows, c)
+    } else {
+        path_heap_replace_worst(mut heap, rows, c)
+    }
+}
+
+fn sort_pathcands(mut xs: List[PathCand], rows: List[List[byte]]) {
+    let n = xs.len
+    if n < 2 {
+        return
+    }
+    var src = copy xs
+    var width = 1
+    while width < n {
+        var dst = List[PathCand]()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if lo + 2 * width < n then lo + 2 * width else n
+            var i = lo
+            var j = mid
+            while i < mid && j < hi {
+                if path_cmp(rows, src[j], src[i]) < 0 {
+                    (mut dst).push(copy src[j])
+                    j += 1
+                } else {
+                    (mut dst).push(copy src[i])
+                    i += 1
+                }
+            }
+            while i < mid {
+                (mut dst).push(copy src[i])
+                i += 1
+            }
+            while j < hi {
+                (mut dst).push(copy src[j])
+                j += 1
+            }
+            lo = hi
+        }
+        src = dst
+        width *= 2
+    }
+    xs = src
+}
+
+// `path_candidates_finish` (`cmdcomp.c:560-625`): head + name (+ `/`),
+// quoted; positions rescored and shifted across the head, or dropped when
+// quoting broke the byte mapping.
+fn path_candidates_finish(
+    mut heap: List[PathCand],
+    rows: List[List[byte]],
+    scan_dir: str,
+    head: List[byte],
+    tail: List[byte],
+    t0: int,
+    force_unknown: bool,
+    mut lstat_calls: int,
+    mut out: List[CompItem],
+) {
+    sort_pathcands(mut heap, rows)
+    var items = List[CompItem]()
+    for c in heap {
+        let rlen = rows[c.row].len
+        let is_dir = path_is_dir(force_unknown, mut lstat_calls, scan_dir, rows[c.row])
+        var raw = copy head
+        var i = 1
+        while i < rlen {
+            (mut raw).push(rows[c.row][i])
+            i += 1
+        }
+        if is_dir {
+            (mut raw).push(47 as byte)
+        }
+        let shown = comp_quote(raw)
+        var pos = List[int]()
+        let _ = comp_key(tail, t0, tail.len, rows[c.row], 1, rlen, true, mut pos)
+        var off = COMP_NO_HIGHLIGHT
+        if !comp_bytes_eq(shown, raw) || head.len >= COMP_NO_HIGHLIGHT {
+            pos = List[int]()
+        } else {
+            off = head.len
+            var p = 0
+            while p < pos.len {
+                let at = pos[p] + head.len
+                pos[p] = if at > 65535 then 65535 else at
+                p += 1
+            }
+        }
+        (mut items).push(CompItem {
+            text: shown,
+            detail: "",
+            kind: COMP_PATH,
+            is_dir: is_dir,
+            deferred: false,
+            score: c.score,
+            m: ws.FzMatch { pos: pos },
+            ranked: comp_slice(rows[c.row], 1, rlen),
+            match_off: off,
+            suffix: List[byte](),
+        })
+    }
+    out = items
+}
+
+/// `enumerate_paths` (`cmdcomp.c:1024-1111`): the entries of the stem's
+/// directory that match its tail, ranked, capped at `COMP_MAX`; answers
+/// the pre-cap total. A cacheable request answers from the sliced
+/// listing (a partial one ranks what has been read); a fresh one retires
+/// the cache and streams.
+pub fn comp_enumerate_paths(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    let head_len = comp_path_head_len(req.stem)
+    let head = comp_slice(req.stem, 0, head_len)
+    let expanded = expand_home_head(head) else {
+        out = List[CompItem]()
+        return 0
+    }
+    let base = if req.has_cwd then req.cwd else ed.ws_dir
+    var scan_bytes = List[byte]()
+    if expanded.len != 0 && expanded[0] as int == 47 {
+        scan_bytes = copy expanded
+    } else {
+        scan_bytes = bytes_of(base)
+        (mut scan_bytes).push(47 as byte)
+        for b in expanded {
+            (mut scan_bytes).push(b)
+        }
+    }
+    var scan_dir = str_from_utf8(scan_bytes) else |_| {
+        out = List[CompItem]()
+        return 0
+    }
+    if scan_dir.len == 0 {
+        scan_dir = base
+    }
+    if !req.allow_cache {
+        comp_listing_invalidate(mut ed)
+    }
+    var heap = List[PathCand]()
+    var total = 0
+    var cached = false
+    if req.allow_cache {
+        let limit = comp_list_limit(ed)
+        let (state, opened) = listing_step(
+            mut ed.comp.listing,
+            scan_dir,
+            req.budget_us,
+            LISTING_KEEP_ALL,
+            limit,
+            ed.comp.force_dtype_unknown,
+        )
+        if opened {
+            ed.comp.opendirs += 1
+        }
+        cached = state != LISTING_UNUSABLE
+    }
+    let force = ed.comp.force_dtype_unknown
+    if cached {
+        for ri in ed.comp.listing.idx {
+            path_rank_one(
+                mut heap,
+                ed.comp.listing.rows,
+                ri,
+                req.stem,
+                head_len,
+                mut total,
+                scan_dir,
+                req,
+                force,
+            )
+        }
+        path_candidates_finish(
+            mut heap,
+            ed.comp.listing.rows,
+            scan_dir,
+            head,
+            req.stem,
+            head_len,
+            force,
+            mut ed.comp.lstat_calls,
+            mut out,
+        )
+        return total
+    }
+    ed.comp.opendirs += 1
+    let rows = fs_read_dir_entries(scan_dir) else |_| {
+        out = List[CompItem]()
+        return 0
+    }
+    var ri = 0
+    while ri < rows.len {
+        path_rank_one(mut heap, rows, ri, req.stem, head_len, mut total, scan_dir, req, force)
+        ri += 1
+    }
+    path_candidates_finish(
+        mut heap,
+        rows,
+        scan_dir,
+        head,
+        req.stem,
+        head_len,
+        force,
+        mut ed.comp.lstat_calls,
+        mut out,
+    )
+    total
+}
+
+// ------------------------------------------------------------------
+// The source registry (`cmdcomp.c:3229-3339`)
+// ------------------------------------------------------------------
+
+// `comp_init`'s built-in rows (`cmdcomp.c:3234-3275`).
+fn comp_init(mut ed: Ed) {
+    if ed.comp.initialized {
+        return
+    }
+    ed.comp.initialized = true
+    let both = COMP_SRC_CACHEABLE | COMP_SRC_SLOW
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_CMD,
+        name: "cmd",
+        impl_id: SRCIMPL_CMD,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_PATH,
+        name: "path",
+        impl_id: SRCIMPL_PATH,
+        flags: both,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_BUFFER,
+        name: "buffer",
+        impl_id: SRCIMPL_BUFFER,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_OPTION,
+        name: "option",
+        impl_id: SRCIMPL_OPTION,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_VALUE,
+        name: "value",
+        impl_id: SRCIMPL_VALUE,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_PLUGIN,
+        name: "plugin",
+        impl_id: SRCIMPL_PLUGIN,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_EXEC,
+        name: "exec",
+        impl_id: SRCIMPL_EXEC,
+        flags: both,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_SHELL,
+        name: "shell",
+        impl_id: SRCIMPL_SHELL,
+        flags: both,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_VAR,
+        name: "var",
+        impl_id: SRCIMPL_VAR,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_USER,
+        name: "user",
+        impl_id: SRCIMPL_USER,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_BUILTIN,
+        name: "builtin",
+        impl_id: SRCIMPL_BUILTIN,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_SPEC,
+        name: "spec",
+        impl_id: SRCIMPL_SPEC,
+        flags: COMP_SRC_CACHEABLE,
+    })
+    comp_source_register(mut ed, CompSource {
+        kind: COMP_GEN,
+        name: "generator",
+        impl_id: SRCIMPL_GEN,
+        flags: COMP_SRC_CACHEABLE,
+    })
+}
+
+/// `yew_comp_source_register` (`cmdcomp.c:3277-3285`): idempotent BY
+/// KIND — registering a kind replaces its source.
+pub fn comp_source_register(mut ed: Ed, src: CompSource) {
+    if src.impl_id == SRCIMPL_NONE || src.name.len == 0 {
+        util.bug("edit.cmdcomp", "completion source needs a name and an enumerator")
+    }
+    if src.kind < 0 || src.kind >= COMP_KIND_N {
+        util.bug("edit.cmdcomp", "completion source has an invalid kind")
+    }
+    ed.comp.initialized = true
+    ed.comp.sources[src.kind] = copy src
+}
+
+/// `yew_comp_source` (`cmdcomp.c:3287-3294`): the source of `kind`, or
+/// none.
+pub fn comp_source(mut ed: Ed, kind: int) -> CompSource ! {none} {
+    comp_init(mut ed)
+    if kind < 0 || kind >= COMP_KIND_N || ed.comp.sources[kind].impl_id == SRCIMPL_NONE {
+        return none
+    }
+    copy ed.comp.sources[kind]
+}
+
+/// `yew_comp_source_count` (`cmdcomp.c:3296-3307`).
+pub fn comp_source_count(mut ed: Ed) -> int {
+    comp_init(mut ed)
+    var n = 0
+    for s in ed.comp.sources {
+        if s.impl_id != SRCIMPL_NONE {
+            n += 1
+        }
+    }
+    n
+}
+
+/// `yew_comp_request` (`cmdcomp.c:3309-3320`): the ONE match over the
+/// source implementations; answers the pre-cap total.
+pub fn comp_request(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    let src = comp_source(mut ed, req.kind) else {
+        out = List[CompItem]()
+        return 0
+    }
+    match src.impl_id {
+        1 => enumerate_commands(ed, req, mut out), // SRCIMPL_CMD
+        2 => comp_enumerate_paths(mut ed, req, mut out), // SRCIMPL_PATH
+        3 => enumerate_buffers(ed, req, mut out), // SRCIMPL_BUFFER
+        4 => enumerate_options(req, mut out), // SRCIMPL_OPTION
+        5 => enumerate_option_values(req, mut out), // SRCIMPL_VALUE
+        6 => enumerate_plugins(mut out), // SRCIMPL_PLUGIN
+        7 => comp_enumerate_exec(mut ed, req, mut out), // SRCIMPL_EXEC
+        8 => comp_enumerate_shell(mut ed, req, mut out), // SRCIMPL_SHELL
+        9 => comp_enumerate_vars(mut ed, req, mut out), // SRCIMPL_VAR
+        10 => comp_enumerate_users(mut ed, req, mut out), // SRCIMPL_USER
+        11 => comp_enumerate_builtins(mut ed, req, mut out), // SRCIMPL_BUILTIN
+        12 => comp_enumerate_spec(mut ed, req, mut out), // SRCIMPL_SPEC
+        13 => comp_enumerate_gen(mut ed, req, mut out), // SRCIMPL_GEN
+        14 => test_stub_enumerate(req, mut out), // SRCIMPL_TEST_STUB
+        _ => {
+            out = List[CompItem]()
+            0
+        },
+    }
+}
+
+// The test probe's body (`stub_enumerate`, `test_cmdcomp.c:183-193`).
+fn test_stub_enumerate(req: CompReq, mut out: List[CompItem]) -> int {
+    var items = List[CompItem]()
+    (mut items).push(compitem_text(bytes_of("stub"), req.kind))
+    out = items
+    1
+}
+
+/// `yew_comp_enumerate` (`cmdcomp.c:3322-3339`): the unbudgeted, FRESH
+/// request — a Tab, or a test after touching the filesystem.
+pub fn comp_enumerate(mut ed: Ed, kind: int, stem: List[byte], mut out: List[CompItem]) -> int {
+    let req = compreq_new(kind, stem)
+    comp_request(mut ed, req, mut out)
+}
+
+/// The enumerate count (`yew_comp_test_enumerate_count`).
+pub fn comp_test_enumerate_count(ed: Ed) -> int {
+    ed.comp.enumerate_calls
+}
+
+/// `yew_comp_test_reset_enumerate_count`.
+pub fn comp_test_reset_enumerate_count(mut ed: Ed) {
+    ed.comp.enumerate_calls = 0
+}
+
+/// `yew_comp_test_set_list_max` (`cmdcomp.c:3828-3832`): 0 restores
+/// `COMP_LIST_MAX`; retires the cache.
+pub fn comp_test_set_list_max(mut ed: Ed, max: int) {
+    ed.comp.list_max = max
+    comp_listing_invalidate(mut ed)
+}
+
+/// `yew_comp_test_force_dtype_unknown` (`cmdcomp.c:3834-3838`).
+pub fn comp_test_force_dtype_unknown(mut ed: Ed, force: bool) {
+    ed.comp.force_dtype_unknown = force
+    ed.comp.lstat_calls = 0
+}
+
+/// `yew_comp_test_lstat_count`.
+pub fn comp_test_lstat_count(ed: Ed) -> int {
+    ed.comp.lstat_calls
+}
+
+// ------------------------------------------------------------------
+// The live filter (`cmdcomp.c:3341-3696`)
+// ------------------------------------------------------------------
+
+// `filter_item_cmp` (`cmdcomp.c:3403-3422`).
+fn item_less(a: CompItem, b: CompItem) -> bool {
+    if a.score != b.score {
+        return a.score > b.score
+    }
+    if a.ranked.len != b.ranked.len {
+        return a.ranked.len < b.ranked.len
+    }
+    let by = comp_bytes_cmp(a.ranked, 0, a.ranked.len, b.ranked, 0, b.ranked.len)
+    if by != 0 {
+        return by < 0
+    }
+    comp_bytes_cmp(a.text, 0, a.text.len, b.text, 0, b.text.len) < 0
+}
+
+/// The completion order over items (`yew_sort_stable` with
+/// `filter_item_cmp`): stable, local.
+pub fn comp_sort_items(mut xs: List[CompItem]) {
+    let n = xs.len
+    if n < 2 {
+        return
+    }
+    var src = List[int]()
+    var i = 0
+    while i < n {
+        (mut src).push(i)
+        i += 1
+    }
+    var width = 1
+    while width < n {
+        var dst = List[int]()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if lo + 2 * width < n then lo + 2 * width else n
+            var a = lo
+            var b = mid
+            while a < mid && b < hi {
+                if item_less(xs[src[b]], xs[src[a]]) {
+                    (mut dst).push(src[b])
+                    b += 1
+                } else {
+                    (mut dst).push(src[a])
+                    a += 1
+                }
+            }
+            while a < mid {
+                (mut dst).push(src[a])
+                a += 1
+            }
+            while b < hi {
+                (mut dst).push(src[b])
+                b += 1
+            }
+            lo = hi
+        }
+        src = dst
+        width *= 2
+    }
+    var out = List[CompItem]()
+    for k in src {
+        (mut out).push(copy xs[k])
+    }
+    xs = out
+}
+
+fn fold_byte(b: int) -> int {
+    if b >= 65 && b <= 90 then b + 32 else b
+}
+
+// `prefix_fold` / `strncmp` over a ranked name (`cmdcomp.c:3434-3452`).
+fn ranked_has_prefix(m: List[byte], pat: List[byte], p0: int, fold: bool) -> bool {
+    let n = pat.len - p0
+    if m.len < n {
+        return false
+    }
+    var i = 0
+    while i < n {
+        let a = m[i] as int
+        let b = pat[p0 + i] as int
+        if fold {
+            if fold_byte(a) != fold_byte(b) {
+                return false
+            }
+        } else if a != b {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// Sprint 57.23 §7's prefix rule (`shell_prefix_rule`, `cmdcomp.c:3461-
+/// 3494`): keep the case-sensitive prefix matches if any, else the
+/// case-insensitive ones, else the fuzzy set as ranked.
+pub fn comp_shell_prefix_rule(mut out: List[CompItem], pat: List[byte], p0: int) {
+    var pass = 0
+    while pass < 2 {
+        let fold = pass == 1
+        var any = false
+        for it in out {
+            if ranked_has_prefix(it.ranked, pat, p0, fold) {
+                any = true
+                break
+            }
+        }
+        if any {
+            var keep = List[CompItem]()
+            for it in out {
+                if ranked_has_prefix(it.ranked, pat, p0, fold) {
+                    (mut keep).push(copy it)
+                }
+            }
+            out = keep
+            return
+        }
+        pass += 1
+    }
+}
+
+// `filter_rerank` (`cmdcomp.c:3496-3532`): the cached set re-scored
+// against `pattern = stem[p0..]`.
+fn filter_rerank(f: CompFilter, stem: List[byte], p0: int, mut out: List[CompItem]) -> int {
+    var items = List[CompItem]()
+    for base in f.base {
+        var pos = List[int]()
+        let score = comp_key(stem, p0, stem.len, base.ranked, 0, base.ranked.len, true, mut pos)
+        if score == ws.FZ_NO_MATCH {
+            continue
+        }
+        var item = copy base
+        item.score = score
+        if item.match_off == COMP_NO_HIGHLIGHT {
+            item.m = ws.fzmatch_none()
+        } else {
+            var p = 0
+            while p < pos.len {
+                let at = pos[p] + item.match_off
+                pos[p] = if at > 65535 then 65535 else at
+                p += 1
+            }
+            item.m = ws.FzMatch { pos: pos }
+        }
+        (mut items).push(item)
+    }
+    if f.kind == COMP_SHELL {
+        comp_shell_prefix_rule(mut items, stem, p0)
+    }
+    comp_sort_items(mut items)
+    if f.kind == COMP_SHELL || f.kind == COMP_USER {
+        comp_users_underscore_last(mut items)
+    }
+    out = items
+    out.len
+}
+
+// `filter_reusable` (`cmdcomp.c:3592-3613`): appending can only shrink a
+// subsequence match, so a grown pattern re-ranks the uncapped set.
+fn filter_reusable(
+    f: CompFilter,
+    kind: int,
+    head: List[byte],
+    stem: List[byte],
+    p0: int,
+    key: CompShellKey,
+) -> bool {
+    if !f.valid || f.kind != kind || f.capped {
+        return false
+    }
+    if !comp_bytes_eq(f.head, head) {
+        return false
+    }
+    if f.has_ctx_key != key.has_key || key.has_key && f.ctx_key != key.key {
+        return false
+    }
+    if stem.len - p0 < f.pattern.len {
+        return false
+    }
+    var i = 0
+    while i < f.pattern.len {
+        if stem[p0 + i] as int != f.pattern[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_comp_filter_run` (`cmdcomp.c:3615-3696`): the candidates for `q`
+/// ranked into `out`, re-enumerating only when the cache cannot answer;
+/// answers the pre-cap match total.
+pub fn comp_filter_run(
+    mut ed: Ed,
+    mut f: CompFilter,
+    q: CompQuery,
+    budget_us: int,
+    mut out: List[CompItem],
+) -> int {
+    let head_len = if q.kind == COMP_PATH || q.kind == COMP_SHELL {
+        comp_path_head_len(q.stem)
+    } else {
+        0
+    }
+    let head = comp_slice(q.stem, 0, head_len)
+    var key = compshellkey_none()
+    if q.kind == COMP_SHELL && q.has_shell {
+        key = comp_shell_ctx_key(mut ed, q)
+    }
+    f.where = copy key.where
+    let reuse = filter_reusable(f, q.kind, head, q.stem, head_len, key)
+    if !reuse {
+        f.base = List[CompItem]()
+        var req = compreq_new(q.kind, q.stem)
+        req.budget_us = budget_us
+        req.allow_cache = true
+        if q.kind == COMP_SHELL {
+            req.shell_line = copy q.shell_line
+            req.shell_cursor = q.shell_cursor
+            req.has_shell = q.has_shell
+        }
+        ed.comp.enumerate_calls += 1
+        var base = List[CompItem]()
+        f.total = comp_request(mut ed, req, mut base)
+        f.base = base
+        f.capped = f.base.len < f.total
+        f.head = head
+        f.pattern = comp_slice(q.stem, head_len, q.stem.len)
+        f.ctx_key = copy key.key
+        f.has_ctx_key = key.has_key
+        f.gen_key = copy key.gen_key
+        f.has_gen_key = key.has_gen
+        f.kind = q.kind
+        f.valid = true
+    }
+    f.gen_pending = f.has_gen_key && comp_shell_awaiting(ed, f.gen_key)
+    let matched = filter_rerank(f, q.stem, head_len, mut out)
+    if reuse || f.kind == COMP_SHELL && !f.capped {
+        return matched
+    }
+    f.total
+}
+
+/// `yew_comp_sole` (`cmdcomp.c:3698-3705`): the index of the ONE
+/// survivor of `kind` (`COMP_KIND_N` for any), or -1.
+pub fn comp_sole(items: List[CompItem], kind: int) -> int {
+    if items.len != 1 {
+        return -1
+    }
+    if kind != COMP_KIND_N && items[0].kind != kind {
+        return -1
+    }
+    0
+}
+
+/// `yew_comp_kind_for` (`cmdcomp.c:3707-3758`): the kind completing
+/// argument `token_index` of the command whose argspec is `argspec`
+/// (`has_entry` false for C's NULL entry); every word of a bang body is
+/// SHELL.
+pub fn comp_kind_for(argspec: str, has_entry: bool, token_index: int, bang_body: bool) -> (
+    bool,
+    int,
+) {
+    if bang_body {
+        return (true, COMP_SHELL)
+    }
+    if token_index == 0 {
+        return (true, COMP_CMD)
+    }
+    if !has_entry || argspec.len == 0 {
+        return (false, COMP_CMD)
+    }
+    var len = argspec.len
+    let repeats = argspec.ends_with("*")
+    if repeats {
+        len -= 1
+    }
+    let arg = token_index - 1
+    var code = 0
+    if arg >= len {
+        if !repeats || len == 0 {
+            return (false, COMP_CMD)
+        }
+        code = argspec.bytes()[len - 1] as int
+    } else {
+        code = argspec.bytes()[arg] as int
+    }
+    match code {
+        102 => (true, COMP_PATH), // 'f'
+        98 => (true, COMP_BUFFER), // 'b'
+        111 => (true, COMP_OPTION), // 'o'
+        118 => (true, COMP_VALUE), // 'v'
+        112 => (true, COMP_PLUGIN), // 'p'
+        _ => (false, COMP_CMD),
+    }
+}
+
+/// The query at a tolerant parse point (`yew_comp_query_at`,
+/// `cmdcomp.c:3760-3791`), taking the point's fields: whether the caret
+/// is in a bang body, its token index, whether the command resolved and
+/// its id, the decoded stem and the token's span, whether the shell
+/// context at the caret completes nothing (§3 row 1), and the line and
+/// caret the shell half re-lexes. Answers whether a source applies.
+pub fn comp_query_point(
+    ed: Ed,
+    bang_body: bool,
+    token_index: int,
+    command_known: bool,
+    command: int,
+    stem: List[byte],
+    tok_lo: int,
+    tok_hi: int,
+    shell_none: bool,
+    line: List[byte],
+    cursor: int,
+) -> (bool, CompQuery) {
+    var q = compquery_new(COMP_CMD, stem, tok_lo, tok_hi)
+    var has_entry = false
+    var argspec = ""
+    if !bang_body && token_index != 0 {
+        if !command_known || !cmd_active(ed.reg, command) {
+            return (false, q)
+        }
+        argspec = ed.reg.entries[command - 1].argspec
+        has_entry = true
+    }
+    if bang_body && shell_none {
+        return (false, q)
+    }
+    let (ok, kind) = comp_kind_for(argspec, has_entry, token_index, bang_body)
+    if !ok {
+        return (false, q)
+    }
+    q.kind = kind
+    if bang_body {
+        q.shell_line = copy line
+        q.shell_cursor = cursor
+        q.has_shell = true
+    }
+    (true, q)
+}
+
+/// `yew_comp_query_at` (`cmdcomp.c:3760-3791`) over a tolerant parse
+/// point of `line` at `cursor` (`edit.cmd_parse_point`'s): §9's hint and
+/// §4's filter read ONE parse per keystroke. The point's shell context —
+/// whether the caret's word completes nothing (§3 row 1) — is the shell
+/// half's (`comp_shell_point_none`).
+pub fn comp_query_at(mut ed: Ed, point: CmdParsePoint, line: List[byte], cursor: int) -> (
+    bool,
+    CompQuery,
+) {
+    let shell_none = point.bang_body && comp_shell_point_none(mut ed, point, line, cursor)
+    comp_query_point(
+        ed,
+        point.bang_body,
+        point.token_index,
+        point.command_known,
+        point.command,
+        point.stem,
+        point.token.lo,
+        point.token.hi,
+        shell_none,
+        line,
+        cursor,
+    )
+}
+
+/// `yew_comp_query` (`cmdcomp.c:3793-3802`): the tolerant parse of `line`
+/// at `cursor`, then its query.
+pub fn comp_query(mut ed: Ed, line: List[byte], cursor: int) -> (bool, CompQuery) {
+    let point = cmd_parse_point(mut ed, line, cursor) else {
+        return (false, compquery_new(COMP_CMD, List[byte](), 0, 0))
+    }
+    comp_query_at(mut ed, point, line, cursor)
+}
+
+/// `yew_comp_lcp` (`cmdcomp.c:3804-3826`): the texts' longest common
+/// byte prefix, backed off to a UTF-8 boundary.
+pub fn comp_lcp(items: List[CompItem]) -> List[byte] {
+    if items.len == 0 {
+        return List[byte]()
+    }
+    let first = copy items[0].text
+    var common = first.len
+    var i = 1
+    while i < items.len && common > 0 {
+        var j = 0
+        while j < common && j < items[i].text.len && items[i].text[j] as int == first[j] as int {
+            j += 1
+        }
+        common = j
+        i += 1
+    }
+    while common > 0 && !unicode.utf8_is_boundary(first, 0, first.len, common) {
+        common -= 1
+    }
+    comp_slice(first, 0, common)
+}
+
+/// A str's bytes as a `List[byte]` (for hosts and tests).
+pub fn comp_bytes(s: str) -> List[byte] {
+    bytes_of(s)
+}
