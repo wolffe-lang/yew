@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# torture-live — the live-editor torture lane (yw04, deliverable 6;
+# R-yw02-1 = A): sagitta's `kill9` driver with its fault shim over the
+# port's LIVE editor, then the port's replica for the lanes the driver
+# cannot reach at wolf 0.2.33.
+#
+#   tools/torture-live --yew BIN [--iters N]
+#
+# Run it inside a container (sprints/RULES.md §5): the driver and the
+# replica SIGKILL their own children.
+#
+# 1. The driver (`tests/torture/kill9.c` with `YEW_TORTURE_LANE=
+#    live-editor`, as `tools/goldens --suite torture` runs it): sagitta's
+#    `yew-live-torture` opens the editor on a PTY, types `Ndd`, a
+#    bracketed paste, `s` and `:ed.quit_force\r` (`yew-live-torture.c:
+#    181-219`), arming the shim with SIGUSR2 before the save. The port's
+#    binary stays dynamically linked so `LD_PRELOAD` reaches it. The lanes
+#    run in order and stop at the first red (`kill9.c:1159-1203`): the
+#    clean save, the atomic sweeps at four seeds, the hard-link sweep,
+#    EINTR and ENOSPC must hold; the determinism lane is G3's red — the
+#    shim log has no `fsync-file` after the writes (the port's save syncs
+#    nothing at 0.2.33, wolf-lang#796) — and is accepted ONLY as that
+#    lane's exact line with every earlier lane ok (R-yw02-2's KNOWN-RED
+#    shape); anything else is red.
+# 2. The replica (`tools/torture-replica.py --live`): the determinism lane
+#    again, whose two runs must exit 0, check green and fail the order by
+#    exactly `fchown where fsync-file is wanted` (G3, by name), with the
+#    same seed giving the same log; then the 500 external SIGKILLs the
+#    driver never reaches, every one old-or-new with the journal
+#    recovering.
+#
+# The day the pin has `fs_sync`/`fs_sync_dir` (0.2.34, G3) the driver's
+# determinism lane goes green, the known-red branch below stops matching,
+# and this tool fails until the acceptance is removed: that is the point.
+set -u
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$YEW_ROOT"
+bin=
+iters=500
+while [ $# -gt 0 ]; do
+  case $1 in
+    --yew) bin=$2; shift 2 ;;
+    --iters) iters=$2; shift 2 ;;
+    *) echo "torture-live: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$bin" ] || { echo "usage: tools/torture-live --yew BIN [--iters N]" >&2; exit 2; }
+case $bin in /*) ;; *) bin=$YEW_ROOT/$bin ;; esac
+tree=$YEW_ROOT/target/oracle/sagitta
+b=$tree/build
+for f in "$b/kill9" "$b/yew-live-torture" "$b/yew-torture" "$b/tests/torture/faultshim.so" "$bin"; do
+  [ -x "$f" ] || [ -f "$f" ] || { echo "torture-live: missing $f (tools/oracle builds the torture binaries)" >&2; exit 2; }
+done
+out=$YEW_ROOT/target/tests/torture-live
+mkdir -p "$out"
+export YEW_TORTURE_CHECKER=$b/yew-torture YEW_TORTURE_YEW=$bin YEW_RUNTIME_DIR=$tree/runtime
+echo "torture-live: editor $bin ($(sha256sum "$bin" | cut -c1-12))"
+
+( cd "$tree" && YEW_TORTURE_LANE=live-editor YEW_TORTURE_SIGKILL_ITERS=$iters \
+  "$b/kill9" "$b/yew-live-torture" "$b/tests/torture/faultshim.so" ) >"$out/driver.log" 2>&1
+drc=$?
+sed 's/^/torture-live: driver: /' "$out/driver.log"
+ok=1
+if [ $drc -eq 0 ]; then
+  echo "torture-live: driver GREEN (the pin syncs: remove the G3 acceptance)"
+  ok=0
+else
+  for want in "atomic seed=1 syscalls=" "atomic seed=7 syscalls=" \
+              "atomic seed=42 syscalls=" "atomic seed=8675309 syscalls=" "hardlink syscalls=" \
+              "retry EINTR ok" "storage ENOSPC preserves old+journal ok"; do
+    grep -q "^$want" "$out/driver.log" || { echo "torture-live: driver lane missing: $want"; ok=0; }
+  done
+  # The driver's verdicts go to stderr unbuffered and its ok lines to a
+  # buffered stdout, so the red line is not the log's last: it must be the
+  # ONE `torture:` line, and the lanes after determinism must not appear.
+  [ "$(grep -c '^torture: ' "$out/driver.log")" = 1 ] &&
+    grep -qx "torture: determinism run failed" "$out/driver.log" &&
+    ! grep -q "^determinism seed=\|^external-sigkill" "$out/driver.log" ||
+    { echo "torture-live: driver red somewhere other than G3's determinism lane"; ok=0; }
+fi
+
+python3 tools/torture-replica.py --live --child "$b/yew-live-torture" --checker "$b/yew-torture" \
+  --shim "$b/tests/torture/faultshim.so" --iters "$iters" --lanes determinism,sigkill >"$out/replica.log" 2>&1
+sed 's/^/torture-live: /' "$out/replica.log"
+o=$out/replica.log
+grep -q "^replica: determinism same seed, same log: yes$" $o || { echo "torture-live: determinism not reproducible"; ok=0; }
+grep -qE "^replica: external-sigkill iterations=$iters attempts=[0-9]+ old=[0-9]+ new=[0-9]+ ok$" $o ||
+  { echo "torture-live: external SIGKILL lane red"; ok=0; }
+if ! grep -q "^replica: GREEN$" $o; then
+  [ "$(grep -c '^replica: determinism run [01]: exit=0 check=1 order=NO (fchown where fsync-file is wanted)$' $o)" = 2 ] ||
+    { echo "torture-live: replica red somewhere other than G3's order"; ok=0; }
+fi
+if [ $ok = 1 ]; then
+  echo "torture-live: GREEN but G3's determinism order, KNOWN-RED by name (the save syncs nothing at 0.2.33, wolf-lang#796)"
+  exit 0
+fi
+echo "torture-live: RED"
+exit 1
