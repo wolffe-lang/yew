@@ -46,7 +46,7 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | a pointer lent into another struct for one call (the window's `CursorSet` as `ec.cset`, the editor's journals) | a swap through a local (`let t = a; a = b; b = t`) out and back around the call (`edit.edit_take`/`edit_give`), every return path restoring it (yw03) | a moved field must be stored back (E1001); a placeholder `List` costs 48 B an edit (G33) |
 | `ed.c` calling `ui/*.c` that take `Ed *` | one module: the `ui` files campaign 03 owns are `src/edit/*.lu` with sagitta's names (yw03) | a module cycle is E0303 |
 | a `poll(fd, 0)` between reads (the typeahead drain) | `term.tty_drain_begin`/`tty_drain_end`: `VMIN=0, VTIME=0` for the drain, the wait's mode after (yw03) | no zero-timeout readiness query on a tty at 0.2.33 (G2) |
-| a field or local named `impl`, `take` or `use` | another name (`impl_id`, `n_take`, `keep`) (yw03) | keywords |
+| a field or local named `impl`, `take`, `use` or `scope` | another name (`impl_id`, `n_take`, `keep`) (yw03) | keywords |
 | two files of one module each with a private `push_str` | one helper per module (yw03) | a module's private names are module-wide (E0302): file boundaries create no scopes |
 
 ## 2. Source directories
