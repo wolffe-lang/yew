@@ -40,11 +40,26 @@
 //! refuses a palette past 127), the palette as two digits, the high
 //! ranges as three digits for each of lo, hi and record.
 //!
-//! Usage (`--word-break` before the directory selects the word-break
-//! tables, `src/unicode/tables_wb.lu`, in each form):
-//!   gen-unicode-tables [--word-break] <ucd-dir> <out.lu>        write the file
-//!   gen-unicode-tables --check [--word-break] <ucd-dir> <out.lu> regenerate, diff: 1 on drift
-//!   gen-unicode-tables --dump [--word-break] <ucd-dir>           the arrays, decimal, one a line
+//! **`--case`** (yw03, s17: `ed.sel.case_*`): C's `generate_case`
+//! (`gen-unicode-tables.c:1029-1042`) — the locale-neutral full default
+//! case mappings: `UnicodeData.txt`'s simple upper (field 12) and lower
+//! (13) for every codepoint, then `SpecialCasing.txt`'s unconditional
+//! rows over them (`parse_case_unicode_data`, 186-221;
+//! `parse_special_casing`, 223-262; an identity mapping stores nothing,
+//! `case_store`, 169-180), packed as one record per mapped codepoint in
+//! ascending order with its lower then upper codepoints appended to one
+//! data array (`build_case_tables`, 847-888), the spot checks (890-905)
+//! — written to `src/unicode/tables_case.lu`, data only; the lookups are
+//! `src/unicode/case.lu`. Encoded as the others are: a data codepoint is
+//! three base-128 digits; a record is the codepoint (three), the lower
+//! and upper offsets into the data (two each) and the two lengths (one
+//! each).
+//!
+//! Usage (`--word-break` or `--case` before the directory selects those
+//! tables, `src/unicode/tables_wb.lu` / `tables_case.lu`, in each form):
+//!   gen-unicode-tables [--word-break|--case] <ucd-dir> <out.lu>        write the file
+//!   gen-unicode-tables --check [--word-break|--case] <ucd-dir> <out.lu> regenerate, diff: 1 on drift
+//!   gen-unicode-tables --dump [--word-break|--case] <ucd-dir>           the arrays, decimal, one a line
 
 use std.fs
 
@@ -947,6 +962,297 @@ fn dump_wb(g: WbGen) {
     write_stdout(out)
 }
 
+// `CASE_MAX_CPS` (C 17): the longest full mapping.
+const CASE_MAX_CPS: int = 3
+
+// The case generator's state (`case_maps`, C 71; `case_recs`/`case_data`,
+// 72-75): the stored mappings by codepoint (sparse: `slot` indexes the
+// parallel lists), then the packed records and data.
+struct CaseGen {
+    slot: Map[int, int],
+    order: List[int],
+    lower: List[List[int]],
+    upper: List[List[int]],
+    data: List[int],
+    rec_cp: List[int],
+    rec_lower_at: List[int],
+    rec_upper_at: List[int],
+    rec_lower_len: List[int],
+    rec_upper_len: List[int],
+}
+
+// `parse_case_sequence` (C 144-167): space-separated codepoints.
+fn parse_case_sequence(field: str, path: str, line_no: int) -> List[int] {
+    var out = List[int]()
+    for word in field.words() {
+        if out.len == CASE_MAX_CPS {
+            die("{path}: case mapping exceeds YEW_CASE_MAX_CODEPOINTS")
+        }
+        (mut out).push(hex_cp(word, path, line_no))
+    }
+    out
+}
+
+// `case_store` (C 169-180): an identity mapping is no mapping.
+fn case_store(mut g: CaseGen, cp: int, lower: List[int], upper: List[int]) {
+    var lo = copy lower
+    var up = copy upper
+    if lo.len == 1 && lo[0] == cp {
+        lo = List[int]()
+    }
+    if up.len == 1 && up[0] == cp {
+        up = List[int]()
+    }
+    let at = g.slot[cp] else -1
+    if at >= 0 {
+        g.lower[at] = lo
+        g.upper[at] = up
+        return
+    }
+    g.slot[cp] = g.lower.len
+    (mut g.order).push(cp)
+    (mut g.lower).push(lo)
+    (mut g.upper).push(up)
+}
+
+// `parse_case_unicode_data` (C 186-221): fields 12 (simple upper) and 13
+// (simple lower) of every line.
+fn parse_case_unicode_data(mut g: CaseGen, dir: str) {
+    let path = "{dir}/UnicodeData.txt"
+    let text = fs.read_text(path) else {
+        die("cannot read {path}")
+        return
+    }
+    var line_no = 0
+    for line in text.lines() {
+        line_no += 1
+        let fields = line.split(";")
+        if fields.len < 15 {
+            die("{path}: UnicodeData line has too few fields")
+        }
+        let cp = hex_cp(fields[0], path, line_no)
+        var upper = List[int]()
+        var lower = List[int]()
+        if fields[12].trim().len != 0 {
+            (mut upper).push(hex_cp(fields[12], path, line_no))
+        }
+        if fields[13].trim().len != 0 {
+            (mut lower).push(hex_cp(fields[13], path, line_no))
+        }
+        case_store(mut g, cp, lower, upper)
+    }
+}
+
+// `parse_special_casing` (C 223-262): the unconditional rows (an empty
+// fifth field) override, comments and blank lines skipped.
+fn parse_special_casing(mut g: CaseGen, dir: str) {
+    let path = "{dir}/SpecialCasing.txt"
+    let text = fs.read_text(path) else {
+        die("cannot read {path}")
+        return
+    }
+    var line_no = 0
+    for raw in text.lines() {
+        line_no += 1
+        let hash = raw.find("#") else raw.len
+        let line = raw[0..hash]
+        if line.trim().len == 0 {
+            continue
+        }
+        let fields = line.split(";")
+        if fields.len < 5 {
+            die("{path}: SpecialCasing line has too few fields")
+        }
+        var condition = false
+        var k = 4
+        while k < fields.len {
+            if fields[k].trim().len != 0 {
+                condition = true
+            }
+            k += 1
+        }
+        if condition {
+            continue
+        }
+        let cp = hex_cp(fields[0], path, line_no)
+        let lower = parse_case_sequence(fields[1], path, line_no)
+        let upper = parse_case_sequence(fields[3], path, line_no)
+        if lower.len == 0 || upper.len == 0 {
+            die("{path}: SpecialCasing mapping is empty")
+        }
+        case_store(mut g, cp, lower, upper)
+    }
+}
+
+// `build_case_tables` (C 847-888): one record per mapped codepoint,
+// ascending; its lower then its upper codepoints appended to the data.
+// C walks every codepoint; the port walks the stored ones, which arrive
+// ascending (UnicodeData's order; SpecialCasing only overrides) — a
+// codepoint out of order is refused, never silently reordered.
+fn build_case_tables(mut g: CaseGen) {
+    var last = -1
+    var i = 0
+    while i < g.order.len {
+        let cp = g.order[i]
+        if cp <= last {
+            die("case codepoints are not ascending at U+{cp}")
+        }
+        last = cp
+        if g.lower[i].len != 0 || g.upper[i].len != 0 {
+            (mut g.rec_cp).push(cp)
+            (mut g.rec_lower_at).push(g.data.len)
+            (mut g.rec_lower_len).push(g.lower[i].len)
+            var k = 0
+            while k < g.lower[i].len {
+                (mut g.data).push(g.lower[i][k])
+                k += 1
+            }
+            (mut g.rec_upper_at).push(g.data.len)
+            (mut g.rec_upper_len).push(g.upper[i].len)
+            k = 0
+            while k < g.upper[i].len {
+                (mut g.data).push(g.upper[i][k])
+                k += 1
+            }
+        }
+        i += 1
+    }
+}
+
+fn case_of(g: CaseGen, cp: int, upper: bool) -> List[int] {
+    let at = g.slot[cp] else -1
+    if at < 0 {
+        return List[int]()
+    }
+    if upper then copy g.upper[at] else copy g.lower[at]
+}
+
+// `validate_case_tables` (C 890-905): ß uppers to SS, İ lowers to i̇,
+// A and a map to each other; the offsets fit the encoding.
+fn validate_case_tables(g: CaseGen) {
+    let sharp_s = case_of(g, 223, true)
+    let dotted_i = case_of(g, 304, false)
+    let upper_a = case_of(g, 65, false)
+    let lower_a = case_of(g, 97, true)
+    if sharp_s.len != 2 ||
+        sharp_s[0] != 83 ||
+        sharp_s[1] != 83 ||
+        dotted_i.len != 2 ||
+        dotted_i[0] != 105 ||
+        dotted_i[1] != 775 ||
+        upper_a.len != 1 ||
+        upper_a[0] != 97 ||
+        lower_a.len != 1 ||
+        lower_a[0] != 65 {
+        die("Unicode 16.0.0 case-mapping semantic spot check failed")
+    }
+    if g.data.len >= 16384 {
+        die("case data offsets do not fit two 7-bit digits")
+    }
+}
+
+// `generate_case` (C 1029-1042).
+fn generate_case(dir: str) -> CaseGen {
+    var g = CaseGen {
+        slot: Map[int, int](),
+        order: List[int](),
+        lower: List[List[int]](),
+        upper: List[List[int]](),
+        data: List[int](),
+        rec_cp: List[int](),
+        rec_lower_at: List[int](),
+        rec_upper_at: List[int](),
+        rec_lower_len: List[int](),
+        rec_upper_len: List[int](),
+    }
+    parse_case_unicode_data(mut g, dir)
+    parse_special_casing(mut g, dir)
+    build_case_tables(mut g)
+    validate_case_tables(g)
+    g
+}
+
+// `emit_case_output` (C 907-1027), in the port's encoding.
+fn emit_case(g: CaseGen, dir: str) -> List[byte] {
+    var out = List[byte]()
+    push_str(mut out, "//! unicode.tables_case — GENERATED by tools/gen-unicode-tables --case\n")
+    push_str(
+        mut out,
+        "//! from UCD 16.0.0; do not edit; regenerate with `tools/check-tables --write`.\n",
+    )
+    push_str(mut out, "//! Data only: the lookups are `src/unicode/case.lu`.\n")
+    push_str(mut out, "//!\n")
+    push_str(mut out, "//! The case tables sagitta's `src/unicode/tables_case.c` holds: one\n")
+    push_str(mut out, "//! record per codepoint with a full default mapping, ascending, and the\n")
+    push_str(mut out, "//! mapped codepoints they index, as `str` constants of 7-bit digits (the\n")
+    push_str(mut out, "//! generator's header says how).\n")
+    push_str(mut out, "//!\n")
+    push_str(
+        mut out,
+        "//! UCD 16.0.0; {g.rec_cp.len} records; {g.data.len} mapped codepoints. Inputs (ucd/MANIFEST):\n",
+    )
+    let manifest = fs.read_text("{dir}/../MANIFEST") else ""
+    for line in manifest.lines() {
+        if line.ends_with("/UnicodeData.txt") || line.ends_with("/SpecialCasing.txt") {
+            push_str(mut out, "//!   sha256 {line}\n")
+        }
+    }
+    push_str(mut out, "\n")
+    push_str(mut out, "/// The number of case records.\n")
+    push_str(mut out, "pub const CASE_REC_LEN: int = {g.rec_cp.len}\n\n")
+    push_str(mut out, "/// The number of mapped codepoints in the data.\n")
+    push_str(mut out, "pub const CASE_DATA_LEN: int = {g.data.len}\n\n")
+    push_str(mut out, "// data: {g.data.len} codepoints, three base-128 digits each.\n")
+    push_str(mut out, "let CASE_DATA: str = \"")
+    for v in g.data {
+        push_digits(mut out, v, 3)
+    }
+    push_str(mut out, "\"\n\n")
+    push_str(
+        mut out,
+        "// recs: {g.rec_cp.len} of (cp three digits, lower_at two, upper_at two, lower_len one, upper_len one).\n",
+    )
+    push_str(mut out, "let CASE_RECS: str = \"")
+    var i = 0
+    while i < g.rec_cp.len {
+        push_digits(mut out, g.rec_cp[i], 3)
+        push_digits(mut out, g.rec_lower_at[i], 2)
+        push_digits(mut out, g.rec_upper_at[i], 2)
+        push_digits(mut out, g.rec_lower_len[i], 1)
+        push_digits(mut out, g.rec_upper_len[i], 1)
+        i += 1
+    }
+    push_str(mut out, "\"\n")
+    out
+}
+
+fn dump_case(g: CaseGen) {
+    var out = List[byte]()
+    push_str(
+        mut out,
+        "# yew's Unicode 16.0.0 case tables as sagitta 9ace98c2's scripts/gen-unicode-tables --case emitted them\n",
+    )
+    push_str(
+        mut out,
+        "# (src/unicode/tables_case.c): the cross-check for tools/gen-unicode-tables. Decimal, one array per line.\n",
+    )
+    push_str(mut out, "data")
+    for v in g.data {
+        push_str(mut out, " {v}")
+    }
+    push_str(mut out, "\nrecs")
+    var i = 0
+    while i < g.rec_cp.len {
+        push_str(
+            mut out,
+            " {g.rec_cp[i]},{g.rec_lower_at[i]},{g.rec_upper_at[i]},{g.rec_lower_len[i]},{g.rec_upper_len[i]}",
+        )
+        i += 1
+    }
+    push_str(mut out, "\n")
+    write_stdout(out)
+}
+
 fn write_stdout(out: List[byte]) {
     let stdout = fs_open_mode("/dev/stdout", 2) else {
         die("cannot open standard output")
@@ -986,6 +1292,7 @@ fn main() -> int {
     var check = false
     var dump_mode = false
     var wb = false
+    var case_mode = false
     var args = List[str]()
     for a in raw {
         if a == "--check" && args.len == 0 {
@@ -994,12 +1301,16 @@ fn main() -> int {
             dump_mode = true
         } else if a == "--word-break" && args.len == 0 {
             wb = true
+        } else if a == "--case" && args.len == 0 {
+            case_mode = true
         } else {
             (mut args).push(a)
         }
     }
     if dump_mode && !check && args.len == 1 {
-        if wb {
+        if case_mode {
+            dump_case(generate_case(args[0]))
+        } else if wb {
             dump_wb(generate_wb(args[0]))
         } else {
             dump(generate(args[0]))
@@ -1007,7 +1318,9 @@ fn main() -> int {
         return 0
     }
     if !dump_mode && args.len == 2 {
-        let out = if wb {
+        let out = if case_mode {
+            emit_case(generate_case(args[0]), args[0])
+        } else if wb {
             emit_wb(generate_wb(args[0]), args[0])
         } else {
             emit(generate(args[0]), args[0])
@@ -1018,7 +1331,7 @@ fn main() -> int {
         return write_file(out, args[1])
     }
     eprint(
-        "usage: gen-unicode-tables [--check] [--word-break] <ucd-dir> <out.lu> | --dump [--word-break] <ucd-dir>",
+        "usage: gen-unicode-tables [--check] [--word-break|--case] <ucd-dir> <out.lu> | --dump [--word-break|--case] <ucd-dir>",
     )
     2
 }
