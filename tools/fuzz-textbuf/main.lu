@@ -1,0 +1,2682 @@
+//! fuzz-textbuf — campaign 02's differential fuzz (s12, contract
+//! deliverable 7): the port of sagitta `tests/fuzz/fuzz_textbuf.c` with
+//! its oracle (`tests/fuzz/oracle.c`), its trace layer and its shrinker
+//! (`tests/fuzz/shrink.c`), sprint `s11-buffer-torture.md` §2-§3.
+//!
+//! wolf 0.2.33 has no `fuzz` verb, so this is the bounded, seeded driver:
+//! C's xorshift64* generator bit for bit (`rng_next`, `choose`, the four
+//! mixes, `generate_op`'s weights, `choose_position`'s five classes,
+//! `generate_payload`'s nine content classes, the six forced ops that open
+//! every epoch), C's tiered checks with C's check ids (1 len, 2 lines,
+//! 3 pieces, 4 line query, 5 materialize, 6 iterator, 7 all lines,
+//! 8 cursor, 9 mark, 10 snapshot, 11 undo state, 12 operation), C's
+//! bounds (64 KiB live document, 8192 lines, 4 snapshots, 8 marks, an
+//! 8 MiB trace before an epoch rolls over) and C's report line, so a
+//! seed's `trace=` and `final=` hashes are C's for the same seed.
+//!
+//!   fuzz-textbuf [--iters=N] [--seconds=N] [--seed=N]
+//!                [--mix=typing|paste|undo|lines] [--trace-out=PATH]
+//!                [--plant-at=N]
+//!   fuzz-textbuf --replay PATH
+//!
+//! `--coverage-report` is refused as C refuses it without a COV=1 build
+//! (the port has no coverage build). On a divergence the trace is re-run
+//! with every check on, shrunk (ddmin, greedy removal, per-op
+//! simplification, de-duplication; 5,000 replays or ten seconds, C's
+//! budgets), written to `target/fuzz-textbuf-crashes/<seed>-<op>.trace`
+//! (C writes `tests/fuzz/crashes/`; the port keeps its repository's
+//! tests/ clean) and named with the seed, the op and the check, so
+//! `--replay` reproduces it. `--plant-at=N` is the port's own: it adds
+//! one byte to the oracle after op N of the first epoch (and of every
+//! replay of that epoch's trace), so the failure path and the shrinker
+//! are seen red on purpose.
+//!
+//! The oracle is C's — a naive document and its line index, rebuilt after
+//! every edit — held as one flat `List[byte]` and a line-start `List[int]`
+//! updated in place (C keeps a `Bytebuf` per line; the answers are the
+//! same), and the undo-state map keeps C's full byte copy per live node.
+//! Memory: wolf frees regions wholesale, and a `mut` argument inside a
+//! `region` block is refused (E1010, docs/MAP.md G18), so the bound is an
+//! epoch: each epoch's trace, replay and oracle live in one `region
+//! epoch` that dies at the rollover C makes at 8 MiB of trace, and only
+//! scalars cross it. Every shrink candidate is a list of op indices
+//! replayed inside its own region, never a copied trace.
+
+use text
+use util
+
+const MAX_LIVE: int = 65536
+
+const MAX_LINES: int = 8192
+
+const SNAPSHOTS: int = 4
+
+const MARKS: int = 8
+
+const CHECK_ARGS: int = 8
+
+const TRACE_BYTES_MAX: int = 8388608
+
+const DEFAULT_ITERS: int = 200000
+
+const MIX_TYPING: int = 0
+
+const MIX_PASTE: int = 1
+
+const MIX_UNDO: int = 2
+
+const MIX_LINES: int = 3
+
+const CHECK_LEN: int = 1
+
+const CHECK_LINES: int = 2
+
+const CHECK_PIECES: int = 3
+
+const CHECK_LINE_QUERY: int = 4
+
+const CHECK_MATERIALIZE: int = 5
+
+const CHECK_ITERATOR: int = 6
+
+const CHECK_ALL_LINES: int = 7
+
+const CHECK_CURSOR: int = 8
+
+const CHECK_MARK: int = 9
+
+const CHECK_SNAPSHOT: int = 10
+
+const CHECK_OPERATION: int = 12
+
+const TRACE_INS: int = 0
+
+const TRACE_DEL: int = 1
+
+const TRACE_LINE_START: int = 2
+
+const TRACE_LINE_OF: int = 3
+
+const TRACE_LINE_SPAN: int = 4
+
+const TRACE_ITER: int = 5
+
+const TRACE_SNAP: int = 6
+
+const TRACE_RELEASE: int = 7
+
+const TRACE_UNDO: int = 8
+
+const TRACE_REDO: int = 9
+
+const TRACE_UNDO_BOUNDARY: int = 10
+
+const TRACE_UNDO_TO: int = 11
+
+const TRACE_SAVE: int = 12
+
+const TRACE_CHECK: int = 13
+
+const CONTENT_ASCII: int = 0
+
+const CONTENT_UTF8: int = 1
+
+const CONTENT_GRAPHEME: int = 2
+
+const CONTENT_INVALID: int = 3
+
+const CONTENT_BINARY: int = 4
+
+const CONTENT_NEWLINES: int = 5
+
+const CONTENT_HUGE_LINE: int = 6
+
+const CONTENT_CRLF: int = 7
+
+// ---------------------------------------------------------------------
+// Unsigned helpers. C's offsets and query arguments are `u64`; a query
+// argument is a raw `rng_next` output, so it is held as `wrapping[u64]`
+// and only ever cast to `int` once reduced below a length.
+
+fn u(x: int) -> wrapping[u64] {
+    x as wrapping[u64]
+}
+
+// `min(a, len)` for an unsigned `a` (`op->a > len ? len : op->a`).
+fn clamp_u(a: wrapping[u64], len: int) -> int {
+    if a > u(len) then len else a as int
+}
+
+fn mod_u(a: wrapping[u64], n: int) -> int {
+    (a % u(n)) as int
+}
+
+// `%llu`.
+fn u64_dec(x: wrapping[u64]) -> str {
+    if x == u(0) {
+        return "0"
+    }
+    var digits = List[int]()
+    var v = x
+    while v != u(0) {
+        (mut digits).push((v % u(10)) as int)
+        v = v / u(10)
+    }
+    var out = ""
+    var k: int = digits.len - 1
+    while k >= 0 {
+        out = out + "{digits[k]}"
+        k -= 1
+    }
+    out
+}
+
+// `%016llx`.
+fn hex16(x: wrapping[u64]) -> str {
+    text.hex16(x)
+}
+
+fn push_str(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn fnv_update(h: wrapping[u64], bytes: List[byte]) -> wrapping[u64] {
+    var hash = h
+    for b in bytes {
+        hash = hash ^ u(b as int)
+        hash = hash * 1099511628211
+    }
+    hash
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `mix64`, `fuzz_textbuf.c:105-112` (splitmix64's finalizer).
+fn mix64(value: wrapping[u64]) -> wrapping[u64] {
+    var v = value
+    v = v ^ v >> 30
+    v = v * 13787848793156543929
+    v = v ^ v >> 27
+    v = v * 10723151780598845931
+    v ^ v >> 31
+}
+
+// ---------------------------------------------------------------------
+// The generator's state (`Generator`, `fuzz_textbuf.c:79-87`), less the
+// trace, which is an epoch's.
+
+struct Gen {
+    rng: wrapping[u64],
+    mix: int,
+    class_counts: List[int],
+    sequence_splits: int,
+}
+
+// `rng_next`, `fuzz_textbuf.c:93-103`.
+fn rng_next(mut g: Gen) -> wrapping[u64] {
+    var x = g.rng
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    g.rng = x
+    x * 2685821657736338717
+}
+
+// `choose`, `fuzz_textbuf.c:114-117`: no draw when `limit` is 0.
+fn choose(mut g: Gen, limit: int) -> int {
+    if limit == 0 {
+        return 0
+    }
+    mod_u(rng_next(mut g), limit)
+}
+
+// ---------------------------------------------------------------------
+// The trace (`shrink.h`'s `Trace`/`TraceOp`). `cap` and `payload_caps`
+// are C's storage arithmetic (`trace_storage_bytes`,
+// `fuzz_textbuf.c:1196-1210`: 320 bytes of `Trace`, 64 per `TraceOp`
+// slot, each payload's `Bytebuf` capacity), which decides when an epoch
+// rolls over, so the generator stays C's across epochs.
+
+struct TraceOp {
+    kind: int,
+    a: wrapping[u64],
+    b: wrapping[u64],
+    ordinal: int,
+    content_class: int,
+    payload: List[byte],
+}
+
+struct Trace {
+    ops: List[TraceOp],
+    cap: int,
+    payload_caps: int,
+    seed: wrapping[u64],
+    mix: str,
+    base: str,
+    plant_at: int,
+}
+
+fn trace_new() -> Trace {
+    Trace {
+        ops: List[TraceOp](),
+        cap: 0,
+        payload_caps: 0,
+        seed: 0,
+        mix: "default",
+        base: "empty",
+        plant_at: -1,
+    }
+}
+
+// `bytebuf_reserve`'s capacity for a fresh buffer appended `len` bytes.
+fn bytebuf_cap(len: int) -> int {
+    if len == 0 {
+        return 0
+    }
+    var cap = 64
+    while cap < len {
+        cap *= 2
+    }
+    cap
+}
+
+fn trace_storage(t: Trace) -> int {
+    320 + t.cap * 64 + t.payload_caps
+}
+
+// `trace_push`, `shrink.c:84-96`.
+fn trace_push(
+    mut t: Trace,
+    kind: int,
+    a: wrapping[u64],
+    b: wrapping[u64],
+    payload: List[byte],
+    class_id: int,
+) {
+    if t.cap < t.ops.len + 1 {
+        t.cap = if t.cap == 0 then 64 else t.cap * 2
+    }
+    t.payload_caps += bytebuf_cap(payload.len)
+    (mut t.ops).push(TraceOp {
+        kind: kind,
+        a: a,
+        b: b,
+        ordinal: t.ops.len,
+        content_class: class_id,
+        payload: copy payload,
+    })
+}
+
+fn mix_name(mix: int) -> str {
+    if mix == MIX_TYPING {
+        return "typing"
+    }
+    if mix == MIX_PASTE {
+        return "paste"
+    }
+    if mix == MIX_UNDO {
+        return "undo"
+    }
+    "lines"
+}
+
+fn parse_mix(name: str) -> int {
+    if name == "typing" {
+        return MIX_TYPING
+    }
+    if name == "paste" {
+        return MIX_PASTE
+    }
+    if name == "undo" {
+        return MIX_UNDO
+    }
+    if name == "lines" {
+        return MIX_LINES
+    }
+    -1
+}
+
+fn op_name(kind: int) -> str {
+    if kind == TRACE_INS {
+        return "ins"
+    }
+    if kind == TRACE_DEL {
+        return "del"
+    }
+    if kind == TRACE_LINE_START {
+        return "line_start"
+    }
+    if kind == TRACE_LINE_OF {
+        return "line_of"
+    }
+    if kind == TRACE_LINE_SPAN {
+        return "line_span"
+    }
+    if kind == TRACE_ITER {
+        return "iter"
+    }
+    if kind == TRACE_SNAP {
+        return "snap"
+    }
+    if kind == TRACE_RELEASE {
+        return "release"
+    }
+    if kind == TRACE_UNDO {
+        return "undo"
+    }
+    if kind == TRACE_REDO {
+        return "redo"
+    }
+    if kind == TRACE_UNDO_BOUNDARY {
+        return "undo_boundary"
+    }
+    if kind == TRACE_UNDO_TO {
+        return "undo_to"
+    }
+    if kind == TRACE_SAVE {
+        return "save"
+    }
+    if kind == TRACE_CHECK {
+        return "check"
+    }
+    util.bug("fuzz-textbuf", "trace_write: invalid operation kind")
+    ""
+}
+
+fn one_arg_kind(kind: int) -> bool {
+    kind == TRACE_LINE_START ||
+        kind == TRACE_LINE_OF ||
+        kind == TRACE_LINE_SPAN ||
+        kind == TRACE_ITER ||
+        kind == TRACE_SNAP ||
+        kind == TRACE_RELEASE ||
+        kind == TRACE_UNDO_TO
+}
+
+fn hex_nibble(n: int) -> byte {
+    if n < 10 then (48 + n) as byte else (87 + n) as byte
+}
+
+// One op's line of `trace_write`, `shrink.c:300-336`.
+fn write_op(
+    mut out: List[byte],
+    kind: int,
+    a: wrapping[u64],
+    b: wrapping[u64],
+    payload: List[byte],
+) {
+    if kind == TRACE_INS {
+        push_str(mut out, "ins {u64_dec(a)} {payload.len} ")
+        for x in payload {
+            let v = x as int
+            (mut out).push(hex_nibble(v >> 4))
+            (mut out).push(hex_nibble(v & 15))
+        }
+        (mut out).push(10 as byte)
+    } else if kind == TRACE_DEL {
+        push_str(mut out, "del {u64_dec(a)} {u64_dec(b)}\n")
+    } else if one_arg_kind(kind) {
+        push_str(mut out, "{op_name(kind)} {u64_dec(a)}\n")
+    } else {
+        push_str(mut out, "{op_name(kind)}\n")
+    }
+}
+
+fn write_header(mut out: List[byte], seed: wrapping[u64], mix: str, base: str) {
+    push_str(mut out, "# yew textbuf trace v1\n")
+    push_str(mut out, "# seed=0x{hex16(seed)} mix={mix} base={base}\n")
+}
+
+// `trace_write`, `shrink.c:300-336`.
+fn trace_write(t: Trace) -> List[byte] {
+    var out = List[byte]()
+    write_header(mut out, t.seed, t.mix, t.base)
+    for op in t.ops {
+        write_op(mut out, op.kind, op.a, op.b, op.payload)
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// The oracle (`tests/fuzz/oracle.c`): the naive document, its length and
+// its lines, independent of `text`. `starts[i]` is line i's first byte;
+// a document of n LFs has n + 1 lines, the last empty after a final LF.
+
+struct Oracle {
+    doc: List[byte],
+    starts: List[int],
+}
+
+fn oracle_rebuild(mut o: Oracle) {
+    var k = 0
+    if o.starts.len == 0 {
+        (mut o.starts).push(0)
+    } else {
+        o.starts[0] = 0
+    }
+    var i = 0
+    while i < o.doc.len {
+        if o.doc[i] == 10 as byte {
+            k += 1
+            if k < o.starts.len {
+                o.starts[k] = i + 1
+            } else {
+                (mut o.starts).push(i + 1)
+            }
+        }
+        i += 1
+    }
+    while o.starts.len > k + 1 {
+        let _ = (mut o.starts).pop() else 0
+    }
+}
+
+fn oracle_init(bytes: List[byte]) -> Oracle {
+    var o = Oracle { doc: copy bytes, starts: List[int]() }
+    oracle_rebuild(mut o)
+    o
+}
+
+// The document replaced in place (C's `oracle_free` + `oracle_init`).
+fn oracle_set(mut o: Oracle, bytes: List[byte]) {
+    while o.doc.len > bytes.len {
+        let _ = (mut o.doc).pop() else 0 as byte
+    }
+    var i = 0
+    while i < bytes.len {
+        if i < o.doc.len {
+            o.doc[i] = bytes[i]
+        } else {
+            (mut o.doc).push(bytes[i])
+        }
+        i += 1
+    }
+    oracle_rebuild(mut o)
+}
+
+fn oracle_insert(mut o: Oracle, at: int, payload: List[byte]) {
+    let n = payload.len
+    if at > o.doc.len {
+        util.bug("fuzz-textbuf", "oracle_insert: offset outside buffer")
+    }
+    if n == 0 {
+        return
+    }
+    let old = o.doc.len
+    var i = 0
+    while i < n {
+        (mut o.doc).push(0 as byte)
+        i += 1
+    }
+    var j = old - 1
+    while j >= at {
+        o.doc[j + n] = o.doc[j]
+        j -= 1
+    }
+    i = 0
+    while i < n {
+        o.doc[at + i] = payload[i]
+        i += 1
+    }
+    oracle_rebuild(mut o)
+}
+
+fn oracle_delete(mut o: Oracle, lo: int, hi: int) {
+    if lo > hi || hi > o.doc.len {
+        util.bug("fuzz-textbuf", "oracle_delete: range outside buffer")
+    }
+    if lo == hi {
+        return
+    }
+    let n = hi - lo
+    var i = hi
+    while i < o.doc.len {
+        o.doc[i - n] = o.doc[i]
+        i += 1
+    }
+    i = 0
+    while i < n {
+        let _ = (mut o.doc).pop() else 0 as byte
+        i += 1
+    }
+    oracle_rebuild(mut o)
+}
+
+fn oracle_len(o: Oracle) -> int {
+    o.doc.len
+}
+
+fn oracle_line_count(o: Oracle) -> int {
+    o.starts.len
+}
+
+fn oracle_line_start(o: Oracle, line: int) -> int {
+    if line < 0 || line >= o.starts.len {
+        util.bug("fuzz-textbuf", "oracle_line_start: line outside buffer")
+    }
+    o.starts[line]
+}
+
+// `oracle_line_of`, `oracle.c:186-199`: the first line whose successor
+// starts past `off`, else the last.
+fn oracle_line_of(o: Oracle, off: int) -> int {
+    if off > o.doc.len {
+        util.bug("fuzz-textbuf", "oracle_line_of: offset outside buffer")
+    }
+    var lo = 0
+    var hi = o.starts.len - 1
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2
+        if o.starts[mid] <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo
+}
+
+// ---------------------------------------------------------------------
+// The replay (`Replay`, `fuzz_textbuf.c:58-77`). C's `EditCtx` points at
+// a buffer, a mark set, a cursor set and a tree; the port's owns them.
+
+struct NodeState {
+    present: bool,
+    bytes: List[byte],
+    pos: int,
+    goal: int,
+    anchor: int,
+    marks: List[int],
+}
+
+struct Replay {
+    ec: text.EditCtx,
+    mark_ids: List[text.MarkId],
+    oracle: Oracle,
+    snaps: List[text.TextSnap],
+    snap_bytes: List[List[byte]],
+    snap_live: List[bool],
+    states: List[NodeState],
+    clock_ms: int,
+    wall_sec: int,
+    mutation_count: int,
+    full_checks: bool,
+}
+
+fn node_state_empty() -> NodeState {
+    NodeState {
+        present: false,
+        bytes: List[byte](),
+        pos: 0,
+        goal: 0,
+        anchor: 0,
+        marks: List[int](),
+    }
+}
+
+// `materialize_text`, `fuzz_textbuf.c:129-144`.
+fn materialize_text(tb: text.TextBuf) -> List[byte] {
+    var out = List[byte]()
+    var it = text.textiter_new()
+    if !text.textiter_begin(mut it, tb, text.byteoff(0)) {
+        return out
+    }
+    loop {
+        let c = text.textiter_chunk(it, tb)
+        if !c.ok || c.len == 0 {
+            util.bug("fuzz-textbuf", "invalid live iterator")
+        }
+        var i = 0
+        while i < c.len {
+            (mut out).push(text.store_byte(tb, c.src, c.at + i))
+            i += 1
+        }
+        if !text.textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    out
+}
+
+// `materialize_snapshot`, `fuzz_textbuf.c:146-162`.
+fn materialize_snapshot(tb: text.TextBuf, snap: text.TextSnap) -> List[byte] {
+    var out = List[byte]()
+    var it = text.textiter_new()
+    if !text.textsnap_iter(mut it, tb, snap, text.byteoff(0)) {
+        return out
+    }
+    loop {
+        let c = text.textiter_chunk(it, tb)
+        if !c.ok || c.len == 0 {
+            util.bug("fuzz-textbuf", "invalid snapshot iterator")
+        }
+        var i = 0
+        while i < c.len {
+            (mut out).push(text.store_byte(tb, c.src, c.at + i))
+            i += 1
+        }
+        if !text.textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    out
+}
+
+// `state_reserve`, `fuzz_textbuf.c:170-186`: C's capacity, 16 doubling.
+fn state_reserve(mut run: Replay, id: int) {
+    if id < run.states.len {
+        return
+    }
+    var cap = if run.states.len == 0 then 16 else run.states.len
+    while cap <= id {
+        cap *= 2
+    }
+    while run.states.len < cap {
+        (mut run.states).push(node_state_empty())
+    }
+}
+
+// `state_capture`, `fuzz_textbuf.c:188-205`.
+fn state_capture(mut run: Replay, id: int) {
+    state_reserve(mut run, id)
+    let p = copy run.ec.cset.curs[run.ec.cset.primary]
+    var ms = List[int]()
+    var i = 0
+    while i < MARKS {
+        (mut ms).push(text.mark_pos(run.ec.marks, run.mark_ids[i]) as int)
+        i += 1
+    }
+    run.states[id] = NodeState {
+        present: true,
+        bytes: copy run.oracle.doc,
+        pos: p.pos,
+        goal: p.goal_col,
+        anchor: p.anchor,
+        marks: ms,
+    }
+}
+
+// `state_prune_dead`, `fuzz_textbuf.c:207-228`.
+fn state_prune_dead(mut run: Replay) {
+    var id = 1
+    while id < run.states.len {
+        if run.states[id].present {
+            if id > run.ec.undo.nodes.len {
+                run.states[id].present = false
+            } else {
+                let n = copy run.ec.undo.nodes[id - 1]
+                if n.id != id || n.flags & text.TXN_DEAD != 0 {
+                    run.states[id].present = false
+                }
+            }
+        }
+        id += 1
+    }
+}
+
+// `state_restore_oracle`, `fuzz_textbuf.c:230-259`.
+fn state_restore_oracle(mut run: Replay, id: int) -> bool {
+    if id >= run.states.len || !run.states[id].present {
+        return false
+    }
+    let st = copy run.states[id]
+    if !same(materialize_text(run.ec.tb), st.bytes) {
+        return false
+    }
+    oracle_set(mut run.oracle, st.bytes)
+    if run.ec.cset.curs.len != 1 {
+        return false
+    }
+    let c = copy run.ec.cset.curs[0]
+    if c.pos != st.pos || c.goal_col != st.goal || c.anchor != st.anchor {
+        return false
+    }
+    var i = 0
+    while i < MARKS {
+        if text.mark_pos(run.ec.marks, run.mark_ids[i]) as int != st.marks[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `replay_base`, `fuzz_textbuf.c:300-331`: `empty`, `fixture:<path>`,
+// `gen:<len>:<seed>`.
+fn replay_base(base: str) -> (bool, List[byte]) {
+    var bytes = List[byte]()
+    if base == "empty" {
+        return (true, bytes)
+    }
+    if base.starts_with("fixture:") {
+        let got = fs_read_bytes(base[8..base.len]) else {
+            return (false, bytes)
+        }
+        return (true, got)
+    }
+    if base.starts_with("gen:") {
+        let rest = base[4..base.len]
+        var colon = -1
+        var i = 0
+        for b in rest.bytes() {
+            if b == 58 as byte && colon < 0 {
+                colon = i
+            }
+            i += 1
+        }
+        if colon <= 0 {
+            return (false, bytes)
+        }
+        let (ok_len, parsed_len) = parse_u64(rest[0..colon])
+        let (ok_seed, parsed_seed) = parse_u64(rest[colon + 1..rest.len])
+        if !ok_len || !ok_seed || parsed_len > u(MAX_LIVE) {
+            return (false, bytes)
+        }
+        var g = Gen {
+            rng: if parsed_seed == u(0) then 11400714819323198485 else parsed_seed,
+            mix: 0,
+            class_counts: List[int](),
+            sequence_splits: 0,
+        }
+        var k = 0
+        while k < parsed_len as int {
+            (mut bytes).push((rng_next(mut g) & 255) as int as byte)
+            k += 1
+        }
+        return (true, bytes)
+    }
+    (false, bytes)
+}
+
+// `replay_init`, `fuzz_textbuf.c:333-389`.
+fn replay_init(base: str) -> (bool, Replay) {
+    let (ok, initial) = replay_base(base)
+    let tb = text.textbuf_from_bytes(initial, 0, initial.len)
+    let oracle = oracle_init(initial)
+    var marks = text.marks_new()
+    let start_ms = 1
+    let wall_sec = 1700000000
+    var undo = text.undo_new(tb)
+    let cset = text.cset_init(text.Cursor { pos: 0, goal_col: 0, anchor: 0 })
+    var ids = List[text.MarkId]()
+    var i = 0
+    while i < MARKS {
+        let bias = if i & 1 == 0 then text.BIAS_LEFT else text.BIAS_RIGHT
+        (mut ids).push(text.mark_add(mut marks, text.byteoff(0), bias))
+        i += 1
+    }
+    text.undo_set_clock(mut undo, start_ms, wall_sec)
+    // C rebases the pristine root onto the injected clock
+    // (`fuzz_textbuf.c:370-374`).
+    undo.nodes[0].t_wall = wall_sec
+    undo.nodes[0].t_last_ms = start_ms
+    text.undo_set_limits(mut undo, 1024 * 1024, 16, text.UNDO_PERSIST_BYTES_MAX)
+    var ec = text.editctx_new(take tb)
+    ec.marks = marks
+    ec.has_marks = true
+    ec.cset = cset
+    ec.has_cset = true
+    ec.undo = undo
+    ec.has_undo = true
+    ec.win_id = 0
+    var snaps = List[text.TextSnap]()
+    var snap_bytes = List[List[byte]]()
+    var snap_live = List[bool]()
+    i = 0
+    while i < SNAPSHOTS {
+        (mut snaps).push(text.textsnap_none())
+        (mut snap_bytes).push(List[byte]())
+        (mut snap_live).push(false)
+        i += 1
+    }
+    var run = Replay {
+        ec: ec,
+        mark_ids: ids,
+        oracle: oracle,
+        snaps: snaps,
+        snap_bytes: snap_bytes,
+        snap_live: snap_live,
+        states: List[NodeState](),
+        clock_ms: start_ms,
+        wall_sec: wall_sec,
+        mutation_count: 0,
+        full_checks: false,
+    }
+    let cur = text.undo_current(run.ec.undo)
+    state_capture(mut run, cur)
+    (ok, run)
+}
+
+// ---------------------------------------------------------------------
+// The comparisons (`fuzz_textbuf.c:405-531`).
+
+fn compare_materialized(run: Replay) -> bool {
+    same(run.oracle.doc, materialize_text(run.ec.tb))
+}
+
+// `compare_iterator_suffix`, `fuzz_textbuf.c:420-453`.
+fn compare_iterator_suffix(run: Replay, at_u: wrapping[u64]) -> bool {
+    let at = clamp_u(at_u, run.oracle.doc.len)
+    var n = 0
+    var it = text.textiter_new()
+    if text.textiter_begin(mut it, run.ec.tb, text.byteoff(at)) {
+        loop {
+            let c = text.textiter_chunk(it, run.ec.tb)
+            if !c.ok || c.len == 0 {
+                return false
+            }
+            var i = 0
+            while i < c.len {
+                if at + n >= run.oracle.doc.len {
+                    return false
+                }
+                if text.store_byte(run.ec.tb, c.src, c.at + i) != run.oracle.doc[at + n] {
+                    return false
+                }
+                n += 1
+                i += 1
+            }
+            if !text.textiter_advance(mut it, run.ec.tb) {
+                break
+            }
+        }
+    }
+    n == run.oracle.doc.len - at
+}
+
+// `compare_all_lines`, `fuzz_textbuf.c:455-472`.
+fn compare_all_lines(run: Replay) -> bool {
+    let lines = oracle_line_count(run.oracle)
+    let len = oracle_len(run.oracle)
+    if text.textbuf_line_count(run.ec.tb) != lines {
+        return false
+    }
+    var at = 0
+    var line = 0
+    while line < lines {
+        let next = if line + 1 < lines then run.oracle.starts[line + 1] else len
+        let s = text.textbuf_line_span(run.ec.tb, text.lineno(line))
+        if text.textbuf_line_start(run.ec.tb, text.lineno(line)) as int != at ||
+            s.lo != at ||
+            s.hi != next {
+            return false
+        }
+        at = next
+        line += 1
+    }
+    at == len
+}
+
+// `compare_line_queries`, `fuzz_textbuf.c:474-497`.
+fn compare_line_queries(run: Replay, salt: wrapping[u64]) -> bool {
+    let len = oracle_len(run.oracle)
+    let lines = oracle_line_count(run.oracle)
+    var i = 0
+    while i < CHECK_ARGS {
+        let random = mix64(salt + u(i) * 11400714819323198485)
+        let off = mod_u(random, len + 1)
+        let line = mod_u(random, lines)
+        let want_start = oracle_line_start(run.oracle, line)
+        let want_of = oracle_line_of(run.oracle, off)
+        let want_hi = if line + 1 < lines then oracle_line_start(run.oracle, line + 1) else len
+        let s = text.textbuf_line_span(run.ec.tb, text.lineno(line))
+        if text.textbuf_line_start(run.ec.tb, text.lineno(line)) as int != want_start ||
+            text.textbuf_line_of(run.ec.tb, text.byteoff(off)) as int != want_of ||
+            s.lo != want_start ||
+            s.hi != want_hi {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `compare_cursor_marks`, `fuzz_textbuf.c:499-521`: 0, or the failing id.
+fn compare_cursor_marks(run: Replay) -> int {
+    let len = text.textbuf_len(run.ec.tb)
+    text.cset_check(run.ec.cset)
+    for c in run.ec.cset.curs {
+        if c.pos > len ||
+            c.anchor > len ||
+            !text.is_grapheme_boundary(run.ec.tb, text.byteoff(c.pos)) {
+            return CHECK_CURSOR
+        }
+    }
+    var i = 0
+    while i < MARKS {
+        if text.mark_pos(run.ec.marks, run.mark_ids[i]) as int > len {
+            return CHECK_MARK
+        }
+        i += 1
+    }
+    0
+}
+
+// `compare_snapshots`, `fuzz_textbuf.c:523-541`.
+fn compare_snapshots(run: Replay) -> bool {
+    var i = 0
+    while i < SNAPSHOTS {
+        if run.snap_live[i] {
+            let snap = copy run.snaps[i]
+            if !same(materialize_snapshot(run.ec.tb, snap), run.snap_bytes[i]) {
+                return false
+            }
+        }
+        i += 1
+    }
+    true
+}
+
+// `check_state`, `fuzz_textbuf.c:543-577`: 0 when every tier holds,
+// else the first failing check's id.
+fn check_state(run: Replay, ordinal: int, index: int, final: bool) -> int {
+    let len = oracle_len(run.oracle)
+    let deep = run.full_checks || final || (index + 1) % 32 == 0
+    if text.textbuf_len(run.ec.tb) != len {
+        return CHECK_LEN
+    }
+    if text.textbuf_line_count(run.ec.tb) != oracle_line_count(run.oracle) {
+        return CHECK_LINES
+    }
+    text.textbuf_check(run.ec.tb)
+    let piece_bound = 2 * (index + 1) + 1
+    if text.textbuf_piece_count(run.ec.tb) > piece_bound {
+        return CHECK_PIECES
+    }
+    if !compare_line_queries(run, u(ordinal) ^ u(index)) {
+        return CHECK_LINE_QUERY
+    }
+    let which = compare_cursor_marks(run)
+    if which != 0 {
+        return which
+    }
+    if deep && !compare_snapshots(run) {
+        return CHECK_SNAPSHOT
+    }
+    if deep && !compare_materialized(run) {
+        return CHECK_MATERIALIZE
+    }
+    if deep && !compare_iterator_suffix(run, u(mod_u(mix64(u(ordinal)), len + 1))) {
+        return CHECK_ITERATOR
+    }
+    if (run.full_checks || final || len < 64 * 1024 || (index + 1) % 512 == 0) &&
+        !compare_all_lines(run) {
+        return CHECK_ALL_LINES
+    }
+    0
+}
+
+// `choose_state_id`, `fuzz_textbuf.c:579-600`.
+fn choose_state_id(run: Replay, choice: wrapping[u64]) -> int {
+    var count = 0
+    var i = 1
+    while i < run.states.len {
+        if run.states[i].present {
+            count += 1
+        }
+        i += 1
+    }
+    if count == 0 {
+        return text.undo_current(run.ec.undo)
+    }
+    var target = mod_u(choice, count)
+    i = 1
+    while i < run.states.len {
+        if run.states[i].present {
+            if target == 0 {
+                return i
+            }
+            target -= 1
+        }
+        i += 1
+    }
+    text.undo_current(run.ec.undo)
+}
+
+// C's `mkstemp("/tmp/yew-fuzz-textbuf-XXXXXX")` then `unlink`: a fresh
+// name nothing holds.
+fn temp_path() -> str {
+    var tries = 0
+    while tries < 100 {
+        var suffix = ""
+        for r in os_random(6) {
+            suffix = suffix + "{r % 10}"
+        }
+        let path = "/tmp/yew-fuzz-textbuf-{suffix}"
+        let fd = fs_open_perm(path, 4, 384) else {
+            tries += 1
+            continue
+        }
+        fs_close(fd) else {}
+        fs_remove(path) else {}
+        return path
+    }
+    ""
+}
+
+// `save_reload_compare`, `fuzz_textbuf.c:602-638`.
+fn save_reload_compare(mut run: Replay) -> bool {
+    let path = temp_path()
+    if path.len == 0 {
+        return false
+    }
+    var saved_meta = text.filemeta_new()
+    var ok = false
+    if text.file_save(mut run.ec.tb, mut saved_meta, path) == text.SAVE_OK {
+        var (rc, loaded, loaded_meta) = text.file_load(path)
+        if rc == text.LOAD_OK {
+            ok = same(run.oracle.doc, materialize_text(loaded))
+        }
+        text.filemeta_dispose(mut loaded_meta, mut loaded)
+        text.textbuf_free(mut loaded)
+    }
+    text.filemeta_dispose(mut saved_meta, mut run.ec.tb)
+    fs_remove(path) else {}
+    ok
+}
+
+// `apply_trace_op`, `fuzz_textbuf.c:645-760`: false when the op's own
+// comparison fails (C's `fail_at(..., CHECK_OPERATION)` by the caller).
+fn apply_trace_op(
+    mut run: Replay,
+    kind: int,
+    a: wrapping[u64],
+    b: wrapping[u64],
+    payload: List[byte],
+) -> bool {
+    let len = oracle_len(run.oracle)
+    run.clock_ms += 500
+    run.wall_sec += 1
+    run.ec.undo.fake_mono = run.clock_ms
+    run.ec.undo.fake_wall = run.wall_sec
+    if kind == TRACE_INS {
+        let lo = clamp_u(a, len)
+        text.undo_begin(mut run.ec, text.TXN_TYPE)
+        let _ = text.edit_insert(mut run.ec, text.byteoff(lo), payload)
+        text.cset_normalize(run.ec.tb, mut run.ec.cset)
+        text.undo_end(mut run.ec)
+        oracle_insert(mut run.oracle, lo, payload)
+        run.mutation_count += 1
+        let cur = text.undo_current(run.ec.undo)
+        state_capture(mut run, cur)
+        state_prune_dead(mut run)
+        return true
+    }
+    if kind == TRACE_DEL {
+        var lo = clamp_u(a, len)
+        var hi = clamp_u(b, len)
+        if hi < lo {
+            let swap = lo
+            lo = hi
+            hi = swap
+        }
+        text.undo_begin(mut run.ec, text.TXN_ERASE)
+        let _ = text.edit_delete(mut run.ec, text.span(lo, hi))
+        text.cset_normalize(run.ec.tb, mut run.ec.cset)
+        text.undo_end(mut run.ec)
+        oracle_delete(mut run.oracle, lo, hi)
+        run.mutation_count += 1
+        let cur = text.undo_current(run.ec.undo)
+        state_capture(mut run, cur)
+        state_prune_dead(mut run)
+        return true
+    }
+    if kind == TRACE_LINE_START {
+        let line = mod_u(a, oracle_line_count(run.oracle))
+        return text.textbuf_line_start(run.ec.tb, text.lineno(line)) as int ==
+            oracle_line_start(run.oracle, line)
+    }
+    if kind == TRACE_LINE_OF {
+        let off = clamp_u(a, len)
+        return text.textbuf_line_of(run.ec.tb, text.byteoff(off)) as int ==
+            oracle_line_of(run.oracle, off)
+    }
+    if kind == TRACE_LINE_SPAN {
+        let lines = oracle_line_count(run.oracle)
+        let line = mod_u(a, lines)
+        let start = oracle_line_start(run.oracle, line)
+        let end = if line + 1 < lines then oracle_line_start(run.oracle, line + 1) else len
+        let s = text.textbuf_line_span(run.ec.tb, text.lineno(line))
+        return s.lo == start && s.hi == end
+    }
+    if kind == TRACE_ITER {
+        return compare_iterator_suffix(run, a)
+    }
+    if kind == TRACE_SNAP {
+        let slot = mod_u(a, SNAPSHOTS)
+        if run.snap_live[slot] {
+            return true
+        }
+        run.snaps[slot] = text.textbuf_snap(mut run.ec.tb)
+        run.snap_bytes[slot] = copy run.oracle.doc
+        run.snap_live[slot] = true
+        return true
+    }
+    if kind == TRACE_RELEASE {
+        let slot = mod_u(a, SNAPSHOTS)
+        if !run.snap_live[slot] {
+            return true
+        }
+        var snap = copy run.snaps[slot]
+        text.textsnap_release(mut run.ec.tb, mut snap)
+        run.snaps[slot] = snap
+        run.snap_live[slot] = false
+        return true
+    }
+    if kind == TRACE_UNDO {
+        if text.undo(mut run.ec) {
+            let cur = text.undo_current(run.ec.undo)
+            return state_restore_oracle(mut run, cur)
+        }
+        return true
+    }
+    if kind == TRACE_REDO {
+        if text.redo(mut run.ec) {
+            let cur = text.undo_current(run.ec.undo)
+            return state_restore_oracle(mut run, cur)
+        }
+        return true
+    }
+    if kind == TRACE_UNDO_BOUNDARY {
+        text.undo_boundary(mut run.ec.undo)
+        return true
+    }
+    if kind == TRACE_UNDO_TO {
+        var target = 0
+        if a < u(run.states.len) && run.states[a as int].present {
+            target = a as int
+        } else {
+            target = choose_state_id(run, a)
+        }
+        if target == text.undo_current(run.ec.undo) {
+            return true
+        }
+        return text.undo_to(mut run.ec, target) && state_restore_oracle(mut run, target)
+    }
+    if kind == TRACE_SAVE {
+        return save_reload_compare(mut run)
+    }
+    if kind == TRACE_CHECK {
+        return true
+    }
+    false
+}
+
+// The port's planted divergence (`--plant-at=N`): one byte appended to
+// the oracle after op N, so the length check (1) is red at that op.
+fn plant(mut run: Replay) {
+    (mut run.oracle.doc).push(122 as byte)
+    oracle_rebuild(mut run.oracle)
+}
+
+// ---------------------------------------------------------------------
+// The generator (`fuzz_textbuf.c:769-1178`).
+
+// `node_start_at`, `fuzz_textbuf.c:769-787`, over the port's node pool.
+fn node_start_at(tb: text.TextBuf, root: int, ordinal_in: int) -> int {
+    var node = root
+    var ordinal = ordinal_in
+    var base = 0
+    while node >= 0 {
+        let nd = copy tb.nodes[node]
+        let left_count = if nd.left >= 0 then tb.nodes[nd.left].sub_count else 0
+        let left_bytes = if nd.left >= 0 then tb.nodes[nd.left].sub_bytes else 0
+        if ordinal < left_count {
+            node = nd.left
+        } else if ordinal == left_count {
+            return base + left_bytes
+        } else {
+            ordinal -= left_count + 1
+            base += left_bytes + nd.hi - nd.lo
+            node = nd.right
+        }
+    }
+    util.bug("fuzz-textbuf", "seam ordinal out of range")
+    0
+}
+
+// `textbuf_seam_at`, `fuzz_textbuf.c:789-797`: C's test-only accessor.
+fn textbuf_seam_at(tb: text.TextBuf, seam: int) -> int {
+    let pieces = text.textbuf_piece_count(tb)
+    if pieces < 2 || seam >= pieces - 1 {
+        util.bug("fuzz-textbuf", "seam index out of range")
+    }
+    node_start_at(tb, tb.root, seam + 1)
+}
+
+// `choose_position`, `fuzz_textbuf.c:799-845`.
+fn choose_position(mut g: Gen, t: Trace, run: Replay) -> int {
+    let len = text.textbuf_len(run.ec.tb)
+    let bucket = choose(mut g, 100)
+    let pieces = text.textbuf_piece_count(run.ec.tb)
+    if bucket < 40 {
+        return choose(mut g, len + 1)
+    }
+    if bucket < 65 && pieces > 1 {
+        return textbuf_seam_at(run.ec.tb, choose(mut g, pieces - 1))
+    }
+    if bucket < 80 {
+        let which = choose(mut g, 4)
+        if which == 0 {
+            return 0
+        }
+        if which == 1 {
+            return len
+        }
+        if which == 2 {
+            return if len == 0 then 0 else len - 1
+        }
+        return if len < 1 then len else 1
+    }
+    if bucket < 90 {
+        let lines = text.textbuf_line_count(run.ec.tb)
+        let line = choose(mut g, lines)
+        if choose(mut g, 2) == 0 {
+            return text.textbuf_line_start(run.ec.tb, text.lineno(line)) as int
+        }
+        return text.textbuf_line_span(run.ec.tb, text.lineno(line)).hi
+    }
+    if t.ops.len != 0 {
+        let prev = copy t.ops[t.ops.len - 1]
+        let delta = choose(mut g, 7) - 3
+        let base = if prev.kind == TRACE_INS then prev.a + u(prev.payload.len) else prev.a
+        if delta < 0 && u(0 - delta) > base {
+            return 0
+        }
+        if delta > 0 {
+            let d = if delta > len then len else delta
+            if base > u(len - d) {
+                return len
+            }
+        }
+        let moved = if delta < 0 then base - u(0 - delta) else base + u(delta)
+        return clamp_u(moved, len)
+    }
+    0
+}
+
+fn payload_repeat(mut payload: List[byte], pattern: List[int], want: int) {
+    var at = 0
+    while at < want {
+        (mut payload).push(pattern[at % pattern.len] as byte)
+        at += 1
+    }
+}
+
+// `generate_payload`, `fuzz_textbuf.c:855-921`.
+fn generate_payload(mut g: Gen, class_id: int, requested_in: int) -> List[byte] {
+    var payload = List[byte]()
+    var requested = requested_in
+    if class_id == CONTENT_HUGE_LINE {
+        requested = 64 * 1024 + choose(mut g, 1024)
+    }
+    if requested == 0 {
+        requested = 1
+    }
+    var i = 0
+    if class_id == CONTENT_ASCII {
+        while i < requested {
+            let value = rng_next(mut g)
+            if value & 15 == u(0) {
+                (mut payload).push(9 as byte)
+            } else {
+                (mut payload).push((32 + mod_u(value, 95)) as byte)
+            }
+            i += 1
+        }
+    } else if class_id == CONTENT_UTF8 {
+        payload_repeat(mut payload, [194, 162, 226, 130, 172, 240, 159, 152, 128], requested)
+    } else if class_id == CONTENT_GRAPHEME {
+        payload_repeat(
+            mut payload,
+            [
+                240,
+                159,
+                145,
+                169,
+                226,
+                128,
+                141,
+                240,
+                159,
+                145,
+                169,
+                240,
+                159,
+                135,
+                186,
+                240,
+                159,
+                135,
+                184,
+            ],
+            requested,
+        )
+    } else if class_id == CONTENT_INVALID {
+        payload_repeat(mut payload, [128, 192, 128, 226, 130, 254, 255, 237, 160, 128], requested)
+    } else if class_id == CONTENT_BINARY {
+        while i < requested {
+            if i % 3 == 0 {
+                (mut payload).push(0 as byte)
+            } else {
+                (mut payload).push((rng_next(mut g) & 255) as int as byte)
+            }
+            i += 1
+        }
+    } else if class_id == CONTENT_NEWLINES {
+        while i < requested {
+            let step = 1 + choose(mut g, 3)
+            (mut payload).push(if i % step == 0 then 10 as byte else 110 as byte)
+            i += 1
+        }
+    } else if class_id == CONTENT_HUGE_LINE {
+        while i < requested {
+            (mut payload).push((97 + i % 26) as byte)
+            i += 1
+        }
+    } else {
+        payload_repeat(mut payload, [13, 10, 13, 120], requested)
+    }
+    payload
+}
+
+// `choose_content`, `fuzz_textbuf.c:923-949`: (class, split).
+fn choose_content(mut g: Gen) -> (int, bool) {
+    let choice = choose(mut g, 100)
+    if choice < 30 {
+        return (CONTENT_ASCII, false)
+    }
+    if choice < 48 {
+        return (CONTENT_UTF8, false)
+    }
+    if choice < 57 {
+        return (CONTENT_GRAPHEME, false)
+    }
+    if choice < 67 {
+        return (CONTENT_INVALID, false)
+    }
+    if choice < 72 {
+        return (CONTENT_ASCII, true)
+    }
+    if choice < 77 {
+        return (CONTENT_BINARY, false)
+    }
+    if choice < 85 {
+        return (CONTENT_NEWLINES, false)
+    }
+    if choice < 90 {
+        return (CONTENT_HUGE_LINE, false)
+    }
+    (CONTENT_CRLF, false)
+}
+
+// `continuation_offset`, `fuzz_textbuf.c:951-967`: the first
+// continuation byte past offset 0, or -1.
+fn continuation_offset(run: Replay) -> int {
+    let len = text.textbuf_len(run.ec.tb)
+    var i = 1
+    while i < len {
+        if text.textbuf_byte_at(run.ec.tb, i) & 192 == 128 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `forced_op`, `fuzz_textbuf.c:981-1019`: the six ops that open every
+// epoch (a 3-byte UTF-8 at 0, a split, invalid, binary, CRLF, a huge
+// line).
+fn forced_op(mut g: Gen, mut t: Trace, run: Replay, index: int) {
+    var payload = List[byte]()
+    var class_id = CONTENT_ASCII
+    var at = text.textbuf_len(run.ec.tb)
+    if index == 0 {
+        (mut payload).push(226 as byte)
+        (mut payload).push(130 as byte)
+        (mut payload).push(172 as byte)
+        class_id = CONTENT_UTF8
+        at = 0
+    } else if index == 1 {
+        (mut payload).push(120 as byte)
+        class_id = CONTENT_ASCII
+        at = 1
+        g.sequence_splits += 1
+    } else if index == 2 {
+        class_id = CONTENT_INVALID
+        payload = generate_payload(mut g, class_id, 10)
+    } else if index == 3 {
+        class_id = CONTENT_BINARY
+        payload = generate_payload(mut g, class_id, 9)
+    } else if index == 4 {
+        class_id = CONTENT_CRLF
+        payload = generate_payload(mut g, class_id, 12)
+    } else {
+        class_id = CONTENT_HUGE_LINE
+        payload = generate_payload(mut g, class_id, 64 * 1024)
+    }
+    g.class_counts[class_id] = g.class_counts[class_id] + 1
+    trace_push(mut t, TRACE_INS, u(at), u(payload.len), payload, class_id)
+}
+
+// `insert_size`, `fuzz_textbuf.c:1021-1030`.
+fn insert_size(mut g: Gen, kind: int) -> int {
+    if kind == 0 {
+        return 1 + choose(mut g, 8)
+    }
+    if kind == 1 {
+        return 9 + choose(mut g, 4088)
+    }
+    if choose(mut g, 128) == 0 {
+        return 1024 * 1024
+    }
+    4096 << choose(mut g, 5)
+}
+
+// `op_choice`, `fuzz_textbuf.c:1032-1044`.
+fn op_choice(g: Gen, random: wrapping[u64]) -> int {
+    let value = mod_u(random, 100)
+    if g.mix == MIX_TYPING {
+        return value
+    }
+    if g.mix == MIX_PASTE {
+        return (value + 20) % 100
+    }
+    if g.mix == MIX_UNDO {
+        return (value + 50) % 100
+    }
+    (value + 72) % 100
+}
+
+// `generate_insert`, `fuzz_textbuf.c:1046-1069`.
+fn generate_insert(mut g: Gen, mut t: Trace, run: Replay, size_id: int) {
+    let (class_id, split_in) = choose_content(mut g)
+    let size = insert_size(mut g, size_id)
+    let payload = generate_payload(mut g, class_id, size)
+    var at = choose_position(mut g, t, run)
+    if split_in {
+        let cont = continuation_offset(run)
+        if cont >= 0 {
+            at = cont
+            g.sequence_splits += 1
+        }
+    }
+    g.class_counts[class_id] = g.class_counts[class_id] + 1
+    trace_push(mut t, TRACE_INS, u(at), u(payload.len), payload, class_id)
+}
+
+// `generate_delete`, `fuzz_textbuf.c:1071-1093`.
+fn generate_delete(mut g: Gen, mut t: Trace, run: Replay, kind: int) {
+    let len = text.textbuf_len(run.ec.tb)
+    if len == 0 {
+        generate_insert(mut g, mut t, run, 0)
+        return
+    }
+    var lo = 0
+    var hi = len
+    if kind != 2 {
+        lo = choose_position(mut g, t, run)
+        if lo == len && len != 0 {
+            lo -= 1
+        }
+        hi = lo + 1 + choose(mut g, if kind == 0 then 8 else 64 * 1024)
+        if hi > len {
+            hi = len
+        }
+    }
+    trace_push(mut t, TRACE_DEL, u(lo), u(hi), List[byte](), CONTENT_ASCII)
+}
+
+fn push_plain(mut t: Trace, kind: int, a: wrapping[u64]) {
+    trace_push(mut t, kind, a, u(0), List[byte](), CONTENT_ASCII)
+}
+
+// `generate_op`, `fuzz_textbuf.c:1095-1152`.
+fn generate_op(mut g: Gen, mut t: Trace, run: Replay, index: int) {
+    if index < 6 {
+        forced_op(mut g, mut t, run, index)
+        return
+    }
+    let len = text.textbuf_len(run.ec.tb)
+    if len > MAX_LIVE || text.textbuf_line_count(run.ec.tb) > MAX_LINES {
+        trace_push(mut t, TRACE_DEL, u(0), u(len), List[byte](), CONTENT_ASCII)
+        return
+    }
+    let choice = op_choice(g, rng_next(mut g))
+    if choice < 26 {
+        generate_insert(mut g, mut t, run, 0)
+    } else if choice < 37 {
+        generate_insert(mut g, mut t, run, 1)
+    } else if choice < 39 {
+        generate_insert(mut g, mut t, run, 2)
+    } else if choice < 56 {
+        generate_delete(mut g, mut t, run, 0)
+    } else if choice < 65 {
+        generate_delete(mut g, mut t, run, 1)
+    } else if choice < 66 {
+        generate_delete(mut g, mut t, run, 2)
+    } else if choice < 76 {
+        let query_index = choose(mut g, 3)
+        let arg = rng_next(mut g)
+        push_plain(mut t, TRACE_LINE_START + query_index, arg)
+    } else if choice < 81 {
+        let arg = rng_next(mut g)
+        push_plain(mut t, TRACE_ITER, arg)
+    } else if choice < 85 {
+        let kind = if choose(mut g, 2) == 0 then TRACE_SNAP else TRACE_RELEASE
+        let slot = choose(mut g, SNAPSHOTS)
+        push_plain(mut t, kind, u(slot))
+    } else if choice < 90 {
+        push_plain(mut t, TRACE_UNDO, u(0))
+    } else if choice < 93 {
+        push_plain(mut t, TRACE_REDO, u(0))
+    } else if choice < 95 {
+        push_plain(mut t, TRACE_UNDO_BOUNDARY, u(0))
+    } else if choice < 97 {
+        let arg = rng_next(mut g)
+        push_plain(mut t, TRACE_UNDO_TO, u(choose_state_id(run, arg)))
+    } else if choice < 98 {
+        push_plain(mut t, TRACE_SAVE, u(0))
+    } else {
+        push_plain(mut t, TRACE_CHECK, u(0))
+    }
+}
+
+// ---------------------------------------------------------------------
+// Replay of a whole trace and the shrinker (`shrink.c`). A shrink
+// candidate is a `List[SOp]`: each op names its source op in the
+// original trace and carries the fields the shrinker edits (kind, a, b,
+// a payload that is the source's prefix of `plen` bytes, all `a` when
+// `fill`), so a candidate costs a few words per op, never a payload.
+
+struct SOp {
+    src: int,
+    kind: int,
+    a: wrapping[u64],
+    b: wrapping[u64],
+    ordinal: int,
+    fill: bool,
+    plen: int,
+}
+
+struct Failure {
+    failed: bool,
+    first_op: int,
+    check_id: int,
+}
+
+fn sop_payload(t: Trace, op: SOp) -> List[byte] {
+    var out = List[byte]()
+    if op.kind != TRACE_INS {
+        return out
+    }
+    var i = 0
+    while i < op.plen {
+        (mut out).push(if op.fill then 97 as byte else t.ops[op.src].payload[i])
+        i += 1
+    }
+    out
+}
+
+fn sops_of(t: Trace) -> List[SOp] {
+    var out = List[SOp]()
+    var i = 0
+    while i < t.ops.len {
+        let op = copy t.ops[i]
+        (mut out).push(SOp {
+            src: i,
+            kind: op.kind,
+            a: op.a,
+            b: op.b,
+            ordinal: op.ordinal,
+            fill: false,
+            plen: op.payload.len,
+        })
+        i += 1
+    }
+    out
+}
+
+// `replay_trace`, `fuzz_textbuf.c:762-799`, over a candidate: the
+// failure (if any) and C's final hash.
+fn replay_sops(t: Trace, ops: List[SOp], full_checks: bool) -> (Failure, wrapping[u64]) {
+    var hash: wrapping[u64] = 1469598103934665603
+    let (ok, run0) = replay_init(t.base)
+    var run = run0
+    if !ok {
+        return (Failure { failed: true, first_op: 0, check_id: CHECK_OPERATION }, hash)
+    }
+    run.full_checks = full_checks
+    var i = 0
+    while i < ops.len {
+        let op = copy ops[i]
+        let payload = sop_payload(t, op)
+        if !apply_trace_op(mut run, op.kind, op.a, op.b, payload) {
+            return (Failure { failed: true, first_op: op.ordinal, check_id: CHECK_OPERATION }, hash)
+        }
+        if op.ordinal == t.plant_at {
+            plant(mut run)
+        }
+        let id = check_state(run, op.ordinal, i, i + 1 == ops.len)
+        if id != 0 {
+            return (Failure { failed: true, first_op: op.ordinal, check_id: id }, hash)
+        }
+        i += 1
+    }
+    hash = fnv_update(hash, run.oracle.doc)
+    hash = hash ^ u(text.undo_current(run.ec.undo))
+    hash = hash * 1099511628211
+    (Failure { failed: false, first_op: 0, check_id: 0 }, hash)
+}
+
+// One replay in its own region: the replay's state dies with it.
+fn probe(t: Trace, ops: List[SOp]) -> Failure {
+    var failed = false
+    var first_op = 0
+    var check_id = 0
+    region replay {
+        let (got, _) = replay_sops(t, ops, true)
+        failed = got.failed
+        first_op = got.first_op
+        check_id = got.check_id
+    }
+    Failure { failed: failed, first_op: first_op, check_id: check_id }
+}
+
+struct Budget {
+    replays: int,
+    max_replays: int,
+    deadline_ms: int,
+}
+
+fn budget_left(b: Budget) -> bool {
+    b.replays < b.max_replays && time_now_ms() < b.deadline_ms
+}
+
+fn failure_equal(a: Failure, b: Failure) -> bool {
+    a.first_op == b.first_op && a.check_id == b.check_id
+}
+
+// `trace_start_len`, `shrink.c:452-477`.
+fn trace_start_len(t: Trace) -> (bool, int) {
+    if t.base == "empty" {
+        return (true, 0)
+    }
+    if !t.base.starts_with("gen:") {
+        return (false, 0)
+    }
+    let rest = t.base[4..t.base.len]
+    var colon = -1
+    var i = 0
+    for b in rest.bytes() {
+        if b == 58 as byte && colon < 0 {
+            colon = i
+        }
+        i += 1
+    }
+    if colon <= 0 || colon >= 32 {
+        return (false, 0)
+    }
+    let (ok, v) = parse_u64(rest[0..colon])
+    if !ok || v > u(MAX_LIVE) {
+        return (false, 0)
+    }
+    (true, v as int)
+}
+
+// `trace_without`, `shrink.c:436-450`.
+fn sops_without(ops: List[SOp], first: int, count: int) -> List[SOp] {
+    var out = List[SOp]()
+    var i = 0
+    while i < ops.len {
+        if i < first || i >= first + count {
+            (mut out).push(copy ops[i])
+        }
+        i += 1
+    }
+    out
+}
+
+// `trace_clamp_offsets`, `shrink.c:479-526`: whether anything moved.
+fn sops_clamp(t: Trace, mut ops: List[SOp]) -> bool {
+    let (known, start) = trace_start_len(t)
+    if !known {
+        return false
+    }
+    var len = u(start)
+    var changed = false
+    var i = 0
+    while i < ops.len {
+        let op = copy ops[i]
+        if op.kind == TRACE_INS {
+            if op.a > len {
+                ops[i].a = len
+                changed = true
+            }
+            len = len + u(op.plen)
+        } else if op.kind == TRACE_DEL {
+            var a = op.a
+            var b = op.b
+            if a > len {
+                a = len
+                changed = true
+            }
+            if b > len {
+                b = len
+                changed = true
+            }
+            if b < a {
+                b = a
+                changed = true
+            }
+            ops[i].a = a
+            ops[i].b = b
+            len = len - (b - a)
+        } else if op.kind == TRACE_LINE_OF || op.kind == TRACE_ITER {
+            if op.a > len {
+                ops[i].a = len
+                changed = true
+            }
+        } else if op.kind == TRACE_UNDO || op.kind == TRACE_REDO || op.kind == TRACE_UNDO_TO {
+            return changed
+        }
+        i += 1
+    }
+    changed
+}
+
+// `try_remove`'s two probes, `shrink.c:528-552`: 0 rejected, 1 the
+// clamped candidate holds, 2 only the unclamped one does; the replays
+// spent.
+fn try_remove_probe(
+    t: Trace,
+    ops: List[SOp],
+    first: int,
+    count: int,
+    b: Budget,
+    target: Failure,
+) -> (int, int) {
+    var used = 0
+    var verdict = 0
+    region attempt {
+        let unclamped = sops_without(ops, first, count)
+        var candidate = sops_without(ops, first, count)
+        let clamped = sops_clamp(t, mut candidate)
+        var budget = b
+        if budget_left(budget) {
+            used += 1
+            budget.replays += 1
+            if failure_equal(probe(t, candidate), target) {
+                verdict = 1
+            }
+        }
+        if verdict == 0 && clamped && budget_left(budget) {
+            used += 1
+            if failure_equal(probe(t, unclamped), target) {
+                verdict = 2
+            }
+        }
+    }
+    (verdict, used)
+}
+
+fn sops_removed(t: Trace, ops: List[SOp], first: int, count: int, verdict: int) -> List[SOp] {
+    var out = sops_without(ops, first, count)
+    if verdict == 1 {
+        let _ = sops_clamp(t, mut out)
+    }
+    out
+}
+
+// `try_op`'s probe, `shrink.c:600-613`: the candidate with op `index`
+// replaced.
+fn try_op_probe(
+    t: Trace,
+    ops: List[SOp],
+    index: int,
+    replacement: SOp,
+    b: Budget,
+    target: Failure,
+) -> (bool, int) {
+    if !budget_left(b) {
+        return (false, 0)
+    }
+    var hit = false
+    region attempt {
+        var candidate = copy ops
+        candidate[index] = replacement
+        hit = failure_equal(probe(t, candidate), target)
+    }
+    (hit, 1)
+}
+
+fn sop_same(t: Trace, x: SOp, y: SOp) -> bool {
+    if x.kind != y.kind || x.a != y.a || x.b != y.b || x.plen != y.plen {
+        return false
+    }
+    if x.plen == 0 {
+        return true
+    }
+    same(sop_payload(t, x), sop_payload(t, y))
+}
+
+// `shrink`, `shrink.c:702-735`, with `ddmin` (557-584), `greedy_remove`
+// (586-598), `simplify_op` (615-672) and `deduplicate` (683-700) as the
+// phases of one loop over a local candidate. Answers whether the result
+// still reproduces `target`, the result, and the replays spent.
+fn shrink(t: Trace, target: Failure) -> (bool, List[SOp], int) {
+    var cur = sops_of(t)
+    var b = Budget { replays: 0, max_replays: 5000, deadline_ms: time_now_ms() + 10000 }
+    var first_ok = false
+    if budget_left(b) {
+        b.replays += 1
+        first_ok = failure_equal(probe(t, cur), target)
+    }
+    if !first_ok {
+        return (false, cur, b.replays)
+    }
+    var changed = true
+    while changed && budget_left(b) {
+        changed = false
+        // ddmin
+        var divisions = 2
+        while cur.len > 1 && budget_left(b) {
+            let chunk = (cur.len + divisions - 1) / divisions
+            var start = 0
+            var accepted = false
+            while start < cur.len && budget_left(b) {
+                var count = chunk
+                if count > cur.len - start {
+                    count = cur.len - start
+                }
+                let (verdict, used) = try_remove_probe(t, cur, start, count, b, target)
+                b.replays += used
+                if verdict != 0 {
+                    cur = sops_removed(t, cur, start, count, verdict)
+                    changed = true
+                    accepted = true
+                    divisions = 2
+                    break
+                }
+                start += chunk
+            }
+            if !accepted {
+                if divisions >= cur.len {
+                    break
+                }
+                divisions *= 2
+                if divisions > cur.len {
+                    divisions = cur.len
+                }
+            }
+        }
+        // greedy removal
+        var i = 0
+        while i < cur.len && budget_left(b) {
+            let (verdict, used) = try_remove_probe(t, cur, i, 1, b, target)
+            b.replays += used
+            if verdict != 0 {
+                cur = sops_removed(t, cur, i, 1, verdict)
+                changed = true
+            } else {
+                i += 1
+            }
+        }
+        // per-op simplification
+        i = 0
+        while i < cur.len && budget_left(b) {
+            var op = copy cur[i]
+            if op.kind == TRACE_INS && op.plen != 0 {
+                if !op.fill {
+                    var all_a = true
+                    var k = 0
+                    while k < op.plen {
+                        if t.ops[op.src].payload[k] != 97 as byte {
+                            all_a = false
+                        }
+                        k += 1
+                    }
+                    var cand = copy op
+                    cand.fill = true
+                    if !all_a {
+                        let (hit, used) = try_op_probe(t, cur, i, cand, b, target)
+                        b.replays += used
+                        if hit {
+                            cur[i] = cand
+                            changed = true
+                        }
+                    }
+                }
+                op = copy cur[i]
+                if op.plen > 1 {
+                    var cand = copy op
+                    cand.plen = 1
+                    cand.b = u(1)
+                    let (hit, used) = try_op_probe(t, cur, i, cand, b, target)
+                    b.replays += used
+                    if hit {
+                        cur[i] = cand
+                        changed = true
+                    }
+                }
+            }
+            op = copy cur[i]
+            if op.a != u(0) {
+                var lo = u(0)
+                var hi = op.a
+                while lo < hi && budget_left(b) {
+                    let mid = lo + (hi - lo) / u(2)
+                    var cand = copy cur[i]
+                    cand.a = mid
+                    let (hit, used) = try_op_probe(t, cur, i, cand, b, target)
+                    b.replays += used
+                    if hit {
+                        cur[i] = cand
+                        changed = true
+                        hi = mid
+                    } else {
+                        lo = mid + u(1)
+                    }
+                }
+            }
+            op = copy cur[i]
+            if op.kind == TRACE_DEL && op.b > op.a + u(1) {
+                var cand = copy op
+                cand.b = cand.a + u(1)
+                let (hit, used) = try_op_probe(t, cur, i, cand, b, target)
+                b.replays += used
+                if hit {
+                    cur[i] = cand
+                    changed = true
+                }
+            } else if op.kind == TRACE_UNDO_TO {
+                var cand = copy op
+                cand.kind = TRACE_UNDO
+                cand.a = u(0)
+                let (hit, used) = try_op_probe(t, cur, i, cand, b, target)
+                b.replays += used
+                if hit {
+                    cur[i] = cand
+                    changed = true
+                }
+            }
+            i += 1
+        }
+        // de-duplication
+        i = 1
+        while i < cur.len && budget_left(b) {
+            var removed = false
+            if sop_same(t, cur[i - 1], cur[i]) {
+                let (verdict, used) = try_remove_probe(t, cur, i, 1, b, target)
+                b.replays += used
+                if verdict != 0 {
+                    cur = sops_removed(t, cur, i, 1, verdict)
+                    changed = true
+                    removed = true
+                }
+            }
+            if !removed {
+                i += 1
+            }
+        }
+    }
+    let final = probe(t, cur)
+    (failure_equal(final, target), cur, b.replays)
+}
+
+fn write_sops(t: Trace, ops: List[SOp]) -> List[byte] {
+    var out = List[byte]()
+    write_header(mut out, t.seed, t.mix, t.base)
+    for op in ops {
+        write_op(mut out, op.kind, op.a, op.b, sop_payload(t, op))
+    }
+    out
+}
+
+// `trace_write_c_snippet`, `shrink.c:338-371`.
+fn write_c_snippet(t: Trace, ops: List[SOp]) -> List[byte] {
+    var out = List[byte]()
+    push_str(mut out, "TextBuf *tb = yew_textbuf_from_bytes(NULL, 0U);\n")
+    for op in ops {
+        if op.kind == TRACE_INS {
+            push_str(mut out, "yew_textbuf_insert(tb, BYTEOFF({u64_dec(op.a)}U), ")
+            if op.plen == 0 {
+                push_str(mut out, "NULL, 0U);\n")
+                continue
+            }
+            push_str(mut out, "(const u8[]){{")
+            var j = 0
+            for x in sop_payload(t, op) {
+                let v = x as int
+                if j != 0 {
+                    push_str(mut out, ", ")
+                }
+                push_str(mut out, "0x")
+                (mut out).push(hex_nibble(v >> 4))
+                (mut out).push(hex_nibble(v & 15))
+                push_str(mut out, "U")
+                j += 1
+            }
+            push_str(mut out, "}}, {op.plen}U);\n")
+        } else if op.kind == TRACE_DEL {
+            push_str(
+                mut out,
+                "yew_textbuf_delete(tb, (Span){{{u64_dec(op.a)}U, {u64_dec(op.b)}U}});\n",
+            )
+        } else {
+            push_str(mut out, "/* trace op: {op_name(op.kind)} {u64_dec(op.a)} */\n")
+        }
+    }
+    push_str(mut out, "yew_textbuf_check(tb);\nyew_textbuf_free(tb);\n")
+    out
+}
+
+fn write_file(path: str, bytes: List[byte]) -> bool {
+    let fd = fs_open_perm(path, 1, 420) else {
+        return false
+    }
+    var ok = true
+    if bytes.len != 0 {
+        fs_write_chunk(fd, bytes) else {
+            ok = false
+        }
+    }
+    fs_close(fd) else {
+        ok = false
+    }
+    ok
+}
+
+fn stderr_bytes(bytes: List[byte]) {
+    let s = str_from_utf8(bytes) else {
+        return
+    }
+    eprint(s)
+}
+
+// `report_failure`, `fuzz_textbuf.c:1293-1350`.
+fn report_failure(t: Trace) -> int {
+    let all = sops_of(t)
+    let first = probe(t, all)
+    if !first.failed {
+        eprint("fuzz-textbuf: tiered failure did not reproduce")
+        return 1
+    }
+    let (ok, minimized, replays) = shrink(t, first)
+    if !ok {
+        eprint("fuzz-textbuf: shrink lost check={first.check_id} op={first.first_op}")
+        return 1
+    }
+    let dir = "target/fuzz-textbuf-crashes"
+    fs_create_dir_all(dir) else |_| {
+        eprint("fuzz-textbuf: cannot create crash directory {dir}")
+    }
+    let path = "{dir}/{hex16(t.seed)}-{first.first_op}.trace"
+    if !write_file(path, write_sops(t, minimized)) {
+        eprint("fuzz-textbuf: cannot write {path}")
+    }
+    eprint(
+        "fuzz-textbuf: divergence seed=0x{hex16(t.seed)} mix={t.mix} op={first.first_op} check={first.check_id} minimized_ops={minimized.len} replays={replays} trace={path}",
+    )
+    stderr_bytes(write_c_snippet(t, minimized))
+    1
+}
+
+// ---------------------------------------------------------------------
+// The trace parser (`trace_parse`, `shrink.c:208-280`) for `--replay`.
+
+fn digit_of(b: int, radix: int) -> int {
+    var d = -1
+    if b >= 48 && b <= 57 {
+        d = b - 48
+    } else if b >= 97 && b <= 102 {
+        d = b - 87
+    } else if b >= 65 && b <= 70 {
+        d = b - 55
+    }
+    if d >= radix {
+        return -1
+    }
+    d
+}
+
+// `strtoull(text, &end, 0)` with C's checks (`parse_u64`, shrink.c:
+// 98-111): no empty text, no '-', no trailing bytes, no overflow.
+fn parse_u64(s: str) -> (bool, wrapping[u64]) {
+    var v = u(0)
+    var bs = List[int]()
+    for b in s.bytes() {
+        (mut bs).push(b as int)
+    }
+    if bs.len == 0 || bs[0] == 45 {
+        return (false, v)
+    }
+    var i = 0
+    if bs[0] == 43 {
+        i = 1
+    }
+    var radix = 10
+    if i + 1 < bs.len && bs[i] == 48 && (bs[i + 1] == 120 || bs[i + 1] == 88) {
+        if i + 2 >= bs.len || digit_of(bs[i + 2], 16) < 0 {
+            return (false, v)
+        }
+        radix = 16
+        i += 2
+    } else if i < bs.len && bs[i] == 48 {
+        radix = 8
+    }
+    if i >= bs.len {
+        return (false, v)
+    }
+    let max: wrapping[u64] = 18446744073709551615
+    while i < bs.len {
+        let d = digit_of(bs[i], radix)
+        if d < 0 {
+            return (false, v)
+        }
+        if v > (max - u(d)) / u(radix) {
+            return (false, v)
+        }
+        v = v * u(radix) + u(d)
+        i += 1
+    }
+    (true, v)
+}
+
+fn tokens(line: str) -> List[str] {
+    var out = List[str]()
+    var start = -1
+    var i = 0
+    for b in line.bytes() {
+        let ws = b == 32 as byte || b == 9 as byte
+        if ws {
+            if start >= 0 {
+                (mut out).push(line[start..i])
+                start = -1
+            }
+        } else if start < 0 {
+            start = i
+        }
+        i += 1
+    }
+    if start >= 0 {
+        (mut out).push(line[start..line.len])
+    }
+    out
+}
+
+fn kind_named(name: str) -> int {
+    var k = 0
+    while k <= TRACE_CHECK {
+        if op_name(k) == name {
+            return k
+        }
+        k += 1
+    }
+    -1
+}
+
+fn parse_hex_payload(hex: str, declared: wrapping[u64]) -> (bool, List[byte]) {
+    var out = List[byte]()
+    var digits = List[int]()
+    for b in hex.bytes() {
+        (mut digits).push(b as int)
+    }
+    if declared > u(digits.len) || u(digits.len) != declared * u(2) {
+        return (false, out)
+    }
+    var i = 0
+    while i < digits.len {
+        let hi = if digits[i] >= 65 && digits[i] <= 70 then -1 else digit_of(digits[i], 16)
+        let lo = if digits[i + 1] >= 65 && digits[i + 1] <= 70 {
+            -1
+        } else {
+            digit_of(digits[i + 1], 16)
+        }
+        if hi < 0 || lo < 0 {
+            return (false, out)
+        }
+        (mut out).push((hi * 16 + lo) as byte)
+        i += 2
+    }
+    (true, out)
+}
+
+// `parse_op`, `shrink.c:166-206`.
+fn parse_op(mut t: Trace, line: str) -> bool {
+    let tk = tokens(line)
+    if tk.len == 0 {
+        return false
+    }
+    let name = tk[0]
+    if name == "ins" {
+        if tk.len != 4 {
+            return false
+        }
+        let (ok_a, a) = parse_u64(tk[1])
+        let (ok_b, b) = parse_u64(tk[2])
+        if !ok_a || !ok_b {
+            return false
+        }
+        let (ok_p, payload) = parse_hex_payload(tk[3], b)
+        if !ok_p {
+            return false
+        }
+        trace_push(mut t, TRACE_INS, a, b, payload, CONTENT_ASCII)
+        return true
+    }
+    if name == "del" {
+        if tk.len != 3 {
+            return false
+        }
+        let (ok_a, a) = parse_u64(tk[1])
+        let (ok_b, b) = parse_u64(tk[2])
+        if !ok_a || !ok_b {
+            return false
+        }
+        trace_push(mut t, TRACE_DEL, a, b, List[byte](), CONTENT_ASCII)
+        return true
+    }
+    let kind = kind_named(name)
+    if kind < 0 {
+        return false
+    }
+    if one_arg_kind(kind) {
+        if tk.len != 2 {
+            return false
+        }
+        let (ok_a, a) = parse_u64(tk[1])
+        if !ok_a {
+            return false
+        }
+        trace_push(mut t, kind, a, u(0), List[byte](), CONTENT_ASCII)
+        return true
+    }
+    if tk.len != 1 {
+        return false
+    }
+    trace_push(mut t, kind, u(0), u(0), List[byte](), CONTENT_ASCII)
+    true
+}
+
+// `parse_header`, `shrink.c:150-164`.
+fn parse_header(mut t: Trace, line: str) -> bool {
+    let tk = tokens(line)
+    if tk.len < 4 || tk[0] != "#" {
+        return false
+    }
+    if !tk[1].starts_with("seed=") || !tk[2].starts_with("mix=") || !tk[3].starts_with("base=") {
+        return false
+    }
+    let seed_text = tk[1][5..tk[1].len]
+    let mix = tk[2][4..tk[2].len]
+    let base = tk[3][5..tk[3].len]
+    if seed_text.len == 0 ||
+        seed_text.len > 31 ||
+        mix.len == 0 ||
+        mix.len > 31 ||
+        base.len == 0 ||
+        base.len > 255 {
+        return false
+    }
+    let (ok, v) = parse_u64(seed_text)
+    if !ok {
+        return false
+    }
+    t.seed = v
+    t.mix = mix
+    t.base = base
+    true
+}
+
+// `trace_parse`: (ok, why).
+fn trace_parse(mut t: Trace, body: str) -> (bool, str) {
+    var saw_magic = false
+    var line_no = 0
+    var start = 0
+    var i = 0
+    let n = body.len
+    while start < n {
+        var end = start
+        while end < n && body.bytes()[end] != 10 as byte {
+            end += 1
+        }
+        line_no += 1
+        var stop = end
+        if stop > start && body.bytes()[stop - 1] == 13 as byte {
+            stop -= 1
+        }
+        let line = body[start..stop]
+        start = end + 1
+        i += 1
+        if line.len == 0 {
+            continue
+        }
+        if line == "# yew textbuf trace v1" {
+            saw_magic = true
+            continue
+        }
+        if line.starts_with("# seed=") {
+            if !parse_header(mut t, line) {
+                return (false, "line {line_no}: invalid metadata")
+            }
+            continue
+        }
+        if line.starts_with("#") {
+            continue
+        }
+        if !parse_op(mut t, line) {
+            return (false, "line {line_no}: invalid operation")
+        }
+    }
+    if !saw_magic {
+        return (false, "line 1: missing trace v1 header")
+    }
+    (true, "")
+}
+
+// `replay_file`, `fuzz_textbuf.c:1519-1557`.
+fn replay_file(path: str) -> int {
+    let body = fs_read_text(path) else {
+        eprint("fuzz-textbuf: cannot read {path}")
+        return 1
+    }
+    var t = trace_new()
+    let (ok, why) = trace_parse(mut t, body)
+    if !ok {
+        eprint("fuzz-textbuf: {path}: {why}")
+        return 1
+    }
+    let (f, hash) = replay_sops(t, sops_of(t), true)
+    if f.failed {
+        eprint("fuzz-textbuf: replay divergence op={f.first_op} check={f.check_id}")
+        return 1
+    }
+    print(
+        "fuzz-textbuf replay={path} seed={hex16(t.seed)} mix={t.mix} ops={t.ops.len} final={hex16(hash)}",
+    )
+    0
+}
+
+// ---------------------------------------------------------------------
+// The campaign (`run_generated`, `fuzz_textbuf.c:1375-1517`).
+
+// What crosses an epoch's region: scalars only.
+struct Carry {
+    rng: wrapping[u64],
+    splits: int,
+    total_ops: int,
+    epochs: int,
+    peak_trace: int,
+    trace_hash: wrapping[u64],
+    final_hash: wrapping[u64],
+    next_seed: wrapping[u64],
+}
+
+fn class_coverage(counts: List[int], splits: int) -> bool {
+    counts[CONTENT_INVALID] != 0 &&
+        counts[CONTENT_BINARY] != 0 &&
+        counts[CONTENT_CRLF] != 0 &&
+        counts[CONTENT_HUGE_LINE] != 0 &&
+        splits != 0
+}
+
+fn run_generated(
+    seed: wrapping[u64],
+    mix: int,
+    iterations: int,
+    seconds: int,
+    trace_out: str,
+    plant_at: int,
+) -> int {
+    let deadline = if seconds == 0 then 0 else time_now_ms() + seconds * 1000
+    var carry = Carry {
+        rng: if seed == u(0) then 11400714819323198485 else seed,
+        splits: 0,
+        total_ops: 0,
+        epochs: 0,
+        peak_trace: 0,
+        trace_hash: 1469598103934665603,
+        final_hash: 1469598103934665603,
+        next_seed: seed,
+    }
+    var counts = List[int]()
+    var k = 0
+    while k < 8 {
+        (mut counts).push(0)
+        k += 1
+    }
+    var result = -1
+    var first_epoch = true
+    while result < 0 {
+        region epoch {
+            var g = Gen {
+                rng: carry.rng,
+                mix: mix,
+                class_counts: copy counts,
+                sequence_splits: carry.splits,
+            }
+            var t = trace_new()
+            t.seed = carry.next_seed
+            t.mix = mix_name(mix)
+            let (ok, run0) = replay_init(t.base)
+            var run = run0
+            if !ok {
+                result = 2
+            }
+            t.plant_at = if first_epoch then plant_at else -1
+            first_epoch = false
+            var rolled = false
+            var total = carry.total_ops
+            var peak = carry.peak_trace
+            while result < 0 && !rolled {
+                let index = t.ops.len
+                generate_op(mut g, mut t, run, index)
+                let op = copy t.ops[t.ops.len - 1]
+                if !apply_trace_op(mut run, op.kind, op.a, op.b, op.payload) {
+                    result = report_failure(t)
+                    break
+                }
+                if index == t.plant_at {
+                    plant(mut run)
+                }
+                if check_state(run, op.ordinal, index, false) != 0 {
+                    result = report_failure(t)
+                    break
+                }
+                total += 1
+                let storage = trace_storage(t)
+                if storage > peak {
+                    peak = storage
+                }
+                let campaign_done = total >= iterations &&
+                    (seconds == 0 || time_now_ms() >= deadline)
+                if campaign_done {
+                    let last = copy t.ops[t.ops.len - 1]
+                    if check_state(run, last.ordinal, t.ops.len - 1, true) != 0 {
+                        result = report_failure(t)
+                        break
+                    }
+                    if !class_coverage(g.class_counts, g.sequence_splits) {
+                        eprint("fuzz-textbuf: required content class missed")
+                        result = 1
+                        break
+                    }
+                    var th = fnv_update(carry.trace_hash, trace_write(t))
+                    var fh = fnv_update(carry.final_hash, run.oracle.doc)
+                    fh = fh ^ u(text.undo_current(run.ec.undo))
+                    fh = fh * 1099511628211
+                    if trace_out.len != 0 && !write_file(trace_out, trace_write(t)) {
+                        eprint("fuzz-textbuf: cannot write trace {trace_out}")
+                        result = 1
+                        break
+                    }
+                    let secs = if seconds != 0 then "seconds={seconds} " else ""
+                    print(
+                        "fuzz-textbuf: seed={u64_dec(seed)} {secs}iters={total} epochs={carry.epochs + 1} peak_trace={peak} mix={mix_name(mix)} trace={hex16(th)} final={hex16(fh)} bytes={text.textbuf_len(run.ec.tb)} pieces={text.textbuf_piece_count(run.ec.tb)} invalid={g.class_counts[CONTENT_INVALID]} nul={g.class_counts[CONTENT_BINARY]} crlf={g.class_counts[CONTENT_CRLF]} split={g.sequence_splits} huge={g.class_counts[CONTENT_HUGE_LINE]} ok",
+                    )
+                    result = 0
+                    break
+                }
+                if storage >= TRACE_BYTES_MAX {
+                    if trace_out.len != 0 {
+                        eprint(
+                            "fuzz-textbuf: --trace-out exceeds the {TRACE_BYTES_MAX}-byte single-trace cap",
+                        )
+                        result = 1
+                        break
+                    }
+                    // `rollover_epoch`, `fuzz_textbuf.c:1352-1373`.
+                    let last = copy t.ops[t.ops.len - 1]
+                    if check_state(run, last.ordinal, t.ops.len - 1, true) != 0 {
+                        result = report_failure(t)
+                        break
+                    }
+                    var th = fnv_update(carry.trace_hash, trace_write(t))
+                    var fh = fnv_update(carry.final_hash, run.oracle.doc)
+                    fh = fh ^ u(text.undo_current(run.ec.undo))
+                    fh = fh * 1099511628211
+                    carry.rng = g.rng
+                    carry.splits = g.sequence_splits
+                    carry.total_ops = total
+                    carry.epochs = carry.epochs + 1
+                    carry.peak_trace = peak
+                    carry.trace_hash = th
+                    carry.final_hash = fh
+                    carry.next_seed = g.rng
+                    k = 0
+                    while k < 8 {
+                        counts[k] = g.class_counts[k]
+                        k += 1
+                    }
+                    rolled = true
+                }
+            }
+        }
+    }
+    result
+}
+
+fn usage() {
+    eprint(
+        "usage: fuzz-textbuf [--iters=N] [--seconds=N] [--seed=N] [--mix=typing|paste|undo|lines] [--trace-out=PATH] [--plant-at=N]\n       fuzz-textbuf --replay PATH\n(--coverage-report needs C's COV=1 build; the port has none)",
+    )
+}
+
+fn main() -> int {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var seed = u(1)
+    var iterations = u(DEFAULT_ITERS)
+    var seconds = u(0)
+    var mix = MIX_TYPING
+    var trace_out = ""
+    var replay = ""
+    var coverage = false
+    var plant_at = -1
+    let env_seed = env_get("YEW_FUZZ_SEED") else ""
+    if env_seed.len != 0 {
+        let (ok, v) = parse_u64(env_seed)
+        if !ok {
+            usage()
+            return 2
+        }
+        seed = v
+    }
+    let env_mix = env_get("YEW_FUZZ_MIX") else ""
+    if env_mix.len != 0 {
+        let m = parse_mix(env_mix)
+        if m < 0 {
+            usage()
+            return 2
+        }
+        mix = m
+    }
+    let args = env_args()
+    var i = 0
+    while i < args.len {
+        let a = args[i]
+        if a.starts_with("--iters=") {
+            let (ok, v) = parse_u64(a[8..a.len])
+            if ok {
+                iterations = v
+                i += 1
+                continue
+            }
+        }
+        if a.starts_with("--seconds=") {
+            let (ok, v) = parse_u64(a[10..a.len])
+            if ok {
+                seconds = v
+                i += 1
+                continue
+            }
+        }
+        if a.starts_with("--seed=") {
+            let (ok, v) = parse_u64(a[7..a.len])
+            if ok {
+                seed = v
+                i += 1
+                continue
+            }
+        }
+        if a.starts_with("--mix=") {
+            let m = parse_mix(a[6..a.len])
+            if m >= 0 {
+                mix = m
+                i += 1
+                continue
+            }
+        }
+        if a.starts_with("--trace-out=") {
+            trace_out = a[12..a.len]
+            i += 1
+            continue
+        }
+        if a.starts_with("--plant-at=") {
+            let (ok, v) = parse_u64(a[11..a.len])
+            if ok && v < u(DEFAULT_ITERS * 1000) {
+                plant_at = v as int
+                i += 1
+                continue
+            }
+        }
+        if a == "--replay" && i + 1 < args.len {
+            replay = args[i + 1]
+            i += 2
+            continue
+        }
+        if a == "--coverage-report" {
+            coverage = true
+            i += 1
+            continue
+        }
+        usage()
+        return 2
+    }
+    if coverage {
+        eprint("fuzz-textbuf: coverage options require a COV=1 build")
+        return 2
+    }
+    if replay.len != 0 {
+        return replay_file(replay)
+    }
+    if iterations < u(6) || iterations > u(1000000000000) || seconds > u(18446744073) {
+        usage()
+        return 2
+    }
+    run_generated(seed, mix, iterations as int, seconds as int, trace_out, plant_at)
+}
