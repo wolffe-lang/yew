@@ -152,11 +152,10 @@ the `Ed` lives in `edit` (`src/edit/*.lu`, sagitta's file names kept).
    anywhere** (`a(a*)*b` × 100,000 within 50 ms; the four scaling
    patterns `t(10⁵)/t(10⁴) ≤ 15`). Unicode classes and case folding
    from `unicode.category` and `unicode.case`, the generator's new
-   `--category` and `--case` modes (data-only, checked against
-   sagitta's arrays as `tools/check-tables` does the grapheme and
-   word-break tables) — unless yw03's H fork already landed `--case`
-   for the selection case commands (`sel_actions.c:665`; yw03's note
-   says which), in which case only `--category` is new. The module is
+   `--category` mode (data-only, checked against sagitta's arrays as
+   `tools/check-tables` does the grapheme, word-break and case tables);
+   `--case` and `unicode.case` landed in yw03 for the selection case
+   commands (`sel_actions.c:665`), so only `--category` is new. The module is
    `search` (sagitta's name, std aliased, ruling R5); no `std.regex`
    exists and the port's becomes a candidate (index row 04). Unit:
    `test_re_engines` (8), `test_re_match` (12, over the 188-row golden
