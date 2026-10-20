@@ -470,8 +470,18 @@ buy and the one the port does not claim.
   seeds), and on macOS too: there the driver interposes the fault shim
   with `DYLD_INSERT_LIBRARIES` over the wolf binary and answers exactly
   the linux lines (the step runs RECORDED on macOS; no plant has seen it
-  red there, so the next lane that plants on macOS promotes it). The
-  final run is the PR's.
+  red there, so the next lane that plants on macOS promotes it); run
+  39396167477 at `3aca202` red on its first attempt at the port's OWN
+  EOL-goal case in `text_undo_serial_test` (line 737) and green on its
+  second: the check scanned every 8-byte window, and the window one byte
+  into C's eight 0xff ends on the record CRC's first byte, which varies
+  with the root's real wall time (`undo_new` stamps it before the
+  fixture's fake clock, as C's does), so a CRC starting 0x7f read as the
+  port's sentinel once in 256 seconds — caught on kasumi by running the
+  old check once a second (`notes/yw02-evidence/checked/flake-eol-goal.
+  log`: `FLAKE c=2 port=1`, the tail `… 255×8 127 41 85 …`, the 579th
+  second) and fixed in `e8a66b1` (windows only where a 0xff run
+  begins). The final run is the PR's.
 - The plants (RULES §7, draft PRs closed unmerged, each on `a8f9236`):
   yew#8 (`da7eafb`, the journal record never written) seen red in run
   39393453647, oracle linux, "sagitta's kill9 driver over the port's
