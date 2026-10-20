@@ -1,20 +1,27 @@
-//! edit.cmdline — the narrow `:` campaign 03's goldens need.
+//! edit.cmdline — the `:`, `/` and `?` prompt (E mode).
 //!
-//! Ports the core of sagitta `src/ui/cmdline.c` (3,957 lines) at
-//! 9ace98c2 — `yew_cmdline_open`, `_close`, `_target`, `_key`, `_draw`,
-//! `ed.cmdline.accept` and `ed.cmdline.cancel` — and nothing else of
-//! sprint 18. Why it is here at all (ruling R-yw03-1, asked): every
-//! campaign-03 PTY case leaves the editor through `esc : ed.quit enter` or
-//! `esc : ed.quit_force enter` (`tests/pty/registry.c:679-700`) and the
-//! case's verdict includes that exit, so without a `:` no campaign-03
-//! case can pass. C's prompt is a real buffer in a hidden window (the
-//! TARGET) that the E-mode editing commands run on through the registry;
-//! the port keeps that shape (one target buffer and window, reused).
-//! Accept parses the narrow grammar a typed command needs here — the
-//! command's name or abbreviation (`builtin_meta`'s), a trailing `!`,
-//! space-separated arguments — and refuses a range or anything else by
-//! name (sprint 18, yw04). History, completion, ghosts, the menu, the
-//! pager, the shell context and the error caret are yw04's.
+//! Ports sagitta `src/ui/cmdline.c` (3,957 lines) and `cmdline.h` at
+//! 9ace98c2 under `s18-cmdline.md` §1–§2, §7, `s18_5-reactive-cmdline.md`
+//! §6–§9, `s57_17`, `s57_28`–`s57_31`. It replaces yw03's narrow `:`
+//! (R-yw03-1) and keeps its shape: the prompt is a one-line `TextBuf` with
+//! a real cursor in its own hidden `Win` — the TARGET the E-mode editing
+//! commands run on through the registry (`yew_cmdline_target`), so there
+//! is no second editor (s18 DoD 3). C copies the target's primary cursor
+//! into `CmdLine.cur` and syncs it back and forth (`sync_from_target`,
+//! `sync_to_target`, `cmdline.c:146-162`); the port reads and writes the
+//! target window's cursor itself, so the two can never drift. C's prompt
+//! target is a fresh buffer and window per prompt; the port keeps one
+//! window and buffer for the session and gives each prompt a fresh edit
+//! context (text, undo tree, marks). C's file-static `comp_idle_dirty`
+//! (`cmdline.c:56-58`) is a field (module state of a run-time value is
+//! E1010, the threaded-value idiom), and C's `YewCmdlineInputDone`
+//! callback with its `void *ctx` is a KIND matched in one place
+//! (`cmdline_input_done`, G19/G20).
+//!
+//! This file is the prompt's core: open, close, restore, the target,
+//! typing and pasting through `ed.edit.insert.text`, the selection and its
+//! collapse table (s57.29), errors and their caret (s18 §7), accept and
+//! cancel, the register and literal inserts, and the draw.
 
 use term
 use text
@@ -23,144 +30,181 @@ use unicode
 /// The `:` prompt (`YEW_PROMPT_CMD`).
 pub const PROMPT_CMD: int = 0
 
-/// The command line (`CmdLine`, `ui/cmdline.h`), the fields the narrow
-/// `:` keeps.
+/// The forward search prompt `/` (`YEW_PROMPT_SEARCH_F`).
+pub const PROMPT_SEARCH_F: int = 1
+
+/// The backward search prompt `?` (`YEW_PROMPT_SEARCH_B`).
+pub const PROMPT_SEARCH_B: int = 2
+
+/// A question another subsystem asks (`YEW_PROMPT_INPUT`).
+pub const PROMPT_INPUT: int = 3
+
+/// No answer is awaited (C's NULL `input_done`).
+pub const INPUT_DONE_NONE: int = 0
+
+/// The unit tests' probe: the answer is recorded in `CmdLine.input_*`.
+pub const INPUT_DONE_TEST: int = 1
+
+// `YEW_CMDLINE_TABWIDTH` (`cmdline.c:37`).
+const CMDLINE_TABWIDTH: int = 4
+
+/// One token a token walk showed (`YewTokHit`, `cmdline.h:28-35`): word
+/// `word` of view entry `entry`, bytes [lo, hi) of it.
+pub struct TokHit {
+    entry: int,
+    word: int,
+    lo: int,
+    hi: int,
+}
+
+/// The command line (`CmdLine`, `cmdline.h:37-150`).
 pub struct CmdLine {
-    active: bool,
     kind: int,
-    target_win: int,
-    return_mode: int,
-    scroll: int,
+    active: bool,
     generation: int,
+    target_win: int,
+    err_lo: int,
+    err_hi: int,
+    err_msg: str,
+    hint: str,
+    scroll: int,
+    click_row: int,
+    return_mode: int,
+    hsearch: bool,
+    hsearch_line: List[byte],
+    walk_prefix: int,
+    walk_bang: bool,
+    comp_total: int,
+    comp_asked: bool,
+    comp_idle_dirty: bool,
+    menu_stem: List[byte],
+    has_menu_stem: bool,
+    menu_original: text.Span,
+    suggest_loaded: bool,
+    input_done: int,
+    input_ctx: int,
+    input_seen: int,
+    input_accepted: bool,
+    input_text: List[byte],
+    last_arg_seq: int,
+    last_arg_gen: int,
+    last_arg_entry: int,
+    last_arg_span: text.Span,
+    tok_seq: int,
+    tok_gen: int,
+    tok_bang: bool,
+    tok_term: List[byte],
+    tok_span: text.Span,
+    tok_seen: List[TokHit],
+    seam_calls: int,
 }
 
 /// A closed command line.
 pub fn cmdline_new() -> CmdLine {
     CmdLine {
-        active: false,
         kind: PROMPT_CMD,
-        target_win: -1,
-        return_mode: MODE_L,
-        scroll: 0,
+        active: false,
         generation: 0,
+        target_win: -1,
+        err_lo: 0,
+        err_hi: 0,
+        err_msg: "",
+        hint: "",
+        scroll: 0,
+        click_row: -1,
+        return_mode: MODE_L,
+        hsearch: false,
+        hsearch_line: List[byte](),
+        walk_prefix: 0,
+        walk_bang: false,
+        comp_total: 0,
+        comp_asked: false,
+        comp_idle_dirty: false,
+        menu_stem: List[byte](),
+        has_menu_stem: false,
+        menu_original: text.span(0, 0),
+        suggest_loaded: false,
+        input_done: INPUT_DONE_NONE,
+        input_ctx: 0,
+        input_seen: 0,
+        input_accepted: false,
+        input_text: List[byte](),
+        last_arg_seq: 0,
+        last_arg_gen: 0,
+        last_arg_entry: 0,
+        last_arg_span: text.span(0, 0),
+        tok_seq: 0,
+        tok_gen: 0,
+        tok_bang: false,
+        tok_term: List[byte](),
+        tok_span: text.span(0, 0),
+        tok_seen: List[TokHit](),
+        seam_calls: 0,
     }
 }
 
-/// The window E-mode commands run on (`yew_cmdline_target`): the prompt's
-/// while it is open, else the focused one.
+/// The window E-mode commands run on (`yew_cmdline_target`,
+/// `cmdline.c:688-698`): the prompt's while it is open, else the focused
+/// one.
 pub fn cmdline_target(ed: Ed) -> int {
     if ed.cmdline.active then ed.cmdline.target_win else ed.win
 }
 
-/// `yew_cmdline_open` (`cmdline.c:463-540`): a fresh target holding
-/// `seed`, E mode.
-pub fn cmdline_open(mut ed: Ed, kind: int, seed: str) {
-    if ed.cmdline.active {
-        cmdline_close(mut ed, false)
-    }
-    let old = ed.mode
-    ed.cmdline.generation += 1
-    var bytes = List[byte]()
-    for b in seed.bytes() {
-        (mut bytes).push(b)
-    }
-    var ec = text.editctx_new(take text.textbuf_from_bytes(bytes, 0, bytes.len))
-    ec.undo = text.undo_new(ec.tb)
-    ec.has_undo = true
-    ec.marks = text.marks_new()
-    ec.has_marks = true
-    if ed.cmdline.target_win < 0 {
-        let id = ed.next_buf_id
-        ed.next_buf_id += 1
-        (mut ed.bufs).push(Buffer {
-            id: id,
-            ec: ec,
-            resident: true,
-            path: "",
-            has_path: false,
-            name: "*cmdline*",
-            has_name: true,
-            flags: BUF_SCRATCH,
-            tabwidth: 1,
-            recovery_pending: false,
-            pairs: pairstate_new(),
-        })
-        let wid = ed.next_win_id
-        ed.next_win_id += 1
-        var w = win_new(wid, ed.bufs.len - 1)
-        vp_init(mut w)
-        (mut ed.wins).push(w)
-        ed.cmdline.target_win = ed.wins.len - 1
-    } else {
-        let bi = ed.wins[ed.cmdline.target_win].buf
-        ed.bufs[bi].ec = ec
-    }
-    let tw = ed.cmdline.target_win
-    let n = bytes.len
-    ed.wins[tw].cs = text.cset_init(text.cursor_at(n as text.ByteOff))
-    ed.cmdline.kind = kind
-    ed.cmdline.active = true
-    ed.cmdline.return_mode = ed.mode
-    ed.cmdline.scroll = 0
-    ed_msg_clear(mut ed)
-    if old != MODE_E {
-        dispatch_set_mode(mut ed, MODE_E)
-    }
-    ed.full_damage = true
-    ed.footer_dirty = true
+// The prompt buffer's index.
+fn cl_buf(ed: Ed) -> int {
+    ed.wins[ed.cmdline.target_win].buf
 }
 
-/// `yew_cmdline_close` (`cmdline.c:584-674`): back to the mode it was
-/// opened from; an accepted command's message stays.
-pub fn cmdline_close(mut ed: Ed, accepted: bool) {
+/// The prompt's length in bytes (0 when closed).
+pub fn cmdline_len(ed: Ed) -> int {
     if !ed.cmdline.active {
+        return 0
+    }
+    text.textbuf_len(ed.bufs[cl_buf(ed)].ec.tb)
+}
+
+/// The prompt's caret, a byte offset (C's `CmdLine.cur.pos`).
+pub fn cmdline_caret(ed: Ed) -> int {
+    if !ed.cmdline.active {
+        return 0
+    }
+    let w = ed.cmdline.target_win
+    let p = ed.wins[w].cs.primary
+    if p >= ed.wins[w].cs.curs.len {
+        return 0
+    }
+    ed.wins[w].cs.curs[p].pos
+}
+
+// Put the caret (and the anchor) at `at`, clamped (`line->cur = …;
+// yew_cursor_clamp; sync_to_target`).
+fn cl_set_caret(mut ed: Ed, at: int) {
+    let w = ed.cmdline.target_win
+    let b = ed.wins[w].buf
+    let p = ed.wins[w].cs.primary
+    if p >= ed.wins[w].cs.curs.len {
         return
     }
-    let keep_message = accepted && ed.msg.active && ed.cmdline.kind == PROMPT_CMD
-    var restore = ed.cmdline.return_mode
-    if restore < 0 || restore >= MODE_N || restore == MODE_E {
-        restore = MODE_L
-    }
-    ed.cmdline.active = false
-    ed.cmdline.scroll = 0
-    if !keep_message {
-        ed_msg_clear(mut ed)
-    }
-    if ed.mode != restore {
-        dispatch_set_mode(mut ed, restore)
-    }
-    ed.full_damage = true
-    ed.footer_dirty = true
+    ed.wins[w].cs.curs[p].pos = at
+    ed.wins[w].cs.curs[p].anchor = at
+    ed.wins[w].cs.curs[p].goal_col = 0
+    text.cursor_clamp(ed.bufs[b].ec.tb, mut ed.wins[w].cs.curs[p])
 }
 
-/// `yew_cmdline_key` (`cmdline.c:1331-1359`): a printable key types into
-/// the line through the registry; everything else falls to the keymap.
-pub fn cmdline_key(mut ed: Ed, key: term.Key) -> bool {
-    if !ed.cmdline.active {
-        return false
+/// The prompt's current text (`yew_cmdline_text`, `cmdline.c:1129-1145`):
+/// empty when there is no prompt.
+pub fn cmdline_text(ed: Ed) -> List[byte] {
+    if !ed.cmdline.active || ed.cmdline.target_win < 0 {
+        return List[byte]()
     }
-    if key.ev == term.KEY_RELEASE {
-        return true
-    }
-    if ed.capture_cmd != 0 {
-        return false
-    }
-    let command_mods = term.MOD_ALT |
-        term.MOD_CTRL |
-        term.MOD_SUPER |
-        term.MOD_HYPER |
-        term.MOD_META
-    if key.code < term.KEY_BASE && key.text.len != 0 && key.mods & command_mods == 0 {
-        cmdline_insert(mut ed, key.text)
-        return true
-    }
-    false
+    text.textbuf_bytes(ed.bufs[cl_buf(ed)].ec.tb)
 }
 
-/// `yew_cmdline_paste` (`cmdline.c:1361-1367`).
-pub fn cmdline_paste(mut ed: Ed, bytes: List[byte]) {
-    if ed.cmdline.active && bytes.len != 0 {
-        cmdline_insert(mut ed, bytes)
+/// `yew_cmdline_sync` (`cmdline.c:1147-1153`): the caret lives in the
+/// target window, so only the footer repaints.
+pub fn cmdline_sync(mut ed: Ed) {
+    if ed.cmdline.active {
+        ed.footer_dirty = true
     }
 }
 
@@ -169,6 +213,22 @@ pub fn cmdline_paste(mut ed: Ed, bytes: List[byte]) {
 fn sanitize_bytes(bytes: List[byte], mut out: List[byte]) {
     var newline_run = false
     for b in bytes {
+        let c = b as int
+        if c == 10 || c == 13 {
+            if !newline_run {
+                (mut out).push(32 as byte)
+            }
+            newline_run = true
+        } else {
+            (mut out).push(b)
+            newline_run = false
+        }
+    }
+}
+
+fn sanitize_str(s: str, mut out: List[byte]) {
+    var newline_run = false
+    for b in s.bytes() {
         let c = b as int
         if c == 10 || c == 13 {
             if !newline_run {
@@ -201,140 +261,864 @@ pub fn cmdline_clean(mut ed: Ed, w: int, b: List[byte]) -> (bool, List[byte]) {
     (true, out)
 }
 
-// `insert_sanitized` (`cmdline.c:314-328`) over `yew_cmdline_clean`.
-fn cmdline_insert(mut ed: Ed, bytes: List[byte]) {
-    let (ok, clean) = cmdline_clean(mut ed, ed.cmdline.target_win, bytes)
-    if !ok {
-        ed.last_status = CMD_ERR_ARG
-        return
-    }
-    if clean.len == 0 {
-        return
-    }
-    let s = str_from_utf8(clean) else ""
+// `invoke_prompt_text` (`cmdline.c:244-260`): the bytes through THE
+// invoke as `ed.edit.insert.text` on the prompt's window — as BYTES, so a
+// paste of invalid UTF-8 lands verbatim (yew#18).
+fn invoke_prompt_text(mut ed: Ed, bytes: List[byte]) -> int {
     var cx = cmdctx_new(ed.cmdline.target_win, SRC_KEY)
-    cx.sarg = s
+    cx.sbytes = copy bytes
+    cx.has_sbytes = true
     cx.has_sarg = true
     let id = cmd_lookup(ed.reg, "ed.edit.insert.text")
     ed.last_cmd = id
-    ed.last_status = ed_cmd_invoke(mut ed, id, mut cx)
+    let status = ed_cmd_invoke(mut ed, id, mut cx)
+    ed.last_status = status
     ed.dispatch_count += 1
+    status
 }
 
-fn cmdline_text(ed: Ed) -> List[byte] {
-    let bi = ed.wins[ed.cmdline.target_win].buf
-    text.textbuf_bytes(ed.bufs[bi].ec.tb)
-}
-
-// The narrow grammar: `name[!] [arg ...]`; the name or its abbreviation.
-fn resolve_name(ed: Ed, name: str) -> int {
-    let id = cmd_lookup(ed.reg, name)
-    if id != 0 {
-        return id
+// `insert_sanitized` (`cmdline.c:314-328`).
+fn insert_sanitized(mut ed: Ed, bytes: List[byte]) -> int {
+    let (ok, clean) = cmdline_clean(mut ed, ed.cmdline.target_win, bytes)
+    if !ok {
+        ed.last_status = CMD_ERR_ARG
+        return CMD_ERR_ARG
     }
-    var i = 0
-    while i < ed.reg.entries.len {
-        if ed.reg.entries[i].active &&
-            ed.reg.entries[i].has_abbrev &&
-            ed.reg.entries[i].abbrev == name {
-            return i + 1
+    invoke_prompt_text(mut ed, clean)
+}
+
+// `replace_span` (`cmdline.c:330-370`): `bytes` over `sp` of the prompt as
+// ONE typing transaction, the caret after it; an edit ends the history
+// walk when `reset_history`.
+fn replace_span(mut ed: Ed, sp: text.Span, bytes: List[byte], reset_history: bool) -> bool {
+    let w = ed.cmdline.target_win
+    let b = ed.wins[w].buf
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    if sp.lo > sp.hi || sp.hi > len {
+        return false
+    }
+    ed_undo_begin(mut ed, w, text.TXN_TYPE)
+    var ok = true
+    if sp.lo != sp.hi {
+        ok = ed_edit_delete(mut ed, w, sp.lo, sp.hi)
+    }
+    if ok && bytes.len != 0 {
+        ok = ed_edit_insert(mut ed, w, sp.lo, bytes, 0, bytes.len)
+    }
+    if ok {
+        ed_undo_end(mut ed, w)
+    } else {
+        ed_undo_abort(mut ed, w)
+    }
+    ed_finish_edit(mut ed, w)
+    if !ok {
+        return false
+    }
+    cl_set_caret(mut ed, sp.lo + bytes.len)
+    if reset_history {
+        cl_walk_end(mut ed)
+    }
+    cl_clear_error(mut ed)
+    ed.footer_dirty = true
+    true
+}
+
+fn replace_all(mut ed: Ed, bytes: List[byte], reset_history: bool) -> bool {
+    replace_span(mut ed, text.span(0, cmdline_len(ed)), bytes, reset_history)
+}
+
+// `clear_error` (`cmdline.c:191-199`).
+fn cl_clear_error(mut ed: Ed) {
+    if ed.cmdline.err_msg.len != 0 {
+        ed.cmdline.err_msg = ""
+        ed.cmdline.err_lo = 0
+        ed.cmdline.err_hi = 0
+        ed.full_damage = true
+    }
+    if ed.msg.active && ed.msg.sev == MSG_ERROR {
+        ed_msg_clear(mut ed)
+    }
+}
+
+/// `set_error` (`cmdline.c:201-237`): the prompt stays open WITH the
+/// message and the offending token, the caret at its start; a live menu
+/// goes (the menu and the message share the rows above the prompt).
+pub fn cmdline_set_error(mut ed: Ed, lo_in: int, hi_in: int, msg: str) {
+    cl_menu_dismiss(mut ed)
+    let len = cmdline_len(ed)
+    var lo = lo_in
+    var hi = hi_in
+    if len != 0 {
+        if lo >= len {
+            lo = len - 1
         }
-        i += 1
+        if hi <= lo {
+            hi = lo + 1
+        }
+        if hi > len {
+            hi = len
+        }
     }
-    0
+    ed.cmdline.err_lo = lo
+    ed.cmdline.err_hi = hi
+    ed.cmdline.err_msg = msg
+    cl_set_caret(mut ed, if len == 0 then 0 else lo)
+    ed_msg(mut ed, MSG_ERROR, "E: {msg}")
+    ed.full_damage = true
+    ed.footer_dirty = true
 }
 
-/// `ed.cmdline.accept` (`yew_cmdline_cmd_accept`, `cmdline.c:3401-3553`).
-pub fn cmdline_accept(mut ed: Ed) -> int {
+// ---- open, close, restore ---------------------------------------------
+
+// The prompt's window and buffer, made once (C makes a fresh pair per
+// prompt, `cmdline.c:470-491`); each open gives the buffer a fresh edit
+// context holding `seed`.
+fn cl_target_reset(mut ed: Ed, seed: List[byte]) {
+    var ec = text.editctx_new(take text.textbuf_from_bytes(seed, 0, seed.len))
+    ec.undo = text.undo_new(ec.tb)
+    ec.has_undo = true
+    ec.marks = text.marks_new()
+    ec.has_marks = true
+    if ed.cmdline.target_win < 0 {
+        let id = ed.next_buf_id
+        ed.next_buf_id += 1
+        (mut ed.bufs).push(Buffer {
+            id: id,
+            ec: ec,
+            resident: true,
+            path: "",
+            has_path: false,
+            name: "*cmdline*",
+            has_name: true,
+            flags: BUF_SCRATCH,
+            tabwidth: CMDLINE_TABWIDTH,
+            recovery_pending: false,
+            pairs: pairstate_new(),
+        })
+        let wid = ed.next_win_id
+        ed.next_win_id += 1
+        var w = win_new(wid, ed.bufs.len - 1)
+        vp_init(mut w)
+        (mut ed.wins).push(w)
+        ed.cmdline.target_win = ed.wins.len - 1
+    } else {
+        let bi = ed.wins[ed.cmdline.target_win].buf
+        ed.bufs[bi].ec = ec
+    }
+    let tw = ed.cmdline.target_win
+    ed.wins[tw].cs = text.cset_init(text.cursor_at(seed.len as text.ByteOff))
+}
+
+fn cl_forget_state(mut ed: Ed) {
+    ed.cmdline.err_msg = ""
+    ed.cmdline.err_lo = 0
+    ed.cmdline.err_hi = 0
+    ed.cmdline.hint = ""
+    ed.cmdline.scroll = 0
+    ed.cmdline.click_row = -1
+    ed.cmdline.hsearch = false
+    ed.cmdline.hsearch_line = List[byte]()
+    ed.cmdline.walk_prefix = 0
+    ed.cmdline.walk_bang = false
+    ed.cmdline.comp_total = 0
+    ed.cmdline.comp_asked = false
+    ed.cmdline.has_menu_stem = false
+    ed.cmdline.menu_stem = List[byte]()
+    ed.cmdline.menu_original = text.span(0, 0)
+    cl_tok_forget(mut ed)
+}
+
+/// `yew_cmdline_open` (`cmdline.c:463-540`): a fresh prompt of `kind`
+/// holding `seed` (sanitized), its caret at the end, E mode.
+pub fn cmdline_open(mut ed: Ed, kind: int, seed: str) {
+    var clean = List[byte]()
+    sanitize_str(seed, mut clean)
+    cmdline_open_bytes(mut ed, kind, clean)
+}
+
+/// `yew_cmdline_open` over a seed of bytes (already sanitized).
+pub fn cmdline_open_bytes(mut ed: Ed, kind: int, seed: List[byte]) {
+    if ed.cmdline.active {
+        cmdline_close(mut ed, false)
+    }
+    let old = ed.mode
+    ed.cmdline.generation += 1
+    if ed.cmdline.generation == 0 {
+        ed.cmdline.generation = 1
+    }
+    cl_target_reset(mut ed, seed)
+    ed.cmdline.kind = kind
+    ed.cmdline.active = true
+    ed.cmdline.return_mode = ed.mode
+    cl_forget_state(mut ed)
+    cl_menu_open(mut ed)
+    cl_history_open(mut ed, kind)
+    cl_walk_end(mut ed)
+    cl_suggest_reset(mut ed)
+    ed.cmdline.comp_idle_dirty = true
+    ed_msg_clear(mut ed)
+    if old != MODE_E {
+        dispatch_set_mode(mut ed, MODE_E)
+    }
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+/// `yew_cmdline_open_input` (`cmdline.c:572-582`): an input prompt whose
+/// answer goes to `done` (a kind) with `ctx`.
+pub fn cmdline_open_input(mut ed: Ed, seed: str, done: int, ctx: int) {
+    cmdline_open(mut ed, PROMPT_INPUT, seed)
+    if ed.cmdline.active {
+        ed.cmdline.input_done = done
+        ed.cmdline.input_ctx = ctx
+    }
+}
+
+/// `yew_cmdline_restore` (`cmdline.c:542-570`, s57.31 §2): reopen a
+/// prompt a command took away — its kind, its text, the caret at `caret`,
+/// the mode it returns to.
+pub fn cmdline_restore(mut ed: Ed, kind: int, line: List[byte], caret: int, return_mode: int) {
+    if kind == PROMPT_SEARCH_F || kind == PROMPT_SEARCH_B {
+        if ed.win < 0 {
+            return
+        }
+        cl_search_open(mut ed, kind == PROMPT_SEARCH_B)
+        if !ed.cmdline.active || !replace_all(mut ed, line, true) {
+            return
+        }
+        cmdline_edited(mut ed)
+    } else {
+        if ed.mode == MODE_I {
+            ed_insert_barrier(mut ed)
+        }
+        var clean = List[byte]()
+        sanitize_bytes(line, mut clean)
+        cmdline_open_bytes(mut ed, PROMPT_CMD, clean)
+        if !ed.cmdline.active {
+            return
+        }
+    }
+    if return_mode >= 0 && return_mode < MODE_N && return_mode != MODE_E {
+        ed.cmdline.return_mode = return_mode
+    }
+    cl_set_caret(mut ed, caret)
+    ed.footer_dirty = true
+}
+
+/// `yew_cmdline_close` (`cmdline.c:584-674`): back to the mode it was
+/// opened from; an accepted command's message stays; an input prompt's
+/// answer goes to its owner after the mode is restored.
+pub fn cmdline_close(mut ed: Ed, accepted: bool) {
+    if !ed.cmdline.active {
+        return
+    }
+    let input_done = ed.cmdline.input_done
+    let input_ctx = ed.cmdline.input_ctx
+    ed.cmdline.input_done = INPUT_DONE_NONE
+    ed.cmdline.input_ctx = 0
+    var input_text = List[byte]()
+    if input_done != INPUT_DONE_NONE {
+        input_text = cmdline_text(ed)
+    }
+    let kind = ed.cmdline.kind
+    let search = kind == PROMPT_SEARCH_F || kind == PROMPT_SEARCH_B
+    let keep_message = accepted &&
+        ed.msg.active &&
+        (kind == PROMPT_CMD || search && cl_search_preview_pending(ed))
+    if search {
+        if accepted {
+            cl_search_accept(mut ed)
+        } else {
+            cl_search_cancel(mut ed)
+        }
+    }
+    var restore = ed.cmdline.return_mode
+    if restore < 0 || restore >= MODE_N || restore == MODE_E {
+        restore = MODE_L
+    }
+    cl_menu_discard(mut ed)
+    cl_prompt_closed(mut ed)
+    ed.cmdline.comp_idle_dirty = false
+    cl_suggest_reset(mut ed)
+    cl_history_release(mut ed, kind)
+    cl_walk_end(mut ed)
+    ed.cmdline.hsearch = false
+    ed.cmdline.hsearch_line = List[byte]()
+    cl_tok_forget(mut ed)
+    ed.cmdline.active = false
+    ed.cmdline.err_msg = ""
+    ed.cmdline.err_lo = 0
+    ed.cmdline.err_hi = 0
+    ed.cmdline.scroll = 0
+    if !keep_message {
+        ed_msg_clear(mut ed)
+    }
+    if ed.mode != restore {
+        dispatch_set_mode(mut ed, restore)
+    }
+    ed.full_damage = true
+    ed.footer_dirty = true
+    cl_search_confirm_reprompt(mut ed)
+    if input_done != INPUT_DONE_NONE {
+        cmdline_input_done(mut ed, input_done, input_ctx, accepted, input_text)
+    }
+}
+
+/// The input prompts' owners (C's `YewCmdlineInputDone` pointers, one
+/// `match` on the kind): the LSP rename (yw11), the AI opt-in (yw12) and
+/// FUSS's questions (yw13) add their kinds with their campaigns.
+pub fn cmdline_input_done(mut ed: Ed, done: int, ctx: int, accepted: bool, answer: List[byte]) {
+    match done {
+        1 => {
+            ed.cmdline.input_seen += 1
+            ed.cmdline.input_accepted = accepted
+            ed.cmdline.input_text = copy answer
+            ed.cmdline.input_ctx = ctx
+        },
+        _ => bug("command line: an input prompt's answer has no owner (kind {done})"),
+    }
+}
+
+/// `yew_cmdline_dispose` (`cmdline.c:676-686`).
+pub fn cmdline_dispose(mut ed: Ed) {
+    if ed.cmdline.active {
+        cmdline_close(mut ed, false)
+    }
+    cl_history_dispose(mut ed)
+}
+
+// ---- typing -----------------------------------------------------------
+
+/// `yew_cmdline_key` (`cmdline.c:1331-1359`): a printable key types into
+/// the line through the registry, which lands in `cmdline_edited`;
+/// everything else falls to the keymap.
+pub fn cmdline_key(mut ed: Ed, key: term.Key) -> bool {
+    if !ed.cmdline.active {
+        return false
+    }
+    if key.ev == term.KEY_RELEASE {
+        return true
+    }
+    if ed.capture_cmd != 0 {
+        return false
+    }
+    let command_mods = term.MOD_ALT |
+        term.MOD_CTRL |
+        term.MOD_SUPER |
+        term.MOD_HYPER |
+        term.MOD_META
+    if key.code < term.KEY_BASE && key.text.len != 0 && key.mods & command_mods == 0 {
+        let _ = insert_sanitized(mut ed, key.text)
+        return true
+    }
+    false
+}
+
+/// `yew_cmdline_paste` (`cmdline.c:1361-1367`).
+pub fn cmdline_paste(mut ed: Ed, bytes: List[byte]) {
+    if ed.cmdline.active && bytes.len != 0 {
+        let _ = insert_sanitized(mut ed, bytes)
+    }
+}
+
+/// `yew_cmdline_edited` (`cmdline.c:1102-1127`): the one place that
+/// reacts to a prompt edit — the walk ends, the error clears, the table
+/// blurs and refilters; the search prompts preview.
+pub fn cmdline_edited(mut ed: Ed) {
+    if !ed.cmdline.active {
+        return
+    }
+    cl_walk_end(mut ed)
+    cl_clear_error(mut ed)
+    cl_menu_blur(mut ed)
+    ed.cmdline.comp_asked = false
+    ed.cmdline.comp_idle_dirty = true
+    cl_refilter(mut ed)
+    ed.footer_dirty = true
+    if ed.cmdline.kind == PROMPT_SEARCH_F || ed.cmdline.kind == PROMPT_SEARCH_B {
+        cl_search_input(mut ed)
+    }
+}
+
+// ---- the selection (s57.29) -------------------------------------------
+
+// The collapse table's rules (`PromptSel`, `cmdline.c:1164-1172`).
+const PSEL_COLLAPSE: int = 0
+
+const PSEL_EXTEND: int = 1
+
+const PSEL_KEEP: int = 2
+
+const PSEL_START: int = 3
+
+const PSEL_END: int = 4
+
+const PSEL_REPLACE: int = 5
+
+const PSEL_DELETE: int = 6
+
+// `prompt_sel_rows` and `prompt_sel_rule` (`cmdline.c:1174-1226`).
+fn prompt_sel_rule(command: str) -> int {
+    if command.starts_with("ed.sel.extend.") {
+        return PSEL_EXTEND
+    }
+    match command {
+        "ed.clip.copy" => PSEL_KEEP,
+        "ed.clip.cut" => PSEL_KEEP,
+        "ed.cmdline.copy_or_cancel" => PSEL_KEEP,
+        "ed.cmdline.last_arg" => PSEL_KEEP,
+        "ed.cmdline.insert_register" => PSEL_KEEP,
+        "ed.cmdline.literal_next" => PSEL_KEEP,
+        "ed.move.char.prev" => PSEL_START,
+        "ed.move.char.left" => PSEL_START,
+        "ed.move.char.next" => PSEL_END,
+        "ed.move.char.right" => PSEL_END,
+        "ed.cmdline.ghost.accept" => PSEL_END,
+        "ed.edit.insert.text" => PSEL_REPLACE,
+        "ed.clip.paste" => PSEL_REPLACE,
+        "ed.edit.kill.yank" => PSEL_REPLACE,
+        "ed.edit.delete.grapheme_left" => PSEL_DELETE,
+        "ed.edit.delete.grapheme" => PSEL_DELETE,
+        _ => PSEL_COLLAPSE,
+    }
+}
+
+/// `yew_cmdline_selection` (`cmdline.c:1240-1250`): the prompt's
+/// selection, [min(anchor, pos), max(anchor, pos)) of its primary cursor —
+/// STATE, never text. (false, empty) when it is empty or there is no
+/// prompt.
+pub fn cmdline_selection(ed: Ed) -> (bool, text.Span) {
+    if !ed.cmdline.active || ed.cmdline.target_win < 0 {
+        return (false, text.span(0, 0))
+    }
+    let w = ed.cmdline.target_win
+    let p = ed.wins[w].cs.primary
+    if p >= ed.wins[w].cs.curs.len {
+        return (false, text.span(0, 0))
+    }
+    let pos = ed.wins[w].cs.curs[p].pos
+    let anchor = ed.wins[w].cs.curs[p].anchor
+    if anchor == pos {
+        return (false, text.span(0, 0))
+    }
+    if pos < anchor {
+        return (true, text.span(pos, anchor))
+    }
+    (true, text.span(anchor, pos))
+}
+
+// `prompt_sel_collapse` (`cmdline.c:1252-1263`).
+fn prompt_sel_collapse(mut ed: Ed, at: int) {
+    let w = ed.cmdline.target_win
+    let p = ed.wins[w].cs.primary
+    if p >= ed.wins[w].cs.curs.len {
+        return
+    }
+    ed.wins[w].cs.curs[p].pos = at
+    ed.wins[w].cs.curs[p].anchor = at
+    ed.wins[w].cs.curs[p].goal_col = text.CCOL_HERE
+    ed.footer_dirty = true
+}
+
+// `prompt_sel_delete` (`cmdline.c:1265-1277`): joins the transaction the
+// dispatcher opened for the command, so a replacement is ONE undo step.
+fn prompt_sel_delete(mut ed: Ed, sp: text.Span) -> bool {
+    let w = ed.cmdline.target_win
+    let ok = ed_edit_delete(mut ed, w, sp.lo, sp.hi)
+    ed_finish_edit(mut ed, w)
+    if ok {
+        prompt_sel_collapse(mut ed, sp.lo)
+    }
+    ok
+}
+
+/// `yew_cmdline_sel` (`cmdline.c:1279-1318`): the collapse table, applied
+/// by THE invoke around every command it runs on the prompt's window.
+/// `after` false runs before the command, inside its transaction, and
+/// answers true when the selection was the whole event; `after` true
+/// leaves the selection collapsed unless the command was a Shift+motion.
+pub fn cmdline_sel(mut ed: Ed, command: str, after: bool) -> bool {
+    if !ed.cmdline.active {
+        return false
+    }
+    let w = ed.cmdline.target_win
+    let p = ed.wins[w].cs.primary
+    if p >= ed.wins[w].cs.curs.len {
+        return false
+    }
+    let rule = prompt_sel_rule(command)
+    let pos = ed.wins[w].cs.curs[p].pos
+    if after {
+        if rule != PSEL_EXTEND && ed.wins[w].cs.curs[p].anchor != pos {
+            prompt_sel_collapse(mut ed, pos)
+        }
+        return false
+    }
+    let (has, sp) = cmdline_selection(ed)
+    if !has {
+        return false
+    }
+    if rule == PSEL_EXTEND || rule == PSEL_KEEP {
+        return false
+    }
+    if rule == PSEL_START {
+        prompt_sel_collapse(mut ed, sp.lo)
+        return true
+    }
+    if rule == PSEL_END {
+        prompt_sel_collapse(mut ed, sp.hi)
+        return true
+    }
+    if rule == PSEL_REPLACE {
+        return !prompt_sel_delete(mut ed, sp)
+    }
+    if rule == PSEL_DELETE {
+        let _ = prompt_sel_delete(mut ed, sp)
+        return true
+    }
+    prompt_sel_collapse(mut ed, pos)
+    false
+}
+
+/// `ed.cmdline.copy_or_cancel` (`yew_cmdline_cmd_copy_or_cancel`,
+/// `cmdline.c:1320-1329`): copy a selection and stay; none, cancel.
+pub fn cmdline_copy_or_cancel_cmd(mut ed: Ed, cx: CmdCtx) -> int {
     if !ed.cmdline.active {
         return CMD_ERR_STATE
     }
-    let raw = cmdline_text(ed)
-    if raw.len == 0 {
-        cmdline_close(mut ed, true)
-        return CMD_OK
+    let (has, _) = cmdline_selection(ed)
+    if !has {
+        return cmdline_cancel_cmd(mut ed, cx)
     }
-    let line = str_from_utf8(raw) else ""
-    let gen = ed.cmdline.generation
-    var words = List[str]()
-    for w in line.words() {
-        (mut words).push(w)
-    }
-    if words.len == 0 {
-        cmdline_close(mut ed, true)
-        return CMD_OK
-    }
-    var name = words[0]
-    let first = name.bytes()[0] as int
-    if first >= 48 && first <= 57 || first == 37 || first == 46 || first == 39 || first == 36 {
-        ed_msg(
-            mut ed,
-            MSG_ERROR,
-            "not yet ported: command ranges: sagitta Sprint 18 (the command line) (yw04)",
-        )
-        return CMD_ERR_DEFERRED
-    }
-    if first == 33 {
-        ed_msg(
-            mut ed,
-            MSG_ERROR,
-            "not yet ported: shell commands: sagitta Sprint 19 (shell jobs) (yw04)",
-        )
-        return CMD_ERR_DEFERRED
-    }
-    var bang = false
-    if name.ends_with("!") {
-        bang = true
-        name = name[0..name.len - 1]
-    }
-    let id = resolve_name(ed, name)
-    if id == 0 {
-        ed_msg(mut ed, MSG_ERROR, "unknown command '{name}' (try Tab)")
+    var c = copy cx
+    c.win = cmdline_target(ed)
+    sc_clip_copy(mut ed, c)
+}
+
+// ---- the register and literal inserts ---------------------------------
+
+/// `ed.cmdline.insert_register` (`yew_cmdline_cmd_insert_register`,
+/// `cmdline.c:2272-2288`).
+pub fn cmdline_insert_register_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    if !ed.cmdline.active || !cx.has_sarg || cx.sarg.len == 0 {
         return CMD_ERR_ARG
     }
-    var cx = cmdctx_new(ed.win, SRC_CMDLINE)
-    cx.bang = bang
-    for w in words {
-        (mut cx.argv).push(w)
+    let name = cx.sarg.bytes()[0] as int
+    let value = text.reg_get(mut ed.regs, name) else {
+        ed_msg(mut ed, MSG_ERROR, "unknown register '{cx.sarg}'")
+        return CMD_ERR_ARG
     }
-    let arity = ed.reg.entries[id - 1].arity
-    if words.len > 1 {
-        if arity == ARITY_STR || arity == ARITY_OPT_STR {
-            cx.sarg = words[1]
-            cx.has_sarg = true
-        } else if arity == ARITY_INT || arity == ARITY_OPT_INT {
-            cx.iarg = words[1].to_int() else {
-                return CMD_ERR_ARG
-            }
-        }
+    insert_sanitized(mut ed, value.bytes)
+}
+
+/// `ed.cmdline.literal_next` (`yew_cmdline_cmd_literal_next`,
+/// `cmdline.c:2290-2296`).
+pub fn cmdline_literal_next_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    if !ed.cmdline.active || !cx.has_sarg {
+        return CMD_ERR_ARG
     }
-    let status = ed_cmd_invoke(mut ed, id, mut cx)
+    insert_sanitized(mut ed, sarg_bytes(cx))
+}
+
+// ---- accept and cancel ------------------------------------------------
+
+/// `ed.cmdline.accept` (`yew_cmdline_cmd_accept`, `cmdline.c:3401-3553`).
+pub fn cmdline_accept_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if ed.cmdline.hsearch {
+        return cl_hsearch_accept(mut ed)
+    }
+    let kind = ed.cmdline.kind
+    let gen = ed.cmdline.generation
+    if cl_menu_chosen(ed) {
+        return cl_menu_take_chosen(mut ed)
+    }
+    let line = cmdline_text(ed)
+    if line.len == 0 {
+        cmdline_close(mut ed, true)
+        return CMD_OK
+    }
+    if kind == PROMPT_SEARCH_F || kind == PROMPT_SEARCH_B || kind == PROMPT_INPUT {
+        cl_history_add(mut ed, line)
+        cmdline_close(mut ed, true)
+        return CMD_OK
+    }
+    let (status, ran) = cl_run_line(mut ed, line)
     if status != CMD_OK {
         return status
     }
-    if ed.cmdline.active && ed.cmdline.generation == gen {
+    let same = ed.cmdline.active && ed.cmdline.generation == gen && ed.cmdline.kind == kind
+    if same {
+        cl_history_add(mut ed, ran)
+    } else {
+        cl_history_add_closed(mut ed, kind, ran)
+    }
+    text.reg_set_cmdline(mut ed.regs, ran)
+    if same {
         cmdline_close(mut ed, true)
     }
     CMD_OK
 }
 
-/// `yew_cmdline_draw` (`cmdline.c:3763-3860`): `:` in E's chip colours,
-/// the text in its row colours, the terminal cursor at the caret.
+/// `ed.cmdline.cancel` (`yew_cmdline_cmd_cancel`, `cmdline.c:3555-3600`):
+/// Esc leaves C-r's pager, then a menu the user opened or entered
+/// (putting the stem back), then the prompt.
+pub fn cmdline_cancel_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if ed.cmdline.hsearch {
+        return cl_hsearch_cancel(mut ed)
+    }
+    if cl_menu_owned(ed) {
+        return cl_menu_cancel(mut ed)
+    }
+    cmdline_close(mut ed, false)
+    CMD_OK
+}
+
+// `%.Ns`: at most `n` bytes of `s`, cut back to a code-point boundary.
+fn clip_bytes(s: str, n: int) -> str {
+    if s.len <= n {
+        return s
+    }
+    var k = n
+    while k > 0 && s.bytes()[k] as int >= 128 && s.bytes()[k] as int < 192 {
+        k -= 1
+    }
+    s[0..k]
+}
+
+// `deferred_dispatch_error` (`cmdline.c:3277-3320`): a deferred command's
+// error names the sprint its help names.
+fn deferred_dispatch_error(mut ed: Ed, id: int, lo: int, hi: int) {
+    let known = id > 0 && id <= ed.reg.entries.len
+    let name = if known then ed.reg.entries[id - 1].name else ""
+    let label = if !known {
+        "command"
+    } else if name.starts_with("ed.") {
+        name[3..]
+    } else {
+        name
+    }
+    let help = if known then ed.reg.entries[id - 1].help else ""
+    let preserve = name.starts_with("ed.ai.") && ed.msg.active && ed.msg.text.len != 0
+    var msg = ":{label} failed"
+    let at = help.find("Sprint ") else -1
+    if at >= 0 {
+        var n = at + 7
+        while n < help.len &&
+            n - at - 7 < 15 &&
+            help.bytes()[n] as int >= 48 &&
+            help.bytes()[n] as int <= 57 {
+            n += 1
+        }
+        let number = help[at + 7..n]
+        if preserve {
+            msg = "{clip_bytes(ed.msg.text, 64)}; :{clip_bytes(label, 24)} lands in Sprint {number}"
+        } else {
+            msg = ":{label} lands in Sprint {number}"
+        }
+    }
+    cmdline_set_error(mut ed, lo, hi, msg)
+}
+
+/// After a command parsed from the prompt ran and failed
+/// (`cmdline.c:3500-3527`): a deferred command names its sprint; any
+/// other failure keeps the message the command left, at the name's token.
+pub fn cmdline_failed(mut ed: Ed, status: int, id: int, lo: int, hi: int, kind: int, gen: int) {
+    let same = ed.cmdline.active && ed.cmdline.generation == gen && ed.cmdline.kind == kind
+    if !same {
+        return
+    }
+    if status == CMD_ERR_DEFERRED {
+        deferred_dispatch_error(mut ed, id, lo, hi)
+        return
+    }
+    var msg = "command failed"
+    if ed.msg.active && ed.msg.text.len != 0 {
+        msg = clip_bytes(ed.msg.text, 127)
+    }
+    cmdline_set_error(mut ed, lo, hi, msg)
+}
+
+// ---- drawing ----------------------------------------------------------
+
+fn cl_blank(style: UiStyle) -> term.Cell {
+    var cell = term.cell_blank()
+    cell.fg = copy style.row_fg
+    cell.bg = copy style.row_bg
+    cell.attrs = style.attrs
+    cell.w = 1
+    cell
+}
+
+// The cell column of byte offset `off` in the prompt (`yew_off_to_ccol`
+// over the whole line, tab width 4).
+fn cl_ccol(ed: Ed, off: int) -> int {
+    let bi = cl_buf(ed)
+    let n = text.textbuf_len(ed.bufs[bi].ec.tb)
+    text.off_to_ccol(
+        ed.bufs[bi].ec.tb,
+        text.span(0, n),
+        off as text.ByteOff,
+        CMDLINE_TABWIDTH,
+    ) as int
+}
+
+// `prompt_message_row` (`cmdline.c:3629-3655`): how much of `s[at..end)`
+// one row of `cells` takes, and how far to advance past it.
+fn prompt_message_row(s: List[byte], at: int, end: int, cells: int) -> (int, int) {
+    var nl = at
+    while nl < end && s[nl] as int != 10 {
+        nl += 1
+    }
+    let line_len = nl - at
+    if line_len == 0 {
+        return (0, if nl < end then 1 else 0)
+    }
+    let (clip_end, _) = unicode.str_clip(s, at, nl, cells)
+    let n_take = clip_end - at
+    if n_take == 0 {
+        let next = unicode.gb_next_bytes(s, nl, at)
+        return (0, next - at)
+    }
+    var advance = n_take
+    if n_take == line_len && nl < end {
+        advance += 1
+    }
+    (n_take, advance)
+}
+
+// `draw_prompt_message_full` (`cmdline.c:3657-3705`): a multi-line
+// disclosure over the rows above the prompt, its tail kept when the
+// terminal is too short.
+fn draw_prompt_message_full(mut ed: Ed, footer: int, style: UiStyle, s: List[byte]) {
+    var pos = 0
+    var rows = 0
+    while pos < s.len {
+        let (_, advance) = prompt_message_row(s, pos, s.len, ed.grid.cols)
+        if advance == 0 {
+            break
+        }
+        pos += advance
+        rows += 1
+    }
+    if rows == 0 {
+        return
+    }
+    let skip = if rows > footer then rows - footer else 0
+    var row = if rows < footer then footer - rows else 0
+    var seen = 0
+    pos = 0
+    while pos < s.len && row < footer {
+        let (n_take, advance) = prompt_message_row(s, pos, s.len, ed.grid.cols)
+        if advance == 0 {
+            break
+        }
+        if seen >= skip {
+            term.grid_fill(mut ed.grid, row, 0, ed.grid.cols, cl_blank(style))
+            if n_take != 0 {
+                let _ = term.grid_puts(
+                    mut ed.grid,
+                    row,
+                    0,
+                    s,
+                    pos,
+                    pos + n_take,
+                    copy style.row_fg,
+                    copy style.row_bg,
+                    style.attrs,
+                )
+            }
+            row += 1
+        }
+        seen += 1
+        pos += advance
+    }
+}
+
+// `draw_prompt_message` (`cmdline.c:3707-3761`): the error, else the
+// message, else the parser's hint, on the row above the prompt — unless a
+// menu holds it.
+fn draw_prompt_message(mut ed: Ed, footer: int, style: UiStyle) {
+    if footer == 0 || cl_menu_open_rows(ed) {
+        return
+    }
+    var mstyle = copy style
+    var message = ""
+    if ed.cmdline.err_msg.len != 0 {
+        mstyle.row_fg = term.color_indexed(196)
+        mstyle.attrs = mstyle.attrs | term.ATTR_BOLD
+        message = "E: {ed.cmdline.err_msg}"
+    } else if ed.msg.active {
+        mstyle = message_style(ed)
+        if ed.cmdline.kind == PROMPT_INPUT && ed.msg.text.contains("\n") {
+            draw_prompt_message_full(mut ed, footer, mstyle, bytes_of(ed.msg.text))
+            return
+        }
+        message = if ed.msg.sev == MSG_ERROR then "E: {ed.msg.text}" else ed.msg.text
+    } else if ed.cmdline.hint.len != 0 {
+        mstyle.attrs = mstyle.attrs | term.ATTR_DIM
+        message = ed.cmdline.hint
+    } else {
+        return
+    }
+    term.grid_fill(mut ed.grid, footer - 1, 0, ed.grid.cols, cl_blank(mstyle))
+    let mb = bytes_of(message)
+    let _ = term.grid_puts(
+        mut ed.grid,
+        footer - 1,
+        0,
+        mb,
+        0,
+        mb.len,
+        copy mstyle.row_fg,
+        copy mstyle.row_bg,
+        mstyle.attrs,
+    )
+}
+
+// The screen cells [x0, x1) of prompt bytes `sp`, clamped to the text
+// drawn (`col`): the history match's and the selection's arithmetic
+// (`cmdline.c:3880-3933`).
+fn cl_span_cells(ed: Ed, r: Rect, sp: text.Span, col: int) -> (int, int) {
+    let lo = cl_ccol(ed, sp.lo)
+    let hi = cl_ccol(ed, sp.hi)
+    let base = r.x + 1
+    let scroll = ed.cmdline.scroll
+    let x0v = if lo > scroll then base + lo - scroll else base
+    let x1v = if hi > scroll then base + hi - scroll else base
+    (if x0v > col then col else x0v, if x1v > col then col else x1v)
+}
+
+/// `yew_cmdline_draw` (`cmdline.c:3763-3957`): `:`, `/` or `?` in E's chip
+/// colours, the line scrolled to the caret, the error token, the history
+/// match, the selection, the ghost, the menu above, the message or hint
+/// above that, the terminal's bar cursor at the caret.
 pub fn cmdline_draw(mut ed: Ed, r: Rect) {
     if !ed.cmdline.active || r.h == 0 || r.y >= ed.grid.rows {
         return
     }
     let style = statusline_mode_style(MODE_E)
-    var blank = term.cell_blank()
-    blank.fg = copy style.row_fg
-    blank.bg = copy style.row_bg
+    let blank = cl_blank(style)
     term.grid_fill(mut ed.grid, r.y, r.x, r.x + r.w, copy blank)
-    let colon = bytes_of(":")
+    let prefix = if ed.cmdline.kind == PROMPT_SEARCH_F {
+        bytes_of("/")
+    } else if ed.cmdline.kind == PROMPT_SEARCH_B {
+        bytes_of("?")
+    } else {
+        bytes_of(":")
+    }
     var col = term.grid_put(
         mut ed.grid,
         r.y,
         r.x,
-        colon,
+        prefix,
         0,
         1,
         copy style.chip_fg,
@@ -342,37 +1126,114 @@ pub fn cmdline_draw(mut ed: Ed, r: Rect) {
         style.attrs,
     )
     let right = if r.x + r.w > ed.grid.cols then ed.grid.cols else r.x + r.w
-    let raw = cmdline_text(ed)
-    let tw = ed.cmdline.target_win
-    let caret_off = ed.wins[tw].cs.curs[ed.wins[tw].cs.primary].pos
-    let caret = unicode.str_width(raw, 0, caret_off, 1)
+    let bi = cl_buf(ed)
+    let len = text.textbuf_len(ed.bufs[bi].ec.tb)
+    let line = text.span(0, len)
+    let caret = cl_ccol(ed, cmdline_caret(ed))
     let visible = if right > col then right - col else 0
     if caret < ed.cmdline.scroll {
         ed.cmdline.scroll = caret
     } else if visible != 0 && caret >= ed.cmdline.scroll + visible {
         ed.cmdline.scroll = caret - visible + 1
     }
-    let (skip, skipped) = unicode.str_clip(raw, 0, raw.len, ed.cmdline.scroll)
-    if skipped < ed.cmdline.scroll && col < right {
-        let gap = ed.cmdline.scroll - skipped
+    var at = text.ccol_to_off(
+        ed.bufs[bi].ec.tb,
+        line,
+        ed.cmdline.scroll as text.CCol,
+        CMDLINE_TABWIDTH,
+    ) as int
+    var logical = cl_ccol(ed, at)
+    if logical > ed.cmdline.scroll && col < right {
+        let gap = logical - ed.cmdline.scroll
         let n_take = if gap > right - col then right - col else gap
         term.grid_fill(mut ed.grid, r.y, col, col + n_take, copy blank)
         col += n_take
     }
-    if skip < raw.len && col < right {
-        col = term.grid_puts(
-            mut ed.grid,
-            r.y,
-            col,
-            raw,
-            skip,
-            raw.len,
-            copy style.row_fg,
-            copy style.row_bg,
-            0,
-        )
+    while at < len && col < right {
+        let (ok, cl) = text.text_cluster_next(ed.bufs[bi].ec.tb, line, at as text.ByteOff)
+        if !ok {
+            bug("cannot decode command line cluster")
+        }
+        if cl.tab {
+            let cells = text.tab_cells(logical as text.CCol, CMDLINE_TABWIDTH)
+            let n_take = if cells > right - col then right - col else cells
+            term.grid_fill(mut ed.grid, r.y, col, col + n_take, copy blank)
+            col += n_take
+        } else {
+            var bytes = List[byte]()
+            text.textbuf_append_range(mut bytes, ed.bufs[bi].ec.tb, cl.lo, cl.hi)
+            col = term.grid_put(
+                mut ed.grid,
+                r.y,
+                col,
+                bytes,
+                0,
+                bytes.len,
+                copy style.row_fg,
+                copy style.row_bg,
+                0,
+            )
+        }
+        logical += cl.cells
+        at = cl.hi
     }
-    let ccol = r.x + 1 + caret - ed.cmdline.scroll
+    if ed.cmdline.err_hi > ed.cmdline.err_lo && len != 0 {
+        let lo = cl_ccol(ed, ed.cmdline.err_lo)
+        let hi = cl_ccol(ed, ed.cmdline.err_hi)
+        let scroll = ed.cmdline.scroll
+        let x0v = if lo > scroll then r.x + 1 + lo - scroll else r.x + 1
+        let x1v = if hi > scroll then r.x + 1 + hi - scroll else x0v + 1
+        var cell = copy blank
+        cell.bg = term.color_indexed(196)
+        cell.attrs = cell.attrs | term.ATTR_UNDERLINE
+        let x0 = if x0v > right then right else x0v
+        var x1 = if x1v > right then right else x1v
+        if x1 <= x0 && x0 < right {
+            x1 = x0 + 1
+        }
+        term.grid_overlay(mut ed.grid, r.y, x0, x1, cell, term.OVERLAY_BG | term.OVERLAY_ATTRS)
+    }
+    let (hist_hit, hit) = cmdline_hist_match(ed)
+    if hist_hit {
+        let (x0, x1) = cl_span_cells(ed, r, hit, col)
+        let (match_style, fields) = draw_search_style(ed, false)
+        if x0 < x1 {
+            term.grid_overlay(mut ed.grid, r.y, x0, x1, match_style, fields)
+        }
+    }
+    let (has_sel, sel) = cmdline_selection(ed)
+    if has_sel {
+        let (x0, x1) = cl_span_cells(ed, r, sel, col)
+        let (sel_style, fields) = draw_sel_style(ed)
+        if x0 < x1 {
+            term.grid_overlay(mut ed.grid, r.y, x0, x1, sel_style, fields)
+        }
+    }
+    if col < right {
+        let ghost = cmdline_ghost(mut ed)
+        if ghost.len != 0 {
+            let (keep, _) = unicode.str_clip(ghost, 0, ghost.len, right - col)
+            let _ = term.grid_puts(
+                mut ed.grid,
+                r.y,
+                col,
+                ghost,
+                0,
+                keep,
+                copy style.row_fg,
+                copy style.row_bg,
+                style.attrs | term.ATTR_DIM,
+            )
+        }
+    }
+    cl_draw_menu(mut ed, r.y, style)
+    draw_prompt_message(mut ed, r.y, style)
+    let cursor_x = r.x + 1 + (if caret > ed.cmdline.scroll then caret - ed.cmdline.scroll else 0)
+    let x = if cursor_x >= right {
+        if right == 0 then 0 else right - 1
+    } else {
+        cursor_x
+    }
     term.grid_cursor_shape(mut ed.grid, term.CURSOR_BAR)
-    term.grid_cursor(mut ed.grid, r.y, if ccol >= right then right - 1 else ccol, true)
+    term.grid_cursor(mut ed.grid, r.y, x, right != 0)
 }
