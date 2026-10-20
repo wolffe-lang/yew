@@ -1,0 +1,3335 @@
+//! text.undo — the undo tree: transactions, grouping, branches, the save
+//! point, trimming under a byte budget, and the `.yewu` sidecar.
+//!
+//! Ports sagitta `src/text/undo.c` (3205 lines) and `undo.h` (231) at
+//! 9ace98c2, under `s10-undo-tree.md`. A node is a transaction of ops
+//! (an insert names its payload's span in the add store; a delete owns a
+//! blob of the removed bytes and the mark repairs its inverse needs), with
+//! the cursor set before and after; typing and erasing bursts merge into
+//! one node within 400 ms and 4 KiB (`may_merge`); undo replays a node's
+//! inverse, redo its ops, `undo_to` walks through the lowest common
+//! ancestor; past `bytes_max` the tree prunes unprotected branches, then
+//! re-roots, and compacts its arenas. The sidecar (`YEWU`, versions 1
+//! FNV and 2 block-hash identity) round-trips byte for byte and is
+//! adopted only when the buffer matches its current or anchor identity.
+//!
+//! The wolf shapes. Node ids are 1-based as C's, the node at id `n` is
+//! `nodes[n - 1]`, 0 is none. The arenas are lists; a C `len =` cut is a
+//! rebuild or a pop loop. The byte budget counts C's `sizeof`s, measured
+//! against the oracle's headers on kasumi (node 104, op 32, cursor record
+//! 24, mark repair 16, repair run 8, replay span 24), so a budget trims
+//! at the same edit it does in C. C's injectable clocks are function
+//! pointers with a context; here a tree has a fake clock VALUE the tests
+//! set (`undo_set_clock`, `fake_mono`, `fake_wall`), values not function
+//! values across modules (docs/MAP.md §1). `yew_undo_dump` writes to a
+//! `FILE`; `undo_dump` answers the same text. The identity-hash counter
+//! (YEW-F-072's test hook) is module state behind `unsafe`.
+
+use util
+
+/// `YEW_UNDO_BURST_MS`.
+pub const UNDO_BURST_MS: int = 400
+
+/// `YEW_UNDO_BURST_BYTES`.
+pub const UNDO_BURST_BYTES: int = 4096
+
+/// `YEW_UNDO_BYTES_MAX`: 64 MiB.
+pub const UNDO_BYTES_MAX: int = 67108864
+
+/// `YEW_UNDO_MIN_NODES`.
+pub const UNDO_MIN_NODES: int = 200
+
+/// `YEW_UNDO_PERSIST_BYTES_MAX`: 16 MiB.
+pub const UNDO_PERSIST_BYTES_MAX: int = 16777216
+
+/// `YEW_OP_INS`.
+pub const OP_INS: int = 1
+
+/// `YEW_OP_DEL`.
+pub const OP_DEL: int = 2
+
+/// `YewTxnReason`: typing.
+pub const TXN_TYPE: int = 0
+
+/// Erasing.
+pub const TXN_ERASE: int = 1
+
+/// A paste.
+pub const TXN_PASTE: int = 2
+
+/// A cut.
+pub const TXN_CUT: int = 3
+
+/// A multi-cursor edit.
+pub const TXN_MULTI: int = 4
+
+/// A macro.
+pub const TXN_MACRO: int = 5
+
+/// A filter.
+pub const TXN_FILTER: int = 6
+
+/// A replace.
+pub const TXN_REPLACE: int = 7
+
+/// An LSP edit.
+pub const TXN_LSP: int = 8
+
+/// An external change (journal recovery).
+pub const TXN_EXTERNAL: int = 9
+
+/// `YEW_TXN_REASON_MAX`.
+pub const TXN_REASON_MAX: int = 10
+
+/// Node flag: re-rooted by a trim.
+pub const TXN_TRIMMED: int = 1
+
+/// Node flag: the save point.
+pub const TXN_SAVED: int = 2
+
+/// Node flag: tombstoned.
+pub const TXN_DEAD: int = 4
+
+/// `YewUndoWriteResult`: written.
+pub const UNDO_WRITE_OK: int = 0
+
+/// An I/O failure.
+pub const UNDO_WRITE_IO: int = 1
+
+/// Over the persist budget even truncated.
+pub const UNDO_WRITE_TOO_LARGE: int = 2
+
+/// `YewUndoReadResult`: adopted at the current state.
+pub const UNDO_READ_CURRENT: int = 0
+
+/// Adopted at the anchor (the saved state).
+pub const UNDO_READ_ANCHOR: int = 1
+
+/// Dropped (invalid, stale, unsafe).
+pub const UNDO_READ_DROPPED: int = 2
+
+/// An I/O failure.
+pub const UNDO_READ_IO: int = 3
+
+const YEWU_VERSION_FNV: int = 1
+
+const YEWU_VERSION_BLOCK: int = 2
+
+const YEWU_VERSION: int = 2
+
+const YEWU_HEADER_LEN: int = 64
+
+const YEWU_TRUNCATED: int = 1
+
+// C's sizeofs (module doc).
+const SIZE_NODE: int = 104
+
+const SIZE_OP: int = 32
+
+const SIZE_CURSOR_REC: int = 24
+
+const SIZE_REPAIR: int = 16
+
+const SIZE_RUN: int = 8
+
+const SIZE_REPLAY: int = 24
+
+/// One recorded edit (`UndoOp`): an insert's `payload` is its span start
+/// in store `src`; a delete's is its blob offset.
+pub struct UndoOp {
+    kind: int,
+    src: int,
+    off: int,
+    len: int,
+    payload: int,
+}
+
+/// A recorded cursor (`CursorRec`).
+pub struct CursorRec {
+    pos: int,
+    anchor: int,
+    goal: int,
+}
+
+/// A mark the inverse of a delete puts back (`MarkRepair`).
+pub struct MarkRepair {
+    mark_id: int,
+    mark_gen: int,
+    rel_off: int,
+}
+
+/// Each delete's slice of the repairs (`UndoRepairRun`).
+pub struct UndoRepairRun {
+    at: int,
+    len: int,
+}
+
+/// A delete's re-insert span, cached after its first undo
+/// (`UndoReplaySpan`).
+pub struct UndoReplaySpan {
+    lo: int,
+    hi: int,
+    src: int,
+    valid: bool,
+}
+
+/// One transaction (`UndoNode`, `undo.h:72-94`).
+pub struct UndoNode {
+    id: int,
+    parent: int,
+    first_child: int,
+    next_sibling: int,
+    redo_child: int,
+    depth: int,
+    ops_at: int,
+    n_ops: int,
+    blob_lo: int,
+    blob_hi: int,
+    cur_before: int,
+    n_before: int,
+    cur_after: int,
+    n_after: int,
+    rep_at: int,
+    n_rep: int,
+    win_id: int,
+    t_wall: int,
+    t_last_ms: int,
+    reason: int,
+    flags: int,
+}
+
+/// The tree (`UndoTree`, `undo.h:107-149`); `owner_bid` names the buffer
+/// C's `owner` pointer did.
+pub struct UndoTree {
+    nodes: List[UndoNode],
+    ops: List[UndoOp],
+    cursors: List[CursorRec],
+    repairs: List[MarkRepair],
+    repair_runs: List[UndoRepairRun],
+    replay_spans: List[UndoReplaySpan],
+    blobs: List[byte],
+    root: int,
+    cur: int,
+    saved: int,
+    open: int,
+    depth: int,
+    bytes_live: int,
+    bytes_dead: int,
+    gen: int,
+    root_len: int,
+    root_hash: wrapping[u64],
+    root_owner_gen: int,
+    saved_len: int,
+    saved_hash: wrapping[u64],
+    bytes_max: int,
+    persist_bytes_max: int,
+    min_nodes: int,
+    identity_version: int,
+    persist_truncated: bool,
+    pending_reason: int,
+    boundary: bool,
+    over_budget_logged: bool,
+    root_owner_identity: bool,
+    reopened: bool,
+    reopen_n_ops: int,
+    reopen_n_rep: int,
+    reopen_cur_after: int,
+    reopen_n_after: int,
+    reopen_blob_hi: int,
+    reopen_t_last_ms: int,
+    clock_fake: bool,
+    fake_mono: int,
+    fake_wall: int,
+    owner_bid: int,
+}
+
+/// What `undo_list` answers per live node (`UndoNodeInfo`).
+pub struct UndoNodeInfo {
+    id: int,
+    parent: int,
+    depth: int,
+    n_children: int,
+    reason: int,
+    t_wall: int,
+    bytes_ins: int,
+    bytes_del: int,
+    on_current_path: bool,
+    is_current: bool,
+    is_saved: bool,
+    is_trimmed: bool,
+}
+
+// `unsafe` census: C's `static u64 text_hash_calls` (`undo.c:35`), the
+// YEW-F-072 test hook counting full identity scans.
+var text_hash_calls: int = 0
+
+/// Full buffer identity scans so far (`yew_undo_hash_count`).
+pub fn undo_hash_count() -> int {
+    // # Safety: invariant 8 — one task edits and hashes.
+    unsafe {
+        text_hash_calls
+    }
+}
+
+/// Reset the scan counter (`yew_undo_hash_count_reset`).
+pub fn undo_hash_count_reset() {
+    // # Safety: invariant 8 — one task edits and hashes.
+    unsafe {
+        text_hash_calls = 0
+    }
+}
+
+fn hash_count_bump() {
+    // # Safety: invariant 8 — one task edits and hashes.
+    unsafe {
+        text_hash_calls += 1
+    }
+}
+
+fn zero_node() -> UndoNode {
+    UndoNode {
+        id: 0,
+        parent: 0,
+        first_child: 0,
+        next_sibling: 0,
+        redo_child: 0,
+        depth: 0,
+        ops_at: 0,
+        n_ops: 0,
+        blob_lo: 0,
+        blob_hi: 0,
+        cur_before: 0,
+        n_before: 0,
+        cur_after: 0,
+        n_after: 0,
+        rep_at: 0,
+        n_rep: 0,
+        win_id: 0,
+        t_wall: 0,
+        t_last_ms: 0,
+        reason: 0,
+        flags: 0,
+    }
+}
+
+/// An empty tree with no root: the `has_undo` false placeholder.
+pub fn undo_none() -> UndoTree {
+    UndoTree {
+        nodes: List[UndoNode](),
+        ops: List[UndoOp](),
+        cursors: List[CursorRec](),
+        repairs: List[MarkRepair](),
+        repair_runs: List[UndoRepairRun](),
+        replay_spans: List[UndoReplaySpan](),
+        blobs: List[byte](),
+        root: 0,
+        cur: 0,
+        saved: 0,
+        open: 0,
+        depth: 0,
+        bytes_live: 0,
+        bytes_dead: 0,
+        gen: 0,
+        root_len: 0,
+        root_hash: 0,
+        root_owner_gen: 0,
+        saved_len: 0,
+        saved_hash: 0,
+        bytes_max: UNDO_BYTES_MAX,
+        persist_bytes_max: UNDO_PERSIST_BYTES_MAX,
+        min_nodes: UNDO_MIN_NODES,
+        identity_version: YEWU_VERSION,
+        persist_truncated: false,
+        pending_reason: TXN_REASON_MAX,
+        boundary: true,
+        over_budget_logged: false,
+        root_owner_identity: false,
+        reopened: false,
+        reopen_n_ops: 0,
+        reopen_n_rep: 0,
+        reopen_cur_after: 0,
+        reopen_n_after: 0,
+        reopen_blob_hi: 0,
+        reopen_t_last_ms: 0,
+        clock_fake: false,
+        fake_mono: 0,
+        fake_wall: 0,
+        owner_bid: 0,
+    }
+}
+
+fn node_ok(ut: UndoTree, id: int) -> bool {
+    id > 0 && id <= ut.nodes.len
+}
+
+fn node_live(ut: UndoTree, id: int) -> bool {
+    node_ok(ut, id) && ut.nodes[id - 1].flags & TXN_DEAD == 0
+}
+
+fn mono_now(ut: UndoTree) -> int {
+    if ut.clock_fake {
+        return ut.fake_mono
+    }
+    time_now_ms()
+}
+
+fn wall_now(ut: UndoTree) -> int {
+    if ut.clock_fake {
+        return ut.fake_wall
+    }
+    let ms = time_unix_ms()
+    if ms >= 0 {
+        return ms / 1000
+    }
+    -((999 - ms) / 1000)
+}
+
+// The 64-bit hashes (`undo.c:73-248`).
+const P1: wrapping[u64] = 11400714785074694791
+
+const P2: wrapping[u64] = 14029467366897019727
+
+const P3: wrapping[u64] = 1609587929392839161
+
+const P4: wrapping[u64] = 9650029242287828579
+
+const P5: wrapping[u64] = 2870177450012600261
+
+fn rotl(v: wrapping[u64], c: int) -> wrapping[u64] {
+    let s = c as wrapping[u64]
+    v << s | v >> (64 - c) as wrapping[u64]
+}
+
+fn load32(bytes: List[byte], at: int) -> wrapping[u64] {
+    let v = bytes[at] as int |
+        bytes[at + 1] as int << 8 |
+        bytes[at + 2] as int << 16 |
+        bytes[at + 3] as int << 24
+    v as wrapping[u64]
+}
+
+fn load64(bytes: List[byte], at: int) -> wrapping[u64] {
+    load32(bytes, at) | load32(bytes, at + 4) << 32
+}
+
+fn hash_round(acc: wrapping[u64], lane: wrapping[u64]) -> wrapping[u64] {
+    let a = acc + lane * P2
+    rotl(a, 31) * P1
+}
+
+struct IdentityHash {
+    total_len: int,
+    l0: wrapping[u64],
+    l1: wrapping[u64],
+    l2: wrapping[u64],
+    l3: wrapping[u64],
+    tail: List[byte],
+}
+
+fn hash_init() -> IdentityHash {
+    let zero: wrapping[u64] = 0
+    IdentityHash { total_len: 0, l0: P1 + P2, l1: P2, l2: 0, l3: zero - P1, tail: List[byte]() }
+}
+
+fn hash_block(mut h: IdentityHash, bytes: List[byte], at: int) {
+    h.l0 = hash_round(h.l0, load64(bytes, at))
+    h.l1 = hash_round(h.l1, load64(bytes, at + 8))
+    h.l2 = hash_round(h.l2, load64(bytes, at + 16))
+    h.l3 = hash_round(h.l3, load64(bytes, at + 24))
+}
+
+// `hash_update`, `undo.c:159-185`, over `bytes[lo..hi)`.
+fn hash_update(mut h: IdentityHash, bytes: List[byte], lo: int, hi: int) {
+    var at = lo
+    var len = hi - lo
+    h.total_len += len
+    if len < 32 - h.tail.len {
+        while at < hi {
+            (mut h.tail).push(bytes[at])
+            at += 1
+        }
+        return
+    }
+    if h.tail.len != 0 {
+        let fill = 32 - h.tail.len
+        var k = 0
+        while k < fill {
+            (mut h.tail).push(bytes[at + k])
+            k += 1
+        }
+        let block = h.tail
+        h.tail = List[byte]()
+        hash_block(mut h, block, 0)
+        at += fill
+        len -= fill
+    }
+    while len >= 32 {
+        hash_block(mut h, bytes, at)
+        at += 32
+        len -= 32
+    }
+    while at < hi {
+        (mut h.tail).push(bytes[at])
+        at += 1
+    }
+}
+
+fn hash_merge(acc: wrapping[u64], lane: wrapping[u64]) -> wrapping[u64] {
+    let zero: wrapping[u64] = 0
+    let a = acc ^ hash_round(zero, lane)
+    a * P1 + P4
+}
+
+// `hash_finish`, `undo.c:194-235`.
+fn hash_finish(h: IdentityHash) -> wrapping[u64] {
+    let zero: wrapping[u64] = 0
+    var value = P5
+    if h.total_len >= 32 {
+        value = rotl(h.l0, 1) + rotl(h.l1, 7) + rotl(h.l2, 12) + rotl(h.l3, 18)
+        value = hash_merge(value, h.l0)
+        value = hash_merge(value, h.l1)
+        value = hash_merge(value, h.l2)
+        value = hash_merge(value, h.l3)
+    }
+    value = value + h.total_len as wrapping[u64]
+    var at = 0
+    var len = h.tail.len
+    while len >= 8 {
+        let lane = hash_round(zero, load64(h.tail, at))
+        value = value ^ lane
+        value = rotl(value, 27) * P1 + P4
+        at += 8
+        len -= 8
+    }
+    if len >= 4 {
+        value = value ^ load32(h.tail, at) * P1
+        value = rotl(value, 23) * P2 + P3
+        at += 4
+        len -= 4
+    }
+    while len != 0 {
+        value = value ^ h.tail[at] as int as wrapping[u64] * P5
+        value = rotl(value, 11) * P1
+        at += 1
+        len -= 1
+    }
+    value = value ^ value >> 33
+    value = value * P2
+    value = value ^ value >> 29
+    value = value * P3
+    value = value ^ value >> 32
+    value
+}
+
+fn text_hash_fnv(tb: TextBuf) -> wrapping[u64] {
+    var hash: wrapping[u64] = 14695981039346656037
+    var it = textiter_new()
+    if !textiter_begin(mut it, tb, 0 as ByteOff) {
+        return hash
+    }
+    loop {
+        let c = textiter_chunk(it, tb)
+        if !c.ok {
+            util.bug("text.undo", "undo: text iterator failed")
+        }
+        var i = 0
+        while i < c.len {
+            hash = hash ^ store_byte(tb, c.src, c.at + i) as int as wrapping[u64]
+            hash = hash * 1099511628211
+            i += 1
+        }
+        if !textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    hash
+}
+
+fn text_hash_block(tb: TextBuf) -> wrapping[u64] {
+    var h = hash_init()
+    var it = textiter_new()
+    if !textiter_begin(mut it, tb, 0 as ByteOff) {
+        return hash_finish(h)
+    }
+    loop {
+        let c = textiter_chunk(it, tb)
+        if !c.ok {
+            util.bug("text.undo", "undo: text iterator failed")
+        }
+        if c.src == STORE_ORIG {
+            hash_update(mut h, tb.orig.bytes, c.at, c.at + c.len)
+        } else {
+            hash_update(mut h, tb.add.bytes, c.at, c.at + c.len)
+        }
+        if !textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    hash_finish(h)
+}
+
+fn text_hash_version(tb: TextBuf, version: int) -> wrapping[u64] {
+    hash_count_bump()
+    if version == YEWU_VERSION_FNV {
+        return text_hash_fnv(tb)
+    }
+    if version == YEWU_VERSION_BLOCK {
+        return text_hash_block(tb)
+    }
+    util.bug("text.undo", "undo: invalid identity version")
+    0
+}
+
+fn require_ctx(ec: EditCtx) {
+    if !ec.has_undo {
+        util.bug("text.undo", "undo: NULL edit context")
+    }
+}
+
+// `snapshot_cursors`, `undo.c:287-309`: the primary first.
+fn snapshot_cursors(mut ut: UndoTree, cs: CursorSet, has_cset: bool) -> (int, int) {
+    let at = ut.cursors.len
+    if !has_cset {
+        return (at, 0)
+    }
+    cset_check(cs)
+    var i = 0
+    while i < cs.curs.len {
+        let index = if i == 0 then cs.primary else if i <= cs.primary then i - 1 else i
+        let c = copy cs.curs[index]
+        (mut ut.cursors).push(CursorRec { pos: c.pos, anchor: c.anchor, goal: c.goal_col })
+        i += 1
+    }
+    (at, cs.curs.len)
+}
+
+// `restore_cursors`, `undo.c:311-332`.
+fn restore_cursors(mut ec: EditCtx, at: int, count: int) {
+    if !ec.has_cset || count == 0 {
+        return
+    }
+    if at + count > ec.undo.cursors.len {
+        util.bug("text.undo", "undo: corrupt cursor slice")
+    }
+    var curs = List[Cursor]()
+    var i = 0
+    while i < count {
+        let r = copy ec.undo.cursors[at + i]
+        (mut curs).push(Cursor { pos: r.pos, goal_col: r.goal, anchor: r.anchor })
+        i += 1
+    }
+    ec.cset.curs = curs
+    ec.cset.primary = 0
+    cset_reseed(mut ec.cset)
+    i = 0
+    while i < ec.cset.selstacks.len {
+        ec.cset.selstacks[i] = selstack_empty()
+        i += 1
+    }
+    cset_normalize(ec.tb, mut ec.cset)
+}
+
+/// A tree whose root is `tb` as it is now (`yew_undo_new`, `undo.c:334-372`).
+pub fn undo_new(tb: TextBuf) -> UndoTree {
+    var ut = undo_none()
+    ut.root = 1
+    ut.cur = 1
+    ut.saved = 0
+    ut.root_len = textbuf_len(tb)
+    // YEW-F-072: a deterministic, piece-independent block hash for new
+    // sidecars; readers keep v1 FNV.
+    ut.root_hash = text_hash_version(tb, ut.identity_version)
+    ut.root_owner_gen = tb.gen
+    ut.root_owner_identity = true
+    ut.saved_len = ut.root_len
+    ut.saved_hash = ut.root_hash
+    ut.owner_bid = tb.bid
+    var root = zero_node()
+    root.id = 1
+    root.t_wall = wall_now(ut)
+    root.t_last_ms = mono_now(ut)
+    (mut ut.nodes).push(root)
+    ut.bytes_live = SIZE_NODE
+    ut
+}
+
+/// Drop a tree (`yew_undo_free`); an open transaction is an internal error.
+pub fn undo_free(mut ut: UndoTree) {
+    if ut.depth != 0 || ut.open != 0 {
+        util.bug("text.undo", "undo: free with an open transaction")
+    }
+    ut = undo_none()
+}
+
+/// Inject the clocks (`yew_undo_set_clock`): a fake monotonic ms and wall
+/// seconds, read until changed (`fake_mono`, `fake_wall`).
+pub fn undo_set_clock(mut ut: UndoTree, mono: int, wall: int) {
+    ut.clock_fake = true
+    ut.fake_mono = mono
+    ut.fake_wall = wall
+}
+
+/// The real clocks again.
+pub fn undo_clear_clock(mut ut: UndoTree) {
+    ut.clock_fake = false
+}
+
+/// The budgets (`yew_undo_set_limits`).
+pub fn undo_set_limits(mut ut: UndoTree, bytes_max: int, min_nodes: int, persist_bytes_max: int) {
+    ut.bytes_max = bytes_max
+    ut.min_nodes = min_nodes
+    ut.persist_bytes_max = persist_bytes_max
+}
+
+// `require_reason`, `undo.c:409-423`.
+fn require_reason(ec: EditCtx, reason: int) {
+    if reason < 0 || reason >= TXN_REASON_MAX {
+        util.bug("text.undo", "undo: invalid transaction reason")
+    }
+    if reason == TXN_MULTI {
+        if !ec.has_cset || ec.cset.curs.len < 2 {
+            util.bug("text.undo", "multi-cursor transaction requires multiple cursors")
+        }
+        cset_check_text(ec.tb, ec.cset)
+    } else if ec.has_cset {
+        if reason == TXN_CUT || reason == TXN_PASTE {
+            cset_check_text(ec.tb, ec.cset)
+        } else {
+            cset_require_single_edit(ec.cset)
+        }
+    }
+}
+
+/// Open (or nest into) a transaction (`yew_undo_begin`, `undo.c:434-452`).
+pub fn undo_begin(mut ec: EditCtx, why: int) {
+    require_ctx(ec)
+    require_reason(ec, why)
+    if ec.undo.depth == 0 {
+        ec.undo.pending_reason = why
+        ec.undo.boundary = true
+        ec.undo.reopened = false
+    } else if ec.undo.pending_reason != why {
+        util.bug("text.undo", "undo: nested transaction reason mismatch")
+    }
+    ec.undo.depth += 1
+}
+
+/// Promote an open typing or erasing transaction to MULTI
+/// (`yew_undo_promote_multi`, `undo.c:454-476`).
+pub fn undo_promote_multi(mut ec: EditCtx) {
+    require_ctx(ec)
+    if ec.undo.depth == 0 || !ec.has_cset || ec.cset.curs.len < 2 {
+        util.bug("text.undo", "undo: invalid multi-cursor transaction promotion")
+    }
+    cset_check_text(ec.tb, ec.cset)
+    if ec.undo.pending_reason == TXN_MULTI {
+        return
+    }
+    if ec.undo.pending_reason != TXN_TYPE && ec.undo.pending_reason != TXN_ERASE {
+        util.bug("text.undo", "undo: cannot promote transaction reason {ec.undo.pending_reason}")
+    }
+    if node_ok(ec.undo, ec.undo.open) {
+        ec.undo.nodes[ec.undo.open - 1].reason = TXN_MULTI
+    }
+    ec.undo.pending_reason = TXN_MULTI
+}
+
+/// End the current merge group (`yew_undo_boundary`).
+pub fn undo_boundary(mut ut: UndoTree) {
+    ut.boundary = true
+}
+
+fn reason_mergeable(reason: int) -> bool {
+    reason == TXN_TYPE || reason == TXN_ERASE
+}
+
+fn op_contiguous(reason: int, prev: UndoOp, kind: int, off: int, len: int) -> bool {
+    if reason == TXN_TYPE && kind == OP_INS && prev.kind == OP_INS {
+        return off == prev.off + prev.len
+    }
+    if reason == TXN_ERASE && kind == OP_DEL && prev.kind == OP_DEL {
+        return off == prev.off || off + len == prev.off
+    }
+    false
+}
+
+fn node_payload_bytes(ut: UndoTree, n: UndoNode) -> int {
+    var total = 0
+    var i = 0
+    while i < n.n_ops {
+        total += ut.ops[n.ops_at + i].len
+        i += 1
+    }
+    total
+}
+
+// `may_merge`, `undo.c:501-520`.
+fn may_merge(ut: UndoTree, reason: int, kind: int, off: int, len: int, now: int) -> bool {
+    if ut.depth != 0 || ut.boundary || !reason_mergeable(reason) || ut.cur != ut.nodes.len {
+        return false
+    }
+    if !node_ok(ut, ut.cur) {
+        return false
+    }
+    let n = copy ut.nodes[ut.cur - 1]
+    if n.reason != reason ||
+        n.n_ops == 0 ||
+        n.first_child != 0 ||
+        now < n.t_last_ms ||
+        now - n.t_last_ms >= UNDO_BURST_MS {
+        return false
+    }
+    let prev = copy ut.ops[n.ops_at + n.n_ops - 1]
+    op_contiguous(reason, prev, kind, off, len) && node_payload_bytes(ut, n) < UNDO_BURST_BYTES
+}
+
+// `link_child`, `undo.c:522-533`: append as the parent's last child.
+fn link_child(mut ut: UndoTree, id: int) {
+    let parent = ut.nodes[id - 1].parent
+    if !node_ok(ut, parent) {
+        util.bug("text.undo", "undo: missing parent")
+    }
+    if ut.nodes[parent - 1].first_child == 0 {
+        ut.nodes[parent - 1].first_child = id
+    } else {
+        var at = ut.nodes[parent - 1].first_child
+        while ut.nodes[at - 1].next_sibling != 0 {
+            at = ut.nodes[at - 1].next_sibling
+        }
+        ut.nodes[at - 1].next_sibling = id
+    }
+    ut.nodes[parent - 1].redo_child = id
+}
+
+// `open_node`, `undo.c:535-578`: answers the open node's id.
+fn open_node(mut ec: EditCtx, reason: int, kind: int, off: int, len: int) -> int {
+    let now = mono_now(ec.undo)
+    if ec.undo.open != 0 {
+        return ec.undo.open
+    }
+    if may_merge(ec.undo, reason, kind, off, len, now) {
+        ec.undo.open = ec.undo.cur
+        return ec.undo.open
+    }
+    var n = zero_node()
+    n.id = ec.undo.nodes.len + 1
+    n.parent = ec.undo.cur
+    if !node_ok(ec.undo, n.parent) {
+        util.bug("text.undo", "undo: invalid current node")
+    }
+    n.depth = ec.undo.nodes[n.parent - 1].depth + 1
+    n.ops_at = ec.undo.ops.len
+    n.rep_at = ec.undo.repairs.len
+    n.blob_lo = ec.undo.blobs.len
+    n.blob_hi = ec.undo.blobs.len
+    n.win_id = ec.win_id
+    n.reason = reason
+    n.t_last_ms = now
+    var wall = wall_now(ec.undo)
+    let last = ec.undo.nodes.len
+    if last != 0 && wall < ec.undo.nodes[last - 1].t_wall {
+        util.log_warn("undo: wall clock stepped backwards; clamped")
+        wall = ec.undo.nodes[last - 1].t_wall
+    }
+    n.t_wall = wall
+    let (at, count) = snapshot_cursors(mut ec.undo, ec.cset, ec.has_cset)
+    n.cur_before = at
+    n.n_before = count
+    let id = n.id
+    (mut ec.undo.nodes).push(n)
+    link_child(mut ec.undo, id)
+    ec.undo.open = id
+    ec.undo.boundary = false
+    ec.undo.bytes_live += SIZE_NODE + count * SIZE_CURSOR_REC
+    id
+}
+
+fn edit_reason(ut: UndoTree, kind: int) -> int {
+    if ut.depth != 0 {
+        return ut.pending_reason
+    }
+    if kind == OP_INS then TXN_TYPE else TXN_ERASE
+}
+
+/// Before an insert reaches the buffer (`yew_undo_prepare_insert`).
+pub fn undo_prepare_insert(mut ec: EditCtx, at: int, len: int) {
+    require_ctx(ec)
+    let reason = edit_reason(ec.undo, OP_INS)
+    let _ = open_node(mut ec, reason, OP_INS, at, len)
+}
+
+/// Before a delete: the bytes into the blob arena, the marks the inverse
+/// must put back (`yew_undo_prepare_delete`, `undo.c:631-651`).
+pub fn undo_prepare_delete(mut ec: EditCtx, range: Span) {
+    require_ctx(ec)
+    let reason = edit_reason(ec.undo, OP_DEL)
+    let id = open_node(mut ec, reason, OP_DEL, range.lo, range.hi - range.lo)
+    textbuf_append_range(mut ec.undo.blobs, ec.tb, range.lo, range.hi)
+    ec.undo.nodes[id - 1].blob_hi = ec.undo.blobs.len
+    if ec.has_marks {
+        for c in marks_collapse_list(ec.marks, range) {
+            (mut ec.undo.repairs).push(MarkRepair {
+                mark_id: c.id.id,
+                mark_gen: c.id.gen,
+                rel_off: c.rel,
+            })
+        }
+    }
+}
+
+fn truncate_cursors(mut ut: UndoTree, n: int) {
+    while ut.cursors.len > n {
+        let _ = (mut ut.cursors).pop() else CursorRec { pos: 0, anchor: 0, goal: 0 }
+    }
+}
+
+// `finish_record`, `undo.c:653-690`.
+fn finish_record(mut ec: EditCtx, id: int, added_op: bool) {
+    let added = SIZE_OP + SIZE_RUN + SIZE_REPLAY
+    if ec.undo.depth != 0 &&
+        (ec.undo.pending_reason == TXN_MULTI || ec.undo.pending_reason == TXN_MACRO) {
+        ec.undo.nodes[id - 1].t_last_ms = mono_now(ec.undo)
+        ec.undo.cur = id
+        if added_op {
+            ec.undo.bytes_live += added
+        }
+        return
+    }
+    let n = copy ec.undo.nodes[id - 1]
+    if n.n_after != 0 &&
+        n.cur_after + n.n_after == ec.undo.cursors.len &&
+        (!ec.undo.reopened || n.cur_after != ec.undo.reopen_cur_after) {
+        truncate_cursors(mut ec.undo, n.cur_after)
+        ec.undo.bytes_live -= n.n_after * SIZE_CURSOR_REC
+        ec.undo.nodes[id - 1].n_after = 0
+    }
+    ec.undo.nodes[id - 1].t_last_ms = mono_now(ec.undo)
+    let (at, count) = snapshot_cursors(mut ec.undo, ec.cset, ec.has_cset)
+    ec.undo.nodes[id - 1].cur_after = at
+    ec.undo.nodes[id - 1].n_after = count
+    ec.undo.cur = id
+    if added_op {
+        ec.undo.bytes_live += added
+    }
+    ec.undo.bytes_live += count * SIZE_CURSOR_REC
+    if ec.undo.depth == 0 {
+        ec.undo.open = 0
+        if ec.has_jrnl {
+            let _ = journal_sync(mut ec.jrnl)
+        }
+        trim_tree(mut ec)
+    }
+}
+
+fn replace_after_snapshot(mut ec: EditCtx, id: int) {
+    let n = copy ec.undo.nodes[id - 1]
+    if n.n_after != 0 &&
+        n.cur_after + n.n_after == ec.undo.cursors.len &&
+        (!ec.undo.reopened || n.cur_after != ec.undo.reopen_cur_after) {
+        truncate_cursors(mut ec.undo, n.cur_after)
+        ec.undo.bytes_live -= n.n_after * SIZE_CURSOR_REC
+        ec.undo.nodes[id - 1].n_after = 0
+    }
+    let (at, count) = snapshot_cursors(mut ec.undo, ec.cset, ec.has_cset)
+    ec.undo.nodes[id - 1].cur_after = at
+    ec.undo.nodes[id - 1].n_after = count
+    ec.undo.bytes_live += count * SIZE_CURSOR_REC
+}
+
+fn commit_reopened_snapshot(mut ut: UndoTree, id: int) {
+    if !ut.reopened {
+        return
+    }
+    let n = copy ut.nodes[id - 1]
+    if n.cur_after < ut.reopen_cur_after + ut.reopen_n_after ||
+        n.cur_after + n.n_after != ut.cursors.len {
+        util.bug("text.undo", "undo: invalid reopened cursor snapshots")
+    }
+    var i = 0
+    while i < n.n_after {
+        ut.cursors[ut.reopen_cur_after + i] = copy ut.cursors[n.cur_after + i]
+        i += 1
+    }
+    ut.nodes[id - 1].cur_after = ut.reopen_cur_after
+    truncate_cursors(mut ut, ut.reopen_cur_after + n.n_after)
+    ut.bytes_live -= ut.reopen_n_after * SIZE_CURSOR_REC
+}
+
+/// After an insert reached the buffer (`yew_undo_record_insert`,
+/// `undo.c:719-768`): inside a typing transaction a contiguous insert
+/// whose payload follows the last one extends it.
+pub fn undo_record_insert(mut ec: EditCtx, at: int, len: int, payload: int) {
+    require_ctx(ec)
+    let id = ec.undo.open
+    if !node_ok(ec.undo, id) {
+        util.bug("text.undo", "undo: insert recorded without prepare")
+    }
+    let n = copy ec.undo.nodes[id - 1]
+    if ec.undo.depth != 0 && ec.undo.pending_reason == TXN_TYPE && n.n_ops != 0 {
+        let index = n.ops_at + n.n_ops - 1
+        let prev = copy ec.undo.ops[index]
+        if prev.kind == OP_INS &&
+            prev.src == STORE_ADD &&
+            at == prev.off + prev.len &&
+            payload == prev.payload + prev.len {
+            ec.undo.ops[index].len += len
+            ec.undo.replay_spans[index].valid = false
+            finish_record(mut ec, id, false)
+            return
+        }
+    }
+    (mut ec.undo.ops).push(UndoOp {
+        kind: OP_INS,
+        src: STORE_ADD,
+        off: at,
+        len: len,
+        payload: payload,
+    })
+    (mut ec.undo.repair_runs).push(UndoRepairRun { at: n.rep_at + n.n_rep, len: 0 })
+    (mut ec.undo.replay_spans).push(UndoReplaySpan { lo: 0, hi: 0, src: 0, valid: false })
+    ec.undo.nodes[id - 1].n_ops += 1
+    finish_record(mut ec, id, true)
+}
+
+/// After a delete reached the buffer (`yew_undo_record_delete`,
+/// `undo.c:770-802`).
+pub fn undo_record_delete(mut ec: EditCtx, range: Span) {
+    require_ctx(ec)
+    let id = ec.undo.open
+    if !node_ok(ec.undo, id) {
+        util.bug("text.undo", "undo: delete recorded without prepare")
+    }
+    let n = copy ec.undo.nodes[id - 1]
+    let len = range.hi - range.lo
+    let run_at = n.rep_at + n.n_rep
+    let run_len = ec.undo.repairs.len - run_at
+    ec.undo.nodes[id - 1].n_rep += run_len
+    (mut ec.undo.ops).push(UndoOp {
+        kind: OP_DEL,
+        src: 0,
+        off: range.lo,
+        len: len,
+        payload: n.blob_hi - len,
+    })
+    (mut ec.undo.repair_runs).push(UndoRepairRun { at: run_at, len: run_len })
+    (mut ec.undo.replay_spans).push(UndoReplaySpan { lo: 0, hi: 0, src: 0, valid: false })
+    ec.undo.nodes[id - 1].n_ops += 1
+    ec.undo.bytes_live += len + run_len * SIZE_REPAIR
+    finish_record(mut ec, id, true)
+}
+
+fn store_len_of(tb: TextBuf, src: int) -> int {
+    if src == STORE_ORIG {
+        return tb.orig.bytes.len
+    }
+    tb.add.bytes.len
+}
+
+fn store_slice(tb: TextBuf, src: int, lo: int, hi: int) -> List[byte] {
+    if src != STORE_ORIG && src != STORE_ADD || lo > hi || hi > store_len_of(tb, src) {
+        util.bug("text.undo", "undo: invalid store span")
+    }
+    if src == STORE_ORIG {
+        return tb.orig.bytes[lo..hi]
+    }
+    tb.add.bytes[lo..hi]
+}
+
+struct LastSpan {
+    off: int,
+    len: int,
+    payload: int,
+}
+
+fn last_push(mut spans: List[LastSpan], off: int, len: int, payload: int) {
+    if len == 0 {
+        return
+    }
+    (mut spans).push(LastSpan { off: off, len: len, payload: payload })
+}
+
+fn last_apply_insert(spans: List[LastSpan], op: UndoOp) -> List[LastSpan] {
+    var next = List[LastSpan]()
+    var placed = false
+    for s in spans {
+        let hi = s.off + s.len
+        if hi <= op.off {
+            last_push(mut next, s.off, s.len, s.payload)
+            continue
+        }
+        if !placed {
+            if s.off < op.off {
+                let left = op.off - s.off
+                last_push(mut next, s.off, left, s.payload)
+                last_push(mut next, op.off, op.len, op.payload)
+                last_push(mut next, op.off + op.len, s.len - left, s.payload + left)
+                placed = true
+                continue
+            }
+            last_push(mut next, op.off, op.len, op.payload)
+            placed = true
+        }
+        last_push(mut next, s.off + op.len, s.len, s.payload)
+    }
+    if !placed {
+        last_push(mut next, op.off, op.len, op.payload)
+    }
+    next
+}
+
+fn last_apply_delete(spans: List[LastSpan], op: UndoOp) -> List[LastSpan] {
+    var next = List[LastSpan]()
+    let hi = op.off + op.len
+    for s in spans {
+        let span_hi = s.off + s.len
+        if span_hi <= op.off {
+            last_push(mut next, s.off, s.len, s.payload)
+        } else if s.off >= hi {
+            last_push(mut next, s.off - op.len, s.len, s.payload)
+        } else {
+            let left = if s.off < op.off then op.off - s.off else 0
+            let right = if span_hi > hi then span_hi - hi else 0
+            last_push(mut next, s.off, left, s.payload)
+            last_push(mut next, op.off, right, s.payload + s.len - right)
+        }
+    }
+    next
+}
+
+/// The text the latest live typing transaction left (`yew_undo_last_insert`,
+/// `undo.c:893-930`): `(found, bytes, t_wall)`; `tb` is the tree's buffer.
+pub fn undo_last_insert(ut: UndoTree, tb: TextBuf) -> (bool, List[byte], int) {
+    if tb.bid != ut.owner_bid {
+        util.bug("text.undo", "undo_last_insert: NULL context")
+    }
+    var at = ut.nodes.len
+    while at > 1 {
+        at -= 1
+        let n = copy ut.nodes[at]
+        if !node_live(ut, n.id) || n.reason != TXN_TYPE {
+            continue
+        }
+        var spans = List[LastSpan]()
+        var i = 0
+        while i < n.n_ops {
+            let op = copy ut.ops[n.ops_at + i]
+            if op.kind == OP_INS {
+                spans = last_apply_insert(spans, op)
+            } else if op.kind == OP_DEL {
+                spans = last_apply_delete(spans, op)
+            } else {
+                util.bug("text.undo", "undo: invalid type transaction operation")
+            }
+            i += 1
+        }
+        var out = List[byte]()
+        for s in spans {
+            for b in store_slice(tb, STORE_ADD, s.payload, s.payload + s.len) {
+                (mut out).push(b)
+            }
+        }
+        return (true, out, n.t_wall)
+    }
+    (false, List[byte](), 0)
+}
+
+// `replay_insert_span`, `undo.c:956-977`.
+fn replay_insert_span(mut ec: EditCtx, at: int, src: int, lo: int, hi: int) {
+    let len = hi - lo
+    let bytes = store_slice(ec.tb, src, lo, hi)
+    edit_notify_pre(mut ec, JOURNAL_INS, at as ByteOff, len)
+    textbuf_insert_span(mut ec.tb, at as ByteOff, src, Span { lo: lo, hi: hi })
+    if ec.has_marks {
+        marks_adjust(mut ec.marks, JOURNAL_INS, at as ByteOff, len)
+    }
+    if ec.has_cset {
+        cset_adjust(mut ec.cset, JOURNAL_INS, at as ByteOff, len)
+    }
+    edit_notify_post(ec, JOURNAL_INS)
+    if ec.has_jrnl {
+        let _ = journal_record(mut ec.jrnl, JOURNAL_INS, at, bytes, 0, len)
+    }
+}
+
+// `replay_insert_blob`, `undo.c:979-1018`: a delete's inverse; its first
+// replay caches the add-store span the bytes landed at.
+fn replay_insert_blob(mut ec: EditCtx, index: int) {
+    let op = copy ec.undo.ops[index]
+    let cache = copy ec.undo.replay_spans[index]
+    if cache.valid {
+        replay_insert_span(mut ec, op.off, cache.src, cache.lo, cache.hi)
+        return
+    }
+    if op.payload > ec.undo.blobs.len || op.len > ec.undo.blobs.len - op.payload {
+        util.bug("text.undo", "undo: corrupt delete payload")
+    }
+    let bytes = ec.undo.blobs[op.payload..op.payload + op.len]
+    edit_notify_pre(mut ec, JOURNAL_INS, op.off as ByteOff, op.len)
+    let payload = textbuf_insert_payload(mut ec.tb, op.off as ByteOff, bytes, 0, op.len)
+    if ec.has_marks {
+        marks_adjust(mut ec.marks, JOURNAL_INS, op.off as ByteOff, op.len)
+    }
+    if ec.has_cset {
+        cset_adjust(mut ec.cset, JOURNAL_INS, op.off as ByteOff, op.len)
+    }
+    edit_notify_post(ec, JOURNAL_INS)
+    if ec.has_jrnl {
+        let _ = journal_record(mut ec.jrnl, JOURNAL_INS, op.off, bytes, 0, op.len)
+    }
+    ec.undo.replay_spans[index] = UndoReplaySpan {
+        lo: payload,
+        hi: payload + op.len,
+        src: STORE_ADD,
+        valid: true,
+    }
+}
+
+// `replay_delete`, `undo.c:1020-1048`.
+fn replay_delete(mut ec: EditCtx, op: UndoOp) {
+    let total = textbuf_len(ec.tb)
+    if op.off > total || op.len > total - op.off {
+        util.bug("text.undo", "undo replay: delete out of bounds")
+    }
+    let bytes = textbuf_copy_range(ec.tb, op.off, op.off + op.len)
+    edit_notify_pre(mut ec, JOURNAL_DEL, op.off as ByteOff, op.len)
+    textbuf_delete(mut ec.tb, Span { lo: op.off, hi: op.off + op.len })
+    if ec.has_marks {
+        marks_adjust(mut ec.marks, JOURNAL_DEL, op.off as ByteOff, op.len)
+    }
+    if ec.has_cset {
+        cset_adjust(mut ec.cset, JOURNAL_DEL, op.off as ByteOff, op.len)
+    }
+    edit_notify_post(ec, JOURNAL_DEL)
+    if ec.has_jrnl {
+        let _ = journal_record(mut ec.jrnl, JOURNAL_DEL, op.off, bytes, 0, op.len)
+    }
+}
+
+fn repair_marks(mut ec: EditCtx, index: int, op: UndoOp) {
+    let run = copy ec.undo.repair_runs[index]
+    var r = 0
+    while r < run.len {
+        let rep = copy ec.undo.repairs[run.at + r]
+        if ec.has_marks {
+            let _ = mark_repair(
+                mut ec.marks,
+                MarkId { id: rep.mark_id, gen: rep.mark_gen },
+                (op.off + rep.rel_off) as ByteOff,
+            )
+        }
+        r += 1
+    }
+}
+
+// `apply_inverse`, `undo.c:1050-1079`: the ops backwards.
+fn apply_inverse(mut ec: EditCtx, id: int) {
+    let n = copy ec.undo.nodes[id - 1]
+    var i = n.n_ops
+    while i != 0 {
+        i -= 1
+        let index = n.ops_at + i
+        let op = copy ec.undo.ops[index]
+        if op.kind == OP_INS {
+            replay_delete(mut ec, op)
+        } else if op.kind == OP_DEL {
+            replay_insert_blob(mut ec, index)
+            repair_marks(mut ec, index, op)
+        } else {
+            util.bug("text.undo", "undo: invalid operation kind")
+        }
+    }
+}
+
+// `apply_forward`, `undo.c:1081-1098`.
+fn apply_forward(mut ec: EditCtx, id: int) {
+    let n = copy ec.undo.nodes[id - 1]
+    var i = 0
+    while i < n.n_ops {
+        let op = copy ec.undo.ops[n.ops_at + i]
+        if op.kind == OP_INS {
+            replay_insert_span(mut ec, op.off, op.src, op.payload, op.payload + op.len)
+        } else if op.kind == OP_DEL {
+            replay_delete(mut ec, op)
+        } else {
+            util.bug("text.undo", "redo: invalid operation kind")
+        }
+        i += 1
+    }
+}
+
+fn sync_navigation(mut ec: EditCtx) {
+    if ec.has_jrnl {
+        let _ = journal_sync(mut ec.jrnl)
+    }
+}
+
+/// Close a transaction (`yew_undo_end`, `undo.c:1106-1126`).
+pub fn undo_end(mut ec: EditCtx) {
+    require_ctx(ec)
+    if ec.undo.depth == 0 {
+        util.bug("text.undo", "undo: unbalanced end")
+    }
+    ec.undo.depth -= 1
+    if ec.undo.depth != 0 {
+        return
+    }
+    if ec.undo.open != 0 {
+        replace_after_snapshot(mut ec, ec.undo.open)
+    }
+    if ec.undo.open != 0 {
+        commit_reopened_snapshot(mut ec.undo, ec.undo.open)
+    }
+    ec.undo.pending_reason = TXN_REASON_MAX
+    ec.undo.open = 0
+    ec.undo.reopened = false
+    ec.undo.boundary = true
+    sync_navigation(mut ec)
+    trim_tree(mut ec)
+}
+
+// `unlink_child`, `undo.c:1128-1141`.
+fn unlink_child(mut ut: UndoTree, parent_id: int, child_id: int) {
+    if !node_ok(ut, parent_id) {
+        util.bug("text.undo", "undo: abort parent missing")
+    }
+    if ut.nodes[parent_id - 1].first_child == child_id {
+        ut.nodes[parent_id - 1].first_child = ut.nodes[child_id - 1].next_sibling
+    } else {
+        var at = ut.nodes[parent_id - 1].first_child
+        while at != 0 && ut.nodes[at - 1].next_sibling != child_id {
+            at = ut.nodes[at - 1].next_sibling
+        }
+        if at != 0 {
+            ut.nodes[at - 1].next_sibling = ut.nodes[child_id - 1].next_sibling
+        }
+    }
+    if ut.nodes[parent_id - 1].redo_child == child_id {
+        ut.nodes[parent_id - 1].redo_child = ut.nodes[parent_id - 1].first_child
+    }
+}
+
+fn cut_ops(mut ut: UndoTree, n: int) {
+    while ut.ops.len > n {
+        let _ = (mut ut.ops).pop() else UndoOp { kind: 0, src: 0, off: 0, len: 0, payload: 0 }
+    }
+    while ut.repair_runs.len > n {
+        let _ = (mut ut.repair_runs).pop() else UndoRepairRun { at: 0, len: 0 }
+    }
+    while ut.replay_spans.len > n {
+        let _ = (mut ut.replay_spans).pop() else UndoReplaySpan {
+            lo: 0,
+            hi: 0,
+            src: 0,
+            valid: false,
+        }
+    }
+}
+
+fn cut_repairs(mut ut: UndoTree, n: int) {
+    while ut.repairs.len > n {
+        let _ = (mut ut.repairs).pop() else MarkRepair { mark_id: 0, mark_gen: 0, rel_off: 0 }
+    }
+}
+
+fn cut_blobs(mut ut: UndoTree, n: int) {
+    if ut.blobs.len > n {
+        ut.blobs = ut.blobs[0..n]
+    }
+}
+
+/// Throw the open transaction away, its edits reverted
+/// (`yew_undo_abort`, `undo.c:1143-1243`).
+pub fn undo_abort(mut ec: EditCtx) {
+    require_ctx(ec)
+    if ec.undo.depth == 0 {
+        util.bug("text.undo", "undo: abort outside transaction")
+    }
+    if ec.undo.open == 0 {
+        ec.undo.depth = 0
+        ec.undo.pending_reason = TXN_REASON_MAX
+        ec.undo.boundary = true
+        return
+    }
+    let id = ec.undo.open
+    let parent = ec.undo.nodes[id - 1].parent
+    let _ = edit_ensure_journal(mut ec)
+    if ec.undo.reopened {
+        let n = copy ec.undo.nodes[id - 1]
+        var i = n.n_ops
+        while i > ec.undo.reopen_n_ops {
+            i -= 1
+            let index = n.ops_at + i
+            let op = copy ec.undo.ops[index]
+            if op.kind == OP_INS {
+                replay_delete(mut ec, op)
+            } else if op.kind == OP_DEL {
+                replay_insert_blob(mut ec, index)
+                repair_marks(mut ec, index, op)
+            } else {
+                util.bug("text.undo", "undo: invalid reopened operation kind")
+            }
+        }
+        restore_cursors(mut ec, ec.undo.reopen_cur_after, ec.undo.reopen_n_after)
+        cut_ops(mut ec.undo, n.ops_at + ec.undo.reopen_n_ops)
+        cut_repairs(mut ec.undo, n.rep_at + ec.undo.reopen_n_rep)
+        cut_blobs(mut ec.undo, ec.undo.reopen_blob_hi)
+        truncate_cursors(mut ec.undo, ec.undo.reopen_cur_after + ec.undo.reopen_n_after)
+        ec.undo.nodes[id - 1].n_ops = ec.undo.reopen_n_ops
+        ec.undo.nodes[id - 1].n_rep = ec.undo.reopen_n_rep
+        ec.undo.nodes[id - 1].blob_hi = ec.undo.reopen_blob_hi
+        ec.undo.nodes[id - 1].cur_after = ec.undo.reopen_cur_after
+        ec.undo.nodes[id - 1].n_after = ec.undo.reopen_n_after
+        ec.undo.nodes[id - 1].t_last_ms = ec.undo.reopen_t_last_ms
+        ec.undo.open = 0
+        ec.undo.depth = 0
+        ec.undo.pending_reason = TXN_REASON_MAX
+        ec.undo.boundary = true
+        ec.undo.reopened = false
+        account_live(mut ec.undo)
+        sync_navigation(mut ec)
+        return
+    }
+    apply_inverse(mut ec, id)
+    let n = copy ec.undo.nodes[id - 1]
+    restore_cursors(mut ec, n.cur_before, n.n_before)
+    unlink_child(mut ec.undo, parent, id)
+    if id == ec.undo.nodes.len && !ec.undo.reopened {
+        cut_ops(mut ec.undo, n.ops_at)
+        cut_repairs(mut ec.undo, n.rep_at)
+        cut_blobs(mut ec.undo, n.blob_lo)
+        truncate_cursors(mut ec.undo, n.cur_before)
+        let _ = (mut ec.undo.nodes).pop() else zero_node()
+    } else {
+        ec.undo.nodes[id - 1].flags = ec.undo.nodes[id - 1].flags | TXN_DEAD
+        ec.undo.bytes_dead += n.blob_hi - n.blob_lo
+    }
+    ec.undo.cur = parent
+    ec.undo.open = 0
+    ec.undo.depth = 0
+    ec.undo.pending_reason = TXN_REASON_MAX
+    ec.undo.boundary = true
+    ec.undo.reopened = false
+    account_live(mut ec.undo)
+    sync_navigation(mut ec)
+}
+
+/// Reopen the current leaf transaction to extend it
+/// (`yew_undo_reopen`, `undo.c:1245-1278`).
+pub fn undo_reopen(mut ec: EditCtx, expect: int) -> bool {
+    require_ctx(ec)
+    require_reason(ec, expect)
+    if ec.undo.depth != 0 || !node_ok(ec.undo, ec.undo.cur) {
+        return false
+    }
+    let n = copy ec.undo.nodes[ec.undo.cur - 1]
+    if n.id == ec.undo.root ||
+        n.reason != expect ||
+        n.first_child != 0 ||
+        n.ops_at + n.n_ops != ec.undo.ops.len ||
+        ec.undo.repair_runs.len != ec.undo.ops.len ||
+        ec.undo.replay_spans.len != ec.undo.ops.len ||
+        n.rep_at + n.n_rep != ec.undo.repairs.len ||
+        n.blob_hi != ec.undo.blobs.len ||
+        n.cur_after + n.n_after != ec.undo.cursors.len {
+        return false
+    }
+    ec.undo.reopen_n_ops = n.n_ops
+    ec.undo.reopen_n_rep = n.n_rep
+    ec.undo.reopen_cur_after = n.cur_after
+    ec.undo.reopen_n_after = n.n_after
+    ec.undo.reopen_blob_hi = n.blob_hi
+    ec.undo.reopen_t_last_ms = n.t_last_ms
+    ec.undo.open = n.id
+    ec.undo.depth = 1
+    ec.undo.pending_reason = expect
+    ec.undo.boundary = false
+    ec.undo.reopened = true
+    true
+}
+
+/// Undo the current node (`yew_undo`, `undo.c:1280-1302`).
+pub fn undo(mut ec: EditCtx) -> bool {
+    require_ctx(ec)
+    if ec.undo.depth != 0 {
+        util.bug("text.undo", "undo navigation inside transaction")
+    }
+    if ec.undo.cur == ec.undo.root {
+        return false
+    }
+    let _ = edit_ensure_journal(mut ec)
+    let id = ec.undo.cur
+    let parent = ec.undo.nodes[id - 1].parent
+    if !node_ok(ec.undo, parent) {
+        util.bug("text.undo", "undo: broken parent chain")
+    }
+    apply_inverse(mut ec, id)
+    let n = copy ec.undo.nodes[id - 1]
+    restore_cursors(mut ec, n.cur_before, n.n_before)
+    ec.undo.nodes[parent - 1].redo_child = id
+    ec.undo.cur = parent
+    ec.undo.boundary = true
+    sync_navigation(mut ec)
+    true
+}
+
+/// Redo along the redo child (`yew_redo`, `undo.c:1304-1325`).
+pub fn redo(mut ec: EditCtx) -> bool {
+    require_ctx(ec)
+    if ec.undo.depth != 0 {
+        util.bug("text.undo", "redo navigation inside transaction")
+    }
+    let parent = ec.undo.cur
+    if !node_ok(ec.undo, parent) || !node_live(ec.undo, ec.undo.nodes[parent - 1].redo_child) {
+        return false
+    }
+    let _ = edit_ensure_journal(mut ec)
+    let child = ec.undo.nodes[parent - 1].redo_child
+    apply_forward(mut ec, child)
+    let n = copy ec.undo.nodes[child - 1]
+    restore_cursors(mut ec, n.cur_after, n.n_after)
+    ec.undo.nodes[parent - 1].redo_child = child
+    ec.undo.cur = child
+    ec.undo.boundary = true
+    sync_navigation(mut ec)
+    true
+}
+
+/// Walk to any live node through the lowest common ancestor
+/// (`yew_undo_to`, `undo.c:1327-1366`).
+pub fn undo_to(mut ec: EditCtx, target_id: int) -> bool {
+    require_ctx(ec)
+    if ec.undo.depth != 0 || !node_live(ec.undo, target_id) {
+        return false
+    }
+    if target_id != ec.undo.cur {
+        let _ = edit_ensure_journal(mut ec)
+    }
+    var from = ec.undo.cur
+    var target = target_id
+    var path = List[int]()
+    while ec.undo.nodes[from - 1].depth > ec.undo.nodes[target - 1].depth {
+        if !undo(mut ec) {
+            util.bug("text.undo", "undo_to: failed ascent")
+        }
+        from = ec.undo.cur
+    }
+    while ec.undo.nodes[target - 1].depth > ec.undo.nodes[from - 1].depth {
+        (mut path).push(target)
+        target = ec.undo.nodes[target - 1].parent
+    }
+    while from != target {
+        (mut path).push(target)
+        target = ec.undo.nodes[target - 1].parent
+        if !undo(mut ec) {
+            util.bug("text.undo", "undo_to: failed LCA ascent")
+        }
+        from = ec.undo.cur
+    }
+    while path.len != 0 {
+        let child = (mut path).pop() else 0
+        let parent = ec.undo.cur
+        apply_forward(mut ec, child)
+        let n = copy ec.undo.nodes[child - 1]
+        restore_cursors(mut ec, n.cur_after, n.n_after)
+        ec.undo.nodes[parent - 1].redo_child = child
+        ec.undo.cur = child
+    }
+    ec.undo.boundary = true
+    sync_navigation(mut ec)
+    true
+}
+
+/// Move `delta` states through the live nodes in id order
+/// (`yew_undo_state`, `undo.c:1368-1393`).
+pub fn undo_state(mut ec: EditCtx, delta_in: int) -> bool {
+    require_ctx(ec)
+    var delta = delta_in
+    if delta == 0 {
+        return true
+    }
+    var id = ec.undo.cur
+    while delta < 0 {
+        loop {
+            if id <= 1 {
+                return false
+            }
+            id -= 1
+            if node_live(ec.undo, id) {
+                break
+            }
+        }
+        delta += 1
+    }
+    while delta > 0 {
+        loop {
+            if id >= ec.undo.nodes.len {
+                return false
+            }
+            id += 1
+            if node_live(ec.undo, id) {
+                break
+            }
+        }
+        delta -= 1
+    }
+    undo_to(mut ec, id)
+}
+
+/// The latest state at or before `wall_secs` (`yew_undo_time`).
+pub fn undo_time(mut ec: EditCtx, wall_secs: int) -> bool {
+    require_ctx(ec)
+    var best = 0
+    var id = 1
+    while id <= ec.undo.nodes.len {
+        if node_live(ec.undo, id) && ec.undo.nodes[id - 1].t_wall <= wall_secs {
+            best = id
+        }
+        id += 1
+    }
+    best != 0 && undo_to(mut ec, best)
+}
+
+fn live_count(ut: UndoTree) -> int {
+    var count = 0
+    var id = 1
+    while id <= ut.nodes.len {
+        if node_live(ut, id) {
+            count += 1
+        }
+        id += 1
+    }
+    count
+}
+
+fn recent_floor(ut: UndoTree) -> int {
+    var seen = 0
+    var id = ut.nodes.len
+    while id != 0 {
+        if node_live(ut, id) {
+            seen += 1
+            if seen >= ut.min_nodes {
+                return id
+            }
+        }
+        id -= 1
+    }
+    1
+}
+
+fn is_ancestor(ut: UndoTree, ancestor: int, id_in: int) -> bool {
+    var id = id_in
+    while id != 0 {
+        if id == ancestor {
+            return true
+        }
+        id = ut.nodes[id - 1].parent
+    }
+    false
+}
+
+fn protected_node(ut: UndoTree, id: int, floor: int) -> bool {
+    id >= floor || is_ancestor(ut, id, ut.cur) || ut.saved != 0 && is_ancestor(ut, id, ut.saved)
+}
+
+fn node_storage_bytes(n: UndoNode) -> int {
+    SIZE_NODE +
+        n.n_ops * (SIZE_OP + SIZE_RUN + SIZE_REPLAY) +
+        (n.blob_hi - n.blob_lo) +
+        (n.n_before + n.n_after) * SIZE_CURSOR_REC +
+        n.n_rep * SIZE_REPAIR
+}
+
+fn account_live(mut ut: UndoTree) {
+    var total = 0
+    var id = 1
+    while id <= ut.nodes.len {
+        if node_live(ut, id) {
+            total += node_storage_bytes(ut.nodes[id - 1])
+        }
+        id += 1
+    }
+    ut.bytes_live = total
+}
+
+// `compact_history`, `undo.c:1454-1594`: rebuild the arenas from the live
+// nodes when the dead outweigh the live.
+fn compact_history(mut ut: UndoTree) {
+    if ut.bytes_dead <= ut.bytes_live {
+        return
+    }
+    var ops = List[UndoOp]()
+    var cursors = List[CursorRec]()
+    var repairs = List[MarkRepair]()
+    var runs = List[UndoRepairRun]()
+    var spans = List[UndoReplaySpan]()
+    var blobs = List[byte]()
+    var id = 1
+    while id <= ut.nodes.len {
+        if !node_live(ut, id) {
+            ut.nodes[id - 1].ops_at = 0
+            ut.nodes[id - 1].n_ops = 0
+            ut.nodes[id - 1].rep_at = 0
+            ut.nodes[id - 1].n_rep = 0
+            ut.nodes[id - 1].blob_lo = 0
+            ut.nodes[id - 1].blob_hi = 0
+            ut.nodes[id - 1].cur_before = 0
+            ut.nodes[id - 1].n_before = 0
+            ut.nodes[id - 1].cur_after = 0
+            ut.nodes[id - 1].n_after = 0
+            id += 1
+            continue
+        }
+        let n = copy ut.nodes[id - 1]
+        if n.ops_at + n.n_ops > ut.ops.len ||
+            n.ops_at + n.n_ops > ut.repair_runs.len ||
+            n.ops_at + n.n_ops > ut.replay_spans.len ||
+            n.rep_at + n.n_rep > ut.repairs.len ||
+            n.cur_before + n.n_before > ut.cursors.len ||
+            n.cur_after + n.n_after > ut.cursors.len {
+            util.bug("text.undo", "undo compact: corrupt arena slice")
+        }
+        ut.nodes[id - 1].ops_at = ops.len
+        ut.nodes[id - 1].rep_at = repairs.len
+        ut.nodes[id - 1].n_rep = 0
+        ut.nodes[id - 1].blob_lo = blobs.len
+        var copied = 0
+        var i = 0
+        while i < n.n_ops {
+            let old_index = n.ops_at + i
+            var op = copy ut.ops[old_index]
+            let old_run = copy ut.repair_runs[old_index]
+            if old_run.at != n.rep_at + copied || old_run.len > n.n_rep - copied {
+                util.bug("text.undo", "undo compact: inconsistent repair run")
+            }
+            let run = UndoRepairRun { at: repairs.len, len: old_run.len }
+            var r = 0
+            while r < old_run.len {
+                (mut repairs).push(copy ut.repairs[old_run.at + r])
+                r += 1
+            }
+            if op.kind == OP_DEL {
+                if op.payload > ut.blobs.len || op.len > ut.blobs.len - op.payload {
+                    util.bug("text.undo", "undo compact: corrupt blob slice")
+                }
+                let old_payload = op.payload
+                op.payload = blobs.len
+                var k = 0
+                while k < op.len {
+                    (mut blobs).push(ut.blobs[old_payload + k])
+                    k += 1
+                }
+            }
+            ut.nodes[id - 1].n_rep += run.len
+            copied += run.len
+            (mut ops).push(op)
+            (mut runs).push(run)
+            (mut spans).push(copy ut.replay_spans[old_index])
+            i += 1
+        }
+        if copied != n.n_rep || ut.nodes[id - 1].n_rep != repairs.len - ut.nodes[id - 1].rep_at {
+            util.bug("text.undo", "undo compact: inconsistent repair slice")
+        }
+        ut.nodes[id - 1].blob_hi = blobs.len
+        ut.nodes[id - 1].cur_before = cursors.len
+        i = 0
+        while i < n.n_before {
+            (mut cursors).push(copy ut.cursors[n.cur_before + i])
+            i += 1
+        }
+        ut.nodes[id - 1].cur_after = cursors.len
+        i = 0
+        while i < n.n_after {
+            (mut cursors).push(copy ut.cursors[n.cur_after + i])
+            i += 1
+        }
+        id += 1
+    }
+    ut.ops = ops
+    ut.cursors = cursors
+    ut.repairs = repairs
+    ut.repair_runs = runs
+    ut.replay_spans = spans
+    ut.blobs = blobs
+    ut.bytes_dead = 0
+    ut.gen += 1
+    account_live(mut ut)
+}
+
+fn subtree_is_unprotected(ut: UndoTree, root: int, floor: int) -> bool {
+    var id = root
+    while id <= ut.nodes.len {
+        if node_live(ut, id) && is_ancestor(ut, root, id) && protected_node(ut, id, floor) {
+            return false
+        }
+        id += 1
+    }
+    true
+}
+
+fn tombstone_subtree(mut ut: UndoTree, root: int) {
+    let parent = ut.nodes[root - 1].parent
+    unlink_child(mut ut, parent, root)
+    var id = root
+    while id <= ut.nodes.len {
+        if node_live(ut, id) && is_ancestor(ut, root, id) {
+            ut.nodes[id - 1].flags = ut.nodes[id - 1].flags | TXN_DEAD
+            ut.bytes_dead += node_storage_bytes(ut.nodes[id - 1])
+        }
+        id += 1
+    }
+}
+
+/// Drop the redo branch of the current node when it is `expect`'s
+/// (`yew_undo_prune_redo`, `undo.c:1633-1660`).
+pub fn undo_prune_redo(mut ut: UndoTree, expect: int) -> bool {
+    if expect < 0 || expect >= TXN_REASON_MAX {
+        util.bug("text.undo", "undo_prune_redo: invalid transaction reason")
+    }
+    if ut.depth != 0 {
+        util.bug("text.undo", "redo prune inside transaction")
+    }
+    if !node_ok(ut, ut.cur) || !node_live(ut, ut.nodes[ut.cur - 1].redo_child) {
+        return false
+    }
+    let child = ut.nodes[ut.cur - 1].redo_child
+    if ut.nodes[child - 1].reason != expect {
+        return false
+    }
+    if ut.saved != 0 && is_ancestor(ut, child, ut.saved) {
+        return false
+    }
+    tombstone_subtree(mut ut, child)
+    ut.boundary = true
+    ut.gen += 1
+    account_live(mut ut)
+    true
+}
+
+fn prune_branch(mut ut: UndoTree, floor: int) -> bool {
+    var id = 1
+    while id <= ut.nodes.len {
+        if node_live(ut, id) &&
+            !protected_node(ut, id, floor) &&
+            subtree_is_unprotected(ut, id, floor) {
+            tombstone_subtree(mut ut, id)
+            ut.gen += 1
+            return true
+        }
+        id += 1
+    }
+    false
+}
+
+// `state_identity_at`, `undo.c:1676-1720`: the length and hash the buffer
+// had at node `target`, an ancestor of the current node, by replaying
+// inverses on a scratch copy.
+fn state_identity_at(ut: UndoTree, tb: TextBuf, target: int) -> (int, wrapping[u64]) {
+    var scratch = textbuf_from_owned_bytes(take textbuf_bytes(tb))
+    var id = ut.cur
+    if !is_ancestor(ut, target, id) {
+        util.bug("text.undo", "undo: identity target is not on current path")
+    }
+    while id != target {
+        let n = copy ut.nodes[id - 1]
+        var i = n.n_ops
+        while i != 0 {
+            i -= 1
+            let op = copy ut.ops[n.ops_at + i]
+            if op.kind == OP_INS {
+                let sl = textbuf_len(scratch)
+                if op.off > sl || op.len > sl - op.off {
+                    util.bug("text.undo", "undo: invalid insert while hashing state")
+                }
+                textbuf_delete(mut scratch, Span { lo: op.off, hi: op.off + op.len })
+            } else if op.kind == OP_DEL {
+                if op.payload > ut.blobs.len ||
+                    op.len > ut.blobs.len - op.payload ||
+                    op.off > textbuf_len(scratch) {
+                    util.bug("text.undo", "undo: invalid delete while hashing state")
+                }
+                textbuf_insert_part(
+                    mut scratch,
+                    op.off as ByteOff,
+                    ut.blobs,
+                    op.payload,
+                    op.payload + op.len,
+                )
+            } else {
+                util.bug("text.undo", "undo: invalid operation while hashing state")
+            }
+        }
+        id = n.parent
+    }
+    let len = textbuf_len(scratch)
+    let hash = text_hash_version(scratch, ut.identity_version)
+    textbuf_free(mut scratch)
+    (len, hash)
+}
+
+// `reroot_one`, `undo.c:1722-1766`.
+fn reroot_one(mut ut: UndoTree) -> bool {
+    if !node_ok(ut, ut.root) || ut.root == ut.saved || live_count(ut) <= ut.min_nodes {
+        return false
+    }
+    var child = 0
+    var at = ut.nodes[ut.root - 1].first_child
+    while at != 0 {
+        if node_live(ut, at) {
+            if child != 0 {
+                return false
+            }
+            child = at
+        }
+        at = ut.nodes[at - 1].next_sibling
+    }
+    if child == 0 || child == ut.cur {
+        return false
+    }
+    let next = copy ut.nodes[child - 1]
+    ut.bytes_dead += node_storage_bytes(ut.nodes[ut.root - 1]) +
+        next.n_ops * (SIZE_OP + SIZE_RUN + SIZE_REPLAY) +
+        (next.blob_hi - next.blob_lo) +
+        next.n_before * SIZE_CURSOR_REC +
+        next.n_rep * SIZE_REPAIR
+    ut.nodes[child - 1].n_ops = 0
+    ut.nodes[child - 1].n_before = 0
+    ut.nodes[child - 1].n_rep = 0
+    ut.nodes[child - 1].blob_lo = next.blob_hi
+    ut.nodes[child - 1].parent = 0
+    ut.nodes[child - 1].flags = ut.nodes[child - 1].flags | TXN_TRIMMED
+    ut.nodes[ut.root - 1].flags = ut.nodes[ut.root - 1].flags | TXN_DEAD
+    ut.root = child
+    ut.root_owner_identity = false
+    ut.gen += 1
+    true
+}
+
+// `trim_tree`, `undo.c:1768-1806`.
+fn trim_tree(mut ec: EditCtx) {
+    if ec.undo.bytes_live <= ec.undo.bytes_max {
+        return
+    }
+    var rerooted = false
+    while ec.undo.bytes_live > ec.undo.bytes_max {
+        let floor = recent_floor(ec.undo)
+        if prune_branch(mut ec.undo, floor) {
+            account_live(mut ec.undo)
+            continue
+        }
+        if reroot_one(mut ec.undo) {
+            rerooted = true
+            account_live(mut ec.undo)
+            continue
+        }
+        if !ec.undo.over_budget_logged {
+            util.log_warn("undo: over budget, nothing trimmable")
+            ec.undo.over_budget_logged = true
+        }
+        break
+    }
+    if rerooted {
+        let depth_base = ec.undo.nodes[ec.undo.root - 1].depth
+        var id = 1
+        while id <= ec.undo.nodes.len {
+            if node_live(ec.undo, id) {
+                if ec.undo.nodes[id - 1].depth < depth_base {
+                    util.bug("text.undo", "undo trim: descendant depth underflow")
+                }
+                ec.undo.nodes[id - 1].depth -= depth_base
+            }
+            id += 1
+        }
+        let (len, hash) = state_identity_at(ec.undo, ec.tb, ec.undo.root)
+        ec.undo.root_len = len
+        ec.undo.root_hash = hash
+    }
+    compact_history(mut ec.undo)
+}
+
+/// Rotate which child redo follows (`yew_undo_branch_cycle`,
+/// `undo.c:1808-1844`); answers the new redo child, or 0.
+pub fn undo_branch_cycle(mut ut: UndoTree, delta: int) -> int {
+    if !node_ok(ut, ut.cur) {
+        return 0
+    }
+    var children = List[int]()
+    var child = ut.nodes[ut.cur - 1].first_child
+    while child != 0 {
+        if node_live(ut, child) {
+            (mut children).push(child)
+        }
+        child = ut.nodes[child - 1].next_sibling
+    }
+    if children.len == 0 {
+        return 0
+    }
+    var index = 0
+    var i = 0
+    while i < children.len {
+        if children[i] == ut.nodes[ut.cur - 1].redo_child {
+            index = i
+            break
+        }
+        i += 1
+    }
+    let n = children.len
+    if delta >= 0 {
+        index = (index + delta % n) % n
+    } else {
+        let back = -delta % n
+        index = (index + n - back) % n
+    }
+    ut.nodes[ut.cur - 1].redo_child = children[index]
+    children[index]
+}
+
+/// The current node (`yew_undo_current`).
+pub fn undo_current(ut: UndoTree) -> int {
+    ut.cur
+}
+
+/// Whether the buffer is at its save point (`yew_undo_at_save_point`).
+pub fn undo_at_save_point(ut: UndoTree) -> bool {
+    ut.saved != 0 && ut.cur == ut.saved
+}
+
+/// Make the current node the save point (`yew_undo_mark_saved`,
+/// `undo.c:1856-1886`); `tb` is the tree's buffer.
+pub fn undo_mark_saved(mut ut: UndoTree, tb: TextBuf) {
+    if node_ok(ut, ut.saved) {
+        let f = ut.nodes[ut.saved - 1].flags
+        ut.nodes[ut.saved - 1].flags = f - (f & TXN_SAVED)
+    }
+    ut.saved = ut.cur
+    if node_ok(ut, ut.saved) {
+        ut.nodes[ut.saved - 1].flags = ut.nodes[ut.saved - 1].flags | TXN_SAVED
+    }
+    if tb.bid != ut.owner_bid {
+        util.bug("text.undo", "undo: save point has no buffer owner")
+    }
+    ut.saved_len = textbuf_len(tb)
+    // YEW-F-072: an unchanged root reuses the identity just computed.
+    if ut.root_owner_identity &&
+        ut.cur == ut.root &&
+        tb.gen == ut.root_owner_gen &&
+        ut.saved_len == ut.root_len {
+        ut.saved_hash = ut.root_hash
+    } else {
+        ut.saved_hash = text_hash_version(tb, ut.identity_version)
+    }
+    ut.boundary = true
+}
+
+/// Every live node (`yew_undo_list`, `undo.c:1898-1940`).
+pub fn undo_list(ut: UndoTree) -> List[UndoNodeInfo] {
+    var out = List[UndoNodeInfo]()
+    var id = 1
+    while id <= ut.nodes.len {
+        if !node_live(ut, id) {
+            id += 1
+            continue
+        }
+        let n = copy ut.nodes[id - 1]
+        var info = UndoNodeInfo {
+            id: id,
+            parent: n.parent,
+            depth: n.depth,
+            n_children: 0,
+            reason: n.reason,
+            t_wall: n.t_wall,
+            bytes_ins: 0,
+            bytes_del: 0,
+            on_current_path: is_ancestor(ut, id, ut.cur),
+            is_current: id == ut.cur,
+            is_saved: id == ut.saved,
+            is_trimmed: n.flags & TXN_TRIMMED != 0,
+        }
+        var child = n.first_child
+        while child != 0 {
+            if node_live(ut, child) {
+                info.n_children += 1
+            }
+            child = ut.nodes[child - 1].next_sibling
+        }
+        var i = 0
+        while i < n.n_ops {
+            let op = copy ut.ops[n.ops_at + i]
+            if op.kind == OP_INS {
+                info.bytes_ins += op.len
+            } else {
+                info.bytes_del += op.len
+            }
+            i += 1
+        }
+        (mut out).push(info)
+        id += 1
+    }
+    out
+}
+
+/// A live node's live children (`yew_undo_children`).
+pub fn undo_children(ut: UndoTree, id: int) -> List[int] {
+    var out = List[int]()
+    if !node_live(ut, id) {
+        return out
+    }
+    var child = ut.nodes[id - 1].first_child
+    while child != 0 {
+        if node_live(ut, child) {
+            (mut out).push(child)
+        }
+        child = ut.nodes[child - 1].next_sibling
+    }
+    out
+}
+
+fn reason_name(reason: int) -> str {
+    let names = [
+        "typed",
+        "erased",
+        "pasted",
+        "cut",
+        "multi",
+        "macro",
+        "filtered",
+        "replaced",
+        "lsp",
+        "external",
+    ]
+    if reason >= 0 && reason < TXN_REASON_MAX {
+        return names[reason]
+    }
+    "unknown"
+}
+
+/// A one-line description (`yew_undo_describe`, `undo.c:1974-2007`):
+/// `#id  +ins -del  reason  age[  *saved]`; `""` for a dead node.
+pub fn undo_describe(ut: UndoTree, id: int, now: int) -> str {
+    if !node_live(ut, id) {
+        return ""
+    }
+    let n = copy ut.nodes[id - 1]
+    var ins = 0
+    var del = 0
+    var i = 0
+    while i < n.n_ops {
+        let op = copy ut.ops[n.ops_at + i]
+        if op.kind == OP_INS {
+            ins += op.len
+        } else {
+            del += op.len
+        }
+        i += 1
+    }
+    let age = if now > n.t_wall then now - n.t_wall else 0
+    var age_text = ""
+    if age < 60 {
+        age_text = "{age}s ago"
+    } else if age < 3600 {
+        age_text = "{age / 60}m ago"
+    } else if age < 86400 {
+        age_text = "{age / 3600}h ago"
+    } else {
+        age_text = "{age / 86400}d ago"
+    }
+    let saved = if id == ut.saved then "  *saved" else ""
+    "#{id}  +{ins} -{del}  {reason_name(n.reason)}  {age_text}{saved}"
+}
+
+/// The tree as text (`yew_undo_dump`, `undo.c:2009-2032`).
+pub fn undo_dump(ut: UndoTree) -> str {
+    var out = "undo root={ut.root} cur={ut.cur} saved={ut.saved} gen={ut.gen}\n"
+    var id = 1
+    while id <= ut.nodes.len {
+        if !node_live(ut, id) {
+            id += 1
+            continue
+        }
+        let n = copy ut.nodes[id - 1]
+        out = out +
+            "node {id} parent={n.parent} redo={n.redo_child} depth={n.depth} reason={n.reason} flags={n.flags} wall={n.t_wall} ops={n.n_ops}\n"
+        var i = 0
+        while i < n.n_ops {
+            let op = copy ut.ops[n.ops_at + i]
+            out = out +
+                "  op {i} kind={op.kind} off={op.off} len={op.len} repairs={ut.repair_runs[n.ops_at + i].len}\n"
+            i += 1
+        }
+        id += 1
+    }
+    out
+}
+
+fn put_u16(mut buf: List[byte], v: int) {
+    (mut buf).push((v & 255) as byte)
+    (mut buf).push((v >> 8 & 255) as byte)
+}
+
+fn put_hash(mut buf: List[byte], h: wrapping[u64]) {
+    var v = h
+    var i = 0
+    while i < 8 {
+        (mut buf).push((v & 255) as int as byte)
+        v = v >> 8
+        i += 1
+    }
+}
+
+fn hash_le_at(data: List[byte], at: int) -> wrapping[u64] {
+    var v: wrapping[u64] = 0
+    var i = 7
+    while i >= 0 {
+        v = v << 8 | data[at + i] as int as wrapping[u64]
+        i -= 1
+    }
+    v
+}
+
+fn put_cursor(mut buf: List[byte], c: CursorRec) {
+    put_u64_le(mut buf, c.pos)
+    put_u64_le(mut buf, c.anchor)
+    put_u64_le(mut buf, c.goal)
+}
+
+fn put_repair(mut buf: List[byte], r: MarkRepair) {
+    put_u32_le(mut buf, r.mark_id)
+    put_u32_le(mut buf, r.mark_gen)
+    put_u64_le(mut buf, r.rel_off)
+}
+
+// `write_header`, `undo.c:2072-2090`.
+fn yewu_header(
+    mut file: List[byte],
+    version: int,
+    flags: int,
+    root: int,
+    cur: int,
+    saved: int,
+    anchor: int,
+    count: int,
+    anchor_len: int,
+    anchor_hash: wrapping[u64],
+    cur_len: int,
+    cur_hash: wrapping[u64],
+) {
+    for b in "YEWU".bytes() {
+        (mut file).push(b)
+    }
+    put_u32_le(mut file, version)
+    put_u32_le(mut file, flags)
+    put_u32_le(mut file, root)
+    put_u32_le(mut file, cur)
+    put_u32_le(mut file, saved)
+    put_u32_le(mut file, anchor)
+    put_u32_le(mut file, count)
+    put_u64_le(mut file, anchor_len)
+    put_hash(mut file, anchor_hash)
+    put_u64_le(mut file, cur_len)
+    put_hash(mut file, cur_hash)
+}
+
+// `write_node_record`, `undo.c:2092-2153`: answers the record's CRC.
+fn write_node_record(
+    ut: UndoTree,
+    tb: TextBuf,
+    mut file: List[byte],
+    n: UndoNode,
+    parent: int,
+    redo_child: int,
+    depth: int,
+    flags: int,
+    rerooted: bool,
+) -> int {
+    let record_at = file.len
+    let n_ops = if rerooted then 0 else n.n_ops
+    let n_before = if rerooted then 0 else n.n_before
+    put_u32_le(mut file, n.id)
+    put_u32_le(mut file, parent)
+    put_u32_le(mut file, redo_child)
+    put_u32_le(mut file, depth)
+    (mut file).push(n.reason as byte)
+    (mut file).push(flags as byte)
+    put_u16(mut file, 0)
+    put_u32_le(mut file, n.win_id)
+    put_u64_le(mut file, n.t_wall)
+    put_u32_le(mut file, n_ops)
+    var i = 0
+    while i < n_ops {
+        let index = n.ops_at + i
+        let op = copy ut.ops[index]
+        let run = copy ut.repair_runs[index]
+        (mut file).push(op.kind as byte)
+        (mut file).push(0 as byte)
+        put_u16(mut file, 0)
+        put_u64_le(mut file, op.off)
+        put_u64_le(mut file, op.len)
+        put_u64_le(mut file, op.len)
+        if op.kind == OP_INS {
+            let lo = op.payload
+            if op.src == STORE_ORIG {
+                if lo + op.len > tb.orig.bytes.len {
+                    util.bug("text.undo", "undo: invalid store span")
+                }
+                var k = 0
+                while k < op.len {
+                    (mut file).push(tb.orig.bytes[lo + k])
+                    k += 1
+                }
+            } else {
+                if lo + op.len > tb.add.bytes.len {
+                    util.bug("text.undo", "undo: invalid store span")
+                }
+                var k = 0
+                while k < op.len {
+                    (mut file).push(tb.add.bytes[lo + k])
+                    k += 1
+                }
+            }
+        } else {
+            if op.payload > ut.blobs.len || op.len > ut.blobs.len - op.payload {
+                util.bug("text.undo", "undo write: corrupt delete payload")
+            }
+            var k = 0
+            while k < op.len {
+                (mut file).push(ut.blobs[op.payload + k])
+                k += 1
+            }
+        }
+        put_u32_le(mut file, run.len)
+        var r = 0
+        while r < run.len {
+            put_repair(mut file, ut.repairs[run.at + r])
+            r += 1
+        }
+        i += 1
+    }
+    put_u32_le(mut file, n_before)
+    i = 0
+    while i < n_before {
+        put_cursor(mut file, ut.cursors[n.cur_before + i])
+        i += 1
+    }
+    put_u32_le(mut file, n.n_after)
+    i = 0
+    while i < n.n_after {
+        put_cursor(mut file, ut.cursors[n.cur_after + i])
+        i += 1
+    }
+    let crc = crc32_of(file, record_at, file.len)
+    put_u32_le(mut file, crc)
+    crc
+}
+
+fn serialized_node_size(ut: UndoTree, n: UndoNode, rerooted: bool) -> int {
+    var total = 36 + 12 + n.n_after * 24
+    if !rerooted {
+        total += n.n_before * 24
+    }
+    if rerooted {
+        return total
+    }
+    var i = 0
+    while i < n.n_ops {
+        let index = n.ops_at + i
+        total += 32 + ut.ops[index].len + ut.repair_runs[index].len * 16
+        i += 1
+    }
+    total
+}
+
+// `write_truncated_path`, `undo.c:2181-2257`.
+fn write_truncated_path(
+    ut: UndoTree,
+    tb: TextBuf,
+    mut file: List[byte],
+    cur_len: int,
+    cur_hash: wrapping[u64],
+) -> bool {
+    var path = List[int]()
+    var id = ut.cur
+    while id != 0 {
+        (mut path).push(id)
+        if id == ut.root {
+            break
+        }
+        id = ut.nodes[id - 1].parent
+    }
+    if path.len == 0 || path[path.len - 1] != ut.root {
+        util.bug("text.undo", "undo write: current path does not reach root")
+    }
+    var rev = List[int]()
+    var k = path.len
+    while k > 0 {
+        k -= 1
+        (mut rev).push(path[k])
+    }
+    path = rev
+    var tail_size = 0
+    var first = -1
+    var i = path.len
+    while i != 0 {
+        i -= 1
+        let n = copy ut.nodes[path[i] - 1]
+        let root_size = serialized_node_size(ut, n, true)
+        let total = YEWU_HEADER_LEN + 8 + root_size + tail_size
+        if total <= ut.persist_bytes_max {
+            first = i
+        } else {
+            break
+        }
+        tail_size += serialized_node_size(ut, n, false)
+    }
+    if first < 0 {
+        return false
+    }
+    var saved = 0
+    if ut.saved != 0 {
+        i = first
+        while i < path.len {
+            if path[i] == ut.saved {
+                saved = ut.saved
+                break
+            }
+            i += 1
+        }
+    }
+    let (root_len, root_hash) = state_identity_at(ut, tb, path[first])
+    file = List[byte]()
+    yewu_header(
+        mut file,
+        ut.identity_version,
+        YEWU_TRUNCATED,
+        path[first],
+        ut.cur,
+        saved,
+        if saved != 0 then saved else path[first],
+        path.len - first,
+        if saved != 0 then ut.saved_len else root_len,
+        if saved != 0 then ut.saved_hash else root_hash,
+        cur_len,
+        cur_hash,
+    )
+    var crc_xor = 0
+    i = first
+    while i < path.len {
+        let n = copy ut.nodes[path[i] - 1]
+        var flags = n.flags - (n.flags & TXN_SAVED)
+        let rerooted = i == first
+        if rerooted {
+            flags = flags | TXN_TRIMMED
+        }
+        if n.id == saved {
+            flags = flags | TXN_SAVED
+        }
+        let parent = if rerooted then 0 else path[i - 1]
+        let redo = if i + 1 < path.len then path[i + 1] else 0
+        crc_xor = crc_xor ^
+            write_node_record(ut, tb, mut file, n, parent, redo, i - first, flags, rerooted)
+        i += 1
+    }
+    put_u32_le(mut file, crc_xor)
+    for b in "UGAS".bytes() {
+        (mut file).push(b)
+    }
+    file.len <= ut.persist_bytes_max
+}
+
+fn selected_redo_child(ut: UndoTree, keep: List[bool], n: UndoNode) -> int {
+    if n.redo_child != 0 && keep[n.redo_child] {
+        return n.redo_child
+    }
+    var child = n.first_child
+    while child != 0 {
+        if keep[child] {
+            return child
+        }
+        child = ut.nodes[child - 1].next_sibling
+    }
+    0
+}
+
+// `write_selected_tree`, `undo.c:2275-2319`.
+fn write_selected_tree(
+    ut: UndoTree,
+    tb: TextBuf,
+    mut file: List[byte],
+    keep: List[bool],
+    root: int,
+    count: int,
+    cur_len: int,
+    cur_hash: wrapping[u64],
+) -> bool {
+    let saved = if ut.saved != 0 && keep[ut.saved] then ut.saved else 0
+    let anchor = if saved != 0 then saved else root
+    let depth_base = ut.nodes[root - 1].depth
+    let (root_len, root_hash) = state_identity_at(ut, tb, root)
+    file = List[byte]()
+    yewu_header(
+        mut file,
+        ut.identity_version,
+        YEWU_TRUNCATED,
+        root,
+        ut.cur,
+        saved,
+        anchor,
+        count,
+        if saved != 0 then ut.saved_len else root_len,
+        if saved != 0 then ut.saved_hash else root_hash,
+        cur_len,
+        cur_hash,
+    )
+    var crc_xor = 0
+    var id = 1
+    while id <= ut.nodes.len {
+        if !keep[id] {
+            id += 1
+            continue
+        }
+        let n = copy ut.nodes[id - 1]
+        if n.depth < depth_base {
+            util.bug("text.undo", "undo write: selected depth underflow")
+        }
+        let rerooted = id == root && root != ut.root
+        var flags = n.flags - (n.flags & (TXN_DEAD | TXN_SAVED))
+        if rerooted {
+            flags = flags | TXN_TRIMMED
+        }
+        if id == saved {
+            flags = flags | TXN_SAVED
+        }
+        let parent = if id == root then 0 else n.parent
+        crc_xor = crc_xor ^
+            write_node_record(
+                ut,
+                tb,
+                mut file,
+                n,
+                parent,
+                selected_redo_child(ut, keep, n),
+                n.depth - depth_base,
+                flags,
+                rerooted,
+            )
+        id += 1
+    }
+    put_u32_le(mut file, crc_xor)
+    for b in "UGAS".bytes() {
+        (mut file).push(b)
+    }
+    file.len <= ut.persist_bytes_max
+}
+
+// `write_truncated_tree`, `undo.c:2321-2460`.
+fn write_truncated_tree(
+    ut: UndoTree,
+    tb: TextBuf,
+    mut file: List[byte],
+    full_size: int,
+    cur_len: int,
+    cur_hash: wrapping[u64],
+) -> bool {
+    let slots = ut.nodes.len + 1
+    var keep = List[bool]()
+    var protect = List[bool]()
+    var sub_protected = List[bool]()
+    var node_sizes = List[int]()
+    var sub_sizes = List[int]()
+    var sub_counts = List[int]()
+    var s = 0
+    while s < slots {
+        (mut keep).push(false)
+        (mut protect).push(false)
+        (mut sub_protected).push(false)
+        (mut node_sizes).push(0)
+        (mut sub_sizes).push(0)
+        (mut sub_counts).push(0)
+        s += 1
+    }
+    var total = full_size
+    var count = live_count(ut)
+    var root = ut.root
+    var id = 1
+    while id <= ut.nodes.len {
+        if node_live(ut, id) {
+            keep[id] = true
+            node_sizes[id] = serialized_node_size(ut, ut.nodes[id - 1], false)
+        }
+        id += 1
+    }
+    var root_size = node_sizes[root]
+    id = ut.cur
+    while id != 0 {
+        protect[id] = true
+        id = ut.nodes[id - 1].parent
+    }
+    id = ut.saved
+    while id != 0 {
+        protect[id] = true
+        id = ut.nodes[id - 1].parent
+    }
+    var recent = 0
+    id = ut.nodes.len
+    while id != 0 && recent < ut.min_nodes {
+        if keep[id] {
+            protect[id] = true
+            recent += 1
+        }
+        id -= 1
+    }
+    var at = ut.nodes.len
+    while at != 0 {
+        id = at
+        at -= 1
+        if !keep[id] {
+            continue
+        }
+        sub_sizes[id] += node_sizes[id]
+        sub_counts[id] += 1
+        if protect[id] {
+            sub_protected[id] = true
+        }
+        let parent = ut.nodes[id - 1].parent
+        if parent != 0 {
+            sub_sizes[parent] += sub_sizes[id]
+            sub_counts[parent] += sub_counts[id]
+            if sub_protected[id] {
+                sub_protected[parent] = true
+            }
+        }
+    }
+    id = 1
+    while id <= ut.nodes.len && total > ut.persist_bytes_max {
+        if !keep[id] || sub_protected[id] {
+            id += 1
+            continue
+        }
+        let parent = ut.nodes[id - 1].parent
+        if parent != 0 && !sub_protected[parent] {
+            id += 1
+            continue
+        }
+        if sub_sizes[id] > total || sub_counts[id] > count {
+            util.bug("text.undo", "undo write: invalid selected subtree accounting")
+        }
+        total -= sub_sizes[id]
+        count -= sub_counts[id]
+        keep[id] = false
+        var drop = id + 1
+        while drop <= ut.nodes.len {
+            if keep[drop] {
+                let cp = ut.nodes[drop - 1].parent
+                if cp != 0 && !keep[cp] {
+                    keep[drop] = false
+                }
+            }
+            drop += 1
+        }
+        id += 1
+    }
+    while total > ut.persist_bytes_max && count > ut.min_nodes && root != ut.saved {
+        var child = 0
+        var c = ut.nodes[root - 1].first_child
+        var many = false
+        while c != 0 {
+            if keep[c] {
+                if child != 0 {
+                    many = true
+                    break
+                }
+                child = c
+            }
+            c = ut.nodes[c - 1].next_sibling
+        }
+        if many {
+            child = 0
+        }
+        if child == 0 || child == ut.cur {
+            break
+        }
+        let old_child_size = node_sizes[child]
+        let new_child_size = serialized_node_size(ut, ut.nodes[child - 1], true)
+        if root_size > total || old_child_size > total - root_size {
+            util.bug("text.undo", "undo write: invalid selected root accounting")
+        }
+        total = total - root_size - old_child_size + new_child_size
+        keep[root] = false
+        root = child
+        root_size = new_child_size
+        count -= 1
+    }
+    if total > ut.persist_bytes_max {
+        return false
+    }
+    write_selected_tree(ut, tb, mut file, keep, root, count, cur_len, cur_hash)
+}
+
+fn serialized_tree_size(ut: UndoTree) -> int {
+    var total = YEWU_HEADER_LEN + 8
+    var id = 1
+    while id <= ut.nodes.len {
+        if node_live(ut, id) {
+            total += serialized_node_size(ut, ut.nodes[id - 1], false)
+        }
+        id += 1
+    }
+    total
+}
+
+/// Write the `.yewu` sidecar atomically (`yew_undo_write`,
+/// `undo.c:2479-2533`).
+pub fn undo_write(ec: EditCtx, path: str) -> int {
+    require_ctx(ec)
+    if ec.undo.depth != 0 {
+        util.bug("text.undo", "undo: serialize inside transaction")
+    }
+    let current_len = textbuf_len(ec.tb)
+    let current_hash = text_hash_version(ec.tb, ec.undo.identity_version)
+    let anchor = if ec.undo.saved != 0 then ec.undo.saved else ec.undo.root
+    let count = live_count(ec.undo)
+    let size = serialized_tree_size(ec.undo)
+    var file = List[byte]()
+    if size > ec.undo.persist_bytes_max {
+        if !write_truncated_tree(ec.undo, ec.tb, mut file, size, current_len, current_hash) &&
+            !write_truncated_path(ec.undo, ec.tb, mut file, current_len, current_hash) {
+            return UNDO_WRITE_TOO_LARGE
+        }
+    } else {
+        yewu_header(
+            mut file,
+            ec.undo.identity_version,
+            if ec.undo.persist_truncated then YEWU_TRUNCATED else 0,
+            ec.undo.root,
+            ec.undo.cur,
+            ec.undo.saved,
+            anchor,
+            count,
+            if ec.undo.saved != 0 then ec.undo.saved_len else ec.undo.root_len,
+            if ec.undo.saved != 0 then ec.undo.saved_hash else ec.undo.root_hash,
+            current_len,
+            current_hash,
+        )
+        var crc_xor = 0
+        var id = 1
+        while id <= ec.undo.nodes.len {
+            if node_live(ec.undo, id) {
+                let n = copy ec.undo.nodes[id - 1]
+                crc_xor = crc_xor ^
+                    write_node_record(
+                        ec.undo,
+                        ec.tb,
+                        mut file,
+                        n,
+                        n.parent,
+                        n.redo_child,
+                        n.depth,
+                        n.flags,
+                        false,
+                    )
+            }
+            id += 1
+        }
+        put_u32_le(mut file, crc_xor)
+        for b in "UGAS".bytes() {
+            (mut file).push(b)
+        }
+    }
+    if file_write_atomic(path, file, 384) == SAVE_OK then UNDO_WRITE_OK else UNDO_WRITE_IO
+}
+
+// The sidecar reader (`YewuReader`, `undo.c:2535-2580`).
+struct YewuReader {
+    at: int,
+    ok: bool,
+}
+
+fn rd_take(mut r: YewuReader, data: List[byte], len: int) -> int {
+    if !r.ok || len < 0 || r.at > data.len || len > data.len - r.at {
+        r.ok = false
+        return 0
+    }
+    let at = r.at
+    r.at += len
+    at
+}
+
+fn rd_u16(mut r: YewuReader, data: List[byte]) -> int {
+    let at = rd_take(mut r, data, 2)
+    if !r.ok {
+        return 0
+    }
+    data[at] as int | data[at + 1] as int << 8
+}
+
+fn rd_u32(mut r: YewuReader, data: List[byte]) -> int {
+    let at = rd_take(mut r, data, 4)
+    if !r.ok {
+        return 0
+    }
+    u32_le_at(data, at)
+}
+
+fn rd_u64(mut r: YewuReader, data: List[byte]) -> int {
+    let at = rd_take(mut r, data, 8)
+    if !r.ok {
+        return 0
+    }
+    u64_le_at(data, at)
+}
+
+fn rd_hash(mut r: YewuReader, data: List[byte]) -> wrapping[u64] {
+    let at = rd_take(mut r, data, 8)
+    if !r.ok {
+        return 0
+    }
+    hash_le_at(data, at)
+}
+
+const FILE_READ_OK: int = 0
+
+const FILE_READ_IO: int = 1
+
+const FILE_READ_INVALID: int = 2
+
+// `read_file_bytes`, `undo.c:2588-2648`.
+fn read_file_bytes(path: str, max_bytes: int) -> (int, List[byte]) {
+    let lst = path_lstat(path)
+    if !lst.ok {
+        return (FILE_READ_IO, List[byte]())
+    }
+    if lst.kind != KIND_FILE {
+        return (FILE_READ_INVALID, List[byte]())
+    }
+    let before = path_stat(path)
+    if !before.ok {
+        return (FILE_READ_IO, List[byte]())
+    }
+    if before.kind != KIND_FILE ||
+        before.dev != lst.dev ||
+        before.ino != lst.ino ||
+        before.size < 0 ||
+        before.size > max_bytes {
+        return (FILE_READ_INVALID, List[byte]())
+    }
+    let data = fs_read_bytes(path) else {
+        return (FILE_READ_IO, List[byte]())
+    }
+    let after = path_stat(path)
+    if data.len != before.size ||
+        !after.ok ||
+        before.dev != after.dev ||
+        before.ino != after.ino ||
+        before.size != after.size {
+        return (FILE_READ_IO, List[byte]())
+    }
+    (FILE_READ_OK, data)
+}
+
+fn grow_node_ids(mut ut: UndoTree, id: int) -> bool {
+    let max_ids = UNDO_PERSIST_BYTES_MAX / 48
+    if id == 0 || id > max_ids {
+        return false
+    }
+    while ut.nodes.len < id {
+        var dead = zero_node()
+        dead.flags = TXN_DEAD
+        (mut ut.nodes).push(dead)
+    }
+    true
+}
+
+// `parse_node`, `undo.c:2701-2830`: answers false on any malformation.
+fn parse_node(
+    mut r: YewuReader,
+    data: List[byte],
+    mut ut: UndoTree,
+    mut crc_xor: int,
+    previous_id: int,
+) -> bool {
+    let record_at = r.at
+    var n = zero_node()
+    n.id = rd_u32(mut r, data)
+    n.parent = rd_u32(mut r, data)
+    n.redo_child = rd_u32(mut r, data)
+    n.depth = rd_u32(mut r, data)
+    let small = rd_take(mut r, data, 2)
+    let pad = rd_u16(mut r, data)
+    n.win_id = rd_u32(mut r, data)
+    let wall = rd_u64(mut r, data)
+    let n_ops = rd_u32(mut r, data)
+    if !r.ok {
+        return false
+    }
+    n.reason = data[small] as int
+    n.flags = data[small + 1] as int
+    n.t_wall = wall
+    if pad != 0 || n.flags - (n.flags & (TXN_TRIMMED | TXN_SAVED)) != 0 {
+        return false
+    }
+    if n.id <= previous_id ||
+        n.reason >= TXN_REASON_MAX ||
+        !grow_node_ids(mut ut, n.id) ||
+        n.parent != 0 && !node_live(ut, n.parent) ||
+        n_ops > (data.len - r.at) / 32 {
+        return false
+    }
+    n.ops_at = ut.ops.len
+    n.rep_at = ut.repairs.len
+    n.blob_lo = ut.blobs.len
+    var i = 0
+    while i < n_ops {
+        let osmall = rd_take(mut r, data, 2)
+        let opad = rd_u16(mut r, data)
+        let off = rd_u64(mut r, data)
+        let len = rd_u64(mut r, data)
+        let plen = rd_u64(mut r, data)
+        if !r.ok || plen != len || plen <= 0 {
+            return false
+        }
+        let payload_at = rd_take(mut r, data, plen)
+        if !r.ok {
+            return false
+        }
+        let kind = data[osmall] as int
+        if kind != OP_INS && kind != OP_DEL || data[osmall + 1] as int != 0 || opad != 0 {
+            return false
+        }
+        let payload = ut.blobs.len
+        var k = 0
+        while k < plen {
+            (mut ut.blobs).push(data[payload_at + k])
+            k += 1
+        }
+        let repair_count = rd_u32(mut r, data)
+        if !r.ok || repair_count > (data.len - r.at) / 16 || kind == OP_INS && repair_count != 0 {
+            return false
+        }
+        let run_at = ut.repairs.len
+        var q = 0
+        while q < repair_count {
+            let mid = rd_u32(mut r, data)
+            let mgen = rd_u32(mut r, data)
+            let rel = rd_u64(mut r, data)
+            if !r.ok {
+                return false
+            }
+            (mut ut.repairs).push(MarkRepair { mark_id: mid, mark_gen: mgen, rel_off: rel })
+            q += 1
+        }
+        n.n_rep += repair_count
+        (mut ut.ops).push(UndoOp { kind: kind, src: 0, off: off, len: len, payload: payload })
+        (mut ut.repair_runs).push(UndoRepairRun { at: run_at, len: repair_count })
+        (mut ut.replay_spans).push(UndoReplaySpan { lo: 0, hi: 0, src: 0, valid: false })
+        i += 1
+    }
+    n.n_ops = n_ops
+    n.n_before = rd_u32(mut r, data)
+    if !r.ok || n.n_before > (data.len - r.at) / 24 {
+        return false
+    }
+    n.cur_before = ut.cursors.len
+    i = 0
+    while i < n.n_before {
+        let p = rd_u64(mut r, data)
+        let a = rd_u64(mut r, data)
+        let g = rd_u64(mut r, data)
+        if !r.ok {
+            return false
+        }
+        (mut ut.cursors).push(CursorRec { pos: p, anchor: a, goal: g })
+        i += 1
+    }
+    n.n_after = rd_u32(mut r, data)
+    if !r.ok || n.n_after > (data.len - r.at) / 24 {
+        return false
+    }
+    n.cur_after = ut.cursors.len
+    i = 0
+    while i < n.n_after {
+        let p = rd_u64(mut r, data)
+        let a = rd_u64(mut r, data)
+        let g = rd_u64(mut r, data)
+        if !r.ok {
+            return false
+        }
+        (mut ut.cursors).push(CursorRec { pos: p, anchor: a, goal: g })
+        i += 1
+    }
+    n.blob_hi = ut.blobs.len
+    let actual = crc32_of(data, record_at, r.at)
+    let stored = rd_u32(mut r, data)
+    if !r.ok || actual != stored {
+        return false
+    }
+    crc_xor = crc_xor ^ stored
+    let nid = n.id
+    let parent = n.parent
+    ut.nodes[nid - 1] = n
+    if parent != 0 {
+        if ut.nodes[parent - 1].first_child == 0 {
+            ut.nodes[parent - 1].first_child = nid
+        } else {
+            var at = ut.nodes[parent - 1].first_child
+            while ut.nodes[at - 1].next_sibling != 0 {
+                at = ut.nodes[at - 1].next_sibling
+            }
+            ut.nodes[at - 1].next_sibling = nid
+        }
+    }
+    true
+}
+
+fn reverse_node_len(ut: UndoTree, n: UndoNode, len_in: int) -> (bool, int) {
+    var len = len_in
+    var i = n.n_ops
+    while i != 0 {
+        i -= 1
+        let op = copy ut.ops[n.ops_at + i]
+        if op.kind == OP_INS {
+            if op.off > len || op.len > len - op.off {
+                return (false, len)
+            }
+            len -= op.len
+        } else if op.kind == OP_DEL {
+            if op.off > len {
+                return (false, len)
+            }
+            len += op.len
+        } else {
+            return (false, len)
+        }
+    }
+    (true, len)
+}
+
+fn forward_node_len(ut: UndoTree, n: UndoNode, len_in: int) -> (bool, int) {
+    var len = len_in
+    var i = 0
+    while i < n.n_ops {
+        let op = copy ut.ops[n.ops_at + i]
+        if op.kind == OP_INS {
+            if op.off > len {
+                return (false, len)
+            }
+            len += op.len
+        } else if op.kind == OP_DEL {
+            if op.off > len || op.len > len - op.off {
+                return (false, len)
+            }
+            len -= op.len
+        } else {
+            return (false, len)
+        }
+        i += 1
+    }
+    (true, len)
+}
+
+fn cursor_slice_valid(ut: UndoTree, at: int, count: int, len: int) -> bool {
+    if at > ut.cursors.len || count > ut.cursors.len - at {
+        return false
+    }
+    var i = 0
+    while i < count {
+        let c = copy ut.cursors[at + i]
+        if c.pos > len || c.anchor > len || c.pos < 0 || c.anchor < 0 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn node_payloads_valid(ut: UndoTree, n: UndoNode) -> bool {
+    if n.ops_at > ut.ops.len || n.n_ops > ut.ops.len - n.ops_at {
+        return false
+    }
+    var i = 0
+    while i < n.n_ops {
+        let index = n.ops_at + i
+        let op = copy ut.ops[index]
+        if index >= ut.repair_runs.len ||
+            op.payload > ut.blobs.len ||
+            op.len > ut.blobs.len - op.payload {
+            return false
+        }
+        let run = copy ut.repair_runs[index]
+        if run.at > ut.repairs.len ||
+            run.len > ut.repairs.len - run.at ||
+            op.kind == OP_INS && run.len != 0 {
+            return false
+        }
+        var r = 0
+        while r < run.len {
+            if ut.repairs[run.at + r].rel_off > op.len {
+                return false
+            }
+            r += 1
+        }
+        i += 1
+    }
+    true
+}
+
+// `validate_loaded`, `undo.c:2930-2997`: answers (valid, root_len).
+fn validate_loaded(
+    ut: UndoTree,
+    root: int,
+    cur: int,
+    saved: int,
+    anchor: int,
+    anchor_len: int,
+    cur_len: int,
+) -> (bool, int) {
+    if !node_live(ut, root) ||
+        ut.nodes[root - 1].parent != 0 ||
+        !node_live(ut, cur) ||
+        !node_live(ut, anchor) ||
+        saved != 0 && !node_live(ut, saved) ||
+        anchor != (if saved != 0 then saved else root) ||
+        !is_ancestor(ut, root, cur) ||
+        !is_ancestor(ut, root, anchor) ||
+        ut.nodes[root - 1].depth != 0 ||
+        ut.nodes[root - 1].n_ops != 0 ||
+        ut.nodes[root - 1].n_before != 0 {
+        return (false, 0)
+    }
+    var root_len = anchor_len
+    var id = anchor
+    while id != root {
+        let n = copy ut.nodes[id - 1]
+        let (ok, l) = reverse_node_len(ut, n, root_len)
+        if !ok {
+            return (false, 0)
+        }
+        root_len = l
+        id = n.parent
+    }
+    var lengths = List[int]()
+    var k = 0
+    while k < ut.nodes.len {
+        (mut lengths).push(0)
+        k += 1
+    }
+    id = 1
+    while id <= ut.nodes.len {
+        if !node_live(ut, id) {
+            id += 1
+            continue
+        }
+        let n = copy ut.nodes[id - 1]
+        if id == root && n.parent != 0 ||
+            id != root &&
+                (
+                    !node_live(ut, n.parent) ||
+                        n.parent == 0 ||
+                        n.depth != ut.nodes[n.parent - 1].depth + 1
+                ) ||
+            (n.flags & TXN_SAVED != 0) != (id == saved) ||
+            !node_payloads_valid(ut, n) {
+            return (false, 0)
+        }
+        if n.redo_child != 0 &&
+            (!node_live(ut, n.redo_child) || ut.nodes[n.redo_child - 1].parent != id) {
+            return (false, 0)
+        }
+        let before_len = if id == root then root_len else lengths[n.parent - 1]
+        let (ok, after_len) = forward_node_len(ut, n, before_len)
+        if !ok ||
+            !cursor_slice_valid(ut, n.cur_before, n.n_before, before_len) ||
+            !cursor_slice_valid(ut, n.cur_after, n.n_after, after_len) {
+            return (false, 0)
+        }
+        lengths[id - 1] = after_len
+        id += 1
+    }
+    if lengths[cur - 1] != cur_len || lengths[anchor - 1] != anchor_len {
+        return (false, 0)
+    }
+    (true, root_len)
+}
+
+// `materialize_insert_payloads`, `undo.c:2999-3018`: each insert's bytes
+// into the add store (appended, then deleted at the end).
+fn materialize_insert_payloads(mut tb: TextBuf, mut ut: UndoTree) {
+    var i = 0
+    while i < ut.ops.len {
+        let op = copy ut.ops[i]
+        if op.kind == OP_INS {
+            let end = textbuf_len(tb)
+            let add_at = textbuf_insert_payload(
+                mut tb,
+                end as ByteOff,
+                ut.blobs,
+                op.payload,
+                op.payload + op.len,
+            )
+            textbuf_delete(mut tb, Span { lo: end, hi: end + op.len })
+            ut.ops[i].src = STORE_ADD
+            ut.ops[i].payload = add_at
+        }
+        i += 1
+    }
+}
+
+// `retain_delete_payloads`, `undo.c:3020-3044`.
+fn retain_delete_payloads(mut ut: UndoTree) {
+    var deletes = List[byte]()
+    var id = 1
+    while id <= ut.nodes.len {
+        if !node_live(ut, id) {
+            id += 1
+            continue
+        }
+        let n = copy ut.nodes[id - 1]
+        ut.nodes[id - 1].blob_lo = deletes.len
+        var i = 0
+        while i < n.n_ops {
+            let op = copy ut.ops[n.ops_at + i]
+            if op.kind == OP_DEL {
+                if op.payload > ut.blobs.len || op.len > ut.blobs.len - op.payload {
+                    util.bug("text.undo", "undo read: corrupt materialized delete payload")
+                }
+                ut.ops[n.ops_at + i].payload = deletes.len
+                var k = 0
+                while k < op.len {
+                    (mut deletes).push(ut.blobs[op.payload + k])
+                    k += 1
+                }
+            }
+            i += 1
+        }
+        ut.nodes[id - 1].blob_hi = deletes.len
+        id += 1
+    }
+    ut.blobs = deletes
+}
+
+/// Read and adopt a `.yewu` sidecar (`yew_undo_read`, `undo.c:3046-3205`).
+pub fn undo_read(mut ec: EditCtx, path: str) -> int {
+    require_ctx(ec)
+    if ec.undo.depth != 0 || ec.undo.open != 0 {
+        util.bug("text.undo", "undo: deserialize inside transaction")
+    }
+    let max = if ec.undo.persist_bytes_max < UNDO_PERSIST_BYTES_MAX {
+        ec.undo.persist_bytes_max
+    } else {
+        UNDO_PERSIST_BYTES_MAX
+    }
+    let (rc, data) = read_file_bytes(path, max)
+    if rc == FILE_READ_IO {
+        return UNDO_READ_IO
+    }
+    if rc == FILE_READ_INVALID {
+        util.log_warn("undo: dropped unsafe or oversized .yewu")
+        return UNDO_READ_DROPPED
+    }
+    var r = YewuReader { at: 0, ok: true }
+    var loaded = undo_none()
+    loaded.owner_bid = ec.tb.bid
+    let magic = rd_take(mut r, data, 4)
+    let version = rd_u32(mut r, data)
+    let flags = rd_u32(mut r, data)
+    let root = rd_u32(mut r, data)
+    let cur = rd_u32(mut r, data)
+    let saved = rd_u32(mut r, data)
+    let anchor = rd_u32(mut r, data)
+    let count = rd_u32(mut r, data)
+    let anchor_len = rd_u64(mut r, data)
+    let anchor_hash = rd_hash(mut r, data)
+    let cur_len = rd_u64(mut r, data)
+    let cur_hash = rd_hash(mut r, data)
+    if !r.ok ||
+        data[magic] as int != 89 ||
+        data[magic + 1] as int != 69 ||
+        data[magic + 2] as int != 87 ||
+        data[magic + 3] as int != 85 ||
+        version != YEWU_VERSION_FNV && version != YEWU_VERSION_BLOCK ||
+        r.at != YEWU_HEADER_LEN ||
+        flags - (flags & YEWU_TRUNCATED) != 0 ||
+        count == 0 ||
+        data.len < YEWU_HEADER_LEN + 8 ||
+        count > (data.len - YEWU_HEADER_LEN - 8) / 48 {
+        util.log_warn("undo: dropped invalid or stale .yewu")
+        return UNDO_READ_DROPPED
+    }
+    loaded.identity_version = version
+    var crc_xor = 0
+    var previous_id = 0
+    var i = 0
+    while i < count {
+        let before = r.at
+        if !parse_node(mut r, data, mut loaded, mut crc_xor, previous_id) || r.at <= before {
+            util.log_warn("undo: dropped invalid or stale .yewu")
+            return UNDO_READ_DROPPED
+        }
+        previous_id = loaded.nodes.len
+        i += 1
+    }
+    let stored_xor = rd_u32(mut r, data)
+    let tail = rd_take(mut r, data, 4)
+    var bad = !r.ok || stored_xor != crc_xor
+    if !bad {
+        bad = data[tail] as int != 85 ||
+            data[tail + 1] as int != 71 ||
+            data[tail + 2] as int != 65 ||
+            data[tail + 3] as int != 83 ||
+            r.at != data.len
+    }
+    var root_len = 0
+    if !bad {
+        let (valid, rl) = validate_loaded(loaded, root, cur, saved, anchor, anchor_len, cur_len)
+        bad = !valid
+        root_len = rl
+    }
+    if bad {
+        util.log_warn("undo: dropped invalid or stale .yewu")
+        return UNDO_READ_DROPPED
+    }
+    let len = textbuf_len(ec.tb)
+    let hash = text_hash_version(ec.tb, loaded.identity_version)
+    var outcome = UNDO_READ_CURRENT
+    if len == cur_len && hash == cur_hash {
+        if saved == 0 {
+            loaded.cur = cur
+            let (rl, rh) = state_identity_at(loaded, ec.tb, root)
+            // YEW-F-076: an unsaved sidecar's anchor names its root.
+            if rl != anchor_len || rh != anchor_hash {
+                util.log_warn("undo: dropped invalid or stale .yewu")
+                return UNDO_READ_DROPPED
+            }
+        }
+        outcome = UNDO_READ_CURRENT
+        loaded.cur = cur
+    } else if len == anchor_len && hash == anchor_hash {
+        outcome = UNDO_READ_ANCHOR
+        loaded.cur = anchor
+    } else {
+        util.log_warn("undo: dropped invalid or stale .yewu")
+        return UNDO_READ_DROPPED
+    }
+    loaded.root = root
+    loaded.saved = saved
+    loaded.root_len = root_len
+    loaded.saved_len = if saved != 0 then anchor_len else root_len
+    loaded.saved_hash = if saved != 0 then anchor_hash else 0
+    loaded.bytes_max = ec.undo.bytes_max
+    loaded.min_nodes = ec.undo.min_nodes
+    loaded.persist_bytes_max = ec.undo.persist_bytes_max
+    loaded.persist_truncated = flags & YEWU_TRUNCATED != 0
+    loaded.clock_fake = ec.undo.clock_fake
+    loaded.fake_mono = ec.undo.fake_mono
+    loaded.fake_wall = ec.undo.fake_wall
+    materialize_insert_payloads(mut ec.tb, mut loaded)
+    retain_delete_payloads(mut loaded)
+    let (rl2, rh2) = state_identity_at(loaded, ec.tb, root)
+    if rl2 != loaded.root_len {
+        util.bug("text.undo", "undo read: validated root length changed")
+    }
+    loaded.root_hash = rh2
+    if saved == 0 {
+        loaded.saved_hash = rh2
+    }
+    account_live(mut loaded)
+    ec.undo = loaded
+    outcome
+}
