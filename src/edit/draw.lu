@@ -1,0 +1,728 @@
+//! edit.draw — the document, its overlays, the cursor and the footer
+//! onto the grid; the layout; one render a turn.
+//!
+//! Ports sagitta `src/ui/draw.c` (1,348 lines) and `ui/draw.h` (48), the
+//! single-window half of `src/ui/layout.c` (`yew_layout`,
+//! `layout_leaf_win`, `layout.c:616-745`) and `yew_ed_render`
+//! (`ed.c:2620-2808`) at 9ace98c2, under `s15-viewport-statusline.md`.
+//! The overlays later campaigns paint — syntax spans (yw10), search
+//! matches (yw04), diagnostics and LSP highlights (yw11), git diffs and
+//! blame (yw13), plugin overlays (yw14), floating panels (yw11) — have no
+//! source before their campaign, so a document row is text in the theme's
+//! `text` attr, then the selection, then the secondary cursors, as C's
+//! order puts them (`draw.c:937-1012`). The pane tree is one leaf (yw05).
+//!
+//! C hashes the cursor overlay's inputs into one `u64` signature
+//! (`cursor_overlay_signature`, `draw.c:149-177`); the port keeps the
+//! inputs themselves and compares them, so no collision can skip a
+//! repaint.
+
+use term
+use text
+use unicode
+
+fn row_right(g: term.Grid, w: Win) -> int {
+    let right = w.rect.x + w.rect.w
+    if right > g.cols then g.cols else right
+}
+
+fn draw_tabwidth(b: Buffer) -> int {
+    if b.tabwidth == 0 then VP_TABWIDTH else b.tabwidth
+}
+
+// `line_content_span` (`draw.c:71-81`).
+fn line_content_span(tb: text.TextBuf, line: int) -> text.Span {
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    var hi = sp.hi
+    if sp.lo == hi || text.textbuf_byte_at(tb, hi - 1) != 10 {
+        return sp
+    }
+    hi -= 1
+    if hi > sp.lo && text.textbuf_byte_at(tb, hi - 1) == 13 {
+        hi -= 1
+    }
+    text.span(sp.lo, hi)
+}
+
+fn put_styled_spaces(
+    mut g: term.Grid,
+    row: int,
+    col: int,
+    end: int,
+    fg: term.Color,
+    bg: term.Color,
+    attrs: int,
+) -> int {
+    var blank = copy g.blank
+    blank.fg = fg
+    blank.bg = bg
+    blank.attrs = attrs
+    if col < end {
+        term.grid_fill(mut g, row, col, end, blank)
+    }
+    end
+}
+
+fn put_spaces(mut g: term.Grid, row: int, col: int, end: int) -> int {
+    if col < end {
+        let blank = copy g.blank
+        term.grid_fill(mut g, row, col, end, blank)
+    }
+    end
+}
+
+fn clear_bytes(mut b: List[byte]) {
+    while b.len != 0 {
+        let _ = (mut b).pop() else 0 as byte
+    }
+}
+
+// `draw_span` (`draw.c:852-935`): one display row of the document, from
+// content column `left`, a grapheme at a time.
+fn draw_span(
+    mut ed: Ed,
+    bi: int,
+    sp: text.Span,
+    row: int,
+    wi: int,
+    left: int,
+    style_in: ThemeEnt,
+    mut cluster: List[byte],
+) {
+    let tabwidth = draw_tabwidth(ed.bufs[bi])
+    let start = text.ccol_to_off(ed.bufs[bi].ec.tb, sp, left as text.CCol, tabwidth) as int
+    var logical = text.off_to_ccol(ed.bufs[bi].ec.tb, sp, start as text.ByteOff, tabwidth) as int
+    var pos = start
+    var col = ed.wins[wi].rect.x
+    let right = row_right(ed.grid, ed.wins[wi])
+    var fg = copy style_in.fg
+    var bg = copy style_in.bg
+    if fg.tag == term.COLOR_DEFAULT {
+        fg = copy ed.grid.blank.fg
+    }
+    if bg.tag == term.COLOR_DEFAULT {
+        bg = copy ed.grid.blank.bg
+    }
+    let attrs = style_in.attrs
+    while pos < sp.hi && col < right {
+        let next = text.grapheme_next_boundary(ed.bufs[bi].ec.tb, pos as text.ByteOff) as int
+        if next <= pos || next > sp.hi {
+            bug("draw: invalid grapheme boundary")
+        }
+        let n = next - pos
+        clear_bytes(mut cluster)
+        var k = pos
+        while k < next {
+            (mut cluster).push(text.textbuf_byte_at(ed.bufs[bi].ec.tb, k) as byte)
+            k += 1
+        }
+        let tab = n == 1 && cluster[0] as int == 9
+        var cells = 0
+        if tab {
+            cells = text.tab_cells(logical as text.CCol, tabwidth)
+        } else {
+            let measured = unicode.cluster_width(cluster, 0, n)
+            cells = if measured > 0 then measured else 0
+        }
+        if logical >= left {
+            let relative = logical - left
+            var target = ed.wins[wi].rect.x + relative
+            if target > right {
+                target = right
+            }
+            col = put_styled_spaces(mut ed.grid, row, col, target, copy fg, copy bg, attrs)
+            if tab {
+                var stop = col + cells
+                if stop > right {
+                    stop = right
+                }
+                col = put_styled_spaces(mut ed.grid, row, col, stop, copy fg, copy bg, attrs)
+            } else {
+                col = term.grid_put(mut ed.grid, row, col, cluster, 0, n, copy fg, copy bg, attrs)
+            }
+        }
+        logical += cells
+        pos = next
+    }
+    let _ = put_spaces(mut ed.grid, row, col, right)
+}
+
+// The theme's `text` attr at the active rendition (`yew_theme_tab`).
+fn text_style(ed: Ed) -> ThemeEnt {
+    theme_attr(ed.theme, theme_rendition_of(ed.render), ATTR_TEXT)
+}
+
+// `themed_overlay` (`draw.c:38-57`).
+fn themed_overlay(mut style: term.Cell, has: bool, t: ThemeEnt) -> int {
+    if !has {
+        return 0
+    }
+    var fields = 0
+    if t.fg.tag != term.COLOR_DEFAULT {
+        style.fg = copy t.fg
+        fields = fields | term.OVERLAY_FG
+    }
+    if t.bg.tag != term.COLOR_DEFAULT {
+        style.bg = copy t.bg
+        fields = fields | term.OVERLAY_BG
+    }
+    if t.attrs != 0 {
+        style.attrs = t.attrs
+        fields = fields | term.OVERLAY_ATTRS
+    }
+    fields
+}
+
+fn grid_x(w: Win, col: int) -> int {
+    let left = if w.vp.wrap then 0 else w.vp.left
+    let relative = if col > left then col - left else 0
+    let x = w.rect.x + relative
+    if x > 65535 then 65535 else x
+}
+
+// `overlay_span` (`draw.c:255-289`).
+fn overlay_span(
+    mut ed: Ed,
+    wi: int,
+    row: int,
+    displayed: text.Span,
+    selected: text.Span,
+    style: term.Cell,
+    fields: int,
+) {
+    let bi = ed.wins[wi].buf
+    let lo = if selected.lo > displayed.lo then selected.lo else displayed.lo
+    let hi = if selected.hi < displayed.hi then selected.hi else displayed.hi
+    if lo >= hi {
+        return
+    }
+    let tabw = draw_tabwidth(ed.bufs[bi])
+    let c0 = text.off_to_ccol(ed.bufs[bi].ec.tb, displayed, lo as text.ByteOff, tabw) as int
+    let c1 = text.off_to_ccol(ed.bufs[bi].ec.tb, displayed, hi as text.ByteOff, tabw) as int
+    var x0 = grid_x(ed.wins[wi], c0)
+    var x1 = grid_x(ed.wins[wi], c1)
+    let right = row_right(ed.grid, ed.wins[wi])
+    if x0 < ed.wins[wi].rect.x {
+        x0 = ed.wins[wi].rect.x
+    }
+    if x1 > right {
+        x1 = right
+    }
+    term.grid_overlay(mut ed.grid, row, x0, x1, style, fields)
+}
+
+/// `yew_draw_sel_style` (`draw.c:342-356`).
+pub fn draw_sel_style(ed: Ed) -> (term.Cell, int) {
+    var style = copy ed.grid.blank
+    let (has, t) = theme_ui(ed.theme, "sel", theme_rendition_of(ed.render))
+    var fields = themed_overlay(mut style, has, t)
+    if fields == 0 {
+        style.bg = term.color_rgb(52, 72, 108)
+        fields = term.OVERLAY_BG
+    }
+    (style, fields)
+}
+
+fn displayed_of(mut ed: Ed, wi: int, bi: int, line: int, sub: int) -> text.Span {
+    if ed.wins[wi].vp.wrap {
+        return wrap_row(mut ed.wins[wi], ed.bufs[bi].ec.tb, line, sub)
+    }
+    line_content_span(ed.bufs[bi].ec.tb, line)
+}
+
+// `draw_selection_rows` (`draw.c:358-411`).
+fn draw_selection_rows(mut ed: Ed, wi: int, lo: int, hi: int) {
+    if ed.mode != MODE_H {
+        return
+    }
+    let bi = ed.wins[wi].buf
+    let (style, fields) = draw_sel_style(ed)
+    let kind = ed.wins[wi].h.kind
+    let tabw = sel_tabwidth(ed.bufs[bi].tabwidth)
+    var i = 0
+    while i < ed.wins[wi].cs.curs.len {
+        let c = copy ed.wins[wi].cs.curs[i]
+        i += 1
+        if c.pos == c.anchor {
+            continue
+        }
+        var rect_spans = List[text.Span]()
+        var rect_first = 0
+        var selected = text.span(0, 0)
+        if kind == SEL_RECT {
+            let pl = text.textbuf_line_of(ed.bufs[bi].ec.tb, c.pos as text.ByteOff) as int
+            let al = text.textbuf_line_of(ed.bufs[bi].ec.tb, c.anchor as text.ByteOff) as int
+            rect_first = if pl < al then pl else al
+            rect_spans = sel_rect_spans(ed.bufs[bi].ec.tb, kind, tabw, c)
+        } else {
+            selected = sel_span(ed.bufs[bi].ec.tb, kind, c)
+        }
+        var srow = lo
+        while srow < hi && srow < ed.wins[wi].rect.h {
+            let (ok, line, sub) = vp_line_of_row(mut ed.wins[wi], ed.bufs[bi].ec.tb, srow)
+            if ok {
+                let displayed = displayed_of(mut ed, wi, bi, line, sub)
+                var keep = true
+                if kind == SEL_RECT {
+                    if line < rect_first || line - rect_first >= rect_spans.len {
+                        keep = false
+                    } else {
+                        selected = copy rect_spans[line - rect_first]
+                    }
+                }
+                if keep {
+                    overlay_span(
+                        mut ed,
+                        wi,
+                        ed.wins[wi].rect.y + srow,
+                        displayed,
+                        copy selected,
+                        copy style,
+                        fields,
+                    )
+                }
+            }
+            srow += 1
+        }
+    }
+}
+
+// `draw_secondary_rows` (`draw.c:413-469`).
+fn draw_secondary_rows(mut ed: Ed, wi: int, lo: int, hi: int) {
+    let bi = ed.wins[wi].buf
+    var style = copy ed.grid.blank
+    let (has, t) = theme_ui(ed.theme, "cursor.secondary", theme_rendition_of(ed.render))
+    var fields = themed_overlay(mut style, has, t)
+    if fields == 0 && ed.render.tier == term.TIER_16 {
+        style.attrs = term.ATTR_REVERSE
+        fields = term.OVERLAY_ATTRS
+    } else if fields == 0 {
+        style.fg = term.color_rgb(250, 252, 255)
+        style.bg = term.color_rgb(104, 139, 214)
+        fields = term.OVERLAY_FG | term.OVERLAY_BG
+    }
+    let tabw = draw_tabwidth(ed.bufs[bi])
+    var i = 0
+    while i < ed.wins[wi].cs.curs.len {
+        if i == ed.wins[wi].cs.primary {
+            i += 1
+            continue
+        }
+        let pos = ed.wins[wi].cs.curs[i].pos
+        i += 1
+        let line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff) as int
+        let count = if ed.wins[wi].vp.wrap {
+            wrap_rows(mut ed.wins[wi], ed.bufs[bi].ec.tb, line)
+        } else {
+            1
+        }
+        var sub = 0
+        var displayed = text.span(0, 0)
+        while sub < count {
+            displayed = displayed_of(mut ed, wi, bi, line, sub)
+            if pos >= displayed.lo && (pos < displayed.hi || sub + 1 == count) {
+                break
+            }
+            sub += 1
+        }
+        if sub == count {
+            continue
+        }
+        let (vis, srow) = vp_row_of_line(mut ed.wins[wi], ed.bufs[bi].ec.tb, line, sub)
+        if !vis || srow < lo || srow >= hi {
+            continue
+        }
+        let col = text.off_to_ccol(ed.bufs[bi].ec.tb, displayed, pos as text.ByteOff, tabw) as int
+        let x = grid_x(ed.wins[wi], col)
+        if ed.wins[wi].rect.y + srow >= ed.grid.rows ||
+            x < ed.wins[wi].rect.x ||
+            x >= row_right(ed.grid, ed.wins[wi]) {
+            continue
+        }
+        term.grid_overlay(mut ed.grid, ed.wins[wi].rect.y + srow, x, x + 1, copy style, fields)
+    }
+}
+
+// The cursor overlay's inputs (C's signature, `draw.c:149-177`).
+fn overlay_inputs(ed: Ed, wi: int) -> List[int] {
+    let w = wi
+    let bi = ed.wins[w].buf
+    var v = List[int]()
+    (mut v).push(ed.wins[w].cs.curs.len)
+    (mut v).push(ed.wins[w].cs.primary)
+    (mut v).push(if ed.mode == MODE_H then 1 else 0)
+    (mut v).push(ed.render.tier)
+    (mut v).push(draw_tabwidth(ed.bufs[bi]))
+    (mut v).push(ed.wins[w].vp.top)
+    (mut v).push(ed.wins[w].vp.top_sub)
+    (mut v).push(ed.wins[w].vp.left)
+    (mut v).push(if ed.wins[w].vp.wrap then 1 else 0)
+    (mut v).push(ed.wins[w].rect.x)
+    (mut v).push(ed.wins[w].rect.y)
+    (mut v).push(ed.wins[w].rect.w)
+    (mut v).push(ed.wins[w].rect.h)
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        if i != ed.wins[w].cs.primary {
+            (mut v).push(ed.wins[w].cs.curs[i].pos)
+            (mut v).push(ed.wins[w].cs.curs[i].anchor)
+        }
+        i += 1
+    }
+    v
+}
+
+fn overlay_matches(ed: Ed, wi: int) -> bool {
+    let now = overlay_inputs(ed, wi)
+    if now.len != ed.overlay_sig.len {
+        return false
+    }
+    var i = 0
+    while i < now.len {
+        if now[i] != ed.overlay_sig[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_draw_cursor_overlay_sync` (`draw.c:179-185`).
+pub fn draw_overlay_sync(mut ed: Ed, wi: int) {
+    ed.overlay_sig = overlay_inputs(ed, wi)
+    ed.overlay_valid = true
+}
+
+/// `yew_draw_document_rows` (`draw.c:937-1012`): window `wi`'s rows
+/// `[lo, hi)`, then the gutter and the overlays.
+pub fn draw_document_rows(mut ed: Ed, wi: int, lo_in: int, hi_in: int) {
+    let bi = ed.wins[wi].buf
+    let line_count = text.textbuf_line_count(ed.bufs[bi].ec.tb)
+    let hi = if hi_in > ed.wins[wi].rect.h then ed.wins[wi].rect.h else hi_in
+    let lo = if lo_in > hi then hi else lo_in
+    let style = text_style(ed)
+    var cluster = List[byte]()
+    var srow = lo
+    while srow < hi {
+        let row = ed.wins[wi].rect.y + srow
+        if row >= ed.grid.rows {
+            break
+        }
+        let (ok, line, sub) = vp_line_of_row(mut ed.wins[wi], ed.bufs[bi].ec.tb, srow)
+        if ok && line < line_count {
+            let sp = displayed_of(mut ed, wi, bi, line, sub)
+            let left = if ed.wins[wi].vp.wrap then 0 else ed.wins[wi].vp.left
+            draw_span(mut ed, bi, sp, row, wi, left, copy style, mut cluster)
+        } else {
+            let right = row_right(ed.grid, ed.wins[wi])
+            let _ = put_spaces(mut ed.grid, row, ed.wins[wi].rect.x, right)
+        }
+        srow += 1
+    }
+    gutter_draw(mut ed, wi, lo, hi)
+    draw_selection_rows(mut ed, wi, lo, hi)
+    draw_secondary_rows(mut ed, wi, lo, hi)
+    if lo == 0 && hi == ed.wins[wi].rect.h {
+        draw_overlay_sync(mut ed, wi)
+        if ed.wins[wi].cs.curs.len != 0 && ed.wins[wi].cs.primary < ed.wins[wi].cs.curs.len {
+            let p = ed.wins[wi].cs.primary
+            ed.overlay_primary_pos = ed.wins[wi].cs.curs[p].pos
+            ed.overlay_primary_anchor = ed.wins[wi].cs.curs[p].anchor
+            ed.overlay_primary_valid = true
+        } else {
+            ed.overlay_primary_valid = false
+        }
+    }
+}
+
+// `redraw_primary_selection_change` (`draw.c:187-244`).
+fn redraw_primary_selection_change(mut ed: Ed, wi: int, pos: int, anchor: int) {
+    let bi = ed.wins[wi].buf
+    let op = text.textbuf_line_of(ed.bufs[bi].ec.tb, ed.overlay_primary_pos as text.ByteOff) as int
+    let oa = text.textbuf_line_of(
+        ed.bufs[bi].ec.tb,
+        ed.overlay_primary_anchor as text.ByteOff,
+    ) as int
+    let np = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff) as int
+    let na = text.textbuf_line_of(ed.bufs[bi].ec.tb, anchor as text.ByteOff) as int
+    var first = if op < oa then op else oa
+    if np < first {
+        first = np
+    }
+    if na < first {
+        first = na
+    }
+    var last = if op > oa then op else oa
+    if np > last {
+        last = np
+    }
+    if na > last {
+        last = na
+    }
+    let h = ed.wins[wi].rect.h
+    var lo = h
+    var hi = 0
+    var row = 0
+    while row < h {
+        let (ok, line, _) = vp_line_of_row(mut ed.wins[wi], ed.bufs[bi].ec.tb, row)
+        if ok && line >= first && line <= last {
+            if lo == h {
+                lo = row
+            }
+            hi = row + 1
+        }
+        row += 1
+    }
+    if lo < hi {
+        draw_document_rows(mut ed, wi, lo, hi)
+    }
+}
+
+/// `yew_draw_cursor` (`draw.c:1014-1058`).
+pub fn draw_cursor(mut ed: Ed, wi: int) {
+    let bi = ed.wins[wi].buf
+    term.grid_cursor_shape(
+        mut ed.grid,
+        if ed.mode == MODE_I then term.CURSOR_BAR else term.CURSOR_BLOCK,
+    )
+    if !ed.overlay_valid || !overlay_matches(ed, wi) {
+        draw_document_rows(mut ed, wi, 0, ed.wins[wi].rect.h)
+    }
+    if ed.wins[wi].cs.curs.len == 0 || ed.wins[wi].cs.primary >= ed.wins[wi].cs.curs.len {
+        term.grid_cursor(mut ed.grid, 0, 0, false)
+        return
+    }
+    let p = ed.wins[wi].cs.primary
+    let pos = ed.wins[wi].cs.curs[p].pos
+    let anchor = ed.wins[wi].cs.curs[p].anchor
+    if ed.mode == MODE_H &&
+        ed.overlay_primary_valid &&
+        (ed.overlay_primary_pos != pos || ed.overlay_primary_anchor != anchor) {
+        redraw_primary_selection_change(mut ed, wi, pos, anchor)
+    }
+    ed.overlay_primary_pos = pos
+    ed.overlay_primary_anchor = anchor
+    ed.overlay_primary_valid = true
+    let line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff) as int
+    let sub = if ed.wins[wi].vp.wrap then vp_cursor_subrow(ed.wins[wi], ed.bufs[bi].ec.tb) else 0
+    let (vis, row) = vp_row_of_line(mut ed.wins[wi], ed.bufs[bi].ec.tb, line, sub)
+    if !vis || ed.wins[wi].rect.w == 0 {
+        term.grid_cursor(mut ed.grid, 0, 0, false)
+        return
+    }
+    let sp = displayed_of(mut ed, wi, bi, line, sub)
+    let col = text.off_to_ccol(
+        ed.bufs[bi].ec.tb,
+        sp,
+        pos as text.ByteOff,
+        draw_tabwidth(ed.bufs[bi]),
+    ) as int
+    let screen_col = vp_gridx_of_ccol(ed.wins[wi], col)
+    if ed.wins[wi].rect.y + row >= ed.grid.rows ||
+        screen_col < ed.wins[wi].rect.x ||
+        screen_col >= row_right(ed.grid, ed.wins[wi]) {
+        term.grid_cursor(mut ed.grid, 0, 0, false)
+        return
+    }
+    term.grid_cursor(mut ed.grid, ed.wins[wi].rect.y + row, screen_col, true)
+}
+
+/// `yew_draw_footer` (`draw.c:1060-1077`): the command line, else the
+/// message, else the statusline.
+pub fn draw_footer(mut ed: Ed, wi: int) {
+    if ed.footer_rect.h == 0 {
+        return
+    }
+    if ed.cmdline.active {
+        let fr = copy ed.footer_rect
+        cmdline_draw(mut ed, fr)
+    } else if msg_visible(ed) {
+        message_draw(mut ed, wi)
+    } else {
+        statusline_draw(mut ed, wi)
+    }
+}
+
+/// `yew_draw_panes` (`draw.c:1324-1343`) for the one leaf: its document,
+/// then the tab strip over it.
+pub fn draw_panes(mut ed: Ed) {
+    let wi = ed.win
+    if ed.wins[wi].rect.w != 0 && ed.wins[wi].rect.h != 0 {
+        draw_document_rows(mut ed, wi, 0, ed.wins[wi].rect.h)
+    }
+    let tr = copy ed.tab_strip_rect
+    tab_strip_draw(mut ed, tr)
+}
+
+/// `yew_theme_sync_surfaces` (`theme_cmds.c:69-96`): the grid's blank
+/// takes the theme's `fg`/`bg`; the underline colours reach the renderer.
+pub fn theme_sync_surfaces(mut ed: Ed) {
+    if !ed.theme.has_name {
+        return
+    }
+    if ed.render_ready {
+        term.render_set_underline_colors(
+            mut ed.render,
+            theme_underline(ed.theme, THEME_TRUECOLOR, 0),
+            theme_underline(ed.theme, THEME_TRUECOLOR, 1),
+            theme_underline(ed.theme, THEME_TRUECOLOR, 2),
+        )
+    }
+    if ed.grid_ready {
+        let r = theme_rendition_of(ed.render)
+        let (hf, fg) = theme_ui(ed.theme, "fg", r)
+        let (hb, bg) = theme_ui(ed.theme, "bg", r)
+        if hf {
+            ed.grid.blank.fg = copy fg.fg
+        }
+        if hb {
+            ed.grid.blank.bg = copy bg.bg
+        }
+        term.grid_mark_all(mut ed.grid)
+    }
+    ed.full_damage = true
+}
+
+// `layout_leaf_win` (`layout.c:616-663`).
+fn layout_leaf_win(mut ed: Ed, wi: int, r: Rect) {
+    let bi = ed.wins[wi].buf
+    if r.w == 0 || r.h == 0 {
+        ed.wins[wi].rect = copy r
+        ed.wins[wi].vp.rows = 0
+        ed.wins[wi].vp.cols = 0
+        return
+    }
+    let old_cols = ed.wins[wi].vp.cols
+    let old_gutter = ed.wins[wi].gutter_width
+    var gutter = if r.w < 20 {
+        0
+    } else {
+        gutter_width_for(text.textbuf_line_count(ed.bufs[bi].ec.tb), ed.wins[wi].number_style)
+    }
+    if gutter >= r.w {
+        gutter = 0
+    }
+    ed.wins[wi].gutter_width = gutter
+    ed.wins[wi].rect = rect(r.x + gutter, r.y, r.w - gutter, r.h)
+    ed.wins[wi].vp.rows = r.h
+    ed.wins[wi].vp.cols = r.w - gutter
+    if old_cols != ed.wins[wi].vp.cols || old_gutter != gutter {
+        vp_invalidate(mut ed.wins[wi])
+        ed.full_damage = true
+        ed.footer_dirty = true
+    }
+    vp_clamp(mut ed.wins[wi], ed.bufs[bi].ec.tb)
+    vp_follow(mut ed.wins[wi], ed.bufs[bi].ec.tb)
+}
+
+/// `yew_ed_layout` (`layout.c:671-745`): the footer row off the bottom,
+/// the tab strip off the top, the window between.
+pub fn ed_layout(mut ed: Ed) {
+    if ed.win < 0 {
+        bug("editor layout: missing window")
+    }
+    let cols = ed.grid.cols
+    var content_rows = ed.grid.rows
+    ed.footer_rect = rect(0, 0, 0, 0)
+    if ed.grid.rows > 1 {
+        content_rows = ed.grid.rows - 1
+        ed.footer_rect = rect(0, content_rows, cols, 1)
+    }
+    var strip = tab_strip_rows(ed)
+    if cols == 0 {
+        strip = 0
+    }
+    if strip > content_rows {
+        strip = content_rows
+    }
+    ed.tab_strip_rect = rect(0, 0, cols, strip)
+    content_rows -= strip
+    layout_leaf_win(mut ed, ed.win, rect(0, strip, cols, content_rows))
+    ed.layout_dirty = false
+}
+
+/// `yew_ed_render` (`ed.c:2620-2808`): damage derived from what moved,
+/// the panes or the damaged rows, the strip when a tab's marker changed,
+/// the footer, the cursor; one frame written; the grid flipped.
+pub fn ed_render(mut ed: Ed) {
+    if !ed.grid_ready || !ed.render_ready || !ed.model_ready {
+        return
+    }
+    let wi = ed.win
+    let bi = ed.wins[wi].buf
+    if ed.cursor_follow_pending {
+        vp_follow(mut ed.wins[wi], ed.bufs[bi].ec.tb)
+        ed.cursor_follow_pending = false
+    }
+    let cpos = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    let cursor_line = text.textbuf_line_of(ed.bufs[bi].ec.tb, cpos as text.ByteOff) as int
+    let cursor_line_changed = ed.drawn_cursor_line_valid && ed.drawn_cursor_line != cursor_line
+    let view_changed = !ed.drawn_top_valid ||
+        ed.drawn_top != ed.wins[wi].vp.top ||
+        ed.drawn_top_sub != ed.wins[wi].vp.top_sub ||
+        ed.drawn_left != ed.wins[wi].vp.left ||
+        ed.drawn_wrap != ed.wins[wi].vp.wrap ||
+        !ed.drawn_cursor_line_valid
+    let ns = ed.wins[wi].number_style
+    if view_changed {
+        ed_damage_document(mut ed)
+    } else if (ns == NUM_REL || ns == NUM_HYBRID) && cursor_line_changed {
+        gutter_draw(mut ed, wi, 0, ed.wins[wi].rect.h)
+        ed.footer_dirty = true
+    } else if ns == NUM_ABS && cursor_line_changed {
+        let (v1, r1) = vp_row_of_line(mut ed.wins[wi], ed.bufs[bi].ec.tb, ed.drawn_cursor_line, 0)
+        if v1 {
+            ed_damage_rows(mut ed, r1, r1 + 1)
+        }
+        let (v2, r2) = vp_row_of_line(mut ed.wins[wi], ed.bufs[bi].ec.tb, cursor_line, 0)
+        if v2 {
+            ed_damage_rows(mut ed, r2, r2 + 1)
+        }
+    }
+    var overlay_synced = false
+    if ed.full_damage {
+        draw_panes(mut ed)
+        term.grid_mark_all(mut ed.grid)
+        overlay_synced = true
+    } else if ed.doc_damage_lo < ed.doc_damage_hi {
+        draw_document_rows(mut ed, wi, ed.doc_damage_lo, ed.doc_damage_hi)
+        overlay_synced = ed.cursor_overlay_damage_complete
+    }
+    if !ed.full_damage && tab_marks(ed) != ed.drawn_tab_marks {
+        let tr = copy ed.tab_strip_rect
+        tab_strip_draw(mut ed, tr)
+    }
+    if overlay_synced {
+        draw_overlay_sync(mut ed, wi)
+    }
+    ed.cursor_overlay_damage_complete = false
+    if ed.full_damage || ed.footer_dirty {
+        draw_footer(mut ed, wi)
+    }
+    if !ed.cmdline.active {
+        draw_cursor(mut ed, wi)
+    }
+    clear_bytes(mut ed.frame)
+    let _ = term.render_frame(mut ed.render, ed.grid, mut ed.frame)
+    text.clip_after_render(mut ed.regs.clip, mut ed.render, mut ed.frame, ed.now_ms)
+    if ed.frame.len != 0 {
+        term.tty_write(ed.frame) else |_| {
+            ed.quit = true
+            ed.exit_code = 3
+            return
+        }
+    }
+    term.grid_flip(mut ed.grid)
+    ed.drawn_tab_marks = tab_marks(ed)
+    ed.full_damage = false
+    ed.footer_dirty = false
+    ed.doc_damage_lo = ed.grid.rows
+    ed.doc_damage_hi = 0
+    ed.drawn_top = ed.wins[wi].vp.top
+    ed.drawn_top_sub = ed.wins[wi].vp.top_sub
+    ed.drawn_left = ed.wins[wi].vp.left
+    ed.drawn_wrap = ed.wins[wi].vp.wrap
+    ed.drawn_cursor_line = cursor_line
+    ed.drawn_cursor_line_valid = true
+    ed.drawn_top_valid = true
+}
