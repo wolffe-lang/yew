@@ -27,9 +27,10 @@
 //! - C's two callbacks become values (no function value crosses a module
 //!   boundary, G19/G20): the environment `YewShEnv` (`get`, `ud`, `base`,
 //!   `shctx.h:136-147`) is `ShEnv` over `term.Env`, and the wrapper lookup
-//!   `YewShWrapperLookup` (`shctx.h:168-174`) is `ShWrapTable`, the rows a
-//!   completion-spec registry answers (`edit.compspec`), matched in one
-//!   place (`sx_wrapper_of`).
+//!   `YewShWrapperLookup` (`shctx.h:168-174`), whose one implementation is
+//!   `yew_compspec_wrapper`, is the spec registry itself, lent `mut`
+//!   (`edit.compspec` is this module's) and asked in one place
+//!   (`sx_wrapper_of`); C's NULL lookup is `use_specs` false.
 //! - `~user` (`shctx.c:788-800`) reads the user database with
 //!   `getpwnam(3)`; wolf 0.2.33 has no user-database surface (G37,
 //!   `docs/MAP.md` §5), so the port reads `/etc/passwd` by name, named
@@ -118,27 +119,16 @@ pub fn shenv_of(vars: term.Env, base: str, has_base: bool) -> ShEnv {
     ShEnv { present: true, vars: copy vars, base: base, has_base: has_base }
 }
 
-/// One precommand wrapper (`YewShWrapper`, `shctx.h:155-166`), as a spec
-/// row answers it. `verdict` is the lookup's answer: 1 a wrapper, 0 not
-/// one (a spec without `precommand` un-wraps a table row).
+/// One precommand wrapper (`YewShWrapper`, `shctx.h:155-166`), as
+/// `compspec_wrapper` answers it. `verdict` is the lookup's answer: 1 a
+/// wrapper, 0 not one (a spec without `precommand` un-wraps a table
+/// row), -1 no opinion.
 pub struct ShWrapRow {
     name: List[byte],
     verdict: int,
     consumes: List[List[byte]],
     operands: int,
     skips_assign: bool,
-}
-
-/// The wrapper lookup as data: a name absent from `rows` is "no opinion"
-/// (-1), and the built-in table answers (`shctx.c:2078-2100`). An empty
-/// table is `yew_shctx_at`'s NULL lookup.
-pub struct ShWrapTable {
-    rows: List[ShWrapRow],
-}
-
-/// The NULL lookup: the built-in table alone.
-pub fn shwrap_none() -> ShWrapTable {
-    ShWrapTable { rows: List[ShWrapRow]() }
 }
 
 // Frame kinds (`shctx.c:35-43`).
@@ -2464,8 +2454,9 @@ fn sx_builtin_wrapper(name: List[byte]) -> SxWrapper {
     }
 }
 
-/// `wrapper_of` (`shctx.c:2109-2136`): the table's row first, then §2's.
-fn sx_wrapper_of(wrap: ShWrapTable, w: SxWord) -> SxWrapper {
+/// `wrapper_of` (`shctx.c:2109-2136`): the spec registry's answer first,
+/// then §2's table.
+fn sx_wrapper_of(mut specs: CompSpecs, use_specs: bool, w: SxWord) -> SxWrapper {
     let none = SxWrapper {
         found: false,
         consumes: List[List[byte]](),
@@ -2475,12 +2466,14 @@ fn sx_wrapper_of(wrap: ShWrapTable, w: SxWord) -> SxWrapper {
     if w.flags & (SX_W_QUOTED | SX_W_EXPANDS | SX_W_SYNTH) != 0 {
         return none
     }
-    for r in wrap.rows {
-        if sx_same(r.name, w.text) {
-            if r.verdict == 0 {
+    if use_specs {
+        let name = str_from_utf8(w.text) else ""
+        if name.len != 0 {
+            let (verdict, r) = compspec_wrapper(mut specs, name)
+            if verdict == 0 {
                 return none
             }
-            if r.verdict > 0 {
+            if verdict > 0 {
                 return SxWrapper {
                     found: true,
                     consumes: copy r.consumes,
@@ -2513,7 +2506,8 @@ fn sx_skip_assign(lx: SxLexer, ci: int, i0: int, n: int) -> int {
 /// `command_index` (`shctx.c:2138-2201`).
 fn sx_command_index(
     lx: SxLexer,
-    wrap: ShWrapTable,
+    mut specs: CompSpecs,
+    use_specs: bool,
     ci: int,
     n: int,
     role: int,
@@ -2524,7 +2518,7 @@ fn sx_command_index(
         if i >= n {
             return n
         }
-        let wr = sx_wrapper_of(wrap, lx.cmd[ci].words[i])
+        let wr = sx_wrapper_of(mut specs, use_specs, lx.cmd[ci].words[i])
         if !wr.found {
             return i
         }
@@ -2604,7 +2598,8 @@ fn sx_ctx_new() -> ShCtx {
 fn sx_resolve(
     lx: SxLexer,
     env: ShEnv,
-    wrap: ShWrapTable,
+    mut specs: CompSpecs,
+    use_specs: bool,
     ci: int,
     role: int,
     assign: bool,
@@ -2613,7 +2608,7 @@ fn sx_resolve(
     let n = lx.cmd[ci].n
     let caret_flag = sx_at(out.stem, 0) == 45 &&
         (!lx.cmd[ci].in_word || lx.cmd[ci].w_flags & SX_W_QUOTED == 0)
-    let cmd = sx_command_index(lx, wrap, ci, n, role, caret_flag)
+    let cmd = sx_command_index(lx, mut specs, use_specs, ci, n, role, caret_flag)
     out.argv = List[List[byte]]()
     out.dirv = List[List[byte]]()
     out.dirv_known = List[bool]()
@@ -2679,7 +2674,14 @@ fn sx_set_none(lx: SxLexer, mut out: ShCtx) {
 }
 
 /// `finish` (`shctx.c:2284-2369`).
-fn sx_finish(s: List[byte], lx: SxLexer, env: ShEnv, wrap: ShWrapTable, mut out: ShCtx) {
+fn sx_finish(
+    s: List[byte],
+    lx: SxLexer,
+    env: ShEnv,
+    mut specs: CompSpecs,
+    use_specs: bool,
+    mut out: ShCtx,
+) {
     let ci = lx.nc - 1
     var assign = false
     var role = SX_ROLE_WORD
@@ -2746,7 +2748,7 @@ fn sx_finish(s: List[byte], lx: SxLexer, env: ShEnv, wrap: ShWrapTable, mut out:
         out.replace_hi = lx.end
         out.stem = List[byte]()
     }
-    sx_resolve(lx, env, wrap, ci, role, assign, mut out)
+    sx_resolve(lx, env, mut specs, use_specs, ci, role, assign, mut out)
     if lx.in_var {
         out.pos = SH_POS_VARIABLE
         return
@@ -2764,17 +2766,26 @@ fn sx_finish(s: List[byte], lx: SxLexer, env: ShEnv, wrap: ShWrapTable, mut out:
 /// `yew_shctx_at` (`shctx.c:2371-2375`): the built-in wrapper table, no
 /// environment. `(ok, ctx)`; false only for a caret past the line.
 pub fn shctx_at(line: List[byte], cursor: int) -> (bool, ShCtx) {
-    shctx_at_env(line, cursor, shwrap_none(), shenv_none())
+    var none = compspecs_new()
+    shctx_at_env(line, cursor, mut none, false, shenv_none())
 }
 
-/// `yew_shctx_at_with` (`shctx.c:2377-2382`).
-pub fn shctx_at_with(line: List[byte], cursor: int, wrap: ShWrapTable) -> (bool, ShCtx) {
-    shctx_at_env(line, cursor, wrap, shenv_none())
+/// `yew_shctx_at_with(…, yew_compspec_wrapper, …)` (`shctx.c:2377-2382`):
+/// the precommand rows of the spec registry `specs` replace the table's.
+pub fn shctx_at_specs(line: List[byte], cursor: int, mut specs: CompSpecs) -> (bool, ShCtx) {
+    shctx_at_env(line, cursor, mut specs, true, shenv_none())
 }
 
 /// `yew_shctx_at_env` (`shctx.c:2384-2425`): never fails on any byte
-/// sequence; a line it cannot classify is `SH_POS_NONE`.
-pub fn shctx_at_env(line: List[byte], cursor: int, wrap: ShWrapTable, env: ShEnv) -> (bool, ShCtx) {
+/// sequence; a line it cannot classify is `SH_POS_NONE`. `use_specs`
+/// false is C's NULL lookup.
+pub fn shctx_at_env(
+    line: List[byte],
+    cursor: int,
+    mut specs: CompSpecs,
+    use_specs: bool,
+    env: ShEnv,
+) -> (bool, ShCtx) {
     var out = sx_ctx_new()
     if cursor < 0 || cursor > line.len {
         return (false, out)
@@ -2817,7 +2828,7 @@ pub fn shctx_at_env(line: List[byte], cursor: int, wrap: ShWrapTable, env: ShEnv
         }
         at = if next > at then next else at + 1
     }
-    sx_finish(line, lx, env, wrap, mut out)
+    sx_finish(line, lx, env, mut specs, use_specs, mut out)
     (true, out)
 }
 
