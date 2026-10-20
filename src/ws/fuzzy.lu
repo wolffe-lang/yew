@@ -1,0 +1,389 @@
+//! ws.fuzzy — the fuss-derived fuzzy scorer and ranker.
+//!
+//! Ports sagitta `src/ws/finder.h` (102 lines) and `src/ws/fuzzy.c` (292
+//! lines) at 9ace98c2: `yew_fz_score` and `yew_fz_rank`, pulled forward
+//! from Sprint 26 by Sprint 18.5 §1 (`finder.h:5-7`) so the command line
+//! ranks and HIGHLIGHTS with them; Sprint 26's finder (yw06) inherits
+//! this unit at this path. A BYTE scan with ASCII case folding: no width
+//! math and no Unicode work (`finder.h:12-15`).
+//!
+//! The port's shapes: text is `(s: List[byte], at, end)` (the scored
+//! bytes are `s[at..end]`, positions are offsets from `at`, as C's are
+//! from the pointer it was handed); C's `FzMatch` is a `List[int]` of
+//! positions (its length is `n_pos`); the optional `FzMatch *m` is a
+//! `record` flag with a caller-owned list, so the scan that ranks 10,000
+//! names allocates nothing per name; the comparator-driven
+//! `yew_sort_stable` is a local bottom-up merge (`util.sort_stable`'s
+//! order) so no function value crosses a module boundary (G19/G20).
+
+/// No match (`YEW_FZ_NO_MATCH`, `finder.h:28`): INT32_MIN, distinct from
+/// a real score of 0.
+pub const FZ_NO_MATCH: int = -2147483648
+
+/// Matched positions beyond this are unhighlighted, never rescored
+/// (`YEW_FZ_MAX_POS`, `finder.h:32`).
+pub const FZ_MAX_POS: int = 64
+
+/// The basename tier (`YEW_FZ_BASENAME_TIER`, `finder.h:35`).
+pub const FZ_BASENAME_TIER: int = 100000
+
+const I32_MAX: int = 2147483647
+
+const U16_MAX: int = 65535
+
+/// Byte offsets into the scored text, ascending (`FzMatch`,
+/// `finder.h:38-42`; `n_pos` is `pos.len`).
+pub struct FzMatch {
+    pos: List[int],
+}
+
+/// No positions.
+pub fn fzmatch_none() -> FzMatch {
+    FzMatch { pos: List[int]() }
+}
+
+/// One ranked candidate (`FzRanked`, `finder.h:74-78`).
+pub struct FzRanked {
+    idx: int,
+    score: int,
+    m: FzMatch,
+}
+
+fn fold(b: int) -> int {
+    if b >= 65 && b <= 90 then b + 32 else b
+}
+
+fn boundary(b: int) -> bool {
+    b == 47 || b == 95 || b == 45 || b == 46
+}
+
+// `fz_eq_fold` and `fz_pfx_fold` (`fuzzy.c:20-42`): `pat[p0..p1]`
+// against the first `p1 - p0` bytes of `text` at `t0`.
+fn pfx_fold(pat: List[byte], p0: int, p1: int, text: List[byte], t0: int) -> bool {
+    var i = 0
+    let n = p1 - p0
+    while i < n {
+        if fold(pat[p0 + i] as int) != fold(text[t0 + i] as int) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `fz_fill_prefix_pos` (`fuzzy.c:52-63`).
+fn fill_prefix(mut pos: List[int], plen: int) {
+    let n = if plen > FZ_MAX_POS then FZ_MAX_POS else plen
+    var i = 0
+    while i < n {
+        (mut pos).push(i)
+        i += 1
+    }
+}
+
+/// `yew_fz_score` with a non-NULL `m` (`fuzzy.c:72-136`): the
+/// positions are PUSHED onto `pos` (which the caller hands in empty).
+fn scan(
+    pat: List[byte],
+    p0: int,
+    p1: int,
+    text: List[byte],
+    t0: int,
+    t1: int,
+    mut pos: List[int],
+) -> int {
+    let plen = p1 - p0
+    let tlen = t1 - t0
+    if plen == 0 {
+        return 1
+    }
+    if plen > tlen {
+        return FZ_NO_MATCH
+    }
+    if pfx_fold(pat, p0, p1, text, t0) {
+        fill_prefix(mut pos, plen)
+        if plen == tlen {
+            return 10000
+        }
+        return 5000
+    }
+    // Accumulated in a 64-bit int and clamped once at the end, as C's
+    // `i64` is (`fuzzy.c:74-79`).
+    var score: int = 0
+    var pi = p0
+    var ti = t0
+    var run = 0
+    var started = false
+    var n_pos = 0
+    while ti < t1 && pi < p1 {
+        if fold(text[ti] as int) != fold(pat[pi] as int) {
+            run = 0
+            if started {
+                score -= 1
+            }
+            ti += 1
+            continue
+        }
+        started = true
+        score += 100
+        run += 1
+        if run >= 2 {
+            score += 50 * run
+        }
+        if ti == t0 {
+            score += 200
+        } else if boundary(text[ti - 1] as int) {
+            score += 150
+        }
+        // Past 64 KiB of text the honest answer is "no highlight"
+        // (`fuzzy.c:116-121`), never a truncated offset.
+        if n_pos < FZ_MAX_POS && ti - t0 <= U16_MAX {
+            (mut pos).push(ti - t0)
+            n_pos += 1
+        }
+        pi += 1
+        ti += 1
+    }
+    if pi < p1 {
+        return FZ_NO_MATCH
+    }
+    score -= tlen
+    if score <= FZ_NO_MATCH {
+        return FZ_NO_MATCH + 1
+    }
+    if score > I32_MAX {
+        return I32_MAX
+    }
+    score
+}
+
+/// Score `text[t0..t1]` against `pat[p0..p1]` (`yew_fz_score` with a
+/// NULL `m`): the table of `finder.h:44-68`; `FZ_NO_MATCH` when the
+/// pattern is not a subsequence. No positions, and no allocation: the
+/// ranking scans that call this once per directory entry run it, so it
+/// is `scan`'s loop without the position list (tools/fuzz-fuzzy asserts
+/// the two agree on every input, `fuzz_fuzzy.c:83-89`).
+pub fn fz_score(pat: List[byte], p0: int, p1: int, text: List[byte], t0: int, t1: int) -> int {
+    let plen = p1 - p0
+    let tlen = t1 - t0
+    if plen == 0 {
+        return 1
+    }
+    if plen > tlen {
+        return FZ_NO_MATCH
+    }
+    if pfx_fold(pat, p0, p1, text, t0) {
+        return if plen == tlen then 10000 else 5000
+    }
+    var score: int = 0
+    var pi = p0
+    var ti = t0
+    var run = 0
+    var started = false
+    while ti < t1 && pi < p1 {
+        if fold(text[ti] as int) != fold(pat[pi] as int) {
+            run = 0
+            if started {
+                score -= 1
+            }
+            ti += 1
+            continue
+        }
+        started = true
+        score += 100
+        run += 1
+        if run >= 2 {
+            score += 50 * run
+        }
+        if ti == t0 {
+            score += 200
+        } else if boundary(text[ti - 1] as int) {
+            score += 150
+        }
+        pi += 1
+        ti += 1
+    }
+    if pi < p1 {
+        return FZ_NO_MATCH
+    }
+    score -= tlen
+    if score <= FZ_NO_MATCH {
+        return FZ_NO_MATCH + 1
+    }
+    if score > I32_MAX {
+        return I32_MAX
+    }
+    score
+}
+
+/// `yew_fz_score` with C's `FzMatch *m`: `m`'s positions are replaced
+/// by the matched bytes (offsets from `t0`), empty on no match.
+pub fn fz_score_m(
+    pat: List[byte],
+    p0: int,
+    p1: int,
+    text: List[byte],
+    t0: int,
+    t1: int,
+    mut m: FzMatch,
+) -> int {
+    var pos = List[int]()
+    let s = scan(pat, p0, p1, text, t0, t1, mut pos)
+    if s == FZ_NO_MATCH {
+        m.pos = List[int]()
+        return s
+    }
+    m.pos = pos
+    s
+}
+
+/// A str's convenience form of `fz_score`.
+pub fn fz_score_str(pat: str, text: str) -> int {
+    fz_score(pat.bytes(), 0, pat.len, text.bytes(), 0, text.len)
+}
+
+// `fz_basename` (`fuzzy.c:152-163`): the last path component, ignoring
+// trailing slashes, as (offset, length) from 0.
+fn basename(text: List[byte]) -> (int, int) {
+    var end = text.len
+    while end > 0 && text[end - 1] as int == 47 {
+        end -= 1
+    }
+    var start = end
+    while start > 0 && text[start - 1] as int != 47 {
+        start -= 1
+    }
+    (start, end - start)
+}
+
+fn shift_pos(mut m: FzMatch, off: int) {
+    if off == 0 {
+        return
+    }
+    var i = 0
+    while i < m.pos.len {
+        let at = m.pos[i] + off
+        m.pos[i] = if at > U16_MAX then U16_MAX else at
+        i += 1
+    }
+}
+
+// The tie order (`fz_rank_cmp`, `fuzzy.c:192-218`): "a precedes b".
+fn ranked_less(a: FzRanked, b: FzRanked, texts: List[List[byte]], empty_pattern: bool) -> bool {
+    if a.score != b.score {
+        return a.score > b.score
+    }
+    if empty_pattern {
+        return false
+    }
+    let ta = texts[a.idx].len
+    let tb = texts[b.idx].len
+    if ta != tb {
+        return ta < tb
+    }
+    bytes_less(texts[a.idx], texts[b.idx])
+}
+
+fn bytes_less(a: List[byte], b: List[byte]) -> bool {
+    var i = 0
+    while i < a.len && i < b.len {
+        if a[i] as int != b[i] as int {
+            return a[i] as int < b[i] as int
+        }
+        i += 1
+    }
+    a.len < b.len
+}
+
+// `yew_sort_stable` over ranked rows: a bottom-up merge, a tie takes the
+// left run (util.sort_stable's order); local, as `text.cset`'s is.
+fn sort_ranked(mut xs: List[FzRanked], texts: List[List[byte]], empty_pattern: bool) {
+    let n = xs.len
+    if n < 2 {
+        return
+    }
+    var src = copy xs
+    var width = 1
+    while width < n {
+        var dst = List[FzRanked]()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if lo + 2 * width < n then lo + 2 * width else n
+            var i = lo
+            var j = mid
+            while i < mid && j < hi {
+                if ranked_less(src[j], src[i], texts, empty_pattern) {
+                    (mut dst).push(copy src[j])
+                    j += 1
+                } else {
+                    (mut dst).push(copy src[i])
+                    i += 1
+                }
+            }
+            while i < mid {
+                (mut dst).push(copy src[i])
+                i += 1
+            }
+            while j < hi {
+                (mut dst).push(copy src[j])
+                j += 1
+            }
+            lo = hi
+        }
+        src = dst
+        width *= 2
+    }
+    xs = src
+}
+
+/// Rank `texts` against `pat[p0..p1]` (`yew_fz_rank`, `fuzzy.c:220-292`):
+/// the MATCHING candidates, best first, each with its index, its key
+/// (the basename tier: `sb >= 5000` lifts it by `FZ_BASENAME_TIER`, else
+/// `max(sb, sp)`), and its positions relative to the WHOLE text. Ties
+/// break by shorter text, then bytes; an empty pattern keeps source
+/// order.
+pub fn fz_rank(
+    pat: List[byte],
+    p0: int,
+    p1: int,
+    texts: List[List[byte]],
+    path_mode: bool,
+) -> List[FzRanked] {
+    var out = List[FzRanked]()
+    var i = 0
+    while i < texts.len {
+        let tlen = texts[i].len
+        var boff = 0
+        var blen = tlen
+        if path_mode {
+            let (o, l) = basename(texts[i])
+            boff = o
+            blen = l
+        }
+        var base_m = fzmatch_none()
+        var path_m = fzmatch_none()
+        let sb = fz_score_m(pat, p0, p1, texts[i], boff, boff + blen, mut base_m)
+        var sp = FZ_NO_MATCH
+        if path_mode {
+            sp = fz_score_m(pat, p0, p1, texts[i], 0, tlen, mut path_m)
+        }
+        if sb == FZ_NO_MATCH && sp == FZ_NO_MATCH {
+            i += 1
+            continue
+        }
+        if sb >= 5000 {
+            let key = if sb > I32_MAX - FZ_BASENAME_TIER then I32_MAX else sb + FZ_BASENAME_TIER
+            shift_pos(mut base_m, boff)
+            (mut out).push(FzRanked { idx: i, score: key, m: base_m })
+        } else if sb != FZ_NO_MATCH && sb >= sp {
+            shift_pos(mut base_m, boff)
+            (mut out).push(FzRanked { idx: i, score: sb, m: base_m })
+        } else {
+            (mut out).push(FzRanked { idx: i, score: sp, m: path_m })
+        }
+        i += 1
+    }
+    sort_ranked(mut out, texts, p1 == p0)
+    out
+}
