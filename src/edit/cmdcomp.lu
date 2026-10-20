@@ -577,16 +577,32 @@ pub fn comp_key(
     record: bool,
     mut pos: List[int],
 ) -> int {
-    var score = ws.FZ_NO_MATCH
-    if record {
-        var m = ws.fzmatch_none()
-        score = ws.fz_score_m(stem, s0, s1, name, m0, m1, mut m)
-        for p in m.pos {
-            (mut pos).push(p)
-        }
-    } else {
-        score = ws.fz_score(stem, s0, s1, name, m0, m1)
+    if !record {
+        return comp_key_score(stem, s0, s1, name, m0, m1)
     }
+    var m = ws.fzmatch_none()
+    let score = ws.fz_score_m(stem, s0, s1, name, m0, m1, mut m)
+    for p in m.pos {
+        (mut pos).push(p)
+    }
+    comp_tier(score)
+}
+
+/// `comp_key` without positions, allocation-free: the per-entry key the
+/// path scan ranks 10,000 names with.
+pub fn comp_key_score(
+    stem: List[byte],
+    s0: int,
+    s1: int,
+    name: List[byte],
+    m0: int,
+    m1: int,
+) -> int {
+    comp_tier(ws.fz_score(stem, s0, s1, name, m0, m1))
+}
+
+// The basename tier (`comp_key`'s second half, `cmdcomp.c:101-108`).
+fn comp_tier(score: int) -> int {
     if score == ws.FZ_NO_MATCH {
         return ws.FZ_NO_MATCH
     }
@@ -683,44 +699,55 @@ fn candidate_less(a: Candidate, b: Candidate) -> bool {
     comp_bytes_cmp(a.text, 0, a.text.len, b.text, 0, b.text.len) < 0
 }
 
+// A stable merge over INDICES, then one copy per row: a candidate owns
+// three lists, and merging the rows themselves copied each ~log n times.
 fn sort_candidates(mut xs: List[Candidate]) {
     let n = xs.len
     if n < 2 {
         return
     }
-    var src = copy xs
+    var src = List[int]()
+    var i = 0
+    while i < n {
+        (mut src).push(i)
+        i += 1
+    }
     var width = 1
     while width < n {
-        var dst = List[Candidate]()
+        var dst = List[int]()
         var lo = 0
         while lo < n {
             let mid = if lo + width < n then lo + width else n
             let hi = if lo + 2 * width < n then lo + 2 * width else n
-            var i = lo
-            var j = mid
-            while i < mid && j < hi {
-                if candidate_less(src[j], src[i]) {
-                    (mut dst).push(copy src[j])
-                    j += 1
+            var a = lo
+            var b = mid
+            while a < mid && b < hi {
+                if candidate_less(xs[src[b]], xs[src[a]]) {
+                    (mut dst).push(src[b])
+                    b += 1
                 } else {
-                    (mut dst).push(copy src[i])
-                    i += 1
+                    (mut dst).push(src[a])
+                    a += 1
                 }
             }
-            while i < mid {
-                (mut dst).push(copy src[i])
-                i += 1
+            while a < mid {
+                (mut dst).push(src[a])
+                a += 1
             }
-            while j < hi {
-                (mut dst).push(copy src[j])
-                j += 1
+            while b < hi {
+                (mut dst).push(src[b])
+                b += 1
             }
             lo = hi
         }
         src = dst
         width *= 2
     }
-    xs = src
+    var out = List[Candidate]()
+    for k in src {
+        (mut out).push(copy xs[k])
+    }
+    xs = out
 }
 
 // `candidate_add` (`cmdcomp.c:154-182`): the candidate when it matches.
@@ -1238,6 +1265,23 @@ struct PathCand {
     row: int,
     len: int,
     score: int,
+    key: int,
+    key2: int,
+}
+
+// Seven name bytes from `from` packed big-endian (0-padded), so two names
+// of one length compare as integers before any byte loop — the first
+// fourteen bytes in two keys: C's `strcmp` is the order
+// (`path_candidate_cmp`), and the port's nested-list byte walk was 41% of
+// a keystroke's profile without them.
+fn name_key(row: List[byte], from: int) -> int {
+    var k = 0
+    var i = from
+    while i < from + 7 {
+        k = k * 256 + (if i < row.len then row[i] as int else 0)
+        i += 1
+    }
+    k
 }
 
 // `path_candidate_cmp` (`cmdcomp.c:437-455`).
@@ -1248,7 +1292,16 @@ fn path_cmp(rows: List[List[byte]], a: PathCand, b: PathCand) -> int {
     if a.len != b.len {
         return if a.len < b.len then -1 else 1
     }
-    comp_bytes_cmp(rows[a.row], 1, rows[a.row].len, rows[b.row], 1, rows[b.row].len)
+    if a.key != b.key {
+        return if a.key < b.key then -1 else 1
+    }
+    if a.key2 != b.key2 {
+        return if a.key2 < b.key2 then -1 else 1
+    }
+    if a.len <= 14 {
+        return 0
+    }
+    comp_bytes_cmp(rows[a.row], 15, rows[a.row].len, rows[b.row], 15, rows[b.row].len)
 }
 
 // `path_heap_push` (`cmdcomp.c:475-499`): a worst-first heap.
@@ -1308,8 +1361,7 @@ fn path_rank_one(
     if rlen > 1 && rows[ri][1] as int == 46 && (t0 >= tail.len || tail[t0] as int != 46) {
         return
     }
-    var none = List[int]()
-    let score = comp_key(tail, t0, tail.len, rows[ri], 1, rlen, false, mut none)
+    let score = comp_key_score(tail, t0, tail.len, rows[ri], 1, rlen)
     if score == ws.FZ_NO_MATCH {
         return
     }
@@ -1317,7 +1369,13 @@ fn path_rank_one(
         return
     }
     total += 1
-    let c = PathCand { row: ri, len: rlen - 1, score: score }
+    let c = PathCand {
+        row: ri,
+        len: rlen - 1,
+        score: score,
+        key: name_key(rows[ri], 1),
+        key2: name_key(rows[ri], 8),
+    }
     if heap.len >= COMP_MAX && path_cmp(rows, c, heap[0]) >= 0 {
         return
     }
@@ -1754,39 +1812,48 @@ pub fn comp_sort_items(mut xs: List[CompItem]) {
     if n < 2 {
         return
     }
-    var src = copy xs
+    var src = List[int]()
+    var i = 0
+    while i < n {
+        (mut src).push(i)
+        i += 1
+    }
     var width = 1
     while width < n {
-        var dst = List[CompItem]()
+        var dst = List[int]()
         var lo = 0
         while lo < n {
             let mid = if lo + width < n then lo + width else n
             let hi = if lo + 2 * width < n then lo + 2 * width else n
-            var i = lo
-            var j = mid
-            while i < mid && j < hi {
-                if item_less(src[j], src[i]) {
-                    (mut dst).push(copy src[j])
-                    j += 1
+            var a = lo
+            var b = mid
+            while a < mid && b < hi {
+                if item_less(xs[src[b]], xs[src[a]]) {
+                    (mut dst).push(src[b])
+                    b += 1
                 } else {
-                    (mut dst).push(copy src[i])
-                    i += 1
+                    (mut dst).push(src[a])
+                    a += 1
                 }
             }
-            while i < mid {
-                (mut dst).push(copy src[i])
-                i += 1
+            while a < mid {
+                (mut dst).push(src[a])
+                a += 1
             }
-            while j < hi {
-                (mut dst).push(copy src[j])
-                j += 1
+            while b < hi {
+                (mut dst).push(src[b])
+                b += 1
             }
             lo = hi
         }
         src = dst
         width *= 2
     }
-    xs = src
+    var out = List[CompItem]()
+    for k in src {
+        (mut out).push(copy xs[k])
+    }
+    xs = out
 }
 
 fn fold_byte(b: int) -> int {
