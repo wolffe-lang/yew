@@ -1,0 +1,297 @@
+//! text.mark — marks: positions that move with edits, each with a gravity
+//! (bias), behind generational handles.
+//!
+//! Ports sagitta `src/text/mark.c` (357 lines) and `mark.h` (51) at
+//! 9ace98c2, under `s10-undo-tree.md` §marks. A mark at an insertion
+//! point stays (LEFT) or moves past the new bytes (RIGHT); a mark inside
+//! a deletion collapses to its start. The set keeps a slab of slots with
+//! a free list and a generation per slot (a deleted handle never names
+//! the slot's next tenant), and the live slots in position order so an
+//! edit touches only the marks at or after it. C's collapse observer is
+//! a callback (`yew_marks_observe_collapse`); the port answers the list
+//! of `(handle, offset into the range)` instead — values, not function
+//! values, across the edit layer (docs/MAP.md §1, the `Env` idiom).
+
+use util
+
+/// `MarkBias`: stay before text inserted at the mark.
+pub const BIAS_LEFT: int = 0
+
+/// Move past text inserted at the mark.
+pub const BIAS_RIGHT: int = 1
+
+const MARK_NO_SLOT: int = -1
+
+const MARK_GEN_MAX: int = 4294967295
+
+/// A generational handle (`MarkId`).
+pub struct MarkId {
+    id: int,
+    gen: int,
+}
+
+/// A mark's state (`Mark`).
+pub struct Mark {
+    pos: int,
+    bias: int,
+    alive: bool,
+}
+
+struct MarkSlot {
+    mark: Mark,
+    gen: int,
+    next_free: int,
+}
+
+/// A collapsed mark the inverse of a delete cannot place by itself: its
+/// handle and its offset from the range's start.
+pub struct MarkCollapse {
+    id: MarkId,
+    rel: int,
+}
+
+/// A set of marks (`MarkSet`, `mark.c:18-28`).
+pub struct MarkSet {
+    slots: List[MarkSlot],
+    free_head: int,
+    order: List[int],
+}
+
+/// An empty set (`yew_marks_new`).
+pub fn marks_new() -> MarkSet {
+    MarkSet { slots: List[MarkSlot](), free_head: MARK_NO_SLOT, order: List[int]() }
+}
+
+fn lower_bound_pos(ms: MarkSet, pos: int) -> int {
+    var lo = 0
+    var hi = ms.order.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if ms.slots[ms.order[mid]].mark.pos < pos {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn upper_bound_pos(ms: MarkSet, pos: int) -> int {
+    var lo = 0
+    var hi = ms.order.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if ms.slots[ms.order[mid]].mark.pos <= pos {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn require_live(ms: MarkSet, id: MarkId, where: str) {
+    if id.id < 0 ||
+        id.id >= ms.slots.len ||
+        !ms.slots[id.id].mark.alive ||
+        ms.slots[id.id].gen != id.gen {
+        util.bug("text.mark", "{where}: dead mark handle {id.id}:{id.gen}")
+    }
+}
+
+// Insert `v` at `at` of `xs`, shifting the tail (C's memmove).
+fn order_insert(mut xs: List[int], at: int, v: int) {
+    (mut xs).push(v)
+    var i = xs.len - 1
+    while i > at {
+        xs[i] = xs[i - 1]
+        i -= 1
+    }
+    xs[at] = v
+}
+
+fn order_remove(mut xs: List[int], at: int) {
+    var i = at
+    while i + 1 < xs.len {
+        xs[i] = xs[i + 1]
+        i += 1
+    }
+    let _ = (mut xs).pop() else -1
+}
+
+/// Add a mark at `pos` with `bias` (`yew_mark_add`, `mark.c:133-170`).
+pub fn mark_add(mut ms: MarkSet, pos: ByteOff, bias: int) -> MarkId {
+    if bias != BIAS_LEFT && bias != BIAS_RIGHT {
+        util.bug("text.mark", "mark_add: invalid bias {bias}")
+    }
+    let p = pos as int
+    var id = 0
+    if ms.free_head != MARK_NO_SLOT {
+        id = ms.free_head
+        ms.free_head = ms.slots[id].next_free
+    } else {
+        (mut ms.slots).push(MarkSlot {
+            mark: Mark { pos: 0, bias: 0, alive: false },
+            gen: 1,
+            next_free: MARK_NO_SLOT,
+        })
+        id = ms.slots.len - 1
+    }
+    ms.slots[id].mark = Mark { pos: p, bias: bias, alive: true }
+    ms.slots[id].next_free = MARK_NO_SLOT
+    let at = upper_bound_pos(ms, p)
+    order_insert(mut ms.order, at, id)
+    MarkId { id: id, gen: ms.slots[id].gen }
+}
+
+/// Delete a live mark (`yew_mark_del`, `mark.c:172-193`); a dead handle is
+/// an internal error.
+pub fn mark_del(mut ms: MarkSet, id: MarkId) {
+    require_live(ms, id, "mark_del")
+    var i = 0
+    while i < ms.order.len && ms.order[i] != id.id {
+        i += 1
+    }
+    if i == ms.order.len {
+        util.bug("text.mark", "mark_del: live mark missing from ordered index")
+    }
+    order_remove(mut ms.order, i)
+    ms.slots[id.id].mark.alive = false
+    if ms.slots[id.id].gen != MARK_GEN_MAX {
+        ms.slots[id.id].gen += 1
+        ms.slots[id.id].next_free = ms.free_head
+        ms.free_head = id.id
+    } else {
+        ms.slots[id.id].next_free = MARK_NO_SLOT
+    }
+}
+
+/// A live mark's position (`yew_mark_pos`); a dead handle is an internal
+/// error.
+pub fn mark_pos(ms: MarkSet, id: MarkId) -> ByteOff {
+    require_live(ms, id, "mark_pos")
+    ms.slots[id.id].mark.pos as ByteOff
+}
+
+/// The marks a delete of `range` collapses and its inverse insert cannot
+/// place again: every mark inside, and a LEFT mark at the end
+/// (`yew_marks_observe_collapse`, `mark.c:202-228`), in position order.
+pub fn marks_collapse_list(ms: MarkSet, range: Span) -> List[MarkCollapse] {
+    if range.lo > range.hi {
+        util.bug("text.mark", "marks_collapse_list: invalid range [{range.lo},{range.hi})")
+    }
+    var out = List[MarkCollapse]()
+    var i = lower_bound_pos(ms, range.lo)
+    while i < ms.order.len {
+        let slot_id = ms.order[i]
+        let pos = ms.slots[slot_id].mark.pos
+        if pos > range.hi {
+            break
+        }
+        if pos < range.hi || ms.slots[slot_id].mark.bias == BIAS_LEFT {
+            (mut out).push(MarkCollapse {
+                id: MarkId { id: slot_id, gen: ms.slots[slot_id].gen },
+                rel: pos - range.lo,
+            })
+        }
+        i += 1
+    }
+    out
+}
+
+/// Whether `id` names a live mark, without failing (`yew_mark_alive`).
+pub fn mark_alive(ms: MarkSet, id: MarkId) -> bool {
+    id.id >= 0 &&
+        id.id < ms.slots.len &&
+        ms.slots[id.id].mark.alive &&
+        ms.slots[id.id].gen == id.gen
+}
+
+/// Move a live mark to `pos`; false for a dead or stale handle
+/// (`yew_mark_repair`, `mark.c:240-272`).
+pub fn mark_repair(mut ms: MarkSet, id: MarkId, pos: ByteOff) -> bool {
+    if !mark_alive(ms, id) {
+        return false
+    }
+    var old_at = 0
+    while old_at < ms.order.len && ms.order[old_at] != id.id {
+        old_at += 1
+    }
+    if old_at == ms.order.len {
+        util.bug("text.mark", "mark_repair: live mark missing from ordered index")
+    }
+    order_remove(mut ms.order, old_at)
+    let p = pos as int
+    ms.slots[id.id].mark.pos = p
+    let new_at = upper_bound_pos(ms, p)
+    order_insert(mut ms.order, new_at, id.id)
+    true
+}
+
+// `adjust_insert`, `mark.c:274-303`: the marks at `at` reorder LEFT first,
+// then every mark after (or RIGHT at) `at` moves.
+fn adjust_insert(mut ms: MarkSet, at: int, len: int) {
+    let first = lower_bound_pos(ms, at)
+    let equal_end = upper_bound_pos(ms, at)
+    if first != equal_end {
+        var scratch = List[int]()
+        var i = first
+        while i < equal_end {
+            if ms.slots[ms.order[i]].mark.bias == BIAS_LEFT {
+                (mut scratch).push(ms.order[i])
+            }
+            i += 1
+        }
+        i = first
+        while i < equal_end {
+            if ms.slots[ms.order[i]].mark.bias == BIAS_RIGHT {
+                (mut scratch).push(ms.order[i])
+            }
+            i += 1
+        }
+        i = first
+        while i < equal_end {
+            ms.order[i] = scratch[i - first]
+            i += 1
+        }
+    }
+    var i = first
+    while i < ms.order.len {
+        let id = ms.order[i]
+        if ms.slots[id].mark.pos > at || ms.slots[id].mark.bias == BIAS_RIGHT {
+            ms.slots[id].mark.pos += len
+        }
+        i += 1
+    }
+}
+
+// `adjust_delete`, `mark.c:305-322`.
+fn adjust_delete(mut ms: MarkSet, at: int, len: int) {
+    let end = at + len
+    var i = lower_bound_pos(ms, at)
+    while i < ms.order.len {
+        let id = ms.order[i]
+        if ms.slots[id].mark.pos < end {
+            ms.slots[id].mark.pos = at
+        } else {
+            ms.slots[id].mark.pos -= len
+        }
+        i += 1
+    }
+}
+
+/// Move every mark for an edit (`yew_marks_adjust`): `op` is
+/// `JOURNAL_INS` or `JOURNAL_DEL`, `at` a pre-edit offset.
+pub fn marks_adjust(mut ms: MarkSet, op: int, at: ByteOff, len: int) {
+    if op != JOURNAL_INS && op != JOURNAL_DEL {
+        util.bug("text.mark", "marks_adjust: invalid edit op {op}")
+    }
+    if len == 0 {
+        return
+    }
+    if op == JOURNAL_INS {
+        adjust_insert(mut ms, at as int, len)
+    } else {
+        adjust_delete(mut ms, at as int, len)
+    }
+}
