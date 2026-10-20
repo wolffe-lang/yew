@@ -1,0 +1,572 @@
+//! search.search — the entry points: three engines, one answer.
+//!
+//! Ports sagitta `src/search/search.c` (564 lines) at 9ace98c2, under
+//! `s20-regex-engine.md` §6 (amendment S59-A8) and §7. The literal
+//! prefilter answers a whole-pattern literal without entering the VM
+//! (one chunk at a time with an `n - 1` byte carry across chunks, a long
+//! literal streaming KMP state, every candidate checked against the UTF-8
+//! decoder's boundaries); otherwise the prefilter skips the dead zone,
+//! the lazy DFA rejects a miss outright or bounds where a leftmost match
+//! can start, and ONE unanchored Pike VM pass produces the span and the
+//! captures. Backward search scans forward inside windows that walk
+//! backwards.
+//!
+//! `fill` false is C's NULL `out`: the verdict only.
+
+use text
+
+// One byte, either backing, re-seeking per call: right for a match-sized
+// span, wrong for a scan (`byte_at`, `search.c:24-42`); -1 past the
+// window.
+fn byte_at(tb: text.TextBuf, bytes: List[byte], inp: ReInput, off: int) -> int {
+    if off >= inp.hi {
+        return -1
+    }
+    if !inp.tb_backed {
+        if off >= inp.len {
+            return -1
+        }
+        return bytes[off] as int
+    }
+    if off >= text.textbuf_len(tb) {
+        return -1
+    }
+    text.textbuf_byte_at(tb, off)
+}
+
+/// One byte of the input, or -1 (`yew_re_input_byte`, `search.c:51-58`):
+/// Sprint 21 expands replacement templates this way.
+pub fn re_input_byte(tb: text.TextBuf, bytes: List[byte], inp: ReInput, off: int) -> int {
+    byte_at(tb, bytes, inp, off)
+}
+
+// The decoded length at `off`, 0 at the end (`cp_len_at`, `search.c:61-
+// 78`).
+fn cp_len_at(tb: text.TextBuf, bytes: List[byte], inp: ReInput, off: int) -> int {
+    let b0 = byte_at(tb, bytes, inp, off)
+    if b0 < 0 {
+        return 0
+    }
+    if b0 < 128 {
+        return 1
+    }
+    var have = 1
+    let b1 = byte_at(tb, bytes, inp, off + 1)
+    var b2 = -1
+    var b3 = -1
+    if b1 >= 0 {
+        have = 2
+        b2 = byte_at(tb, bytes, inp, off + 2)
+        if b2 >= 0 {
+            have = 3
+            b3 = byte_at(tb, bytes, inp, off + 3)
+            if b3 >= 0 {
+                have = 4
+            }
+        }
+    }
+    let (_cp, n) = dec4(b0, b1, b2, b3, have)
+    n
+}
+
+/// Whether `off` is a codepoint boundary under the decoder
+/// (`is_cp_start`, `search.c:80-108`, YEW-F-082): a nominal lead length
+/// is not enough (E0 80 is two escapes, C2 A2 one codepoint), so the
+/// at most four bytes that can cover `off` are replayed.
+fn is_cp_start(tb: text.TextBuf, bytes: List[byte], inp: ReInput, off: int) -> bool {
+    if off == inp.lo || off == inp.hi {
+        return true
+    }
+    if off < inp.lo || off > inp.hi {
+        return false
+    }
+    var probe = if off - inp.lo > 4 then off - 4 else inp.lo
+    while probe < off {
+        let step = cp_len_at(tb, bytes, inp, probe)
+        if step == 0 || step > off - probe {
+            return false
+        }
+        probe += step
+    }
+    probe == off
+}
+
+// One codepoint on from `off` (`next_cp_off`, `search.c:111-118`).
+fn next_cp_off(tb: text.TextBuf, bytes: List[byte], inp: ReInput, off: int) -> int {
+    let step = cp_len_at(tb, bytes, inp, off)
+    if step == 0 then off + 1 else off + step
+}
+
+// A literal longer than 32 bytes over a piece tree: KMP state streamed
+// across chunks, no carry window, nothing materialized
+// (`long_literal_find_textbuf`, `search.c:120-152`).
+fn long_literal_find_textbuf(l: ReLit, tb: text.TextBuf, inp: ReInput, from: int) -> int {
+    var it = text.textiter_new()
+    if from >= inp.hi || l.kmp.len == 0 || !text.textiter_begin(mut it, tb, from as text.ByteOff) {
+        return -1
+    }
+    var at = from
+    var matched = 0
+    while at < inp.hi {
+        let ch = text.textiter_chunk(it, tb)
+        if !ch.ok || ch.len == 0 {
+            return -1
+        }
+        let span = if ch.len < inp.hi - at then ch.len else inp.hi - at
+        var i = 0
+        while i < span {
+            let b = text.store_byte(tb, ch.src, ch.at + i)
+            while matched != 0 && l.s[matched] != b {
+                matched = l.kmp[matched - 1]
+            }
+            if l.s[matched] == b {
+                matched += 1
+            }
+            if matched == l.n {
+                return at + i + 1 - l.n
+            }
+            i += 1
+        }
+        at += span
+        if at == inp.hi || !text.textiter_advance(mut it, tb) {
+            break
+        }
+    }
+    -1
+}
+
+// `lit_find` over one chunk of a piece tree's store.
+fn lit_find_chunk(l: ReLit, tb: text.TextBuf, src: int, at: int, n: int) -> int {
+    if l.kind == RE_LIT_NONE || l.n == 0 || n < l.n {
+        return -1
+    }
+    let m = l.n
+    let last = l.s[m - 1]
+    var pos = 0
+    while pos + m <= n {
+        let tail = text.store_byte(tb, src, at + pos + m - 1)
+        if tail == last {
+            var k = 0
+            while k < m - 1 && text.store_byte(tb, src, at + pos + k) == l.s[k] {
+                k += 1
+            }
+            if k == m - 1 {
+                return pos
+            }
+        }
+        pos += if m == 1 then 1 else l.skip[tail as int]
+    }
+    -1
+}
+
+/// The prefilter over the input one chunk at a time, carrying `n - 1`
+/// bytes across chunk boundaries (`prefilter_find`, `search.c:164-228`):
+/// without the carry a literal straddling two pieces is missed — only on
+/// edited buffers, only sometimes, never from one contiguous array.
+/// Answers the candidate offset, `from` itself when there is no
+/// prefilter, or -1.
+fn prefilter_find(re: Re, tb: text.TextBuf, bytes: List[byte], inp: ReInput, from: int) -> int {
+    let l = re.lit
+    if l.kind == RE_LIT_NONE || l.n == 0 {
+        return from
+    }
+    if !inp.tb_backed {
+        if from >= inp.hi {
+            return -1
+        }
+        let hit = lit_find(l, bytes, from, inp.hi)
+        return if hit < 0 then -1 else from + hit
+    }
+    if l.n > RE_LIT_SMALL {
+        return long_literal_find_textbuf(l, tb, inp, from)
+    }
+    var at = from
+    var it = text.textiter_new()
+    while at < inp.hi {
+        if !text.textiter_begin(mut it, tb, at as text.ByteOff) {
+            return -1
+        }
+        let ch = text.textiter_chunk(it, tb)
+        if !ch.ok || ch.len == 0 {
+            return -1
+        }
+        var span = ch.len
+        if at + span > inp.hi {
+            span = inp.hi - at
+        }
+        let hit = lit_find_chunk(l, tb, ch.src, ch.at, span)
+        if hit >= 0 {
+            return at + hit
+        }
+        // The straddle window: the last n-1 bytes of this chunk plus the
+        // first n-1 of the next.
+        if l.n > 1 && span >= 1 {
+            let back = if l.n - 1 < span then l.n - 1 else span
+            let base = at + span - back
+            var want = (l.n - 1) * 2
+            if want > 64 {
+                want = 64
+            }
+            var carry = List[byte]()
+            var k = 0
+            while k < want && base + k < inp.hi {
+                let b = byte_at(tb, bytes, inp, base + k)
+                if b < 0 {
+                    break
+                }
+                (mut carry).push(b as byte)
+                k += 1
+            }
+            if carry.len >= l.n {
+                let chit = lit_find(l, carry, 0, carry.len)
+                if chit >= 0 {
+                    return base + chit
+                }
+            }
+        }
+        at += span
+    }
+    -1
+}
+
+// `literal_equal_at` (`search.c:230-259`).
+fn literal_equal_at(l: ReLit, tb: text.TextBuf, bytes: List[byte], inp: ReInput, at: int) -> bool {
+    if at < inp.lo || at > inp.hi || l.n > inp.hi - at {
+        return false
+    }
+    if !inp.tb_backed {
+        var k = 0
+        while k < l.n {
+            if bytes[at + k] != l.s[k] {
+                return false
+            }
+            k += 1
+        }
+        return true
+    }
+    var it = text.textiter_new()
+    if !text.textiter_begin(mut it, tb, at as text.ByteOff) {
+        return false
+    }
+    var checked = 0
+    while checked < l.n {
+        let ch = text.textiter_chunk(it, tb)
+        if !ch.ok || ch.len == 0 {
+            return false
+        }
+        let n_take = if ch.len < l.n - checked then ch.len else l.n - checked
+        var k = 0
+        while k < n_take {
+            if text.store_byte(tb, ch.src, ch.at + k) != l.s[checked + k] {
+                return false
+            }
+            k += 1
+        }
+        checked += n_take
+        if checked < l.n && !text.textiter_advance(mut it, tb) {
+            return false
+        }
+    }
+    true
+}
+
+fn fill_one(mut out: ReMatch, lo: int, hi: int) {
+    match_clear(mut out)
+    out.ngroups = 1
+    out.lo[0] = lo
+    out.hi[0] = hi
+}
+
+/// A whole literal anchored at `at` (`yew_re_literal_match_at`,
+/// `search.c:261-276`).
+fn literal_match_at(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    at: int,
+    mut out: ReMatch,
+    fill: bool,
+) -> bool {
+    if re.lit.kind != RE_LIT_WHOLE ||
+        !is_cp_start(tb, bytes, inp, at) ||
+        re.lit.n > inp.hi - at ||
+        !is_cp_start(tb, bytes, inp, at + re.lit.n) ||
+        !literal_equal_at(re.lit, tb, bytes, inp, at) {
+        return false
+    }
+    if fill {
+        fill_one(mut out, at, at + re.lit.n)
+    }
+    true
+}
+
+/// A whole literal at or after `from` (`yew_re_literal_search`,
+/// `search.c:278-305`): candidates off codepoint boundaries rejected.
+fn literal_search(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: int,
+    mut out: ReMatch,
+    fill: bool,
+) -> bool {
+    if re.lit.kind != RE_LIT_WHOLE {
+        return false
+    }
+    var at = if from < inp.lo then inp.lo else from
+    while at <= inp.hi {
+        let hit = prefilter_find(re, tb, bytes, inp, at)
+        if hit < 0 || hit > inp.hi || re.lit.n > inp.hi - hit {
+            return false
+        }
+        if !is_cp_start(tb, bytes, inp, hit) || !is_cp_start(tb, bytes, inp, hit + re.lit.n) {
+            at = hit + 1
+            continue
+        }
+        if fill {
+            fill_one(mut out, hit, hit + re.lit.n)
+        }
+        return true
+    }
+    false
+}
+
+/// Anchored at `at`: the match must start exactly there
+/// (`yew_re_match_at`, `search.c:307-315`).
+pub fn re_match_at(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    at: text.ByteOff,
+    mut out: ReMatch,
+) -> bool {
+    let a = at as int
+    if re.lit.kind == RE_LIT_WHOLE {
+        return literal_match_at(re, tb, bytes, inp, a, mut out, true)
+    }
+    re_pike_run(re, tb, bytes, inp, a, mut out)
+}
+
+/// `re_match_at` on a caller's workspace (`yew_re_match_at_ws`,
+/// `search.c:317-325`): many anchored probes, one set of buffers.
+pub fn re_match_at_ws(
+    mut ws: ReWorkspace,
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    at: text.ByteOff,
+    mut out: ReMatch,
+) -> bool {
+    let a = at as int
+    if re.lit.kind == RE_LIT_WHOLE {
+        return literal_match_at(re, tb, bytes, inp, a, mut out, true)
+    }
+    pike_run(mut ws, re, tb, bytes, inp, a, true, mut out, true)
+}
+
+// The dispatcher (`yew_re_search`, `search.c:327-442`).
+fn search_from(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: int,
+    mut out: ReMatch,
+    fill: bool,
+) -> bool {
+    var at = if from < inp.lo then inp.lo else from
+    // A whole-pattern literal: the VM is never entered.
+    if re.lit.kind == RE_LIT_WHOLE {
+        return literal_search(re, tb, bytes, inp, at, mut out, fill)
+    }
+    // Otherwise the prefilter ONLY skips the dead zone before the first
+    // candidate; re-running an anchored match at every hit would make
+    // `a(a*)*b` over 100,000 a's O(n^2), a hang.
+    if re.lit.kind != RE_LIT_NONE {
+        let first = prefilter_find(re, tb, bytes, inp, at)
+        if first < 0 || first > inp.hi {
+            return false
+        }
+        at = first
+    }
+    // §6c, S59-A8: the DFA locates a REGION and the VM produces the
+    // answer. NO: nothing matches ahead, return without the VM. YES: the
+    // earliest end `e` bounds the leftmost start for a bounded pattern
+    // (s* >= e - 4 * max_len), so the VM is seeded there.
+    let (verdict, end) = re_dfa_find_end(re, tb, bytes, inp, at)
+    if verdict == DFA_NO {
+        return false
+    }
+    if verdict == DFA_YES &&
+        is_cp_start(tb, bytes, inp, at) &&
+        re.max_len != RE_UNBOUNDED &&
+        re.max_len <= RE_SPAN_WINDOW / 4 {
+        let span = re.max_len * 4
+        if end > at + span {
+            var to = end - span
+            let floor = if to > 4 then to - 4 else inp.lo
+            // Start and finish on codepoint boundaries, or not at all:
+            // both engines derive `\b` and `^` context by decoding back
+            // from where they start.
+            while to > floor && !is_cp_start(tb, bytes, inp, to) {
+                to -= 1
+            }
+            if to > at && is_cp_start(tb, bytes, inp, to) {
+                at = to
+            }
+        }
+    }
+    // Start the scan at `at`, but hand the VM the ORIGINAL window: `^`,
+    // `\A` and `\b` are measured against it.
+    var ws = re_workspace_new()
+    pike_run(mut ws, re, tb, bytes, inp, at, false, mut out, fill)
+}
+
+/// The leftmost-first match at or after `from` (`yew_re_search`).
+pub fn re_search(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: text.ByteOff,
+    mut out: ReMatch,
+) -> bool {
+    search_from(re, tb, bytes, inp, from as int, mut out, true)
+}
+
+/// Whether there is a match at or after `from`, no span asked
+/// (`yew_re_search` with a NULL `out`).
+pub fn re_search_any(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: text.ByteOff,
+) -> bool {
+    var m = re_match_new()
+    search_from(re, tb, bytes, inp, from as int, mut m, false)
+}
+
+// `dfa_verdict_or_pike` (`search.c:444-452`, YEW-F-090): a second flush
+// is an observed hand-off; finish on the correctness-reference VM.
+fn dfa_verdict_or_pike(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: int,
+    verdict: int,
+) -> bool {
+    if verdict != DFA_GIVE_UP {
+        return verdict == DFA_YES
+    }
+    var ws = re_workspace_new()
+    var m = re_match_new()
+    pike_run(mut ws, re, tb, bytes, inp, from, false, mut m, false)
+}
+
+/// Match or not at or after `from`: the whole-literal matcher, otherwise
+/// the lazy DFA with the Pike VM after a cache thrash (`yew_re_test`,
+/// `search.c:454-466`).
+pub fn re_test(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: text.ByteOff,
+) -> bool {
+    let f = from as int
+    if re.lit.kind == RE_LIT_WHOLE {
+        var m = re_match_new()
+        return search_from(re, tb, bytes, inp, f, mut m, false)
+    }
+    let v = re_dfa_test(re, tb, bytes, inp, f)
+    dfa_verdict_or_pike(re, tb, bytes, inp, f, v)
+}
+
+/// `re_test` under a lowered DFA cap (`yew_re_test_limits`,
+/// `search.c:468-481`).
+pub fn re_test_limits(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: text.ByteOff,
+    max_states: int,
+    max_bytes: int,
+    mut stats: ReDfaStats,
+) -> bool {
+    let f = from as int
+    if re.lit.kind == RE_LIT_WHOLE {
+        var m = re_match_new()
+        return search_from(re, tb, bytes, inp, f, mut m, false)
+    }
+    let v = re_dfa_test_limits(re, tb, bytes, inp, f, max_states, max_bytes, mut stats)
+    dfa_verdict_or_pike(re, tb, bytes, inp, f, v)
+}
+
+/// The last match starting strictly before `before`
+/// (`yew_re_search_back`, `search.c:496-564`): forward scans inside
+/// 256 KiB windows walking backwards, keeping the last match; matches
+/// may overlap (YEW-F-083), so each next scan starts one decoded
+/// codepoint after the prior match's START.
+pub fn re_search_back(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    before: text.ByteOff,
+    mut out: ReMatch,
+) -> bool {
+    let window = 262144
+    let b = before as int
+    var hi = if b > inp.hi then inp.hi else b
+    if hi <= inp.lo {
+        return false
+    }
+    var best = re_match_new()
+    var cur = re_match_new()
+    loop {
+        let lo = if hi > inp.lo + window then hi - window else inp.lo
+        var scan_lo = lo
+        if re.lit.kind == RE_LIT_WHOLE && re.lit.n > 1 {
+            let overlap = re.lit.n - 1
+            scan_lo = if lo > inp.lo + overlap then lo - overlap else inp.lo
+        }
+        // A whole literal has no anchors to preserve, so its window ends
+        // where the question does; a regex keeps the original high edge
+        // (\z is measured against it).
+        var sub_hi = inp.hi
+        if re.lit.kind == RE_LIT_WHOLE {
+            let overlap = if re.lit.n > 1 then re.lit.n - 1 else 0
+            sub_hi = if overlap > inp.hi - hi then inp.hi else hi + overlap
+        }
+        let sub = ReInput { tb_backed: inp.tb_backed, len: inp.len, lo: scan_lo, hi: sub_hi }
+        var at = scan_lo
+        var found = false
+        while at < hi {
+            if !search_from(re, tb, bytes, sub, at, mut cur, true) {
+                break
+            }
+            if cur.lo[0] >= hi {
+                break
+            }
+            re_match_copy(mut best, cur)
+            found = true
+            at = next_cp_off(tb, bytes, inp, cur.lo[0])
+        }
+        if found {
+            re_match_copy(mut out, best)
+            return true
+        }
+        if lo == inp.lo {
+            return false
+        }
+        hi = lo
+    }
+    false
+}
