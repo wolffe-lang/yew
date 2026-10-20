@@ -1,0 +1,761 @@
+//! search.pike — the Pike VM: an NFA simulation with submatch capture,
+//! leftmost-first, and the input cursor every engine reads through.
+//!
+//! Ports sagitta `src/search/pike.c` (761 lines) at 9ace98c2, under
+//! `s20-regex-engine.md` §6a. Two thread lists over a sparse set of pc
+//! values (a per-pc generation stamp: O(1) membership, no clearing
+//! between steps), `addthread` over an EXPLICIT stack (`(a*)*` chains
+//! SPLIT/JMP with no input consumed; the membership check lives INSIDE
+//! the loop, which is what keeps it from spinning), capture arrays
+//! reference-counted and copy-on-write, the priority cut that is
+//! leftmost-first, and the unanchored scan that seeds a thread at every
+//! position in ONE pass so a search is O(n*m), never O(n^2). There is no
+//! recursion and no backtracking here; the word appears only in comments
+//! explaining its absence.
+//!
+//! The port's shapes: C's `Caps` structs on a malloc'd free list are rows
+//! of one slot table (`cap_slots`, 64 slots a row — C sizes a row to the
+//! pattern, `pike.c:107-115`, and the port reads and copies only the
+//! pattern's `2 * ngroups` of them, so the traffic is C's), with a
+//! reference count and a free-list link per row; C's `PikeWorkspace`
+//! behind `YewReWorkspace.impl` is `ReWorkspace`, a caller-owned value
+//! reused across runs (`re_match_at_ws`) or made per call.
+
+use text
+use unicode
+
+// ---------------------------------------------------------------- input
+
+/// The input cursor (`ReCursor`, `pike.c:22-28`): through `TextIter`,
+/// never materializing (§1's law); the current chunk is a span of one of
+/// the buffer's stores.
+struct ReCursor {
+    it: text.TextIter,
+    has_chunk: bool,
+    chunk_at: int,
+    n: int,
+    src: int,
+    at: int,
+}
+
+fn cursor_new() -> ReCursor {
+    ReCursor { it: text.textiter_new(), has_chunk: false, chunk_at: 0, n: 0, src: 0, at: 0 }
+}
+
+/// The byte at `off`, or -1 (`cursor_byte`, `pike.c:35-58`): refills the
+/// chunk on a miss; the iterator is forward-only, so a backward step
+/// restarts it.
+fn cursor_byte(
+    mut c: ReCursor,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    off: int,
+) -> int {
+    if off >= inp.hi {
+        return -1
+    }
+    if !inp.tb_backed {
+        if off >= inp.len {
+            return -1
+        }
+        return bytes[off] as int
+    }
+    if c.has_chunk && off >= c.chunk_at && off < c.chunk_at + c.n {
+        return text.store_byte(tb, c.src, c.at + off - c.chunk_at) as int
+    }
+    if !text.textiter_begin(mut c.it, tb, off as text.ByteOff) {
+        return -1
+    }
+    let ch = text.textiter_chunk(c.it, tb)
+    if !ch.ok || ch.len == 0 {
+        return -1
+    }
+    c.chunk_at = off
+    c.n = ch.len
+    c.src = ch.src
+    c.at = ch.at
+    c.has_chunk = true
+    text.store_byte(tb, c.src, c.at) as int
+}
+
+fn is_tail(b: int, lo: int, hi: int) -> bool {
+    b >= lo && b <= hi
+}
+
+/// Decode up to four gathered bytes exactly as `unicode.utf8_decode`
+/// does (yew's DFA: overlongs, surrogates and values past U+10FFFF
+/// reject, and a rejected or truncated sequence is the escape of its
+/// first byte alone): answers (cp, n).
+fn dec4(b0: int, b1: int, b2: int, b3: int, have: int) -> (int, int) {
+    if b0 < 128 {
+        return (b0, 1)
+    }
+    let esc = unicode.utf8_escape_of(b0)
+    if b0 >= 194 && b0 <= 223 {
+        if have >= 2 && is_tail(b1, 128, 191) {
+            return ((b0 & 31) << 6 | b1 & 63, 2)
+        }
+        return (esc, 1)
+    }
+    if b0 >= 224 && b0 <= 239 {
+        let lo = if b0 == 224 then 160 else 128
+        let hi = if b0 == 237 then 159 else 191
+        if have >= 3 && is_tail(b1, lo, hi) && is_tail(b2, 128, 191) {
+            return ((b0 & 15) << 12 | (b1 & 63) << 6 | b2 & 63, 3)
+        }
+        return (esc, 1)
+    }
+    if b0 >= 240 && b0 <= 244 {
+        let lo = if b0 == 240 then 144 else 128
+        let hi = if b0 == 244 then 143 else 191
+        if have >= 4 && is_tail(b1, lo, hi) && is_tail(b2, 128, 191) && is_tail(b3, 128, 191) {
+            return ((b0 & 7) << 18 | (b1 & 63) << 12 | (b2 & 63) << 6 | b3 & 63, 4)
+        }
+        return (esc, 1)
+    }
+    (esc, 1)
+}
+
+/// The codepoint starting at `off` and its length, (0, 0) at the end
+/// (`cursor_decode`, `pike.c:63-96`): invalid bytes are U+DC80 escapes
+/// (§3); a flat ASCII byte skips the general decoder.
+fn cursor_decode(mut c: ReCursor, tb: text.TextBuf, bytes: List[byte], inp: ReInput, off: int) -> (
+    int,
+    int,
+) {
+    if !inp.tb_backed && off < inp.hi && off < inp.len && bytes[off] as int < 128 {
+        return (bytes[off] as int, 1)
+    }
+    let b0 = cursor_byte(mut c, tb, bytes, inp, off)
+    if b0 < 0 {
+        return (0, 0)
+    }
+    if b0 < 128 {
+        return (b0, 1)
+    }
+    var have = 1
+    let b1 = cursor_byte(mut c, tb, bytes, inp, off + 1)
+    var b2 = -1
+    var b3 = -1
+    if b1 >= 0 {
+        have = 2
+        b2 = cursor_byte(mut c, tb, bytes, inp, off + 2)
+        if b2 >= 0 {
+            have = 3
+            b3 = cursor_byte(mut c, tb, bytes, inp, off + 3)
+            if b3 >= 0 {
+                have = 4
+            }
+        }
+    }
+    dec4(b0, b1, b2, b3, have)
+}
+
+// The codepoint ENDING at `pos`, decoding forward from at most four
+// bytes back and never before the window (the "codepoint preceding the
+// seed" walk of `pike.c:557-580` and `dfa.c:664-680`): (cp, found).
+fn cursor_prev(mut c: ReCursor, tb: text.TextBuf, bytes: List[byte], inp: ReInput, pos: int) -> (
+    int,
+    bool,
+) {
+    if pos <= inp.lo {
+        return (0, false)
+    }
+    let back = if pos - inp.lo > 4 then 4 else pos - inp.lo
+    var probe = pos - back
+    while probe < pos {
+        let (cp, len) = cursor_decode(mut c, tb, bytes, inp, probe)
+        if len == 0 {
+            return (0, false)
+        }
+        if probe + len >= pos {
+            return (cp, true)
+        }
+        probe += len
+    }
+    (0, false)
+}
+
+// ---------------------------------------------------------------- workspace
+
+/// Slots a capture row holds: `RE_MAX_GROUPS * 2`.
+const CAP_STRIDE: int = 64
+
+/// Reusable execution storage (`YewReWorkspace` / `PikeWorkspace`,
+/// `regex.h:43-50`, `pike.c:210-221`): the two thread lists, their
+/// membership stamps and generations, the addthread stack, and the
+/// capture rows. Make one with `re_workspace_new`, reuse it serially.
+pub struct ReWorkspace {
+    prog_cap: int,
+    dense_pc: List[int],
+    dense_caps: List[int],
+    stamp: List[int],
+    gen0: int,
+    gen1: int,
+    stack_pc: List[int],
+    stack_caps: List[int],
+    cap_slots: List[int],
+    cap_refs: List[int],
+    cap_next: List[int],
+    cap_free: int,
+    nslots: int,
+}
+
+/// A fresh workspace (`yew_re_workspace_init`).
+pub fn re_workspace_new() -> ReWorkspace {
+    ReWorkspace {
+        prog_cap: 0,
+        dense_pc: List[int](),
+        dense_caps: List[int](),
+        stamp: List[int](),
+        gen0: 0,
+        gen1: 0,
+        stack_pc: List[int](),
+        stack_caps: List[int](),
+        cap_slots: List[int](),
+        cap_refs: List[int](),
+        cap_next: List[int](),
+        cap_free: -1,
+        nslots: 0,
+    }
+}
+
+/// Release a workspace's storage (`yew_re_workspace_free`); a freed
+/// workspace is a fresh one, and freeing twice is valid.
+pub fn re_workspace_free(mut ws: ReWorkspace) {
+    ws = re_workspace_new()
+}
+
+/// Whether the workspace holds storage (C's `workspace.impl != NULL`).
+pub fn re_workspace_live(ws: ReWorkspace) -> bool {
+    ws.prog_cap != 0 || ws.cap_refs.len != 0
+}
+
+// `workspace_prepare` (`pike.c:299-332`): the lists grown to the
+// program (stamps of new slots zeroed), every capture row back on the
+// free list.
+fn ws_prepare(mut ws: ReWorkspace, nprog: int, nslots: int) {
+    if ws.prog_cap < nprog {
+        // Two lists, each `prog_cap` wide; re-laid out at the new width
+        // with every stamp zeroed and the generations restarted.
+        var dp = List[int]()
+        var dc = List[int]()
+        var st = List[int]()
+        var i = 0
+        while i < 2 * nprog {
+            (mut dp).push(0)
+            (mut dc).push(-1)
+            (mut st).push(0)
+            i += 1
+        }
+        ws.dense_pc = dp
+        ws.dense_caps = dc
+        ws.stamp = st
+        ws.gen0 = 0
+        ws.gen1 = 0
+        var sp = List[int]()
+        var sc = List[int]()
+        i = 0
+        while i < 2 * nprog + 8 {
+            (mut sp).push(0)
+            (mut sc).push(-1)
+            i += 1
+        }
+        ws.stack_pc = sp
+        ws.stack_caps = sc
+        ws.prog_cap = nprog
+    }
+    ws.nslots = nslots
+    ws_caps_reset(mut ws)
+}
+
+fn ws_caps_reset(mut ws: ReWorkspace) {
+    var i = 0
+    ws.cap_free = -1
+    while i < ws.cap_refs.len {
+        ws.cap_refs[i] = 0
+        ws.cap_next[i] = ws.cap_free
+        ws.cap_free = i
+        i += 1
+    }
+}
+
+// `caps_new` (`pike.c:239-258`): a row off the free list or a new one,
+// one reference, its pattern slots unset.
+fn caps_new(mut ws: ReWorkspace) -> int {
+    var c = ws.cap_free
+    if c >= 0 {
+        ws.cap_free = ws.cap_next[c]
+    } else {
+        c = ws.cap_refs.len
+        (mut ws.cap_refs).push(0)
+        (mut ws.cap_next).push(-1)
+        var k = 0
+        while k < CAP_STRIDE {
+            (mut ws.cap_slots).push(-1)
+            k += 1
+        }
+    }
+    ws.cap_refs[c] = 1
+    ws.cap_next[c] = -1
+    var k = 0
+    while k < ws.nslots {
+        ws.cap_slots[c * CAP_STRIDE + k] = -1
+        k += 1
+    }
+    c
+}
+
+fn caps_share(mut ws: ReWorkspace, c: int) -> int {
+    if c >= 0 {
+        ws.cap_refs[c] = ws.cap_refs[c] + 1
+    }
+    c
+}
+
+fn caps_release(mut ws: ReWorkspace, c: int) {
+    if c < 0 || ws.cap_refs[c] == 0 {
+        return
+    }
+    ws.cap_refs[c] = ws.cap_refs[c] - 1
+    if ws.cap_refs[c] == 0 {
+        ws.cap_next[c] = ws.cap_free
+        ws.cap_free = c
+    }
+}
+
+// Copy-on-write: a SAVE on a shared row copies once (`caps_set`,
+// `pike.c:279-297`).
+fn caps_set(mut ws: ReWorkspace, c: int, slot: int, value: int) -> int {
+    if slot >= ws.nslots {
+        return c
+    }
+    if c < 0 {
+        return -1
+    }
+    var target = c
+    if ws.cap_refs[c] > 1 {
+        let copy_row = caps_new(mut ws)
+        var k = 0
+        while k < ws.nslots {
+            ws.cap_slots[copy_row * CAP_STRIDE + k] = ws.cap_slots[c * CAP_STRIDE + k]
+            k += 1
+        }
+        ws.cap_refs[c] = ws.cap_refs[c] - 1
+        target = copy_row
+    }
+    ws.cap_slots[target * CAP_STRIDE + slot] = value
+    target
+}
+
+// ---------------------------------------------------------------- lists
+
+/// One thread list's view (`ReList`, `pike.c:127-134`): which half of the
+/// workspace's arrays, its count and generation.
+struct PList {
+    half: int,
+    n: int,
+    gen: int,
+}
+
+// No clearing between steps: bumping the generation invalidates every
+// membership stamp at once (`list_clear`, `pike.c:146-155`).
+fn plist_clear(mut ws: ReWorkspace, mut l: PList, nprog: int) {
+    l.n = 0
+    if l.gen >= 4294967294 {
+        var i = 0
+        while i < nprog {
+            ws.stamp[l.half * ws.prog_cap + i] = 0
+            i += 1
+        }
+        l.gen = 0
+    }
+    l.gen += 1
+}
+
+fn plist_has(ws: ReWorkspace, l: PList, pc: int, nprog: int) -> bool {
+    pc < nprog && ws.stamp[l.half * ws.prog_cap + pc] == l.gen + 1
+}
+
+fn plist_mark(mut ws: ReWorkspace, l: PList, pc: int, nprog: int) {
+    if pc < nprog {
+        ws.stamp[l.half * ws.prog_cap + pc] = l.gen + 1
+    }
+}
+
+// ---------------------------------------------------------------- assertions
+
+/// The assertion context (`ReCtx`, `pike.c:161-168`).
+struct PCtx {
+    pos: int,
+    prev_cp: int,
+    at_start: bool,
+}
+
+// `assertion_holds` (`pike.c:175-219`).
+fn assertion_holds(
+    mut c: ReCursor,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    x: PCtx,
+    op: int,
+    cp: int,
+    have_cp: bool,
+) -> bool {
+    if op == RE_BOT {
+        return x.pos == inp.lo
+    }
+    if op == RE_EOT {
+        return x.pos == inp.hi
+    }
+    if op == RE_BOL {
+        return x.pos == inp.lo || x.prev_cp == 10
+    }
+    if op == RE_EOL {
+        // `$` matches at the window end, before an LF, and before the CR
+        // of a CRLF pair — s08 keeps \r\n verbatim.
+        if x.pos == inp.hi {
+            return true
+        }
+        if !have_cp {
+            return false
+        }
+        if cp == 10 {
+            return true
+        }
+        if cp == 13 {
+            let (next, len) = cursor_decode(mut c, tb, bytes, inp, x.pos + 1)
+            return len != 0 && next == 10
+        }
+        return false
+    }
+    if op == RE_WORDB || op == RE_NWORDB {
+        let before = !x.at_start && re_is_word(x.prev_cp)
+        let after = have_cp && re_is_word(cp)
+        let boundary = before != after
+        return if op == RE_WORDB then boundary else !boundary
+    }
+    false
+}
+
+// ---------------------------------------------------------------- the VM
+
+// `addthread` (`pike.c:343-428`): explicit stack, never recursion.
+fn addthread(
+    mut ws: ReWorkspace,
+    re: Re,
+    mut l: PList,
+    pc0: int,
+    caps0: int,
+    mut cur: ReCursor,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    x: PCtx,
+    cp: int,
+    have_cp: bool,
+) {
+    let nprog = re.prog.len
+    let stack_cap = nprog * 2 + 8
+    ws.stack_pc[0] = pc0
+    ws.stack_caps[0] = caps0
+    var top = 1
+    while top != 0 {
+        top -= 1
+        let pc = ws.stack_pc[top]
+        let caps = ws.stack_caps[top]
+        // THE empty-width fix: this check lives INSIDE the loop. `(a*)*`
+        // chains SPLIT/JMP without consuming input, and re-adding the
+        // same pc would spin forever; moving it out makes the dedicated
+        // unit test hang.
+        if pc >= nprog || plist_has(ws, l, pc, nprog) {
+            caps_release(mut ws, caps)
+            continue
+        }
+        plist_mark(mut ws, l, pc, nprog)
+        let op = re.prog[pc].op
+        if op == RE_JMP {
+            assert(top + 1 <= stack_cap, "regex: addthread stack overflow")
+            ws.stack_pc[top] = re.prog[pc].x
+            ws.stack_caps[top] = caps
+            top += 1
+        } else if op == RE_SPLIT {
+            assert(top + 2 <= stack_cap, "regex: addthread stack overflow")
+            // Lower priority pushed first so the higher-priority branch
+            // pops first — that ordering IS leftmost-first.
+            ws.stack_pc[top] = re.prog[pc].y
+            ws.stack_caps[top] = caps_share(mut ws, caps)
+            top += 1
+            ws.stack_pc[top] = re.prog[pc].x
+            ws.stack_caps[top] = caps
+            top += 1
+        } else if op == RE_SAVE {
+            let c2 = caps_set(mut ws, caps, re.prog[pc].arg, x.pos)
+            assert(top + 1 <= stack_cap, "regex: addthread stack overflow")
+            ws.stack_pc[top] = pc + 1
+            ws.stack_caps[top] = c2
+            top += 1
+        } else if op >= RE_BOL && op <= RE_NWORDB {
+            if assertion_holds(mut cur, tb, bytes, inp, x, op, cp, have_cp) {
+                assert(top + 1 <= stack_cap, "regex: addthread stack overflow")
+                ws.stack_pc[top] = pc + 1
+                ws.stack_caps[top] = caps
+                top += 1
+            } else {
+                caps_release(mut ws, caps)
+            }
+        } else
+        // A consuming op or MATCH: it stays in the list.
+        if l.n < nprog {
+            ws.dense_pc[l.half * ws.prog_cap + l.n] = pc
+            ws.dense_caps[l.half * ws.prog_cap + l.n] = caps
+            l.n += 1
+        } else {
+            caps_release(mut ws, caps)
+        }
+    }
+}
+
+// `inst_matches` (`pike.c:430-445`).
+fn inst_matches(re: Re, pc: int, cp: int) -> bool {
+    let op = re.prog[pc].op
+    if op == RE_CHAR {
+        return cp == re.prog[pc].arg
+    }
+    if op == RE_CLASS {
+        return re.prog[pc].arg < re.cls_start.len && class_has(re, re.prog[pc].arg, cp)
+    }
+    if op == RE_ANY {
+        return re.prog[pc].arg != 0 || cp != 10
+    }
+    false
+}
+
+/// The VM over `inp` from `start` (`yew_re_pike_run_ws`, `pike.c:495-
+/// 761`). `anchored`: the match must begin exactly at `start`; else a
+/// fresh thread is seeded at EVERY position in the one pass, after the
+/// live ones (so an earlier start keeps its priority: leftmost), until a
+/// match is recorded. `fill` false asks for the verdict only (C's NULL
+/// `out`).
+fn pike_run(
+    mut ws: ReWorkspace,
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    start: int,
+    anchored: bool,
+    mut out: ReMatch,
+    fill: bool,
+) -> bool {
+    if re.prog.len == 0 {
+        return false
+    }
+    if re.lit.kind == RE_LIT_WHOLE {
+        if anchored {
+            return literal_match_at(re, tb, bytes, inp, start, mut out, fill)
+        }
+        return literal_search(re, tb, bytes, inp, start, mut out, fill)
+    }
+    let nprog = re.prog.len
+    // Anchored with no explicit groups: group zero is exactly [start,
+    // MATCH-position], so the capture rows are skipped entirely.
+    let captureless = anchored && re.ngroups == 1
+    var nslots = re.ngroups * 2
+    if nslots > CAP_STRIDE {
+        nslots = CAP_STRIDE
+    }
+    ws_prepare(mut ws, nprog, nslots)
+    var clist = PList { half: 0, n: 0, gen: ws.gen0 }
+    var nlist = PList { half: 1, n: 0, gen: ws.gen1 }
+    var cur = cursor_new()
+    var best = -1
+    var pos = start
+    var match_end = start
+    var matched = false
+
+    // The codepoint preceding the seed, needed by \b and ^ without a
+    // second pass; bounded by four bytes.
+    var prev_cp = 0
+    if pos > inp.lo {
+        if !inp.tb_backed && pos <= inp.len && bytes[pos - 1] as int < 128 {
+            prev_cp = bytes[pos - 1] as int
+        } else {
+            let (pcp, _found) = cursor_prev(mut cur, tb, bytes, inp, pos)
+            prev_cp = pcp
+        }
+    }
+    plist_clear(mut ws, mut clist, nprog)
+    plist_clear(mut ws, mut nlist, nprog)
+    var (cp, cp_len) = cursor_decode(mut cur, tb, bytes, inp, pos)
+    loop {
+        let have_cp = cp_len != 0 && pos < inp.hi
+        var next_cp = 0
+        var next_len = 0
+        var have_next = false
+        let x = PCtx { pos: pos, prev_cp: prev_cp, at_start: pos == inp.lo }
+        // Seed a new start thread here; once a match is recorded a later
+        // start can never beat it.
+        if !matched && (pos == start || !anchored) {
+            let seed = if captureless then -1 else caps_new(mut ws)
+            addthread(mut ws, re, mut clist, 0, seed, mut cur, tb, bytes, inp, x, cp, have_cp)
+        }
+        if clist.n == 0 {
+            if anchored || matched || !have_cp {
+                break
+            }
+            // No live threads, but an unanchored scan keeps walking.
+            prev_cp = cp
+            pos += cp_len
+            plist_clear(mut ws, mut clist, nprog)
+            let (c2, l2) = cursor_decode(mut cur, tb, bytes, inp, pos)
+            cp = c2
+            cp_len = l2
+            continue
+        }
+        plist_clear(mut ws, mut nlist, nprog)
+        // Successors of a consuming instruction live at the NEXT position,
+        // so they are added with its context — a SAVE there records where
+        // the match ends.
+        let next_pos = pos + (if have_cp then cp_len else 0)
+        if have_cp {
+            let (c2, l2) = cursor_decode(mut cur, tb, bytes, inp, next_pos)
+            next_cp = c2
+            next_len = l2
+            have_next = next_len != 0 && next_pos < inp.hi
+        }
+        let xn = PCtx {
+            pos: next_pos,
+            prev_cp: if have_cp then cp else prev_cp,
+            at_start: next_pos == inp.lo,
+        }
+        var i = 0
+        while i < clist.n {
+            let pc = ws.dense_pc[clist.half * ws.prog_cap + i]
+            let caps = ws.dense_caps[clist.half * ws.prog_cap + i]
+            if re.prog[pc].op == RE_MATCH {
+                caps_release(mut ws, best)
+                best = caps
+                match_end = pos
+                matched = true
+                // Priority cut: every later thread in clist is lower
+                // priority; higher-priority threads already in nlist
+                // keep running.
+                i += 1
+                while i < clist.n {
+                    caps_release(mut ws, ws.dense_caps[clist.half * ws.prog_cap + i])
+                    i += 1
+                }
+                break
+            }
+            if have_cp && inst_matches(re, pc, cp) {
+                addthread(
+                    mut ws,
+                    re,
+                    mut nlist,
+                    pc + 1,
+                    caps,
+                    mut cur,
+                    tb,
+                    bytes,
+                    inp,
+                    xn,
+                    next_cp,
+                    have_next,
+                )
+            } else {
+                caps_release(mut ws, caps)
+            }
+            i += 1
+        }
+        if !have_cp {
+            break
+        }
+        // Swap lists.
+        let t = clist
+        clist = nlist
+        nlist = t
+        prev_cp = cp
+        pos += cp_len
+        cp = next_cp
+        cp_len = next_len
+        if clist.n == 0 && (anchored || matched) {
+            break
+        }
+    }
+    if matched && fill {
+        match_clear(mut out)
+        out.ngroups = re.ngroups
+        if captureless {
+            out.lo[0] = start
+            out.hi[0] = match_end
+        } else {
+            var g = 0
+            while g < re.ngroups && g < RE_MAX_GROUPS {
+                let lo = ws.cap_slots[best * CAP_STRIDE + g * 2]
+                let hi = ws.cap_slots[best * CAP_STRIDE + g * 2 + 1]
+                if lo < 0 || hi < 0 {
+                    out.lo[g] = -1
+                    out.hi[g] = -1
+                } else {
+                    out.lo[g] = lo
+                    out.hi[g] = hi
+                }
+                g += 1
+            }
+        }
+    }
+    if clist.half == 0 {
+        ws.gen0 = clist.gen
+        ws.gen1 = nlist.gen
+    } else {
+        ws.gen0 = nlist.gen
+        ws.gen1 = clist.gen
+    }
+    ws_caps_reset(mut ws)
+    matched
+}
+
+/// The VM anchored at `start` (`yew_re_pike_run`): the correctness
+/// reference the DFA is held to.
+pub fn re_pike_run(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    start: int,
+    mut out: ReMatch,
+) -> bool {
+    var ws = re_workspace_new()
+    pike_run(mut ws, re, tb, bytes, inp, start, true, mut out, true)
+}
+
+/// The VM anchored or unanchored (`yew_re_pike_run_ex`).
+pub fn re_pike_run_ex(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    start: int,
+    anchored: bool,
+    mut out: ReMatch,
+) -> bool {
+    var ws = re_workspace_new()
+    pike_run(mut ws, re, tb, bytes, inp, start, anchored, mut out, true)
+}
+
+/// The VM on a caller's workspace (`yew_re_pike_run_ws`).
+pub fn re_pike_run_ws(
+    mut ws: ReWorkspace,
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    start: int,
+    anchored: bool,
+    mut out: ReMatch,
+) -> bool {
+    pike_run(mut ws, re, tb, bytes, inp, start, anchored, mut out, true)
+}
