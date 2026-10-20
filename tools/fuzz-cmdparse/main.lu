@@ -1,0 +1,531 @@
+//! fuzz-cmdparse — Sprint 18's parser fuzz (s18 DoD 10): the port of
+//! sagitta `tests/fuzz/fuzz_cmdparse.c` over the generator of
+//! `tests/fuzz/fuzzlib.c` (`yew_fuzz_main`) at 9ace98c2.
+//!
+//! wolf 0.2.33 has no `fuzz` verb, so this is the bounded, seeded driver,
+//! and it is C's bit for bit where C's run is deterministic: the
+//! xorshift64* generator (`prng_next`, `choose`), the five built-in seeds
+//! sorted by name (`add_builtin_corpus`, `corpus_sort`; `fuzz_cmdparse`
+//! has no corpus directory and no dictionary at the pin, so ten
+//! mutators), one to four mutations an iteration chosen as C chooses them
+//! (`mutate`, `fuzzlib.c:742-913`), the 64 KiB input cap, and the FNV-1a
+//! hash over every input (`hash_bytes`) — so a seed's `hash=` is C's for
+//! the same seed and iterations, which is the witness that the port fed
+//! the parser the same inputs.
+//!
+//! The check is C's (`check_cmdparse`): every input parses (or fails)
+//! twice — as typed and behind `file.write ` — on a headless editor with
+//! no buffer (`yew_ed_init`), and a failure's token is `[0,0)` on an
+//! empty line, else non-empty and inside the line (the `tok` invariant).
+//! A trap anywhere is the crash C's harness reports.
+//!
+//!   fuzz-cmdparse [--iters=N] [--seed=N]
+//!
+//! Defaults are C's (`--iters=200000 --seed=1`); sagitta's `make
+//! fuzz-cmdparse` runs `--iters=1000000` (`CMDPARSE_FUZZ_ITERS`). C's
+//! watchdog, crash minimiser, `--seconds`, `--corpus-only` and coverage
+//! admission are not ported (a divergence prints the input as hex). The
+//! iterations run in epochs of 4,096 inside a `region`, the editor
+//! rebuilt per epoch, so the driver's memory is flat (G33).
+
+use edit
+use text
+
+const MAX_INPUT: int = 65536
+
+const EPOCH: int = 4096
+
+struct Run {
+    state: wrapping[u64],
+    hash: wrapping[u64],
+}
+
+fn u(x: int) -> wrapping[u64] {
+    x as wrapping[u64]
+}
+
+// `prng_next` (`fuzzlib.c:726-735`): xorshift64*.
+fn prng_next(mut r: Run) -> wrapping[u64] {
+    var x = r.state
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    r.state = x
+    x * 2685821657736338717
+}
+
+// `choose` (`fuzzlib.c:737-740`).
+fn choose(mut r: Run, limit: int) -> int {
+    if limit == 0 {
+        return 0
+    }
+    (prng_next(mut r) % u(limit)) as int
+}
+
+fn insert_at(b: List[byte], at_in: int, data: List[byte], lo: int, n_in: int) -> List[byte] {
+    let at = if at_in > b.len then b.len else at_in
+    var n = n_in
+    if n > MAX_INPUT - b.len {
+        n = MAX_INPUT - b.len
+    }
+    if n <= 0 {
+        return copy b
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < at {
+        (mut out).push(b[i])
+        i += 1
+    }
+    var k = 0
+    while k < n {
+        (mut out).push(data[lo + k])
+        k += 1
+    }
+    while i < b.len {
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+fn delete_at(b: List[byte], at: int, n_in: int) -> List[byte] {
+    if at >= b.len {
+        return copy b
+    }
+    var n = n_in
+    if n > b.len - at {
+        n = b.len - at
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < b.len {
+        if i < at || i >= at + n {
+            (mut out).push(b[i])
+        }
+        i += 1
+    }
+    out
+}
+
+fn one(x: int) -> List[byte] {
+    var out = List[byte]()
+    (mut out).push(x as byte)
+    out
+}
+
+// The mutators (`fuzzlib.c:742-893`), C's choose calls in C's order.
+fn mutate_flip(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        let x = (prng_next(mut r) & 255) as int
+        return insert_at(b, 0, one(x), 0, 1)
+    }
+    let at = choose(mut r, b.len)
+    var out = copy b
+    out[at] = (b[at] as int ^ 1 << choose(mut r, 8)) as byte
+    out
+}
+
+fn mutate_delete(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let at = choose(mut r, b.len)
+    let n = 1 + choose(mut r, b.len - at)
+    delete_at(b, at, n)
+}
+
+fn mutate_duplicate(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let from = choose(mut r, b.len)
+    var n = 1 + choose(mut r, b.len - from)
+    if n > MAX_INPUT - b.len {
+        n = MAX_INPUT - b.len
+    }
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, b, from, n)
+}
+
+fn mutate_swap(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len < 2 {
+        return copy b
+    }
+    let a = choose(mut r, b.len - 1)
+    let c = a + 1 + choose(mut r, b.len - a - 1)
+    var max_len = c - a
+    if max_len > b.len - c {
+        max_len = b.len - c
+    }
+    if max_len == 0 {
+        return copy b
+    }
+    let n = 1 + choose(mut r, max_len)
+    var out = copy b
+    var i = 0
+    while i < n {
+        out[a + i] = b[c + i]
+        out[c + i] = b[a + i]
+        i += 1
+    }
+    out
+}
+
+fn mutate_truncate(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let n = choose(mut r, b.len + 1)
+    if n == b.len {
+        return copy b
+    }
+    b[0..n]
+}
+
+fn mutate_splice(mut r: Run, b: List[byte], corpus: List[List[byte]]) -> List[byte] {
+    let which = choose(mut r, corpus.len)
+    let at = choose(mut r, b.len + 1)
+    let other = copy corpus[which]
+    if other.len == 0 {
+        return copy b
+    }
+    let from = choose(mut r, other.len + 1)
+    var n = other.len - from
+    if n != 0 {
+        n = 1 + choose(mut r, n)
+    }
+    insert_at(b, at, other, from, n)
+}
+
+fn mutate_split_utf8(mut r: Run, b: List[byte]) -> List[byte] {
+    let start = choose(mut r, b.len + 1)
+    var i = 0
+    while i < b.len {
+        let at = (start + i) % b.len
+        let x = b[at] as int
+        var tails = 0
+        if x >= 194 && x <= 223 {
+            tails = 1
+        } else if x >= 224 && x <= 239 {
+            tails = 2
+        } else if x >= 240 && x <= 244 {
+            tails = 3
+        }
+        if tails != 0 && at + 1 < b.len {
+            var cut = 1 + choose(mut r, tails)
+            if cut > b.len - at - 1 {
+                cut = b.len - at - 1
+            }
+            return delete_at(b, at + 1, cut)
+        }
+        i += 1
+    }
+    mutate_flip(mut r, b)
+}
+
+fn lead(i: int) -> int {
+    match i {
+        0 => 128,
+        1 => 192,
+        2 => 194,
+        3 => 224,
+        4 => 225,
+        5 => 237,
+        6 => 240,
+        7 => 241,
+        8 => 244,
+        9 => 245,
+        _ => 255,
+    }
+}
+
+fn mutate_lead_class(mut r: Run, b: List[byte]) -> List[byte] {
+    let x = lead(choose(mut r, 11))
+    if b.len == 0 {
+        return insert_at(b, 0, one(x), 0, 1)
+    }
+    let at = choose(mut r, b.len)
+    var out = copy b
+    out[at] = x as byte
+    out
+}
+
+fn mutate_continuation(mut r: Run, b: List[byte]) -> List[byte] {
+    let x = 128 | choose(mut r, 64)
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, one(x), 0, 1)
+}
+
+fn mutate_surrogate(mut r: Run, b: List[byte]) -> List[byte] {
+    var s = List[byte]()
+    (mut s).push(237 as byte)
+    (mut s).push(160 as byte)
+    (mut s).push(128 as byte)
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, s, 0, 3)
+}
+
+fn op_name(op: int) -> str {
+    match op {
+        0 => "byte-flip",
+        1 => "chunk-delete",
+        2 => "chunk-duplicate",
+        3 => "chunk-swap",
+        4 => "truncate",
+        5 => "corpus-splice",
+        6 => "utf8-split",
+        7 => "lead-class",
+        8 => "lone-continuation",
+        _ => "surrogate-inject",
+    }
+}
+
+// `mutate` (`fuzzlib.c:895-913`): ten mutators (no dictionary).
+fn mutate(mut r: Run, b: List[byte], corpus: List[List[byte]]) -> (List[byte], int) {
+    let op = choose(mut r, 10)
+    let out = match op {
+        0 => mutate_flip(mut r, b),
+        1 => mutate_delete(mut r, b),
+        2 => mutate_duplicate(mut r, b),
+        3 => mutate_swap(mut r, b),
+        4 => mutate_truncate(mut r, b),
+        5 => mutate_splice(mut r, b, corpus),
+        6 => mutate_split_utf8(mut r, b),
+        7 => mutate_lead_class(mut r, b),
+        8 => mutate_continuation(mut r, b),
+        _ => mutate_surrogate(mut r, b),
+    }
+    (out, op)
+}
+
+// `hash_bytes` (`fuzzlib.c:915-930`): FNV-1a (C seeds it with
+// 1469598103934665603, `fuzzlib.c:1711`) over the length's eight
+// bytes, low first, then the input.
+fn hash_bytes(mut r: Run, b: List[byte]) {
+    let prime: wrapping[u64] = 1099511628211
+    var h = r.hash
+    var len = u(b.len)
+    var i = 0
+    while i < 8 {
+        h = (h ^ len & 255) * prime
+        len = len >> 8
+        i += 1
+    }
+    for x in b {
+        h = (h ^ u(x as int)) * prime
+    }
+    r.hash = h
+}
+
+fn bytes_of(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+    out
+}
+
+fn from_ints(xs: List[int]) -> List[byte] {
+    var out = List[byte]()
+    for x in xs {
+        (mut out).push(x as byte)
+    }
+    out
+}
+
+// `add_builtin_corpus` (`fuzzlib.c:1590-1606`), sorted by name as
+// `corpus_sort` leaves it: ascii, empty, grapheme, invalid, valid.
+fn builtin_corpus() -> List[List[byte]] {
+    var c = List[List[byte]]()
+    (mut c).push(bytes_of("yew\n"))
+    (mut c).push(List[byte]())
+    (mut c).push(from_ints([101, 204, 129, 240, 159, 135, 166, 240, 159, 135, 186]))
+    (mut c).push(from_ints([128, 192, 128, 237, 160, 128, 255]))
+    (mut c).push(from_ints([226, 130, 172, 240, 159, 145, 141]))
+    c
+}
+
+fn corpus_name(i: int) -> str {
+    match i {
+        0 => "builtin/ascii",
+        1 => "builtin/empty",
+        2 => "builtin/grapheme",
+        3 => "builtin/invalid",
+        _ => "builtin/valid",
+    }
+}
+
+// `check_failure_token` (`fuzz_cmdparse.c:12-29`): "" when it holds.
+fn check_one(mut ed: edit.Ed, data: List[byte]) -> str {
+    let r = edit.cmd_parse(mut ed, data)
+    if edit.cmd_parse_ok(r) {
+        return ""
+    }
+    let lo = r.err.tok_lo
+    let hi = r.err.tok_hi
+    if data.len == 0 {
+        if lo == 0 && hi == 0 {
+            return ""
+        }
+    } else if lo < hi && hi <= data.len {
+        return ""
+    }
+    "failure token [{lo},{hi}) is outside input length {data.len}"
+}
+
+// `check_cmdparse` (`fuzz_cmdparse.c:45-78`).
+fn check(mut ed: edit.Ed, data: List[byte]) -> str {
+    let why = check_one(mut ed, data)
+    if why.len != 0 {
+        return why
+    }
+    var shaped = bytes_of("file.write ")
+    for x in data {
+        (mut shaped).push(x)
+    }
+    check_one(mut ed, shaped)
+}
+
+fn hex_of(b: List[byte]) -> str {
+    let digits = "0123456789abcdef"
+    var out = List[byte]()
+    for x in b {
+        (mut out).push(digits.bytes()[x as int >> 4])
+        (mut out).push(digits.bytes()[x as int & 15])
+    }
+    str_from_utf8(out) else ""
+}
+
+fn digit_of(b: int, radix: int) -> int {
+    var d = -1
+    if b >= 48 && b <= 57 {
+        d = b - 48
+    } else if b >= 97 && b <= 102 {
+        d = b - 87
+    } else if b >= 65 && b <= 70 {
+        d = b - 55
+    }
+    if d >= radix {
+        return -1
+    }
+    d
+}
+
+// `strtoull(text, &end, 0)` with C's checks (`parse_u64_option`).
+fn parse_u64(s: str) -> (bool, wrapping[u64]) {
+    var v = u(0)
+    var bs = List[int]()
+    for b in s.bytes() {
+        (mut bs).push(b as int)
+    }
+    if bs.len == 0 || bs[0] == 45 {
+        return (false, v)
+    }
+    var i = 0
+    if bs[0] == 43 {
+        i = 1
+    }
+    var radix = 10
+    if i + 1 < bs.len && bs[i] == 48 && (bs[i + 1] == 120 || bs[i + 1] == 88) {
+        if i + 2 >= bs.len || digit_of(bs[i + 2], 16) < 0 {
+            return (false, v)
+        }
+        radix = 16
+        i += 2
+    } else if i < bs.len && bs[i] == 48 {
+        radix = 8
+    }
+    if i >= bs.len {
+        return (false, v)
+    }
+    let max: wrapping[u64] = 18446744073709551615
+    while i < bs.len {
+        let d = digit_of(bs[i], radix)
+        if d < 0 {
+            return (false, v)
+        }
+        if v > (max - u(d)) / u(radix) {
+            return (false, v)
+        }
+        v = v * u(radix) + u(d)
+        i += 1
+    }
+    (true, v)
+}
+
+fn usage() -> int {
+    eprint("usage: fuzz-cmdparse [--seed=N] [--iters=N]")
+    2
+}
+
+fn main() -> int {
+    var seed = u(1)
+    var iters = 200000
+    for a in env_args() {
+        if a.starts_with("--seed=") {
+            let (ok, v) = parse_u64(a[7..])
+            if !ok {
+                return usage()
+            }
+            seed = v
+        } else if a.starts_with("--iters=") {
+            let (ok, v) = parse_u64(a[8..])
+            if !ok || v > u(1000000000000) {
+                return usage()
+            }
+            iters = v as int
+        } else {
+            return usage()
+        }
+    }
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let corpus = builtin_corpus()
+    var state = seed
+    if seed == u(0) {
+        state = 11400714819323198485
+    }
+    var hash: wrapping[u64] = 1469598103934665603
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > EPOCH then EPOCH else iters - done
+        region epoch {
+            var r = Run { state: state, hash: hash }
+            var ed = edit.ed_new()
+            var k = 0
+            while k < n {
+                let which = choose(mut r, corpus.len)
+                var input = copy corpus[which]
+                let mutations = 1 + choose(mut r, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, o) = mutate(mut r, input, corpus)
+                    input = next
+                    op = o
+                    m += 1
+                }
+                hash_bytes(mut r, input)
+                let why = check(mut ed, input)
+                if why.len != 0 {
+                    print(
+                        "fuzz_cmdparse: FAIL seed={seed} iter={done + k} corpus={corpus_name(which)} op={op_name(op)}: {why}",
+                    )
+                    print("fuzz_cmdparse: input={hex_of(input)}")
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = r.state
+            hash = r.hash
+        }
+        done += n
+    }
+    if failed {
+        return 1
+    }
+    print("fuzz_cmdparse: seed={seed} iters={iters} corpus={corpus.len} hash={text.hex16(hash)} ok")
+    0
+}
