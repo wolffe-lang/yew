@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# run-perf-cmdcomp — the per-keystroke completion gate, the port beside C.
+#
+#   tools/run-perf-cmdcomp [--cpus 0-3] [--trials N]
+#
+# Runs sagitta's own perf_cmdcomp (built here into the oracle tree from
+# its Makefile if tools/oracle has not: `build/perf_cmdcomp`, with C's
+# runtime as `make perf-cmdcomp` sets it) and the port's twin
+# (tools/perf-cmdcomp/main.lu, release tier, staged beside the port's
+# modules — D32) over a 10,000-entry fixture of C's names, both pinned to
+# the CPUs given (the track's rule on kasumi: 0-3), C first, the port,
+# C again, and prints one ratio line: for each key that does path work
+# (C's per-key max >= 0.1 ms), the port's per-key MEAN over its trials
+# against C's per-key MAX over its 11 (the two C runs averaged), the
+# worst key and the sum:
+#
+#   perf-cmdcomp: C p99_ms=… | per key …: 10:1.42 11:0.95 … | worst key
+#     17 2.00 | sum A/B ms = R
+#
+# A mean against a max is a LOWER bound on the like-for-like ratio: C's
+# harness prints no per-key mean, and the port's millisecond clock (G8)
+# gives dithered means, never a per-sample max. The port's key is the
+# engine and the menu — tools/perf-cmdcomp/main.lu says what that leaves
+# out; read the ratio with both caveats. Exit 0 but on a harness fault
+# (2): the ratios are a FINDING for the note.
+set -eu
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export YEW_ROOT
+cd "$YEW_ROOT"
+. tools/lib-toolchain.sh
+
+cpus=0-3
+trials=400
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --cpus) cpus=$2; shift 2 ;;
+    --trials) trials=$2; shift 2 ;;
+    *) echo "run-perf-cmdcomp: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+
+oracle=$YEW_ROOT/target/oracle/sagitta
+[ -d "$oracle" ] || { echo "run-perf-cmdcomp: no oracle tree (tools/oracle)" >&2; exit 2; }
+build=$(readlink "$oracle/build" || echo build-gcc)
+cc=gcc
+case "$build" in build-clang) cc=clang ;; esac
+if [ ! -x "$oracle/$build/perf_cmdcomp" ]; then
+    make -C "$oracle" --no-print-directory CC="$cc" BUILD="$build" "$build/perf_cmdcomp" >/dev/null
+fi
+
+stage=$YEW_ROOT/target/perf-cmdcomp
+rm -rf "$stage"
+mkdir -p "$stage"
+cp tools/perf-cmdcomp/main.lu "$stage/main.lu"
+for m in util unicode term text ws edit; do
+    cp -R "src/$m" "$stage/$m"
+    rm -f "$stage/$m"/*_test.lu
+done
+"$WOLF" build --release --deny-warnings "$stage/main.lu" -o "$stage/perf-cmdcomp"
+
+fixture=$(mktemp -d /tmp/yew-perf-cmdcomp-XXXXXX)
+trap 'rm -rf "$fixture"' EXIT
+i=0
+while [ $i -lt 10000 ]; do
+    : > "$fixture/$(printf 'entry%05d' $i)"
+    i=$((i + 1))
+done
+
+runc() {
+    (cd "$oracle" && YEW_RUNTIME_DIR="$oracle/runtime" taskset -c "$cpus" "$build/perf_cmdcomp")
+}
+c1=$(runc | grep '^perf-cmdcomp: ')
+port=$(cd "$YEW_ROOT" && YEW_LOG=/dev/null taskset -c "$cpus" "$stage/perf-cmdcomp" "$fixture" --trials "$trials")
+c2=$(runc | grep '^perf-cmdcomp: ')
+echo "$c1" | sed 's/^/C (first): /'
+echo "$port"
+echo "$c2" | sed 's/^/C (again): /'
+python3 -I - "$c1" "$c2" "$port" <<'PY'
+import re, sys
+c1, c2, port = sys.argv[1], sys.argv[2], sys.argv[3]
+def per_key(text, key):
+    m = re.search(key + r'=([0-9.,]+)', text)
+    return [float(x) for x in m.group(1).split(',')] if m else []
+def num(text, key):
+    m = re.search(key + r'=([0-9.]+)', text)
+    return float(m.group(1)) if m else 0.0
+cm = [(a + b) / 2 for a, b in zip(per_key(c1, 'per_key_max_ms'), per_key(c2, 'per_key_max_ms'))]
+pm = per_key(port, 'per_key_mean_ms')
+# The keys that do path work (C's per-key max >= 0.1 ms); the command
+# keys cost microseconds, below the port's millisecond clock's reach.
+keys = [i for i in range(len(cm)) if cm[i] >= 0.1]
+ratios = ["%d:%.2f" % (i, pm[i] / cm[i]) for i in keys]
+worst = max(keys, key=lambda i: pm[i] / cm[i])
+print("perf-cmdcomp: C p99_ms=%.3f (two runs, mean) | per key, port MEAN over its trials / C MAX over C's 11 (a lower bound on a like-for-like ratio): %s | worst key %d %.2f | sum %.3f/%.3f ms = %.2f"
+      % ((num(c1, 'p99_ms') + num(c2, 'p99_ms')) / 2, " ".join(ratios), worst, pm[worst] / cm[worst],
+         sum(pm[i] for i in keys), sum(cm[i] for i in keys), sum(pm[i] for i in keys) / sum(cm[i] for i in keys)))
+PY

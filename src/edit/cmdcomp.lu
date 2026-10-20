@@ -577,16 +577,32 @@ pub fn comp_key(
     record: bool,
     mut pos: List[int],
 ) -> int {
-    var score = ws.FZ_NO_MATCH
-    if record {
-        var m = ws.fzmatch_none()
-        score = ws.fz_score_m(stem, s0, s1, name, m0, m1, mut m)
-        for p in m.pos {
-            (mut pos).push(p)
-        }
-    } else {
-        score = ws.fz_score(stem, s0, s1, name, m0, m1)
+    if !record {
+        return comp_key_score(stem, s0, s1, name, m0, m1)
     }
+    var m = ws.fzmatch_none()
+    let score = ws.fz_score_m(stem, s0, s1, name, m0, m1, mut m)
+    for p in m.pos {
+        (mut pos).push(p)
+    }
+    comp_tier(score)
+}
+
+/// `comp_key` without positions, allocation-free: the per-entry key the
+/// path scan ranks 10,000 names with.
+pub fn comp_key_score(
+    stem: List[byte],
+    s0: int,
+    s1: int,
+    name: List[byte],
+    m0: int,
+    m1: int,
+) -> int {
+    comp_tier(ws.fz_score(stem, s0, s1, name, m0, m1))
+}
+
+// The basename tier (`comp_key`'s second half, `cmdcomp.c:101-108`).
+fn comp_tier(score: int) -> int {
     if score == ws.FZ_NO_MATCH {
         return ws.FZ_NO_MATCH
     }
@@ -683,44 +699,55 @@ fn candidate_less(a: Candidate, b: Candidate) -> bool {
     comp_bytes_cmp(a.text, 0, a.text.len, b.text, 0, b.text.len) < 0
 }
 
+// A stable merge over INDICES, then one copy per row: a candidate owns
+// three lists, and merging the rows themselves copied each ~log n times.
 fn sort_candidates(mut xs: List[Candidate]) {
     let n = xs.len
     if n < 2 {
         return
     }
-    var src = copy xs
+    var src = List[int]()
+    var i = 0
+    while i < n {
+        (mut src).push(i)
+        i += 1
+    }
     var width = 1
     while width < n {
-        var dst = List[Candidate]()
+        var dst = List[int]()
         var lo = 0
         while lo < n {
             let mid = if lo + width < n then lo + width else n
             let hi = if lo + 2 * width < n then lo + 2 * width else n
-            var i = lo
-            var j = mid
-            while i < mid && j < hi {
-                if candidate_less(src[j], src[i]) {
-                    (mut dst).push(copy src[j])
-                    j += 1
+            var a = lo
+            var b = mid
+            while a < mid && b < hi {
+                if candidate_less(xs[src[b]], xs[src[a]]) {
+                    (mut dst).push(src[b])
+                    b += 1
                 } else {
-                    (mut dst).push(copy src[i])
-                    i += 1
+                    (mut dst).push(src[a])
+                    a += 1
                 }
             }
-            while i < mid {
-                (mut dst).push(copy src[i])
-                i += 1
+            while a < mid {
+                (mut dst).push(src[a])
+                a += 1
             }
-            while j < hi {
-                (mut dst).push(copy src[j])
-                j += 1
+            while b < hi {
+                (mut dst).push(src[b])
+                b += 1
             }
             lo = hi
         }
         src = dst
         width *= 2
     }
-    xs = src
+    var out = List[Candidate]()
+    for k in src {
+        (mut out).push(copy xs[k])
+    }
+    xs = out
 }
 
 // `candidate_add` (`cmdcomp.c:154-182`): the candidate when it matches.
@@ -752,7 +779,7 @@ fn candidate_add(
 
 // `candidate_finish` (`cmdcomp.c:184-223`): sorted, capped at COMP_MAX,
 // a path's text quoted; answers the pre-cap total.
-fn candidate_finish(kind: int, mut matches: List[Candidate], mut out: List[CompItem]) -> int {
+fn candidate_finish(kind: int, mut matches: List[Candidate]) -> (List[CompItem], int) {
     let total = matches.len
     sort_candidates(mut matches)
     var items = List[CompItem]()
@@ -776,46 +803,67 @@ fn candidate_finish(kind: int, mut matches: List[Candidate], mut out: List[CompI
         })
         i += 1
     }
-    out = items
-    total
+    (items, total)
 }
 
 // ------------------------------------------------------------------
 // The command, plugin, buffer, option and value sources
+//
+// Each source's ranking is a PURE function whose candidates die at its
+// `copy region` (`rank_paths` says why); only the ranked items survive.
 // ------------------------------------------------------------------
 
 // `enumerate_commands` (`cmdcomp.c:225-256`): every live `ed.` command not
 // INTERNAL, by its name without `ed.` and by its abbreviation.
 fn enumerate_commands(ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    var matches = List[Candidate]()
-    var i = 0
-    while i < ed.reg.entries.len {
-        if !ed.reg.entries[i].active {
+    let (items, total) = command_rows(ed, req)
+    out = items
+    total
+}
+
+fn command_rows(ed: Ed, req: CompReq) -> (List[CompItem], int) {
+    copy region rows {
+        var matches = List[Candidate]()
+        var i = 0
+        while i < ed.reg.entries.len {
+            if !ed.reg.entries[i].active {
+                i += 1
+                continue
+            }
+            let name_s = ed.reg.entries[i].name
+            let flags = ed.reg.entries[i].flags
+            if !name_s.starts_with("ed.") || flags & CMD_INTERNAL != 0 {
+                i += 1
+                continue
+            }
+            let name = bytes_of(name_s[3..])
+            let deferred = flags & CMD_DEFERRED != 0
+            let _ = candidate_add(
+                mut matches,
+                req.stem,
+                name,
+                name,
+                ed.reg.entries[i].help,
+                false,
+                deferred,
+            )
+            if ed.reg.entries[i].has_abbrev && ed.reg.entries[i].abbrev != name_s[3..] {
+                let ab = bytes_of(ed.reg.entries[i].abbrev)
+                let _ = candidate_add(mut matches, req.stem, ab, ab, name_s[3..], false, deferred)
+            }
             i += 1
-            continue
         }
-        let e = copy ed.reg.entries[i]
-        if !e.name.starts_with("ed.") || e.flags & CMD_INTERNAL != 0 {
-            i += 1
-            continue
-        }
-        let name = bytes_of(e.name[3..])
-        let deferred = e.flags & CMD_DEFERRED != 0
-        let _ = candidate_add(mut matches, req.stem, name, name, e.help, false, deferred)
-        if e.has_abbrev && e.abbrev != e.name[3..] {
-            let ab = bytes_of(e.abbrev)
-            let _ = candidate_add(mut matches, req.stem, ab, ab, e.name[3..], false, deferred)
-        }
-        i += 1
+        candidate_finish(COMP_CMD, mut matches)
     }
-    candidate_finish(COMP_CMD, mut matches, mut out)
 }
 
 // `enumerate_plugins` (`cmdcomp.c:258-281`): the winners' names. The
 // plugin system is Sprint 54's (yw14): none is ever loaded before it.
 fn enumerate_plugins(mut out: List[CompItem]) -> int {
     var matches = List[Candidate]()
-    candidate_finish(COMP_PLUGIN, mut matches, mut out)
+    let (items, total) = candidate_finish(COMP_PLUGIN, mut matches)
+    out = items
+    total
 }
 
 /// Is `ed.bufs[i]` a workspace buffer (C's `ed->ws.bufs`)? The prompt's
@@ -844,24 +892,32 @@ fn comp_buffer_name(b: Buffer) -> str {
 // `enumerate_buffers` (`cmdcomp.c:293-312`): each buffer by its name and
 // by its 1-based number.
 fn enumerate_buffers(ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    var matches = List[Candidate]()
-    var n = 0
-    var i = 0
-    while i < ed.bufs.len {
-        if !comp_ws_buffer(ed, i) {
+    let (items, total) = buffers_rows(ed, req)
+    out = items
+    total
+}
+
+fn buffers_rows(ed: Ed, req: CompReq) -> (List[CompItem], int) {
+    copy region rows {
+        var matches = List[Candidate]()
+        var n = 0
+        var i = 0
+        while i < ed.bufs.len {
+            if !comp_ws_buffer(ed, i) {
+                i += 1
+                continue
+            }
+            let name = comp_buffer_name(ed.bufs[i])
+            let path = if ed.bufs[i].has_path then ed.bufs[i].path else ""
+            let nb = bytes_of(name)
+            let _ = candidate_add(mut matches, req.stem, nb, nb, path, false, false)
+            n += 1
+            let number = bytes_of("{n}")
+            let _ = candidate_add(mut matches, req.stem, number, number, name, false, false)
             i += 1
-            continue
         }
-        let name = comp_buffer_name(ed.bufs[i])
-        let path = if ed.bufs[i].has_path then ed.bufs[i].path else ""
-        let nb = bytes_of(name)
-        let _ = candidate_add(mut matches, req.stem, nb, nb, path, false, false)
-        n += 1
-        let number = bytes_of("{n}")
-        let _ = candidate_add(mut matches, req.stem, number, number, name, false, false)
-        i += 1
+        candidate_finish(COMP_BUFFER, mut matches)
     }
-    candidate_finish(COMP_BUFFER, mut matches, mut out)
 }
 
 // `yew_opts[]`'s names and help, in C's order (`src/edit/option.c:213-
@@ -947,26 +1003,42 @@ ai.backoff_max_ms\x1fMaximum AI backend cooldown in milliseconds
 
 // `enumerate_options` (`cmdcomp.c:1648-1669`).
 fn enumerate_options(req: CompReq, mut out: List[CompItem]) -> int {
-    var matches = List[Candidate]()
-    for row in OPT_ROWS.lines() {
-        if row.len == 0 {
-            continue
+    let (items, total) = options_rows(req)
+    out = items
+    total
+}
+
+fn options_rows(req: CompReq) -> (List[CompItem], int) {
+    copy region rows {
+        var matches = List[Candidate]()
+        for row in OPT_ROWS.lines() {
+            if row.len == 0 {
+                continue
+            }
+            let cut = row.find("\x1f") else 0
+            let name = bytes_of(row[0..cut])
+            let _ = candidate_add(mut matches, req.stem, name, name, row[cut + 1..], false, false)
         }
-        let cut = row.find("\x1f") else 0
-        let name = bytes_of(row[0..cut])
-        let _ = candidate_add(mut matches, req.stem, name, name, row[cut + 1..], false, false)
+        candidate_finish(COMP_OPTION, mut matches)
     }
-    candidate_finish(COMP_OPTION, mut matches, mut out)
 }
 
 // `enumerate_option_values` (`cmdcomp.c:1671-1684`).
 fn enumerate_option_values(req: CompReq, mut out: List[CompItem]) -> int {
-    var matches = List[Candidate]()
-    for v in "false true off abs rel both gcol gcol_ccol yank all unnamed".words() {
-        let b = bytes_of(v)
-        let _ = candidate_add(mut matches, req.stem, b, b, "option value", false, false)
+    let (items, total) = option_values_rows(req)
+    out = items
+    total
+}
+
+fn option_values_rows(req: CompReq) -> (List[CompItem], int) {
+    copy region rows {
+        var matches = List[Candidate]()
+        for v in "false true off abs rel both gcol gcol_ccol yank all unnamed".words() {
+            let b = bytes_of(v)
+            let _ = candidate_add(mut matches, req.stem, b, b, "option value", false, false)
+        }
+        candidate_finish(COMP_VALUE, mut matches)
     }
-    candidate_finish(COMP_VALUE, mut matches, mut out)
 }
 
 // ------------------------------------------------------------------
@@ -1238,6 +1310,23 @@ struct PathCand {
     row: int,
     len: int,
     score: int,
+    key: int,
+    key2: int,
+}
+
+// Seven name bytes from `from` packed big-endian (0-padded), so two names
+// of one length compare as integers before any byte loop — the first
+// fourteen bytes in two keys: C's `strcmp` is the order
+// (`path_candidate_cmp`), and the port's nested-list byte walk was 41% of
+// a keystroke's profile without them.
+fn name_key(row: List[byte], from: int) -> int {
+    var k = 0
+    var i = from
+    while i < from + 7 {
+        k = k * 256 + (if i < row.len then row[i] as int else 0)
+        i += 1
+    }
+    k
 }
 
 // `path_candidate_cmp` (`cmdcomp.c:437-455`).
@@ -1248,7 +1337,16 @@ fn path_cmp(rows: List[List[byte]], a: PathCand, b: PathCand) -> int {
     if a.len != b.len {
         return if a.len < b.len then -1 else 1
     }
-    comp_bytes_cmp(rows[a.row], 1, rows[a.row].len, rows[b.row], 1, rows[b.row].len)
+    if a.key != b.key {
+        return if a.key < b.key then -1 else 1
+    }
+    if a.key2 != b.key2 {
+        return if a.key2 < b.key2 then -1 else 1
+    }
+    if a.len <= 14 {
+        return 0
+    }
+    comp_bytes_cmp(rows[a.row], 15, rows[a.row].len, rows[b.row], 15, rows[b.row].len)
 }
 
 // `path_heap_push` (`cmdcomp.c:475-499`): a worst-first heap.
@@ -1308,8 +1406,7 @@ fn path_rank_one(
     if rlen > 1 && rows[ri][1] as int == 46 && (t0 >= tail.len || tail[t0] as int != 46) {
         return
     }
-    var none = List[int]()
-    let score = comp_key(tail, t0, tail.len, rows[ri], 1, rlen, false, mut none)
+    let score = comp_key_score(tail, t0, tail.len, rows[ri], 1, rlen)
     if score == ws.FZ_NO_MATCH {
         return
     }
@@ -1317,7 +1414,13 @@ fn path_rank_one(
         return
     }
     total += 1
-    let c = PathCand { row: ri, len: rlen - 1, score: score }
+    let c = PathCand {
+        row: ri,
+        len: rlen - 1,
+        score: score,
+        key: name_key(rows[ri], 1),
+        key2: name_key(rows[ri], 8),
+    }
     if heap.len >= COMP_MAX && path_cmp(rows, c, heap[0]) >= 0 {
         return
     }
@@ -1460,8 +1563,6 @@ pub fn comp_enumerate_paths(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -
     if !req.allow_cache {
         comp_listing_invalidate(mut ed)
     }
-    var heap = List[PathCand]()
-    var total = 0
     var cached = false
     if req.allow_cache {
         let limit = comp_list_limit(ed)
@@ -1480,30 +1581,18 @@ pub fn comp_enumerate_paths(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -
     }
     let force = ed.comp.force_dtype_unknown
     if cached {
-        for ri in ed.comp.listing.idx {
-            path_rank_one(
-                mut heap,
-                ed.comp.listing.rows,
-                ri,
-                req.stem,
-                head_len,
-                mut total,
-                scan_dir,
-                req,
-                force,
-            )
-        }
-        path_candidates_finish(
-            mut heap,
+        let (items, total, lstats) = rank_paths(
             ed.comp.listing.rows,
-            scan_dir,
+            ed.comp.listing.idx,
+            false,
+            req,
             head,
-            req.stem,
             head_len,
+            scan_dir,
             force,
-            mut ed.comp.lstat_calls,
-            mut out,
         )
+        ed.comp.lstat_calls += lstats
+        out = items
         return total
     }
     ed.comp.opendirs += 1
@@ -1511,23 +1600,78 @@ pub fn comp_enumerate_paths(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -
         out = List[CompItem]()
         return 0
     }
-    var ri = 0
-    while ri < rows.len {
-        path_rank_one(mut heap, rows, ri, req.stem, head_len, mut total, scan_dir, req, force)
-        ri += 1
-    }
-    path_candidates_finish(
-        mut heap,
-        rows,
-        scan_dir,
-        head,
-        req.stem,
-        head_len,
-        force,
-        mut ed.comp.lstat_calls,
-        mut out,
-    )
+    let none = List[int]()
+    let (items, total, lstats) = rank_paths(rows, none, true, req, head, head_len, scan_dir, force)
+    ed.comp.lstat_calls += lstats
+    out = items
     total
+}
+
+// The ranking proper (`enumerate_paths`' loop and finish), a PURE function
+// whose scratch — the heap, the merges, the per-row bytes — dies at the
+// `copy region` (`[mem.region.copyout]`): a session-long editor keeps a
+// keystroke's temporaries otherwise (G33; notes/yw04-evidence/witness/
+// region-copyout). `all` ranks every row, else the rows `idx` names.
+// Answers the items, the pre-cap total and the lstats it paid.
+fn rank_paths(
+    rows: List[List[byte]],
+    idx: List[int],
+    all: bool,
+    req: CompReq,
+    head: List[byte],
+    head_len: int,
+    scan_dir: str,
+    force: bool,
+) -> (List[CompItem], int, int) {
+    copy region rank {
+        var heap = List[PathCand]()
+        var total = 0
+        if all {
+            var ri = 0
+            while ri < rows.len {
+                path_rank_one(
+                    mut heap,
+                    rows,
+                    ri,
+                    req.stem,
+                    head_len,
+                    mut total,
+                    scan_dir,
+                    req,
+                    force,
+                )
+                ri += 1
+            }
+        } else {
+            for ri in idx {
+                path_rank_one(
+                    mut heap,
+                    rows,
+                    ri,
+                    req.stem,
+                    head_len,
+                    mut total,
+                    scan_dir,
+                    req,
+                    force,
+                )
+            }
+        }
+        var lstats = 0
+        var items = List[CompItem]()
+        path_candidates_finish(
+            mut heap,
+            rows,
+            scan_dir,
+            head,
+            req.stem,
+            head_len,
+            force,
+            mut lstats,
+            mut items,
+        )
+        (items, total, lstats)
+    }
 }
 
 // ------------------------------------------------------------------
@@ -1754,39 +1898,48 @@ pub fn comp_sort_items(mut xs: List[CompItem]) {
     if n < 2 {
         return
     }
-    var src = copy xs
+    var src = List[int]()
+    var i = 0
+    while i < n {
+        (mut src).push(i)
+        i += 1
+    }
     var width = 1
     while width < n {
-        var dst = List[CompItem]()
+        var dst = List[int]()
         var lo = 0
         while lo < n {
             let mid = if lo + width < n then lo + width else n
             let hi = if lo + 2 * width < n then lo + 2 * width else n
-            var i = lo
-            var j = mid
-            while i < mid && j < hi {
-                if item_less(src[j], src[i]) {
-                    (mut dst).push(copy src[j])
-                    j += 1
+            var a = lo
+            var b = mid
+            while a < mid && b < hi {
+                if item_less(xs[src[b]], xs[src[a]]) {
+                    (mut dst).push(src[b])
+                    b += 1
                 } else {
-                    (mut dst).push(copy src[i])
-                    i += 1
+                    (mut dst).push(src[a])
+                    a += 1
                 }
             }
-            while i < mid {
-                (mut dst).push(copy src[i])
-                i += 1
+            while a < mid {
+                (mut dst).push(src[a])
+                a += 1
             }
-            while j < hi {
-                (mut dst).push(copy src[j])
-                j += 1
+            while b < hi {
+                (mut dst).push(src[b])
+                b += 1
             }
             lo = hi
         }
         src = dst
         width *= 2
     }
-    xs = src
+    var out = List[CompItem]()
+    for k in src {
+        (mut out).push(copy xs[k])
+    }
+    xs = out
 }
 
 fn fold_byte(b: int) -> int {
@@ -1845,7 +1998,15 @@ pub fn comp_shell_prefix_rule(mut out: List[CompItem], pat: List[byte], p0: int)
 
 // `filter_rerank` (`cmdcomp.c:3496-3532`): the cached set re-scored
 // against `pattern = stem[p0..]`.
-fn filter_rerank(f: CompFilter, stem: List[byte], p0: int, mut out: List[CompItem]) -> int {
+// A pure function whose scratch dies at the `copy region` (`rank_paths`
+// says why).
+fn filter_rerank(f: CompFilter, stem: List[byte], p0: int) -> List[CompItem] {
+    copy region rerank {
+        filter_rerank_in(f, stem, p0)
+    }
+}
+
+fn filter_rerank_in(f: CompFilter, stem: List[byte], p0: int) -> List[CompItem] {
     var items = List[CompItem]()
     for base in f.base {
         var pos = List[int]()
@@ -1875,8 +2036,7 @@ fn filter_rerank(f: CompFilter, stem: List[byte], p0: int, mut out: List[CompIte
     if f.kind == COMP_SHELL || f.kind == COMP_USER {
         comp_users_underscore_last(mut items)
     }
-    out = items
-    out.len
+    items
 }
 
 // `filter_reusable` (`cmdcomp.c:3592-3613`): appending can only shrink a
@@ -1958,7 +2118,8 @@ pub fn comp_filter_run(
         f.valid = true
     }
     f.gen_pending = f.has_gen_key && comp_shell_awaiting(ed, f.gen_key)
-    let matched = filter_rerank(f, q.stem, head_len, mut out)
+    out = filter_rerank(f, q.stem, head_len)
+    let matched = out.len
     if reuse || f.kind == COMP_SHELL && !f.capped {
         return matched
     }
@@ -2062,6 +2223,40 @@ pub fn comp_query_point(
         q.has_shell = true
     }
     (true, q)
+}
+
+/// `yew_comp_query_at` (`cmdcomp.c:3760-3791`) over a tolerant parse
+/// point of `line` at `cursor` (`edit.cmd_parse_point`'s): §9's hint and
+/// §4's filter read ONE parse per keystroke. The point's shell context —
+/// whether the caret's word completes nothing (§3 row 1) — is the shell
+/// half's (`comp_shell_point_none`).
+pub fn comp_query_at(mut ed: Ed, point: CmdParsePoint, line: List[byte], cursor: int) -> (
+    bool,
+    CompQuery,
+) {
+    let shell_none = point.bang_body && comp_shell_point_none(mut ed, point, line, cursor)
+    comp_query_point(
+        ed,
+        point.bang_body,
+        point.token_index,
+        point.command_known,
+        point.command,
+        point.stem,
+        point.token.lo,
+        point.token.hi,
+        shell_none,
+        line,
+        cursor,
+    )
+}
+
+/// `yew_comp_query` (`cmdcomp.c:3793-3802`): the tolerant parse of `line`
+/// at `cursor`, then its query.
+pub fn comp_query(mut ed: Ed, line: List[byte], cursor: int) -> (bool, CompQuery) {
+    let point = cmd_parse_point(mut ed, line, cursor) else {
+        return (false, compquery_new(COMP_CMD, List[byte](), 0, 0))
+    }
+    comp_query_at(mut ed, point, line, cursor)
 }
 
 /// `yew_comp_lcp` (`cmdcomp.c:3804-3826`): the texts' longest common
