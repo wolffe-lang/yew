@@ -1,0 +1,661 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_clipboard.c` (1023 lines), one
+//! test per C test in registry order (`tests/unit/registry.c:242-256`).
+//! The fake tool is the oracle's own build of `tests/unit/fakeclip.c`
+//! (`target/oracle/sagitta/build/fakeclip`, made by `tools/oracle`); the
+//! fixture directory is under `target/tests/`. The environment is the
+//! process's (`env_set`/`env_unset`, C's `setenv`/`unsetenv`), saved and
+//! restored per test as C's `ClipEnv`; the log capture is a `YEW_LOG`
+//! scratch file.
+//!
+//! The subprocess writer and reader are a gap at wolf 0.2.33
+//! (`src/text/clipboard.lu`'s header): every case or half-case that
+//! spawns a tool is SKIPPED LOUDLY by name on both streams, and four
+//! re-executed children (`--gap N`) prove that reaching each spawn is the
+//! named hard error (exit 4), never a silent fallback; those children
+//! skip loudly on the checked machine, where `os_exe()` is `wolf`.
+
+use std.env as std_env
+use std.fs
+use std.process
+use term
+use text
+
+const WRITER_GAP: str = "the subprocess clipboard writer is not ported at wolf 0.2.33 (no non-blocking pipe write, no fork): yw02 [reg] gap"
+
+const READER_GAP: str = "the subprocess clipboard reader is not ported at wolf 0.2.33 (no timed wait on a pipe; os_signal_wait_fds is 0.2.34): yw02 [reg] gap"
+
+const NO_FAKE: str = "target/oracle/sagitta/build/fakeclip is missing: run tools/oracle first"
+
+const LOG_PATH: str = "target/tests/text-clipboard-test.log"
+
+struct Saved {
+    name: str,
+    value: str,
+    had: bool,
+}
+
+struct Fixture {
+    dir: str,
+    fake: str,
+    output: str,
+    input: str,
+    pidlog: str,
+}
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn save(name: str) -> Saved {
+    let v = env_get(name) else {
+        return Saved { name: name, value: "", had: false }
+    }
+    Saved { name: name, value: v, had: true }
+}
+
+fn save_all(names: List[str]) -> List[Saved] {
+    var out = List[Saved]()
+    for n in names {
+        (mut out).push(save(n))
+    }
+    out
+}
+
+// `clip_env_restore` over the saved list, newest first.
+fn restore_all(saved: List[Saved]) {
+    var i = saved.len
+    while i != 0 {
+        i -= 1
+        let s = copy saved[i]
+        if s.had {
+            env_set(s.name, s.value) else |_| {}
+        } else {
+            env_unset(s.name) else |_| {}
+        }
+    }
+}
+
+fn set(name: str, value: str) {
+    env_set(name, value) else |_| {
+        assert(false, "setenv {name}")
+    }
+}
+
+fn unset(name: str) {
+    env_unset(name) else |_| {
+        assert(false, "unsetenv {name}")
+    }
+}
+
+// `clip_clear_environment`, `test_clipboard.c:56-64`.
+fn clear_environment() {
+    unset("YEW_CLIPBOARD")
+    unset("YEW_OSC52")
+    unset("WAYLAND_DISPLAY")
+    unset("DISPLAY")
+    unset("SSH_TTY")
+    unset("SSH_CONNECTION")
+}
+
+fn fake_path() -> str {
+    let cwd = std_env.cwd() else "."
+    "{cwd}/target/oracle/sagitta/build/fakeclip"
+}
+
+// `clip_fixture_init`, `test_clipboard.c:67-103`: an empty directory and
+// the fake tool's absolute path.
+fn fixture() -> Fixture {
+    let cwd = std_env.cwd() else "."
+    let dir = "{cwd}/target/tests/yew-clip-{std_env.pid()}"
+    fs.remove_dir_all(dir) else |_| {}
+    fs.create_dir_all(dir) else |_| {
+        assert(false, "fixture dir {dir}")
+    }
+    Fixture {
+        dir: dir,
+        fake: fake_path(),
+        output: "{dir}/out.bin",
+        input: "{dir}/in.bin",
+        pidlog: "{dir}/pids.txt",
+    }
+}
+
+fn fixture_free(f: Fixture) {
+    fs.remove_dir_all(f.dir) else |_| {
+        assert(false, "fixture rmdir {f.dir}")
+    }
+}
+
+fn link(f: Fixture, name: str) {
+    fs.symlink(f.fake, "{f.dir}/{name}") else |_| {
+        assert(false, "symlink {name}")
+    }
+}
+
+fn unlink(f: Fixture, name: str) {
+    fs.remove("{f.dir}/{name}") else |_| {
+        assert(false, "unlink {name}")
+    }
+}
+
+fn value(bytes: List[byte]) -> text.RegVal {
+    var v = text.regval_new()
+    v.kind = text.REG_CHARWISE
+    v.bytes = copy bytes
+    v
+}
+
+fn renderer() -> term.Render {
+    term.render_new(term.caps_new(), term.env_process())
+}
+
+fn capture_log() {
+    fs.remove(LOG_PATH) else |_| {}
+}
+
+fn warned(needle: str) -> bool {
+    let log = fs.read_text(LOG_PATH) else ""
+    for line in log.lines() {
+        if line.contains(" warn: ") && line.contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn skip(what: str, why: str) {
+    print("clipboard_test: SKIP {what}: {why}")
+    eprint("clipboard_test: SKIP {what}: {why}")
+}
+
+// `clip_set_custom`, `test_clipboard.c:232-249`.
+fn set_custom(f: Fixture, write_mode: str, with_read: bool) {
+    if with_read {
+        set(
+            "YEW_CLIPBOARD",
+            "cmd:{f.fake} {f.output} {write_mode} alpha beta|{f.fake} {f.input} read",
+        )
+    } else {
+        set("YEW_CLIPBOARD", "cmd:{f.fake} {f.output} {write_mode}")
+    }
+}
+
+fn self_reexecutes() -> bool {
+    let exe = os_exe() else {
+        return false
+    }
+    var c = process.command(exe)
+    process.push_arg(mut c, "--self-check")
+    let sink = fs.open_append("/dev/null") else |_| {
+        return false
+    }
+    process.set_stderr(mut c, sink)
+    process.set_stdout(mut c, sink)
+    let child = process.start(c) else |_| {
+        return false
+    }
+    let status = process.wait_status(take child) else -1
+    fs.close(take sink) else |_| {}
+    status == 7
+}
+
+// The gap children: each reaches one subprocess spawn and must exit 4.
+fn gap_scenario(n: int) {
+    var c = text.clip_new()
+    var r = renderer()
+    var out = List[byte]()
+    if n == 0 || n == 2 {
+        text.clip_reset(mut c)
+        let _ = text.clip_write(mut c, value(bytes_of("fallback")), '+' as int)
+        text.clip_after_render(mut c, mut r, mut out, time_now_ms())
+    } else if n == 1 {
+        text.clip_reset(mut c)
+        var got = text.regval_new()
+        let _ = text.clip_read(mut c, mut got, '+' as int)
+    } else {
+        var regs = text.reg_new()
+        regs.clipboard_sync = text.CLIP_SYNC_UNNAMED
+        let tb = text.textbuf_from_str("a")
+        let undo = text.undo_new(tb)
+        var ec = text.editctx_new(take tb)
+        ec.cset = text.cset_init(text.cursor_at(text.byteoff(0)))
+        ec.has_cset = true
+        ec.undo = undo
+        ec.has_undo = true
+        ec.win_id = 7
+        let _ = text.reg_paste(mut regs, mut ec, '"' as int, true, 8)
+    }
+    os_exit(0)
+}
+
+fn gap_child(n: int, err_path: str) -> int {
+    let exe = os_exe() else {
+        return -1
+    }
+    var c = process.command(exe)
+    process.push_arg(mut c, "--gap")
+    process.push_arg(mut c, "{n}")
+    fs.write_text(err_path, "") else |_| {
+        return -1
+    }
+    let err = fs.open_append(err_path) else |_| {
+        return -1
+    }
+    let sink = fs.open_append("/dev/null") else |_| {
+        return -1
+    }
+    process.set_stderr(mut c, err)
+    process.set_stdout(mut c, sink)
+    let child = process.start(c) else |_| {
+        return -1
+    }
+    let status = process.wait_status(take child) else -1
+    fs.close(take err) else |_| {}
+    fs.close(take sink) else |_| {}
+    status
+}
+
+// One gap witness: the child exits 4 and its stderr names the gap.
+fn gap_witness(n: int, f: Fixture, what: str, needle: str) {
+    if !self_reexecutes() {
+        skip(
+            "{what}'s gap witness",
+            "os_exe() does not re-run this test here (the checked machine)",
+        )
+        return
+    }
+    let err_path = "{f.dir}/gap-{n}.err"
+    assert(gap_child(n, err_path) == 4, "{what}: reaching the spawn exits 4")
+    let err = fs.read_text(err_path) else ""
+    assert(
+        err.contains("not yet ported") && err.contains(needle),
+        "{what}: the error names the gap",
+    )
+    print("clipboard_test: {what}: the spawn is the named gap (exit 4)")
+}
+
+fn clipboard_detection_matrix() {
+    if !fs.exists(fake_path()) {
+        skip("clipboard_detection_matrix", NO_FAKE)
+        return
+    }
+    let saved = save_all(
+        [
+            "YEW_CLIPBOARD",
+            "YEW_OSC52",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+            "SSH_TTY",
+            "SSH_CONNECTION",
+            "PATH",
+        ],
+    )
+    let f = fixture()
+    clear_environment()
+    set("YEW_OSC52", "off")
+    set("PATH", f.dir)
+    var c = text.clip_new()
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_NONE, "nothing on PATH")
+    link(f, "wl-copy")
+    set("WAYLAND_DISPLAY", "wayland-1")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_WL, "wayland")
+    unset("WAYLAND_DISPLAY")
+    link(f, "xclip")
+    set("DISPLAY", ":1")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_XCLIP, "xclip")
+    link(f, "xsel")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_XCLIP, "xclip before xsel")
+    unlink(f, "xclip")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_XSEL, "xsel")
+    set("WAYLAND_DISPLAY", "wayland-1")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_WL, "wayland before X")
+    unlink(f, "wl-copy")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_XSEL, "xsel without wl-copy")
+    set("SSH_TTY", "/dev/pts/9")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_NONE, "remote writes are OSC 52 only")
+    assert(text.clip_detect_read(mut c) == text.CLIP_XSEL, "remote reads stay local")
+    unset("SSH_TTY")
+    set("SSH_CONNECTION", "1 2 3 4")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_NONE, "SSH_CONNECTION is remote")
+    assert(text.clip_detect_read(mut c) == text.CLIP_XSEL, "reads stay local")
+    unset("SSH_CONNECTION")
+    unset("DISPLAY")
+    text.clip_reset(mut c)
+    assert(text.clip_detect_read(mut c) == text.CLIP_NONE, "no display, no reader")
+    set("YEW_CLIPBOARD", "auto")
+    text.clip_reset(mut c)
+    assert(text.clip_detect(mut c) == text.CLIP_NONE, "auto writes")
+    assert(text.clip_detect_read(mut c) == text.CLIP_NONE, "auto reads")
+    text.clip_shutdown(mut c)
+    unlink(f, "xsel")
+    fixture_free(f)
+    restore_all(saved)
+}
+
+fn clipboard_override_matrix() {
+    let values = [
+        "none",
+        "osc52",
+        "wl",
+        "xclip",
+        "xsel",
+        "pb",
+        "cmd:/bin/false",
+        "cmd:/bin/false|/bin/false",
+    ]
+    let writes = [
+        text.CLIP_NONE,
+        text.CLIP_OSC52,
+        text.CLIP_WL,
+        text.CLIP_XCLIP,
+        text.CLIP_XSEL,
+        text.CLIP_PB,
+        text.CLIP_CUSTOM,
+        text.CLIP_CUSTOM,
+    ]
+    let reads = [
+        text.CLIP_NONE,
+        text.CLIP_NONE,
+        text.CLIP_WL,
+        text.CLIP_XCLIP,
+        text.CLIP_XSEL,
+        text.CLIP_PB,
+        text.CLIP_NONE,
+        text.CLIP_CUSTOM,
+    ]
+    let saved = save_all(["YEW_CLIPBOARD"])
+    var c = text.clip_new()
+    var i = 0
+    while i < values.len {
+        set("YEW_CLIPBOARD", values[i])
+        text.clip_reset(mut c)
+        assert(text.clip_detect(mut c) == writes[i], "{values[i]} writes")
+        assert(text.clip_detect_read(mut c) == reads[i], "{values[i]} reads")
+        i += 1
+    }
+    text.clip_shutdown(mut c)
+    restore_all(saved)
+}
+
+fn clipboard_write_defers_backend_detection() {
+    let saved = save_all(["YEW_CLIPBOARD"])
+    set("YEW_CLIPBOARD", "none")
+    var c = text.clip_new()
+    text.clip_reset(mut c)
+    var r = renderer()
+    var terminal = List[byte]()
+    capture_log()
+    assert(text.clip_write(mut c, value(bytes_of("queued")), '+' as int), "queued")
+    assert(text.clip_pending(c), "pending")
+    assert(!warned("no writable"), "nothing detected yet")
+    text.clip_after_render(mut c, mut r, mut terminal, time_now_ms())
+    assert(!text.clip_pending(c), "drained")
+    assert(warned("no writable"), "detected at the render")
+    text.clip_shutdown(mut c)
+    restore_all(saved)
+}
+
+fn clipboard_custom_write_coalesces_binary() {
+    skip("clipboard_custom_write_coalesces_binary", WRITER_GAP)
+    if !fs.exists(fake_path()) {
+        skip("clipboard_custom_write_coalesces_binary's gap witness", NO_FAKE)
+        return
+    }
+    let saved = save_all(["YEW_CLIPBOARD"])
+    let f = fixture()
+    set_custom(f, "write", true)
+    gap_witness(0, f, "clipboard_custom_write_coalesces_binary", "clipboard writer")
+    fixture_free(f)
+    restore_all(saved)
+}
+
+fn clipboard_custom_read_binary_and_cap() {
+    skip("clipboard_custom_read_binary_and_cap", READER_GAP)
+    if !fs.exists(fake_path()) {
+        skip("clipboard_custom_read_binary_and_cap's gap witness", NO_FAKE)
+        return
+    }
+    let saved = save_all(["YEW_CLIPBOARD"])
+    let f = fixture()
+    set_custom(f, "write", true)
+    gap_witness(1, f, "clipboard_custom_read_binary_and_cap", "clipboard reader")
+    fixture_free(f)
+    restore_all(saved)
+}
+
+fn clipboard_reader_reaped_before_pipe_eof() {
+    skip("clipboard_reader_reaped_before_pipe_eof", READER_GAP)
+}
+
+fn clipboard_read_failures_are_reported() {
+    let saved = save_all(["YEW_CLIPBOARD", "YEW_CLIPBOARD_TIMEOUT_MS"])
+    var keep = List[byte]()
+    (mut keep).push('k' as int as byte)
+    (mut keep).push(0 as byte)
+    (mut keep).push('p' as int as byte)
+    var out = value(keep)
+    set("YEW_CLIPBOARD", "none")
+    var c = text.clip_new()
+    text.clip_reset(mut c)
+    capture_log()
+    assert(!text.clip_read(mut c, mut out, '+' as int), "no reader")
+    assert(warned("no readable"), "reported")
+    assert(same(out.bytes, keep), "out untouched")
+    skip("clipboard_read_failures_are_reported's exit-17 and timeout halves", READER_GAP)
+    text.clip_shutdown(mut c)
+    restore_all(saved)
+}
+
+fn clipboard_osc52_flushes_after_esu() {
+    let saved = save_all(["YEW_CLIPBOARD", "YEW_OSC52"])
+    let prefix = "frame\x1b[?2026l"
+    let suffix = "\x1b]52;c;Zm9v\x1b\\"
+    set("YEW_CLIPBOARD", "osc52")
+    set("YEW_OSC52", "plain")
+    var c = text.clip_new()
+    text.clip_reset(mut c)
+    var r = renderer()
+    term.render_oob_clear(mut r)
+    var terminal = bytes_of(prefix)
+    assert(text.clip_write(mut c, value(bytes_of("foo")), '+' as int), "queued")
+    text.clip_after_render(mut c, mut r, mut terminal, time_now_ms())
+    assert(term.render_oob_pending(r) == 0, "the queue is flushed")
+    assert(terminal.len == prefix.len + suffix.len, "frame then OSC 52, {terminal.len} bytes")
+    assert(same(terminal[0..prefix.len], bytes_of(prefix)), "the frame first")
+    assert(same(terminal[prefix.len..terminal.len], bytes_of(suffix)), "the OSC 52 after the ESU")
+    term.render_oob_clear(mut r)
+    text.clip_shutdown(mut c)
+    restore_all(saved)
+}
+
+fn clipboard_nonexit_100_writes_are_nonblocking() {
+    skip("clipboard_nonexit_100_writes_are_nonblocking", WRITER_GAP)
+}
+
+fn clipboard_epipe_demotes_failed_backend() {
+    skip("clipboard_epipe_demotes_failed_backend", WRITER_GAP)
+}
+
+fn clipboard_exec_failure_demotes_small_write() {
+    skip("clipboard_exec_failure_demotes_small_write", WRITER_GAP)
+}
+
+fn clipboard_osc52_over_limit_falls_back_to_subprocess() {
+    if !fs.exists(fake_path()) {
+        skip("clipboard_osc52_over_limit_falls_back_to_subprocess", NO_FAKE)
+        return
+    }
+    let saved = save_all(
+        [
+            "YEW_CLIPBOARD",
+            "YEW_OSC52",
+            "YEW_OSC52_MAX",
+            "YEW_FAKECLIP_OUTPUT",
+            "WAYLAND_DISPLAY",
+            "SSH_TTY",
+            "SSH_CONNECTION",
+            "PATH",
+        ],
+    )
+    let f = fixture()
+    link(f, "wl-copy")
+    unset("SSH_TTY")
+    unset("SSH_CONNECTION")
+    set("YEW_CLIPBOARD", "osc52")
+    set("YEW_OSC52", "plain")
+    set("YEW_OSC52_MAX", "1")
+    set("YEW_FAKECLIP_OUTPUT", f.output)
+    set("WAYLAND_DISPLAY", "wayland-1")
+    set("PATH", f.dir)
+    skip("clipboard_osc52_over_limit_falls_back_to_subprocess's local fallback half", WRITER_GAP)
+    gap_witness(2, f, "clipboard_osc52_over_limit_falls_back_to_subprocess", "clipboard writer")
+    set("SSH_TTY", "/dev/pts/9")
+    var c = text.clip_new()
+    text.clip_reset(mut c)
+    var r = renderer()
+    var terminal = List[byte]()
+    assert(text.clip_write(mut c, value(bytes_of("fallback")), '+' as int), "queued")
+    text.clip_after_render(mut c, mut r, mut terminal, time_now_ms())
+    assert(!text.clip_busy(c), "no writer over SSH")
+    assert(!fs.exists(f.output), "nothing written")
+    text.clip_shutdown(mut c)
+    unlink(f, "wl-copy")
+    fixture_free(f)
+    restore_all(saved)
+}
+
+fn clipboard_sync_default_yank_not_delete() {
+    if !fs.exists(fake_path()) {
+        skip("clipboard_sync_default_yank_not_delete", NO_FAKE)
+        return
+    }
+    let saved = save_all(["YEW_CLIPBOARD"])
+    let f = fixture()
+    set_custom(f, "write", false)
+    var regs = text.reg_new()
+    text.clip_reset(mut regs.clip)
+    let v = value(bytes_of("sync"))
+    assert(regs.clipboard_sync == text.CLIP_SYNC_YANK, "sync yank")
+    text.reg_delete(mut regs, 0, v)
+    assert(!text.clip_pending(regs.clip), "a delete is not synced")
+    assert(regs.system.bytes.len == 0, "+ untouched")
+    text.reg_yank(mut regs, 0, v)
+    assert(text.clip_pending(regs.clip), "a yank is")
+    assert(regs.system.bytes.len == 4, "+ holds it")
+    skip("clipboard_sync_default_yank_not_delete's delivery half", WRITER_GAP)
+    text.clip_shutdown(mut regs.clip)
+    fixture_free(f)
+    restore_all(saved)
+}
+
+fn clipboard_sync_modes_route_only_documented_writes() {
+    if !fs.exists(fake_path()) {
+        skip("clipboard_sync_modes_route_only_documented_writes", NO_FAKE)
+        return
+    }
+    let saved = save_all(["YEW_CLIPBOARD"])
+    let f = fixture()
+    set_custom(f, "write", false)
+    var regs = text.reg_new()
+    text.clip_reset(mut regs.clip)
+    let v = value(bytes_of("modes"))
+    regs.clipboard_sync = text.CLIP_SYNC_OFF
+    text.reg_yank(mut regs, 0, v)
+    assert(!text.clip_pending(regs.clip), "off: a yank stays")
+    text.reg_yank(mut regs, '+' as int, v)
+    assert(text.clip_pending(regs.clip), "off: + still reaches it")
+    text.clip_reset(mut regs.clip)
+    regs.clipboard_sync = text.CLIP_SYNC_YANK
+    text.reg_delete(mut regs, 0, v)
+    assert(!text.clip_pending(regs.clip), "yank: a delete stays")
+    text.reg_yank(mut regs, 0, v)
+    assert(text.clip_pending(regs.clip), "yank: a yank goes")
+    text.clip_reset(mut regs.clip)
+    regs.clipboard_sync = text.CLIP_SYNC_ALL
+    text.reg_delete(mut regs, 0, v)
+    assert(text.clip_pending(regs.clip), "all: a delete goes")
+    text.clip_reset(mut regs.clip)
+    regs.clipboard_sync = text.CLIP_SYNC_UNNAMED
+    text.reg_delete(mut regs, 0, v)
+    assert(text.clip_pending(regs.clip), "unnamed: a delete goes")
+    assert(same(regs.system.bytes, bytes_of("modes")), "+ holds it")
+    text.clip_shutdown(mut regs.clip)
+    fixture_free(f)
+    restore_all(saved)
+}
+
+fn clipboard_unnamed_paste_reads_subprocess() {
+    skip("clipboard_unnamed_paste_reads_subprocess", READER_GAP)
+    if !fs.exists(fake_path()) {
+        skip("clipboard_unnamed_paste_reads_subprocess's gap witness", NO_FAKE)
+        return
+    }
+    let saved = save_all(["YEW_CLIPBOARD"])
+    let f = fixture()
+    set_custom(f, "write", true)
+    gap_witness(3, f, "clipboard_unnamed_paste_reads_subprocess", "clipboard reader")
+    fixture_free(f)
+    restore_all(saved)
+}
+
+fn main() {
+    let args = env_args()
+    if args.len == 1 && args[0] == "--self-check" {
+        os_exit(7)
+    }
+    if args.len == 2 && args[0] == "--gap" {
+        gap_scenario(args[1].to_int() else 0)
+        return
+    }
+    fs.create_dir_all("target/tests") else |_| {}
+    env_set("YEW_LOG", LOG_PATH) else |_| {}
+    env_set("YEW_LOG_LEVEL", "debug") else |_| {}
+    clipboard_detection_matrix()
+    clipboard_override_matrix()
+    clipboard_write_defers_backend_detection()
+    clipboard_custom_write_coalesces_binary()
+    clipboard_custom_read_binary_and_cap()
+    clipboard_reader_reaped_before_pipe_eof()
+    clipboard_read_failures_are_reported()
+    clipboard_osc52_flushes_after_esu()
+    clipboard_nonexit_100_writes_are_nonblocking()
+    clipboard_epipe_demotes_failed_backend()
+    clipboard_exec_failure_demotes_small_write()
+    clipboard_osc52_over_limit_falls_back_to_subprocess()
+    clipboard_sync_default_yank_not_delete()
+    clipboard_sync_modes_route_only_documented_writes()
+    clipboard_unnamed_paste_reads_subprocess()
+    fs.remove(LOG_PATH) else |_| {}
+    print(
+        "clipboard_test: 15 cases ported (5 whole, 3 in part, 7 skipped by name: the subprocess gap)",
+    )
+}
