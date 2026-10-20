@@ -1,0 +1,680 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_undo_serial.c` (832 lines), one
+//! test per C test in registry order (`tests/unit/registry.c:465-478`).
+//! C's fixture holds a buffer, a cursor set (no marks) and an undo tree by
+//! pointer inside an `EditCtx`; the port's `EditCtx` owns them and the
+//! injected clock is the tree's fake clock (`undo.fake_mono`,
+//! `undo.fake_wall`). `serial_dump`'s FILE* is `text.undo_dump`'s str, and
+//! C's `mkfifo(3)` is the `mkfifo` utility (wolf has no fifo call).
+
+use std.process
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn cursor(pos: int, anchor: int, goal: int) -> text.Cursor {
+    text.Cursor { pos: pos, goal_col: goal, anchor: anchor }
+}
+
+// `memset(payload, b, n)`.
+fn filled(b: int, n: int) -> List[byte] {
+    var out = List[byte]()
+    var i = 0
+    while i < n {
+        (mut out).push(b as byte)
+        i += 1
+    }
+    out
+}
+
+fn run_of(c: str, n: int) -> List[byte] {
+    filled(bytes_of(c)[0] as int, n)
+}
+
+fn prefix(bytes: List[byte], n: int) -> List[byte] {
+    var out = List[byte]()
+    var i = 0
+    while i < n {
+        (mut out).push(bytes[i])
+        i += 1
+    }
+    out
+}
+
+// `serial_fixture_init`, `test_undo_serial.c:31-46`.
+fn fixture(bytes: List[byte]) -> text.EditCtx {
+    let tb = text.textbuf_from_bytes(bytes, 0, bytes.len)
+    let undo = text.undo_new(tb)
+    var ec = text.editctx_new(take tb)
+    ec.cset = text.cset_init(cursor(0, 0, 0))
+    ec.has_cset = true
+    ec.undo = undo
+    ec.has_undo = true
+    ec.win_id = 0
+    text.undo_set_clock(mut ec.undo, 1000, 100)
+    ec
+}
+
+// `serial_append`, `test_undo_serial.c:55-63`.
+fn serial_append(mut f: text.EditCtx, bytes: List[byte]) -> int {
+    f.undo.fake_mono += text.UNDO_BURST_MS
+    f.undo.fake_wall += 1
+    text.undo_begin(mut f, text.TXN_PASTE)
+    let _ = text.edit_insert(mut f, text.byteoff(text.textbuf_len(f.tb)), bytes)
+    text.undo_end(mut f)
+    text.undo_current(f.undo)
+}
+
+// `serial_path`, `test_undo_serial.c:65-74`: a fresh name under /tmp,
+// created exclusively and unlinked, as `mkstemp` then `unlink`.
+fn serial_path() -> str {
+    var tries = 0
+    while tries < 100 {
+        var suffix = ""
+        for r in os_random(6) {
+            suffix = suffix + "{r % 10}"
+        }
+        let path = "/tmp/yew-yewu-{suffix}"
+        let fd = fs_open_perm(path, 4, 384) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            denied => { -1 },
+            invalid => { -1 },
+            not_found => { -1 },
+            unsupported => { -1 },
+            io => { -1 },
+        }
+        assert(fd >= 0, "mkstemp {path}")
+        fs_close(fd) else {
+            assert(false, "close {path}")
+        }
+        remove(path)
+        return path
+    }
+    assert(false, "mkstemp exhausted")
+    ""
+}
+
+fn remove(path: str) {
+    fs_remove(path) else {
+        assert(false, "unlink {path}")
+    }
+}
+
+// `serial_read_file`, `test_undo_serial.c:76-88`.
+fn read_file(path: str) -> List[byte] {
+    let b = fs_read_bytes(path) else {
+        assert(false, "read {path}")
+        return List[byte]()
+    }
+    b
+}
+
+// `serial_write_file`, `test_undo_serial.c:90-97`.
+fn write_file(path: str, bytes: List[byte]) {
+    fs_write_bytes(path, bytes) else {
+        assert(false, "write {path}")
+    }
+}
+
+// `serial_u32`, `test_undo_serial.c:136-140`.
+fn u32_at(data: List[byte], at: int) -> int {
+    data[at] as int |
+        data[at + 1] as int << 8 |
+        data[at + 2] as int << 16 |
+        data[at + 3] as int << 24
+}
+
+// `serial_u64`, `test_undo_serial.c:142-145`.
+fn u64_at(data: List[byte], at: int) -> wrapping[u64] {
+    u32_at(data, at) as wrapping[u64] | u32_at(data, at + 4) as wrapping[u64] << 32
+}
+
+// `serial_put_u32`, `test_undo_serial.c:147-153`.
+fn put_u32(mut data: List[byte], at: int, value: int) {
+    data[at] = value as byte
+    data[at + 1] = (value >> 8) as byte
+    data[at + 2] = (value >> 16) as byte
+    data[at + 3] = (value >> 24) as byte
+}
+
+// `serial_put_u64`, `test_undo_serial.c:155-159`.
+fn put_u64(mut data: List[byte], at: int, value: wrapping[u64]) {
+    put_u32(mut data, at, (value & 4294967295) as int)
+    put_u32(mut data, at + 4, (value >> 32) as int)
+}
+
+// `serial_fnv`, `test_undo_serial.c:161-171`: FNV-1a, 64 bits.
+fn fnv(bytes: List[byte]) -> wrapping[u64] {
+    var hash: wrapping[u64] = 14695981039346656037
+    var i = 0
+    while i < bytes.len {
+        hash = hash ^ bytes[i] as int as wrapping[u64]
+        hash = hash * 1099511628211
+        i += 1
+    }
+    hash
+}
+
+// `serial_crc_offsets`, `test_undo_serial.c:173-219`: where each node
+// record's CRC sits, walking the records from the 64-byte header.
+fn crc_offsets(file: List[byte]) -> List[int] {
+    var out = List[int]()
+    var at = 64
+    assert(file.len >= 72, "a header and a trailer")
+    let node_count = u32_at(file, 28)
+    while out.len < node_count {
+        assert(at + 36 <= file.len, "a node record")
+        let n_ops = u32_at(file, at + 32)
+        at += 36
+        var i = 0
+        while i < n_ops {
+            assert(at + 28 <= file.len, "an op record")
+            let payload_len = u64_at(file, at + 20)
+            assert(
+                payload_len <= (9223372036854775807 - at - 28) as wrapping[u64],
+                "payload length",
+            )
+            at += 28 + payload_len as int
+            assert(at + 4 <= file.len, "a repair count")
+            let n_rep = u32_at(file, at)
+            at += 4 + n_rep * 16
+            i += 1
+        }
+        assert(at + 4 <= file.len, "a before-cursor count")
+        let n_before = u32_at(file, at)
+        at += 4 + n_before * 24
+        assert(at + 4 <= file.len, "an after-cursor count")
+        let n_after = u32_at(file, at)
+        at += 4 + n_after * 24
+        assert(at + 4 <= file.len, "a node CRC")
+        (mut out).push(at)
+        at += 4
+    }
+    assert(at + 8 <= file.len, "the trailer")
+    out
+}
+
+// `serial_recrc_node`, `test_undo_serial.c:221-240`: a node's CRC made
+// valid again, and the trailer's xor with it.
+fn recrc_node(mut file: List[byte], node_index: int) {
+    let crc_at = crc_offsets(file)
+    assert(crc_at.len <= 8, "at most eight nodes")
+    assert(node_index < crc_at.len, "the node exists")
+    let record_at = if node_index == 0 then 64 else crc_at[node_index - 1] + 4
+    let old_crc = u32_at(file, crc_at[node_index])
+    let new_crc = text.crc32_of(file, record_at, crc_at[node_index])
+    put_u32(mut file, crc_at[node_index], new_crc)
+    let trailer_xor = u32_at(file, file.len - 8)
+    put_u32(mut file, file.len - 8, trailer_xor ^ old_crc ^ new_crc)
+}
+
+// `serial_try_read`, `test_undo_serial.c:242-253`.
+fn try_read(path: str, content: List[byte]) -> int {
+    var f = fixture(content)
+    let result = text.undo_read(mut f, path)
+    text.textbuf_check(f.tb)
+    result
+}
+
+// `serial_build_500`, `test_undo_serial.c:255-272`.
+fn build_500(mut f: text.EditCtx) {
+    var large = List[byte]()
+    var i = 0
+    while i < 1048576 {
+        (mut large).push((i * 29 + i % 251) as byte)
+        i += 1
+    }
+    large[0] = 0 as byte
+    large[1] = 255 as byte
+    large[2] = 192 as byte
+    let _ = serial_append(mut f, large)
+    i = 1
+    while i < 500 {
+        var one = List[byte]()
+        (mut one).push((i * 37) as byte)
+        let _ = serial_append(mut f, one)
+        i += 1
+    }
+    assert(f.undo.nodes.len == 501, "501 nodes (have {f.undo.nodes.len})")
+}
+
+fn t_undo_serial_roundtrips_500_binary_nodes() {
+    var source = fixture(List[byte]())
+    build_500(mut source)
+    let content = text.textbuf_bytes(source.tb)
+    let before = text.undo_dump(source.undo)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    var loaded = fixture(content)
+    assert(text.undo_read(mut loaded, path) == text.UNDO_READ_CURRENT, "read current")
+    let after = text.undo_dump(loaded.undo)
+    assert(after == before, "the dump survives the round trip")
+    assert(loaded.undo.nodes.len == 501, "501 nodes loaded")
+    assert(loaded.undo.cur == source.undo.cur, "the same current node")
+    remove(path)
+}
+
+fn t_undo_serial_rejects_each_corrupt_node_crc() {
+    var source = fixture(List[byte]())
+    build_500(mut source)
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    var file = read_file(path)
+    let crc_at = crc_offsets(file)
+    assert(crc_at.len == 501, "501 node CRCs (have {crc_at.len})")
+    var i = 0
+    while i < crc_at.len {
+        let saved = file[crc_at[i]]
+        file[crc_at[i]] = (saved as int ^ 128) as byte
+        write_file(path, file)
+        assert(try_read(path, content) == text.UNDO_READ_DROPPED, "node {i}'s CRC flipped drops")
+        file[crc_at[i]] = saved
+        i += 1
+    }
+    remove(path)
+}
+
+fn t_undo_serial_rejects_every_64_byte_truncation() {
+    var source = fixture(List[byte]())
+    var payload = bytes_of("truncate")
+    (mut payload).push(0 as byte)
+    (mut payload).push(255 as byte)
+    let _ = serial_append(mut source, payload)
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    let file = read_file(path)
+    var len = 0
+    while len < file.len {
+        write_file(path, prefix(file, len))
+        let result = try_read(path, content)
+        assert(
+            result == text.UNDO_READ_DROPPED || result == text.UNDO_READ_IO,
+            "a {len}-byte prefix drops (read {result})",
+        )
+        len += 64
+    }
+    write_file(path, file)
+    assert(try_read(path, content) == text.UNDO_READ_CURRENT, "the whole file reads")
+    remove(path)
+}
+
+fn t_undo_serial_rejects_unknown_version() {
+    var source = fixture(List[byte]())
+    let _ = serial_append(mut source, bytes_of("version"))
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    var file = read_file(path)
+    assert(same(prefix(file, 4), bytes_of("YEWU")), "the magic")
+    file[4] = 3 as byte
+    file[5] = 0 as byte
+    file[6] = 0 as byte
+    file[7] = 0 as byte
+    write_file(path, file)
+    assert(try_read(path, content) == text.UNDO_READ_DROPPED, "version 3 drops")
+    remove(path)
+}
+
+fn t_undo_serial_reads_v1_and_preserves_version() {
+    let legacy = bytes_of("legacy")
+    let legacy_hash = fnv(legacy)
+    var source = fixture(legacy)
+    text.undo_mark_saved(mut source.undo, source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    var file = read_file(path)
+    put_u32(mut file, 4, 1)
+    put_u64(mut file, 40, legacy_hash)
+    put_u64(mut file, 56, legacy_hash)
+    write_file(path, file)
+
+    var loaded = fixture(legacy)
+    assert(text.undo_read(mut loaded, path) == text.UNDO_READ_CURRENT, "a v1 file reads")
+    assert(loaded.undo.identity_version == 1, "identity version 1")
+    assert(text.undo_write(loaded, path) == text.UNDO_WRITE_OK, "rewrite")
+    let rewritten = read_file(path)
+    assert(u32_at(rewritten, 4) == 1, "still version 1")
+    assert(u64_at(rewritten, 40) == legacy_hash, "the FNV anchor hash")
+    assert(u64_at(rewritten, 56) == legacy_hash, "the FNV current hash")
+    remove(path)
+}
+
+fn t_undo_serial_validates_current_anchor_and_stale_content() {
+    var source = fixture(List[byte]())
+    let _ = serial_append(mut source, bytes_of("saved"))
+    text.undo_mark_saved(mut source.undo, source.tb)
+    let _ = serial_append(mut source, bytes_of("-current"))
+    let current = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    assert(try_read(path, current) == text.UNDO_READ_CURRENT, "the current bytes")
+    assert(try_read(path, bytes_of("saved")) == text.UNDO_READ_ANCHOR, "the anchor bytes")
+    assert(try_read(path, bytes_of("stale")) == text.UNDO_READ_DROPPED, "stale bytes drop")
+    assert(try_read(path, bytes_of("saved!")) == text.UNDO_READ_DROPPED, "longer bytes drop")
+    remove(path)
+}
+
+fn t_undo_serial_rejects_noncanonical_unsaved_anchor_hash() {
+    var source = fixture(List[byte]())
+    let _ = serial_append(mut source, bytes_of("current"))
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    var file = read_file(path)
+    assert(u32_at(file, 20) == 0, "never saved")
+    file[40] = (file[40] as int ^ 8) as byte
+    write_file(path, file)
+    assert(try_read(path, content) == text.UNDO_READ_DROPPED, "a bent anchor hash drops")
+    remove(path)
+}
+
+fn t_undo_serial_persist_budget_does_not_mutate_memory_tree() {
+    var source = fixture(List[byte]())
+    var i = 0
+    while i < 80 {
+        let _ = serial_append(mut source, filled(i, 256))
+        i += 1
+    }
+    let cur = source.undo.cur
+    let nodes = source.undo.nodes.len
+    let gen = source.undo.gen
+    text.undo_set_limits(mut source.undo, text.UNDO_BYTES_MAX, text.UNDO_MIN_NODES, 4096)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    assert(source.undo.cur == cur, "cur unchanged")
+    assert(source.undo.nodes.len == nodes, "nodes unchanged")
+    assert(source.undo.gen == gen, "gen unchanged")
+    let file = read_file(path)
+    assert(file.len <= 4096, "within the persist budget ({file.len})")
+    assert(u32_at(file, 8) & 1 != 0, "flagged truncated")
+    let persisted_root = u32_at(file, 12)
+    let persisted_count = u32_at(file, 28)
+    assert(persisted_count > 1, "more than one node persisted")
+    assert(persisted_root != cur, "the persisted root is not cur")
+    let content = text.textbuf_bytes(source.tb)
+    var loaded = fixture(content)
+    assert(text.undo_read(mut loaded, path) == text.UNDO_READ_CURRENT, "read current")
+    assert(loaded.undo.cur == cur, "loaded cur")
+    assert(loaded.undo.root == persisted_root, "loaded root")
+    let rewrite_path = serial_path()
+    assert(text.undo_write(loaded, rewrite_path) == text.UNDO_WRITE_OK, "rewrite")
+    let rewritten = read_file(rewrite_path)
+    assert(rewritten.len == file.len, "the rewrite's length")
+    assert(same(rewritten, file), "the rewrite's bytes")
+    remove(rewrite_path)
+    assert(text.undo(mut loaded), "undo")
+    assert(text.textbuf_len(loaded.tb) < content.len, "undo shrinks")
+    assert(text.redo(mut loaded), "redo")
+    let restored = text.textbuf_bytes(loaded.tb)
+    assert(restored.len == content.len, "redo restores the length")
+    assert(same(restored, content), "redo restores the bytes")
+    assert(text.undo_to(mut source, persisted_root), "source to the persisted root")
+    let anchor_content = text.textbuf_bytes(source.tb)
+    assert(text.undo_to(mut source, cur), "source back to cur")
+    assert(
+        try_read(path, anchor_content) == text.UNDO_READ_ANCHOR,
+        "the persisted root is the anchor",
+    )
+    remove(path)
+}
+
+fn t_undo_serial_persist_budget_preserves_surviving_branches() {
+    var source = fixture(List[byte]())
+    let root = source.undo.root
+    var payload = run_of("a", 128)
+    var i = 0
+    while i < 4 {
+        let _ = serial_append(mut source, payload)
+        i += 1
+    }
+    assert(text.undo_to(mut source, root), "to root")
+    payload = run_of("b", 128)
+    var branch_b = 0
+    i = 0
+    while i < 4 {
+        branch_b = serial_append(mut source, payload)
+        i += 1
+    }
+    assert(text.undo_to(mut source, root), "to root again")
+    payload = run_of("c", 128)
+    i = 0
+    while i < 4 {
+        let _ = serial_append(mut source, payload)
+        i += 1
+    }
+    let current = source.undo.cur
+    text.undo_set_limits(mut source.undo, text.UNDO_BYTES_MAX, 4, 2300)
+
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    let file = read_file(path)
+    assert(file.len <= 2300, "within the persist budget ({file.len})")
+    assert(u32_at(file, 12) == root, "the root persisted")
+    assert(u32_at(file, 28) == 9, "nine nodes (have {u32_at(file, 28)})")
+
+    var loaded = fixture(content)
+    assert(text.undo_read(mut loaded, path) == text.UNDO_READ_CURRENT, "read current")
+    assert(loaded.undo.cur == current, "loaded cur")
+    assert(text.undo_to(mut loaded, branch_b), "to branch b")
+    let branch = text.textbuf_bytes(loaded.tb)
+    assert(branch.len == 128 * 4, "branch b's length")
+    let b = bytes_of("b")[0]
+    i = 0
+    while i < branch.len {
+        assert(branch[i] == b, "branch b's byte {i}")
+        i += 1
+    }
+    assert(text.undo_to(mut loaded, current), "back to current")
+    remove(path)
+}
+
+fn t_undo_serial_virtual_reroot_preserves_saved_branch() {
+    var source = fixture(List[byte]())
+    var payload = run_of("p", 128)
+    var common = 0
+    var i = 0
+    while i < 8 {
+        common = serial_append(mut source, payload)
+        i += 1
+    }
+    payload = run_of("s", 128)
+    let saved = serial_append(mut source, payload)
+    text.undo_mark_saved(mut source.undo, source.tb)
+    let saved_content = text.textbuf_bytes(source.tb)
+    assert(text.undo_to(mut source, common), "to common")
+    payload = run_of("c", 128)
+    i = 0
+    while i < 4 {
+        let _ = serial_append(mut source, payload)
+        i += 1
+    }
+    let current = source.undo.cur
+    text.undo_set_limits(mut source.undo, text.UNDO_BYTES_MAX, 4, 1500)
+
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    let file = read_file(path)
+    assert(file.len <= 1500, "within the persist budget ({file.len})")
+    assert(u32_at(file, 12) == common, "re-rooted at common (have {u32_at(file, 12)})")
+    assert(u32_at(file, 20) == saved, "the saved node")
+    assert(u32_at(file, 28) == 6, "six nodes (have {u32_at(file, 28)})")
+
+    var loaded = fixture(content)
+    assert(text.undo_read(mut loaded, path) == text.UNDO_READ_CURRENT, "read current")
+    assert(loaded.undo.cur == current, "loaded cur")
+    assert(loaded.undo.saved == saved, "loaded saved")
+    assert(text.undo_to(mut loaded, saved), "to saved")
+    let restored = text.textbuf_bytes(loaded.tb)
+    assert(restored.len == saved_content.len, "the saved length")
+    assert(same(restored, saved_content), "the saved bytes")
+    remove(path)
+}
+
+// FAILS against `src/text/undo.lu` at 7994c22: yew internal error "delete
+// range [-1,6) beyond buffer length 7". `u64_le_at` reads the forged
+// UINT64_MAX offset as -1, and `forward_node_len`/`reverse_node_len`
+// (`undo.lu:2999-3043`) test only `op.off > len`; C's operands are u64
+// (`undo.c:2867-2894`), so the forged offset fails that test there and
+// passes it here, and the unsaved anchor's replay (`undo.lu:3313`) deletes
+// from -1. The fix, in the yw02-userial report: `op.off < 0 ||` ahead of
+// each of the four `op.off > len` tests.
+fn t_undo_serial_rejects_crc_valid_out_of_bounds_op() {
+    var source = fixture(List[byte]())
+    let _ = serial_append(mut source, bytes_of("payload"))
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+    var file = read_file(path)
+    let crc_at = crc_offsets(file)
+    assert(crc_at.len == 2, "two nodes")
+    let child_at = crc_at[0] + 4
+    assert(u32_at(file, child_at + 32) == 1, "one op")
+    let far: wrapping[u64] = 18446744073709551615
+    put_u64(mut file, child_at + 36 + 4, far)
+    recrc_node(mut file, 1)
+    write_file(path, file)
+    assert(try_read(path, content) == text.UNDO_READ_DROPPED, "an out-of-bounds op drops")
+    remove(path)
+}
+
+fn make_fifo(path: str) {
+    var c = process.command("mkfifo")
+    process.push_arg(mut c, "-m")
+    process.push_arg(mut c, "600")
+    process.push_arg(mut c, path)
+    let code = process.run(c) else -1
+    assert(code == 0, "mkfifo {path} (exit {code})")
+}
+
+fn t_undo_serial_rejects_unsafe_and_oversized_inputs() {
+    var source = fixture(List[byte]())
+    let _ = serial_append(mut source, bytes_of("safe"))
+    let content = text.textbuf_bytes(source.tb)
+    let target = serial_path()
+    assert(text.undo_write(source, target) == text.UNDO_WRITE_OK, "write")
+
+    var candidate = serial_path()
+    fs_symlink(target, candidate) else {
+        assert(false, "symlink")
+    }
+    assert(try_read(candidate, content) == text.UNDO_READ_DROPPED, "a symlink drops")
+    remove(candidate)
+
+    candidate = serial_path()
+    make_fifo(candidate)
+    assert(try_read(candidate, content) == text.UNDO_READ_DROPPED, "a fifo drops")
+    remove(candidate)
+
+    candidate = serial_path()
+    let fd = fs_open_perm(candidate, 4, 384) else {
+        assert(false, "create {candidate}")
+        return
+    }
+    fs_truncate(fd, text.UNDO_PERSIST_BYTES_MAX + 1) else {
+        assert(false, "ftruncate")
+    }
+    fs_close(fd) else {
+        assert(false, "close")
+    }
+    assert(try_read(candidate, content) == text.UNDO_READ_DROPPED, "an oversized file drops")
+    remove(candidate)
+
+    remove(target)
+}
+
+fn t_undo_serial_roundtrips_rerooted_tree_depths() {
+    let payload = run_of("r", 1536)
+    var source = fixture(List[byte]())
+    text.undo_set_limits(mut source.undo, 4096, 2, text.UNDO_PERSIST_BYTES_MAX)
+    var i = 0
+    while i < 40 {
+        let _ = serial_append(mut source, payload)
+        i += 1
+    }
+    assert(source.undo.root != 1, "re-rooted")
+    assert(source.undo.nodes[source.undo.root - 1].depth == 0, "the root's depth")
+    let content = text.textbuf_bytes(source.tb)
+    let path = serial_path()
+    assert(text.undo_write(source, path) == text.UNDO_WRITE_OK, "write")
+
+    var loaded = fixture(content)
+    assert(text.undo_read(mut loaded, path) == text.UNDO_READ_CURRENT, "read current")
+    assert(loaded.undo.root == source.undo.root, "the same root")
+    assert(loaded.undo.nodes[loaded.undo.root - 1].depth == 0, "the loaded root's depth")
+    assert(text.undo(mut loaded), "undo")
+    assert(text.redo(mut loaded), "redo")
+    remove(path)
+}
+
+fn t_undo_serial_is_deterministic_for_5000_ops() {
+    var left = fixture(List[byte]())
+    var right = fixture(List[byte]())
+    var i = 0
+    while i < 5000 {
+        var one = List[byte]()
+        (mut one).push((i * 131 + i / 251) as byte)
+        let _ = serial_append(mut left, one)
+        let _ = serial_append(mut right, one)
+        i += 1
+    }
+    let left_dump = text.undo_dump(left.undo)
+    let right_dump = text.undo_dump(right.undo)
+    assert(left_dump == right_dump, "the same dump")
+    let left_path = serial_path()
+    let right_path = serial_path()
+    assert(text.undo_write(left, left_path) == text.UNDO_WRITE_OK, "write left")
+    assert(text.undo_write(right, right_path) == text.UNDO_WRITE_OK, "write right")
+    let left_file = read_file(left_path)
+    let right_file = read_file(right_path)
+    assert(left_file.len == right_file.len, "the same length")
+    assert(same(left_file, right_file), "the same bytes")
+    remove(right_path)
+    remove(left_path)
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    t_undo_serial_roundtrips_500_binary_nodes()
+    t_undo_serial_rejects_each_corrupt_node_crc()
+    t_undo_serial_rejects_every_64_byte_truncation()
+    t_undo_serial_rejects_unknown_version()
+    t_undo_serial_reads_v1_and_preserves_version()
+    t_undo_serial_validates_current_anchor_and_stale_content()
+    t_undo_serial_rejects_noncanonical_unsaved_anchor_hash()
+    t_undo_serial_persist_budget_does_not_mutate_memory_tree()
+    t_undo_serial_persist_budget_preserves_surviving_branches()
+    t_undo_serial_virtual_reroot_preserves_saved_branch()
+    t_undo_serial_rejects_crc_valid_out_of_bounds_op()
+    t_undo_serial_rejects_unsafe_and_oversized_inputs()
+    t_undo_serial_roundtrips_rerooted_tree_depths()
+    t_undo_serial_is_deterministic_for_5000_ops()
+    print("undo_serial_test: 14 cases pass")
+}
