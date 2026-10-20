@@ -10,6 +10,10 @@
 
 use std.env as std_env
 use std.fs
+use std.process
+use std.signal
+use term
+use text
 use unicode
 
 /// Concurrent jobs (`YEW_JOB_MAX`, `job.h:94-96`).
@@ -228,4 +232,262 @@ pub fn job_exec_ok(path: str) -> bool {
 /// `yew_ws_root` (`ed.c:807-810`): the workspace directory, `.` when none.
 pub fn shell_ws_root(ed: Ed) -> str {
     if ed.ws_dir.len == 0 then "." else ed.ws_dir
+}
+
+// ------------------------------------------------------------------
+// The environment a job runs with (§7)
+// ------------------------------------------------------------------
+
+/// `yew_job_env` / `job_build_env` (`job.c:581-695`): the environment a
+/// plain `:!` command runs with — the process environment (the shell
+/// session's exports once there are any: none at 0.2.33, R-yw04-1) less
+/// the rows the job layer owns, then `YEW_FILE`, `YEW_LINE`, `YEW_COL`
+/// (the grapheme column, the number the statusline shows), `YEW_WORKSPACE`
+/// and `YEW_JOB=1`; `PAGER=cat` and `GIT_PAGER=cat` unless the child is
+/// handed the real terminal (57.31 §3: it keeps the user's pagers).
+/// NAME=value rows in C's order.
+pub fn job_env(mut ed: Ed, inherit_tty: bool) -> List[str] {
+    var out = List[str]()
+    for row in std_env.vars() {
+        var skip = false
+        for d in [
+            "COLUMNS=",
+            "LINES=",
+            "YEW_FILE=",
+            "YEW_LINE=",
+            "YEW_COL=",
+            "YEW_WORKSPACE=",
+            "YEW_JOB=",
+            "PAGER=",
+            "GIT_PAGER=",
+        ] {
+            if inherit_tty && (d == "PAGER=" || d == "GIT_PAGER=") {
+                continue
+            }
+            if row.starts_with(d) {
+                skip = true
+                break
+            }
+        }
+        if !skip {
+            (mut out).push(row)
+        }
+    }
+    var path = ""
+    var line = 0
+    var col = 0
+    if ed.win >= 0 && ed.win < ed.wins.len {
+        let b = ed.wins[ed.win].buf
+        if b >= 0 && b < ed.bufs.len {
+            if ed.bufs[b].has_path {
+                path = ed.bufs[b].path
+            }
+            let w = ed.win
+            if ed.wins[w].cs.curs.len != 0 {
+                let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+                let ln = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
+                line = copy ln as int
+                let span = text.textbuf_line_span(ed.bufs[b].ec.tb, ln)
+                col = text.off_to_gcol(mut ed.bufs[b].ec.tb, span, pos as text.ByteOff) as int
+            }
+        }
+    }
+    (mut out).push("YEW_FILE={path}")
+    (mut out).push("YEW_LINE={line + 1}")
+    (mut out).push("YEW_COL={col + 1}")
+    (mut out).push("YEW_WORKSPACE={shell_ws_root(ed)}")
+    (mut out).push("YEW_JOB=1")
+    if !inherit_tty {
+        (mut out).push("PAGER=cat")
+        (mut out).push("GIT_PAGER=cat")
+    }
+    out
+}
+
+/// `YewJobWait` (`job.h:221-226`): how a synchronous child ended.
+pub struct JobWait {
+    state: int,
+    exit_code: int,
+    termsig: int,
+    exec_errno: int,
+}
+
+fn jb_wait_none() -> JobWait {
+    JobWait { state: JOB_RUNNING, exit_code: 0, termsig: 0, exec_errno: 0 }
+}
+
+/// The environment and directory a spawn gives its child, applied to
+/// THIS process around the spawn and put back after it. C builds `envp`
+/// for `execve` and `chdir`s in the forked child (`job.c:870-900`);
+/// wolf 0.2.33's spawn takes neither an environment nor a directory
+/// (G36), and the child inherits both at the spawn, so the core — one
+/// thread, invariant 8 — swaps its own for the instant of the spawn.
+struct JbSaved {
+    env: List[str],
+    cwd: str,
+}
+
+fn jb_apply(rows: List[str], dir: str) -> JbSaved {
+    let saved = JbSaved { env: std_env.vars(), cwd: os_cwd() else "." }
+    for r in saved.env {
+        let k = std_env.entry_key(r)
+        var keep = false
+        for n in rows {
+            if std_env.entry_key(n) == k {
+                keep = true
+                break
+            }
+        }
+        if !keep {
+            std_env.unset(k) else |_| {}
+        }
+    }
+    for n in rows {
+        std_env.set(std_env.entry_key(n), std_env.entry_value(n)) else |_| {}
+    }
+    os_chdir(dir) else |_| {}
+    saved
+}
+
+fn jb_restore(saved: JbSaved) {
+    for r in std_env.vars() {
+        let k = std_env.entry_key(r)
+        var keep = false
+        for n in saved.env {
+            if std_env.entry_key(n) == k {
+                keep = true
+                break
+            }
+        }
+        if !keep {
+            std_env.unset(k) else |_| {}
+        }
+    }
+    for n in saved.env {
+        std_env.set(std_env.entry_key(n), std_env.entry_value(n)) else |_| {}
+    }
+    os_chdir(saved.cwd) else |_| {}
+}
+
+/// The meanings a child's dispositions go back to the default for
+/// (`job_child_reset_signals`, `job.c:795-810`).
+fn jb_child_defaults() -> int {
+    signal.broken_pipe() |
+        signal.interrupt() |
+        signal.terminate() |
+        signal.reload() |
+        signal.quit() |
+        signal.resize() |
+        signal.child() |
+        signal.continued() |
+        signal.suspend() |
+        signal.bg_read() |
+        signal.bg_write()
+}
+
+/// `yew_job_run_sync` (`job.c:902-1077`): one inherited-terminal child
+/// run to completion outside the job table — the handover `:!!` and the
+/// interactive commands take (Sprint 57.18 §4). `argv` the words, or
+/// `cmdline` under `$SHELL -c` when `argv` is empty. The child stays in
+/// the editor's foreground process group with stdin, stdout and stderr
+/// the terminal; the editor ignores interrupt and quit while it runs;
+/// with a terminal (`ed.tty_ready`) the raw mode and the alternate screen
+/// are handed over first and taken back on EVERY path out (invariant 6).
+/// A synchronous wait needs no wait over N descriptors: the editor is not
+/// painting meanwhile. `(ok, wait, error)`: `ok` false is a parent-side
+/// failure; an exec failure is `JOB_EXECFAIL`, never exit 127 (s19 DoD 3).
+pub fn job_run_sync(mut ed: Ed, argv0: List[str], cmdline: str) -> (bool, JobWait, str) {
+    var result = jb_wait_none()
+    var argv = copy argv0
+    if argv.len == 0 {
+        if cmdline.len == 0 {
+            return (false, result, "no command")
+        }
+        (mut argv).push(job_shell())
+        (mut argv).push("-c")
+        (mut argv).push(cmdline)
+    }
+    let envp = job_env(mut ed, true)
+    let dir = shsession_cwd(ed)
+    signal.ignore(signal.interrupt() | signal.quit()) else |_| {
+        return (false, result, "cannot prepare terminal signals")
+    }
+    var handed = false
+    if ed.tty_ready {
+        if !term.tty_handover_begin(mut ed.tty) {
+            jb_signals_back()
+            return (false, result, "cannot hand over terminal")
+        }
+        handed = true
+    }
+    var ok = false
+    var err = ""
+    var c = process.from_argv(argv)
+    process.set_stdin(mut c, fs.stdin())
+    let saved = jb_apply(envp, dir)
+    let started = process.start_job(c, -1, jb_child_defaults())
+    jb_restore(saved)
+    let ch = started else |e| {
+        match e {
+            not_found => {
+                result.state = JOB_EXECFAIL
+                result.exec_errno = 2
+                result.exit_code = 127
+                ok = true
+            },
+            denied => {
+                result.state = JOB_EXECFAIL
+                result.exec_errno = 13
+                result.exit_code = 127
+                ok = true
+            },
+            invalid => { err = "cannot start the child: invalid" },
+            unsupported => { err = "cannot start the child: unsupported" },
+            io => { err = "cannot fork" },
+        }
+        jb_resume(mut ed, handed)
+        jb_signals_back()
+        return (ok, result, err)
+    }
+    let status = process.wait_status(take ch) else |_| {
+        jb_resume(mut ed, handed)
+        jb_signals_back()
+        return (false, result, "cannot wait for child")
+    }
+    if status >= 0 {
+        result.state = JOB_EXITED
+        result.exit_code = status
+    } else {
+        result.state = JOB_SIGNALED
+        result.termsig = 0 - status
+    }
+    let resumed = jb_resume(mut ed, handed)
+    jb_signals_back()
+    if !resumed {
+        return (false, result, "cannot resume terminal")
+    }
+    (true, result, "")
+}
+
+// The resume epilogue every path takes (`job.c:1052-1076`): the terminal
+// back, the input modes and the window size re-read, a full repaint.
+fn jb_resume(mut ed: Ed, handed: bool) -> bool {
+    if !handed {
+        return true
+    }
+    if !term.tty_handover_end(mut ed.tty) {
+        return false
+    }
+    ed_resize(mut ed, true)
+    ed.layout_dirty = true
+    ed.full_damage = true
+    ed.footer_dirty = true
+    true
+}
+
+// Interrupt back to its default and the editor's own set listened again
+// (C restores the saved actions, `job.c:1072-1075`).
+fn jb_signals_back() {
+    signal.reset(signal.interrupt() | signal.quit()) else |_| {}
+    signal.listen(term.tty_signal_set()) else |_| {}
 }
