@@ -1,0 +1,492 @@
+//! edit.fldata — a reader for the literal subset of Fletch the editor's
+//! runtime files are written in, until Fletch itself lands (yw07–yw09).
+//!
+//! C reads `runtime/init.fl` by RUNNING it in the Fletch VM (`fl/
+//! flconf.c`, Sprint 36) and a theme by walking its Fletch AST
+//! (`syn/theme.c:720-778`, `fl_parse_literal`). Both shipped files are
+//! flat: `init.fl` is one `set({...})` of literals and 381 `bind(...)`
+//! calls; a theme is one map literal (and the PTY harness's user
+//! `init.fl` is one `let lsp = {servers: {}}`). This reader takes exactly
+//! that shape — call statements, `let NAME = <literal>`, and literals
+//! (maps with name or string keys,
+//! lists, strings with Fletch's escapes (`fl/lex.c:377-496`), integers,
+//! booleans, `nil`), `#` comments — into a node pool, and refuses
+//! anything else by line and column, so a user's `init.fl` that needs the
+//! VM is a named error, never a silent misread (invariant 3). Ruling
+//! R-yw03-2 asks whether this interim stands until yw09.
+
+/// A map node (`N_MAP`): `keys`/`vals` index the pool pairwise.
+pub const FN_MAP: int = 0
+
+/// A list node: `vals` are its items.
+pub const FN_LIST: int = 1
+
+/// A string node: `text`.
+pub const FN_STR: int = 2
+
+/// An integer node: `num`.
+pub const FN_INT: int = 3
+
+/// A boolean node: `num` 1 or 0.
+pub const FN_BOOL: int = 4
+
+/// `nil`.
+pub const FN_NIL: int = 5
+
+/// A call statement: `text` the callee, `vals` the arguments.
+pub const FN_CALL: int = 6
+
+/// A `let` of a literal: `text` the name, `vals` its one value.
+pub const FN_LET: int = 7
+
+/// One node of a read document.
+pub struct FlNode {
+    kind: int,
+    text: str,
+    num: int,
+    keys: List[int],
+    vals: List[int],
+    line: int,
+    col: int,
+}
+
+/// A read document: the node pool, the top-level statements (calls) or
+/// the one literal, and the first error ("" when none).
+pub struct FlDoc {
+    nodes: List[FlNode],
+    top: List[int],
+    error: str,
+}
+
+struct Rd {
+    src: List[byte],
+    at: int,
+    line: int,
+    col: int,
+    error: str,
+}
+
+fn rd_peek(r: Rd) -> int {
+    if r.at < r.src.len then r.src[r.at] as int else -1
+}
+
+fn rd_peek2(r: Rd) -> int {
+    if r.at + 1 < r.src.len then r.src[r.at + 1] as int else -1
+}
+
+fn rd_bump(mut r: Rd) -> int {
+    let c = r.src[r.at] as int
+    r.at += 1
+    if c == 10 {
+        r.line += 1
+        r.col = 1
+    } else {
+        r.col += 1
+    }
+    c
+}
+
+fn rd_fail(mut r: Rd, what: str) {
+    if r.error.len == 0 {
+        r.error = "{r.line}:{r.col}: {what}"
+    }
+}
+
+// Whitespace, newlines, `;` and `#` comments between tokens.
+fn rd_skip(mut r: Rd) {
+    while r.at < r.src.len {
+        let c = rd_peek(r)
+        if c == 32 || c == 9 || c == 13 || c == 10 || c == 59 {
+            let _ = rd_bump(mut r)
+        } else if c == 35 {
+            while r.at < r.src.len && rd_peek(r) != 10 {
+                let _ = rd_bump(mut r)
+            }
+        } else {
+            return
+        }
+    }
+}
+
+fn is_ident_start(c: int) -> bool {
+    c >= 97 && c <= 122 || c >= 65 && c <= 90 || c == 95
+}
+
+fn is_ident(c: int) -> bool {
+    is_ident_start(c) || c >= 48 && c <= 57
+}
+
+fn hex_val(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    -1
+}
+
+fn new_node(mut doc: FlDoc, kind: int, r: Rd) -> int {
+    (mut doc.nodes).push(FlNode {
+        kind: kind,
+        text: "",
+        num: 0,
+        keys: List[int](),
+        vals: List[int](),
+        line: r.line,
+        col: r.col,
+    })
+    doc.nodes.len - 1
+}
+
+fn read_ident(mut r: Rd) -> str {
+    let start = r.at
+    while r.at < r.src.len && is_ident(rd_peek(r)) {
+        let _ = rd_bump(mut r)
+    }
+    var b = List[byte]()
+    var i = start
+    while i < r.at {
+        (mut b).push(r.src[i])
+        i += 1
+    }
+    str_from_utf8(b) else ""
+}
+
+// `lex_string` (`fl/lex.c:377-496`).
+fn read_string(mut r: Rd) -> str {
+    let _ = rd_bump(mut r)
+    var out = List[byte]()
+    loop {
+        if r.at >= r.src.len {
+            rd_fail(mut r, "unterminated string literal")
+            return ""
+        }
+        let c = rd_peek(r)
+        if c == 34 {
+            let _ = rd_bump(mut r)
+            break
+        }
+        if c == 10 {
+            rd_fail(mut r, "newline in string literal; use '\\n'")
+            return ""
+        }
+        if c != 92 {
+            (mut out).push(rd_bump(mut r) as byte)
+            continue
+        }
+        let _ = rd_bump(mut r)
+        let e = rd_peek(r)
+        if e == 110 {
+            let _ = rd_bump(mut r)
+            (mut out).push(10 as byte)
+        } else if e == 116 {
+            let _ = rd_bump(mut r)
+            (mut out).push(9 as byte)
+        } else if e == 114 {
+            let _ = rd_bump(mut r)
+            (mut out).push(13 as byte)
+        } else if e == 92 || e == 34 {
+            (mut out).push(rd_bump(mut r) as byte)
+        } else if e == 48 {
+            let _ = rd_bump(mut r)
+            (mut out).push(0 as byte)
+        } else if e == 120 {
+            let _ = rd_bump(mut r)
+            var v = 0
+            var k = 0
+            while k < 2 {
+                let h = hex_val(rd_peek(r))
+                if h < 0 {
+                    rd_fail(mut r, "'\\x' needs two hexadecimal digits")
+                    return ""
+                }
+                let _ = rd_bump(mut r)
+                v = v * 16 + h
+                k += 1
+            }
+            (mut out).push(v as byte)
+        } else if e == 117 {
+            let _ = rd_bump(mut r)
+            if rd_peek(r) != 123 {
+                rd_fail(mut r, "'\\u' needs a braced codepoint, as '\\u{{1F600}}'")
+                return ""
+            }
+            let _ = rd_bump(mut r)
+            var v = 0
+            var nd = 0
+            while hex_val(rd_peek(r)) >= 0 && nd < 8 {
+                v = v * 16 + hex_val(rd_bump(mut r))
+                nd += 1
+            }
+            if nd == 0 || rd_peek(r) != 125 || v > 1114111 || v >= 55296 && v <= 57343 {
+                rd_fail(mut r, "'\\u{{...}}' is not a Unicode scalar value")
+                return ""
+            }
+            let _ = rd_bump(mut r)
+            unicode_encode_into(mut out, v)
+        } else {
+            rd_fail(mut r, "unknown escape in string literal")
+            return ""
+        }
+    }
+    str_from_utf8(out) else {
+        rd_fail(mut r, "string literal is not UTF-8")
+        ""
+    }
+}
+
+fn unicode_encode_into(mut out: List[byte], cp: int) {
+    if cp < 128 {
+        (mut out).push(cp as byte)
+    } else if cp < 2048 {
+        (mut out).push((192 + cp / 64) as byte)
+        (mut out).push((128 + cp % 64) as byte)
+    } else if cp < 65536 {
+        (mut out).push((224 + cp / 4096) as byte)
+        (mut out).push((128 + cp / 64 % 64) as byte)
+        (mut out).push((128 + cp % 64) as byte)
+    } else {
+        (mut out).push((240 + cp / 262144) as byte)
+        (mut out).push((128 + cp / 4096 % 64) as byte)
+        (mut out).push((128 + cp / 64 % 64) as byte)
+        (mut out).push((128 + cp % 64) as byte)
+    }
+}
+
+fn read_int(mut r: Rd, negative: bool) -> int {
+    var v = 0
+    var any = false
+    if rd_peek(r) == 48 && (rd_peek2(r) == 120 || rd_peek2(r) == 88) {
+        let _ = rd_bump(mut r)
+        let _ = rd_bump(mut r)
+        while hex_val(rd_peek(r)) >= 0 || rd_peek(r) == 95 {
+            let c = rd_bump(mut r)
+            if c != 95 {
+                v = v * 16 + hex_val(c)
+                any = true
+            }
+        }
+    } else {
+        while rd_peek(r) >= 48 && rd_peek(r) <= 57 || rd_peek(r) == 95 {
+            let c = rd_bump(mut r)
+            if c != 95 {
+                v = v * 10 + c - 48
+                any = true
+            }
+        }
+    }
+    if !any {
+        rd_fail(mut r, "a number needs at least one digit")
+    }
+    if rd_peek(r) == 46 {
+        rd_fail(mut r, "floats are not in the literal subset (Fletch is yw07's)")
+    }
+    if negative then -v else v
+}
+
+fn read_value(mut r: Rd, mut doc: FlDoc) -> int {
+    rd_skip(mut r)
+    let c = rd_peek(r)
+    if c == 123 {
+        let n = new_node(mut doc, FN_MAP, r)
+        let _ = rd_bump(mut r)
+        loop {
+            rd_skip(mut r)
+            if r.error.len != 0 {
+                return n
+            }
+            if rd_peek(r) == 125 {
+                let _ = rd_bump(mut r)
+                return n
+            }
+            let k = new_node(mut doc, FN_STR, r)
+            if rd_peek(r) == 34 {
+                doc.nodes[k].text = read_string(mut r)
+            } else if is_ident_start(rd_peek(r)) {
+                doc.nodes[k].text = read_ident(mut r)
+            } else {
+                rd_fail(mut r, "a map key must be a string or a name")
+                return n
+            }
+            rd_skip(mut r)
+            if rd_peek(r) != 58 {
+                rd_fail(mut r, "expected ':' after a map key")
+                return n
+            }
+            let _ = rd_bump(mut r)
+            let v = read_value(mut r, mut doc)
+            (mut doc.nodes[n].keys).push(k)
+            (mut doc.nodes[n].vals).push(v)
+            rd_skip(mut r)
+            if rd_peek(r) == 44 {
+                let _ = rd_bump(mut r)
+            } else if rd_peek(r) != 125 {
+                rd_fail(mut r, "expected ',' or '}}' in a map")
+                return n
+            }
+        }
+    }
+    if c == 91 {
+        let n = new_node(mut doc, FN_LIST, r)
+        let _ = rd_bump(mut r)
+        loop {
+            rd_skip(mut r)
+            if r.error.len != 0 {
+                return n
+            }
+            if rd_peek(r) == 93 {
+                let _ = rd_bump(mut r)
+                return n
+            }
+            let v = read_value(mut r, mut doc)
+            (mut doc.nodes[n].vals).push(v)
+            rd_skip(mut r)
+            if rd_peek(r) == 44 {
+                let _ = rd_bump(mut r)
+            } else if rd_peek(r) != 93 {
+                rd_fail(mut r, "expected ',' or ']' in a list")
+                return n
+            }
+        }
+    }
+    if c == 34 {
+        let n = new_node(mut doc, FN_STR, r)
+        doc.nodes[n].text = read_string(mut r)
+        return n
+    }
+    if c == 45 || c >= 48 && c <= 57 {
+        let n = new_node(mut doc, FN_INT, r)
+        var negative = false
+        if c == 45 {
+            let _ = rd_bump(mut r)
+            negative = true
+        }
+        doc.nodes[n].num = read_int(mut r, negative)
+        return n
+    }
+    if is_ident_start(c) {
+        let n = new_node(mut doc, FN_NIL, r)
+        let word = read_ident(mut r)
+        if word == "true" || word == "false" {
+            doc.nodes[n].kind = FN_BOOL
+            doc.nodes[n].num = if word == "true" then 1 else 0
+        } else if word != "nil" {
+            rd_fail(mut r, "'{word}' is not a literal (the Fletch VM is yw07's)")
+        }
+        return n
+    }
+    let n = new_node(mut doc, FN_NIL, r)
+    rd_fail(mut r, "expected a literal")
+    n
+}
+
+fn rd_new(src: List[byte]) -> Rd {
+    Rd { src: copy src, at: 0, line: 1, col: 1, error: "" }
+}
+
+fn doc_new() -> FlDoc {
+    FlDoc { nodes: List[FlNode](), top: List[int](), error: "" }
+}
+
+/// Read one literal document (a theme): `top` holds its one value.
+pub fn fl_read_literal(src: List[byte]) -> FlDoc {
+    var r = rd_new(src)
+    var doc = doc_new()
+    let v = read_value(mut r, mut doc)
+    (mut doc.top).push(v)
+    rd_skip(mut r)
+    if r.error.len == 0 && r.at < r.src.len {
+        rd_fail(mut r, "trailing text after the literal")
+    }
+    doc.error = r.error
+    doc
+}
+
+/// Read a program of call statements and `let`s (`init.fl`): `top`
+/// holds them in order.
+pub fn fl_read_calls(src: List[byte]) -> FlDoc {
+    var r = rd_new(src)
+    var doc = doc_new()
+    loop {
+        rd_skip(mut r)
+        if r.error.len != 0 || r.at >= r.src.len {
+            break
+        }
+        if !is_ident_start(rd_peek(r)) {
+            rd_fail(mut r, "expected a call statement (the Fletch VM is yw07's)")
+            break
+        }
+        let n = new_node(mut doc, FN_CALL, r)
+        doc.nodes[n].text = read_ident(mut r)
+        rd_skip(mut r)
+        if doc.nodes[n].text == "let" {
+            doc.nodes[n].kind = FN_LET
+            if !is_ident_start(rd_peek(r)) {
+                rd_fail(mut r, "expected a name after 'let'")
+                break
+            }
+            doc.nodes[n].text = read_ident(mut r)
+            rd_skip(mut r)
+            if rd_peek(r) != 61 || rd_peek2(r) == 61 {
+                rd_fail(mut r, "expected '=' after 'let {doc.nodes[n].text}'")
+                break
+            }
+            let _ = rd_bump(mut r)
+            let v = read_value(mut r, mut doc)
+            (mut doc.nodes[n].vals).push(v)
+            (mut doc.top).push(n)
+            continue
+        }
+        if rd_peek(r) != 40 {
+            rd_fail(mut r, "expected '(' after '{doc.nodes[n].text}' (the Fletch VM is yw07's)")
+            break
+        }
+        let _ = rd_bump(mut r)
+        loop {
+            rd_skip(mut r)
+            if r.error.len != 0 {
+                break
+            }
+            if rd_peek(r) == 41 {
+                let _ = rd_bump(mut r)
+                break
+            }
+            let v = read_value(mut r, mut doc)
+            (mut doc.nodes[n].vals).push(v)
+            rd_skip(mut r)
+            if rd_peek(r) == 44 {
+                let _ = rd_bump(mut r)
+            } else if rd_peek(r) != 41 {
+                rd_fail(mut r, "expected ',' or ')' in a call")
+                break
+            }
+        }
+        (mut doc.top).push(n)
+    }
+    doc.error = r.error
+    doc
+}
+
+/// The value under key `want` of map node `map`, or -1.
+pub fn fl_map_find(doc: FlDoc, map: int, want: str) -> int {
+    if map < 0 || doc.nodes[map].kind != FN_MAP {
+        return -1
+    }
+    var i = 0
+    while i < doc.nodes[map].keys.len {
+        if doc.nodes[doc.nodes[map].keys[i]].text == want {
+            return doc.nodes[map].vals[i]
+        }
+        i += 1
+    }
+    -1
+}
+
+/// The kind of node `n` (-1 for none).
+pub fn fl_kind(doc: FlDoc, n: int) -> int {
+    if n < 0 then -1 else doc.nodes[n].kind
+}
