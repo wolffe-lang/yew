@@ -1,0 +1,911 @@
+//! edit.viewport — the follow-cursor viewport: scrolloff, horizontal
+//! scroll for `nowrap`, grapheme-aware `wrap` with its row cache.
+//!
+//! Ports sagitta `src/ui/viewport.c` (1,034 lines) and `ui/viewport.h`
+//! (77) at 9ace98c2, under `s15-viewport-statusline.md`. The functions
+//! that read C's `vp_text(w)` (the window's buffer's `TextBuf`) take it as
+//! an explicit `tb`; `vp_goal_tabwidth(w)` (the buffer's tab width, or
+//! `VP_TABWIDTH`) is the explicit `goal_tabw`. C's wrap cache grows two
+//! heap arrays with `realloc`; the port keeps C's `cap`/`len` split over
+//! two `List`s it only ever grows and overwrites in place, because a
+//! replaced `List` in a session-long value is held until the value's
+//! region ends (G33). The linked-diff scroll sync (`git_scroll_sync`,
+//! Sprint 53) is yw13's: no window carries a `scroll_link` before then.
+
+use text
+
+/// The wrap layout's tab width, and a goal's when the buffer sets none
+/// (`YEW_VP_TABWIDTH`, `viewport.h:10-13`).
+pub const VP_TABWIDTH: int = 4
+/// Lines the wrap cache fills past the window (`YEW_VP_WRAP_SLACK`).
+pub const VP_WRAP_SLACK: int = 64
+
+/// `Viewport` (`viewport.h:15-24`).
+pub struct Viewport {
+    top: int,
+    top_sub: int,
+    left: int,
+    rows: int,
+    cols: int,
+    scrolloff: int,
+    sidescrolloff: int,
+    wrap: bool,
+}
+
+/// `WrapCache` (`viewport.h:26-44`): `rows[0..len)` the display-row count
+/// of each line from `first`; `spans[0..spans_len)` one line's row spans
+/// from `spans_first`. The lists' own lengths are the capacity.
+pub struct WrapCache {
+    rows: List[int],
+    len: int,
+    first: int,
+    cols: int,
+    tabwidth: int,
+    generation: int,
+    valid: bool,
+    spans: List[text.Span],
+    spans_len: int,
+    spans_line: int,
+    spans_first: int,
+    spans_cols: int,
+    spans_generation: int,
+    spans_valid: bool,
+}
+
+/// `yew_vp_init`'s viewport (`viewport.c:359-376`).
+pub fn viewport_new() -> Viewport {
+    Viewport {
+        top: 0,
+        top_sub: 0,
+        left: 0,
+        rows: 0,
+        cols: 0,
+        scrolloff: 3,
+        sidescrolloff: 5,
+        wrap: false,
+    }
+}
+
+/// An empty wrap cache.
+pub fn wrapcache_new() -> WrapCache {
+    WrapCache {
+        rows: List[int](),
+        len: 0,
+        first: 0,
+        cols: 0,
+        tabwidth: 0,
+        generation: 0,
+        valid: false,
+        spans: List[text.Span](),
+        spans_len: 0,
+        spans_line: 0,
+        spans_first: 0,
+        spans_cols: 0,
+        spans_generation: 0,
+        spans_valid: false,
+    }
+}
+
+/// `yew_vp_init` (`viewport.c:359-376`): the window's viewport reset, the
+/// hybrid gutter, an empty cache.
+pub fn vp_init(mut w: Win) {
+    w.vp = viewport_new()
+    w.number_style = NUM_HYBRID
+    w.gutter_width = 0
+    vp_invalidate(mut w)
+    w.wrap_goal = 0
+    w.wrap_goal_valid = false
+}
+
+fn sat_add(a: int, b: int) -> int {
+    let max: int = 9223372036854775807
+    if max - a < b {
+        return max
+    }
+    a + b
+}
+
+fn primary_index(w: Win) -> int {
+    if w.cs.curs.len == 0 || w.cs.primary >= w.cs.curs.len {
+        bug("viewport: missing primary cursor")
+    }
+    w.cs.primary
+}
+
+/// C's `line_content_hi` (`viewport.c:95-104`): the line's span without
+/// its LF or CRLF, except on the final line.
+pub fn vp_line_content_hi(tb: text.TextBuf, line: int, sp: text.Span) -> int {
+    var hi = sp.hi
+    if line + 1 >= text.textbuf_line_count(tb) || sp.lo == hi ||
+        text.textbuf_byte_at(tb, hi - 1) != 10 {
+        return hi
+    }
+    hi -= 1
+    if hi > sp.lo && text.textbuf_byte_at(tb, hi - 1) == 13 {
+        hi -= 1
+    }
+    hi
+}
+
+fn cp_is_cjk(cp: int) -> bool {
+    cp >= 11904 && cp <= 42191 || cp >= 44032 && cp <= 55203 || cp >= 63744 && cp <= 64255 ||
+        cp >= 131072 && cp <= 262143
+}
+
+fn cp_is_space(cp: int) -> bool {
+    cp == 32 || cp == 9
+}
+
+fn cp_is_dash_or_slash(cp: int) -> bool {
+    cp == 45 || cp == 47 || cp == 8211 || cp == 8212
+}
+
+fn cluster_cells(cl: text.TextCluster, at: int) -> int {
+    if cl.tab {
+        return text.tab_cells(at as text.CCol, VP_TABWIDTH)
+    }
+    cl.cells
+}
+
+fn cluster_at(tb: text.TextBuf, line: text.Span, pos: int, what: str) -> text.TextCluster {
+    let (ok, cl) = text.text_cluster_next(tb, line, pos as text.ByteOff)
+    if !ok {
+        bug(what)
+    }
+    cl
+}
+
+// `wrap_next` (`viewport.c:134-186`): the byte end of one row; an
+// over-wide first cluster is a row of its own (the progress guarantee).
+fn wrap_next(tb: text.TextBuf, line: text.Span, start: int, cols: int) -> int {
+    var pos = start
+    var opportunity = start
+    var used = 0
+    let limit = if cols == 0 then 1 else cols
+    while pos < line.hi {
+        let before = pos
+        let cl = cluster_at(tb, line, pos, "viewport: cluster scan ended early")
+        pos = cl.hi
+        if cp_is_cjk(cl.base_cp) && before > start {
+            opportunity = before
+        }
+        let cells = cluster_cells(cl, used)
+        if sat_add(used, cells) > limit {
+            if cl.base_cp == 32 {
+                while pos < line.hi {
+                    let next = cluster_at(tb, line, pos, "viewport: space scan ended early")
+                    if next.base_cp != 32 {
+                        break
+                    }
+                    pos = next.hi
+                }
+                return pos
+            }
+            if opportunity > start {
+                return opportunity
+            }
+            if before > start {
+                return before
+            }
+            return pos
+        }
+        used += cells
+        if cp_is_space(cl.base_cp) || cp_is_cjk(cl.base_cp) {
+            opportunity = pos
+        } else if cp_is_dash_or_slash(cl.base_cp) && pos < line.hi {
+            let next = cluster_at(tb, line, pos, "viewport: dash lookahead ended early")
+            if !cp_is_space(next.base_cp) {
+                opportunity = pos
+            }
+        }
+    }
+    line.hi
+}
+
+fn content_span(tb: text.TextBuf, line: int) -> text.Span {
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    text.span(sp.lo, vp_line_content_hi(tb, line, sp))
+}
+
+fn wrap_count_raw(tb: text.TextBuf, line: int, cols: int) -> int {
+    let sp = content_span(tb, line)
+    var start = sp.lo
+    if start == sp.hi {
+        return 1
+    }
+    var rows = 0
+    while start < sp.hi {
+        let end = wrap_next(tb, sp, start, cols)
+        if end <= start {
+            bug("viewport: wrap made no progress")
+        }
+        start = end
+        rows += 1
+    }
+    rows
+}
+
+fn wrap_row_raw(tb: text.TextBuf, line: int, sub: int, cols: int) -> text.Span {
+    let content = content_span(tb, line)
+    if content.lo == content.hi {
+        return if sub == 0 then content else text.span(content.hi, content.hi)
+    }
+    var start = content.lo
+    var row = 0
+    while start < content.hi {
+        let end = wrap_next(tb, content, start, cols)
+        if end <= start {
+            bug("viewport: raw wrap made no progress")
+        }
+        if row == sub {
+            return text.span(start, end)
+        }
+        start = end
+        row += 1
+    }
+    text.span(content.hi, content.hi)
+}
+
+// `wrap_subrow_raw` (`viewport.c:237-265`): the sub-row `pos` is on and
+// that row's span.
+fn wrap_subrow_raw(tb: text.TextBuf, line: int, pos: int, cols: int) -> (int, text.Span) {
+    let content = content_span(tb, line)
+    if content.lo == content.hi {
+        return (0, content)
+    }
+    var start = content.lo
+    var sub = 0
+    while start < content.hi {
+        let end = wrap_next(tb, content, start, cols)
+        if end <= start {
+            bug("viewport: raw wrap made no progress")
+        }
+        if pos < end || end == content.hi {
+            return (sub, text.span(start, end))
+        }
+        start = end
+        sub += 1
+    }
+    bug("viewport: position did not map to a raw display row")
+    (0, content)
+}
+
+fn span_cache_fill(mut w: Win, tb: text.TextBuf, line: int, first: int) {
+    let content = content_span(tb, line)
+    let wanted = w.vp.rows + 1
+    w.wrap_cache.spans_len = 0
+    w.wrap_cache.spans_line = line
+    w.wrap_cache.spans_first = first
+    w.wrap_cache.spans_cols = w.vp.cols
+    w.wrap_cache.spans_generation = tb.gen
+    w.wrap_cache.spans_valid = true
+    if content.lo == content.hi {
+        if first == 0 {
+            span_cache_put(mut w.wrap_cache, content)
+        }
+        return
+    }
+    var start = content.lo
+    var sub = 0
+    while start < content.hi && w.wrap_cache.spans_len < wanted {
+        let end = wrap_next(tb, content, start, w.vp.cols)
+        if end <= start {
+            bug("viewport: wrap made no progress")
+        }
+        if sub >= first {
+            span_cache_put(mut w.wrap_cache, text.span(start, end))
+        }
+        start = end
+        sub += 1
+    }
+}
+
+fn span_cache_put(mut c: WrapCache, sp: text.Span) {
+    if c.spans_len < c.spans.len {
+        c.spans[c.spans_len] = sp
+    } else {
+        (mut c.spans).push(sp)
+    }
+    c.spans_len += 1
+}
+
+fn cache_fill(mut w: Win, tb: text.TextBuf, requested: int) {
+    let lines = text.textbuf_line_count(tb)
+    var first = w.vp.top
+    if requested < first || requested >= sat_add(first, w.vp.rows + VP_WRAP_SLACK + 1) {
+        first = requested
+    }
+    if first >= lines {
+        first = lines - 1
+    }
+    var wanted = w.vp.rows + VP_WRAP_SLACK + 1
+    let available = lines - first
+    if wanted > available {
+        wanted = available
+    }
+    w.wrap_cache.first = first
+    w.wrap_cache.len = wanted
+    w.wrap_cache.cols = w.vp.cols
+    w.wrap_cache.tabwidth = VP_TABWIDTH
+    w.wrap_cache.generation = tb.gen
+    var i = 0
+    while i < wanted {
+        let n = wrap_count_raw(tb, first + i, w.vp.cols)
+        if i < w.wrap_cache.rows.len {
+            w.wrap_cache.rows[i] = n
+        } else {
+            (mut w.wrap_cache.rows).push(n)
+        }
+        i += 1
+    }
+    w.wrap_cache.valid = true
+}
+
+/// `yew_vp_invalidate` (`viewport.c:387-395`).
+pub fn vp_invalidate(mut w: Win) {
+    w.wrap_cache.valid = false
+    w.wrap_cache.len = 0
+    w.wrap_cache.spans_valid = false
+    w.wrap_cache.spans_len = 0
+}
+
+/// `yew_vp_invalidate_from` (`viewport.c:397-412`).
+pub fn vp_invalidate_from(mut w: Win, line: int) {
+    let end = sat_add(w.wrap_cache.first, w.wrap_cache.len)
+    if !w.wrap_cache.valid || line < end {
+        vp_invalidate(mut w)
+    } else if w.wrap_cache.spans_valid && line <= w.wrap_cache.spans_line {
+        w.wrap_cache.spans_valid = false
+        w.wrap_cache.spans_len = 0
+    }
+}
+
+/// `yew_wrap_rows` (`viewport.c:414-431`): the display rows of `line`.
+pub fn wrap_rows(mut w: Win, tb: text.TextBuf, line: int) -> int {
+    if line >= text.textbuf_line_count(tb) {
+        bug("viewport: wrap line out of range")
+    }
+    if !w.vp.wrap {
+        return 1
+    }
+    let stale = !w.wrap_cache.valid || w.wrap_cache.cols != w.vp.cols ||
+        w.wrap_cache.tabwidth != VP_TABWIDTH ||
+        w.wrap_cache.generation != tb.gen ||
+        line < w.wrap_cache.first ||
+        line >= sat_add(w.wrap_cache.first, w.wrap_cache.len)
+    if stale {
+        cache_fill(mut w, tb, line)
+    }
+    w.wrap_cache.rows[line - w.wrap_cache.first]
+}
+
+/// `yew_wrap_row` (`viewport.c:433-458`): the span of display row `sub`.
+pub fn wrap_row(mut w: Win, tb: text.TextBuf, line: int, sub: int) -> text.Span {
+    if line >= text.textbuf_line_count(tb) {
+        bug("viewport: wrap line out of range")
+    }
+    let sp = content_span(tb, line)
+    if !w.vp.wrap {
+        return if sub == 0 then sp else text.span(sp.hi, sp.hi)
+    }
+    let count = wrap_rows(mut w, tb, line)
+    if sub >= count {
+        return text.span(sp.hi, sp.hi)
+    }
+    if !w.wrap_cache.spans_valid || w.wrap_cache.spans_line != line ||
+        w.wrap_cache.spans_cols != w.vp.cols ||
+        w.wrap_cache.spans_generation != tb.gen ||
+        sub < w.wrap_cache.spans_first ||
+        sub - w.wrap_cache.spans_first >= w.wrap_cache.spans_len {
+        span_cache_fill(mut w, tb, line, sub)
+    }
+    if sub < w.wrap_cache.spans_first || sub - w.wrap_cache.spans_first >= w.wrap_cache.spans_len {
+        bug("viewport: requested wrap row was not cached")
+    }
+    copy w.wrap_cache.spans[sub - w.wrap_cache.spans_first]
+}
+
+fn top_step_down(mut w: Win, tb: text.TextBuf) {
+    let lines = text.textbuf_line_count(tb)
+    let count = wrap_rows(mut w, tb, w.vp.top)
+    if w.vp.top_sub + 1 < count {
+        w.vp.top_sub += 1
+    } else if w.vp.top + 1 < lines {
+        w.vp.top += 1
+        w.vp.top_sub = 0
+    }
+}
+
+fn top_step_up(mut w: Win, tb: text.TextBuf) {
+    if w.vp.top_sub != 0 {
+        w.vp.top_sub -= 1
+    } else if w.vp.top != 0 {
+        w.vp.top -= 1
+        w.vp.top_sub = wrap_rows(mut w, tb, w.vp.top) - 1
+    }
+}
+
+fn shift_top(mut w: Win, tb: text.TextBuf, rows_in: int) {
+    var rows = rows_in
+    while rows > 0 {
+        let old_line = w.vp.top
+        let old_sub = w.vp.top_sub
+        top_step_down(mut w, tb)
+        if old_line == w.vp.top && old_sub == w.vp.top_sub {
+            break
+        }
+        rows -= 1
+    }
+    while rows < 0 {
+        let old_line = w.vp.top
+        let old_sub = w.vp.top_sub
+        top_step_up(mut w, tb)
+        if old_line == w.vp.top && old_sub == w.vp.top_sub {
+            break
+        }
+        rows += 1
+    }
+}
+
+fn rows_from_top(mut w: Win, tb: text.TextBuf, limit: int) -> int {
+    let lines = text.textbuf_line_count(tb)
+    var line = w.vp.top
+    var sub = w.vp.top_sub
+    var total = 0
+    while line < lines && total < limit {
+        let add = wrap_rows(mut w, tb, line) - sub
+        if add > limit - total {
+            return limit
+        }
+        total += add
+        line += 1
+        sub = 0
+    }
+    total
+}
+
+/// `yew_vp_row_of_line` (`viewport.c:521-546`): the window row of
+/// (`line`, `sub`), or false when it is not visible.
+pub fn vp_row_of_line(mut w: Win, tb: text.TextBuf, line: int, sub: int) -> (bool, int) {
+    if line < w.vp.top || line == w.vp.top && sub < w.vp.top_sub {
+        return (false, 0)
+    }
+    var screen = 0
+    var scan = w.vp.top
+    var scan_sub = w.vp.top_sub
+    while scan < line {
+        screen += wrap_rows(mut w, tb, scan) - scan_sub
+        if screen >= w.vp.rows {
+            return (false, 0)
+        }
+        scan += 1
+        scan_sub = 0
+    }
+    screen += sub - scan_sub
+    if screen >= w.vp.rows || screen > 65535 {
+        return (false, 0)
+    }
+    (true, screen)
+}
+
+/// `yew_vp_line_of_row` (`viewport.c:548-575`).
+pub fn vp_line_of_row(mut w: Win, tb: text.TextBuf, row: int) -> (bool, int, int) {
+    let lines = text.textbuf_line_count(tb)
+    var scan = w.vp.top
+    var scan_sub = w.vp.top_sub
+    var left = row
+    while scan < lines {
+        let available = wrap_rows(mut w, tb, scan) - scan_sub
+        if left < available {
+            return (true, scan, scan_sub + left)
+        }
+        left -= available
+        scan += 1
+        scan_sub = 0
+    }
+    (false, 0, 0)
+}
+
+/// `yew_vp_gridx_of_ccol` (`viewport.c:590-618`): the ABSOLUTE grid x of
+/// a content column; `w.rect.x` is the content origin (the gutter is
+/// already inside it).
+pub fn vp_gridx_of_ccol(w: Win, col: int) -> int {
+    if col < w.vp.left {
+        return w.rect.x
+    }
+    var relative = col - w.vp.left
+    if w.vp.wrap && w.vp.cols != 0 && relative >= w.vp.cols {
+        relative = w.vp.cols - 1
+    }
+    let x = w.rect.x + relative
+    if x > 65535 then 65535 else x
+}
+
+/// `yew_vp_ccol_of_gridx` (`viewport.c:620-627`).
+pub fn vp_ccol_of_gridx(w: Win, grid_x: int) -> int {
+    if grid_x <= w.rect.x {
+        return w.vp.left
+    }
+    sat_add(w.vp.left, grid_x - w.rect.x)
+}
+
+/// `yew_vp_cursor_subrow` (`viewport.c:629-668`).
+pub fn vp_cursor_subrow(w: Win, tb: text.TextBuf) -> int {
+    if !w.vp.wrap {
+        return 0
+    }
+    let pos = w.cs.curs[primary_index(w)].pos
+    let line = text.textbuf_line_of(tb, pos as text.ByteOff) as int
+    let content = content_span(tb, line)
+    if w.wrap_cache.spans_valid && w.wrap_cache.spans_line == line &&
+        w.wrap_cache.spans_cols == w.vp.cols &&
+        w.wrap_cache.spans_generation == tb.gen {
+        var i = 0
+        while i < w.wrap_cache.spans_len {
+            let sp = copy w.wrap_cache.spans[i]
+            if pos >= sp.lo && (pos < sp.hi || sp.hi == content.hi) {
+                return w.wrap_cache.spans_first + i
+            }
+            i += 1
+        }
+    }
+    var start = content.lo
+    if start == content.hi {
+        return 0
+    }
+    var sub = 0
+    while start < content.hi {
+        let end = wrap_next(tb, content, start, w.vp.cols)
+        if pos < end || end == content.hi {
+            return sub
+        }
+        start = end
+        sub += 1
+    }
+    bug("viewport: cursor did not map to a display row")
+    0
+}
+
+fn follow_vertical(mut w: Win, tb: text.TextBuf, line: int, sub: int) {
+    if w.vp.rows == 0 {
+        w.vp.top = line
+        w.vp.top_sub = sub
+        return
+    }
+    let margin = w.vp.scrolloff
+    let (visible, row) = vp_row_of_line(mut w, tb, line, sub)
+    if w.vp.rows <= 2 * margin {
+        let center = w.vp.rows / 2
+        if !visible {
+            w.vp.top = line
+            w.vp.top_sub = sub
+            shift_top(mut w, tb, -center)
+        } else if row < center {
+            shift_top(mut w, tb, -(center - row))
+        } else if row > center {
+            shift_top(mut w, tb, row - center)
+        }
+        return
+    }
+    let bottom = w.vp.rows - 1 - margin
+    if !visible {
+        let above = line < w.vp.top || line == w.vp.top && sub < w.vp.top_sub
+        w.vp.top = line
+        w.vp.top_sub = sub
+        shift_top(mut w, tb, -(if above then margin else bottom))
+    } else if row < margin {
+        shift_top(mut w, tb, -(margin - row))
+    } else if row > bottom {
+        shift_top(mut w, tb, row - bottom)
+    }
+}
+
+fn follow_horizontal(mut w: Win, tb: text.TextBuf, line: text.Span, pos: int) {
+    let start = text.off_to_ccol(tb, line, pos as text.ByteOff, VP_TABWIDTH) as int
+    let lno = text.textbuf_line_of(tb, pos as text.ByteOff) as int
+    var next = pos
+    if pos < vp_line_content_hi(tb, lno, line) {
+        next = text.grapheme_next_boundary(tb, pos as text.ByteOff) as int
+    }
+    let end = text.off_to_ccol(tb, line, next as text.ByteOff, VP_TABWIDTH) as int
+    var side = w.vp.sidescrolloff
+    if w.vp.cols == 0 {
+        w.vp.left = start
+        return
+    }
+    if 2 * side >= w.vp.cols {
+        side = w.vp.cols / 2
+    }
+    if start < sat_add(w.vp.left, side) {
+        w.vp.left = if start > side then start - side else 0
+    }
+    let inner = w.vp.cols - side
+    if end > sat_add(w.vp.left, inner) {
+        w.vp.left = if end > inner then end - inner else 0
+    }
+    if start < w.vp.left {
+        w.vp.left = start
+    }
+}
+
+/// `yew_vp_follow` (`viewport.c:739-754`): scroll so the primary cursor is
+/// visible inside the scrolloff margins.
+pub fn vp_follow(mut w: Win, tb: text.TextBuf) {
+    let pos = w.cs.curs[primary_index(w)].pos
+    let line = text.textbuf_line_of(tb, pos as text.ByteOff) as int
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    vp_clamp(mut w, tb)
+    let sub = if w.vp.wrap then vp_cursor_subrow(w, tb) else 0
+    follow_vertical(mut w, tb, line, sub)
+    vp_clamp(mut w, tb)
+    if w.vp.wrap {
+        w.vp.left = 0
+    } else {
+        follow_horizontal(mut w, tb, sp, pos)
+    }
+}
+
+/// `yew_vp_scroll` (`viewport.c:756-762`).
+pub fn vp_scroll(mut w: Win, tb: text.TextBuf, rows: int) {
+    shift_top(mut w, tb, rows)
+    vp_clamp(mut w, tb)
+}
+
+fn cursor_to_row(mut w: Win, mut tb: text.TextBuf, goal_tabw: int, target_in: int) {
+    let p = primary_index(w)
+    let old_pos = w.cs.curs[p].pos
+    let old_line = text.textbuf_line_of(tb, old_pos as text.ByteOff) as int
+    let old_sub = if w.vp.wrap then vp_cursor_subrow(w, tb) else 0
+    let unselected = w.cs.curs[p].anchor == old_pos
+    var target = target_in
+    var line = 0
+    var sub = 0
+    loop {
+        let (ok, l, s) = vp_line_of_row(mut w, tb, target)
+        if ok {
+            line = l
+            sub = s
+            break
+        }
+        if target == 0 {
+            return
+        }
+        target -= 1
+    }
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    var pos = 0
+    if w.vp.wrap {
+        let old_row = wrap_row(mut w, tb, old_line, old_sub)
+        let target_row = wrap_row(mut w, tb, line, sub)
+        let target_rows = wrap_rows(mut w, tb, line)
+        if !w.wrap_goal_valid {
+            w.wrap_goal = text.off_to_ccol(tb, old_row, old_pos as text.ByteOff, VP_TABWIDTH) as int
+            w.wrap_goal_valid = true
+        }
+        pos = text.ccol_to_off(tb, target_row, w.wrap_goal as text.CCol, VP_TABWIDTH) as int
+        if pos == target_row.hi && sub + 1 < target_rows && target_row.lo < target_row.hi {
+            pos = text.grapheme_prev_boundary(mut tb, pos as text.ByteOff) as int
+        }
+    } else {
+        let goal = text.cursor_goal(tb, w.cs.curs[p], goal_tabw) as int
+        w.cs.curs[p].goal_col = goal
+        pos = text.ccol_to_off_padded(tb, sp, goal as text.CCol, goal_tabw) as int
+    }
+    w.cs.curs[p].pos = pos
+    if w.vp.wrap {
+        w.cs.curs[p].goal_col = text.off_to_ccol(tb, sp, pos as text.ByteOff, goal_tabw) as int
+    }
+    if unselected {
+        w.cs.curs[p].anchor = pos
+    }
+}
+
+/// `yew_vp_push_cursor` (`viewport.c:816-850`): after a scroll, push the
+/// cursor back inside the scrolloff margins.
+pub fn vp_push_cursor(mut w: Win, mut tb: text.TextBuf, goal_tabw: int) {
+    let pos = w.cs.curs[primary_index(w)].pos
+    let line = text.textbuf_line_of(tb, pos as text.ByteOff) as int
+    let sub = if w.vp.wrap then vp_cursor_subrow(w, tb) else 0
+    if w.vp.rows == 0 {
+        return
+    }
+    let (visible, row) = vp_row_of_line(mut w, tb, line, sub)
+    if w.vp.rows <= 2 * w.vp.scrolloff {
+        let target = w.vp.rows / 2
+        if !visible || row != target {
+            cursor_to_row(mut w, mut tb, goal_tabw, target)
+        }
+        return
+    }
+    let low = w.vp.scrolloff
+    let high = w.vp.rows - 1 - w.vp.scrolloff
+    if visible && row >= low && row <= high {
+        return
+    }
+    var target = 0
+    if !visible {
+        let above = line < w.vp.top || line == w.vp.top && sub < w.vp.top_sub
+        target = if above then low else high
+    } else {
+        target = if row < low then low else high
+    }
+    cursor_to_row(mut w, mut tb, goal_tabw, target)
+}
+
+/// `yew_vp_page` (`viewport.c:852-861`).
+pub fn vp_page(mut w: Win, tb: text.TextBuf, pages: int) {
+    let step = if w.vp.rows > 2 then w.vp.rows - 2 else 1
+    var amount = step * pages
+    if amount > 2147483647 {
+        amount = 2147483647
+    }
+    if amount < -2147483648 {
+        amount = -2147483648
+    }
+    vp_scroll(mut w, tb, amount)
+}
+
+fn place_cursor(mut w: Win, tb: text.TextBuf, row: int) {
+    let pos = w.cs.curs[primary_index(w)].pos
+    let line = text.textbuf_line_of(tb, pos as text.ByteOff) as int
+    let sub = if w.vp.wrap then vp_cursor_subrow(w, tb) else 0
+    w.vp.top = line
+    w.vp.top_sub = sub
+    shift_top(mut w, tb, -row)
+}
+
+// `yew_vp_center`, `yew_vp_top`, `yew_vp_bottom` (`viewport.c:874-887`).
+/// Center the cursor's row.
+pub fn vp_center(mut w: Win, tb: text.TextBuf) {
+    place_cursor(mut w, tb, w.vp.rows / 2)
+}
+
+/// Put the cursor's row at the top.
+pub fn vp_top(mut w: Win, tb: text.TextBuf) {
+    place_cursor(mut w, tb, 0)
+}
+
+/// Put the cursor's row at the bottom.
+pub fn vp_bottom(mut w: Win, tb: text.TextBuf) {
+    place_cursor(mut w, tb, if w.vp.rows == 0 then 0 else w.vp.rows - 1)
+}
+
+/// `yew_vp_clamp` (`viewport.c:889-910`).
+pub fn vp_clamp(mut w: Win, tb: text.TextBuf) {
+    let lines = text.textbuf_line_count(tb)
+    if w.vp.top >= lines {
+        w.vp.top = lines - 1
+    }
+    let count = wrap_rows(mut w, tb, w.vp.top)
+    if w.vp.top_sub >= count {
+        w.vp.top_sub = count - 1
+    }
+    if !w.vp.wrap {
+        w.vp.top_sub = 0
+    } else {
+        w.vp.left = 0
+    }
+    if w.vp.rows != 0 {
+        let available = rows_from_top(mut w, tb, w.vp.rows)
+        if available < w.vp.rows {
+            shift_top(mut w, tb, -(w.vp.rows - available))
+        }
+    }
+}
+
+/// `yew_vp_move_display` (`viewport.c:912-959`): move the primary cursor
+/// `rows` display rows, keeping the wrap goal.
+pub fn vp_move_display(mut w: Win, mut tb: text.TextBuf, rows: int) -> bool {
+    let p = primary_index(w)
+    let old = w.cs.curs[p].pos
+    var line = text.textbuf_line_of(tb, old as text.ByteOff) as int
+    var sub = vp_cursor_subrow(w, tb)
+    var current = wrap_row(mut w, tb, line, sub)
+    let cursor_col = text.off_to_ccol(tb, current, old as text.ByteOff, VP_TABWIDTH) as int
+    var remain = rows
+    let unselected = w.cs.curs[p].anchor == old
+    if !w.wrap_goal_valid {
+        w.wrap_goal = cursor_col
+        w.wrap_goal_valid = true
+    }
+    let lines = text.textbuf_line_count(tb)
+    while remain > 0 {
+        if sub + 1 < wrap_rows(mut w, tb, line) {
+            sub += 1
+        } else if line + 1 < lines {
+            line += 1
+            sub = 0
+        } else {
+            break
+        }
+        remain -= 1
+    }
+    while remain < 0 {
+        if sub != 0 {
+            sub -= 1
+        } else if line != 0 {
+            line -= 1
+            sub = wrap_rows(mut w, tb, line) - 1
+        } else {
+            break
+        }
+        remain += 1
+    }
+    current = wrap_row(mut w, tb, line, sub)
+    var pos = text.ccol_to_off(tb, current, w.wrap_goal as text.CCol, VP_TABWIDTH) as int
+    if pos == current.hi && sub + 1 < wrap_rows(mut w, tb, line) && current.lo < current.hi {
+        pos = text.grapheme_prev_boundary(mut tb, pos as text.ByteOff) as int
+    }
+    w.cs.curs[p].pos = pos
+    if unselected {
+        w.cs.curs[p].anchor = pos
+    }
+    vp_follow(mut w, tb)
+    pos != old
+}
+
+/// `yew_vp_display_col` (`viewport.c:961-972`): the display column of
+/// `pos` on its (wrapped) row.
+pub fn vp_display_col(w: Win, tb: text.TextBuf, pos: int) -> int {
+    let line = text.textbuf_line_of(tb, pos as text.ByteOff) as int
+    var row = text.textbuf_line_span(tb, line as text.LineNo)
+    if w.vp.wrap {
+        let (_, r) = wrap_subrow_raw(tb, line, pos, w.vp.cols)
+        row = r
+    }
+    text.off_to_ccol(tb, row, pos as text.ByteOff, VP_TABWIDTH) as int
+}
+
+/// `yew_vp_display_target` (`viewport.c:974-1020`): the offset `rows`
+/// display rows from `pos`, at the wrap goal; no cache, cursor or
+/// viewport writes (the line unit engine's pure counterpart).
+pub fn vp_display_target(w: Win, mut tb: text.TextBuf, pos: int, rows: int) -> int {
+    let line_count = text.textbuf_line_count(tb)
+    var line = text.textbuf_line_of(tb, pos as text.ByteOff) as int
+    let (sub0, current) = wrap_subrow_raw(tb, line, pos, w.vp.cols)
+    var sub = sub0
+    let goal = if w.wrap_goal_valid then w.wrap_goal else text.off_to_ccol(tb, current, pos as text.ByteOff, VP_TABWIDTH) as int
+    var remain = rows
+    while remain > 0 {
+        let count = wrap_count_raw(tb, line, w.vp.cols)
+        if sub + 1 < count {
+            sub += 1
+        } else if line + 1 < line_count {
+            line += 1
+            sub = 0
+        } else {
+            break
+        }
+        remain -= 1
+    }
+    while remain < 0 {
+        if sub != 0 {
+            sub -= 1
+        } else if line != 0 {
+            line -= 1
+            sub = wrap_count_raw(tb, line, w.vp.cols) - 1
+        } else {
+            break
+        }
+        remain += 1
+    }
+    let target = wrap_row_raw(tb, line, sub, w.vp.cols)
+    let target_rows = wrap_count_raw(tb, line, w.vp.cols)
+    var result = text.ccol_to_off(tb, target, goal as text.CCol, VP_TABWIDTH) as int
+    if result == target.hi && sub + 1 < target_rows && target.lo < target.hi {
+        result = text.grapheme_prev_boundary(mut tb, result as text.ByteOff) as int
+    }
+    result
+}
+
+/// `yew_vp_last_visible_line` (`viewport.c:1022-1034`).
+pub fn vp_last_visible_line(mut w: Win, tb: text.TextBuf) -> int {
+    if w.vp.rows == 0 {
+        return w.vp.top
+    }
+    let (ok, line, _) = vp_line_of_row(mut w, tb, w.vp.rows - 1)
+    if ok {
+        return line
+    }
+    text.textbuf_line_count(tb) - 1
+}

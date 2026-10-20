@@ -1,0 +1,305 @@
+//! edit.motion — the unit-engine interface and the line and char engines.
+//!
+//! Ports sagitta `src/edit/motion.c` (286 lines) and `motion.h` (42) at
+//! 9ace98c2, under `s13-keymap-engine.md` §5 and `s16-modes-W-B.md`. C's
+//! `UnitOps` is a table of five function pointers per unit
+//! (`motion.h:25-32`) and `yew_unit_of_mode` hands one out; wolf refuses a
+//! function value across a module boundary on the release tier (G19/G20,
+//! wolf-lang#806), so the port's unit is a KIND (`UNIT_LINE`, `UNIT_WORD`,
+//! `UNIT_BLOCK`, `UNIT_CHAR`) and the five operations are one `match` each
+//! on it (the shape ruled at launch, contract deliverable 1).
+//!
+//! C's `UnitCtx` holds the buffer's `TextBuf`, the `Buffer` and the `Win`
+//! by pointer; the port passes the `TextBuf` (`mut`: the grapheme index
+//! caches) and the window explicitly, and `UnitCtx` carries the buffer's
+//! scalars the engines read (its tab width, whether it has a language) and
+//! whether a window was given (C's `u->win != NULL`); a caller with none
+//! passes `win_detached()`.
+
+use text
+
+/// The line unit (C's `yew_unit_line`).
+pub const UNIT_LINE: int = 0
+/// The word unit (`yew_unit_word`).
+pub const UNIT_WORD: int = 1
+/// The block unit (`yew_unit_block`).
+pub const UNIT_BLOCK: int = 2
+/// The char unit (`yew_unit_char`).
+pub const UNIT_CHAR: int = 3
+/// No unit (C's `NULL` from `yew_unit_of_mode`).
+pub const UNIT_NONE: int = -1
+
+/// `YEW_SEL_DEPTH` (`motion.h:9`).
+pub const SEL_DEPTH: int = 16
+
+/// What a unit engine knows about its buffer and window.
+pub struct UnitCtx {
+    has_buf: bool,
+    tabwidth: int,
+    has_lang: bool,
+    has_win: bool,
+}
+
+/// A context over a bare text (C's `{tb, NULL, NULL}`).
+pub fn unitctx_text() -> UnitCtx {
+    UnitCtx { has_buf: false, tabwidth: 0, has_lang: false, has_win: false }
+}
+
+/// A context over a buffer with tab width `tabwidth` and no window.
+pub fn unitctx_buf(tabwidth: int, has_lang: bool) -> UnitCtx {
+    UnitCtx { has_buf: true, tabwidth: tabwidth, has_lang: has_lang, has_win: false }
+}
+
+/// The unit's name (`UnitOps.name`).
+pub fn unit_name(kind: int) -> str {
+    match kind {
+        0 => "line",
+        1 => "word",
+        2 => "block",
+        3 => "char",
+        _ => "none",
+    }
+}
+
+/// `yew_unit_of_mode` (`motion.c:257-276`): L, W, B and I have a unit;
+/// H, E and F have none.
+pub fn unit_of_mode(mode: int) -> int {
+    if mode == MODE_L {
+        return UNIT_LINE
+    }
+    if mode == MODE_W {
+        return UNIT_WORD
+    }
+    if mode == MODE_B {
+        return UNIT_BLOCK
+    }
+    if mode == MODE_I {
+        return UNIT_CHAR
+    }
+    UNIT_NONE
+}
+
+/// `UnitOps.next`.
+pub fn unit_next(kind: int, mut tb: text.TextBuf, u: UnitCtx, w: Win, p: int, alt: bool) -> int {
+    match kind {
+        0 => line_next(mut tb, u, w, p, alt),
+        1 => word_next(mut tb, u, p, alt),
+        2 => block_next(mut tb, u, p, alt),
+        _ => char_next(tb, p),
+    }
+}
+
+/// `UnitOps.prev`.
+pub fn unit_prev(kind: int, mut tb: text.TextBuf, u: UnitCtx, w: Win, p: int, alt: bool) -> int {
+    match kind {
+        0 => line_prev(mut tb, u, w, p, alt),
+        1 => word_prev(mut tb, u, p, alt),
+        2 => block_prev(mut tb, u, p, alt),
+        _ => char_prev(mut tb, p),
+    }
+}
+
+/// `UnitOps.home`.
+pub fn unit_home(kind: int, mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
+    match kind {
+        0 => line_home(mut tb, p, alt),
+        1 => word_home(mut tb, u, p, alt),
+        2 => block_home(mut tb, u, p, alt),
+        _ => char_at(mut tb, p).lo,
+    }
+}
+
+/// `UnitOps.end`.
+pub fn unit_end(kind: int, mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
+    match kind {
+        0 => line_end(mut tb, p, alt),
+        1 => word_end(mut tb, u, p, alt),
+        2 => block_end(mut tb, u, p, alt),
+        _ => char_at(mut tb, p).hi,
+    }
+}
+
+/// `UnitOps.span`.
+pub fn unit_span(kind: int, mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> text.Span {
+    match kind {
+        0 => line_span(mut tb, p, alt),
+        1 => word_unit_span(mut tb, u, p, alt),
+        2 => block_span(mut tb, u, p, alt),
+        _ => char_at(mut tb, p),
+    }
+}
+
+/// `clamp_pos` (`motion.c:8-17`): inside the buffer, on a grapheme
+/// boundary.
+pub fn motion_clamp(tb: text.TextBuf, p_in: int) -> int {
+    let len = text.textbuf_len(tb)
+    var p = p_in
+    if p > len {
+        p = len
+    }
+    if !text.is_grapheme_boundary(tb, p as text.ByteOff) {
+        p = text.grapheme_prev(tb, p as text.ByteOff) as int
+    }
+    p
+}
+
+// `line_content_end` (`motion.c:19-27`).
+fn line_content_end(mut tb: text.TextBuf, line: int) -> int {
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    var end = sp.hi
+    if line + 1 < text.textbuf_line_count(tb) {
+        end = text.grapheme_prev_boundary(mut tb, end as text.ByteOff) as int
+    }
+    end
+}
+
+/// `motion_tabwidth` (`motion.c:29-40`): the buffer's tab width, a goal
+/// column being a SCREEN column.
+pub fn motion_tabwidth(u: UnitCtx) -> int {
+    if u.has_buf && u.tabwidth != 0 then u.tabwidth else VP_TABWIDTH
+}
+
+// `line_at_col` (`motion.c:42-74`): the PADDED lookup — a caret, not a
+// character.
+fn line_at_col(tb: text.TextBuf, line: int, goal: int, tabw: int) -> int {
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    text.ccol_to_off_padded(tb, sp, goal as text.CCol, tabw) as int
+}
+
+// `line_goal` (`motion.c:76-90`): the primary cursor's goal when it sits
+// at `p`, else `p`'s own column.
+fn line_goal(tb: text.TextBuf, u: UnitCtx, w: Win, p: int) -> int {
+    let tabw = motion_tabwidth(u)
+    if u.has_win && w.cs.curs.len != 0 && w.cs.primary < w.cs.curs.len {
+        let c = copy w.cs.curs[w.cs.primary]
+        if c.pos == p {
+            return text.cursor_goal(tb, c, tabw) as int
+        }
+    }
+    let sp = text.textbuf_line_span(tb, text.textbuf_line_of(tb, p as text.ByteOff))
+    text.off_to_ccol(tb, sp, p as text.ByteOff, tabw) as int
+}
+
+fn line_step(u: UnitCtx, w: Win, alt: bool) -> int {
+    if !alt {
+        return 1
+    }
+    let rows = if u.has_win then w.vp.rows / 2 else 1
+    if rows == 0 then 1 else rows
+}
+
+fn line_next(mut tb: text.TextBuf, u: UnitCtx, w: Win, p_in: int, alt: bool) -> int {
+    let p = motion_clamp(tb, p_in)
+    if u.has_win && w.vp.wrap {
+        let target = vp_display_target(w, mut tb, p, line_step(u, w, alt))
+        return if target > p then target else text.textbuf_len(tb)
+    }
+    let count = text.textbuf_line_count(tb)
+    let line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    if line + 1 >= count {
+        return text.textbuf_len(tb)
+    }
+    let goal = line_goal(tb, u, w, p)
+    var target = line + line_step(u, w, alt)
+    if target >= count {
+        target = count - 1
+    }
+    line_at_col(tb, target, goal, motion_tabwidth(u))
+}
+
+fn line_prev(mut tb: text.TextBuf, u: UnitCtx, w: Win, p_in: int, alt: bool) -> int {
+    let p = motion_clamp(tb, p_in)
+    if p == 0 {
+        return p
+    }
+    if u.has_win && w.vp.wrap {
+        let target = vp_display_target(w, mut tb, p, -line_step(u, w, alt))
+        return if target < p then target else 0
+    }
+    let line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    if line == 0 {
+        return 0
+    }
+    let goal = line_goal(tb, u, w, p)
+    let step = line_step(u, w, alt)
+    line_at_col(tb, if line > step then line - step else 0, goal, motion_tabwidth(u))
+}
+
+// `cluster_is_blank` (`motion.c:132-141`).
+fn cluster_is_blank(tb: text.TextBuf, line: text.Span, p: int) -> bool {
+    let (ok, cl) = text.text_cluster_next(tb, line, p as text.ByteOff)
+    if !ok {
+        return false
+    }
+    unicode_is_white_space(cl.base_cp) && cl.base_cp != 10 && cl.base_cp != 13
+}
+
+fn line_home(mut tb: text.TextBuf, p_in: int, alt: bool) -> int {
+    let p = motion_clamp(tb, p_in)
+    let line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    var at = sp.lo
+    if !alt {
+        return at
+    }
+    let end = line_content_end(mut tb, line)
+    while at < end && cluster_is_blank(tb, sp, at) {
+        at = text.grapheme_next_boundary(tb, at as text.ByteOff) as int
+    }
+    if at <= p then at else sp.lo
+}
+
+fn line_end(mut tb: text.TextBuf, p_in: int, alt: bool) -> int {
+    let p = motion_clamp(tb, p_in)
+    let line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    let end = line_content_end(mut tb, line)
+    if !alt {
+        return end
+    }
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    var at = sp.lo
+    var last = at
+    while at < end {
+        let next = text.grapheme_next_boundary(tb, at as text.ByteOff) as int
+        if !cluster_is_blank(tb, sp, at) {
+            last = next
+        }
+        at = next
+    }
+    if last >= p then last else end
+}
+
+fn line_span(mut tb: text.TextBuf, p: int, alt: bool) -> text.Span {
+    let lo = line_home(mut tb, p, alt)
+    text.span(lo, line_end(mut tb, p, alt))
+}
+
+// The char unit (`motion.c:192-244`): every result a grapheme boundary;
+// the alternate's codepoint view projected onto legal cursor positions.
+fn char_next(tb: text.TextBuf, p: int) -> int {
+    let at = motion_clamp(tb, p)
+    text.grapheme_next_boundary(tb, at as text.ByteOff) as int
+}
+
+fn char_prev(mut tb: text.TextBuf, p: int) -> int {
+    let at = motion_clamp(tb, p)
+    text.grapheme_prev_boundary(mut tb, at as text.ByteOff) as int
+}
+
+fn char_at(mut tb: text.TextBuf, p_in: int) -> text.Span {
+    let len = text.textbuf_len(tb)
+    let p = motion_clamp(tb, p_in)
+    if p == len && p != 0 {
+        return text.span(text.grapheme_prev_boundary(mut tb, p as text.ByteOff) as int, p)
+    }
+    text.span(p, text.grapheme_next_boundary(tb, p as text.ByteOff) as int)
+}
+
+/// `yew_selstack_clear` (`motion.c:278-286`).
+pub fn selstack_clear(mut w: Win) {
+    var i = 0
+    while i < w.cs.selstacks.len {
+        w.cs.selstacks[i].n = 0
+        i += 1
+    }
+}
