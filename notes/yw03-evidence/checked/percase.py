@@ -30,6 +30,14 @@ for f in sys.argv[1:]:
     lines = main.strip("\n").splitlines()[1:-1]
     first = next(k for k, l in enumerate(lines) if CALL.search(l))
     prologue = [l for l in lines[:first] if not l.strip().startswith("//")]
+    # Keep only whole statements: cut where the braces last balance (a
+    # `let v = if … {` that opens around the first case is not prologue).
+    depth, keep = 0, 0
+    for k, l in enumerate(prologue):
+        depth += l.count("{") - l.count("}")
+        if depth == 0:
+            keep = k + 1
+    prologue = prologue[:keep]
     calls = []
     for l in lines[first:]:
         for m in CALL.finditer(l):
