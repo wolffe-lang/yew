@@ -1,0 +1,336 @@
+//! edit.cmdline — the narrow `:` campaign 03's goldens need.
+//!
+//! Ports the core of sagitta `src/ui/cmdline.c` (3,957 lines) at
+//! 9ace98c2 — `yew_cmdline_open`, `_close`, `_target`, `_key`, `_draw`,
+//! `ed.cmdline.accept` and `ed.cmdline.cancel` — and nothing else of
+//! sprint 18. Why it is here at all (ruling R-yw03-1, asked): every
+//! campaign-03 PTY case leaves the editor through `esc : ed.quit enter` or
+//! `esc : ed.quit_force enter` (`tests/pty/registry.c:679-700`) and the
+//! case's verdict includes that exit, so without a `:` no campaign-03
+//! case can pass. C's prompt is a real buffer in a hidden window (the
+//! TARGET) that the E-mode editing commands run on through the registry;
+//! the port keeps that shape (one target buffer and window, reused).
+//! Accept parses the narrow grammar a typed command needs here — the
+//! command's name or abbreviation (`builtin_meta`'s), a trailing `!`,
+//! space-separated arguments — and refuses a range or anything else by
+//! name (sprint 18, yw04). History, completion, ghosts, the menu, the
+//! pager, the shell context and the error caret are yw04's.
+
+use term
+use text
+use unicode
+
+/// The `:` prompt (`YEW_PROMPT_CMD`).
+pub const PROMPT_CMD: int = 0
+
+/// The command line (`CmdLine`, `ui/cmdline.h`), the fields the narrow
+/// `:` keeps.
+pub struct CmdLine {
+    active: bool,
+    kind: int,
+    target_win: int,
+    return_mode: int,
+    scroll: int,
+    generation: int,
+}
+
+/// A closed command line.
+pub fn cmdline_new() -> CmdLine {
+    CmdLine {
+        active: false,
+        kind: PROMPT_CMD,
+        target_win: -1,
+        return_mode: MODE_L,
+        scroll: 0,
+        generation: 0,
+    }
+}
+
+/// The window E-mode commands run on (`yew_cmdline_target`): the prompt's
+/// while it is open, else the focused one.
+pub fn cmdline_target(ed: Ed) -> int {
+    if ed.cmdline.active then ed.cmdline.target_win else ed.win
+}
+
+/// `yew_cmdline_open` (`cmdline.c:463-540`): a fresh target holding
+/// `seed`, E mode.
+pub fn cmdline_open(mut ed: Ed, kind: int, seed: str) {
+    if ed.cmdline.active {
+        cmdline_close(mut ed, false)
+    }
+    let old = ed.mode
+    ed.cmdline.generation += 1
+    var bytes = List[byte]()
+    for b in seed.bytes() {
+        (mut bytes).push(b)
+    }
+    var ec = text.editctx_new(take text.textbuf_from_bytes(bytes, 0, bytes.len))
+    ec.undo = text.undo_new(ec.tb)
+    ec.has_undo = true
+    ec.marks = text.marks_new()
+    ec.has_marks = true
+    if ed.cmdline.target_win < 0 {
+        let id = ed.next_buf_id
+        ed.next_buf_id += 1
+        (mut ed.bufs).push(Buffer {
+            id: id,
+            ec: ec,
+            resident: true,
+            path: "",
+            has_path: false,
+            name: "*cmdline*",
+            has_name: true,
+            flags: BUF_SCRATCH,
+            tabwidth: 1,
+            recovery_pending: false,
+            pairs: pairstate_new(),
+        })
+        let wid = ed.next_win_id
+        ed.next_win_id += 1
+        var w = win_new(wid, ed.bufs.len - 1)
+        vp_init(mut w)
+        (mut ed.wins).push(w)
+        ed.cmdline.target_win = ed.wins.len - 1
+    } else {
+        let bi = ed.wins[ed.cmdline.target_win].buf
+        ed.bufs[bi].ec = ec
+    }
+    let tw = ed.cmdline.target_win
+    let n = bytes.len
+    ed.wins[tw].cs = text.cset_init(text.cursor_at(n as text.ByteOff))
+    ed.cmdline.kind = kind
+    ed.cmdline.active = true
+    ed.cmdline.return_mode = ed.mode
+    ed.cmdline.scroll = 0
+    ed_msg_clear(mut ed)
+    if old != MODE_E {
+        dispatch_set_mode(mut ed, MODE_E)
+    }
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+/// `yew_cmdline_close` (`cmdline.c:584-674`): back to the mode it was
+/// opened from; an accepted command's message stays.
+pub fn cmdline_close(mut ed: Ed, accepted: bool) {
+    if !ed.cmdline.active {
+        return
+    }
+    let keep_message = accepted && ed.msg.active && ed.cmdline.kind == PROMPT_CMD
+    var restore = ed.cmdline.return_mode
+    if restore < 0 || restore >= MODE_N || restore == MODE_E {
+        restore = MODE_L
+    }
+    ed.cmdline.active = false
+    ed.cmdline.scroll = 0
+    if !keep_message {
+        ed_msg_clear(mut ed)
+    }
+    if ed.mode != restore {
+        dispatch_set_mode(mut ed, restore)
+    }
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+/// `yew_cmdline_key` (`cmdline.c:1331-1359`): a printable key types into
+/// the line through the registry; everything else falls to the keymap.
+pub fn cmdline_key(mut ed: Ed, key: term.Key) -> bool {
+    if !ed.cmdline.active {
+        return false
+    }
+    if key.ev == term.KEY_RELEASE {
+        return true
+    }
+    if ed.capture_cmd != 0 {
+        return false
+    }
+    let command_mods = term.MOD_ALT |
+        term.MOD_CTRL |
+        term.MOD_SUPER |
+        term.MOD_HYPER |
+        term.MOD_META
+    if key.code < term.KEY_BASE && key.text.len != 0 && key.mods & command_mods == 0 {
+        cmdline_insert(mut ed, key.text)
+        return true
+    }
+    false
+}
+
+/// `yew_cmdline_paste` (`cmdline.c:1361-1367`).
+pub fn cmdline_paste(mut ed: Ed, bytes: List[byte]) {
+    if ed.cmdline.active && bytes.len != 0 {
+        cmdline_insert(mut ed, bytes)
+    }
+}
+
+// `insert_sanitized` (`cmdline.c:314-328`): control bytes are not
+// prompt text (`sanitize_bytes`, `cmdline.c:262-277`).
+fn cmdline_insert(mut ed: Ed, bytes: List[byte]) {
+    var clean = List[byte]()
+    for b in bytes {
+        let c = b as int
+        if c >= 32 && c != 127 {
+            (mut clean).push(b)
+        }
+    }
+    if clean.len == 0 {
+        return
+    }
+    let s = str_from_utf8(clean) else ""
+    var cx = cmdctx_new(ed.cmdline.target_win, SRC_KEY)
+    cx.sarg = s
+    cx.has_sarg = true
+    let id = cmd_lookup(ed.reg, "ed.edit.insert.text")
+    ed.last_cmd = id
+    ed.last_status = ed_cmd_invoke(mut ed, id, mut cx)
+    ed.dispatch_count += 1
+}
+
+fn cmdline_text(ed: Ed) -> List[byte] {
+    let bi = ed.wins[ed.cmdline.target_win].buf
+    text.textbuf_bytes(ed.bufs[bi].ec.tb)
+}
+
+// The narrow grammar: `name[!] [arg ...]`; the name or its abbreviation.
+fn resolve_name(ed: Ed, name: str) -> int {
+    let id = cmd_lookup(ed.reg, name)
+    if id != 0 {
+        return id
+    }
+    var i = 0
+    while i < ed.reg.entries.len {
+        if ed.reg.entries[i].active &&
+            ed.reg.entries[i].has_abbrev &&
+            ed.reg.entries[i].abbrev == name {
+            return i + 1
+        }
+        i += 1
+    }
+    0
+}
+
+/// `ed.cmdline.accept` (`yew_cmdline_cmd_accept`, `cmdline.c:3401-3553`).
+pub fn cmdline_accept(mut ed: Ed) -> int {
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    let raw = cmdline_text(ed)
+    if raw.len == 0 {
+        cmdline_close(mut ed, true)
+        return CMD_OK
+    }
+    let line = str_from_utf8(raw) else ""
+    let gen = ed.cmdline.generation
+    var words = List[str]()
+    for w in line.words() {
+        (mut words).push(w)
+    }
+    if words.len == 0 {
+        cmdline_close(mut ed, true)
+        return CMD_OK
+    }
+    var name = words[0]
+    let first = name.bytes()[0] as int
+    if first >= 48 && first <= 57 || first == 37 || first == 46 || first == 39 || first == 36 {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            "not yet ported: command ranges: sagitta Sprint 18 (the command line) (yw04)",
+        )
+        return CMD_ERR_DEFERRED
+    }
+    var bang = false
+    if name.ends_with("!") {
+        bang = true
+        name = name[0..name.len - 1]
+    }
+    let id = resolve_name(ed, name)
+    if id == 0 {
+        ed_msg(mut ed, MSG_ERROR, "unknown command '{name}' (try Tab)")
+        return CMD_ERR_ARG
+    }
+    var cx = cmdctx_new(ed.win, SRC_CMDLINE)
+    cx.bang = bang
+    for w in words {
+        (mut cx.argv).push(w)
+    }
+    let arity = ed.reg.entries[id - 1].arity
+    if words.len > 1 {
+        if arity == ARITY_STR || arity == ARITY_OPT_STR {
+            cx.sarg = words[1]
+            cx.has_sarg = true
+        } else if arity == ARITY_INT || arity == ARITY_OPT_INT {
+            cx.iarg = words[1].to_int() else {
+                return CMD_ERR_ARG
+            }
+        }
+    }
+    let status = ed_cmd_invoke(mut ed, id, mut cx)
+    if status != CMD_OK {
+        return status
+    }
+    if ed.cmdline.active && ed.cmdline.generation == gen {
+        cmdline_close(mut ed, true)
+    }
+    CMD_OK
+}
+
+/// `yew_cmdline_draw` (`cmdline.c:3763-3860`): `:` in E's chip colours,
+/// the text in its row colours, the terminal cursor at the caret.
+pub fn cmdline_draw(mut ed: Ed, r: Rect) {
+    if !ed.cmdline.active || r.h == 0 || r.y >= ed.grid.rows {
+        return
+    }
+    let style = statusline_mode_style(MODE_E)
+    var blank = term.cell_blank()
+    blank.fg = copy style.row_fg
+    blank.bg = copy style.row_bg
+    term.grid_fill(mut ed.grid, r.y, r.x, r.x + r.w, copy blank)
+    let colon = bytes_of(":")
+    var col = term.grid_put(
+        mut ed.grid,
+        r.y,
+        r.x,
+        colon,
+        0,
+        1,
+        copy style.chip_fg,
+        copy style.chip_bg,
+        style.attrs,
+    )
+    let right = if r.x + r.w > ed.grid.cols then ed.grid.cols else r.x + r.w
+    let raw = cmdline_text(ed)
+    let tw = ed.cmdline.target_win
+    let caret_off = ed.wins[tw].cs.curs[ed.wins[tw].cs.primary].pos
+    let caret = unicode.str_width(raw, 0, caret_off, 1)
+    let visible = if right > col then right - col else 0
+    if caret < ed.cmdline.scroll {
+        ed.cmdline.scroll = caret
+    } else if visible != 0 && caret >= ed.cmdline.scroll + visible {
+        ed.cmdline.scroll = caret - visible + 1
+    }
+    let (skip, skipped) = unicode.str_clip(raw, 0, raw.len, ed.cmdline.scroll)
+    if skipped < ed.cmdline.scroll && col < right {
+        let gap = ed.cmdline.scroll - skipped
+        let n_take = if gap > right - col then right - col else gap
+        term.grid_fill(mut ed.grid, r.y, col, col + n_take, copy blank)
+        col += n_take
+    }
+    if skip < raw.len && col < right {
+        col = term.grid_puts(
+            mut ed.grid,
+            r.y,
+            col,
+            raw,
+            skip,
+            raw.len,
+            copy style.row_fg,
+            copy style.row_bg,
+            0,
+        )
+    }
+    let ccol = r.x + 1 + caret - ed.cmdline.scroll
+    term.grid_cursor_shape(mut ed.grid, term.CURSOR_BAR)
+    term.grid_cursor(mut ed.grid, r.y, if ccol >= right then right - 1 else ccol, true)
+}
