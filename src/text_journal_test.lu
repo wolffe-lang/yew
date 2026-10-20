@@ -1,0 +1,553 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_journal.c` (711 lines), one test
+//! per C test in registry order (`tests/unit/registry.c:393-406`). C's
+//! process-global journal owner list is the `JournalSet` each test
+//! threads; C's discard clears the borrowed `FileMeta.journal_pinned`, the
+//! port's answers whether to (`discard` below does it). C's `pwrite` of the
+//! legacy version is a seek and a write; `utimensat` is `fs_set_times`.
+
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn fresh_dir(prefix: str) -> str {
+    var tries = 0
+    while tries < 100 {
+        var suffix = ""
+        for r in os_random(6) {
+            suffix = suffix + "{r % 10}"
+        }
+        let dir = "/tmp/{prefix}-{suffix}"
+        fs_create_dir_mode(dir, 448) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            denied => { assert(false, "mkdtemp denied") },
+            invalid => { assert(false, "mkdtemp invalid") },
+            not_found => { assert(false, "mkdtemp not found") },
+            unsupported => { assert(false, "mkdtemp unsupported") },
+            io => { assert(false, "mkdtemp io") },
+        }
+        return dir
+    }
+    assert(false, "mkdtemp exhausted")
+    ""
+}
+
+struct Fixture {
+    state: str,
+    source: str,
+    journal: str,
+    base: str,
+    stale: str,
+    base_stale: str,
+}
+
+fn jpath_for(state: str, realpath: str) -> str {
+    "{state}/yew/journal/{text.hex16(text.path_fnv64(realpath))}.yewj"
+}
+
+fn fixture_make() -> Fixture {
+    let state = fresh_dir("yew-journal")
+    let source = "{state}/base.txt"
+    let journal = jpath_for(state, source)
+    env_set("XDG_STATE_HOME", state) else {
+        assert(false, "setenv")
+    }
+    Fixture {
+        state: state,
+        source: source,
+        journal: journal,
+        base: "{journal}.base",
+        stale: "{journal}.stale",
+        base_stale: "{journal}.base.stale",
+    }
+}
+
+fn fixture_repoint(mut f: Fixture, realpath: str) {
+    f.journal = jpath_for(f.state, realpath)
+    f.base = "{f.journal}.base"
+    f.stale = "{f.journal}.stale"
+    f.base_stale = "{f.journal}.base.stale"
+}
+
+fn unlink_quiet(path: str) {
+    fs_remove(path) else |_| {}
+}
+
+fn fixture_remove(f: Fixture) {
+    unlink_quiet(f.journal)
+    unlink_quiet(f.base)
+    unlink_quiet(f.stale)
+    unlink_quiet(f.base_stale)
+    unlink_quiet(f.source)
+    unlink_quiet("{f.state}/yew/log")
+    fs_remove_dir("{f.state}/yew/journal") else {
+        assert(false, "rmdir journal")
+    }
+    fs_remove_dir("{f.state}/yew") else {
+        assert(false, "rmdir yew")
+    }
+    fs_remove_dir(f.state) else {
+        assert(false, "rmdir state")
+    }
+}
+
+fn meta_init(path: str) -> text.FileMeta {
+    var meta = text.filemeta_new()
+    meta.exists = true
+    meta.size_on_disk = 6
+    meta.mtime_s = 123456
+    meta.mtime_ns = 789
+    meta.realpath = path
+    meta.has_realpath = true
+    meta
+}
+
+fn assert_text(tb: text.TextBuf, expected: str) {
+    assert(same(text.textbuf_bytes(tb), bytes_of(expected)), "text is {expected}")
+}
+
+fn read_file(path: str) -> List[byte] {
+    let b = fs_read_bytes(path) else {
+        assert(false, "read {path}")
+        return List[byte]()
+    }
+    b
+}
+
+fn write_file(path: str, bytes: List[byte]) {
+    let fd = fs_open_perm(path, 1, 384) else {
+        assert(false, "create {path}")
+        return
+    }
+    if bytes.len != 0 {
+        fs_write_chunk(fd, bytes) else {
+            assert(false, "write {path}")
+        }
+    }
+    fs_close(fd) else {
+        assert(false, "close {path}")
+    }
+}
+
+fn exists(path: str) -> bool {
+    let _ = fs_lstat(path) else {
+        return false
+    }
+    true
+}
+
+fn open_ok(mut reg: text.JournalSet, path: str, mut meta: text.FileMeta) -> text.Journal {
+    let (j, err) = text.journal_open(mut reg, path, mut meta)
+    assert(j.open, "journal opens (err {err})")
+    j
+}
+
+fn record(mut j: text.Journal, op: int, off: int, s: str) {
+    let b = bytes_of(s)
+    assert(text.journal_record(mut j, op, off, b, 0, b.len), "record")
+}
+
+fn discard(mut reg: text.JournalSet, mut j: text.Journal, mut meta: text.FileMeta) {
+    if text.journal_discard(mut reg, mut j) {
+        meta.journal_pinned = false
+    }
+}
+
+fn make_three_record_journal(f: Fixture, mut meta: text.FileMeta) -> List[byte] {
+    var reg = text.journalset_new()
+    var j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_INS, 3, "XYZ")
+    record(mut j, text.JOURNAL_DEL, 1, "bc")
+    record(mut j, text.JOURNAL_INS, 7, "!")
+    let _ = text.journal_sync(mut j)
+    let bytes = read_file(f.journal)
+    discard(mut reg, mut j, mut meta)
+    assert(!exists(f.journal), "discarded")
+    bytes
+}
+
+fn t_journal_crc32_known_vectors_and_streaming() {
+    let empty = List[byte]()
+    assert(text.crc32_of(empty, 0, 0) == 0, "empty")
+    let check = bytes_of("123456789")
+    assert(text.crc32_of(check, 0, check.len) == 3421780262, "check value 0xcbf43926")
+    var crc = text.crc32_begin()
+    crc = text.crc32_add(crc, check, 0, 4)
+    crc = text.crc32_add(crc, check, 4, check.len)
+    assert(text.crc32_end(crc) == 3421780262, "streaming")
+}
+
+fn t_journal_replays_insert_and_delete_records() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var tb = text.textbuf_from_str("abcdef")
+    var j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_INS, 3, "XYZ")
+    record(mut j, text.JOURNAL_DEL, 1, "bc")
+    record(mut j, text.JOURNAL_INS, 7, "!")
+    let _ = text.journal_sync(mut j)
+    text.journal_close(mut reg, mut j)
+    assert(text.journal_replay(reg, f.source, mut tb, mut meta), "replays")
+    assert_text(tb, "aXYZdef!")
+    text.textbuf_check(tb)
+    j = open_ok(mut reg, f.source, mut meta)
+    discard(mut reg, mut j, mut meta)
+    text.textbuf_free(mut tb)
+    fixture_remove(f)
+}
+
+fn t_journal_delete_requires_and_removes_recorded_bytes() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var tb = text.textbuf_from_str("abcdef")
+    var j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_DEL, 2, "cd")
+    let _ = text.journal_sync(mut j)
+    text.journal_close(mut reg, mut j)
+    assert(text.journal_replay(reg, f.source, mut tb, mut meta), "replays")
+    assert_text(tb, "abef")
+    j = open_ok(mut reg, f.source, mut meta)
+    discard(mut reg, mut j, mut meta)
+    text.textbuf_free(mut tb)
+    fixture_remove(f)
+}
+
+fn t_journal_obsolete_leftover_is_replaced_not_fatal() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_INS, 0, "old")
+    let _ = text.journal_sync(mut j)
+    text.journal_close(mut reg, mut j)
+    meta.size_on_disk = 4096
+    meta.mtime_s = 999999
+    assert(!text.journal_probe(reg, f.source, meta), "nothing to recover")
+    j = open_ok(mut reg, f.source, mut meta)
+    assert(text.journal_ok(j), "usable")
+    record(mut j, text.JOURNAL_INS, 0, "new")
+    let _ = text.journal_sync(mut j)
+    assert(text.journal_ok(j), "still usable")
+    discard(mut reg, mut j, mut meta)
+    unlink_quiet("{f.state}/yew/log")
+    fixture_remove(f)
+}
+
+fn t_journal_recovers_replaced_file_from_pinned_base() {
+    var f = fixture_make()
+    var reg = text.journalset_new()
+    write_file(f.source, bytes_of("alpha\n"))
+    var (rc, original_tb, original_meta) = text.file_load(f.source)
+    assert(rc == text.LOAD_OK, "load original")
+    fixture_repoint(mut f, original_meta.realpath)
+    let original_dev = original_meta.dev
+    let original_ino = original_meta.ino
+    var j = open_ok(mut reg, original_meta.realpath, mut original_meta)
+    let source_st = fs_stat(f.source) else List[int]()
+    let base_st = fs_stat(f.base) else List[int]()
+    assert(source_st[5] == 2, "two links")
+    assert(base_st[10] == source_st[10], "the base is the file")
+    assert(original_meta.journal_pinned, "pinned")
+    assert(text.journal_record(mut j, text.JOURNAL_INS, 0, bytes_of("X"), 0, 1), "record")
+    assert(text.journal_sync(mut j), "sync")
+    text.journal_close(mut reg, mut j)
+    let incoming = "{f.state}/incoming"
+    write_file(incoming, bytes_of("omega\n"))
+    fs_set_times(
+        incoming,
+        original_meta.mtime_s,
+        original_meta.mtime_ns,
+        original_meta.mtime_s,
+        original_meta.mtime_ns,
+        true,
+    ) else {
+        assert(false, "utimensat")
+    }
+    fs_rename(incoming, f.source) else {
+        assert(false, "rename")
+    }
+    var (rc2, replacement_tb, replacement_meta) = text.file_load(f.source)
+    assert(rc2 == text.LOAD_OK, "load replacement")
+    assert(replacement_meta.ino != original_ino, "a new inode")
+    assert(text.journal_probe(reg, f.source, replacement_meta), "probe finds the base")
+    assert(
+        text.journal_replay(reg, f.source, mut replacement_tb, mut replacement_meta),
+        "replays from the base",
+    )
+    assert_text(replacement_tb, "Xalpha\n")
+    assert(replacement_meta.dev == original_dev, "identity of the base")
+    assert(replacement_meta.ino == original_ino, "inode of the base")
+    var adopted = open_ok(mut reg, replacement_meta.realpath, mut replacement_meta)
+    discard(mut reg, mut adopted, mut replacement_meta)
+    assert(!replacement_meta.journal_pinned, "unpinned")
+    assert(!exists(f.journal), "journal gone")
+    assert(!exists(f.base), "base gone")
+    text.filemeta_dispose(mut replacement_meta, mut replacement_tb)
+    text.filemeta_dispose(mut original_meta, mut original_tb)
+    text.textbuf_free(mut replacement_tb)
+    text.textbuf_free(mut original_tb)
+    fixture_remove(f)
+}
+
+fn t_journal_preserves_legacy_log_and_base() {
+    var f = fixture_make()
+    var reg = text.journalset_new()
+    write_file(f.source, bytes_of("alpha\n"))
+    var (rc, tb, meta) = text.file_load(f.source)
+    assert(rc == text.LOAD_OK, "load")
+    fixture_repoint(mut f, meta.realpath)
+    var j = open_ok(mut reg, meta.realpath, mut meta)
+    assert(text.journal_record(mut j, text.JOURNAL_INS, 0, bytes_of("X"), 0, 1), "record")
+    assert(text.journal_sync(mut j), "sync")
+    text.journal_close(mut reg, mut j)
+    let fd = fs_open_mode(f.journal, 3) else {
+        assert(false, "open for the legacy patch")
+        return
+    }
+    let _ = fs_seek(fd, 4, 0) else -1
+    var legacy = List[byte]()
+    for x in [1, 0, 0, 0] {
+        (mut legacy).push(x as byte)
+    }
+    fs_write_chunk(fd, legacy) else {
+        assert(false, "pwrite")
+    }
+    fs_close(fd) else {
+        assert(false, "close")
+    }
+    let before = read_file(f.journal)
+    j = open_ok(mut reg, meta.realpath, mut meta)
+    let stale = read_file(f.stale)
+    assert(same(stale, before), "the legacy log is preserved byte for byte")
+    let source_st = fs_stat(f.source) else List[int]()
+    let stale_base_st = fs_stat(f.base_stale) else List[int]()
+    assert(stale_base_st[10] == source_st[10], "the legacy base is preserved")
+    discard(mut reg, mut j, mut meta)
+    text.filemeta_dispose(mut meta, mut tb)
+    text.textbuf_free(mut tb)
+    fixture_remove(f)
+}
+
+fn t_journal_pin_keeps_single_link_save_atomic() {
+    var f = fixture_make()
+    var reg = text.journalset_new()
+    write_file(f.source, bytes_of("alpha\n"))
+    var (rc, tb, meta) = text.file_load(f.source)
+    assert(rc == text.LOAD_OK, "load")
+    fixture_repoint(mut f, meta.realpath)
+    var j = open_ok(mut reg, meta.realpath, mut meta)
+    assert(meta.journal_pinned, "pinned")
+    let before = fs_stat(f.source) else List[int]()
+    var base = fs_stat(f.base) else List[int]()
+    assert(before[10] == base[10], "base is the file")
+    text.textbuf_insert_str(mut tb, text.byteoff(text.textbuf_len(tb)), "saved\n")
+    assert(text.file_save(mut tb, mut meta, f.source) == text.SAVE_OK, "save")
+    assert(!meta.journal_pinned, "the save unpins")
+    let after = fs_stat(f.source) else List[int]()
+    assert(after[10] != before[10], "an atomic save: a new inode")
+    base = fs_stat(f.base) else List[int]()
+    assert(base[10] == before[10], "the base keeps the old inode")
+    assert(same(read_file(f.source), bytes_of("alpha\nsaved\n")), "saved bytes")
+    discard(mut reg, mut j, mut meta)
+    assert(!meta.journal_pinned, "still unpinned")
+    assert(!exists(f.base), "base gone")
+    text.filemeta_dispose(mut meta, mut tb)
+    text.textbuf_free(mut tb)
+    fixture_remove(f)
+}
+
+fn t_journal_truncated_at_every_byte_replays_valid_prefix() {
+    let f = fixture_make()
+    let reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    let complete = make_three_record_journal(f, mut meta)
+    let header_end = 60 + f.source.len
+    let first_end = header_end + 21 + 3
+    let second_end = first_end + 21 + 2
+    let third_end = second_end + 21 + 1
+    assert(complete.len == third_end, "the record layout")
+    var cut = 0
+    while cut <= complete.len {
+        var tb = text.textbuf_from_str("abcdef")
+        unlink_quiet(f.journal)
+        unlink_quiet(f.stale)
+        write_file(f.journal, complete[0..cut])
+        let replayed = text.journal_replay(reg, f.source, mut tb, mut meta)
+        assert(replayed == (cut >= header_end), "replayed at cut {cut}")
+        var expected = "abcdef"
+        if cut >= third_end {
+            expected = "aXYZdef!"
+        } else if cut >= second_end {
+            expected = "aXYZdef"
+        } else if cut >= first_end {
+            expected = "abcXYZdef"
+        }
+        assert_text(tb, expected)
+        text.textbuf_check(tb)
+        text.textbuf_free(mut tb)
+        cut += 1
+    }
+    fixture_remove(f)
+}
+
+fn t_journal_crc_failure_stops_before_corrupt_record() {
+    let f = fixture_make()
+    let reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var complete = make_three_record_journal(f, mut meta)
+    let header_end = 60 + f.source.len
+    let ends = [header_end + 24, header_end + 24 + 23, header_end + 24 + 23 + 22]
+    let expected = ["abcdef", "abcXYZdef", "aXYZdef"]
+    var i = 0
+    while i < 3 {
+        var tb = text.textbuf_from_str("abcdef")
+        let saved = complete[ends[i] - 1]
+        complete[ends[i] - 1] = (saved as int ^ 128) as byte
+        write_file(f.journal, complete)
+        assert(text.journal_replay(reg, f.source, mut tb, mut meta), "replays a prefix")
+        assert_text(tb, expected[i])
+        text.textbuf_check(tb)
+        complete[ends[i] - 1] = saved
+        fs_remove(f.journal) else {
+            assert(false, "unlink")
+        }
+        text.textbuf_free(mut tb)
+        i += 1
+    }
+    fixture_remove(f)
+}
+
+fn t_journal_stale_header_is_renamed_and_not_applied() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var tb = text.textbuf_from_str("abcdef")
+    var j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_INS, 6, "!")
+    let _ = text.journal_sync(mut j)
+    text.journal_close(mut reg, mut j)
+    var changed = copy meta
+    changed.size_on_disk += 1
+    assert(!text.journal_replay(reg, f.source, mut tb, mut changed), "not applied")
+    assert_text(tb, "abcdef")
+    assert(!exists(f.journal), "renamed away")
+    assert(exists(f.stale), "kept as .stale")
+    text.textbuf_free(mut tb)
+    fixture_remove(f)
+}
+
+fn t_journal_discard_removes_log() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var j = open_ok(mut reg, f.source, mut meta)
+    assert(exists(f.journal), "created")
+    discard(mut reg, mut j, mut meta)
+    assert(!exists(f.journal), "removed")
+    fixture_remove(f)
+}
+
+fn t_journal_replayed_log_can_be_adopted_and_discarded() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_INS, 6, "!")
+    let _ = text.journal_sync(mut j)
+    text.journal_close(mut reg, mut j)
+    var tb = text.textbuf_from_str("abcdef")
+    assert(text.journal_replay(reg, f.source, mut tb, mut meta), "replays")
+    assert_text(tb, "abcdef!")
+    text.textbuf_free(mut tb)
+    j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_INS, 7, "?")
+    let _ = text.journal_sync(mut j)
+    text.journal_close(mut reg, mut j)
+    tb = text.textbuf_from_str("abcdef")
+    assert(text.journal_replay(reg, f.source, mut tb, mut meta), "replays the adopted log")
+    assert_text(tb, "abcdef!?")
+    text.textbuf_free(mut tb)
+    j = open_ok(mut reg, f.source, mut meta)
+    discard(mut reg, mut j, mut meta)
+    assert(!exists(f.journal), "discarded")
+    fixture_remove(f)
+}
+
+fn t_journal_rejects_duplicate_in_process_owner() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var first = open_ok(mut reg, f.source, mut meta)
+    let (second, err) = text.journal_open(mut reg, f.source, mut meta)
+    assert(!second.open, "a second owner is refused")
+    assert(err == text.JERR_BUSY, "EBUSY")
+    text.journal_close(mut reg, mut first)
+    var again = open_ok(mut reg, f.source, mut meta)
+    discard(mut reg, mut again, mut meta)
+    fixture_remove(f)
+}
+
+fn t_journal_replay_refuses_hardlinked_log() {
+    let f = fixture_make()
+    var reg = text.journalset_new()
+    var meta = meta_init(f.source)
+    var j = open_ok(mut reg, f.source, mut meta)
+    record(mut j, text.JOURNAL_INS, 6, "!")
+    let _ = text.journal_sync(mut j)
+    text.journal_close(mut reg, mut j)
+    fs_link(f.journal, f.stale) else {
+        assert(false, "link")
+    }
+    var tb = text.textbuf_from_str("abcdef")
+    assert(!text.journal_replay(reg, f.source, mut tb, mut meta), "refused")
+    assert_text(tb, "abcdef")
+    assert(exists(f.journal), "journal kept")
+    assert(exists(f.stale), "link kept")
+    text.textbuf_free(mut tb)
+    fixture_remove(f)
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    t_journal_crc32_known_vectors_and_streaming()
+    t_journal_replays_insert_and_delete_records()
+    t_journal_delete_requires_and_removes_recorded_bytes()
+    t_journal_obsolete_leftover_is_replaced_not_fatal()
+    t_journal_recovers_replaced_file_from_pinned_base()
+    t_journal_preserves_legacy_log_and_base()
+    t_journal_pin_keeps_single_link_save_atomic()
+    t_journal_truncated_at_every_byte_replays_valid_prefix()
+    t_journal_crc_failure_stops_before_corrupt_record()
+    t_journal_stale_header_is_renamed_and_not_applied()
+    t_journal_discard_removes_log()
+    t_journal_replayed_log_can_be_adopted_and_discarded()
+    t_journal_rejects_duplicate_in_process_owner()
+    t_journal_replay_refuses_hardlinked_log()
+    print("journal_test: 14 cases pass")
+}
