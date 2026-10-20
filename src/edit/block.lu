@@ -1,54 +1,970 @@
-//! edit.block — STUB until the block fork lands (yw03-block): the B unit
-//! engine (`src/edit/block.c`).
+//! edit.block — the B unit engine: structural units chained by
+//! containment.
+//!
+//! Ports sagitta `src/edit/block.c` (1,058 lines) and `block.h` (29) at
+//! 9ace98c2, under `s16-modes-W-B.md`. A block is the smallest span some
+//! provider proposes that strictly contains the previous level: the
+//! bracket scope with its string and comment heuristics, the indentation
+//! block, the paragraph (and its section), and finally the whole buffer.
+//!
+//! **The providers' shape.** C keeps a registered array of
+//! `BlockProvider`s, each a name, a priority and an `enclosing` function
+//! pointer (`block.h:9-14`, `block.c:32-95`); `yew_block_register` lets
+//! the syntax layer swap its own in (`syn/synblock.c:339-345`). wolf
+//! refuses a function value across a module boundary on the release tier
+//! (G19/G20, wolf-lang#806), so the port's providers are KINDS in C's
+//! registration order (`ensure_providers`, `block.c:71-81`) and
+//! `block_provider_enclosing` is one `match` on the kind — the shape
+//! ruled at launch. Nothing registers a provider after start in C but the
+//! syntax install, so the set is fixed.
+//!
+//! **The syntax provider is inert until yw10.** No syntax engine exists in
+//! the port before campaign 08, and C's syntax provider answers nothing
+//! for a buffer without a settled engine (`synblock.c:291-296`), as does
+//! C's `yew_syn_in_string_or_comment` (`synblock.c:369-371`); so the
+//! port's `syn_block_enclosing`, `syn_in_string_or_comment` and
+//! `syn_exact_through` answer false and say so, and the code paths C takes
+//! when they answer true are ported beside them, so the day yw10 lands
+//! those three bodies change. `UnitCtx.has_lang` is C's `buf->lang !=
+//! NULL` — a language NAME, which a test sets without an engine
+//! (`test_block.c:543`, `:647`) — and is false for every editor buffer in
+//! yw03.
+//!
+//! **Memory.** C mallocs the scan window and the scope stack and frees
+//! them per call. A wolf function allocates in its caller's region, and
+//! the editor's caller is the session, so the scan's scratch lives in a
+//! `region` block inside `scope_pair` and `block_source_brace`; only
+//! integers leave it.
+//!
+//! `yew_unicode_is_white_space` is the word-break tables' (yw03's word
+//! half); this file calls the module's `unicode_is_white_space`, the name
+//! `motion.lu` calls.
 
 use text
 
-fn block_stub_touch(mut tb: text.TextBuf, p: int) -> int {
-    let at = motion_clamp(tb, p)
-    if at > 0 {
-        return text.grapheme_prev_boundary(mut tb, at as text.ByteOff) as int + at - at
+/// `YEW_BLOCK_SCAN_LINES` (`block.h:7`): the scope scan's half-window.
+pub const BLOCK_SCAN_LINES: int = 2000
+
+/// The syntax provider (priority 40), inert until yw10.
+pub const BLOCK_PROVIDER_SYNTAX: int = 0
+
+/// The bracket-scope provider (priority 30).
+pub const BLOCK_PROVIDER_SCOPE: int = 1
+
+/// The indentation provider (priority 20).
+pub const BLOCK_PROVIDER_INDENT: int = 2
+
+/// The paragraph provider (priority 10).
+pub const BLOCK_PROVIDER_PARAGRAPH: int = 3
+
+/// The number of providers, in C's registration order.
+pub const BLOCK_PROVIDER_COUNT: int = 4
+
+const INT_MIN: int = -9223372036854775807 - 1
+
+/// A provider's priority (`ensure_providers`, `block.c:71-81`).
+pub fn block_provider_priority(kind: int) -> int {
+    match kind {
+        0 => 40,
+        1 => 30,
+        2 => 20,
+        _ => 10,
+    }
+}
+
+/// A provider's name (`BlockProvider.name`).
+pub fn block_provider_name(kind: int) -> str {
+    match kind {
+        0 => "syntax",
+        1 => "scope",
+        2 => "indent",
+        _ => "paragraph",
+    }
+}
+
+/// One provider's proposal (`BlockProvider.enclosing`): the span it says
+/// encloses `p` past `inner`, or false.
+pub fn block_provider_enclosing(
+    kind: int,
+    tb: text.TextBuf,
+    u: UnitCtx,
+    p: int,
+    inner: text.Span,
+) -> (bool, text.Span) {
+    match kind {
+        0 => syn_block_enclosing(u, p, inner),
+        1 => scope_enclosing(tb, u, p, inner),
+        2 => indent_enclosing(tb, u, p, inner),
+        _ => paragraph_enclosing(tb, u, p, inner),
+    }
+}
+
+// The syntax provider (`syn/synblock.c:279-337`): the syntax engine's,
+// yw10. C's answers false unless the buffer's engine has settled the line
+// (`synblock.c:295-296`); no buffer has an engine before campaign 08.
+fn syn_block_enclosing(u: UnitCtx, p: int, inner: text.Span) -> (bool, text.Span) {
+    if u.has_lang && p < 0 {
+        bug("block: negative offset")
+    }
+    (false, text.span(inner.lo, inner.hi))
+}
+
+// `yew_syn_in_string_or_comment` (`syn/synblock.c:359-400`): false for a
+// buffer with no syntax engine (`synblock.c:369-371`), which is every
+// buffer until yw10.
+fn syn_in_string_or_comment(u: UnitCtx, off: int) -> bool {
+    if u.has_lang && off < 0 {
+        bug("block: negative offset")
+    }
+    false
+}
+
+// C's `syntax_exact` (`block.c:577-581`, `:784-790`): the buffer's engine
+// attached, not degraded, settled past `line`. Never before yw10.
+fn syn_exact_through(u: UnitCtx, line: int) -> bool {
+    if u.has_lang && line < 0 {
+        bug("block: negative line")
+    }
+    false
+}
+
+// `LineInfo` (`block.c:27-32`).
+struct LineInfo {
+    span: text.Span,
+    first: int,
+    indent: int,
+    blank: bool,
+}
+
+fn span_contains(outer: text.Span, inner: text.Span) -> bool {
+    if inner.lo == inner.hi {
+        return outer.lo <= inner.lo && inner.lo < outer.hi
+    }
+    outer.lo <= inner.lo && outer.hi >= inner.hi
+}
+
+fn span_strictly_contains(outer: text.Span, inner: text.Span) -> bool {
+    span_contains(outer, inner) && (outer.lo < inner.lo || outer.hi > inner.hi)
+}
+
+fn span_size(sp: text.Span) -> int {
+    sp.hi - sp.lo
+}
+
+// `line_info` (`block.c:137-162`): indent.lu's classifier in LineInfo's
+// historical shape — a blank line reports indent 0 and `first` at the line
+// start.
+fn line_info(tb: text.TextBuf, u: UnitCtx, line: int) -> LineInfo {
+    let sp = text.textbuf_line_span(tb, line as text.LineNo)
+    let tabwidth = if u.has_buf && u.tabwidth != 0 then u.tabwidth else 4
+    let info = indent_info(tb, sp, tabwidth)
+    if info.blank {
+        let lo = sp.lo
+        return LineInfo { span: sp, first: lo, indent: 0, blank: true }
+    }
+    LineInfo { span: sp, first: info.first, indent: info.width, blank: false }
+}
+
+fn line_blank(tb: text.TextBuf, u: UnitCtx, line: int) -> bool {
+    line_info(tb, u, line).blank
+}
+
+fn line_lo(tb: text.TextBuf, line: int) -> int {
+    text.textbuf_line_span(tb, line as text.LineNo).lo
+}
+
+fn line_hi(tb: text.TextBuf, line: int) -> int {
+    text.textbuf_line_span(tb, line as text.LineNo).hi
+}
+
+// `better_span` (`block.c:172-184`): smaller wins, then priority.
+fn better_span(
+    candidate: text.Span,
+    priority: int,
+    best: text.Span,
+    best_priority: int,
+    have_best: bool,
+) -> bool {
+    if !have_best {
+        return true
+    }
+    let candidate_size = span_size(candidate)
+    let best_size = span_size(best)
+    candidate_size < best_size || candidate_size == best_size && priority > best_priority
+}
+
+/// `yew_block_level` (`block.c:186-235`): the block `level` steps out
+/// from `p` (level 0 the innermost), saturating at the whole buffer.
+pub fn block_level(tb: text.TextBuf, u: UnitCtx, p_in: int, level: int) -> text.Span {
+    let len = text.textbuf_len(tb)
+    let p = if p_in > len then len else p_in
+    var inner = text.span(p, p)
+    var depth = 0
+    while depth <= level {
+        var best = text.span(0, 0)
+        var best_priority = INT_MIN
+        var have_best = false
+        var kind = 0
+        while kind < BLOCK_PROVIDER_COUNT {
+            let (ok, candidate) = block_provider_enclosing(kind, tb, u, p, inner)
+            if ok &&
+                candidate.lo <= candidate.hi &&
+                candidate.hi <= len &&
+                span_strictly_contains(candidate, inner) {
+                let priority = block_provider_priority(kind)
+                if better_span(candidate, priority, best, best_priority, have_best) {
+                    best = candidate
+                    best_priority = priority
+                    have_best = true
+                }
+            }
+            kind += 1
+        }
+        if !have_best {
+            let whole = text.span(0, len)
+            if span_strictly_contains(whole, inner) {
+                best = whole
+            } else {
+                return whole
+            }
+        }
+        inner = best
+        depth += 1
+    }
+    inner
+}
+
+// `paragraph_run` (`block.c:237-263`): the run of lines around `line`
+// sharing its blankness, and its first and last lines.
+fn paragraph_run(tb: text.TextBuf, u: UnitCtx, line_in: int) -> (bool, text.Span, int, int) {
+    let count = text.textbuf_line_count(tb)
+    if count == 0 {
+        return (false, text.span(0, 0), 0, 0)
+    }
+    let line = if line_in >= count then count - 1 else line_in
+    let blank = line_blank(tb, u, line)
+    var lo = line
+    while lo != 0 && line_blank(tb, u, lo - 1) == blank {
+        lo -= 1
+    }
+    var hi = line
+    while hi + 1 < count && line_blank(tb, u, hi + 1) == blank {
+        hi += 1
+    }
+    (true, text.span(line_lo(tb, lo), line_hi(tb, hi)), lo, hi)
+}
+
+// `paragraph_section` (`block.c:265-308`): the run of paragraphs between
+// two multi-blank-line gaps.
+fn paragraph_section(tb: text.TextBuf, u: UnitCtx, line: int) -> (bool, text.Span) {
+    let count = text.textbuf_line_count(tb)
+    var lo = 0
+    var hi = if count == 0 then 0 else count - 1
+    if count == 0 || line_blank(tb, u, line) {
+        return (false, text.span(0, 0))
+    }
+    var cursor = 0
+    while cursor < line {
+        if line_blank(tb, u, cursor) {
+            var end = cursor
+            while end + 1 < count && line_blank(tb, u, end + 1) {
+                end += 1
+            }
+            if end > cursor && end < line {
+                lo = end + 1
+            }
+            cursor = end + 1
+        } else {
+            cursor += 1
+        }
+    }
+    cursor = line + 1
+    while cursor < count {
+        if line_blank(tb, u, cursor) {
+            var end = cursor
+            while end + 1 < count && line_blank(tb, u, end + 1) {
+                end += 1
+            }
+            if end > cursor {
+                hi = cursor - 1
+                break
+            }
+            cursor = end + 1
+        } else {
+            cursor += 1
+        }
+    }
+    if lo > hi {
+        return (false, text.span(0, 0))
+    }
+    (true, text.span(line_lo(tb, lo), line_hi(tb, hi)))
+}
+
+// `paragraph_enclosing` (`block.c:310-331`).
+fn paragraph_enclosing(tb: text.TextBuf, u: UnitCtx, p: int, inner: text.Span) -> (
+    bool,
+    text.Span,
+) {
+    let line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    let (ok, run, _, _) = paragraph_run(tb, u, line)
+    if !ok {
+        return (false, text.span(0, 0))
+    }
+    if span_strictly_contains(run, inner) {
+        return (true, run)
+    }
+    let (sok, section) = paragraph_section(tb, u, line)
+    if sok && span_strictly_contains(section, inner) {
+        return (true, section)
+    }
+    (false, text.span(0, 0))
+}
+
+// `indent_candidate` (`block.c:333-391`): the indentation run around
+// `target` at `threshold`, trailing blank lines left out.
+fn indent_candidate(
+    tb: text.TextBuf,
+    u: UnitCtx,
+    target: int,
+    threshold: int,
+    include_equal: bool,
+) -> text.Span {
+    let count = text.textbuf_line_count(tb)
+    var lo = target
+    var hi = target
+    var committed_hi = target
+    if include_equal && threshold == 0 {
+        var first = 0
+        var last = count - 1
+        while first < count {
+            if !line_info(tb, u, first).blank {
+                break
+            }
+            first += 1
+        }
+        while last > first {
+            if !line_info(tb, u, last).blank {
+                break
+            }
+            last -= 1
+        }
+        if first < count {
+            return text.span(line_lo(tb, first), line_hi(tb, last))
+        }
+    }
+    while include_equal && lo != 0 {
+        let info = line_info(tb, u, lo - 1)
+        if !info.blank && info.indent < threshold {
+            break
+        }
+        lo -= 1
+    }
+    var at = target
+    while at < count {
+        let info = line_info(tb, u, at)
+        if !info.blank &&
+            (
+                info.indent < threshold ||
+                    !include_equal && at != target && info.indent == threshold
+            ) {
+            break
+        }
+        hi = at
+        if !info.blank {
+            committed_hi = at
+        }
+        at += 1
+    }
+    while lo < target {
+        if !line_info(tb, u, lo).blank {
+            break
+        }
+        lo += 1
+    }
+    hi = committed_hi
+    text.span(line_lo(tb, lo), line_hi(tb, hi))
+}
+
+// `indent_enclosing` (`block.c:393-483`).
+fn indent_enclosing(tb: text.TextBuf, u: UnitCtx, p: int, inner: text.Span) -> (bool, text.Span) {
+    let count = text.textbuf_line_count(tb)
+    let line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    var target = line
+    var best = text.span(0, 0)
+    var have_best = false
+    if count == 0 {
+        return (false, best)
+    }
+    var target_info = line_info(tb, u, target)
+    if target_info.blank {
+        var found = false
+        var at = target
+        while at != 0 {
+            target_info = line_info(tb, u, at - 1)
+            if !target_info.blank {
+                target = at - 1
+                found = true
+                break
+            }
+            at -= 1
+        }
+        if !found {
+            at = target + 1
+            while at < count {
+                target_info = line_info(tb, u, at)
+                if !target_info.blank {
+                    target = at
+                    found = true
+                    break
+                }
+                at += 1
+            }
+        }
+        if !found {
+            return (false, best)
+        }
+    }
+    // At level zero an unindented line yields nothing smaller than its
+    // paragraph (`block.c:432-437`).
+    if target_info.indent == 0 && inner.lo == inner.hi {
+        return (false, best)
+    }
+    let candidate = indent_candidate(tb, u, target, target_info.indent, true)
+    if span_strictly_contains(candidate, inner) {
+        best = candidate
+        have_best = true
+    }
+    var search = target
+    var child_indent = target_info.indent
+    while search != 0 {
+        var found = false
+        var header_indent = 0
+        var at = search
+        while at != 0 {
+            let header = line_info(tb, u, at - 1)
+            if !header.blank && header.indent < child_indent {
+                search = at - 1
+                header_indent = header.indent
+                found = true
+                break
+            }
+            at -= 1
+        }
+        if !found {
+            break
+        }
+        let outer = indent_candidate(tb, u, search, header_indent, false)
+        if span_strictly_contains(outer, inner) &&
+            (!have_best || span_size(outer) < span_size(best)) {
+            best = outer
+            have_best = true
+        }
+        child_indent = header_indent
+    }
+    if !have_best {
+        return (false, best)
+    }
+    (true, best)
+}
+
+// `escaped_at` (`block.c:485-492`): an odd run of backslashes before
+// `bytes[pos]`, within the line that starts at `base`.
+fn escaped_at(bytes: List[byte], base: int, pos_in: int) -> bool {
+    var slashes = 0
+    var pos = pos_in
+    while pos != base {
+        pos -= 1
+        if bytes[pos] as int != 92 {
+            break
+        }
+        slashes += 1
+    }
+    slashes % 2 != 0
+}
+
+// `quote_count` (`block.c:494-503`): unescaped `quote` bytes in the line
+// `bytes[base..base+len)`.
+fn quote_count(bytes: List[byte], base: int, len: int, quote: int) -> int {
+    var count = 0
+    var i = 0
+    while i < len {
+        if bytes[base + i] as int == quote && !escaped_at(bytes, base, base + i) {
+            count += 1
+        }
+        i += 1
+    }
+    count
+}
+
+// `opener_for` (`block.c:505-519`).
+fn opener_for(close: int) -> (bool, int) {
+    if close == 41 {
+        return (true, 40)
+    }
+    if close == 93 {
+        return (true, 91)
+    }
+    if close == 125 {
+        return (true, 123)
+    }
+    (false, 0)
+}
+
+fn is_open(b: int) -> bool {
+    b == 40 || b == 91 || b == 123
+}
+
+fn is_close(b: int) -> bool {
+    b == 41 || b == 93 || b == 125
+}
+
+// `scope_window_has_delimiter` (`block.c:526-536`).
+fn scope_window_has_delimiter(bytes: List[byte]) -> bool {
+    for b in bytes {
+        let x = b as int
+        if is_open(x) || is_close(x) {
+            return true
+        }
+    }
+    false
+}
+
+// The length of the line at `bytes[base..base+raw_len)` without its LF or
+// CRLF (`line_content_hi` over a copied line, `block.c:125-135`).
+fn bytes_content_len(bytes: List[byte], base: int, raw_len: int) -> int {
+    var len = raw_len
+    if len != 0 && bytes[base + len - 1] as int == 10 {
+        len -= 1
+        if len != 0 && bytes[base + len - 1] as int == 13 {
+            len -= 1
+        }
+    }
+    len
+}
+
+// `ScopeOpen` (`block.c:16-19`).
+struct ScopeOpen {
+    b: int,
+    off: int,
+}
+
+// `scope_pair` (`block.c:552-693`): the smallest bracket pair within the
+// scan window that contains `p` and strictly contains `inner`, quoted
+// text and comments skipped by heuristics (or by the syntax engine,
+// yw10); (found, the pair's span, the opener's offset, the closer's).
+fn scope_pair(tb: text.TextBuf, u: UnitCtx, p: int, inner: text.Span) -> (
+    bool,
+    text.Span,
+    int,
+    int,
+) {
+    let count = text.textbuf_line_count(tb)
+    let center = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    let first = if center > BLOCK_SCAN_LINES then center - BLOCK_SCAN_LINES else 0
+    var last = center + BLOCK_SCAN_LINES
+    if last >= count || last < center {
+        last = count - 1
+    }
+    let window_lo = line_lo(tb, first)
+    let window_hi = line_hi(tb, last)
+    let syntax_exact = syn_exact_through(u, last)
+    var have_best = false
+    var best_lo = 0
+    var best_hi = 0
+    var best_open = 0
+    var best_close = 0
+    region scan {
+        let bytes = text.textbuf_copy_range(tb, window_lo, window_hi)
+        let window_len = bytes.len
+        if scope_window_has_delimiter(bytes) {
+            var stack = List[ScopeOpen]()
+            var block_comment = false
+            var cursor = 0
+            while cursor < window_len {
+                var raw_len = 0
+                while cursor + raw_len < window_len {
+                    raw_len += 1
+                    if bytes[cursor + raw_len - 1] as int == 10 {
+                        break
+                    }
+                }
+                let line_at = window_lo + cursor
+                let len = bytes_content_len(bytes, cursor, raw_len)
+                let singles = quote_count(bytes, cursor, len, 39)
+                let doubles = quote_count(bytes, cursor, len, 34)
+                var quote = 0
+                var i = 0
+                while i < len {
+                    let b = bytes[cursor + i] as int
+                    let nx = if i + 1 < len then bytes[cursor + i + 1] as int else -1
+                    var consider = true
+                    if syntax_exact {
+                        let (closer, _) = opener_for(b)
+                        if !is_open(b) && !closer || syn_in_string_or_comment(u, line_at + i) {
+                            consider = false
+                        }
+                    } else if block_comment {
+                        if b == 42 && nx == 47 {
+                            block_comment = false
+                            i += 1
+                        }
+                        consider = false
+                    } else if quote != 0 {
+                        if b == 92 && i + 1 < len {
+                            i += 1
+                        } else if b == quote {
+                            quote = 0
+                        }
+                        consider = false
+                    } else if b == 47 && nx == 42 {
+                        block_comment = true
+                        i += 1
+                        consider = false
+                    } else if b == 47 && nx == 47 || b == 45 && nx == 45 || b == 35 || b == 59 {
+                        break
+                    } else if b == 39 && singles != 0 && singles % 2 == 0 ||
+                        b == 34 && doubles != 0 && doubles % 2 == 0 {
+                        quote = b
+                        consider = false
+                    }
+                    if consider {
+                        if is_open(b) {
+                            (mut stack).push(ScopeOpen { b: b, off: line_at + i })
+                        } else {
+                            let (closer, wanted) = opener_for(b)
+                            if closer && stack.len != 0 && stack[stack.len - 1].b == wanted {
+                                let open = (mut stack).pop() else ScopeOpen { b: 0, off: 0 }
+                                let candidate = text.span(open.off, line_at + i + 1)
+                                if candidate.lo <= p &&
+                                    p < candidate.hi &&
+                                    span_strictly_contains(candidate, inner) &&
+                                    (!have_best || span_size(candidate) < best_hi - best_lo) {
+                                    best_lo = candidate.lo
+                                    best_hi = candidate.hi
+                                    best_open = open.off
+                                    best_close = line_at + i
+                                    have_best = true
+                                }
+                            }
+                        }
+                    }
+                    i += 1
+                }
+                cursor += raw_len
+            }
+        }
+    }
+    (have_best, text.span(best_lo, best_hi), best_open, best_close)
+}
+
+// `scope_enclosing` (`block.c:695-700`).
+fn scope_enclosing(tb: text.TextBuf, u: UnitCtx, p: int, inner: text.Span) -> (bool, text.Span) {
+    let (ok, pair, _, _) = scope_pair(tb, u, p, inner)
+    (ok, pair)
+}
+
+/// `yew_block_match` (`block.c:702-717`): the opener (or, `next`, the
+/// closer) of the innermost bracket pair around `p`, or false.
+pub fn block_match(tb: text.TextBuf, u: UnitCtx, p_in: int, next: bool) -> (bool, int) {
+    let len = text.textbuf_len(tb)
+    let p = if p_in > len then len else p_in
+    let (ok, _, open_off, close_off) = scope_pair(tb, u, p, text.span(p, p))
+    if !ok {
+        return (false, 0)
+    }
+    (true, if next then close_off else open_off)
+}
+
+// `cluster_white_at` (`block.c:719-726`).
+fn cluster_white_at(tb: text.TextBuf, at: int) -> bool {
+    let line = text.textbuf_line_span(tb, text.textbuf_line_of(tb, at as text.ByteOff))
+    let (ok, cl) = text.text_cluster_next(tb, line, at as text.ByteOff)
+    ok && unicode_is_white_space(cl.base_cp)
+}
+
+fn skip_white_next(tb: text.TextBuf, at_in: int) -> int {
+    let len = text.textbuf_len(tb)
+    var at = at_in
+    while at < len && cluster_white_at(tb, at) {
+        at = text.grapheme_next_boundary(tb, at as text.ByteOff) as int
     }
     at
 }
 
-fn block_stub(u: UnitCtx, alt: bool) {
-    if u.has_win && alt {
-        bug("unreachable")
+fn skip_white_prev(mut tb: text.TextBuf, at_in: int) -> int {
+    var at = at_in
+    while at != 0 {
+        let prev = text.grapheme_prev_boundary(mut tb, at as text.ByteOff) as int
+        if !cluster_white_at(tb, prev) {
+            break
+        }
+        at = prev
     }
-    bug("not yet ported: the block unit engine (yw03-block)")
-}
-
-// stub: `block_next` until the fork lands.
-fn block_next(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    block_stub(u, alt)
-    let at = block_stub_touch(mut tb, p)
     at
 }
 
-// stub: `block_prev` until the fork lands.
-fn block_prev(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    block_stub(u, alt)
-    let at = block_stub_touch(mut tb, p)
-    at
-}
-
-// stub: `block_home` until the fork lands.
-fn block_home(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    block_stub(u, alt)
-    let at = block_stub_touch(mut tb, p)
-    at
-}
-
-// stub: `block_end` until the fork lands.
-fn block_end(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
-    block_stub(u, alt)
-    let at = block_stub_touch(mut tb, p)
-    at
-}
-
-// stub: `block_span` until the fork lands.
+// `block_span` (`block.c:749-782`): for a buffer with a language, the
+// scope at `p` or the one just before it (whitespace absorbed to the
+// next non-blank); otherwise level 0. `alt` changes nothing (C's
+// `(void)alt`).
 fn block_span(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> text.Span {
-    block_stub(u, alt)
-    let at = block_stub_touch(mut tb, p)
-    text.span(at, at)
+    let len = text.textbuf_len(tb)
+    if u.has_buf && u.has_lang && !syn_in_string_or_comment(u, p) {
+        if p < len {
+            let (ok, sp, _, _) = scope_pair(tb, u, p, text.span(p, p))
+            if ok {
+                return sp
+            }
+        }
+        if p != 0 {
+            let before = skip_white_prev(mut tb, p)
+            if before != 0 {
+                let probe = text.grapheme_prev_boundary(mut tb, before as text.ByteOff) as int
+                let (ok, sp, _, _) = scope_pair(tb, u, probe, text.span(probe, probe))
+                if ok {
+                    let after = skip_white_next(tb, sp.hi)
+                    if after > p || p == len && after == p {
+                        return text.span(sp.lo, after)
+                    }
+                }
+            }
+        }
+    }
+    block_level(tb, u, p, 0)
+}
+
+// `block_byte_at` (`block.c:792-801`).
+fn block_byte_at(tb: text.TextBuf, off: int) -> (bool, int) {
+    if off < 0 || off >= text.textbuf_len(tb) {
+        return (false, 0)
+    }
+    (true, text.textbuf_byte_at(tb, off))
+}
+
+// `block_continuation_byte` (`block.c:808-830`).
+fn block_continuation_byte(b: int) -> bool {
+    match b {
+        92 => true,
+        46 => true,
+        61 => true,
+        43 => true,
+        45 => true,
+        42 => true,
+        47 => true,
+        37 => true,
+        38 => true,
+        124 => true,
+        94 => true,
+        33 => true,
+        63 => true,
+        60 => true,
+        62 => true,
+        _ => false,
+    }
+}
+
+// `block_source_brace` (`block.c:832-921`): the line's first structural
+// `{` (not after a match-arm `=>`, not quoted or commented).
+fn block_source_brace(tb: text.TextBuf, u: UnitCtx, line_no: int, info: LineInfo) -> (bool, int) {
+    if info.span.hi == info.span.lo {
+        return (false, 0)
+    }
+    let syntax_exact = syn_exact_through(u, line_no)
+    var found = false
+    var at_off = 0
+    region scan {
+        let bytes = text.textbuf_copy_range(tb, info.span.lo, info.span.hi)
+        let len = bytes_content_len(bytes, 0, bytes.len)
+        let singles = quote_count(bytes, 0, len, 39)
+        let doubles = quote_count(bytes, 0, len, 34)
+        var block_comment = false
+        var arm = false
+        var quote = 0
+        var i = 0
+        while i < len {
+            let b = bytes[i] as int
+            let nx = if i + 1 < len then bytes[i + 1] as int else -1
+            let here = info.span.lo + i
+            if syntax_exact {
+                if b == 61 && nx == 62 && !syn_in_string_or_comment(u, here) {
+                    arm = true
+                }
+                if b == 123 && !arm && !syn_in_string_or_comment(u, here) {
+                    found = true
+                    at_off = here
+                    break
+                }
+            } else if block_comment {
+                if b == 42 && nx == 47 {
+                    block_comment = false
+                    i += 1
+                }
+            } else if quote != 0 {
+                if b == 92 && i + 1 < len {
+                    i += 1
+                } else if b == quote {
+                    quote = 0
+                }
+            } else if b == 47 && nx == 42 {
+                block_comment = true
+                i += 1
+            } else if b == 47 && nx == 47 ||
+                b == 45 && nx == 45 && here == info.first ||
+                (b == 35 || b == 59) && here == info.first {
+                break
+            } else if b == 39 && singles != 0 && singles % 2 == 0 ||
+                b == 34 && doubles != 0 && doubles % 2 == 0 {
+                quote = b
+            } else if b == 61 && nx == 62 {
+                arm = true
+                i += 1
+            } else if b == 123 && !arm {
+                found = true
+                at_off = here
+                break
+            }
+            i += 1
+        }
+    }
+    (found, at_off)
+}
+
+// `block_indent_header` (`block.c:923-945`): a line that opens an
+// indentation block (the next non-blank line is deeper), not a
+// continuation or a closer.
+fn block_indent_header(tb: text.TextBuf, u: UnitCtx, line: int, current: LineInfo) -> bool {
+    let count = text.textbuf_line_count(tb)
+    if current.blank {
+        return false
+    }
+    let (fok, first) = block_byte_at(tb, current.first)
+    if !fok || first == 125 || first == 41 || first == 93 {
+        return false
+    }
+    let (lok, last) = indent_last_nonwhite(tb, current.span)
+    if !lok || block_continuation_byte(last) || last == 40 || last == 91 || last == 44 {
+        return false
+    }
+    var at = line + 1
+    while at < count {
+        let next = line_info(tb, u, at)
+        if !next.blank {
+            return next.indent > current.indent
+        }
+        at += 1
+    }
+    false
+}
+
+// `block_source_landmark` (`block.c:947-961`).
+fn block_source_landmark(tb: text.TextBuf, u: UnitCtx, line: int) -> (bool, int) {
+    let info = line_info(tb, u, line)
+    if info.blank {
+        return (false, 0)
+    }
+    let (bok, brace) = block_source_brace(tb, u, line, info)
+    if bok {
+        return (true, brace)
+    }
+    if block_indent_header(tb, u, line, info) {
+        return (true, info.first)
+    }
+    (false, 0)
+}
+
+// `block_plain_next` (`block.c:963-975`).
+fn block_plain_next(tb: text.TextBuf, u: UnitCtx, p: int) -> int {
+    let len = text.textbuf_len(tb)
+    let line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    let (_, run, _, _) = paragraph_run(tb, u, line)
+    if run.hi > p {
+        return run.hi
+    }
+    if p >= len {
+        return len
+    }
+    text.grapheme_next_boundary(tb, p as text.ByteOff) as int
+}
+
+// `block_plain_prev` (`block.c:977-996`).
+fn block_plain_prev(tb: text.TextBuf, u: UnitCtx, p: int) -> int {
+    if p == 0 {
+        return 0
+    }
+    var line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    if line_lo(tb, line) >= p {
+        if line == 0 {
+            return 0
+        }
+        line -= 1
+    }
+    let (_, run, _, _) = paragraph_run(tb, u, line)
+    if run.lo < p {
+        return run.lo
+    }
+    0
+}
+
+// `block_home`, `block_end` (`block.c:998-1006`).
+fn block_home(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
+    block_span(mut tb, u, p, alt).lo
+}
+
+fn block_end(mut tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
+    block_span(mut tb, u, p, alt).hi
+}
+
+// `block_next` (`block.c:1008-1029`): the next structural landmark in a
+// buffer with a language (within the scan budget), else the next
+// paragraph boundary. `alt` changes nothing (C's `(void)alt`).
+fn block_next(tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
+    let len = text.textbuf_len(tb)
+    let count = text.textbuf_line_count(tb)
+    if p >= len {
+        return len
+    }
+    if !u.has_buf || !u.has_lang {
+        return block_plain_next(tb, u, p)
+    }
+    var line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    var scanned = 0
+    while line < count {
+        scanned += 1
+        if scanned > BLOCK_SCAN_LINES {
+            break
+        }
+        let (ok, home) = block_source_landmark(tb, u, line)
+        if ok && home > p {
+            return home
+        }
+        line += 1
+    }
+    len
+}
+
+// `block_prev` (`block.c:1031-1052`).
+fn block_prev(tb: text.TextBuf, u: UnitCtx, p: int, alt: bool) -> int {
+    if p == 0 {
+        return 0
+    }
+    if !u.has_buf || !u.has_lang {
+        return block_plain_prev(tb, u, p)
+    }
+    var line = text.textbuf_line_of(tb, p as text.ByteOff) as int
+    var scanned = 0
+    loop {
+        scanned += 1
+        if scanned > BLOCK_SCAN_LINES {
+            break
+        }
+        let (ok, home) = block_source_landmark(tb, u, line)
+        if ok && home < p {
+            return home
+        }
+        if line == 0 {
+            break
+        }
+        line -= 1
+    }
+    0
 }
