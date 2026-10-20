@@ -1,0 +1,1044 @@
+//! edit.ed — the editor: buffers, windows, tabs, the edit seam, damage,
+//! prompts, save and quit.
+//!
+//! Ports sagitta `src/edit/ed.c` (3,142 lines) and `ed.h` (513) at
+//! 9ace98c2, under `s14-modes-L-I.md` — the parts campaign 03 reaches. C's
+//! `Ed` holds a pane tree of `Win *`, a workspace of `Buffer *` and a tab
+//! array, each by pointer; the port's `Ed` holds them as lists and refers
+//! by index (`Win.buf`, `Ed.win`), one tab per open file, one window
+//! (panes, splits and tab switching are campaign 05's, yw05).
+//!
+//! **The ownership seam** (contract deliverable 2). yw02's `text.EditCtx`
+//! OWNS the text, marks, journal, undo tree and file metadata, so each
+//! `Buffer` owns one `EditCtx` for its life, with a SPARE cursor set in
+//! its `cset` slot; the window owns the real `CursorSet`, and the editor
+//! owns the one `JournalSet` (C's process-wide journal owner list). An
+//! edit swaps the window's set and the editor's journal list into the
+//! buffer's context through a local and swaps them back
+//! (`edit_take`/`edit_give`): no allocation, measured (`notes/yw03`; a
+//! fresh empty set per edit would hold 48 bytes for the session, G33).
+//!
+//! What C's `Ed` carries for later campaigns — the workspace state and
+//! symbol index (yw06/yw11), jobs and the shell session (yw04), LSP, AI,
+//! git, plugins, Fletch (yw07+), search (yw04), the mouse (yw06) — lands
+//! with them; a command that reaches one refuses by name (`edit.cmd`).
+
+use term
+use text
+use util
+
+/// A scratch buffer (`YEW_BUF_SCRATCH`, `buf.h:6-10`).
+pub const BUF_SCRATCH: int = 1
+
+/// Edits are not recorded for undo (`YEW_BUF_NOUNDO`).
+pub const BUF_NOUNDO: int = 2
+
+/// Read-only (`YEW_BUF_READONLY`).
+pub const BUF_READONLY: int = 4
+
+/// No prompt (`PromptKind`, `ed.h:47-56`).
+pub const PROMPT_NONE: int = 0
+
+/// The crash-journal recovery prompt.
+pub const PROMPT_RECOVER: int = 1
+
+/// The dirty-quit prompt.
+pub const PROMPT_QUIT_DIRTY: int = 2
+
+/// The changed-on-disk overwrite prompt.
+pub const PROMPT_OVERWRITE: int = 3
+
+/// An information message (`MsgSev`, `message.h:9-13`).
+pub const MSG_INFO: int = 0
+
+/// A warning.
+pub const MSG_WARN: int = 1
+
+/// An error.
+pub const MSG_ERROR: int = 2
+
+/// The editor's buffer (`Buffer`, `edit/buf.h:12-52`): its edit context
+/// (the text and everything that rides it) and C's scalars.
+pub struct Buffer {
+    id: int,
+    ec: text.EditCtx,
+    resident: bool,
+    path: str,
+    has_path: bool,
+    name: str,
+    has_name: bool,
+    flags: int,
+    tabwidth: int,
+    recovery_pending: bool,
+    pairs: PairState,
+}
+
+/// A tab (`Tab`, `ui/tabs.h`): the buffer it shows, its own window (C's
+/// one-leaf pane tree), its canonical path and the path it displays.
+pub struct Tab {
+    tab_id: int,
+    buffer_id: int,
+    win: int,
+    path: str,
+    display_path: str,
+    has_path: bool,
+}
+
+/// A message (`Msg`, `message.h:15-25`).
+pub struct Msg {
+    text: str,
+    sev: int,
+    expiry: int,
+    active: bool,
+    prompt: bool,
+    truncated: bool,
+    expanded: bool,
+}
+
+/// No message.
+pub fn msg_none() -> Msg {
+    Msg {
+        text: "",
+        sev: MSG_INFO,
+        expiry: 0,
+        active: false,
+        prompt: false,
+        truncated: false,
+        expanded: false,
+    }
+}
+
+/// The key chord in flight (`Chord`, `dispatch.h:13-21`).
+pub struct Chord {
+    seq: List[int],
+    n: int,
+    layer: int,
+    count: int,
+    count_given: bool,
+    deadline: int,
+}
+
+/// The editor (`struct Ed`, `ed.h:213-416`), the fields campaign 03 uses.
+pub struct Ed {
+    tty: term.Tty,
+    input: term.In,
+    grid: term.Grid,
+    render: term.Render,
+    frame: List[byte],
+    reg: CmdReg,
+    keymaps: List[Keymap],
+    keys: List[int],
+    chord: Chord,
+    capture_cmd: int,
+    capture_count: int,
+    capture_count_given: bool,
+    chord_timeout_ms: int,
+    last_cmd: int,
+    last_status: int,
+    dispatch_count: int,
+    invoke_seq: int,
+    dispatch_message: str,
+    now_ms: int,
+    bufs: List[Buffer],
+    next_buf_id: int,
+    wins: List[Win],
+    win: int,
+    next_win_id: int,
+    tabs: List[Tab],
+    tab_active: int,
+    next_tab_id: int,
+    tab_scroll: int,
+    journals: text.JournalSet,
+    regs: text.Registers,
+    yank: text.YankStack,
+    mode: int,
+    prev_unit: int,
+    timers: TimerHeap,
+    msg: Msg,
+    msg_hint: Msg,
+    cmdline: CmdLine,
+    prompt: int,
+    quit_after_save: bool,
+    insert_txn: bool,
+    durability_failed: bool,
+    paste_active: bool,
+    paste: List[byte],
+    quit: bool,
+    exit_code: int,
+    layout_dirty: bool,
+    full_damage: bool,
+    footer_dirty: bool,
+    cursor_follow_pending: bool,
+    doc_damage_lo: int,
+    doc_damage_hi: int,
+    damage_batching: bool,
+    damage_batch_pending: bool,
+    damage_batch_full: bool,
+    damage_batch_line_pending: bool,
+    damage_batch_row_pending: bool,
+    damage_batch_win: int,
+    damage_batch_lines: int,
+    damage_batch_gen: int,
+    damage_batch_line_lo: int,
+    cursor_overlay_damage_complete: bool,
+    drawn_top: int,
+    drawn_top_sub: int,
+    drawn_left: int,
+    drawn_wrap: bool,
+    drawn_cursor_line: int,
+    drawn_cursor_line_valid: bool,
+    drawn_top_valid: bool,
+    drawn_tab_marks: str,
+    overlay_sig: List[int],
+    overlay_valid: bool,
+    overlay_primary_pos: int,
+    overlay_primary_anchor: int,
+    overlay_primary_valid: bool,
+    theme: Theme,
+    opts: Opts,
+    config_error: str,
+    config_globals: Map[str, str],
+    footer_rect: Rect,
+    tab_strip_rect: Rect,
+    headless: bool,
+    clean: bool,
+    undo_break_on_newline: bool,
+    errorbells: bool,
+    ws_dir: str,
+    model_ready: bool,
+    tty_ready: bool,
+    input_ready: bool,
+    probe_seeded: bool,
+    grid_ready: bool,
+    render_ready: bool,
+}
+
+// The keymap pool's layout: mode keymaps (the panic floor, H's motions),
+// the user layer, the config layer per mode (`ed->mode_keys[]`,
+// `ed->user_keys`, `ed->bind_keys[]`).
+fn km_mode(m: int) -> int {
+    m
+}
+
+fn km_user() -> int {
+    MODE_N
+}
+
+fn km_bind(m: int) -> int {
+    MODE_N + 1 + m
+}
+
+/// A headless editor with no buffer (`yew_ed_init`, `ed.c:728-806`): the
+/// registry built, the panic keymaps installed (`yew_dispatch_init`), the
+/// config layer empty (`yew_bind_init`), the descriptor defaults.
+pub fn ed_new() -> Ed {
+    let reg = cmdreg_builtin()
+    var keymaps = List[Keymap]()
+    var m = 0
+    while m < MODE_N {
+        let (ok, km) = keymap_build(reg, mode_name(m), keys_panic(m))
+        if !ok {
+            bug("invalid panic {mode_name(m)}-mode key table")
+        }
+        (mut keymaps).push(km)
+        m += 1
+    }
+    let (uok, user) = keymap_build(reg, "user", List[BindRow]())
+    if !uok {
+        bug("cannot build empty user key table")
+    }
+    (mut keymaps).push(user)
+    var b = 0
+    while b < MODE_N {
+        let (cok, cfg) = keymap_build(reg, "config", List[BindRow]())
+        if !cok {
+            bug("cannot build empty config keymap")
+        }
+        (mut keymaps).push(cfg)
+        b += 1
+    }
+    var keys = List[int]()
+    (mut keys).push(km_mode(MODE_L))
+    (mut keys).push(km_user())
+    (mut keys).push(km_bind(MODE_L))
+    var ed = Ed {
+        tty: term.tty_new(),
+        input: term.input_new(term.caps_new()),
+        grid: term.grid_new(1, 1),
+        render: term.render_new(term.caps_new(), term.env_process()),
+        frame: List[byte](),
+        reg: reg,
+        keymaps: keymaps,
+        keys: keys,
+        chord: Chord {
+            seq: List[int](),
+            n: 0,
+            layer: -1,
+            count: 0,
+            count_given: false,
+            deadline: 0,
+        },
+        capture_cmd: 0,
+        capture_count: 0,
+        capture_count_given: false,
+        chord_timeout_ms: dispatch_timeout_from_env(),
+        last_cmd: 0,
+        last_status: CMD_OK,
+        dispatch_count: 0,
+        invoke_seq: 0,
+        dispatch_message: "",
+        now_ms: 0,
+        bufs: List[Buffer](),
+        next_buf_id: 1,
+        wins: List[Win](),
+        win: -1,
+        next_win_id: 1,
+        tabs: List[Tab](),
+        tab_active: -1,
+        next_tab_id: 1,
+        tab_scroll: 0,
+        journals: text.journalset_new(),
+        regs: text.reg_new(),
+        yank: text.yank_new(),
+        mode: MODE_L,
+        prev_unit: MODE_L,
+        timers: timers_new(),
+        msg: msg_none(),
+        msg_hint: msg_none(),
+        cmdline: cmdline_new(),
+        prompt: PROMPT_NONE,
+        quit_after_save: false,
+        insert_txn: false,
+        durability_failed: false,
+        paste_active: false,
+        paste: List[byte](),
+        quit: false,
+        exit_code: util.EXIT_OK,
+        layout_dirty: true,
+        full_damage: true,
+        footer_dirty: true,
+        cursor_follow_pending: false,
+        doc_damage_lo: 0,
+        doc_damage_hi: 0,
+        damage_batching: false,
+        damage_batch_pending: false,
+        damage_batch_full: false,
+        damage_batch_line_pending: false,
+        damage_batch_row_pending: false,
+        damage_batch_win: -1,
+        damage_batch_lines: 0,
+        damage_batch_gen: 0,
+        damage_batch_line_lo: 0,
+        cursor_overlay_damage_complete: false,
+        drawn_top: 0,
+        drawn_top_sub: 0,
+        drawn_left: 0,
+        drawn_wrap: false,
+        drawn_cursor_line: 0,
+        drawn_cursor_line_valid: false,
+        drawn_top_valid: false,
+        drawn_tab_marks: "",
+        overlay_sig: List[int](),
+        overlay_valid: false,
+        overlay_primary_pos: 0,
+        overlay_primary_anchor: 0,
+        overlay_primary_valid: false,
+        theme: theme_none(),
+        opts: opts_default(),
+        config_error: "",
+        config_globals: Map[str, str](),
+        footer_rect: rect(0, 0, 0, 0),
+        tab_strip_rect: rect(0, 0, 0, 0),
+        headless: false,
+        clean: false,
+        undo_break_on_newline: true,
+        errorbells: false,
+        ws_dir: ".",
+        model_ready: false,
+        tty_ready: false,
+        input_ready: false,
+        probe_seeded: false,
+        grid_ready: false,
+        render_ready: false,
+    }
+    ed.chord_timeout_ms = dispatch_timeout_from_env()
+    keys_highlight_install(mut ed, MODE_L)
+    ed
+}
+
+/// `yew_keys_highlight_install` (`keys_highlight.c:96-137`): H's keymap
+/// rebuilt for `unit`.
+pub fn keys_highlight_install(mut ed: Ed, unit: int) {
+    let (ok, km) = keymap_build(ed.reg, "H", keys_highlight(unit))
+    if !ok {
+        bug("invalid built-in H-mode key table")
+    }
+    ed.keymaps[km_mode(MODE_H)] = km
+}
+
+// A fresh buffer around `tb` (C's `ed_model_finish` and
+// `yew_ws_scratch_new` share this shape, `ed.c:342-376`, `644-726`).
+fn buffer_around(
+    mut ed: Ed,
+    take tb: text.TextBuf,
+    meta: text.FileMeta,
+    path: str,
+    has_path: bool,
+) -> Buffer {
+    let id = ed.next_buf_id
+    ed.next_buf_id += 1
+    var ec = text.editctx_new(take tb)
+    ec.undo = text.undo_new(ec.tb)
+    ec.has_undo = true
+    text.undo_mark_saved(mut ec.undo, ec.tb)
+    ec.marks = text.marks_new()
+    ec.has_marks = true
+    ec.meta = meta
+    ec.has_meta = has_path
+    Buffer {
+        id: id,
+        ec: ec,
+        resident: true,
+        path: path,
+        has_path: has_path,
+        name: "",
+        has_name: false,
+        flags: 0,
+        tabwidth: VP_TABWIDTH,
+        recovery_pending: false,
+        pairs: pairstate_new(),
+    }
+}
+
+/// The buffer index of buffer id `id`, or -1.
+pub fn ed_buf_index(ed: Ed, id: int) -> int {
+    var i = 0
+    while i < ed.bufs.len {
+        if ed.bufs[i].id == id {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// The focused window's buffer index (C's `yew_ed_doc`).
+pub fn ed_doc(ed: Ed) -> int {
+    if ed.win < 0 {
+        return if ed.bufs.len != 0 then 0 else -1
+    }
+    ed.wins[ed.win].buf
+}
+
+/// `yew_buf_dirty` (`ed.c:989-992`): away from the save point.
+pub fn buf_dirty(b: Buffer) -> bool {
+    b.resident && b.ec.has_undo && !text.undo_at_save_point(b.ec.undo)
+}
+
+/// The scratch "untitled" buffer and its tab and window (`yew_ed_open_
+/// scratch`, `ed.c:957-967`): the bootstrap model the startup files
+/// replace.
+pub fn ed_open_scratch(mut ed: Ed) {
+    let b = buffer_around(mut ed, take text.textbuf_new(), text.filemeta_new(), "", false)
+    let bid = b.id
+    (mut ed.bufs).push(b)
+    let wid = ed.next_win_id
+    ed.next_win_id += 1
+    var w = win_new(wid, ed.bufs.len - 1)
+    vp_init(mut w)
+    apply_win_opts(ed.opts, mut w)
+    (mut ed.wins).push(w)
+    ed.win = ed.wins.len - 1
+    let tid = ed.next_tab_id
+    ed.next_tab_id += 1
+    (mut ed.tabs).push(Tab {
+        tab_id: tid,
+        buffer_id: bid,
+        win: ed.win,
+        path: "",
+        display_path: "",
+        has_path: false,
+    })
+    ed.tab_active = ed.tabs.len - 1
+    ed.model_ready = true
+    ed.layout_dirty = true
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+/// A buffer over `bytes` named `name` (`yew_ed_open_memory`, `ed.c:969-
+/// 987`), shown in the window: the unit tests' fixture.
+pub fn ed_open_memory(mut ed: Ed, bytes: List[byte], name: str) {
+    if !ed.model_ready {
+        ed_open_scratch(mut ed)
+    }
+    var b = buffer_around(
+        mut ed,
+        take text.textbuf_from_bytes(bytes, 0, bytes.len),
+        text.filemeta_new(),
+        "",
+        false,
+    )
+    b.name = name
+    b.has_name = true
+    b.flags = BUF_SCRATCH
+    (mut ed.bufs).push(b)
+    ed_show_buffer(mut ed, ed.bufs.len - 1)
+}
+
+/// The window options from the configuration (`option_changed_target`'s
+/// window rows, `option.c:828-842`).
+pub fn apply_win_opts(o: Opts, mut w: Win) {
+    w.vp.wrap = o.wrap
+    w.vp.scrolloff = o.scrolloff
+    w.number_style = o.number_style
+}
+
+/// Point the focused window at buffer index `bi` with a fresh view
+/// (`yew_ed_show_buffer`, `ed.c:604-642`).
+pub fn ed_show_buffer(mut ed: Ed, bi: int) {
+    if ed.win < 0 {
+        return
+    }
+    if ed.wins[ed.win].buf == bi {
+        return
+    }
+    ed_insert_barrier(mut ed)
+    let wid = ed.wins[ed.win].id
+    var w = win_new(wid, bi)
+    vp_init(mut w)
+    apply_win_opts(ed.opts, mut w)
+    ed.wins[ed.win] = w
+    ed.layout_dirty = true
+    ed.full_damage = true
+    ed.footer_dirty = true
+    ed.drawn_cursor_line_valid = false
+    ed.drawn_top_valid = false
+}
+
+/// The tab's display basename (`tab_basename`, `tabs.c:642-660`).
+pub fn tab_basename(ed: Ed, t: Tab) -> str {
+    if !t.has_path {
+        let bi = ed_buf_index(ed, t.buffer_id)
+        if bi >= 0 && ed.bufs[bi].has_name && ed.bufs[bi].flags & BUF_SCRATCH != 0 {
+            return ed.bufs[bi].name
+        }
+        return "untitled"
+    }
+    let slash = t.path.rfind("/") else -1
+    if slash >= 0 && slash + 1 < t.path.len {
+        return t.path[slash + 1..]
+    }
+    t.path
+}
+
+/// Whether tab `idx` shows a dirty buffer (`yew_tab_modified`).
+pub fn tab_modified(ed: Ed, idx: int) -> bool {
+    let bi = ed_buf_index(ed, ed.tabs[idx].buffer_id)
+    bi >= 0 && buf_dirty(ed.bufs[bi])
+}
+
+/// The display path of a buffer (`ed_buffer_display_path`, `ed.c:51-68`):
+/// its tab's path, else its own, else "[no name]".
+pub fn ed_display_path(ed: Ed, bi: int) -> str {
+    if bi < 0 {
+        return "[no name]"
+    }
+    for t in ed.tabs {
+        if t.buffer_id == ed.bufs[bi].id && t.has_path {
+            return t.display_path
+        }
+    }
+    if ed.bufs[bi].has_path then ed.bufs[bi].path else "[no name]"
+}
+
+// ---- the edit seam ----------------------------------------------------
+
+/// Swap window `w`'s cursor set and the editor's journal list INTO its
+/// buffer's edit context (the seam; no allocation).
+pub fn edit_take(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    let cs = ed.wins[w].cs
+    ed.wins[w].cs = ed.bufs[b].ec.cset
+    ed.bufs[b].ec.cset = cs
+    ed.bufs[b].ec.has_cset = true
+    ed.bufs[b].ec.win_id = ed.wins[w].id
+    let js = ed.journals
+    ed.journals = ed.bufs[b].ec.journals
+    ed.bufs[b].ec.journals = js
+    ed.bufs[b].ec.now_ms = ed.now_ms
+}
+
+/// Swap them back OUT (`edit_take`'s inverse).
+pub fn edit_give(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    let cs = ed.bufs[b].ec.cset
+    ed.bufs[b].ec.cset = ed.wins[w].cs
+    ed.wins[w].cs = cs
+    ed.bufs[b].ec.has_cset = false
+    let js = ed.bufs[b].ec.journals
+    ed.bufs[b].ec.journals = ed.journals
+    ed.journals = js
+}
+
+/// `yew_edit_insert` through window `w` (the seam around `text.edit_
+/// insert_part`).
+pub fn ed_edit_insert(mut ed: Ed, w: int, at: int, bytes: List[byte], lo: int, hi: int) -> bool {
+    let b = ed.wins[w].buf
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, at as text.ByteOff) as int
+    let lines_before = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    edit_take(mut ed, w)
+    let ok = text.edit_insert_part(mut ed.bufs[b].ec, at as text.ByteOff, bytes, lo, hi)
+    edit_give(mut ed, w)
+    ed_note_edit(mut ed, w, line, lines_before)
+    ok
+}
+
+/// `yew_edit_delete` through window `w`.
+pub fn ed_edit_delete(mut ed: Ed, w: int, lo: int, hi: int) -> bool {
+    let b = ed.wins[w].buf
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, lo as text.ByteOff) as int
+    let lines_before = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    edit_take(mut ed, w)
+    let ok = text.edit_delete(mut ed.bufs[b].ec, text.span(lo, hi))
+    edit_give(mut ed, w)
+    ed_note_edit(mut ed, w, line, lines_before)
+    ok
+}
+
+// C's `edit/notify.c` consumers that campaign 03 has: the window's damage
+// for the edited line (`ed_damage_win_line`, `ed.c:1486-1535`) and the
+// footer (`ed_on_change`, `ed.c:1051-1068`).
+fn ed_note_edit(mut ed: Ed, w: int, line: int, lines_before: int) {
+    let b = ed.wins[w].buf
+    let changed = text.textbuf_line_count(ed.bufs[b].ec.tb) != lines_before
+    ed_damage_win_line(mut ed, w, line, changed)
+    ed.footer_dirty = true
+}
+
+/// `yew_undo_begin` through window `w`.
+pub fn ed_undo_begin(mut ed: Ed, w: int, why: int) {
+    let b = ed.wins[w].buf
+    edit_take(mut ed, w)
+    text.undo_begin(mut ed.bufs[b].ec, why)
+    edit_give(mut ed, w)
+}
+
+/// `yew_undo_end` through window `w`.
+pub fn ed_undo_end(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    edit_take(mut ed, w)
+    text.undo_end(mut ed.bufs[b].ec)
+    edit_give(mut ed, w)
+}
+
+/// `yew_undo_abort` through window `w`.
+pub fn ed_undo_abort(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    edit_take(mut ed, w)
+    text.undo_abort(mut ed.bufs[b].ec)
+    edit_give(mut ed, w)
+}
+
+/// `yew_undo_promote_multi` through window `w`.
+pub fn ed_undo_promote_multi(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    edit_take(mut ed, w)
+    text.undo_promote_multi(mut ed.bufs[b].ec)
+    edit_give(mut ed, w)
+}
+
+/// `yew_ed_finish_edit` (`ed.c:1397-1445`): the journal's health.
+pub fn ed_finish_edit(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    if ed.bufs[b].ec.has_jrnl && !text.journal_ok(ed.bufs[b].ec.jrnl) {
+        ed.durability_failed = true
+        ed_msg(mut ed, MSG_ERROR, "crash journal failed; save or q! before continuing")
+    }
+}
+
+/// `yew_ed_insert_barrier` (`ed.c:1666-1676`): close the open insert
+/// transaction.
+pub fn ed_insert_barrier(mut ed: Ed) {
+    if !ed.insert_txn || ed.win < 0 {
+        return
+    }
+    ed_undo_end(mut ed, ed.win)
+    ed_finish_edit(mut ed, ed.win)
+    ed.insert_txn = false
+}
+
+/// The focused window's primary cursor offset.
+pub fn ed_cursor_pos(ed: Ed) -> int {
+    let w = ed.win
+    ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+}
+
+// ---- damage -----------------------------------------------------------
+
+/// `yew_ed_damage_document` (`ed.c:1447-1459`).
+pub fn ed_damage_document(mut ed: Ed) {
+    if ed.win < 0 {
+        return
+    }
+    if ed.damage_batching {
+        ed.damage_batch_pending = true
+        ed.damage_batch_full = true
+        return
+    }
+    ed.doc_damage_lo = 0
+    ed.doc_damage_hi = ed.wins[ed.win].rect.h
+    ed.footer_dirty = true
+}
+
+/// `yew_ed_damage_rows` (`ed.c:1461-1484`).
+pub fn ed_damage_rows(mut ed: Ed, lo_in: int, hi_in: int) {
+    if ed.win < 0 || lo_in >= hi_in {
+        return
+    }
+    if ed.damage_batching {
+        ed.damage_batch_pending = true
+    }
+    let h = ed.wins[ed.win].rect.h
+    let lo = if lo_in > h then h else lo_in
+    let hi = if hi_in > h then h else hi_in
+    if lo >= hi {
+        return
+    }
+    if ed.damage_batching {
+        ed.damage_batch_row_pending = true
+    }
+    if ed.doc_damage_lo >= ed.doc_damage_hi {
+        ed.doc_damage_lo = lo
+        ed.doc_damage_hi = hi
+    } else {
+        if lo < ed.doc_damage_lo {
+            ed.doc_damage_lo = lo
+        }
+        if hi > ed.doc_damage_hi {
+            ed.doc_damage_hi = hi
+        }
+    }
+}
+
+// `ed_damage_win_line` (`ed.c:1486-1535`).
+fn ed_damage_win_line(mut ed: Ed, w: int, line: int, line_count_changed: bool) {
+    let b = ed.wins[w].buf
+    if ed.damage_batching {
+        ed.damage_batch_pending = true
+        if !ed.damage_batch_line_pending || line < ed.damage_batch_line_lo {
+            ed.damage_batch_line_lo = line
+        }
+        ed.damage_batch_line_pending = true
+        if line_count_changed || ed.wins[w].vp.wrap {
+            ed.damage_batch_full = true
+            return
+        }
+        let top = ed.wins[w].vp.top
+        if line >= top {
+            let (ok, row) = vp_row_of_line(mut ed.wins[w], ed.bufs[b].ec.tb, line, 0)
+            if ok {
+                ed_damage_rows(mut ed, row, row + 1)
+            }
+        }
+        return
+    }
+    vp_invalidate_from(mut ed.wins[w], line)
+    if line_count_changed {
+        ed.layout_dirty = true
+    }
+    if ed.wins[w].vp.wrap {
+        ed_damage_document(mut ed)
+        return
+    }
+    let top = ed.wins[w].vp.top
+    if line < top {
+        if line_count_changed {
+            ed_damage_document(mut ed)
+        }
+        return
+    }
+    let (ok, lo) = vp_row_of_line(mut ed.wins[w], ed.bufs[b].ec.tb, line, 0)
+    if !ok {
+        return
+    }
+    let hi = if line_count_changed then ed.wins[w].rect.h else lo + 1
+    ed_damage_rows(mut ed, lo, hi)
+}
+
+/// `yew_ed_damage_line` (`ed.c:1537-1542`).
+pub fn ed_damage_line(mut ed: Ed, line: int, line_count_changed: bool) {
+    if ed.win >= 0 {
+        ed_damage_win_line(mut ed, ed.win, line, line_count_changed)
+    }
+}
+
+/// `yew_ed_damage_batch_begin` (`ed.c:1580-1600`).
+pub fn ed_damage_batch_begin(mut ed: Ed, w: int) {
+    if ed.damage_batching {
+        bug("damage batch: nested begin")
+    }
+    ed.damage_batching = true
+    ed.damage_batch_pending = false
+    ed.damage_batch_full = false
+    ed.damage_batch_line_pending = false
+    ed.damage_batch_row_pending = false
+    ed.damage_batch_win = w
+    if w >= 0 {
+        let b = ed.wins[w].buf
+        ed.damage_batch_lines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+        ed.damage_batch_gen = ed.bufs[b].ec.tb.gen
+    } else {
+        ed.damage_batch_lines = 0
+        ed.damage_batch_gen = 0
+    }
+}
+
+/// `yew_ed_damage_batch_end` (`ed.c:1602-1651`).
+pub fn ed_damage_batch_end(mut ed: Ed) {
+    if !ed.damage_batching {
+        bug("damage batch: end without begin")
+    }
+    var pending = ed.damage_batch_pending
+    var full = ed.damage_batch_full
+    let line_pending = ed.damage_batch_line_pending
+    let w = ed.damage_batch_win
+    if w >= 0 {
+        let b = ed.wins[w].buf
+        if ed.bufs[b].ec.tb.gen != ed.damage_batch_gen &&
+            (!pending || !ed.damage_batch_row_pending) {
+            pending = true
+            full = true
+        }
+    }
+    ed.damage_batching = false
+    ed.damage_batch_pending = false
+    ed.damage_batch_full = false
+    ed.damage_batch_line_pending = false
+    ed.damage_batch_row_pending = false
+    ed.damage_batch_win = -1
+    if w >= 0 {
+        if line_pending {
+            vp_invalidate_from(mut ed.wins[w], ed.damage_batch_line_lo)
+        }
+        let b = ed.wins[w].buf
+        if text.textbuf_line_count(ed.bufs[b].ec.tb) != ed.damage_batch_lines {
+            ed.layout_dirty = true
+            full = true
+        }
+    }
+    ed.damage_batch_lines = 0
+    ed.damage_batch_gen = 0
+    if pending {
+        if full {
+            ed_damage_document(mut ed)
+        } else if line_pending {
+            ed.cursor_overlay_damage_complete = true
+        }
+    }
+}
+
+// ---- prompts, save, quit -----------------------------------------------
+
+/// `yew_ed_prompt` (`ed.c:1927-1973`).
+pub fn ed_prompt(mut ed: Ed, prompt: int) {
+    ed.prompt = prompt
+    let path = ed_display_path(ed, ed_doc(ed))
+    if prompt == PROMPT_NONE {
+        ed_msg_clear(mut ed)
+    } else if prompt == PROMPT_RECOVER {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            "recover unsaved changes to {path}? [r]ecover [d]iscard [esc] open as-is",
+        )
+    } else if prompt == PROMPT_QUIT_DIRTY {
+        ed_msg(mut ed, MSG_ERROR, "save changes to {path}? [w]rite [d]iscard [esc] cancel")
+    } else if prompt == PROMPT_OVERWRITE {
+        ed_msg(mut ed, MSG_ERROR, "file changed on disk - [o]verwrite [esc] cancel")
+    }
+    if prompt != PROMPT_NONE {
+        ed.msg.prompt = true
+    }
+}
+
+/// `yew_ed_file_save_win` (`ed.c:1975-2070`) for the focused window.
+pub fn ed_file_save(mut ed: Ed, force: bool) -> int {
+    if !ed.model_ready || ed.win < 0 {
+        return CMD_ERR_STATE
+    }
+    ed_insert_barrier(mut ed)
+    let w = ed.win
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].has_path {
+        ed_msg(mut ed, MSG_ERROR, "no file name; use :w path")
+        ed.quit_after_save = false
+        return CMD_ERR_STATE
+    }
+    if !ed.bufs[b].resident {
+        ed_msg(mut ed, MSG_ERROR, "{ed_display_path(ed, b)} was never loaded; nothing written")
+        ed.quit_after_save = false
+        return CMD_ERR_STATE
+    }
+    let path = ed.bufs[b].path
+    var result = 0
+    edit_take(mut ed, w)
+    if force {
+        result = text.file_save_force_opts(
+            mut ed.bufs[b].ec.tb,
+            mut ed.bufs[b].ec.meta,
+            path,
+            text.save_opts_default(),
+        )
+        if text.save_committed(result) {
+            text.undo_boundary(mut ed.bufs[b].ec.undo)
+            text.undo_mark_saved(mut ed.bufs[b].ec.undo, ed.bufs[b].ec.tb)
+            if ed.bufs[b].ec.has_jrnl {
+                let _ = text.journal_discard(mut ed.bufs[b].ec.journals, mut ed.bufs[b].ec.jrnl)
+                ed.bufs[b].ec.has_jrnl = false
+            }
+        }
+    } else {
+        result = text.edit_save_opts(mut ed.bufs[b].ec, path, text.save_opts_default())
+    }
+    edit_give(mut ed, w)
+    ed_finish_edit(mut ed, w)
+    if result == text.SAVE_CHANGED_ON_DISK {
+        if !ed.headless {
+            ed_prompt(mut ed, PROMPT_OVERWRITE)
+        } else {
+            ed_msg(
+                mut ed,
+                MSG_ERROR,
+                "{ed_display_path(ed, b)} changed on disk; pass {{force: true}} to save",
+            )
+        }
+        return CMD_ERR_IO
+    }
+    if !text.save_committed(result) {
+        ed_msg(mut ed, MSG_ERROR, "could not write {ed_display_path(ed, b)}")
+        ed.quit_after_save = false
+        return CMD_ERR_IO
+    }
+    ed.durability_failed = false
+    ed.prompt = PROMPT_NONE
+    let lines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    if result == text.SAVE_BACKUP_FAILED {
+        ed_msg(mut ed, MSG_WARN, "wrote {ed_display_path(ed, b)}, but backup retention failed")
+    } else {
+        ed_msg(mut ed, MSG_INFO, "wrote {ed_display_path(ed, b)}, {lines} lines")
+    }
+    if ed.quit_after_save {
+        ed.quit_after_save = false
+        ed.quit = true
+    }
+    CMD_OK
+}
+
+/// `yew_ed_request_quit` (`ed.c:2192-2209`).
+pub fn ed_request_quit(mut ed: Ed, force: bool) -> int {
+    if !ed.model_ready {
+        return CMD_ERR_STATE
+    }
+    ed_insert_barrier(mut ed)
+    if !force && ed.durability_failed {
+        ed_msg(mut ed, MSG_ERROR, "crash journal failed; save or q! to discard changes")
+        return CMD_ERR_IO
+    }
+    let d = ed_doc(ed)
+    if !force && d >= 0 && buf_dirty(ed.bufs[d]) {
+        ed_prompt(mut ed, PROMPT_QUIT_DIRTY)
+        return CMD_OK
+    }
+    ed.quit = true
+    ed.exit_code = util.EXIT_OK
+    CMD_OK
+}
+
+/// `prompt_key` (`ed.c:2211-2298`): the answer to the open prompt; every
+/// key is consumed.
+pub fn ed_prompt_key(mut ed: Ed, key: term.Key) -> bool {
+    let code = key.code
+    if key.ev == term.KEY_RELEASE {
+        return true
+    }
+    if code == term.KEY_ESCAPE {
+        if ed.prompt == PROMPT_RECOVER {
+            let d = ed_doc(ed)
+            if d >= 0 {
+                ed.bufs[d].recovery_pending = false
+            }
+        }
+        ed.quit_after_save = false
+        ed_prompt(mut ed, PROMPT_NONE)
+        return true
+    }
+    if key.mods != 0 || code > 127 {
+        return true
+    }
+    if ed.prompt == PROMPT_RECOVER && code == 114 {
+        let w = ed.win
+        let b = ed.wins[w].buf
+        let rp = ed.bufs[b].ec.meta.realpath
+        edit_take(mut ed, w)
+        var meta = ed.bufs[b].ec.meta
+        ed.bufs[b].ec.meta = text.filemeta_new()
+        let recovered = text.journal_replay_edit(rp, mut ed.bufs[b].ec, mut meta)
+        ed.bufs[b].ec.meta = meta
+        var reopened = true
+        if recovered {
+            let (j, _) = text.journal_open(mut ed.bufs[b].ec.journals, rp, mut ed.bufs[b].ec.meta)
+            ed.bufs[b].ec.jrnl = j
+            ed.bufs[b].ec.has_jrnl = ed.bufs[b].ec.jrnl.open
+            reopened = ed.bufs[b].ec.has_jrnl
+        }
+        edit_give(mut ed, w)
+        ed.bufs[b].recovery_pending = false
+        ed_finish_edit(mut ed, w)
+        ed_prompt(mut ed, PROMPT_NONE)
+        ed_damage_document(mut ed)
+        ed.layout_dirty = true
+        if recovered && !reopened {
+            ed.durability_failed = true
+            ed_msg(
+                mut ed,
+                MSG_ERROR,
+                "recovered changes, but crash journal could not reopen; save or q!",
+            )
+        } else if recovered {
+            ed_msg(mut ed, MSG_WARN, "recovered unsaved changes")
+        } else {
+            ed_msg(mut ed, MSG_ERROR, "could not recover unsaved changes")
+        }
+        return true
+    }
+    if ed.prompt == PROMPT_RECOVER && code == 100 {
+        let d = ed_doc(ed)
+        let discarded = text.journal_discard_path(
+            ed.journals,
+            ed.bufs[d].ec.meta.realpath,
+            ed.bufs[d].ec.meta,
+        )
+        ed.bufs[d].recovery_pending = false
+        ed_prompt(mut ed, PROMPT_NONE)
+        if !discarded {
+            ed_msg(mut ed, MSG_ERROR, "could not discard recovery journal")
+        }
+        return true
+    }
+    if ed.prompt == PROMPT_QUIT_DIRTY && code == 119 {
+        ed.quit_after_save = true
+        let _ = ed_file_save(mut ed, false)
+        return true
+    }
+    if ed.prompt == PROMPT_QUIT_DIRTY && code == 100 {
+        ed.prompt = PROMPT_NONE
+        ed.quit = true
+        return true
+    }
+    if ed.prompt == PROMPT_OVERWRITE && code == 111 {
+        let _ = ed_file_save(mut ed, true)
+        return true
+    }
+    true
+}
