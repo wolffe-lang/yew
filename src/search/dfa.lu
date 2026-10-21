@@ -1,0 +1,936 @@
+//! search.dfa — the lazy DFA: "is there a match", built on demand.
+//!
+//! Ports sagitta `src/search/dfa.c` (811 lines) at 9ace98c2, under
+//! `s20-regex-engine.md` §6b. A state is a SET of NFA program counters
+//! plus the assertion context it was built under; states are interned
+//! on demand and cached, so a scan over plain text stops doing closure
+//! work almost at once and becomes a table walk. It answers one question
+//! — match or not, and where the earliest match ENDS — never captures, so
+//! it cannot disagree with the Pike VM about anything subtle.
+//!
+//! Cache policy, C's: `DFA_MAX_STATES` = 1,024 states or 1 MiB of state
+//! storage, whichever first; on overflow the WHOLE cache is flushed and
+//! the scan continues; after a second flush in one search the caller is
+//! told to give up and finish on the Pike VM (a pattern that thrashes is
+//! slower rebuilding states than simulating). The byte accounting is C's
+//! (four bytes a pc, four a transition slot), so the flush points are.
+//!
+//! The port's shapes: C's arena of states and per-state transition
+//! arrays are flat pools with LOGICAL lengths (`nstates`, `pool_len`,
+//! `ascii_len`) that a flush resets and later states overwrite — a
+//! `List` cleared would allocate a new one (G33). A piece-tree input is
+//! read through the shared cursor (`pike.lu`) where C's `dfa_byte`
+//! re-seeks the iterator per byte: the same bytes, without the seek.
+
+use text
+
+const DFA_MAX_STATES: int = 1024
+
+const DFA_MAX_BYTES: int = 1048576
+
+const DFA_BUCKETS: int = 2048
+
+const DFA_EDGE_CACHE: int = 4096
+
+const DFA_EDGE_WAYS: int = 4
+
+const DFA_EDGE_SETS: int = 1024
+
+// Two flushes in one search: the working set does not fit.
+const DFA_MAX_FLUSHES: int = 2
+
+const DFA_EDGE_MISS: int = -1
+
+const DFA_EDGE_SKIP_BOL: int = -2
+
+/// The DFA's verdicts (`YEW_DFA_*`, `regex_internal.h:218`).
+pub const DFA_NO: int = 0
+
+/// A match.
+pub const DFA_YES: int = 1
+
+/// The cache thrashed: finish on the Pike VM.
+pub const DFA_GIVE_UP: int = -1
+
+// The assertion context bits, folded into the state key
+// (`dfa.c:51-58`).
+const DFA_AT_BOL: int = 1
+
+const DFA_AT_EOL: int = 2
+
+const DFA_AFTER_WORD: int = 4
+
+const DFA_BEFORE_WORD: int = 8
+
+const DFA_AT_BOT: int = 16
+
+const DFA_AT_EOT: int = 32
+
+/// A scan's cache statistics (`YewReDfaStats`, `regex_internal.h:219-
+/// 223`).
+pub struct ReDfaStats {
+    flushes: int,
+    max_states: int,
+    max_bytes: int,
+}
+
+/// Zeroed statistics.
+pub fn re_dfa_stats_new() -> ReDfaStats {
+    ReDfaStats { flushes: 0, max_states: 0, max_bytes: 0 }
+}
+
+/// The lazy DFA's working state (`Dfa`, `dfa.c:84-114`).
+struct Dfa {
+    nprog: int,
+    limit_states: int,
+    limit_bytes: int,
+    flushes: int,
+    bytes: int,
+    nstates: int,
+    st_pcs_at: List[int],
+    st_npcs: List[int],
+    st_hash: List[int],
+    st_ctx: List[int],
+    st_matched: List[bool],
+    st_next: List[int],
+    st_ascii_at: List[int],
+    pool: List[int],
+    pool_len: int,
+    ascii: List[int],
+    ascii_len: int,
+    buckets: List[int],
+    work: List[int],
+    work_tmp: List[int],
+    stamp: List[int],
+    gen: int,
+    stack: List[int],
+    combined: List[int],
+    cur: List[int],
+    has_edges: bool,
+    edge_state: List[int],
+    edge_cp: List[int],
+    edge_next: List[int],
+    edge_ctx: List[int],
+    edge_valid: List[bool],
+    edge_hand: List[int],
+    ctx_index: List[int],
+    ascii_ctx_variants: int,
+    ctx_mask: int,
+    has_assert: bool,
+    stats: ReDfaStats,
+}
+
+// `ctx_holds` (`dfa.c:116-138`).
+fn ctx_holds(ctx: int, op: int) -> bool {
+    if op == RE_BOL {
+        return ctx & DFA_AT_BOL != 0
+    }
+    if op == RE_EOL {
+        return ctx & DFA_AT_EOL != 0
+    }
+    if op == RE_BOT {
+        return ctx & DFA_AT_BOT != 0
+    }
+    if op == RE_EOT {
+        return ctx & DFA_AT_EOT != 0
+    }
+    if op == RE_WORDB {
+        return (ctx & DFA_AFTER_WORD != 0) != (ctx & DFA_BEFORE_WORD != 0)
+    }
+    if op == RE_NWORDB {
+        return (ctx & DFA_AFTER_WORD != 0) == (ctx & DFA_BEFORE_WORD != 0)
+    }
+    false
+}
+
+// The epsilon-closure of `combined[0..nseed)` under `ctx`, into
+// `d.work` (`closure`, `dfa.c:143-191`): iterative for the VM's reason.
+// Answers (n, matched).
+fn closure(mut d: Dfa, re: Re, nseed: int, ctx: int) -> (int, bool) {
+    var top = 0
+    var n = 0
+    var matched = false
+    d.gen += 1
+    var i = 0
+    while i < nseed {
+        d.stack[top] = d.combined[i]
+        top += 1
+        i += 1
+    }
+    while top != 0 {
+        top -= 1
+        let pc = d.stack[top]
+        if pc >= d.nprog || d.stamp[pc] == d.gen {
+            continue
+        }
+        d.stamp[pc] = d.gen
+        let op = re.prog[pc].op
+        if op == RE_JMP {
+            d.stack[top] = re.prog[pc].x
+            top += 1
+        } else if op == RE_SPLIT {
+            d.stack[top] = re.prog[pc].y
+            top += 1
+            d.stack[top] = re.prog[pc].x
+            top += 1
+        } else if op == RE_SAVE {
+            // Captures are meaningless to a DFA; step over them.
+            d.stack[top] = pc + 1
+            top += 1
+        } else if op >= RE_BOL && op <= RE_NWORDB {
+            if ctx_holds(ctx, op) {
+                d.stack[top] = pc + 1
+                top += 1
+            }
+        } else if op == RE_MATCH {
+            matched = true
+        } else {
+            // A consuming instruction: it belongs to the state.
+            d.work[n] = pc
+            n += 1
+        }
+    }
+    (n, matched)
+}
+
+// `yew_sort_stable` with `cmp_u32` over `d.work[0..n)`: a bottom-up
+// merge through `d.work_tmp`.
+fn work_sort(mut d: Dfa, n: int) {
+    if n < 2 {
+        return
+    }
+    if n <= 16 {
+        var i = 1
+        while i < n {
+            let v = d.work[i]
+            var j = i
+            while j > 0 && d.work[j - 1] > v {
+                d.work[j] = d.work[j - 1]
+                j -= 1
+            }
+            d.work[j] = v
+            i += 1
+        }
+        return
+    }
+    var width = 1
+    var in_work = true
+    while width < n {
+        var start = 0
+        while start < n {
+            let mid = if start + width < n then start + width else n
+            let end = if start + 2 * width < n then start + 2 * width else n
+            var i = start
+            var j = mid
+            var k = start
+            while k < end {
+                var left = false
+                if in_work {
+                    left = i < mid && (j >= end || d.work[i] <= d.work[j])
+                    if left {
+                        d.work_tmp[k] = d.work[i]
+                        i += 1
+                    } else {
+                        d.work_tmp[k] = d.work[j]
+                        j += 1
+                    }
+                } else {
+                    left = i < mid && (j >= end || d.work_tmp[i] <= d.work_tmp[j])
+                    if left {
+                        d.work[k] = d.work_tmp[i]
+                        i += 1
+                    } else {
+                        d.work[k] = d.work_tmp[j]
+                        j += 1
+                    }
+                }
+                k += 1
+            }
+            start += 2 * width
+        }
+        in_work = !in_work
+        width *= 2
+    }
+    if !in_work {
+        var k = 0
+        while k < n {
+            d.work[k] = d.work_tmp[k]
+            k += 1
+        }
+    }
+}
+
+// FNV-1a over the pcs and the context (`hash_pcs`, `dfa.c:203-213`),
+// in u32.
+fn hash_pcs(d: Dfa, n: int, ctx: int) -> int {
+    var h = 2166136261 ^ ctx
+    var i = 0
+    while i < n {
+        h = h ^ d.work[i]
+        h = h * 16777619 & 4294967295
+        i += 1
+    }
+    h
+}
+
+// `dfa_flush` (`dfa.c:215-235`): state ids are indices, so a flush is a
+// reset — no per-state teardown.
+fn dfa_flush(mut d: Dfa) {
+    var i = 0
+    while i < DFA_BUCKETS {
+        d.buckets[i] = -1
+        i += 1
+    }
+    if d.has_edges {
+        i = 0
+        while i < DFA_EDGE_CACHE {
+            d.edge_valid[i] = false
+            d.edge_state[i] = 0
+            d.edge_cp[i] = 0
+            d.edge_next[i] = 0
+            d.edge_ctx[i] = 0
+            i += 1
+        }
+        i = 0
+        while i < DFA_EDGE_SETS {
+            d.edge_hand[i] = 0
+            i += 1
+        }
+    }
+    d.nstates = 0
+    d.bytes = 0
+    d.pool_len = 0
+    d.ascii_len = 0
+    d.flushes += 1
+    d.stats.flushes = d.flushes
+}
+
+fn mul32(a: int, b: int) -> int {
+    (a & 4294967295) * (b & 4294967295) & 4294967295
+}
+
+// `edge_set` (`dfa.c:237-245`).
+fn edge_set(state: int, cp: int, ctx: int) -> int {
+    var h = mul32(state, 2654435761)
+    h = h ^ mul32(cp, 2246822507)
+    h = h ^ mul32(ctx, 3266489909)
+    h = h ^ h >> 16
+    h & DFA_EDGE_SETS - 1
+}
+
+// `edge_get` (`dfa.c:247-263`): the cached transition or DFA_EDGE_MISS.
+fn edge_get(d: Dfa, state: int, cp: int, ctx: int) -> int {
+    let base = edge_set(state, cp, ctx) * DFA_EDGE_WAYS
+    var way = 0
+    while way < DFA_EDGE_WAYS {
+        let e = base + way
+        if d.edge_valid[e] &&
+            d.edge_state[e] == state &&
+            d.edge_cp[e] == cp &&
+            d.edge_ctx[e] == ctx {
+            return d.edge_next[e]
+        }
+        way += 1
+    }
+    DFA_EDGE_MISS
+}
+
+// `edge_put` (`dfa.c:265-291`): a free way, else round-robin.
+fn edge_put(mut d: Dfa, state: int, cp: int, ctx: int, next: int) {
+    let set = edge_set(state, cp, ctx)
+    let base = set * DFA_EDGE_WAYS
+    var e = -1
+    var way = 0
+    while way < DFA_EDGE_WAYS && e < 0 {
+        if !d.edge_valid[base + way] {
+            e = base + way
+        }
+        way += 1
+    }
+    if e < 0 {
+        let w = d.edge_hand[set]
+        d.edge_hand[set] = w + 1 & DFA_EDGE_WAYS - 1
+        e = base + w
+    }
+    d.edge_state[e] = state
+    d.edge_cp[e] = cp
+    d.edge_next[e] = next
+    d.edge_ctx[e] = ctx
+    d.edge_valid[e] = true
+}
+
+fn set_or_push(mut xs: List[int], i: int, v: int) {
+    if i < xs.len {
+        xs[i] = v
+    } else {
+        (mut xs).push(v)
+    }
+}
+
+// Intern the closure in `d.work[0..n)` as a state id, or -1 when the
+// cache overflowed and may not flush again (`dfa_intern`, `dfa.c:293-
+// 359`).
+fn dfa_intern(mut d: Dfa, re: Re, n: int, ctx: int, matched: bool) -> int {
+    let state_bytes = n * 4 + d.ascii_ctx_variants * 128 * 4
+    // The closure's pcs in ascending order: C sorts them; when the set is
+    // dense in the program the port reads them off the closure's stamps
+    // in pc order instead (the same sorted, unique list).
+    if n * 8 > d.nprog {
+        var k = 0
+        var pc = 0
+        while pc < d.nprog {
+            if d.stamp[pc] == d.gen && re.prog[pc].op <= RE_ANY {
+                d.work[k] = pc
+                k += 1
+            }
+            pc += 1
+        }
+    } else {
+        work_sort(mut d, n)
+    }
+    let h = hash_pcs(d, n, ctx)
+    let bucket = h % DFA_BUCKETS
+    var at = d.buckets[bucket]
+    while at >= 0 {
+        if d.st_hash[at] == h &&
+            d.st_ctx[at] == ctx &&
+            d.st_npcs[at] == n &&
+            d.st_matched[at] == matched {
+            var same = true
+            var k = 0
+            let base = d.st_pcs_at[at]
+            while same && k < n {
+                if d.pool[base + k] != d.work[k] {
+                    same = false
+                }
+                k += 1
+            }
+            if same {
+                return at
+            }
+        }
+        at = d.st_next[at]
+    }
+    if d.nstates == d.limit_states || state_bytes > d.limit_bytes - d.bytes {
+        if d.flushes >= DFA_MAX_FLUSHES {
+            return -1
+        }
+        dfa_flush(mut d)
+        if state_bytes > d.limit_bytes {
+            return -1
+        }
+    }
+    let id = d.nstates
+    set_or_push(mut d.st_pcs_at, id, d.pool_len)
+    var k = 0
+    while k < n && d.pool_len < d.pool.len {
+        d.pool[d.pool_len] = d.work[k]
+        d.pool_len += 1
+        k += 1
+    }
+    while k < n {
+        (mut d.pool).push(d.work[k])
+        d.pool_len += 1
+        k += 1
+    }
+    set_or_push(mut d.st_npcs, id, n)
+    set_or_push(mut d.st_hash, id, h)
+    set_or_push(mut d.st_ctx, id, ctx)
+    if id < d.st_matched.len {
+        d.st_matched[id] = matched
+    } else {
+        (mut d.st_matched).push(matched)
+    }
+    set_or_push(mut d.st_next, id, d.buckets[bucket])
+    if d.ascii_ctx_variants != 0 {
+        set_or_push(mut d.st_ascii_at, id, d.ascii_len)
+        let slots = 128 * d.ascii_ctx_variants
+        k = 0
+        while k < slots && d.ascii_len < d.ascii.len {
+            d.ascii[d.ascii_len] = -1
+            d.ascii_len += 1
+            k += 1
+        }
+        while k < slots {
+            (mut d.ascii).push(-1)
+            d.ascii_len += 1
+            k += 1
+        }
+    } else {
+        set_or_push(mut d.st_ascii_at, id, -1)
+    }
+    d.buckets[bucket] = id
+    d.bytes += state_bytes
+    d.nstates += 1
+    if d.nstates > d.stats.max_states {
+        d.stats.max_states = d.nstates
+    }
+    if d.bytes > d.stats.max_bytes {
+        d.stats.max_bytes = d.bytes
+    }
+    id
+}
+
+// `inst_takes` (`dfa.c:361-376`).
+fn inst_takes(re: Re, pc: int, cp: int) -> bool {
+    inst_matches(re, pc, cp)
+}
+
+// `dfa_is_word` (`dfa.c:426-435`): the ASCII fast path, then `\w`.
+fn dfa_is_word(cp: int) -> bool {
+    if cp < 128 {
+        let lower = cp | 32
+        return lower >= 97 && lower <= 122 || cp >= 48 && cp <= 57 || cp == 95
+    }
+    re_is_word(cp)
+}
+
+// `ctx_at` (`dfa.c:437-461`).
+fn ctx_at(
+    inp: ReInput,
+    pos: int,
+    prev_cp: int,
+    has_prev: bool,
+    cp: int,
+    have_cp: bool,
+    mask: int,
+) -> int {
+    var ctx = 0
+    if mask & DFA_AT_BOT != 0 && pos == inp.lo {
+        ctx = ctx | DFA_AT_BOT
+    }
+    if mask & DFA_AT_BOL != 0 && (pos == inp.lo || has_prev && prev_cp == 10) {
+        ctx = ctx | DFA_AT_BOL
+    }
+    if mask & DFA_AT_EOT != 0 && pos == inp.hi {
+        ctx = ctx | DFA_AT_EOT
+    }
+    if mask & DFA_AT_EOL != 0 && (pos == inp.hi || have_cp && (cp == 10 || cp == 13)) {
+        ctx = ctx | DFA_AT_EOL
+    }
+    if mask & DFA_AFTER_WORD != 0 && has_prev && dfa_is_word(prev_cp) {
+        ctx = ctx | DFA_AFTER_WORD
+    }
+    if mask & DFA_BEFORE_WORD != 0 && have_cp && dfa_is_word(cp) {
+        ctx = ctx | DFA_BEFORE_WORD
+    }
+    ctx
+}
+
+/// An empty DFA: its storage grows on first use and is reused after.
+fn dfa_empty() -> Dfa {
+    Dfa {
+        nprog: 0,
+        limit_states: DFA_MAX_STATES,
+        limit_bytes: DFA_MAX_BYTES,
+        flushes: 0,
+        bytes: 0,
+        nstates: 0,
+        st_pcs_at: List[int](),
+        st_npcs: List[int](),
+        st_hash: List[int](),
+        st_ctx: List[int](),
+        st_matched: List[bool](),
+        st_next: List[int](),
+        st_ascii_at: List[int](),
+        pool: List[int](),
+        pool_len: 0,
+        ascii: List[int](),
+        ascii_len: 0,
+        buckets: List[int](),
+        work: List[int](),
+        work_tmp: List[int](),
+        stamp: List[int](),
+        gen: 0,
+        stack: List[int](),
+        combined: List[int](),
+        cur: List[int](),
+        has_edges: false,
+        edge_state: List[int](),
+        edge_cp: List[int](),
+        edge_next: List[int](),
+        edge_ctx: List[int](),
+        edge_valid: List[bool](),
+        edge_hand: List[int](),
+        ctx_index: List[int](),
+        ascii_ctx_variants: 0,
+        ctx_mask: 0,
+        has_assert: false,
+        stats: re_dfa_stats_new(),
+    }
+}
+
+fn grow_to(mut xs: List[int], n: int, v: int) {
+    while xs.len < n {
+        (mut xs).push(v)
+    }
+}
+
+// A scan's fresh start over `d`'s storage (C's per-scan `arena_init` and
+// allocations, `dfa.c:536-568`): the pools are emptied by their logical
+// lengths, the scratch arrays grown to the program; the closure stamps
+// keep their generation, which only ever rises, so no stale stamp
+// equals it.
+fn dfa_reset(mut d: Dfa, re: Re, max_states: int, max_bytes: int) {
+    let nprog = re.prog.len
+    d.nprog = nprog
+    d.limit_states = if max_states == 0 || max_states > DFA_MAX_STATES {
+        DFA_MAX_STATES
+    } else {
+        max_states
+    }
+    d.limit_bytes = if max_bytes == 0 || max_bytes > DFA_MAX_BYTES then DFA_MAX_BYTES else max_bytes
+    d.flushes = 0
+    d.bytes = 0
+    d.nstates = 0
+    d.pool_len = 0
+    d.ascii_len = 0
+    grow_to(mut d.buckets, DFA_BUCKETS, -1)
+    grow_to(mut d.work, nprog, 0)
+    grow_to(mut d.work_tmp, nprog, 0)
+    grow_to(mut d.stamp, nprog, 0)
+    grow_to(mut d.stack, nprog * 2 + 8, 0)
+    grow_to(mut d.combined, nprog + 2, 0)
+    grow_to(mut d.cur, nprog, 0)
+    grow_to(mut d.ctx_index, 64, 0)
+    d.has_edges = false
+    d.ascii_ctx_variants = 0
+    d.ctx_mask = 0
+    d.has_assert = false
+    d.stats = re_dfa_stats_new()
+}
+
+/// Unanchored "does it match at or after `from`" (`dfa_scan`,
+/// `dfa.c:503-811`): (verdict, where the earliest match ends).
+fn dfa_scan(
+    mut d: Dfa,
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: int,
+    max_states: int,
+    max_bytes: int,
+    mut stats: ReDfaStats,
+) -> (int, int) {
+    stats.flushes = 0
+    stats.max_states = 0
+    stats.max_bytes = 0
+    if re.prog.len == 0 {
+        return (DFA_NO, 0)
+    }
+    if re.lit.kind == RE_LIT_WHOLE {
+        var m = re_match_new()
+        if !literal_search(re, tb, bytes, inp, from, mut m, true) {
+            return (DFA_NO, 0)
+        }
+        return (DFA_YES, m.hi[0])
+    }
+    dfa_reset(mut d, re, max_states, max_bytes)
+    // Assertions make a transition depend on the surrounding text as well
+    // as the codepoint: compress the context bits the pattern reads so
+    // common anchor and boundary patterns still get direct tables.
+    var k = 0
+    while k < re.prog.len {
+        let op = re.prog[k].op
+        if op == RE_BOL {
+            d.ctx_mask = d.ctx_mask | DFA_AT_BOL
+        } else if op == RE_EOL {
+            d.ctx_mask = d.ctx_mask | DFA_AT_EOL
+        } else if op == RE_BOT {
+            d.ctx_mask = d.ctx_mask | DFA_AT_BOT
+        } else if op == RE_EOT {
+            d.ctx_mask = d.ctx_mask | DFA_AT_EOT
+        } else if op == RE_WORDB || op == RE_NWORDB {
+            d.ctx_mask = d.ctx_mask | DFA_AFTER_WORD | DFA_BEFORE_WORD
+        }
+        k += 1
+    }
+    d.has_assert = d.ctx_mask != 0
+    var variants = 1
+    var bit = 1
+    while bit <= DFA_AT_EOT {
+        if d.ctx_mask & bit != 0 {
+            variants = variants << 1
+        }
+        bit = bit << 1
+    }
+    if variants <= 4 {
+        d.ascii_ctx_variants = variants
+    }
+    k = 0
+    while k < 64 {
+        var dense = 0
+        var out_bit = 1
+        bit = 1
+        while bit <= DFA_AT_EOT {
+            if d.ctx_mask & bit != 0 {
+                if k & bit != 0 {
+                    dense = dense | out_bit
+                }
+                out_bit = out_bit << 1
+            }
+            bit = bit << 1
+        }
+        d.ctx_index[k] = dense
+        k += 1
+    }
+    if d.has_assert && d.ascii_ctx_variants == 0 {
+        d.has_edges = true
+        grow_to(mut d.edge_state, DFA_EDGE_CACHE, 0)
+        grow_to(mut d.edge_cp, DFA_EDGE_CACHE, 0)
+        grow_to(mut d.edge_next, DFA_EDGE_CACHE, 0)
+        grow_to(mut d.edge_ctx, DFA_EDGE_CACHE, 0)
+        while d.edge_valid.len < DFA_EDGE_CACHE {
+            (mut d.edge_valid).push(false)
+        }
+        grow_to(mut d.edge_hand, DFA_EDGE_SETS, 0)
+    }
+    dfa_flush(mut d)
+    d.flushes = 0
+    d.stats.flushes = 0
+
+    var pos = if from < inp.lo then inp.lo else from
+    var cur = cursor_new()
+    // The codepoint before `pos`: a scan that starts mid-text still has
+    // to know whether it stands after a newline or a word character
+    // (`/^$/` over "foo\n" from 4 must see the '\n' behind it).
+    let (prev0, has_prev0) = cursor_prev(mut cur, tb, bytes, inp, pos)
+    let (c0, l0) = cursor_decode(mut cur, tb, bytes, inp, pos)
+    var scan_cp = c0
+    var scan_cp_len = l0
+    var have_scan_cp = scan_cp_len != 0 && pos < inp.hi
+    var scan_word = false
+    if d.ctx_mask & (DFA_AFTER_WORD | DFA_BEFORE_WORD) != 0 && have_scan_cp {
+        scan_word = dfa_is_word(scan_cp)
+    }
+    let ctx0 = if d.has_assert {
+        ctx_at(inp, pos, prev0, has_prev0, scan_cp, have_scan_cp, d.ctx_mask)
+    } else {
+        0
+    }
+    d.combined[0] = 0
+    let (n0, matched0) = closure(mut d, re, 1, ctx0)
+    var state = dfa_intern(mut d, re, n0, ctx0, matched0)
+    if state < 0 {
+        stats.flushes = d.stats.flushes
+        stats.max_states = d.stats.max_states
+        stats.max_bytes = d.stats.max_bytes
+        return (DFA_GIVE_UP, 0)
+    }
+    var verdict = DFA_NO
+    var end_at = 0
+    // The port's table walk for a flat input with no assertions: the
+    // cached ASCII transition per byte, no decode, no context — the same
+    // states and edges as the general step below, which takes over at the
+    // first byte that is not ASCII or not yet cached.
+    let fast = !inp.tb_backed && !d.has_assert && d.ascii_ctx_variants == 1
+    let flat_hi = if inp.hi < inp.len then inp.hi else inp.len
+    loop {
+        if fast && have_scan_cp && scan_cp < 128 {
+            var fpos = pos
+            var fstate = state
+            var moved = false
+            loop {
+                if d.st_matched[fstate] || fpos >= flat_hi {
+                    break
+                }
+                let b = bytes[fpos] as int
+                if b >= 128 {
+                    break
+                }
+                let nx = d.ascii[d.st_ascii_at[fstate] + b]
+                if nx < 0 {
+                    break
+                }
+                fstate = nx
+                fpos += 1
+                moved = true
+            }
+            if moved {
+                state = fstate
+                pos = fpos
+                let (c2, l2) = cursor_decode(mut cur, tb, bytes, inp, pos)
+                scan_cp = c2
+                scan_cp_len = l2
+                have_scan_cp = scan_cp_len != 0 && pos < inp.hi
+            }
+        }
+        let cp = scan_cp
+        let cp_len = scan_cp_len
+        let have_cp = have_scan_cp
+        if d.st_matched[state] {
+            verdict = DFA_YES
+            end_at = pos
+            break
+        }
+        if !have_cp {
+            break
+        }
+        let next_pos = pos + cp_len
+        let (ncp, nlen) = cursor_decode(mut cur, tb, bytes, inp, next_pos)
+        let next_cp = ncp
+        let next_cp_len = nlen
+        let have_next_cp = next_cp_len != 0 && next_pos < inp.hi
+        var next_word = false
+        var next_ctx = 0
+        var next = DFA_EDGE_MISS
+        if d.has_assert {
+            // ctx_at(next_pos), flattened for the loop; word status is
+            // carried forward so each codepoint is classified once.
+            if d.ctx_mask & DFA_AT_BOL != 0 && cp == 10 {
+                next_ctx = next_ctx | DFA_AT_BOL
+            }
+            if next_pos == inp.hi {
+                next_ctx = next_ctx | d.ctx_mask & (DFA_AT_EOT | DFA_AT_EOL)
+            } else if d.ctx_mask & DFA_AT_EOL != 0 &&
+                have_next_cp &&
+                (next_cp == 10 || next_cp == 13) {
+                next_ctx = next_ctx | DFA_AT_EOL
+            }
+            if d.ctx_mask & (DFA_AFTER_WORD | DFA_BEFORE_WORD) != 0 {
+                if have_next_cp {
+                    next_word = dfa_is_word(next_cp)
+                }
+                if d.ctx_mask & DFA_AFTER_WORD != 0 && scan_word {
+                    next_ctx = next_ctx | DFA_AFTER_WORD
+                }
+                if d.ctx_mask & DFA_BEFORE_WORD != 0 && next_word {
+                    next_ctx = next_ctx | DFA_BEFORE_WORD
+                }
+            }
+        }
+        if cp < 128 && d.st_ascii_at[state] >= 0 {
+            let slot = cp * d.ascii_ctx_variants + d.ctx_index[next_ctx]
+            next = d.ascii[d.st_ascii_at[state] + slot]
+        } else if d.has_edges {
+            next = edge_get(d, state, cp, next_ctx)
+        }
+        if next < 0 {
+            if next == DFA_EDGE_SKIP_BOL {
+                // YEW-F-072: a BOL-only state with no consuming
+                // instruction cannot change before the next LF.
+                let scan_hi = if inp.hi < inp.len then inp.hi else inp.len
+                if pos >= scan_hi {
+                    break
+                }
+                var nl = pos
+                while nl < scan_hi && bytes[nl] as int != 10 {
+                    nl += 1
+                }
+                if nl >= scan_hi {
+                    break
+                }
+                pos = nl
+                scan_cp = 10
+                scan_cp_len = 1
+                have_scan_cp = true
+                scan_word = false
+                continue
+            }
+            // Step every live instruction on `cp`, then re-seed the start
+            // instruction: the scan is unanchored.
+            var ncur = 0
+            var i = 0
+            let base = d.st_pcs_at[state]
+            let npcs = d.st_npcs[state]
+            while i < npcs {
+                let pc = d.pool[base + i]
+                if inst_takes(re, pc, cp) {
+                    d.cur[ncur] = pc + 1
+                    ncur += 1
+                }
+                i += 1
+            }
+            i = 0
+            while i < ncur {
+                d.combined[i] = d.cur[i]
+                i += 1
+            }
+            d.combined[ncur] = 0
+            let from_state = state
+            let from_flushes = d.flushes
+            let (n, matched) = closure(mut d, re, ncur + 1, next_ctx)
+            next = dfa_intern(mut d, re, n, next_ctx, matched)
+            if next < 0 {
+                verdict = DFA_GIVE_UP
+                break
+            }
+            // Record the edge just walked, if a flush did not invalidate
+            // `from_state`.
+            if d.flushes == from_flushes {
+                if cp < 128 && from_state < d.nstates && d.st_ascii_at[from_state] >= 0 {
+                    let slot = cp * d.ascii_ctx_variants + d.ctx_index[next_ctx]
+                    var cached = next
+                    if !inp.tb_backed &&
+                        d.ctx_mask == DFA_AT_BOL &&
+                        d.st_npcs[from_state] == 0 &&
+                        cp != 10 &&
+                        next == from_state {
+                        cached = DFA_EDGE_SKIP_BOL
+                    }
+                    d.ascii[d.st_ascii_at[from_state] + slot] = cached
+                } else if d.has_edges {
+                    edge_put(mut d, from_state, cp, next_ctx, next)
+                }
+            }
+        }
+        state = next
+        pos += cp_len
+        scan_cp = next_cp
+        scan_cp_len = next_cp_len
+        have_scan_cp = have_next_cp
+        scan_word = next_word
+    }
+    stats.flushes = d.stats.flushes
+    stats.max_states = d.stats.max_states
+    stats.max_bytes = d.stats.max_bytes
+    (verdict, end_at)
+}
+
+/// The DFA's verdict at or after `from` (`yew_re_dfa_test`).
+pub fn re_dfa_test(re: Re, tb: text.TextBuf, bytes: List[byte], inp: ReInput, from: int) -> int {
+    var stats = re_dfa_stats_new()
+    var d = dfa_empty()
+    let (v, _end) = dfa_scan(
+        mut d,
+        re,
+        tb,
+        bytes,
+        inp,
+        from,
+        DFA_MAX_STATES,
+        DFA_MAX_BYTES,
+        mut stats,
+    )
+    v
+}
+
+/// The verdict under a lowered cache cap, with its statistics
+/// (`yew_re_dfa_test_limits`).
+pub fn re_dfa_test_limits(
+    re: Re,
+    tb: text.TextBuf,
+    bytes: List[byte],
+    inp: ReInput,
+    from: int,
+    max_states: int,
+    max_bytes: int,
+    mut stats: ReDfaStats,
+) -> int {
+    var d = dfa_empty()
+    let (v, _end) = dfa_scan(mut d, re, tb, bytes, inp, from, max_states, max_bytes, mut stats)
+    v
+}
+
+/// Where the earliest match ENDS — not where it starts, and not
+/// necessarily the leftmost match's end (`yew_re_dfa_find_end`):
+/// (verdict, end).
+pub fn re_dfa_find_end(re: Re, tb: text.TextBuf, bytes: List[byte], inp: ReInput, from: int) -> (
+    int,
+    int,
+) {
+    var stats = re_dfa_stats_new()
+    var d = dfa_empty()
+    dfa_scan(mut d, re, tb, bytes, inp, from, DFA_MAX_STATES, DFA_MAX_BYTES, mut stats)
+}

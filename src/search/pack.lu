@@ -1,0 +1,383 @@
+//! search.pack — the stable, pointer-free compiled form.
+//!
+//! Ports sagitta `src/search/pack.c` (325 lines) at 9ace98c2: the
+//! syntax-definition cache's serialization (yw10 reads it back). Byte
+//! for byte C's layout — `YEWREP1` (or `YEWREP2` for a literal longer
+//! than 32 bytes, which only `build_large_literal` makes), a 96-byte
+//! header of little-endian u32s (the counts, flags, bounds, smartcase
+//! bits, the literal's kind, length and anchoring, a short literal's
+//! bytes at 64), then 16-byte instructions (x, y, arg, op at 12), forward
+//! then reverse, then each class's count and (lo, hi) ranges, then a long
+//! literal's bytes. Unpacking validates every bound and shape and never
+//! parses a pattern; REP2 admits only the exact inert shape the
+//! compiler produces, since its matcher trusts the metadata (YEW-F-085).
+
+use unicode
+
+const RE_PACK_HEADER: int = 96
+
+const RE_PACK_INST: int = 16
+
+const RE_PACK_RANGE: int = 8
+
+fn put32(mut b: List[byte], at: int, v: int) {
+    b[at] = (v & 255) as byte
+    b[at + 1] = (v >> 8 & 255) as byte
+    b[at + 2] = (v >> 16 & 255) as byte
+    b[at + 3] = (v >> 24 & 255) as byte
+}
+
+fn get32(b: List[byte], at: int) -> int {
+    b[at] as int | b[at + 1] as int << 8 | b[at + 2] as int << 16 | b[at + 3] as int << 24
+}
+
+fn magic_is(b: List[byte], at: int, version: int) -> bool {
+    let m = "YEWREP"
+    var i = 0
+    while i < 6 {
+        if b[at + i] != m.bytes()[i] {
+            return false
+        }
+        i += 1
+    }
+    b[at + 6] as int == version && b[at + 7] as int == 0
+}
+
+fn pack_inst(mut b: List[byte], at: int, i: ReInst) {
+    put32(mut b, at, i.x)
+    put32(mut b, at + 4, i.y)
+    put32(mut b, at + 8, i.arg)
+    b[at + 12] = (i.op & 255) as byte
+}
+
+// `inst_valid` (`pack.c:49-67`).
+fn inst_valid(i: ReInst, nprog: int, nclasses: int, ngroups: int) -> bool {
+    if i.op > RE_MATCH {
+        return false
+    }
+    if i.op == RE_JMP && i.x >= nprog {
+        return false
+    }
+    if i.op == RE_SPLIT && (i.x >= nprog || i.y >= nprog) {
+        return false
+    }
+    if i.op == RE_CLASS && i.arg >= nclasses {
+        return false
+    }
+    if i.op == RE_SAVE && i.arg >= ngroups * 2 {
+        return false
+    }
+    if i.op == RE_CHAR && i.arg > 1114111 {
+        return false
+    }
+    if i.op == RE_ANY && i.arg > 1 {
+        return false
+    }
+    true
+}
+
+fn inst_is(i: ReInst, op: int, x: int, y: int, arg: int) -> bool {
+    i.op == op && i.x == x && i.y == y && i.arg == arg
+}
+
+/// Append `re`'s packed form to `out` (`yew_re_pack`, `pack.c:118-194`);
+/// false (nothing appended) when `re` is not a shape the format holds.
+pub fn re_pack(re: Re, mut out: List[byte]) -> bool {
+    let nprog = re.prog.len
+    let nrprog = re.rprog.len
+    let nclasses = re.cls_start.len
+    if nprog > RE_MAX_PROG ||
+        nrprog > RE_MAX_PROG ||
+        nclasses > RE_MAX_CLASSES ||
+        re.ngroups == 0 ||
+        re.ngroups > RE_MAX_GROUPS ||
+        re.lit.n > RE_MAX_PATTERN ||
+        re.lit.n > RE_LIT_SMALL && re.lit.kind != RE_LIT_WHOLE {
+        return false
+    }
+    let long_literal = re.lit.n > RE_LIT_SMALL
+    var size = RE_PACK_HEADER + nprog * RE_PACK_INST + nrprog * RE_PACK_INST
+    var c = 0
+    while c < nclasses {
+        size += 4 + re.cls_n[c] * RE_PACK_RANGE
+        c += 1
+    }
+    if long_literal {
+        size += re.lit.n
+    }
+    let start = out.len
+    var k = 0
+    while k < size {
+        (mut out).push(0 as byte)
+        k += 1
+    }
+    let m = "YEWREP"
+    k = 0
+    while k < 6 {
+        out[start + k] = m.bytes()[k]
+        k += 1
+    }
+    out[start + 6] = (if long_literal then 50 else 49) as byte
+    put32(mut out, start + 8, nprog)
+    put32(mut out, start + 12, nrprog)
+    put32(mut out, start + 16, nclasses)
+    put32(mut out, start + 20, re.ngroups)
+    put32(mut out, start + 24, re.flags)
+    put32(mut out, start + 28, re.min_len)
+    put32(mut out, start + 32, re.max_len)
+    var bools = 0
+    if re.saw_upper_literal {
+        bools = bools | 1
+    }
+    if re.force_icase {
+        bools = bools | 2
+    }
+    if re.force_case {
+        bools = bools | 4
+    }
+    put32(mut out, start + 36, bools)
+    put32(mut out, start + 40, re.lit.kind)
+    put32(mut out, start + 44, re.lit.n)
+    put32(mut out, start + 48, if re.lit.anchored then 1 else 0)
+    if !long_literal {
+        k = 0
+        while k < re.lit.n {
+            out[start + 64 + k] = re.lit.s[k]
+            k += 1
+        }
+    }
+    var p = start + RE_PACK_HEADER
+    k = 0
+    while k < nprog {
+        pack_inst(mut out, p, copy re.prog[k])
+        p += RE_PACK_INST
+        k += 1
+    }
+    k = 0
+    while k < nrprog {
+        pack_inst(mut out, p, copy re.rprog[k])
+        p += RE_PACK_INST
+        k += 1
+    }
+    c = 0
+    while c < nclasses {
+        put32(mut out, p, re.cls_n[c])
+        p += 4
+        var j = 0
+        while j < re.cls_n[c] {
+            put32(mut out, p, re.cls_lo[re.cls_start[c] + j])
+            put32(mut out, p + 4, re.cls_hi[re.cls_start[c] + j])
+            p += RE_PACK_RANGE
+            j += 1
+        }
+        c += 1
+    }
+    if long_literal {
+        k = 0
+        while k < re.lit.n {
+            out[p] = re.lit.s[k]
+            p += 1
+            k += 1
+        }
+    }
+    p - start == size
+}
+
+// `take` (`pack.c:196-202`): advance `at` over `count * width` bytes
+// within `len`, or refuse.
+fn pack_take(at: int, len: int, count: int, width: int) -> int {
+    if at > len || count != 0 && width > (len - at) / count {
+        return -1
+    }
+    at + count * width
+}
+
+/// The compiled form at `data[at..end)` (`yew_re_unpack`, `pack.c:204-
+/// 325`): the pattern and the bytes it used, or `invalid`.
+pub fn re_unpack(data: List[byte], at0: int, end: int) -> (Re, int) ! {invalid} {
+    let len = end - at0
+    if len < RE_PACK_HEADER {
+        return invalid
+    }
+    let v2 = magic_is(data, at0, 50)
+    if !v2 && !magic_is(data, at0, 49) {
+        return invalid
+    }
+    let nprog = get32(data, at0 + 8)
+    let nrprog = get32(data, at0 + 12)
+    let nclasses = get32(data, at0 + 16)
+    let ngroups = get32(data, at0 + 20)
+    let flags = get32(data, at0 + 24)
+    let min_len = get32(data, at0 + 28)
+    let max_len = get32(data, at0 + 32)
+    let bools = get32(data, at0 + 36)
+    let lit_kind = get32(data, at0 + 40) & 255
+    let lit_n = get32(data, at0 + 44)
+    let anchored_word = get32(data, at0 + 48)
+    var at = RE_PACK_HEADER
+    let rep2_header = nprog == 3 &&
+        nrprog == 3 &&
+        nclasses == 0 &&
+        ngroups == 1 &&
+        flags & RE_ICASE == 0 &&
+        bools - (bools & 1) == 0 &&
+        min_len == max_len &&
+        min_len > RE_MAX_PROG - 3 &&
+        lit_kind == RE_LIT_WHOLE &&
+        lit_n > RE_LIT_SMALL &&
+        anchored_word == 0
+    if nprog == 0 ||
+        nprog > RE_MAX_PROG ||
+        nrprog == 0 ||
+        nrprog > RE_MAX_PROG ||
+        nclasses > RE_MAX_CLASSES ||
+        ngroups == 0 ||
+        ngroups > RE_MAX_GROUPS ||
+        flags - (flags & 15) != 0 ||
+        max_len != RE_UNBOUNDED && max_len < min_len ||
+        bools > 7 ||
+        lit_kind > RE_LIT_WHOLE ||
+        lit_n > RE_MAX_PATTERN ||
+        !v2 && lit_n > RE_LIT_SMALL ||
+        v2 && lit_n <= RE_LIT_SMALL ||
+        lit_n > RE_LIT_SMALL && lit_kind != RE_LIT_WHOLE ||
+        lit_kind == RE_LIT_NONE && lit_n != 0 ||
+        lit_kind == RE_LIT_BYTE && lit_n != 1 ||
+        lit_kind == RE_LIT_BMH && lit_n < 2 ||
+        lit_kind == RE_LIT_WHOLE && lit_n == 0 ||
+        anchored_word > 1 ||
+        v2 && !rep2_header {
+        return invalid
+    }
+    at = pack_take(at, len, nprog, RE_PACK_INST)
+    if at < 0 {
+        return invalid
+    }
+    at = pack_take(at, len, nrprog, RE_PACK_INST)
+    if at < 0 {
+        return invalid
+    }
+    var prog = List[ReInst]()
+    var i = 0
+    while i < nprog {
+        let q = at0 + RE_PACK_HEADER + i * RE_PACK_INST
+        let ins = ReInst {
+            op: data[q + 12] as int,
+            x: get32(data, q),
+            y: get32(data, q + 4),
+            arg: get32(data, q + 8),
+        }
+        if !inst_valid(copy ins, nprog, nclasses, ngroups) {
+            return invalid
+        }
+        (mut prog).push(ins)
+        i += 1
+    }
+    var rprog = List[ReInst]()
+    i = 0
+    while i < nrprog {
+        let q = at0 + RE_PACK_HEADER + nprog * RE_PACK_INST + i * RE_PACK_INST
+        let ins = ReInst {
+            op: data[q + 12] as int,
+            x: get32(data, q),
+            y: get32(data, q + 4),
+            arg: get32(data, q + 8),
+        }
+        if !inst_valid(copy ins, nrprog, nclasses, ngroups) {
+            return invalid
+        }
+        (mut rprog).push(ins)
+        i += 1
+    }
+    if v2 &&
+        !(
+            inst_is(copy prog[0], RE_SAVE, 0, 0, 0) &&
+                inst_is(copy prog[1], RE_SAVE, 0, 0, 1) &&
+                inst_is(copy prog[2], RE_MATCH, 0, 0, 0) &&
+                inst_is(copy rprog[0], RE_SAVE, 0, 0, 1) &&
+                inst_is(copy rprog[1], RE_SAVE, 0, 0, 0) &&
+                inst_is(copy rprog[2], RE_MATCH, 0, 0, 0)
+        ) {
+        return invalid
+    }
+    var cls_lo = List[int]()
+    var cls_hi = List[int]()
+    var cls_start = List[int]()
+    var cls_n = List[int]()
+    var c = 0
+    while c < nclasses {
+        at = pack_take(at, len, 1, 4)
+        if at < 0 {
+            return invalid
+        }
+        let count = get32(data, at0 + at - 4)
+        at = pack_take(at, len, count, RE_PACK_RANGE)
+        if at < 0 {
+            return invalid
+        }
+        (mut cls_start).push(cls_lo.len)
+        (mut cls_n).push(count)
+        var j = 0
+        while j < count {
+            let q = at0 + at - (count - j) * RE_PACK_RANGE
+            let lo = get32(data, q)
+            let hi = get32(data, q + 4)
+            if lo > hi || hi > 1114111 || j != 0 && cls_hi[cls_hi.len - 1] >= lo {
+                return invalid
+            }
+            (mut cls_lo).push(lo)
+            (mut cls_hi).push(hi)
+            j += 1
+        }
+        c += 1
+    }
+    var lit = lit_none()
+    if v2 {
+        let literal_at = at
+        at = pack_take(at, len, lit_n, 1)
+        if at < 0 {
+            return invalid
+        }
+        // The direct matcher trusts the header's cardinality: admit only
+        // a literal of exactly `min_len` codepoints.
+        var off = 0
+        var codepoints = 0
+        while off < lit_n {
+            let (_cp, step) = unicode.utf8_decode(
+                data,
+                at0 + literal_at + off,
+                at0 + literal_at + lit_n,
+            )
+            if step == 0 {
+                return invalid
+            }
+            off += step
+            codepoints += 1
+        }
+        if codepoints != min_len {
+            return invalid
+        }
+        lit = lit_prepare(lit_kind, data, at0 + literal_at, at0 + literal_at + lit_n)
+    } else if lit_n != 0 {
+        lit = lit_prepare(lit_kind, data, at0 + 64, at0 + 64 + lit_n)
+    }
+    lit.anchored = anchored_word != 0
+    let re = Re {
+        prog: prog,
+        rprog: rprog,
+        cls_lo: cls_lo,
+        cls_hi: cls_hi,
+        cls_start: cls_start,
+        cls_n: cls_n,
+        ngroups: ngroups,
+        lit: lit,
+        flags: flags,
+        saw_upper_literal: bools & 1 != 0,
+        force_icase: bools & 2 != 0,
+        force_case: bools & 4 != 0,
+        min_len: min_len,
+        max_len: max_len,
+        walked: 0,
+    }
+    (re, at)
+}

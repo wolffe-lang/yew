@@ -1,0 +1,1499 @@
+//! search.parse — pattern bytes to an AST, with precise error offsets.
+//!
+//! Ports sagitta `src/search/parse.c` (1,281 lines) and the AST and
+//! parser types of `regex_internal.h:100-191` at 9ace98c2, under
+//! `s20-regex-engine.md` §2/§3/§8 and `s21-search-replace.md` §2 (the
+//! smartcase inputs). The grammar, the error rows, their offsets and the
+//! class construction are C's, row for row; three shapes are the port's:
+//!
+//! - **The parser keeps its own stack.** C recurses `parse_alt` →
+//!   `parse_concat` → `parse_piece` → `parse_atom` → `parse_group` →
+//!   `parse_alt` once per nesting level; a 64 KiB pattern of `(?:` nests
+//!   16,384 deep, five C frames a level. A wolf stack overflow is a
+//!   plain SIGSEGV with no trap line, and a three-argument frame dies
+//!   between 50,000 and 100,000 deep natively and 150,000 and 200,000 on
+//!   the release tier on the 8 MiB stack (`notes/yw04-evidence/witness/
+//!   deep-recursion/`), so the port parses with an explicit stack of open groups
+//!   (`GroupFrame`) and visits the same constructs in the same order: the
+//!   AST and the first error are C's. The AST is a node pool (`ReAst`
+//!   rows, -1 for none), as the piece tree is.
+//! - **No process-wide caches.** C builds each Unicode property's run
+//!   table once per process by scanning the 1.1M scalars and the ICASE
+//!   fold table by scanning them again (`parse.c:208-252`, `:325-361`);
+//!   module state of a `List` is refused (G15), so the port builds both
+//!   per compile — the runs from the trie's STRUCTURE (each distinct
+//!   stage-2 block's 128 entries once, the high planes by range), the
+//!   fold table from the case table's records (only a codepoint with a
+//!   record can map) — which yields the same ranges and the same table.
+//! - **Messages are `str`.** C formats `unknown escape '\%c'` and the
+//!   POSIX class names with the pattern's raw bytes; a byte >= 0x80 there
+//!   cannot be in a wolf `str`, so it is spelled `\xHH` (the one place
+//!   the port's text differs from C's: a backslash before a non-ASCII
+//!   byte, or a non-UTF-8 class name).
+
+use unicode
+
+// The AST kinds (`ReAstKind`, `regex_internal.h:104-122`).
+const RE_A_EMPTY: int = 0
+
+const RE_A_CHAR: int = 1
+
+const RE_A_CLASS: int = 2
+
+const RE_A_ANY: int = 3
+
+const RE_A_CAT: int = 4
+
+const RE_A_ALT: int = 5
+
+const RE_A_STAR: int = 6
+
+const RE_A_PLUS: int = 7
+
+const RE_A_QUEST: int = 8
+
+const RE_A_REPEAT: int = 9
+
+const RE_A_GROUP: int = 10
+
+const RE_A_BOL: int = 11
+
+const RE_A_EOL: int = 12
+
+const RE_A_BOT: int = 13
+
+const RE_A_EOT: int = 14
+
+const RE_A_WORDB: int = 15
+
+const RE_A_NWORDB: int = 16
+
+/// One AST node (`struct ReAst`, `regex_internal.h:124-140`): `a` and `b`
+/// are node indices, -1 for none.
+struct ReAst {
+    kind: int,
+    greedy: bool,
+    emits_none: bool,
+    cp: int,
+    cls: int,
+    group: int,
+    min: int,
+    max: int,
+    dotall: bool,
+    a: int,
+    b: int,
+}
+
+/// The parser's state (`ReParse`, `regex_internal.h:144-168`); the
+/// pattern bytes travel beside it.
+struct ReParse {
+    at: int,
+    len: int,
+    flags: int,
+    base_flags: int,
+    ngroups: int,
+    nodes: List[ReAst],
+    cls_lo: List[int],
+    cls_hi: List[int],
+    cls_start: List[int],
+    cls_n: List[int],
+    failed: bool,
+    err_off: int,
+    err_msg: str,
+    saw_upper_literal: bool,
+    force_icase: bool,
+    force_case: bool,
+    cache: ReCache,
+}
+
+/// What C keeps for the process's lifetime (`parse.c:208-215` the
+/// property runs, `:325-330` the fold table), as a VALUE its owner
+/// threads through `re_compile_cached` (module state of a `List` is
+/// refused, G15/G27): each property's runs and the fold table built on
+/// first use and reused by every later compile given the same cache. A
+/// caller that compiles many patterns (a syntax definition set, the
+/// incremental search) keeps one; `re_compile` makes a fresh one per
+/// compile.
+pub struct ReCache {
+    prop_ready: List[bool],
+    prop_lo: List[List[int]],
+    prop_hi: List[List[int]],
+    fold_ready: bool,
+    fold_canon: List[int],
+    fold_cp: List[int],
+}
+
+/// An empty cache.
+pub fn re_cache_new() -> ReCache {
+    var ready = List[bool]()
+    var plo = List[List[int]]()
+    var phi = List[List[int]]()
+    var k = 0
+    while k < 13 {
+        (mut ready).push(false)
+        (mut plo).push(List[int]())
+        (mut phi).push(List[int]())
+        k += 1
+    }
+    ReCache {
+        prop_ready: ready,
+        prop_lo: plo,
+        prop_hi: phi,
+        fold_ready: false,
+        fold_canon: List[int](),
+        fold_cp: List[int](),
+    }
+}
+
+// A placeholder for the swap seam: no lists behind the flags.
+fn re_cache_new_empty() -> ReCache {
+    ReCache {
+        prop_ready: List[bool](),
+        prop_lo: List[List[int]](),
+        prop_hi: List[List[int]](),
+        fold_ready: false,
+        fold_canon: List[int](),
+        fold_cp: List[int](),
+    }
+}
+
+fn parse_new(len: int, flags: int) -> ReParse {
+    ReParse {
+        at: 0,
+        len: len,
+        flags: flags,
+        base_flags: flags,
+        ngroups: 1,
+        nodes: List[ReAst](),
+        cls_lo: List[int](),
+        cls_hi: List[int](),
+        cls_start: List[int](),
+        cls_n: List[int](),
+        failed: false,
+        err_off: 0,
+        err_msg: "",
+        saw_upper_literal: false,
+        force_icase: false,
+        force_case: false,
+        cache: re_cache_new_empty(),
+    }
+}
+
+// ---------------------------------------------------------------- errors
+
+/// The first failure wins; the offset is clamped into the pattern
+/// (`yew_re_fail`, `parse.c:50-59`).
+fn re_fail(mut p: ReParse, off: int, msg: str) {
+    if p.failed {
+        return
+    }
+    p.failed = true
+    p.err_off = if off > p.len then p.len else off
+    p.err_msg = msg
+}
+
+// A message fragment from pattern bytes as C's `%.*s` prints it — up to
+// `end` or the first NUL — with UTF-8 kept and any byte that does not
+// decode spelled `\xHH` (the module header says why).
+fn msg_bytes(pat: List[byte], at: int, end: int) -> str {
+    let hex = "0123456789abcdef"
+    var out = List[byte]()
+    var i = at
+    while i < end && pat[i] as int != 0 {
+        let (cp, n) = unicode.utf8_decode(pat, i, end)
+        if unicode.utf8_is_escape(cp) {
+            let b = pat[i] as int
+            (mut out).push(92 as byte)
+            (mut out).push(120 as byte)
+            (mut out).push(hex.bytes()[b >> 4 & 15])
+            (mut out).push(hex.bytes()[b & 15])
+        } else {
+            var k = 0
+            while k < n {
+                (mut out).push(pat[i + k])
+                k += 1
+            }
+        }
+        i += n
+    }
+    str_from_utf8(out) else "?"
+}
+
+// ---------------------------------------------------------------- classes
+
+// A stable bottom-up merge sort of the range pairs by (lo, hi)
+// (`yew_sort_stable` with `range_cmp`, `parse.c:65-76`).
+fn ranges_sort(mut lo: List[int], mut hi: List[int]) {
+    let n = lo.len
+    if n < 2 {
+        return
+    }
+    var src_lo = copy lo
+    var src_hi = copy hi
+    var dst_lo = copy lo
+    var dst_hi = copy hi
+    var width = 1
+    while width < n {
+        var start = 0
+        while start < n {
+            let mid = if start + width < n then start + width else n
+            let end = if start + 2 * width < n then start + 2 * width else n
+            var i = start
+            var j = mid
+            var k = start
+            while k < end {
+                var take_left = false
+                if i < mid && j < end {
+                    take_left = src_lo[i] < src_lo[j] ||
+                        src_lo[i] == src_lo[j] && src_hi[i] <= src_hi[j]
+                } else {
+                    take_left = i < mid
+                }
+                if take_left {
+                    dst_lo[k] = src_lo[i]
+                    dst_hi[k] = src_hi[i]
+                    i += 1
+                } else {
+                    dst_lo[k] = src_lo[j]
+                    dst_hi[k] = src_hi[j]
+                    j += 1
+                }
+                k += 1
+            }
+            start += 2 * width
+        }
+        let tl = src_lo
+        src_lo = dst_lo
+        dst_lo = tl
+        let th = src_hi
+        src_hi = dst_hi
+        dst_hi = th
+        width *= 2
+    }
+    var k = 0
+    while k < n {
+        lo[k] = src_lo[k]
+        hi[k] = src_hi[k]
+        k += 1
+    }
+}
+
+/// Sort, merge overlaps (and adjacency), optionally complement over the
+/// scalar space — which includes the U+DC80..U+DCFF escapes, so `[^x]`
+/// still matches a raw byte (`normalize`, `parse.c:78-126`); appended to
+/// the class table as class `p.cls_start.len`.
+fn class_intern(mut p: ReParse, mut lo: List[int], mut hi: List[int], negate: bool) -> int {
+    if p.cls_start.len >= RE_MAX_CLASSES {
+        re_fail(mut p, p.at, "too many character classes (max 256)")
+        return -1
+    }
+    ranges_sort(mut lo, mut hi)
+    var mlo = List[int]()
+    var mhi = List[int]()
+    var i = 0
+    while i < lo.len {
+        let w = mlo.len
+        if w != 0 && lo[i] <= mhi[w - 1] + 1 {
+            if hi[i] > mhi[w - 1] {
+                mhi[w - 1] = hi[i]
+            }
+        } else {
+            (mut mlo).push(lo[i])
+            (mut mhi).push(hi[i])
+        }
+        i += 1
+    }
+    let start = p.cls_lo.len
+    if !negate {
+        var k = 0
+        while k < mlo.len {
+            (mut p.cls_lo).push(mlo[k])
+            (mut p.cls_hi).push(mhi[k])
+            k += 1
+        }
+    } else {
+        var next = 0
+        var k = 0
+        while k < mlo.len {
+            if mlo[k] > next {
+                (mut p.cls_lo).push(next)
+                (mut p.cls_hi).push(mlo[k] - 1)
+            }
+            if mhi[k] + 1 > next {
+                next = mhi[k] + 1
+            }
+            k += 1
+        }
+        if next <= 1114111 {
+            (mut p.cls_lo).push(next)
+            (mut p.cls_hi).push(1114111)
+        }
+    }
+    (mut p.cls_start).push(start)
+    (mut p.cls_n).push(p.cls_lo.len - start)
+    p.cls_start.len - 1
+}
+
+/// Whether class `c` holds `cp`: one binary search
+/// (`yew_re_class_has`, `parse.c:153-169`).
+fn class_has(re: Re, c: int, cp: int) -> bool {
+    var lo = re.cls_start[c]
+    var hi = lo + re.cls_n[c]
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if cp < re.cls_lo[mid] {
+            hi = mid
+        } else if cp > re.cls_hi[mid] {
+            lo = mid + 1
+        } else {
+            return true
+        }
+    }
+    false
+}
+
+// The property predicates the class builders materialize: `\w`, `\d`
+// and the thirteen POSIX names of `parse.c:648-660`.
+const PROP_WORD: int = 0
+
+const PROP_DIGIT: int = 1
+
+const PROP_ALPHA: int = 2
+
+const PROP_ALNUM: int = 3
+
+const PROP_UPPER: int = 4
+
+const PROP_LOWER: int = 5
+
+const PROP_SPACE: int = 6
+
+const PROP_BLANK: int = 7
+
+const PROP_PUNCT: int = 8
+
+const PROP_CNTRL: int = 9
+
+const PROP_GRAPH: int = 10
+
+const PROP_PRINT: int = 11
+
+const PROP_XDIGIT: int = 12
+
+// One predicate over a codepoint, its category record and its word-break
+// record (`posix_*`, `parse.c:595-640`; `yew_re_is_word`/`_digit`/
+// `_space`, `parse.c:28-44`).
+fn prop_holds_rec(kind: int, cp: int, rec: int, wb: int) -> bool {
+    let space = wb & unicode.WB_RECORD_WHITE_SPACE != 0
+    match kind {
+        0 => rec & (unicode.CAT_ALPHA | unicode.CAT_ND | unicode.CAT_PC) != 0, // PROP_WORD
+        1 => rec & unicode.CAT_ND != 0, // PROP_DIGIT
+        2 => rec & unicode.CAT_ALPHA != 0, // PROP_ALPHA
+        3 => rec & (unicode.CAT_ALPHA | unicode.CAT_ND) != 0, // PROP_ALNUM
+        4 => rec & unicode.CAT_UPPER != 0, // PROP_UPPER
+        5 => rec & unicode.CAT_LOWER != 0, // PROP_LOWER
+        6 => space, // PROP_SPACE
+        7 => cp == 9 || cp == 32 || rec & unicode.CAT_ZS != 0, // PROP_BLANK
+        8 => rec & unicode.CAT_PUNCT != 0, // PROP_PUNCT
+        9 => rec & unicode.CAT_CNTRL != 0, // PROP_CNTRL
+        10 => rec & unicode.CAT_ASSIGNED != 0 && rec & unicode.CAT_CNTRL == 0 && !space, // PROP_GRAPH
+        11 => rec & unicode.CAT_ASSIGNED != 0 && rec & unicode.CAT_CNTRL == 0 && !space || cp == 32, // PROP_PRINT
+        12 => cp >= 48 && cp <= 57 || cp >= 97 && cp <= 102 || cp >= 65 && cp <= 70, // PROP_XDIGIT
+        _ => false,
+    }
+}
+
+fn prop_holds(kind: int, cp: int) -> bool {
+    prop_holds_rec(kind, cp, unicode.cat_rec(cp), unicode.wb_record(cp))
+}
+
+// Append the run [lo, hi], extending the previous one when adjacent: the
+// maximal runs C's scan produces.
+fn run_add(mut lo: List[int], mut hi: List[int], a: int, b: int) {
+    let n = lo.len
+    if n != 0 && hi[n - 1] + 1 == a {
+        hi[n - 1] = b
+        return
+    }
+    (mut lo).push(a)
+    (mut hi).push(b)
+}
+
+/// A property as explicit maximal runs over U+0000..U+10FFFF — what C's
+/// `build_prop_ranges` (`parse.c:217-252`) scans for, computed from the
+/// tables' structure: below U+30000 a block of 128 codepoints is decided
+/// by its category and word-break stage-2 blocks (block 0 directly, as
+/// `blank`, `print` and `xdigit` name ASCII codepoints), each distinct
+/// pair evaluated once; above it both tables are constant between their
+/// high ranges' edges.
+// A property's runs appended to `lo`/`hi`, from the cache or built and
+// cached (`build_prop_ranges`'s cache, `parse.c:217-252`).
+fn prop_runs_cached(mut p: ReParse, kind: int, mut lo: List[int], mut hi: List[int]) {
+    if !p.cache.prop_ready[kind] {
+        var clo = List[int]()
+        var chi = List[int]()
+        prop_runs(kind, mut clo, mut chi)
+        p.cache.prop_lo[kind] = clo
+        p.cache.prop_hi[kind] = chi
+        p.cache.prop_ready[kind] = true
+    }
+    var i = 0
+    while i < p.cache.prop_lo[kind].len {
+        (mut lo).push(p.cache.prop_lo[kind][i])
+        (mut hi).push(p.cache.prop_hi[kind][i])
+        i += 1
+    }
+}
+
+fn prop_runs(kind: int, mut lo: List[int], mut hi: List[int]) {
+    // Past block 0 a predicate reads only the category record, and the
+    // word-break record for the three White_Space kinds: a category-only
+    // kind is decided per palette entry and memoized per stage-2 block.
+    let needs_wb = kind == PROP_SPACE || kind == PROP_GRAPH || kind == PROP_PRINT
+    var pal_on = List[bool]()
+    var pi = 0
+    while pi < unicode.CAT_PAL_LEN {
+        (mut pal_on).push(prop_holds_rec(kind, 128, unicode.cat_pal(pi), 0))
+        pi += 1
+    }
+    var memo = Map[int, int]()
+    var memo_lo = List[int]()
+    var memo_hi = List[int]()
+    var memo_start = List[int]()
+    var memo_n = List[int]()
+    var b = 0
+    while b < 1536 {
+        let base = b * 128
+        if b == 0 {
+            var c = 0
+            while c < 128 {
+                if prop_holds(kind, c) {
+                    run_add(mut lo, mut hi, c, c)
+                }
+                c += 1
+            }
+        } else {
+            let cb = unicode.cat_stage1(b)
+            let wbb = if needs_wb then unicode.wb_stage1(b) else 0
+            let key = cb * 16384 + wbb
+            var slot = memo[key] else -1
+            if slot < 0 {
+                slot = memo_start.len
+                (mut memo_start).push(memo_lo.len)
+                var s = 0
+                var run_from = -1
+                while s < 128 {
+                    var on = false
+                    if needs_wb {
+                        let rec = unicode.cat_pal(unicode.cat_stage2(cb * 128 + s))
+                        let wb = unicode.wb_stage2(wbb * 128 + s)
+                        on = prop_holds_rec(kind, base + s, rec, wb)
+                    } else {
+                        on = pal_on[unicode.cat_stage2(cb * 128 + s)]
+                    }
+                    if on && run_from < 0 {
+                        run_from = s
+                    }
+                    if !on && run_from >= 0 {
+                        (mut memo_lo).push(run_from)
+                        (mut memo_hi).push(s - 1)
+                        run_from = -1
+                    }
+                    s += 1
+                }
+                if run_from >= 0 {
+                    (mut memo_lo).push(run_from)
+                    (mut memo_hi).push(127)
+                }
+                (mut memo_n).push(memo_lo.len - memo_start[slot])
+                memo[key] = slot
+            }
+            var r = memo_start[slot]
+            let r_end = r + memo_n[slot]
+            while r < r_end {
+                run_add(mut lo, mut hi, base + memo_lo[r], base + memo_hi[r])
+                r += 1
+            }
+        }
+        b += 1
+    }
+    // Above the tries: the edges of both high-range tables cut the planes
+    // into stretches where every record is constant.
+    var edges = List[int]()
+    (mut edges).push(196608)
+    (mut edges).push(1114112)
+    var i = 0
+    while i < unicode.CAT_HI_LEN {
+        (mut edges).push(unicode.cat_hi_lo(i))
+        (mut edges).push(unicode.cat_hi_hi(i) + 1)
+        i += 1
+    }
+    i = 0
+    while i < unicode.WB_HI_LEN {
+        (mut edges).push(unicode.wb_hi_lo(i))
+        (mut edges).push(unicode.wb_hi_hi(i) + 1)
+        i += 1
+    }
+    var ehi = copy edges
+    ranges_sort(mut edges, mut ehi)
+    var prev = -1
+    i = 0
+    while i < edges.len {
+        let a = edges[i]
+        if a != prev && a >= 196608 && a < 1114112 {
+            var next = 1114112
+            var k = i + 1
+            while k < edges.len && next == 1114112 {
+                if edges[k] > a {
+                    next = edges[k]
+                }
+                k += 1
+            }
+            if prop_holds(kind, a) {
+                run_add(mut lo, mut hi, a, next - 1)
+            }
+        }
+        prev = a
+        i += 1
+    }
+}
+
+/// The class for a Perl shorthand: `w`, `d`, `s` and their negations
+/// (`yew_re_class_perl`, `parse.c:270-292`; `\s` is the fixed table of
+/// `build_space_ranges`, `parse.c:254-268`).
+fn class_perl(mut p: ReParse, which: int) -> int {
+    let negate = which == 87 || which == 68 || which == 83
+    let base = if negate then which + 32 else which
+    var lo = List[int]()
+    var hi = List[int]()
+    if base == 119 {
+        prop_runs_cached(mut p, PROP_WORD, mut lo, mut hi)
+    } else if base == 100 {
+        prop_runs_cached(mut p, PROP_DIGIT, mut lo, mut hi)
+    } else {
+        let space = "\x09\x0d\x20\x20\u{85}\u{85}\u{a0}\u{a0}\u{1680}\u{1680}\u{2000}\u{200a}\u{2028}\u{2029}\u{202f}\u{202f}\u{205f}\u{205f}\u{3000}\u{3000}"
+        for c in space.chars() {
+            if lo.len == hi.len {
+                (mut lo).push(c as int)
+            } else {
+                (mut hi).push(c as int)
+            }
+        }
+    }
+    class_intern(mut p, mut lo, mut hi, negate)
+}
+
+// ---------------------------------------------------------------- folding
+
+// The single-codepoint uppercase, or `cp` (`fold_canon`, `parse.c:315-
+// 324`): a multi-codepoint expansion is full folding, which §3 rules out.
+fn fold_canon(cp: int) -> int {
+    let (at, len) = unicode.case_map_span(cp, unicode.CASE_UPPER)
+    if len == 1 then unicode.case_data_at(at) else cp
+}
+
+// `fold_build` (`parse.c:338-361`): every codepoint that case-maps,
+// grouped under its uppercase form, sorted by (canon, cp). C scans the
+// scalar space; a codepoint without a case record maps to itself, so the
+// records are the same set (ascending, so the sort by canon is stable).
+fn fold_build(mut p: ReParse) {
+    if p.cache.fold_ready {
+        return
+    }
+    p.cache.fold_ready = true
+    var i = 0
+    while i < unicode.CASE_REC_LEN {
+        // `fold_canon` of the record's own codepoint, read off the record
+        // (the binary search would find this same record).
+        let cp = unicode.case_rec_cp(i)
+        let canon = if unicode.case_rec_upper_len(i) == 1 {
+            unicode.case_data_at(unicode.case_rec_upper_at(i))
+        } else {
+            cp
+        }
+        if canon != cp && p.cache.fold_canon.len < 4096 {
+            (mut p.cache.fold_canon).push(canon)
+            (mut p.cache.fold_cp).push(cp)
+        }
+        i += 1
+    }
+    ranges_sort(mut p.cache.fold_canon, mut p.cache.fold_cp)
+}
+
+// `fold_push` (`parse.c:363-392`): THE ONLY WAY a partner enters the
+// list — bounded at four, never twice.
+fn fold_push(mut out: List[int], cp: int) {
+    if out.len >= 4 {
+        return
+    }
+    for x in out {
+        if x == cp {
+            return
+        }
+    }
+    (mut out).push(cp)
+}
+
+// `fold_class_members` (`parse.c:394-414`).
+fn fold_class_members(p: ReParse, canon: int, mut out: List[int]) {
+    var lo = 0
+    var hi = p.cache.fold_canon.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if p.cache.fold_canon[mid] < canon {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    while lo < p.cache.fold_canon.len && p.cache.fold_canon[lo] == canon && out.len < 4 {
+        fold_push(mut out, p.cache.fold_cp[lo])
+        lo += 1
+    }
+}
+
+/// The simple-folding partners of `cp`, itself first, at most four
+/// (`yew_re_fold_partners`, `parse.c:416-449`): the class through the
+/// shared uppercase form (which brings final sigma in), the simple maps,
+/// and the Kelvin sign and long s probes.
+fn fold_partners(mut p: ReParse, cp: int) -> List[int] {
+    var out = List[int]()
+    fold_push(mut out, cp)
+    fold_build(mut p)
+    let canon = fold_canon(cp)
+    fold_push(mut out, canon)
+    fold_class_members(p, canon, mut out)
+    let (lat, llen) = unicode.case_map_span(cp, unicode.CASE_LOWER)
+    if llen == 0 {
+        fold_push(mut out, cp)
+    } else if llen == 1 {
+        fold_push(mut out, unicode.case_data_at(lat))
+    }
+    let (uat, ulen) = unicode.case_map_span(cp, unicode.CASE_UPPER)
+    if ulen == 0 {
+        fold_push(mut out, cp)
+    } else if ulen == 1 {
+        fold_push(mut out, unicode.case_data_at(uat))
+    }
+    var probe = 0
+    if cp == 107 || cp == 75 {
+        probe = 8490
+    } else if cp == 115 || cp == 83 {
+        probe = 383
+    }
+    if probe != 0 {
+        fold_push(mut out, probe)
+    }
+    out
+}
+
+// ---------------------------------------------------------------- lexing
+
+fn at_end(p: ReParse) -> bool {
+    p.at >= p.len
+}
+
+fn peek(p: ReParse, pat: List[byte]) -> int {
+    if p.at < p.len then pat[p.at] as int else 0
+}
+
+fn peek_at(p: ReParse, pat: List[byte], ahead: int) -> int {
+    if p.at + ahead < p.len then pat[p.at + ahead] as int else 0
+}
+
+/// One codepoint written literally, advancing (`take_cp`, `parse.c:444-
+/// 455`): invalid bytes become escapes; the ONLY path a bare literal
+/// takes, so the right place for smartcase's "did the user type an
+/// uppercase letter".
+fn take_cp(mut p: ReParse, pat: List[byte]) -> int {
+    let (cp, n) = unicode.utf8_decode(pat, p.at, p.len)
+    p.at += if n == 0 then 1 else n
+    if unicode.cat_rec(cp) & unicode.CAT_UPPER != 0 {
+        p.saw_upper_literal = true
+    }
+    cp
+}
+
+fn node(mut p: ReParse, kind: int) -> int {
+    (mut p.nodes).push(ReAst {
+        kind: kind,
+        greedy: true,
+        emits_none: false,
+        cp: 0,
+        cls: 0,
+        group: 0,
+        min: 0,
+        max: 0,
+        dotall: false,
+        a: -1,
+        b: -1,
+    })
+    p.nodes.len - 1
+}
+
+fn node2(mut p: ReParse, kind: int, a: int, b: int) -> int {
+    let n = node(mut p, kind)
+    p.nodes[n].a = a
+    p.nodes[n].b = b
+    n
+}
+
+fn hex_digit(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    -1
+}
+
+// `parse_hex_digits` (`parse.c:468-490`): `count` digits or false.
+fn parse_hex_digits(mut p: ReParse, pat: List[byte], count: int) -> (bool, int) {
+    var value = 0
+    var i = 0
+    while i < count {
+        let d = hex_digit(peek(p, pat))
+        if d < 0 {
+            return (false, 0)
+        }
+        value = value * 16 + d
+        p.at += 1
+        i += 1
+    }
+    (true, value)
+}
+
+// `\xHH` and `\x{H..}` (`parse_hex_escape`, `parse.c:492-525`).
+fn parse_hex_escape(mut p: ReParse, pat: List[byte], start: int) -> (bool, int) {
+    if peek(p, pat) == 123 {
+        var value = 0
+        var digits = 0
+        p.at += 1
+        while !at_end(p) && peek(p, pat) != 125 {
+            let (ok, one) = parse_hex_digits(mut p, pat, 1)
+            if !ok || digits >= 6 {
+                re_fail(mut p, start, "invalid codepoint escape")
+                return (false, 0)
+            }
+            value = value * 16 + one
+            digits += 1
+        }
+        if digits == 0 || at_end(p) || peek(p, pat) != 125 || value > 1114111 {
+            re_fail(mut p, start, "invalid codepoint escape")
+            return (false, 0)
+        }
+        p.at += 1
+        return (true, value)
+    }
+    let (ok, v) = parse_hex_digits(mut p, pat, 2)
+    if !ok {
+        re_fail(mut p, start, "invalid codepoint escape")
+        return (false, 0)
+    }
+    (true, v)
+}
+
+/// Pattern- and class-level escapes (`parse_escape`, `parse.c:527-
+/// 565`): answers (ok, codepoint, class index or -1); called with `p.at`
+/// just past the backslash.
+fn parse_escape(mut p: ReParse, pat: List[byte]) -> (bool, int, int) {
+    let start = p.at - 1
+    if at_end(p) {
+        re_fail(mut p, start, "trailing backslash")
+        return (false, 0, -1)
+    }
+    let c = peek(p, pat)
+    let simple = match c {
+        110 => 10, // \n
+        116 => 9, // \t
+        114 => 13, // \r
+        102 => 12, // \f
+        118 => 11, // \v
+        97 => 7, // \a
+        101 => 27, // \e
+        48 => 0, // \0
+        _ => -1,
+    }
+    if simple >= 0 {
+        p.at += 1
+        return (true, simple, -1)
+    }
+    if c == 120 {
+        p.at += 1
+        let (ok, v) = parse_hex_escape(mut p, pat, start)
+        return (ok, v, -1)
+    }
+    if c == 119 || c == 87 || c == 100 || c == 68 || c == 115 || c == 83 {
+        p.at += 1
+        let cls = class_perl(mut p, c)
+        return (!p.failed, 0, cls)
+    }
+    // Metacharacters and punctuation escape to themselves.
+    if c >= 33 && c <= 47 || c >= 58 && c <= 64 || c >= 91 && c <= 96 || c >= 123 && c <= 126 {
+        p.at += 1
+        return (true, c, -1)
+    }
+    if c == 0 {
+        // C's `%c` of a NUL ends the message there.
+        re_fail(mut p, start, "unknown escape '\\")
+    } else {
+        re_fail(mut p, start, "unknown escape '\\{msg_bytes(pat, p.at, p.at + 1)}'")
+    }
+    (false, 0, -1)
+}
+
+// The class buffer (`ClassBuf`, `parse.c:571-596`): ranges gathered for
+// one bracket expression or one folded literal.
+fn cbuf_add_class(p: ReParse, mut lo: List[int], mut hi: List[int], idx: int) {
+    if idx < 0 || idx >= p.cls_start.len {
+        return
+    }
+    var i = p.cls_start[idx]
+    let end = i + p.cls_n[idx]
+    while i < end {
+        (mut lo).push(p.cls_lo[i])
+        (mut hi).push(p.cls_hi[i])
+        i += 1
+    }
+}
+
+fn cbuf_add_folded(mut p: ReParse, mut lo: List[int], mut hi: List[int], cp: int) {
+    if p.flags & RE_ICASE != 0 {
+        let partners = fold_partners(mut p, cp)
+        for x in partners {
+            (mut lo).push(x)
+            (mut hi).push(x)
+        }
+        return
+    }
+    (mut lo).push(cp)
+    (mut hi).push(cp)
+}
+
+// The predicate of the `k`th POSIX name, in `parse.c:648-660`'s order.
+fn posix_kind(k: int) -> int {
+    match k {
+        0 => PROP_ALPHA,
+        1 => PROP_DIGIT,
+        2 => PROP_ALNUM,
+        3 => PROP_UPPER,
+        4 => PROP_LOWER,
+        5 => PROP_SPACE,
+        6 => PROP_BLANK,
+        7 => PROP_PUNCT,
+        8 => PROP_CNTRL,
+        9 => PROP_GRAPH,
+        10 => PROP_PRINT,
+        11 => PROP_XDIGIT,
+        _ => PROP_WORD,
+    }
+}
+
+// `[[:name:]]` (`parse_posix_class`, `parse.c:642-694`): `p.at` at the
+// ':' of "[:".
+fn parse_posix_class(
+    mut p: ReParse,
+    pat: List[byte],
+    mut lo: List[int],
+    mut hi: List[int],
+) -> bool {
+    let start = p.at
+    var negate = false
+    p.at += 1
+    if peek(p, pat) == 94 {
+        negate = true
+        p.at += 1
+    }
+    let name_at = p.at
+    while !at_end(p) && peek(p, pat) != 58 {
+        p.at += 1
+    }
+    if at_end(p) || peek_at(p, pat, 1) != 93 {
+        re_fail(mut p, start - 1, "unterminated character class")
+        return false
+    }
+    let name_len = p.at - name_at
+    let end = p.at + 2
+    let names = "alpha digit alnum upper lower space blank punct cntrl graph print xdigit word"
+    var k = 0
+    for name in names.words() {
+        var same = name.len == name_len
+        var j = 0
+        while same && j < name_len {
+            if pat[name_at + j] != name.bytes()[j] {
+                same = false
+            }
+            j += 1
+        }
+        if same {
+            var rlo = List[int]()
+            var rhi = List[int]()
+            prop_runs_cached(mut p, posix_kind(k), mut rlo, mut rhi)
+            let idx = class_intern(mut p, mut rlo, mut rhi, negate)
+            cbuf_add_class(p, mut lo, mut hi, idx)
+            p.at = end
+            return !p.failed
+        }
+        k += 1
+    }
+    let shown = if name_len > 24 then 24 else name_len
+    re_fail(
+        mut p,
+        start - 1,
+        "unknown POSIX class '[:{msg_bytes(pat, name_at, name_at + shown)}:]'",
+    )
+    false
+}
+
+/// A bracket expression, `p.at` just past its `[` (`parse_class`,
+/// `parse.c:696-806`): the interned class or -1.
+fn parse_class(mut p: ReParse, pat: List[byte]) -> int {
+    var lo = List[int]()
+    var hi = List[int]()
+    let open = p.at - 1
+    var negate = false
+    var first = true
+    if peek(p, pat) == 94 {
+        negate = true
+        p.at += 1
+    }
+    // `[:alpha:]` where a class was expected is the classic POSIX
+    // mistake: say so rather than accept a class of ':','a','l',...
+    if peek(p, pat) == 58 {
+        var scan = p.at + 1
+        while scan + 1 < p.len && pat[scan] as int != 58 {
+            scan += 1
+        }
+        if scan + 1 < p.len && pat[scan] as int == 58 && pat[scan + 1] as int == 93 {
+            var shown = scan - p.at - 1
+            if shown > 24 {
+                shown = 24
+            }
+            re_fail(
+                mut p,
+                open,
+                "[:{msg_bytes(pat, p.at + 1, p.at + 1 + shown)}:] is only valid inside [...]",
+            )
+            return -1
+        }
+    }
+    loop {
+        var c_lo = 0
+        if at_end(p) {
+            re_fail(mut p, open, "unterminated character class")
+            return -1
+        }
+        // ']' first is a literal, per the syntax table.
+        if peek(p, pat) == 93 && !first {
+            p.at += 1
+            break
+        }
+        first = false
+        if peek(p, pat) == 91 && peek_at(p, pat, 1) == 58 {
+            p.at += 1
+            if !parse_posix_class(mut p, pat, mut lo, mut hi) {
+                return -1
+            }
+            continue
+        }
+        if peek(p, pat) == 92 {
+            p.at += 1
+            let (ok, cp, cls) = parse_escape(mut p, pat)
+            if !ok {
+                return -1
+            }
+            if cls >= 0 {
+                cbuf_add_class(p, mut lo, mut hi, cls)
+                continue
+            }
+            c_lo = cp
+        } else {
+            c_lo = take_cp(mut p, pat)
+        }
+        // A '-' at the end is a literal, not a range opener.
+        if peek(p, pat) == 45 && peek_at(p, pat, 1) != 93 && p.at + 1 < p.len {
+            var c_hi = 0
+            p.at += 1
+            if peek(p, pat) == 92 {
+                p.at += 1
+                let (ok, cp, cls) = parse_escape(mut p, pat)
+                if !ok {
+                    return -1
+                }
+                if cls >= 0 {
+                    // [a-\d] is nonsense; treat '-' as literal.
+                    cbuf_add_folded(mut p, mut lo, mut hi, c_lo)
+                    (mut lo).push(45)
+                    (mut hi).push(45)
+                    cbuf_add_class(p, mut lo, mut hi, cls)
+                    continue
+                }
+                c_hi = cp
+            } else {
+                c_hi = take_cp(mut p, pat)
+            }
+            if c_hi < c_lo {
+                re_fail(mut p, open, "invalid range in character class")
+                return -1
+            }
+            if p.flags & RE_ICASE != 0 && c_lo < 128 && c_hi < 128 {
+                // ASCII ranges fold elementwise; non-ASCII ranges keep
+                // their literal meaning.
+                var c = c_lo
+                while c <= c_hi {
+                    cbuf_add_folded(mut p, mut lo, mut hi, c)
+                    c += 1
+                }
+            } else {
+                (mut lo).push(c_lo)
+                (mut hi).push(c_hi)
+            }
+            continue
+        }
+        cbuf_add_folded(mut p, mut lo, mut hi, c_lo)
+    }
+    if lo.len == 0 && !negate {
+        re_fail(mut p, open, "empty character class")
+        return -1
+    }
+    class_intern(mut p, mut lo, mut hi, negate)
+}
+
+// ---------------------------------------------------------------- grammar
+
+// A literal: under ICASE the class of its folded partners, so the VM
+// does no case work per input codepoint (`literal_node`, `parse.c:812-
+// 840`).
+fn literal_node(mut p: ReParse, cp: int) -> int {
+    if p.flags & RE_ICASE != 0 {
+        let partners = fold_partners(mut p, cp)
+        if partners.len > 1 {
+            var lo = List[int]()
+            var hi = List[int]()
+            for x in partners {
+                (mut lo).push(x)
+                (mut hi).push(x)
+            }
+            let a = node(mut p, RE_A_CLASS)
+            p.nodes[a].cls = class_intern(mut p, mut lo, mut hi, false)
+            return a
+        }
+    }
+    let a = node(mut p, RE_A_CHAR)
+    p.nodes[a].cp = cp
+    a
+}
+
+// `(?i)` `(?-i)` `(?s)` `(?-s)` and the scoped `(?i:...)` forms
+// (`parse_flags`, `parse.c:842-882`): answers (ok, scoped, the scoped
+// flags); a directive sets `p.flags` itself.
+fn parse_flags(mut p: ReParse, pat: List[byte]) -> (bool, bool, int) {
+    let start = p.at
+    var negate = false
+    var flags = p.flags
+    loop {
+        let c = peek(p, pat)
+        if c == 45 {
+            negate = true
+            p.at += 1
+            continue
+        }
+        if c == 105 || c == 115 {
+            let bit = if c == 105 then RE_ICASE else RE_DOTALL
+            if negate {
+                flags = flags - (flags & bit)
+            } else {
+                flags = flags | bit
+            }
+            p.at += 1
+            continue
+        }
+        break
+    }
+    if peek(p, pat) == 58 {
+        p.at += 1
+        return (true, true, flags)
+    }
+    if peek(p, pat) == 41 {
+        p.at += 1
+        // Applies from here to the end of the enclosing group.
+        p.flags = flags
+        return (true, false, flags)
+    }
+    re_fail(mut p, start - 2, "unknown group flags")
+    (false, false, 0)
+}
+
+// `{m}`, `{m,}`, `{m,n}` (`parse_repeat_bounds`, `parse.c:1031-1088`):
+// answers (is a quantifier, min, max); a bare `{` is a literal. The
+// error rows fire with the quantifier still reported as one.
+fn parse_repeat_bounds(mut p: ReParse, pat: List[byte]) -> (bool, int, int) {
+    let open = p.at
+    var scan = p.at + 1
+    var lo = 0
+    var have_lo = false
+    var comma = false
+    var have_hi = false
+    var hi_val = 0
+    while scan < p.len && pat[scan] as int >= 48 && pat[scan] as int <= 57 {
+        lo = lo * 10 + (pat[scan] as int - 48)
+        have_lo = true
+        scan += 1
+        if lo > 1000000 {
+            break
+        }
+    }
+    if scan < p.len && pat[scan] as int == 44 {
+        comma = true
+        scan += 1
+        while scan < p.len && pat[scan] as int >= 48 && pat[scan] as int <= 57 {
+            hi_val = hi_val * 10 + (pat[scan] as int - 48)
+            have_hi = true
+            scan += 1
+            if hi_val > 1000000 {
+                break
+            }
+        }
+    }
+    if scan >= p.len || pat[scan] as int != 125 || !have_lo {
+        return (false, 0, 0)
+    }
+    let hi = if comma then (if have_hi then hi_val else RE_UNBOUNDED) else lo
+    if lo > RE_MAX_REPEAT || hi != RE_UNBOUNDED && hi > RE_MAX_REPEAT {
+        let shown = if lo > RE_MAX_REPEAT then lo else hi
+        re_fail(mut p, open, "repeat count {shown} exceeds {RE_MAX_REPEAT}")
+        return (true, 0, 0)
+    }
+    if hi != RE_UNBOUNDED && lo > hi {
+        re_fail(mut p, open, "invalid repeat: min {lo} > max {hi}")
+        return (true, 0, 0)
+    }
+    p.at = scan + 1
+    (true, lo, hi)
+}
+
+// The quantifier loop after an atom (`parse_piece`, `parse.c:1090-
+// 1137`): answers the node, or -1 with the error recorded.
+fn parse_quantifiers(mut p: ReParse, pat: List[byte], atom: int) -> int {
+    var a = atom
+    loop {
+        let c = peek(p, pat)
+        var q = -1
+        if c == 42 || c == 43 || c == 63 {
+            p.at += 1
+            let kind = if c == 42 then RE_A_STAR else (if c == 43 then RE_A_PLUS else RE_A_QUEST)
+            q = node(mut p, kind)
+            p.nodes[q].a = a
+        } else if c == 123 {
+            let (is_rep, rmin, rmax) = parse_repeat_bounds(mut p, pat)
+            if !is_rep {
+                // A bare '{' is a literal; it is not a repeat.
+                break
+            }
+            if p.failed {
+                return -1
+            }
+            q = node(mut p, RE_A_REPEAT)
+            p.nodes[q].a = a
+            p.nodes[q].min = rmin
+            p.nodes[q].max = rmax
+        } else {
+            break
+        }
+        if peek(p, pat) == 63 {
+            p.at += 1
+            p.nodes[q].greedy = false
+        }
+        a = q
+        if peek(p, pat) == 43 {
+            // a*+ is possessive: it only means something to a
+            // backtracker, so name it rather than report the symptom.
+            re_fail(
+                mut p,
+                p.at,
+                "possessive quantifiers are not supported (yew's regex engine is linear-time by design; see man yew-regex)",
+            )
+            return -1
+        }
+        if peek(p, pat) == 42 {
+            re_fail(mut p, p.at, "nothing to repeat")
+            return -1
+        }
+    }
+    a
+}
+
+/// An open group on the parser's stack: what `parse_group`'s C frame
+/// holds while its body is parsed (`parse.c:884-960`) and what
+/// `parse_alt`/`parse_concat` accumulate (`parse.c:1139-1180`).
+struct GroupFrame {
+    open: int,
+    saved_flags: int,
+    group: int,
+    alt: int,
+    cat: int,
+}
+
+fn frame_new(open: int, saved_flags: int, group: int) -> GroupFrame {
+    GroupFrame { open: open, saved_flags: saved_flags, group: group, alt: -1, cat: -1 }
+}
+
+// Append a finished piece to the innermost frame's concatenation
+// (`parse_concat`'s left-deep CAT, `parse.c:1139-1160`).
+fn frame_push_piece(mut p: ReParse, mut frames: List[GroupFrame], piece: int) {
+    let top = frames.len - 1
+    if frames[top].cat < 0 {
+        frames[top].cat = piece
+    } else {
+        let left = frames[top].cat
+        frames[top].cat = node2(mut p, RE_A_CAT, left, piece)
+    }
+}
+
+// End the innermost frame's concatenation into its alternation
+// (`parse_alt`, `parse.c:1162-1180`).
+fn frame_end_concat(mut p: ReParse, mut frames: List[GroupFrame]) {
+    let top = frames.len - 1
+    var cat = frames[top].cat
+    if cat < 0 {
+        cat = node(mut p, RE_A_EMPTY)
+    }
+    if frames[top].alt < 0 {
+        frames[top].alt = cat
+    } else {
+        let left = frames[top].alt
+        frames[top].alt = node2(mut p, RE_A_ALT, left, cat)
+    }
+    frames[top].cat = -1
+}
+
+// The atom at `p.at` that is not a group (`parse_atom`, `parse.c:962-
+// 1029`): answers the node, or -1 with the error recorded.
+fn parse_simple_atom(mut p: ReParse, pat: List[byte]) -> int {
+    let c = peek(p, pat)
+    let here = p.at
+    if c == 91 {
+        p.at += 1
+        let idx = parse_class(mut p, pat)
+        if idx < 0 {
+            return -1
+        }
+        let a = node(mut p, RE_A_CLASS)
+        p.nodes[a].cls = idx
+        return a
+    }
+    if c == 46 {
+        p.at += 1
+        let a = node(mut p, RE_A_ANY)
+        p.nodes[a].dotall = p.flags & RE_DOTALL != 0
+        return a
+    }
+    if c == 94 {
+        p.at += 1
+        return node(mut p, RE_A_BOL)
+    }
+    if c == 36 {
+        p.at += 1
+        return node(mut p, RE_A_EOL)
+    }
+    if c == 41 {
+        re_fail(mut p, here, "unmatched )")
+        return -1
+    }
+    if c == 42 || c == 43 || c == 63 {
+        re_fail(mut p, here, "nothing to repeat")
+        return -1
+    }
+    if c == 92 {
+        p.at += 1
+        // Anchors and boundaries that are not classes.
+        let d = peek(p, pat)
+        if d == 65 {
+            p.at += 1
+            return node(mut p, RE_A_BOT)
+        }
+        if d == 122 {
+            p.at += 1
+            return node(mut p, RE_A_EOT)
+        }
+        if d == 98 {
+            p.at += 1
+            return node(mut p, RE_A_WORDB)
+        }
+        if d == 66 {
+            p.at += 1
+            return node(mut p, RE_A_NWORDB)
+        }
+        // s21 §2: \c and \C are case directives, not matchable atoms;
+        // they compile to EMPTY as `(?i)` does and outrank every option.
+        if d == 99 {
+            p.at += 1
+            p.force_icase = true
+            return node(mut p, RE_A_EMPTY)
+        }
+        if d == 67 {
+            p.at += 1
+            p.force_case = true
+            return node(mut p, RE_A_EMPTY)
+        }
+        if d >= 49 && d <= 57 {
+            re_fail(
+                mut p,
+                here,
+                "backreferences are not supported (yew's regex engine is linear-time by design; see man yew-regex)",
+            )
+            return -1
+        }
+        let (ok, cp, cls) = parse_escape(mut p, pat)
+        if !ok {
+            return -1
+        }
+        if cls >= 0 {
+            let a = node(mut p, RE_A_CLASS)
+            p.nodes[a].cls = cls
+            return a
+        }
+        return literal_node(mut p, cp)
+    }
+    let cp = take_cp(mut p, pat)
+    literal_node(mut p, cp)
+}
+
+/// Parse the whole pattern (`yew_re_parse`, `parse.c:1182-1281`):
+/// answers the root node, or -1 with `p.failed` and the error set.
+fn re_parse(mut p: ReParse, pat: List[byte]) -> int {
+    // RE_LITERAL: every byte is itself, metacharacters included.
+    if p.base_flags & RE_LITERAL != 0 {
+        var left = -1
+        while !at_end(p) {
+            let cp = take_cp(mut p, pat)
+            let lit = literal_node(mut p, cp)
+            if p.failed {
+                return -1
+            }
+            if left < 0 {
+                left = lit
+            } else {
+                left = node2(mut p, RE_A_CAT, left, lit)
+            }
+        }
+        return if left < 0 then node(mut p, RE_A_EMPTY) else left
+    }
+    var frames = List[GroupFrame]()
+    (mut frames).push(frame_new(0, p.flags, -1))
+    loop {
+        let c = peek(p, pat)
+        if at_end(p) || c == 124 || c == 41 {
+            frame_end_concat(mut p, mut frames)
+            if !at_end(p) && c == 124 {
+                p.at += 1
+                continue
+            }
+            let top = frames.len - 1
+            if frames[top].group < 0 {
+                // The root: parse_alt stops at a ')' it did not open.
+                if !at_end(p) {
+                    re_fail(mut p, p.at, "unmatched )")
+                    return -1
+                }
+                return frames[top].alt
+            }
+            if at_end(p) {
+                re_fail(mut p, frames[top].open, "unterminated group")
+                return -1
+            }
+            p.at += 1
+            // Inline flags die with their enclosing group.
+            p.flags = frames[top].saved_flags
+            let g = node(mut p, RE_A_GROUP)
+            p.nodes[g].group = frames[top].group
+            p.nodes[g].a = frames[top].alt
+            let _ = (mut frames).pop() else frame_new(0, 0, 0)
+            let piece = parse_quantifiers(mut p, pat, g)
+            if piece < 0 || p.failed {
+                return -1
+            }
+            frame_push_piece(mut p, mut frames, piece)
+            continue
+        }
+        if c == 40 {
+            let open = p.at
+            p.at += 1
+            let saved = p.flags
+            if peek(p, pat) == 63 {
+                let k = peek_at(p, pat, 1)
+                // The permanent non-goals, said plainly: incompatible with
+                // the linear-time guarantee, not waiting on a sprint.
+                if k == 62 {
+                    re_fail(
+                        mut p,
+                        open,
+                        "atomic groups are not supported (yew's regex engine is linear-time by design; see man yew-regex)",
+                    )
+                    return -1
+                }
+                if k == 61 || k == 33 || k == 60 {
+                    re_fail(
+                        mut p,
+                        open,
+                        "lookaround is not supported (yew's regex engine is linear-time by design; see man yew-regex)",
+                    )
+                    return -1
+                }
+                if k == 80 || k == 39 {
+                    re_fail(mut p, open, "named groups are not supported in 1.0")
+                    return -1
+                }
+                p.at += 2
+                if k == 58 {
+                    (mut frames).push(frame_new(open, saved, 0))
+                    continue
+                }
+                // Re-read the flag letters.
+                p.at -= 1
+                let (ok, scoped, scoped_flags) = parse_flags(mut p, pat)
+                if !ok {
+                    return -1
+                }
+                if !scoped {
+                    // `(?i)` is a directive, not a group: its ')' is
+                    // consumed and its flags apply to the rest of the
+                    // enclosing group; the EMPTY node it leaves takes
+                    // quantifiers as any atom does.
+                    let e = node(mut p, RE_A_EMPTY)
+                    let piece = parse_quantifiers(mut p, pat, e)
+                    if piece < 0 || p.failed {
+                        return -1
+                    }
+                    frame_push_piece(mut p, mut frames, piece)
+                    continue
+                }
+                p.flags = scoped_flags
+                (mut frames).push(frame_new(open, saved, 0))
+                continue
+            }
+            if p.ngroups >= RE_MAX_GROUPS {
+                re_fail(mut p, open, "too many capture groups (max 32)")
+                return -1
+            }
+            let group = p.ngroups
+            p.ngroups += 1
+            (mut frames).push(frame_new(open, saved, group))
+            continue
+        }
+        let atom = parse_simple_atom(mut p, pat)
+        if atom < 0 || p.failed {
+            return -1
+        }
+        let piece = parse_quantifiers(mut p, pat, atom)
+        if piece < 0 || p.failed {
+            return -1
+        }
+        frame_push_piece(mut p, mut frames, piece)
+    }
+    -1
+}

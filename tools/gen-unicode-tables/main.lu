@@ -55,11 +55,24 @@
 //! and upper offsets into the data (two each) and the two lengths (one
 //! each).
 //!
-//! Usage (`--word-break` or `--case` before the directory selects those
-//! tables, `src/unicode/tables_wb.lu` / `tables_case.lu`, in each form):
-//!   gen-unicode-tables [--word-break|--case] <ucd-dir> <out.lu>        write the file
-//!   gen-unicode-tables --check [--word-break|--case] <ucd-dir> <out.lu> regenerate, diff: 1 on drift
-//!   gen-unicode-tables --dump [--word-break|--case] <ucd-dir>           the arrays, decimal, one a line
+//! **`--category`** (yw04, s20: the regex engine's `\w`, `\d` and the
+//! POSIX classes): C's `generate_category` (`gen-unicode-tables.c:
+//! 1336-1349`) — u16 records of general-category and core-property bits
+//! (`UnicodeData.txt`'s General_Category with its First/Last blocks,
+//! `parse_cat_unicodedata`, 1097-1145; Alphabetic, Uppercase and
+//! Lowercase from `DerivedCoreProperties.txt`, `parse_cat_derived`,
+//! 1147-1190), the spot checks (1269-1298), the same 128-codepoint trie
+//! with a palette in first-use order (`build_cat_trie`, 1206-1243) and
+//! the range table above it (1245-1267) — written to
+//! `src/unicode/tables_cat.lu`, data only; the lookups are
+//! `src/unicode/category.lu`. Encoded as the grapheme trie is.
+//!
+//! Usage (`--word-break`, `--case` or `--category` before the directory
+//! selects those tables, `src/unicode/tables_wb.lu` / `tables_case.lu` /
+//! `tables_cat.lu`, in each form):
+//!   gen-unicode-tables [--word-break|--case|--category] <ucd-dir> <out.lu>        write the file
+//!   gen-unicode-tables --check [--word-break|--case|--category] <ucd-dir> <out.lu> regenerate, diff: 1 on drift
+//!   gen-unicode-tables --dump [--word-break|--case|--category] <ucd-dir>           the arrays, decimal, one a line
 
 use std.fs
 
@@ -1253,6 +1266,307 @@ fn dump_case(g: CaseGen) {
     write_stdout(out)
 }
 
+// ---------------------------------------------------------------- category
+
+// The category record bits (`gen-unicode-tables.c:1048-1058`, the
+// `YEW_CAT_*` of `src/unicode/category.h:23-33`).
+const CAT_ALPHA: int = 1
+
+const CAT_ND: int = 2
+
+const CAT_UPPER: int = 4
+
+const CAT_LOWER: int = 8
+
+const CAT_PUNCT: int = 16
+
+const CAT_CNTRL: int = 32
+
+const CAT_ZS: int = 64
+
+const CAT_PC: int = 128
+
+const CAT_ASSIGNED: int = 256
+
+// `cat_or` (C 1069-1077): OR `bits` into every record of `lo..=hi`.
+fn cat_or(mut g: Gen, lo: int, hi_in: int, bits: int) {
+    var hi = hi_in
+    if hi >= CP_COUNT {
+        hi = CP_COUNT - 1
+    }
+    var cp = lo
+    while cp <= hi {
+        g.records[cp] = g.records[cp] | bits
+        cp += 1
+    }
+}
+
+// `cat_bits_for` (C 1079-1095): a General_Category onto the flag set.
+fn cat_bits_for(gc: str) -> int {
+    var bits = CAT_ASSIGNED
+    if gc == "Nd" {
+        bits = bits | CAT_ND
+    } else if gc == "Cc" {
+        bits = bits | CAT_CNTRL
+    } else if gc == "Zs" {
+        bits = bits | CAT_ZS
+    } else if gc == "Pc" {
+        bits = bits | CAT_PUNCT | CAT_PC
+    } else if gc.starts_with("P") || gc.starts_with("S") {
+        bits = bits | CAT_PUNCT
+    }
+    bits
+}
+
+// `parse_cat_unicodedata` (C 1097-1145): the category of every
+// codepoint, First/Last pairs covering their whole block.
+fn parse_cat_unicodedata(mut g: Gen, dir: str) {
+    let path = "{dir}/UnicodeData.txt"
+    let text = fs.read_text(path) else {
+        die("cannot read {path}")
+        return
+    }
+    var line_no = 0
+    var have_pending = false
+    var pending_lo = 0
+    var pending_category = ""
+    for line in text.lines() {
+        line_no += 1
+        let fields = line.split(";")
+        if fields.len < 3 {
+            die("{path}:{line_no}: UnicodeData line has too few fields")
+        }
+        let cp = hex_cp(fields[0], path, line_no)
+        if fields[1].contains(", First>") {
+            if fields[2].len >= 8 {
+                die("{path}: General_Category is too long")
+            }
+            pending_lo = cp
+            pending_category = fields[2]
+            have_pending = true
+        } else if fields[1].contains(", Last>") {
+            if !have_pending {
+                die("{path}: malformed UnicodeData First/Last pair")
+            }
+            cat_or(mut g, pending_lo, cp, cat_bits_for(pending_category))
+            have_pending = false
+        } else {
+            cat_or(mut g, cp, cp, cat_bits_for(fields[2]))
+        }
+    }
+}
+
+// `parse_cat_derived` (C 1147-1190): Alphabetic, Uppercase and
+// Lowercase from DerivedCoreProperties.txt.
+fn parse_cat_derived(mut g: Gen, dir: str) {
+    let path = "{dir}/DerivedCoreProperties.txt"
+    let text = fs.read_text(path) else {
+        die("cannot read {path}")
+        return
+    }
+    var line_no = 0
+    for raw in text.lines() {
+        line_no += 1
+        let hash = raw.find("#") else raw.len
+        let range_field = raw[0..hash].trim()
+        if range_field.len == 0 {
+            continue
+        }
+        let semi = range_field.find(";") else -1
+        if semi < 0 {
+            continue
+        }
+        var property = range_field[semi + 1..].trim()
+        let semi2 = property.find(";") else -1
+        if semi2 >= 0 {
+            property = property[0..semi2].trim()
+        }
+        let (lo, hi) = parse_range(range_field[0..semi], path, line_no)
+        if property == "Alphabetic" {
+            cat_or(mut g, lo, hi, CAT_ALPHA)
+        } else if property == "Uppercase" {
+            cat_or(mut g, lo, hi, CAT_UPPER)
+        } else if property == "Lowercase" {
+            cat_or(mut g, lo, hi, CAT_LOWER)
+        }
+    }
+}
+
+// `validate_cat_records` (C 1269-1298): the spot checks that would
+// catch a shifted field or a dropped First/Last range.
+fn validate_cat_records(g: Gen) {
+    let r = g.records
+    if r[65] & (CAT_ALPHA | CAT_UPPER) != CAT_ALPHA | CAT_UPPER {
+        die("category spot check failed: U+0041 is not Alphabetic+Upper")
+    }
+    if r[97] & (CAT_ALPHA | CAT_LOWER) != CAT_ALPHA | CAT_LOWER {
+        die("category spot check failed: U+0061")
+    }
+    if r[48] & CAT_ND == 0 {
+        die("category spot check failed: U+0030 is not Nd")
+    }
+    if r[95] & CAT_PC == 0 {
+        die("category spot check failed: U+005F is not Pc")
+    }
+    if r[28450] & CAT_ALPHA == 0 {
+        die("category spot check failed: U+6F22 (Han) is not Alphabetic")
+    }
+    if r[9] & CAT_CNTRL == 0 {
+        die("category spot check failed: U+0009 is not Cc")
+    }
+    if r[32] & CAT_ZS == 0 {
+        die("category spot check failed: U+0020 is not Zs")
+    }
+    if r[33] & CAT_PUNCT == 0 {
+        die("category spot check failed: U+0021 is not punctuation")
+    }
+    if r[128512] & CAT_ASSIGNED == 0 {
+        die("category spot check failed: U+1F600 is unassigned")
+    }
+}
+
+// `generate_category` (C 1336-1349): the same 128-codepoint two-level
+// trie with first-occurrence dedup and a palette in first-use order as
+// the grapheme tables (`build_cat_trie`, `build_cat_high_ranges`, C
+// 1192-1267, are `build_trie` and `build_high_ranges` over these
+// records, step for step).
+fn generate_category(dir: str) -> Gen {
+    var records = List[int]()
+    var cp = 0
+    while cp < CP_COUNT {
+        (mut records).push(0)
+        cp += 1
+    }
+    var g = Gen {
+        records: records,
+        stage1: List[int](),
+        stage2: List[int](),
+        palette: List[int](),
+        hi_lo: List[int](),
+        hi_hi: List[int](),
+        hi_rec: List[int](),
+    }
+    parse_cat_unicodedata(mut g, dir)
+    parse_cat_derived(mut g, dir)
+    validate_cat_records(g)
+    build_trie(mut g)
+    build_high_ranges(mut g)
+    if g.palette.len > 127 {
+        die("the category palette does not fit one 7-bit digit")
+    }
+    let table_bytes = STAGE1_LEN * 2 + g.stage2.len + g.palette.len * 2 + g.hi_lo.len * 12
+    if table_bytes > 65536 {
+        die("category tables exceed the 64 KiB budget")
+    }
+    g
+}
+
+// `emit_cat_output` (C 1300-1334), in the port's encoding: stage 1 two
+// base-128 digits an entry, stage 2 one digit (a palette index), the
+// palette two digits (a record is at most 0x1FF), the ranges three
+// digits for each of lo, hi and record.
+fn emit_cat(g: Gen, dir: str) -> List[byte] {
+    var out = List[byte]()
+    let block_count = g.stage2.len / BLOCK_SIZE
+    let table_bytes = STAGE1_LEN * 2 + g.stage2.len + g.palette.len * 2 + g.hi_lo.len * 12
+    push_str(mut out, "//! unicode.tables_cat — GENERATED by tools/gen-unicode-tables --category\n")
+    push_str(
+        mut out,
+        "//! from UCD 16.0.0; do not edit; regenerate with `tools/check-tables --write`.\n",
+    )
+    push_str(mut out, "//! Data only: the lookups are `src/unicode/category.lu`.\n")
+    push_str(mut out, "//!\n")
+    push_str(mut out, "//! The category trie sagitta's `src/unicode/tables_cat.c` holds: one u16\n")
+    push_str(mut out, "//! record per codepoint — the `CAT_*` bits of `category.lu` (Alphabetic,\n")
+    push_str(mut out, "//! Nd, Uppercase, Lowercase, P*/S*, Cc, Zs, Pc, assigned) — through a\n")
+    push_str(mut out, "//! two-level trie over U+0000–U+2FFFF (128-codepoint blocks, a palette\n")
+    push_str(mut out, "//! of distinct records) and a sorted range table above it, as `str`\n")
+    push_str(mut out, "//! constants of 7-bit digits (the generator's header says how).\n")
+    push_str(mut out, "//!\n")
+    push_str(
+        mut out,
+        "//! UCD 16.0.0; {table_bytes} bytes; {block_count}/{STAGE1_LEN} unique stage-2 blocks;\n",
+    )
+    push_str(
+        mut out,
+        "//! {g.palette.len} palette entries; {g.hi_lo.len} high ranges. Inputs (ucd/MANIFEST):\n",
+    )
+    let manifest = fs.read_text("{dir}/../MANIFEST") else ""
+    for line in manifest.lines() {
+        if line.ends_with("/UnicodeData.txt") || line.ends_with("/DerivedCoreProperties.txt") {
+            push_str(mut out, "//!   sha256 {line}\n")
+        }
+    }
+    push_str(mut out, "\n")
+    push_str(mut out, "/// The number of category stage-2 blocks.\n")
+    push_str(mut out, "pub const CAT_STAGE2_BLOCKS: int = {block_count}\n\n")
+    push_str(mut out, "/// The number of category palette records.\n")
+    push_str(mut out, "pub const CAT_PAL_LEN: int = {g.palette.len}\n\n")
+    push_str(mut out, "/// The number of category high ranges (`yew_cat_hi_len`).\n")
+    push_str(mut out, "pub const CAT_HI_LEN: int = {g.hi_lo.len}\n\n")
+    push_str(mut out, "// stage1: {STAGE1_LEN} block indices, two base-128 digits each.\n")
+    push_str(mut out, "let CAT_STAGE1: str = \"")
+    for v in g.stage1 {
+        push_digits(mut out, v, 2)
+    }
+    push_str(mut out, "\"\n\n")
+    push_str(mut out, "// stage2: {block_count} blocks of 128 palette indices, one digit each.\n")
+    push_str(mut out, "let CAT_STAGE2: str = \"")
+    for v in g.stage2 {
+        push_digits(mut out, v, 1)
+    }
+    push_str(mut out, "\"\n\n")
+    push_str(mut out, "// pal: {g.palette.len} records, two digits each.\n")
+    push_str(mut out, "let CAT_PAL: str = \"")
+    for v in g.palette {
+        push_digits(mut out, v, 2)
+    }
+    push_str(mut out, "\"\n\n")
+    push_str(mut out, "// hi: {g.hi_lo.len} ranges of (lo, hi, rec), three digits each.\n")
+    push_str(mut out, "let CAT_HI: str = \"")
+    var i = 0
+    while i < g.hi_lo.len {
+        push_digits(mut out, g.hi_lo[i], 3)
+        push_digits(mut out, g.hi_hi[i], 3)
+        push_digits(mut out, g.hi_rec[i], 3)
+        i += 1
+    }
+    push_str(mut out, "\"\n")
+    out
+}
+
+fn dump_cat(g: Gen) {
+    var out = List[byte]()
+    push_str(
+        mut out,
+        "# yew's Unicode 16.0.0 category trie as sagitta 9ace98c2's scripts/gen-unicode-tables --category emitted it\n",
+    )
+    push_str(
+        mut out,
+        "# (src/unicode/tables_cat.c): the cross-check for tools/gen-unicode-tables. Decimal, one array per line.\n",
+    )
+    push_str(mut out, "stage1")
+    for v in g.stage1 {
+        push_str(mut out, " {v}")
+    }
+    push_str(mut out, "\nstage2")
+    for v in g.stage2 {
+        push_str(mut out, " {v}")
+    }
+    push_str(mut out, "\npal")
+    for v in g.palette {
+        push_str(mut out, " {v}")
+    }
+    push_str(mut out, "\nhi")
+    var i = 0
+    while i < g.hi_lo.len {
+        push_str(mut out, " {g.hi_lo[i]},{g.hi_hi[i]},{g.hi_rec[i]}")
+        i += 1
+    }
+    push_str(mut out, "\n")
+    write_stdout(out)
+}
+
 fn write_stdout(out: List[byte]) {
     let stdout = fs_open_mode("/dev/stdout", 2) else {
         die("cannot open standard output")
@@ -1293,6 +1607,7 @@ fn main() -> int {
     var dump_mode = false
     var wb = false
     var case_mode = false
+    var cat_mode = false
     var args = List[str]()
     for a in raw {
         if a == "--check" && args.len == 0 {
@@ -1303,12 +1618,16 @@ fn main() -> int {
             wb = true
         } else if a == "--case" && args.len == 0 {
             case_mode = true
+        } else if a == "--category" && args.len == 0 {
+            cat_mode = true
         } else {
             (mut args).push(a)
         }
     }
     if dump_mode && !check && args.len == 1 {
-        if case_mode {
+        if cat_mode {
+            dump_cat(generate_category(args[0]))
+        } else if case_mode {
             dump_case(generate_case(args[0]))
         } else if wb {
             dump_wb(generate_wb(args[0]))
@@ -1318,7 +1637,9 @@ fn main() -> int {
         return 0
     }
     if !dump_mode && args.len == 2 {
-        let out = if case_mode {
+        let out = if cat_mode {
+            emit_cat(generate_category(args[0]), args[0])
+        } else if case_mode {
             emit_case(generate_case(args[0]), args[0])
         } else if wb {
             emit_wb(generate_wb(args[0]), args[0])
@@ -1331,7 +1652,7 @@ fn main() -> int {
         return write_file(out, args[1])
     }
     eprint(
-        "usage: gen-unicode-tables [--check] [--word-break|--case] <ucd-dir> <out.lu> | --dump [--word-break|--case] <ucd-dir>",
+        "usage: gen-unicode-tables [--check] [--word-break|--case|--category] <ucd-dir> <out.lu> | --dump [--word-break|--case|--category] <ucd-dir>",
     )
     2
 }
