@@ -5,6 +5,33 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw04 — execute and search (2026-10-21)
+
+- Campaign 04 ported at wolf 0.2.33: the full `:` prompt replacing
+  yw03's narrow one (`edit.cmdline` with its history, grammar and ranges,
+  completion engine, ranked menu, ghost, hint, pager, selection and the
+  readline set; `edit.cmdparse`, `edit.cmdhist`, `edit.cmdcomp`,
+  `edit.menu`, `edit.region`, `edit.cmdedit`, `edit.readline_cmds`,
+  `ws.fuzzy`); the regex engine (`search`: Thompson NFA, Pike VM, lazy DFA,
+  the literal prefilter, pack; `unicode.category` from the generator's
+  `--category`); search, replace and the jump lists (`search.replace`,
+  `edit.overlay`, `edit.searchui`, `edit.search_cmds`, `edit.jumplist`,
+  `text.jumpring`); the shell completion engine and the synchronous job
+  route (`edit.shctx`, `compspec` over the 24 runtime specs, `compgen`,
+  `comphelp`, `compfish`, `shell`, `shell_cmds`, `job`, `shsession`), the
+  job half refusing by name until `os_signal_wait_fds` (R-yw04-1).
+- 83 of campaign 04's 104 PTY goldens gated by name (M-YW4), the 21 others
+  recorded by owner; campaign 03's 62 unchanged. The live-editor kill9 lane
+  over the port's editor (`tools/torture-live`, the replica's `--live` and
+  `--state-per-run`), G3's determinism order known-red by name.
+- The `VTIME` interim no longer reorders events: a deadline's turn runs
+  before bytes a tick read returns after it, and a deadline under the tick
+  waits finely (`edit.loop`, `term.tty`); a history append opens once.
+- Fuzzers (`tools/fuzz-{cmdparse,fuzzy,re,shctx,comphelp,search}`, C's
+  generator bit for bit, hashes equal to C's drivers) and perf harnesses
+  (`tools/run-perf-{cmdcomp,re,search,search-session}`); the regex golden
+  table and the shell corpora drift-checked against the pin.
+
 ### yw02 — the text engine (2026-10-20)
 
 - Campaign 02 ported into `text`: the piece tree with its snapshots,
