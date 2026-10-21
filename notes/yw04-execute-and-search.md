@@ -209,3 +209,7 @@ the note.
   re-checked its branch, worktrees, uncommitted edits, kasumi jobs and
   containers by recorded pid (none live) and CI on `yw04`, then resumed the
   forks from their saved state.
+- The search fork, reported by itself: before the lane's container
+  reminder it ran native test binaries on kasumi's host, and one trapped
+  (`edit_cmdrange_test`'s assert, exit 134) around 2026-10-20T23:2xZ;
+  `coredumpctl` shows no core stored. Every later run was in the container.
