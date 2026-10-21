@@ -26,6 +26,17 @@ lane's first commit. The release list is read again before deliverable
 3 (R-yw04-1, below); if v0.2.34 is out then, the bump is a commit of its
 own with its prediction.
 
+**Deliverable 3 was reached before 0.2.34 existed.** The shell fork read
+the release list when it started `job.c`'s model, at
+**2026-10-20T23:19:20Z** (and again at 2026-10-21T03:00:51Z and
+12:50:04Z): v0.2.33 every time (`notes/yw04-evidence/shell/
+toolchain-at-job-model.txt`). **v0.2.34 was published at
+2026-10-21T12:58:10Z** (created 12:49:57Z), after deliverable 3's code had
+landed at 0.2.33 with R-yw04-1's stops. So, as R-yw04-1 rules, the lane
+finishes at 0.2.33 and **the bump is yw05's** first commit
+(`notes/contracts/yw05-panes-tabs-groups.md` deliverable 1), which turns
+the job half's stops into calls.
+
 ## Rulings taken at launch (the orchestrator's, recorded)
 
 - **R-yw04-1 = A.** The job half — deliverable 3's streaming, filter and
