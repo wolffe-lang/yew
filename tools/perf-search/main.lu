@@ -1,0 +1,206 @@
+//! perf-search — Sprint 21 DoD 5: search inside the keypress budget on a
+//! big file. The port's twin of sagitta `tests/perf/search_latency.c`
+//! (320 lines) at 9ace98c2, which links the C editor in-process, so the
+//! port measures its own: the same buffer (`static int compute_value(int
+//! argument, int other) { 0; }` rows to the size, then one `ZQNEEDLE`),
+//! the same 50x120 window and default options, and C's three
+//! measurements:
+//!
+//!   keystroke  `ZQNEEDLE` typed a character at a time, each prefix
+//!              compiled under smartcase and the overlay refreshed with
+//!              the per-keystroke budget — the max over the prefixes
+//!              (C's "p99" of eight samples)
+//!   step       1,000 `n` steps through `compute_value`, the mean (and
+//!              again over `reps`/50 thousand steps for the ms clock)
+//!   rss        the resident high-water mark's growth across both
+//!
+//! G8: wolf 0.2.33's clock is milliseconds (`time_now_ms`), so a sample
+//! is a batch: each prefix's compile and refresh is repeated `--reps`
+//! times (each repetition a new pattern generation, so the refresh scans
+//! as a keystroke's does, never reusing the last one's spans) and the
+//! batch divided; the 1,000 steps are one batch already. The resident
+//! mark is `/proc/self/status`'s `VmHWM` (C's `getrusage` `ru_maxrss`).
+//!
+//!   perf-search [--bytes=N] [--reps=N]
+//!
+//! prints C's three lines (`search.keypress_p99`, `search.step_mean`,
+//! `search.overlay_rss`) in nanoseconds and bytes. `--bytes` defaults to
+//! C's `YEW_SEARCH_LATENCY_BYTES` or 1 GiB.
+
+use edit
+use search
+use std.fs
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+// `/proc/self/status`'s `VmHWM`, in bytes (C's `peak_rss`).
+fn peak_rss() -> int {
+    let t = fs.read_text("/proc/self/status") else ""
+    for line in t.lines() {
+        if line.starts_with("VmHWM:") {
+            var kb = 0
+            for w in line[6..].words() {
+                kb = w.to_int() else kb
+                break
+            }
+            return kb * 1024
+        }
+    }
+    0
+}
+
+// One typed prefix: compiled under smartcase, the overlay refreshed with
+// the per-keystroke budget under generation `gen` (C's loop body).
+fn keystroke(mut ed: edit.Ed, w: int, typed: List[byte], n: int, gen: int) -> bool {
+    var prefix = List[byte]()
+    var i = 0
+    while i < n {
+        (mut prefix).push(typed[i])
+        i += 1
+    }
+    var err = search.re_err_new()
+    let re = edit.search_compile_cached(
+        prefix,
+        ed.search_opts,
+        mut ed.search.cache,
+        mut err,
+    ) else |_| {
+        eprint("perf-search: a prefix did not compile")
+        return false
+    }
+    edit.search_set_re(mut ed, take re)
+    edit.overlay_refresh(mut ed, w, gen, edit.OVERLAY_BUDGET_US)
+    true
+}
+
+fn arg_int(a: str, prefix: str) -> int {
+    a[prefix.len..].to_int() else -1
+}
+
+fn main() -> int {
+    var bytes = 1073741824
+    let env_bytes = env_get("YEW_SEARCH_LATENCY_BYTES") else ""
+    if env_bytes.len != 0 {
+        bytes = env_bytes.to_int() else bytes
+    }
+    var reps = 50
+    for a in env_args() {
+        if a.starts_with("--bytes=") {
+            bytes = arg_int(a, "--bytes=")
+        } else if a.starts_with("--reps=") {
+            reps = arg_int(a, "--reps=")
+        } else {
+            eprint("usage: perf-search [--bytes=N] [--reps=N]")
+            return 2
+        }
+    }
+    if bytes <= 0 || reps <= 0 {
+        eprint("usage: perf-search [--bytes=N] [--reps=N]")
+        return 2
+    }
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let row = bytes_of("static int compute_value(int argument, int other) {{ 0; }}\n")
+    var src = List[byte]()
+    while src.len + row.len < bytes {
+        for x in row {
+            (mut src).push(x)
+        }
+    }
+    for x in "ZQNEEDLE\n".bytes() {
+        (mut src).push(x)
+    }
+    let w = ed.win
+    if !edit.ed_edit_insert(mut ed, w, 0, src, 0, src.len) {
+        eprint("perf-search: insert failed")
+        return 2
+    }
+    ed.wins[w].rect = edit.rect(0, 1, 120, 50)
+    ed.wins[w].vp.rows = 50
+    ed.wins[w].vp.cols = 120
+    ed.search_opts = edit.search_opts_new()
+    let rss_before = peak_rss()
+    // The resident window is C's: the eight keystrokes once each, then the
+    // 1,000 steps; the batched timing runs after it, so its repetitions
+    // (G8) do not charge the overlay's footprint.
+    let typed = bytes_of("ZQNEEDLE")
+    var gen = 1
+    var n = 1
+    while n <= typed.len {
+        if !keystroke(mut ed, w, typed, n, gen) {
+            return 2
+        }
+        gen += 1
+        n += 1
+    }
+    // `n` through many matches: one engine search from the cursor each.
+    text.reg_set_search(mut ed.regs, bytes_of("compute_value"))
+    var err = search.re_err_new()
+    let re = edit.search_compile_cached(
+        bytes_of("compute_value"),
+        ed.search_opts,
+        mut ed.search.cache,
+        mut err,
+    ) else |_| {
+        eprint("perf-search: compute_value did not compile")
+        return 2
+    }
+    edit.search_set_re(mut ed, take re)
+    ed.search.reverse = false
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p].pos = 0
+    ed.wins[w].cs.curs[p].anchor = 0
+    let steps = 1000
+    let s0 = time_now_ms()
+    var k = 0
+    while k < steps {
+        let _ = edit.search_step(mut ed, w, true, 1)
+        k += 1
+    }
+    var mean = (time_now_ms() - s0) * 1000000 / steps
+    let rss_after = peak_rss()
+    // The mean again over `reps` thousand steps, for the clock's
+    // resolution (G8): 1,000 steps is a few milliseconds.
+    let s1 = time_now_ms()
+    k = 0
+    while k < steps * reps / 50 {
+        let _ = edit.search_step(mut ed, w, true, 1)
+        k += 1
+    }
+    if k > steps {
+        mean = (time_now_ms() - s1) * 1000000 / k
+    }
+    // The keystrokes, timed: each prefix's compile and refresh `reps`
+    // times, a new generation each, the batch divided (G8).
+    var worst = 0
+    n = 1
+    while n <= typed.len {
+        let t0 = time_now_ms()
+        var r = 0
+        while r < reps {
+            if !keystroke(mut ed, w, typed, n, gen) {
+                return 2
+            }
+            gen += 1
+            r += 1
+        }
+        let per = (time_now_ms() - t0) * 1000000 / reps
+        if per > worst {
+            worst = per
+        }
+        n += 1
+    }
+    print("search.keypress_p99 {worst} ns (port, {reps} reps a prefix; G8)")
+    print("search.step_mean {mean} ns (port)")
+    let delta = if rss_after > rss_before then rss_after - rss_before else 0
+    print("search.overlay_rss {delta} bytes (port)")
+    0
+}
