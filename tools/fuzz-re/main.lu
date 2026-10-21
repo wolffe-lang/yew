@@ -1,0 +1,1626 @@
+//! fuzz-re — the regex engine's three fuzz campaigns: `fuzz_re_compile`
+//! (any bytes compile or fail with an in-range offset, and a compiled
+//! program runs), `fuzz_re_diff` (generated patterns against a naive
+//! backtracking oracle, flat and piece-tree backings) and `fuzz_re_quote`
+//! (the `re_quote` round-trip law).
+//!
+//! wolf has no `fuzz` verb, so this is the bounded seeded driver: a port
+//! of sagitta's `tests/fuzz/fuzzlib.c` campaign loop (`yew_fuzz_main`,
+//! `:1614-1837`: the built-in corpus, the guided corpus and dictionary,
+//! sorted by name; per iteration a corpus entry, one to four of the
+//! eleven mutators, the FNV-1a input hash) with the mutators ported
+//! byte-exact (`:726-911`), so for one seed this driver feeds the checks
+//! the SAME inputs C's does — the printed `hash=` is the witness — and of
+//! the three checks: `fuzz_re_compile.c` (98 lines), `fuzz_re_diff.c`
+//! (447) with its oracle `re_ref.c` (653) and `re_ref.h` (49), and
+//! `fuzz_re_quote.c` (109), at 9ace98c2, under `s20-regex-engine.md` DoD
+//! 6-7 and `s21-search-replace.md` DoD 13. What it does not port: C's
+//! CPU-time watchdog (a SIGPROF timer; `tools/run-fuzz-re` bounds a run
+//! with `timeout` instead), the crash minimizer and the coverage-guided
+//! admission (a `COV=1` build's).
+//!
+//! The oracle is a RECURSIVE BACKTRACKER — what the engine refuses to be
+//! — so it is an independent implementation with different failure
+//! modes; it lives here, never in `src/search/`, and its step budget
+//! turns an exponential case into a counted skip. C's continuation-
+//! passing (function pointers with stack contexts) is a stack of
+//! continuation records interpreted in one `match` (no function values).
+//!
+//!   fuzz-re --target=compile|diff|quote [--iters=N] [--seed=N] [--fixtures=DIR]
+//!
+//! Exit 0 when every input held, 1 with the failing seed, iteration,
+//! corpus entry, operator, reason and input (hex), 2 on a usage error.
+//! Each iteration's work runs in its own region: the RNG, the hash and
+//! the counters are outer scalars (a `mut` struct inside a region is
+//! E1010, G18), so a five-million-case campaign stays flat in memory.
+
+use search
+use std.fs
+use text
+use unicode
+
+// ---------------------------------------------------------------- the PRNG
+
+/// One xorshift64* step (`prng_next`, `fuzzlib.c:726-735`): (output,
+/// next state).
+fn prng(s: wrapping[u64]) -> (wrapping[u64], wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    (x * 2685821657736338717, x)
+}
+
+/// `choose` (`fuzzlib.c:737-740`): 0 for a zero limit.
+fn choose(s: wrapping[u64], limit: int) -> (int, wrapping[u64]) {
+    if limit == 0 {
+        return (0, s)
+    }
+    let (v, n) = prng(s)
+    ((v % limit as wrapping[u64]) as int, n)
+}
+
+// ---------------------------------------------------------------- buffers
+
+const MAX_INPUT: int = 65536
+
+fn buf_insert(mut buf: List[byte], at_in: int, data: List[byte], lo: int, hi: int) {
+    var at = at_in
+    if at > buf.len {
+        at = buf.len
+    }
+    var len = hi - lo
+    if len > MAX_INPUT - buf.len {
+        len = MAX_INPUT - buf.len
+    }
+    if len <= 0 {
+        return
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < at {
+        (mut out).push(buf[i])
+        i += 1
+    }
+    var k = 0
+    while k < len {
+        (mut out).push(data[lo + k])
+        k += 1
+    }
+    while i < buf.len {
+        (mut out).push(buf[i])
+        i += 1
+    }
+    buf = out
+}
+
+fn buf_delete(mut buf: List[byte], at: int, len_in: int) {
+    if at >= buf.len {
+        return
+    }
+    var len = len_in
+    if len > buf.len - at {
+        len = buf.len - at
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < buf.len {
+        if i < at || i >= at + len {
+            (mut out).push(buf[i])
+        }
+        i += 1
+    }
+    buf = out
+}
+
+fn one_byte(b: int) -> List[byte] {
+    var v = List[byte]()
+    (mut v).push(b as byte)
+    v
+}
+
+// ---------------------------------------------------------------- mutators
+
+// `mutate_flip` (`fuzzlib.c:742-753`).
+fn mutate_flip(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        let (v, s1) = prng(s)
+        buf_insert(mut buf, 0, one_byte((v & 255) as int), 0, 1)
+        return s1
+    }
+    let (at, s1) = choose(s, buf.len)
+    let (bit, s2) = choose(s1, 8)
+    buf[at] = (buf[at] as int ^ 1 << bit) as byte
+    s2
+}
+
+// `mutate_delete` (`:755-765`).
+fn mutate_delete(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        return s
+    }
+    let (at, s1) = choose(s, buf.len)
+    let (span, s2) = choose(s1, buf.len - at)
+    buf_delete(mut buf, at, 1 + span)
+    s2
+}
+
+// `mutate_duplicate` (`:767-785`).
+fn mutate_duplicate(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        return s
+    }
+    let (from, s1) = choose(s, buf.len)
+    let (span, s2) = choose(s1, buf.len - from)
+    var len = 1 + span
+    if len > MAX_INPUT - buf.len {
+        len = MAX_INPUT - buf.len
+    }
+    var dup = List[byte]()
+    var i = 0
+    while i < len {
+        (mut dup).push(buf[from + i])
+        i += 1
+    }
+    let (at, s3) = choose(s2, buf.len + 1)
+    buf_insert(mut buf, at, dup, 0, dup.len)
+    s3
+}
+
+// `mutate_swap` (`:787-810`).
+fn mutate_swap(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len < 2 {
+        return s
+    }
+    let (a, s1) = choose(s, buf.len - 1)
+    let (bo, s2) = choose(s1, buf.len - a - 1)
+    let b = a + 1 + bo
+    var max_len = b - a
+    if max_len > buf.len - b {
+        max_len = buf.len - b
+    }
+    if max_len == 0 {
+        return s2
+    }
+    let (lo, s3) = choose(s2, max_len)
+    let len = 1 + lo
+    var i = 0
+    while i < len {
+        let t = buf[a + i]
+        buf[a + i] = buf[b + i]
+        buf[b + i] = t
+        i += 1
+    }
+    s3
+}
+
+// `mutate_truncate` (`:812-816`).
+fn mutate_truncate(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    if buf.len == 0 {
+        return s
+    }
+    let (keep, s1) = choose(s, buf.len + 1)
+    buf_delete(mut buf, keep, buf.len - keep)
+    s1
+}
+
+// `mutate_splice` (`:818-833`).
+fn mutate_splice(s: wrapping[u64], mut buf: List[byte], corpus: List[List[byte]]) -> wrapping[u64] {
+    let (which, s1) = choose(s, corpus.len)
+    let (at, s2) = choose(s1, buf.len + 1)
+    let other = corpus[which]
+    if other.len == 0 {
+        return s2
+    }
+    let (from, s3) = choose(s2, other.len + 1)
+    var len = other.len - from
+    var s4 = s3
+    if len != 0 {
+        let (l, s5) = choose(s3, len)
+        len = 1 + l
+        s4 = s5
+    }
+    buf_insert(mut buf, at, other, from, from + len)
+    s4
+}
+
+// `mutate_split_utf8` (`:835-856`).
+fn mutate_split_utf8(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    let (start, s1) = choose(s, buf.len + 1)
+    var i = 0
+    while i < buf.len {
+        let at = (start + i) % buf.len
+        let b = buf[at] as int
+        let tails = if b >= 194 && b <= 223 {
+            1
+        } else {
+            (if b >= 224 && b <= 239 then 2 else (if b >= 240 && b <= 244 then 3 else 0))
+        }
+        if tails != 0 && at + 1 < buf.len {
+            let (c, s2) = choose(s1, tails)
+            var cut = 1 + c
+            if cut > buf.len - at - 1 {
+                cut = buf.len - at - 1
+            }
+            buf_delete(mut buf, at + 1, cut)
+            return s2
+        }
+        i += 1
+    }
+    mutate_flip(s1, mut buf)
+}
+
+// `mutate_lead_class` (`:858-870`).
+fn mutate_lead_class(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    let leads = [128, 192, 194, 224, 225, 237, 240, 241, 244, 245, 255]
+    let (which, s1) = choose(s, leads.len)
+    let b = leads[which]
+    if buf.len == 0 {
+        buf_insert(mut buf, 0, one_byte(b), 0, 1)
+        return s1
+    }
+    let (at, s2) = choose(s1, buf.len)
+    buf[at] = b as byte
+    s2
+}
+
+// `mutate_continuation` (`:872-877`).
+fn mutate_continuation(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    let (c, s1) = choose(s, 64)
+    let (at, s2) = choose(s1, buf.len + 1)
+    buf_insert(mut buf, at, one_byte(128 | c), 0, 1)
+    s2
+}
+
+// `mutate_surrogate` (`:879-885`).
+fn mutate_surrogate(s: wrapping[u64], mut buf: List[byte]) -> wrapping[u64] {
+    var sur = List[byte]()
+    (mut sur).push(237 as byte)
+    (mut sur).push(160 as byte)
+    (mut sur).push(128 as byte)
+    let (at, s1) = choose(s, buf.len + 1)
+    buf_insert(mut buf, at, sur, 0, 3)
+    s1
+}
+
+// `mutate_dictionary` (`:887-893`).
+fn mutate_dictionary(
+    s: wrapping[u64],
+    mut buf: List[byte],
+    dict: List[List[byte]],
+) -> wrapping[u64] {
+    let (which, s1) = choose(s, dict.len)
+    let (at, s2) = choose(s1, buf.len + 1)
+    let token = dict[which]
+    buf_insert(mut buf, at, token, 0, token.len)
+    s2
+}
+
+// `mutate` (`:895-912`): (operator, next state).
+fn mutate(
+    s: wrapping[u64],
+    mut buf: List[byte],
+    corpus: List[List[byte]],
+    dict: List[List[byte]],
+) -> (int, wrapping[u64]) {
+    let ops = if dict.len == 0 then 10 else 11
+    let (op, s1) = choose(s, ops)
+    let s2 = match op {
+        0 => mutate_flip(s1, mut buf),
+        1 => mutate_delete(s1, mut buf),
+        2 => mutate_duplicate(s1, mut buf),
+        3 => mutate_swap(s1, mut buf),
+        4 => mutate_truncate(s1, mut buf),
+        5 => mutate_splice(s1, mut buf, corpus),
+        6 => mutate_split_utf8(s1, mut buf),
+        7 => mutate_lead_class(s1, mut buf),
+        8 => mutate_continuation(s1, mut buf),
+        9 => mutate_surrogate(s1, mut buf),
+        _ => mutate_dictionary(s1, mut buf, dict),
+    }
+    (op, s2)
+}
+
+fn op_name(op: int) -> str {
+    match op {
+        0 => "byte-flip",
+        1 => "chunk-delete",
+        2 => "chunk-duplicate",
+        3 => "chunk-swap",
+        4 => "truncate",
+        5 => "corpus-splice",
+        6 => "utf8-split",
+        7 => "lead-class",
+        8 => "lone-continuation",
+        9 => "surrogate-inject",
+        _ => "dictionary-splice",
+    }
+}
+
+// FNV-1a over the length's eight bytes then the bytes (`hash_bytes`,
+// `fuzzlib.c:915-927`).
+fn hash_bytes(h: wrapping[u64], buf: List[byte]) -> wrapping[u64] {
+    var v = h
+    var i = 0
+    while i < 8 {
+        v = v ^ (buf.len >> i * 8 & 255) as wrapping[u64]
+        v = v * 1099511628211
+        i += 1
+    }
+    for b in buf {
+        v = v ^ b as int as wrapping[u64]
+        v = v * 1099511628211
+    }
+    v
+}
+
+fn hex_of(buf: List[byte]) -> str {
+    let digits = "0123456789abcdef"
+    var out = List[byte]()
+    for b in buf {
+        let v = b as int
+        (mut out).push(digits.bytes()[v / 16])
+        (mut out).push(digits.bytes()[v % 16])
+    }
+    str_from_utf8(out) else "?"
+}
+
+fn hex16(h: wrapping[u64]) -> str {
+    let digits = "0123456789abcdef"
+    var rev = List[byte]()
+    var v = h
+    var i = 0
+    while i < 16 {
+        let d = (v % 16) as int
+        (mut rev).push(digits.bytes()[d])
+        v = v / 16
+        i += 1
+    }
+    var out = List[byte]()
+    i = 15
+    while i >= 0 {
+        (mut out).push(rev[i])
+        i -= 1
+    }
+    str_from_utf8(out) else "?"
+}
+
+// ---------------------------------------------------------------- the corpus
+
+/// One corpus entry: its NAME (C sorts by it) and bytes.
+struct Entry {
+    name: str,
+    bytes: List[byte],
+}
+
+fn bytes_list(xs: List[int]) -> List[byte] {
+    var out = List[byte]()
+    for x in xs {
+        (mut out).push(x as byte)
+    }
+    out
+}
+
+// strcmp(a, b) > 0, byte for byte.
+fn name_gt(a: str, b: str) -> bool {
+    let n = if a.len < b.len then a.len else b.len
+    var i = 0
+    while i < n {
+        let x = a.bytes()[i] as int
+        let y = b.bytes()[i] as int
+        if x != y {
+            return x > y
+        }
+        i += 1
+    }
+    a.len > b.len
+}
+
+// `add_builtin_corpus` (`fuzzlib.c:1590-1606`), the guided corpus files
+// under their C names (`tests/fuzz/corpus/<target>/<file>`), sorted by
+// name as `corpus_sort` does (a stable insertion sort, `:321-337`).
+fn load_corpus(target: str, fixtures: str) -> List[List[byte]] {
+    var entries = List[Entry]()
+    (mut entries).push(Entry { name: "builtin/empty", bytes: List[byte]() })
+    (mut entries).push(Entry { name: "builtin/ascii", bytes: bytes_list([121, 101, 119, 10]) })
+    (mut entries).push(Entry {
+        name: "builtin/valid",
+        bytes: bytes_list([226, 130, 172, 240, 159, 145, 141]),
+    })
+    (mut entries).push(Entry {
+        name: "builtin/invalid",
+        bytes: bytes_list([128, 192, 128, 237, 160, 128, 255]),
+    })
+    (mut entries).push(Entry {
+        name: "builtin/grapheme",
+        bytes: bytes_list([101, 204, 129, 240, 159, 135, 166, 240, 159, 135, 186]),
+    })
+    let dir = "{fixtures}/corpus/{target}"
+    let listing = fs.read_text("{dir}/INDEX") else ""
+    for line in listing.lines() {
+        let f = line.trim()
+        if f.len == 0 || f.starts_with("#") {
+            continue
+        }
+        let data = fs.read_bytes("{dir}/{f}") else {
+            eprint("fuzz-re: cannot read corpus {dir}/{f}")
+            os_exit(2)
+            List[byte]()
+        }
+        (mut entries).push(Entry { name: "tests/fuzz/corpus/{target}/{f}", bytes: data })
+    }
+    var i = 1
+    while i < entries.len {
+        var j = i
+        while j > 0 && name_gt(entries[j - 1].name, entries[j].name) {
+            let a = copy entries[j - 1]
+            let b = copy entries[j]
+            entries[j - 1] = b
+            entries[j] = a
+            j -= 1
+        }
+        i += 1
+    }
+    var out = List[List[byte]]()
+    for e in entries {
+        (mut out).push(copy e.bytes)
+    }
+    out
+}
+
+fn hex_nibble(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    -1
+}
+
+// `load_dictionary` and `decode_dictionary_token` (`fuzzlib.c:634-720`):
+// one token a line, `#` comments, `\xNN`, `\n`, `\r`, `\t`, `\\`.
+fn load_dict(target: str, fixtures: str) -> List[List[byte]] {
+    var out = List[List[byte]]()
+    let path = "{fixtures}/dict/{target}.txt"
+    let data = fs.read_bytes(path) else {
+        return out
+    }
+    var start = 0
+    while start < data.len {
+        var end = start
+        while end < data.len && data[end] as int != 10 {
+            end += 1
+        }
+        var len = end
+        while len > start && (data[len - 1] as int == 10 || data[len - 1] as int == 13) {
+            len -= 1
+        }
+        var first = start
+        while first < len && (data[first] as int == 32 || data[first] as int == 9) {
+            first += 1
+        }
+        if first < len && data[first] as int != 35 {
+            var tok = List[byte]()
+            var i = first
+            while i < len {
+                var b = data[i] as int
+                if b == 92 && i + 1 < len {
+                    let e = data[i + 1] as int
+                    if e == 120 && i + 3 < len {
+                        let hi = hex_nibble(data[i + 2] as int)
+                        let lo = hex_nibble(data[i + 3] as int)
+                        if hi >= 0 && lo >= 0 {
+                            b = hi << 4 | lo
+                            i += 3
+                        }
+                    } else if e == 110 || e == 114 || e == 116 || e == 92 {
+                        b = if e == 110 {
+                            10
+                        } else {
+                            (if e == 114 then 13 else (if e == 116 then 9 else 92))
+                        }
+                        i += 1
+                    }
+                }
+                (mut tok).push(b as byte)
+                i += 1
+            }
+            (mut out).push(tok)
+        }
+        start = end + 1
+    }
+    out
+}
+
+// ---------------------------------------------------------------- the checks
+
+fn at0() -> text.ByteOff {
+    0 as text.ByteOff
+}
+
+/// `compile_one` (`fuzz_re_compile.c:19-71`): a program, or a failure
+/// with a message and an offset inside the pattern; a program runs.
+fn compile_one(data: List[byte], flags: int, empty_tb: text.TextBuf) -> str {
+    var err = search.re_err_new()
+    err.off = 4294967295
+    let re = search.re_compile(data, flags, mut err) else {
+        if err.msg.len == 0 {
+            return "compile failed with no message (flags {flags})"
+        }
+        if err.off > data.len {
+            return "error offset {err.off} exceeds pattern length {data.len} (flags {flags}): {err.msg}"
+        }
+        return ""
+    }
+    let g = search.re_group_count(re)
+    if g == 0 || g > search.RE_MAX_GROUPS {
+        return "compiled with {g} groups"
+    }
+    // Running it is part of the contract: a program that compiles but
+    // hangs the matcher is not a success.
+    let probe = bytes_list([97, 98, 99, 32, 49, 50, 51, 32, 230, 188, 162, 240, 159, 152, 128])
+    let inp = search.re_input_bytes(probe.len)
+    var m = search.re_match_new()
+    let _a = search.re_search(re, empty_tb, probe, inp, at0(), mut m)
+    let _b = search.re_test(re, empty_tb, probe, inp, at0())
+    ""
+}
+
+// `check_re_compile` (`fuzz_re_compile.c:73-92`): every flag set is a
+// different parse path.
+fn check_compile(data: List[byte], empty_tb: text.TextBuf) -> str {
+    for f in [
+        0,
+        search.RE_ICASE,
+        search.RE_DOTALL,
+        search.RE_LITERAL,
+        search.RE_ICASE | search.RE_DOTALL,
+    ] {
+        let why = compile_one(data, f, empty_tb)
+        if why.len != 0 {
+            return why
+        }
+    }
+    ""
+}
+
+/// `quote_round_trip` (`fuzz_re_quote.c:26-103`): the quoted literal
+/// compiles, matches exactly its text, and not a one-bit perturbation.
+fn check_quote(data: List[byte], empty_tb: text.TextBuf) -> str {
+    var pat = List[byte]()
+    search.re_quote(mut pat, data, 0, data.len)
+    var err = search.re_err_new()
+    let re = search.re_compile(pat, 0, mut err) else {
+        return "quoted literal did not compile at {err.off}: {err.msg}"
+    }
+    var m = search.re_match_new()
+    if !search.re_search(re, empty_tb, data, search.re_input_bytes(data.len), at0(), mut m) {
+        return "quoted literal does not match its own text"
+    }
+    if m.lo[0] != 0 || m.hi[0] != data.len {
+        return "quoted literal matched {m.lo[0]}..{m.hi[0]} of {data.len} -- a metacharacter survived quoting"
+    }
+    if data.len > 0 {
+        var bent = copy data
+        let mid = data.len / 2
+        bent[mid] = (bent[mid] as int ^ 1) as byte
+        if search.re_search(re, empty_tb, bent, search.re_input_bytes(bent.len), at0(), mut m) &&
+            m.lo[0] == 0 &&
+            m.hi[0] == data.len {
+            return "quoted literal also matches a perturbed string -- it compiled to a wildcard"
+        }
+    }
+    ""
+}
+
+// ---------------------------------------------------------------- the diff generator
+
+// The generator's own xorshift64* (`fuzz_re_diff.c:26-45`): a u32 from
+// the top half of the product.
+fn grng(s: wrapping[u64]) -> (int, wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    let v = x * 2685821657736338717 >> 32
+    (v as int, x)
+}
+
+fn gbelow(s: wrapping[u64], n: int) -> (int, wrapping[u64]) {
+    if n == 0 {
+        return (0, s)
+    }
+    let (v, x) = grng(s)
+    (v % n, x)
+}
+
+/// The pattern generator's state (`Gen`, `fuzz_re_diff.c:50-55`).
+struct Gen {
+    buf: List[byte],
+    s: wrapping[u64],
+    groups: int,
+}
+
+const REF_MAX_GROUPS: int = 8
+
+fn g_ch(mut g: Gen, c: int) {
+    if g.buf.len + 1 < 256 {
+        (mut g.buf).push(c as byte)
+    }
+}
+
+fn g_str(mut g: Gen, s: str) {
+    if g.buf.len + s.len < 256 {
+        for b in s.bytes() {
+            (mut g.buf).push(b)
+        }
+    }
+}
+
+fn g_below(mut g: Gen, n: int) -> int {
+    let (v, s1) = gbelow(g.s, n)
+    g.s = s1
+    v
+}
+
+fn alpha(i: int) -> int {
+    97 + i
+}
+
+// `gen_atom` (`fuzz_re_diff.c:89-144`): answers nullability; the depth
+// cap is what guarantees termination.
+fn gen_atom(mut g: Gen, depth: int) -> bool {
+    let pick = g_below(mut g, if depth == 0 then 5 else 9)
+    if pick <= 2 {
+        let c = g_below(mut g, 3)
+        g_ch(mut g, alpha(c))
+        return false
+    }
+    if pick == 3 {
+        g_ch(mut g, 46)
+        return false
+    }
+    if pick == 4 {
+        g_ch(mut g, 91)
+        if g_below(mut g, 4) == 0 {
+            g_ch(mut g, 94)
+        }
+        let c = g_below(mut g, 3)
+        g_ch(mut g, alpha(c))
+        if g_below(mut g, 2) == 0 {
+            g_ch(mut g, 45)
+            g_ch(mut g, 99)
+        }
+        g_ch(mut g, 93)
+        return false
+    }
+    if pick == 5 {
+        g_ch(mut g, 94)
+        return true
+    }
+    if pick == 6 {
+        g_ch(mut g, 36)
+        return true
+    }
+    if pick == 7 {
+        let which = g_below(mut g, 2)
+        g_str(mut g, if which == 0 then "\\b" else "\\B")
+        return true
+    }
+    // A group, capturing only while slots remain.
+    g_ch(mut g, 40)
+    if g.groups + 1 >= REF_MAX_GROUPS || g_below(mut g, 3) == 0 {
+        g_str(mut g, "?:")
+    } else {
+        g.groups += 1
+    }
+    let nullable = gen_alt(mut g, depth - 1)
+    g_ch(mut g, 41)
+    nullable
+}
+
+// `gen_piece` (`:146-170`): a nullable atom takes only '?'.
+fn gen_piece(mut g: Gen, depth: int) -> bool {
+    let nullable = gen_atom(mut g, depth)
+    let pick = if nullable then 4 + g_below(mut g, 4) else g_below(mut g, 8)
+    if pick == 0 {
+        g_ch(mut g, 42)
+        return true
+    }
+    if pick == 1 {
+        g_ch(mut g, 43)
+        return nullable
+    }
+    if pick == 2 {
+        g_ch(mut g, 63)
+        return true
+    }
+    if pick == 3 {
+        let which = g_below(mut g, 2)
+        g_str(mut g, if which == 0 then "*?" else "+?")
+        return true
+    }
+    nullable
+}
+
+// `gen_concat` (`:172-182`).
+fn gen_concat(mut g: Gen, depth: int) -> bool {
+    let n = 1 + g_below(mut g, 3)
+    var nullable = true
+    var i = 0
+    while i < n {
+        nullable = gen_piece(mut g, depth) && nullable
+        i += 1
+    }
+    nullable
+}
+
+// `gen_alt` (`:184-197`).
+fn gen_alt(mut g: Gen, depth: int) -> bool {
+    let n = 1 + g_below(mut g, if depth == 0 then 1 else 2)
+    var nullable = false
+    var i = 0
+    while i < n {
+        if i != 0 {
+            g_ch(mut g, 124)
+        }
+        nullable = gen_concat(mut g, depth) || nullable
+        i += 1
+    }
+    nullable
+}
+
+// `gen_input` (`:214-234`): from the pattern's alphabet, with newline,
+// space, an outside letter and an invalid byte.
+fn gen_input(s: wrapping[u64]) -> (List[byte], wrapping[u64]) {
+    var out = List[byte]()
+    let (n, s1) = gbelow(s, 12)
+    var st = s1
+    var i = 0
+    while i < n {
+        let (pick, s2) = gbelow(st, 12)
+        st = s2
+        if pick < 8 {
+            let (c, s3) = gbelow(st, 3)
+            st = s3
+            (mut out).push(alpha(c) as byte)
+        } else if pick == 8 {
+            (mut out).push(10 as byte)
+        } else if pick == 9 {
+            (mut out).push(32 as byte)
+        } else if pick == 10 {
+            (mut out).push(100 as byte)
+        } else {
+            (mut out).push(255 as byte)
+        }
+        i += 1
+    }
+    (out, st)
+}
+
+// `tb_of` (`:237-250`): the bytes inserted one at a time at random
+// existing positions — a permutation, read back as the truth.
+fn tb_of(bytes: List[byte], s: wrapping[u64]) -> (text.TextBuf, wrapping[u64]) {
+    var tb = text.textbuf_new()
+    var st = s
+    var i = 0
+    while i < bytes.len {
+        let (pos, s1) = gbelow(st, i + 1)
+        st = s1
+        text.textbuf_insert_part(mut tb, pos as text.ByteOff, bytes, i, i + 1)
+        i += 1
+    }
+    (tb, st)
+}
+
+// ---------------------------------------------------------------- the oracle
+
+// The oracle's node kinds (`re_ref.c:18-33`).
+const N_EMPTY: int = 0
+
+const N_CHAR: int = 1
+
+const N_ANY: int = 2
+
+const N_CLASS: int = 3
+
+const N_CAT: int = 4
+
+const N_ALT: int = 5
+
+const N_STAR: int = 6
+
+const N_PLUS: int = 7
+
+const N_QUEST: int = 8
+
+const N_GROUP: int = 9
+
+const N_BOL: int = 10
+
+const N_EOL: int = 11
+
+const N_WORDB: int = 12
+
+const N_NWORDB: int = 13
+
+const REF_STEP_BUDGET: int = 1000000
+
+const REF_MAX_NODES: int = 512
+
+/// One oracle node (`RefNode`, `re_ref.c:40-50`): its ranges are
+/// `rlo/rhi[rat..rat + rn)` of the program.
+struct RefNode {
+    kind: int,
+    greedy: bool,
+    negate: bool,
+    cp: int,
+    group: int,
+    rat: int,
+    rn: int,
+    a: int,
+    b: int,
+}
+
+/// The oracle's program (`RefProg`, `re_ref.c:52-61`).
+struct RefProg {
+    nodes: List[RefNode],
+    rlo: List[int],
+    rhi: List[int],
+    at: int,
+    ngroups: int,
+    failed: bool,
+    unsupported: bool,
+}
+
+fn ref_node(mut p: RefProg, kind: int) -> int {
+    if p.nodes.len == REF_MAX_NODES {
+        p.unsupported = true
+        return -1
+    }
+    (mut p.nodes).push(RefNode {
+        kind: kind,
+        greedy: true,
+        negate: false,
+        cp: 0,
+        group: 0,
+        rat: 0,
+        rn: 0,
+        a: -1,
+        b: -1,
+    })
+    p.nodes.len - 1
+}
+
+fn ref_take_cp(mut p: RefProg, pat: List[byte]) -> int {
+    let (cp, n) = unicode.utf8_decode(pat, p.at, pat.len)
+    p.at += if n == 0 then 1 else n
+    cp
+}
+
+// `add_range` (`re_ref.c:99-106`): at most 32 ranges a class.
+fn ref_add_range(mut p: RefProg, id: int, lo: int, hi: int) {
+    if p.nodes[id].rn < 32 {
+        if p.nodes[id].rn == 0 {
+            p.nodes[id].rat = p.rlo.len
+        }
+        (mut p.rlo).push(lo)
+        (mut p.rhi).push(hi)
+        p.nodes[id].rn = p.nodes[id].rn + 1
+    }
+}
+
+// `parse_class` (`re_ref.c:109-156`): only the generator's class syntax.
+fn ref_parse_class(mut p: RefProg, pat: List[byte]) -> int {
+    let id = ref_node(mut p, N_CLASS)
+    if id < 0 {
+        return -1
+    }
+    var first = true
+    if p.at < pat.len && pat[p.at] as int == 94 {
+        p.nodes[id].negate = true
+        p.at += 1
+    }
+    loop {
+        if p.at >= pat.len {
+            p.failed = true
+            return -1
+        }
+        if pat[p.at] as int == 93 && !first {
+            p.at += 1
+            break
+        }
+        first = false
+        if pat[p.at] as int == 92 {
+            p.unsupported = true
+            return -1
+        }
+        let lo = ref_take_cp(mut p, pat)
+        if p.at + 1 < pat.len && pat[p.at] as int == 45 && pat[p.at + 1] as int != 93 {
+            p.at += 1
+            let hi = ref_take_cp(mut p, pat)
+            if hi < lo {
+                p.failed = true
+                return -1
+            }
+            ref_add_range(mut p, id, lo, hi)
+            continue
+        }
+        ref_add_range(mut p, id, lo, lo)
+    }
+    id
+}
+
+// `parse_atom` (`re_ref.c:158-252`).
+fn ref_parse_atom(mut p: RefProg, pat: List[byte]) -> int {
+    if p.at >= pat.len {
+        return ref_node(mut p, N_EMPTY)
+    }
+    let c = pat[p.at] as int
+    if c == 40 {
+        p.at += 1
+        var group = 0
+        if p.at + 1 < pat.len && pat[p.at] as int == 63 && pat[p.at + 1] as int == 58 {
+            p.at += 2
+        } else if p.at < pat.len && pat[p.at] as int == 63 {
+            p.unsupported = true
+            return -1
+        } else {
+            if p.ngroups >= REF_MAX_GROUPS {
+                p.unsupported = true
+                return -1
+            }
+            group = p.ngroups
+            p.ngroups += 1
+        }
+        let body = ref_parse_alt(mut p, pat)
+        if body < 0 || p.at >= pat.len || pat[p.at] as int != 41 {
+            p.failed = true
+            return -1
+        }
+        p.at += 1
+        let id = ref_node(mut p, N_GROUP)
+        if id < 0 {
+            return -1
+        }
+        p.nodes[id].group = group
+        p.nodes[id].a = body
+        return id
+    }
+    if c == 91 {
+        p.at += 1
+        return ref_parse_class(mut p, pat)
+    }
+    if c == 46 {
+        p.at += 1
+        return ref_node(mut p, N_ANY)
+    }
+    if c == 94 {
+        p.at += 1
+        return ref_node(mut p, N_BOL)
+    }
+    if c == 36 {
+        p.at += 1
+        return ref_node(mut p, N_EOL)
+    }
+    if c == 41 || c == 42 || c == 43 || c == 63 {
+        p.failed = true
+        return -1
+    }
+    if c == 92 {
+        p.at += 1
+        if p.at >= pat.len {
+            p.failed = true
+            return -1
+        }
+        let e = pat[p.at] as int
+        if e == 98 || e == 66 {
+            p.at += 1
+            return ref_node(mut p, if e == 98 then N_WORDB else N_NWORDB)
+        }
+        // Perl classes and the rest are outside the subset.
+        if e >= 97 && e <= 122 || e >= 65 && e <= 90 || e >= 48 && e <= 57 {
+            p.unsupported = true
+            return -1
+        }
+        p.at += 1
+        let id = ref_node(mut p, N_CHAR)
+        if id >= 0 {
+            p.nodes[id].cp = e
+        }
+        return id
+    }
+    let id = ref_node(mut p, N_CHAR)
+    if id >= 0 {
+        p.nodes[id].cp = ref_take_cp(mut p, pat)
+    }
+    id
+}
+
+// `parse_piece` (`re_ref.c:254-291`).
+fn ref_parse_piece(mut p: RefProg, pat: List[byte]) -> int {
+    var a = ref_parse_atom(mut p, pat)
+    if a < 0 {
+        return -1
+    }
+    loop {
+        if p.at >= pat.len {
+            break
+        }
+        let c = pat[p.at] as int
+        var q = -1
+        if c == 42 {
+            q = ref_node(mut p, N_STAR)
+        } else if c == 43 {
+            q = ref_node(mut p, N_PLUS)
+        } else if c == 63 {
+            q = ref_node(mut p, N_QUEST)
+        } else if c == 123 {
+            p.unsupported = true
+            return -1
+        } else {
+            break
+        }
+        if q < 0 {
+            return -1
+        }
+        p.at += 1
+        p.nodes[q].a = a
+        if p.at < pat.len && pat[p.at] as int == 63 {
+            p.nodes[q].greedy = false
+            p.at += 1
+        }
+        a = q
+    }
+    a
+}
+
+// `parse_concat` (`re_ref.c:293-315`).
+fn ref_parse_concat(mut p: RefProg, pat: List[byte]) -> int {
+    var left = -1
+    while p.at < pat.len && pat[p.at] as int != 124 && pat[p.at] as int != 41 {
+        let piece = ref_parse_piece(mut p, pat)
+        if piece < 0 {
+            return -1
+        }
+        if left < 0 {
+            left = piece
+            continue
+        }
+        let cat = ref_node(mut p, N_CAT)
+        if cat < 0 {
+            return -1
+        }
+        p.nodes[cat].a = left
+        p.nodes[cat].b = piece
+        left = cat
+    }
+    if left < 0 then ref_node(mut p, N_EMPTY) else left
+}
+
+// `parse_alt` (`re_ref.c:317-339`).
+fn ref_parse_alt(mut p: RefProg, pat: List[byte]) -> int {
+    var left = ref_parse_concat(mut p, pat)
+    if left < 0 {
+        return -1
+    }
+    while p.at < pat.len && pat[p.at] as int == 124 {
+        p.at += 1
+        let right = ref_parse_concat(mut p, pat)
+        if right < 0 {
+            return -1
+        }
+        let alt = ref_node(mut p, N_ALT)
+        if alt < 0 {
+            return -1
+        }
+        p.nodes[alt].a = left
+        p.nodes[alt].b = right
+        left = alt
+    }
+    left
+}
+
+// The continuation kinds: C's `cont_done`, `cont_cat`, `cont_star`
+// (`re_ref.c:370-410`).
+const K_DONE: int = 0
+
+const K_CAT: int = 1
+
+const K_STAR: int = 2
+
+/// A continuation record: what C's `RefCont` and its context carry.
+struct Cont {
+    kind: int,
+    node: int,
+    last: int,
+    next: int,
+}
+
+/// The backtracker's run (`RefRun`, `re_ref.c:345-354`).
+struct RefRun {
+    steps: int,
+    budget_out: bool,
+    end: int,
+    conts: List[Cont],
+    glo: List[int],
+}
+
+fn ref_decode_at(hay: List[byte], pos: int) -> (int, int) {
+    if pos >= hay.len {
+        return (0, 0)
+    }
+    let (cp, n) = unicode.utf8_decode(hay, pos, hay.len)
+    (cp, if n == 0 then 1 else n)
+}
+
+// `decode_before` (`re_ref.c:449-467`).
+fn ref_decode_before(hay: List[byte], pos: int) -> int {
+    var back = if pos > 4 then pos - 4 else 0
+    while back < pos {
+        let (cp, len) = ref_decode_at(hay, back)
+        if len == 0 {
+            break
+        }
+        if back + len >= pos {
+            return cp
+        }
+        back += len
+    }
+    0
+}
+
+fn ref_class_has(p: RefProg, id: int, cp: int) -> bool {
+    var inside = false
+    var i = 0
+    while i < p.nodes[id].rn {
+        let k = p.nodes[id].rat + i
+        inside = inside || cp >= p.rlo[k] && cp <= p.rhi[k]
+        i += 1
+    }
+    if p.nodes[id].negate then !inside else inside
+}
+
+fn push_cont(mut r: RefRun, kind: int, node: int, last: int, next: int) -> int {
+    (mut r.conts).push(Cont { kind: kind, node: node, last: last, next: next })
+    r.conts.len - 1
+}
+
+fn trim_conts(mut r: RefRun, n: int) {
+    while r.conts.len > n {
+        let _ = (mut r.conts).pop() else Cont { kind: 0, node: 0, last: 0, next: 0 }
+    }
+}
+
+// Apply continuation `k` at `pos`.
+fn run_cont(p: RefProg, mut r: RefRun, hay: List[byte], k: int, pos: int) -> bool {
+    let c = copy r.conts[k]
+    if c.kind == K_DONE {
+        r.end = pos
+        return true
+    }
+    if c.kind == K_CAT {
+        return ref_match(p, mut r, hay, c.node, pos, c.next)
+    }
+    // An empty iteration would loop forever: stop and let the
+    // continuation run, as a careful backtracker does.
+    if pos == c.last {
+        return run_cont(p, mut r, hay, c.next, pos)
+    }
+    ref_match_star(p, mut r, hay, c.node, pos, c.next)
+}
+
+// `match_star` (`re_ref.c:412-433`).
+fn ref_match_star(p: RefProg, mut r: RefRun, hay: List[byte], id: int, pos: int, k: int) -> bool {
+    r.steps -= 1
+    if r.steps < 0 {
+        r.budget_out = true
+        return false
+    }
+    let mark = r.conts.len
+    if p.nodes[id].greedy {
+        let rc = push_cont(mut r, K_STAR, id, pos, k)
+        let ok1 = ref_match(p, mut r, hay, p.nodes[id].a, pos, rc)
+        trim_conts(mut r, mark)
+        if ok1 {
+            return true
+        }
+        return run_cont(p, mut r, hay, k, pos)
+    }
+    if run_cont(p, mut r, hay, k, pos) {
+        return true
+    }
+    let rc = push_cont(mut r, K_STAR, id, pos, k)
+    let ok2 = ref_match(p, mut r, hay, p.nodes[id].a, pos, rc)
+    trim_conts(mut r, mark)
+    ok2
+}
+
+// `match_node` (`re_ref.c:479-597`).
+fn ref_match(p: RefProg, mut r: RefRun, hay: List[byte], id: int, pos: int, k: int) -> bool {
+    if id < 0 {
+        return false
+    }
+    r.steps -= 1
+    if r.steps < 0 {
+        r.budget_out = true
+        return false
+    }
+    let kind = p.nodes[id].kind
+    if kind == N_EMPTY {
+        return run_cont(p, mut r, hay, k, pos)
+    }
+    if kind == N_CHAR || kind == N_ANY || kind == N_CLASS {
+        let (cp, len) = ref_decode_at(hay, pos)
+        if len == 0 {
+            return false
+        }
+        if kind == N_CHAR && cp != p.nodes[id].cp {
+            return false
+        }
+        if kind == N_ANY && cp == 10 {
+            return false
+        }
+        if kind == N_CLASS && !ref_class_has(p, id, cp) {
+            return false
+        }
+        return run_cont(p, mut r, hay, k, pos + len)
+    }
+    if kind == N_CAT {
+        let mark = r.conts.len
+        let cc = push_cont(mut r, K_CAT, p.nodes[id].b, 0, k)
+        let ok = ref_match(p, mut r, hay, p.nodes[id].a, pos, cc)
+        trim_conts(mut r, mark)
+        return ok
+    }
+    if kind == N_ALT {
+        // Leftmost-first: the earlier branch wins.
+        if ref_match(p, mut r, hay, p.nodes[id].a, pos, k) {
+            return true
+        }
+        return ref_match(p, mut r, hay, p.nodes[id].b, pos, k)
+    }
+    if kind == N_STAR {
+        return ref_match_star(p, mut r, hay, id, pos, k)
+    }
+    if kind == N_PLUS {
+        // One mandatory iteration, then star semantics.
+        let mark = r.conts.len
+        let rc = push_cont(mut r, K_STAR, id, pos, k)
+        let ok = ref_match(p, mut r, hay, p.nodes[id].a, pos, rc)
+        trim_conts(mut r, mark)
+        return ok
+    }
+    if kind == N_QUEST {
+        if p.nodes[id].greedy {
+            if ref_match(p, mut r, hay, p.nodes[id].a, pos, k) {
+                return true
+            }
+            return run_cont(p, mut r, hay, k, pos)
+        }
+        if run_cont(p, mut r, hay, k, pos) {
+            return true
+        }
+        return ref_match(p, mut r, hay, p.nodes[id].a, pos, k)
+    }
+    if kind == N_GROUP {
+        // Captures are recorded on the way through and restored on a
+        // failed branch; only group 0's span is ever compared.
+        let g = p.nodes[id].group
+        let saved = r.glo[g]
+        r.glo[g] = pos
+        let ok = ref_match(p, mut r, hay, p.nodes[id].a, pos, k)
+        if !ok {
+            r.glo[g] = saved
+        }
+        return ok
+    }
+    if kind == N_BOL {
+        if pos == 0 || pos > 0 && hay[pos - 1] as int == 10 {
+            return run_cont(p, mut r, hay, k, pos)
+        }
+        return false
+    }
+    if kind == N_EOL {
+        if pos == hay.len ||
+            hay[pos] as int == 10 ||
+            hay[pos] as int == 13 && pos + 1 < hay.len && hay[pos + 1] as int == 10 {
+            return run_cont(p, mut r, hay, k, pos)
+        }
+        return false
+    }
+    if kind == N_WORDB || kind == N_NWORDB {
+        let (cp, len) = ref_decode_at(hay, pos)
+        let before = pos != 0 && search.re_is_word(ref_decode_before(hay, pos))
+        let after = len != 0 && search.re_is_word(cp)
+        let boundary = before != after
+        if (if kind == N_WORDB then boundary else !boundary) {
+            return run_cont(p, mut r, hay, k, pos)
+        }
+        return false
+    }
+    false
+}
+
+// The oracle's verdicts (`YewRefResult`, `re_ref.h:28-37`).
+const REF_NO_MATCH: int = 0
+
+const REF_MATCH: int = 1
+
+const REF_BUDGET: int = -1
+
+const REF_OUTSIDE: int = -2
+
+/// `yew_ref_search` (`re_ref.c:599-653`): (verdict, lo, hi).
+fn ref_search(pat: List[byte], hay: List[byte], from: int) -> (int, int, int) {
+    var p = RefProg {
+        nodes: List[RefNode](),
+        rlo: List[int](),
+        rhi: List[int](),
+        at: 0,
+        ngroups: 1,
+        failed: false,
+        unsupported: false,
+    }
+    let root = ref_parse_alt(mut p, pat)
+    if p.unsupported {
+        return (REF_OUTSIDE, 0, 0)
+    }
+    if root < 0 || p.failed || p.at != pat.len {
+        return (REF_OUTSIDE, 0, 0)
+    }
+    var start = from
+    while start <= hay.len {
+        var glo = List[int]()
+        var i = 0
+        while i < REF_MAX_GROUPS {
+            (mut glo).push(0)
+            i += 1
+        }
+        var r = RefRun {
+            steps: REF_STEP_BUDGET,
+            budget_out: false,
+            end: 0,
+            conts: List[Cont](),
+            glo: glo,
+        }
+        let done = push_cont(mut r, K_DONE, 0, 0, 0)
+        if ref_match(p, mut r, hay, root, start, done) {
+            return (REF_MATCH, start, r.end)
+        }
+        if r.budget_out {
+            return (REF_BUDGET, 0, 0)
+        }
+        // Only advance to the next codepoint boundary.
+        if start < hay.len {
+            let (_cp, len) = ref_decode_at(hay, start)
+            if len > 1 {
+                start += len - 1
+            }
+        }
+        start += 1
+    }
+    (REF_NO_MATCH, 0, 0)
+}
+
+// `one_case` (`fuzz_re_diff.c:281-401`): answers (why, next generator
+// state, compared 0/1, budget-skipped 0/1).
+fn one_case(s: wrapping[u64], empty_tb: text.TextBuf) -> (str, wrapping[u64], int, int) {
+    var g = Gen { buf: List[byte](), s: s, groups: 0 }
+    let _n = gen_alt(mut g, 2)
+    let pat = copy g.buf
+    let (raw, s1) = gen_input(g.s)
+    let (tb, s2) = tb_of(raw, s1)
+    // The piece tree holds the permutation; both engines are asked about
+    // THAT.
+    let hay = text.textbuf_bytes(tb)
+    let shown = str_from_utf8(pat) else "?"
+    var err = search.re_err_new()
+    let re = search.re_compile(pat, 0, mut err) else {
+        return (
+            "generated shared-subset /{shown}/ did not compile at {err.off}: {err.msg}",
+            s2,
+            0,
+            0,
+        )
+    }
+    let (want, rlo, rhi) = ref_search(pat, hay, 0)
+    if want == REF_BUDGET {
+        return ("", s2, 0, 1)
+    }
+    if want == REF_OUTSIDE {
+        return ("generated /{shown}/ is outside the oracle subset", s2, 0, 0)
+    }
+    let inp = search.re_input_bytes(hay.len)
+    var m = search.re_match_new()
+    let got = search.re_search(re, empty_tb, hay, inp, at0(), mut m)
+    if got != (want == REF_MATCH) {
+        return (
+            "/{shown}/ on {hex_of(hay)}: engine says {got}, oracle says {want == REF_MATCH}",
+            s2,
+            0,
+            0,
+        )
+    }
+    if got && (m.lo[0] != rlo || m.hi[0] != rhi) {
+        return (
+            "/{shown}/ on {hex_of(hay)}: span {m.lo[0]}..{m.hi[0]}, oracle {rlo}..{rhi}",
+            s2,
+            0,
+            0,
+        )
+    }
+    // The boolean engines must agree with the span engine.
+    let tested = search.re_test(re, empty_tb, hay, inp, at0())
+    if tested != got {
+        return ("/{shown}/: search says {got} but test says {tested}", s2, 0, 0)
+    }
+    // And the piece-tree backing with the flat one: the chunk-carry check.
+    var tm = search.re_match_new()
+    let empty = List[byte]()
+    let tgot = search.re_search(re, tb, empty, search.re_input_textbuf(tb), at0(), mut tm)
+    if tgot != got || got && (tm.lo[0] != m.lo[0] || tm.hi[0] != m.hi[0]) {
+        return ("/{shown}/: flat and piece-tree backings disagree", s2, 0, 0)
+    }
+    ("", s2, 1, 0)
+}
+
+// `check_re_diff` (`fuzz_re_diff.c:408-429`): the harness bytes only seed
+// the generator; sixteen cases each. Answers (why, compared, skipped).
+fn check_diff(data: List[byte], empty_tb: text.TextBuf) -> (str, int, int) {
+    var s: wrapping[u64] = 11400714819323198485
+    for b in data {
+        s = s ^ b as int as wrapping[u64] + 11400714819323198485 + (s << 6) + (s >> 2)
+    }
+    if s == 0 {
+        s = 1
+    }
+    var compared = 0
+    var skipped = 0
+    var round = 0
+    while round < 16 {
+        let (why, s1, c, k) = one_case(s, empty_tb)
+        s = s1
+        compared += c
+        skipped += k
+        if why.len != 0 {
+            return (why, compared, skipped)
+        }
+        round += 1
+    }
+    ("", compared, skipped)
+}
+
+// ---------------------------------------------------------------- the loop
+
+// `strtoull(s, &end, 0)` for the forms the campaigns pass: decimal or
+// 0x hex, as a u64 (a seed may exceed an int); (value, ok).
+fn parse_u64(s: str) -> (wrapping[u64], bool) {
+    var v: wrapping[u64] = 0
+    if s.starts_with("0x") || s.starts_with("0X") {
+        if s.len == 2 {
+            return (v, false)
+        }
+        for b in s[2..].bytes() {
+            let d = hex_nibble(b as int)
+            if d < 0 {
+                return (v, false)
+            }
+            v = v * 16 + d as wrapping[u64]
+        }
+        return (v, true)
+    }
+    if s.len == 0 {
+        return (v, false)
+    }
+    for b in s.bytes() {
+        let c = b as int
+        if c < 48 || c > 57 {
+            return (v, false)
+        }
+        v = v * 10 + (c - 48) as wrapping[u64]
+    }
+    (v, true)
+}
+
+fn main() -> int {
+    var target = ""
+    var iters = 200000
+    var seed: wrapping[u64] = 1
+    var fixtures = "tests/fixtures/fuzz"
+    for a in env_args() {
+        if a.starts_with("--target=") {
+            target = a[9..]
+        } else if a.starts_with("--iters=") {
+            let (v, good) = parse_u64(a[8..])
+            iters = if good && v <= 1000000000000 then v as int else -1
+        } else if a.starts_with("--seed=") {
+            let (v, good) = parse_u64(a[7..])
+            if !good {
+                eprint(
+                    "usage: fuzz-re --target=compile|diff|quote [--iters=N] [--seed=N] [--fixtures=DIR]",
+                )
+                return 2
+            }
+            seed = v
+        } else if a.starts_with("--fixtures=") {
+            fixtures = a[11..]
+        } else {
+            eprint(
+                "usage: fuzz-re --target=compile|diff|quote [--iters=N] [--seed=N] [--fixtures=DIR]",
+            )
+            return 2
+        }
+    }
+    if target != "compile" && target != "diff" && target != "quote" || iters < 0 {
+        eprint("usage: fuzz-re --target=compile|diff|quote [--iters=N] [--seed=N] [--fixtures=DIR]")
+        return 2
+    }
+    let name = "fuzz_re_{target}"
+    let corpus = load_corpus(name, fixtures)
+    let dict = load_dict(name, fixtures)
+    var st: wrapping[u64] = if seed == 0 then 11400714819323198485 else seed
+    var hash: wrapping[u64] = 1469598103934665603
+    var compared = 0
+    var skipped = 0
+    var failed = false
+    let empty_tb = text.textbuf_new()
+    var it = 0
+    while it < iters && !failed {
+        region turn {
+            let (which, s1) = choose(st, corpus.len)
+            var input = copy corpus[which]
+            let (nm, s2) = choose(s1, 4)
+            var s3 = s2
+            var op = -1
+            var m = 0
+            while m < 1 + nm {
+                let (o, s4) = mutate(s3, mut input, corpus, dict)
+                op = o
+                s3 = s4
+                m += 1
+            }
+            st = s3
+            hash = hash_bytes(hash, input)
+            var why = ""
+            if target == "compile" {
+                why = check_compile(input, empty_tb)
+            } else if target == "quote" {
+                why = check_quote(input, empty_tb)
+            } else {
+                let (w, c, k) = check_diff(input, empty_tb)
+                why = w
+                compared += c
+                skipped += k
+            }
+            if why.len != 0 {
+                eprint("{name}: FAIL seed={seed} iter={it} op={op_name(op)}: {why}")
+                eprint("{name}: input {hex_of(input)}")
+                failed = true
+            }
+        }
+        it += 1
+    }
+    if failed {
+        return 1
+    }
+    print("{name}: seed={seed} iters={iters} corpus={corpus.len} hash={hex16(hash)} ok")
+    if target == "diff" && compared + skipped != 0 {
+        // C's `%.6f%%`, rounded as printf rounds (half up at the seventh
+        // digit).
+        let micro = (skipped * 1000000000 / (compared + skipped) + 5) / 10
+        let frac = micro % 1000000
+        var digits = "{frac}"
+        while digits.len < 6 {
+            digits = "0{digits}"
+        }
+        print(
+            "{name}: {compared} compared, {skipped} oracle-budget skipped ({micro / 1000000}.{digits}%)",
+        )
+    }
+    0
+}

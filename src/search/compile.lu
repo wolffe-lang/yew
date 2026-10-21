@@ -1,0 +1,1001 @@
+//! search.compile — the AST to a Thompson program and its reverse, the
+//! literal prefix, the length bounds, and `re_compile` itself.
+//!
+//! Ports sagitta `src/search/compile.c` (986 lines) at 9ace98c2, under
+//! `s20-regex-engine.md` §5/§7: the emission table, the program limit
+//! checked DURING emission (so `(a{100}){100}` never builds ten megabytes
+//! of program first), the empty-body pre-pass that keeps a repeat of
+//! nothing O(1) (`note_emits_none`), `min_len`/`max_len`, the literal
+//! prefix, the long-literal path past the program cap, `first_bytes`,
+//! `is_simple_catch_all` and the input constructors.
+//!
+//! **The walks keep their own stacks.** C's `gen`, `note_emits_none`,
+//! `min_len`, `max_len` and `collect_literal` recurse over the AST, and a
+//! left-deep concatenation is as deep as the pattern is long (a 4,000
+//! byte literal-and-class pattern recurses 4,000 deep before its first
+//! instruction); the port's `gen` is a loop over a task stack whose tasks
+//! run in exactly the order C's calls do, so the program is C's
+//! instruction for instruction, and the three bottom-up passes run once
+//! over the node pool in index order (every node is made after its
+//! children). The walk count is C's: one per `gen` call.
+
+use unicode
+
+// The gen tasks: the steps of C's `gen`/`gen_repeat` recursion
+// (`compile.c:88-358`), each run where C's call would return to.
+const T_GEN: int = 0
+
+const T_ALT_MID: int = 1
+
+const T_ALT_END: int = 2
+
+const T_STAR_END: int = 3
+
+const T_PLUS_END: int = 4
+
+const T_QUEST_END: int = 5
+
+const T_SAVE: int = 6
+
+const T_REP_MIN: int = 7
+
+const T_REP_TAIL: int = 8
+
+const T_REP_OPT: int = 9
+
+const T_REP_OPT_PATCH: int = 10
+
+struct GenTask {
+    kind: int,
+    node: int,
+    v1: int,
+    v2: int,
+    v3: int,
+}
+
+/// The emitter (`Emit`, `compile.c:10-18`).
+struct Emit {
+    prog: List[ReInst],
+    overflow: bool,
+    reverse: bool,
+    walked: int,
+    splits: List[int],
+    tasks: List[GenTask],
+}
+
+// `emit` (`compile.c:28-60`): the limit checked as the program grows.
+fn emit(mut e: Emit, op: int, x: int, y: int, arg: int) -> int {
+    if e.overflow {
+        return 0
+    }
+    if e.prog.len >= RE_MAX_PROG {
+        e.overflow = true
+        return 0
+    }
+    (mut e.prog).push(ReInst { op: op, x: x, y: y, arg: arg })
+    e.prog.len - 1
+}
+
+fn patch_x(mut e: Emit, at: int, target: int) {
+    if !e.overflow && at < e.prog.len {
+        e.prog[at].x = target
+    }
+}
+
+fn patch_y(mut e: Emit, at: int, target: int) {
+    if !e.overflow && at < e.prog.len {
+        e.prog[at].y = target
+    }
+}
+
+fn task(mut e: Emit, kind: int, node: int, v1: int, v2: int, v3: int) {
+    (mut e.tasks).push(GenTask { kind: kind, node: node, v1: v1, v2: v2, v3: v3 })
+}
+
+// Patch a loop's SPLIT by greediness (the STAR / {m,} tail and `e?`
+// shapes, `compile.c:262-283`).
+fn patch_split(mut e: Emit, split: int, body: int, greedy: bool) {
+    let end = e.prog.len
+    if greedy {
+        patch_x(mut e, split, body)
+        patch_y(mut e, split, end)
+    } else {
+        patch_x(mut e, split, end)
+        patch_y(mut e, split, body)
+    }
+}
+
+// One `gen(e, a)` call (`compile.c:216-301`): the walk counted, the node
+// emitted or its children scheduled.
+fn gen_node(mut e: Emit, nodes: List[ReAst], a: int) {
+    e.walked += 1
+    if a < 0 || e.overflow || nodes[a].emits_none {
+        return
+    }
+    let kind = nodes[a].kind
+    if kind == RE_A_EMPTY {
+        return
+    }
+    if kind == RE_A_CHAR {
+        let _ = emit(mut e, RE_CHAR, 0, 0, nodes[a].cp)
+        return
+    }
+    if kind == RE_A_CLASS {
+        let _ = emit(mut e, RE_CLASS, 0, 0, nodes[a].cls)
+        return
+    }
+    if kind == RE_A_ANY {
+        let _ = emit(mut e, RE_ANY, 0, 0, if nodes[a].dotall then 1 else 0)
+        return
+    }
+    if kind == RE_A_CAT {
+        // Concatenation is the only place direction matters: the reverse
+        // program is the same AST with operand order flipped (§6c).
+        if e.reverse {
+            task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+            task(mut e, T_GEN, nodes[a].b, 0, 0, 0)
+        } else {
+            task(mut e, T_GEN, nodes[a].b, 0, 0, 0)
+            task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+        }
+        return
+    }
+    if kind == RE_A_ALT {
+        let split = emit(mut e, RE_SPLIT, 0, 0, 0)
+        patch_x(mut e, split, e.prog.len)
+        task(mut e, T_ALT_MID, a, split, 0, 0)
+        task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_STAR {
+        let split = emit(mut e, RE_SPLIT, 0, 0, 0)
+        task(mut e, T_STAR_END, a, split, e.prog.len, 0)
+        task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_PLUS {
+        task(mut e, T_PLUS_END, a, e.prog.len, 0, 0)
+        task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_QUEST {
+        let split = emit(mut e, RE_SPLIT, 0, 0, 0)
+        task(mut e, T_QUEST_END, a, split, e.prog.len, 0)
+        task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_REPEAT {
+        // `gen_repeat` (`compile.c:146-214`).
+        let body = nodes[a].a
+        if body < 0 || nodes[body].emits_none || nodes[a].max == 0 {
+            return
+        }
+        task(mut e, T_REP_MIN, a, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_GROUP {
+        // Group 0 is the whole match and is saved by the caller; in the
+        // reverse program the end slot is written first.
+        let g = nodes[a].group
+        if g != 0 {
+            let first = if e.reverse then g * 2 + 1 else g * 2
+            let second = if e.reverse then g * 2 else g * 2 + 1
+            let _ = emit(mut e, RE_SAVE, 0, 0, first)
+            task(mut e, T_SAVE, a, second, 0, 0)
+        }
+        task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_BOL {
+        let _ = emit(mut e, if e.reverse then RE_EOL else RE_BOL, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_EOL {
+        let _ = emit(mut e, if e.reverse then RE_BOL else RE_EOL, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_BOT {
+        let _ = emit(mut e, if e.reverse then RE_EOT else RE_BOT, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_EOT {
+        let _ = emit(mut e, if e.reverse then RE_BOT else RE_EOT, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_WORDB {
+        // \b is symmetric: it looks at both sides either way.
+        let _ = emit(mut e, RE_WORDB, 0, 0, 0)
+        return
+    }
+    if kind == RE_A_NWORDB {
+        let _ = emit(mut e, RE_NWORDB, 0, 0, 0)
+        return
+    }
+    util_bug_kind(kind)
+}
+
+fn util_bug_kind(kind: int) {
+    assert(false, "regex compile: unknown AST node {kind}")
+}
+
+// Run one task (the code after a C call returns).
+fn gen_step(mut e: Emit, nodes: List[ReAst], t: GenTask) {
+    let a = t.node
+    if t.kind == T_GEN {
+        gen_node(mut e, nodes, a)
+        return
+    }
+    if t.kind == T_ALT_MID {
+        let jmp = emit(mut e, RE_JMP, 0, 0, 0)
+        patch_y(mut e, t.v1, e.prog.len)
+        task(mut e, T_ALT_END, a, jmp, 0, 0)
+        task(mut e, T_GEN, nodes[a].b, 0, 0, 0)
+        return
+    }
+    if t.kind == T_ALT_END {
+        patch_x(mut e, t.v1, e.prog.len)
+        return
+    }
+    if t.kind == T_STAR_END {
+        let _ = emit(mut e, RE_JMP, t.v1, 0, 0)
+        patch_split(mut e, t.v1, t.v2, nodes[a].greedy)
+        return
+    }
+    if t.kind == T_PLUS_END {
+        let split = emit(mut e, RE_SPLIT, 0, 0, 0)
+        // `e+`: body first, then the SPLIT that loops back (lazy: swapped).
+        if nodes[a].greedy {
+            patch_x(mut e, split, t.v1)
+            patch_y(mut e, split, e.prog.len)
+        } else {
+            patch_x(mut e, split, e.prog.len)
+            patch_y(mut e, split, t.v1)
+        }
+        return
+    }
+    if t.kind == T_QUEST_END {
+        patch_split(mut e, t.v1, t.v2, nodes[a].greedy)
+        return
+    }
+    if t.kind == T_SAVE {
+        let _ = emit(mut e, RE_SAVE, 0, 0, t.v1)
+        return
+    }
+    if t.kind == T_REP_MIN {
+        // m copies, then the tail.
+        if t.v1 < nodes[a].min {
+            task(mut e, T_REP_MIN, a, t.v1 + 1, 0, 0)
+            task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+        } else {
+            task(mut e, T_REP_TAIL, a, 0, 0, 0)
+        }
+        return
+    }
+    if t.kind == T_REP_TAIL {
+        if nodes[a].max == RE_UNBOUNDED {
+            // m copies then a star.
+            let split = emit(mut e, RE_SPLIT, 0, 0, 0)
+            task(mut e, T_STAR_END, a, split, e.prog.len, 0)
+            task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+            return
+        }
+        // (max - min) optional copies; each is a SPLIT plus a non-empty
+        // body, so refuse before building a split table the cap could
+        // never hold.
+        let opt = nodes[a].max - nodes[a].min
+        if opt > RE_MAX_PROG - e.prog.len {
+            e.overflow = true
+            return
+        }
+        task(mut e, T_REP_OPT, a, 0, e.splits.len, 0)
+        return
+    }
+    if t.kind == T_REP_OPT {
+        let opt = nodes[a].max - nodes[a].min
+        let i = t.v1
+        let base = t.v2
+        if i < opt {
+            let split = emit(mut e, RE_SPLIT, 0, 0, 0)
+            (mut e.splits).push(split)
+            task(mut e, T_REP_OPT_PATCH, a, i, base, split)
+            task(mut e, T_GEN, nodes[a].a, 0, 0, 0)
+            return
+        }
+        // Every optional copy exits to the same end.
+        var k = 0
+        while k < opt {
+            let s = e.splits[base + k]
+            if nodes[a].greedy {
+                patch_y(mut e, s, e.prog.len)
+            } else {
+                patch_x(mut e, s, e.prog.len)
+            }
+            k += 1
+        }
+        while e.splits.len > base {
+            let _ = (mut e.splits).pop() else 0
+        }
+        return
+    }
+    if t.kind == T_REP_OPT_PATCH {
+        // `body` is the instruction after the copy's SPLIT.
+        let body = t.v3 + 1
+        if nodes[a].greedy {
+            patch_x(mut e, t.v3, body)
+        } else {
+            patch_y(mut e, t.v3, body)
+        }
+        task(mut e, T_REP_OPT, a, t.v1 + 1, t.v2, 0)
+        return
+    }
+}
+
+/// `gen(e, root)` to completion; stops at the first overflow, after
+/// which C's remaining calls emit nothing.
+fn gen_all(mut e: Emit, nodes: List[ReAst], root: int) {
+    task(mut e, T_GEN, root, 0, 0, 0)
+    while e.tasks.len != 0 && !e.overflow {
+        let t = (mut e.tasks).pop() else GenTask { kind: -1, node: -1, v1: 0, v2: 0, v3: 0 }
+        gen_step(mut e, nodes, t)
+    }
+    while e.tasks.len != 0 {
+        let _ = (mut e.tasks).pop() else GenTask { kind: -1, node: -1, v1: 0, v2: 0, v3: 0 }
+    }
+}
+
+/// Bottom-up, once per compile: does gen() emit NOTHING for this node
+/// (`note_emits_none`, `compile.c:102-144`)? The program cap bounds what
+/// is emitted, not what is walked, so `x{0}{110}{1000}{1,1000}` walked
+/// 1.1e8 empty copies before this flag (fuzz_re_compile, seeds 20260929
+/// and 20261002). Children precede parents in the pool, so one pass in
+/// index order is C's post-order.
+fn note_emits_none(mut nodes: List[ReAst]) {
+    var i = 0
+    while i < nodes.len {
+        let kind = nodes[i].kind
+        let a = nodes[i].a
+        let b = nodes[i].b
+        let none_a = a < 0 || nodes[a].emits_none
+        let none_b = b < 0 || nodes[b].emits_none
+        var none = false
+        if kind == RE_A_EMPTY {
+            none = true
+        } else if kind == RE_A_CAT {
+            none = none_a && none_b
+        } else if kind == RE_A_REPEAT {
+            none = none_a || nodes[i].max == 0
+        } else if kind == RE_A_GROUP {
+            none = none_a && nodes[i].group == 0
+        }
+        nodes[i].emits_none = none
+        i += 1
+    }
+}
+
+// Saturating u32 arithmetic for the bounds.
+fn sat_add(l: int, r: int) -> int {
+    if l + r > RE_UNBOUNDED then RE_UNBOUNDED else l + r
+}
+
+/// The fewest codepoints any match consumes, per node (`min_len`,
+/// `compile.c:303-343`): an underestimate is safe, an overestimate a
+/// correctness bug.
+fn min_lens(nodes: List[ReAst]) -> List[int] {
+    var out = List[int]()
+    var i = 0
+    while i < nodes.len {
+        let kind = nodes[i].kind
+        let a = nodes[i].a
+        let b = nodes[i].b
+        let la = if a < 0 then 0 else out[a]
+        let lb = if b < 0 then 0 else out[b]
+        var v = 0
+        if kind == RE_A_CHAR || kind == RE_A_CLASS || kind == RE_A_ANY {
+            v = 1
+        } else if kind == RE_A_CAT {
+            v = sat_add(la, lb)
+        } else if kind == RE_A_ALT {
+            v = if la < lb then la else lb
+        } else if kind == RE_A_PLUS || kind == RE_A_GROUP {
+            v = la
+        } else if kind == RE_A_REPEAT {
+            let inner = if nodes[i].min == 0 then 0 else la
+            if inner == 0 {
+                v = 0
+            } else {
+                v = if inner > RE_UNBOUNDED / nodes[i].min {
+                    RE_UNBOUNDED
+                } else {
+                    inner * nodes[i].min
+                }
+            }
+        }
+        (mut out).push(v)
+        i += 1
+    }
+    out
+}
+
+/// The most codepoints any match consumes, `RE_UNBOUNDED` for none, per
+/// node (`max_len`, `compile.c:345-395`): an overestimate is safe.
+fn max_lens(nodes: List[ReAst]) -> List[int] {
+    var out = List[int]()
+    var i = 0
+    while i < nodes.len {
+        let kind = nodes[i].kind
+        let a = nodes[i].a
+        let b = nodes[i].b
+        let la = if a < 0 then 0 else out[a]
+        let lb = if b < 0 then 0 else out[b]
+        var v = 0
+        if kind == RE_A_CHAR || kind == RE_A_CLASS || kind == RE_A_ANY {
+            v = 1
+        } else if kind == RE_A_CAT {
+            v = if la == RE_UNBOUNDED || lb == RE_UNBOUNDED then RE_UNBOUNDED else sat_add(la, lb)
+        } else if kind == RE_A_ALT {
+            v = if la > lb then la else lb
+        } else if kind == RE_A_STAR || kind == RE_A_PLUS {
+            v = RE_UNBOUNDED
+        } else if kind == RE_A_QUEST || kind == RE_A_GROUP {
+            v = la
+        } else if kind == RE_A_REPEAT {
+            let rmax = nodes[i].max
+            if rmax == RE_UNBOUNDED {
+                v = RE_UNBOUNDED
+            } else if la == RE_UNBOUNDED || rmax == 0 {
+                v = if la == RE_UNBOUNDED then RE_UNBOUNDED else 0
+            } else if la != 0 && rmax > RE_UNBOUNDED / la {
+                v = RE_UNBOUNDED
+            } else {
+                v = la * rmax
+            }
+        }
+        (mut out).push(v)
+        i += 1
+    }
+    out
+}
+
+// `build_program` (`compile.c:397-411`): SAVE 0 ... SAVE 1, MATCH.
+fn build_program(mut e: Emit, nodes: List[ReAst], root: int, reverse: bool) -> bool {
+    e.reverse = reverse
+    e.prog = List[ReInst]()
+    e.overflow = false
+    let _ = emit(mut e, RE_SAVE, 0, 0, if reverse then 1 else 0)
+    gen_all(mut e, nodes, root)
+    let _ = emit(mut e, RE_SAVE, 0, 0, if reverse then 0 else 1)
+    let _ = emit(mut e, RE_MATCH, 0, 0, 0)
+    !e.overflow
+}
+
+// Literal prefix extraction (`collect_literal`, `compile.c:413-445`):
+// the leading concatenation of plain literals, at most 32 bytes; a
+// class, a quantifier, an alternation or a capturing group ends it.
+// Answers whether the walk stopped early (`done`).
+fn collect_literal(nodes: List[ReAst], root: int, mut out: List[byte]) -> bool {
+    var stack = List[int]()
+    (mut stack).push(root)
+    while stack.len != 0 {
+        let a = (mut stack).pop() else -1
+        if a < 0 {
+            continue
+        }
+        let kind = nodes[a].kind
+        if kind == RE_A_CHAR {
+            let n = unicode.utf8_len(nodes[a].cp)
+            if n == 0 || out.len + n > RE_LIT_SMALL {
+                return true
+            }
+            let _ = unicode.utf8_encode_into(mut out, nodes[a].cp)
+        } else if kind == RE_A_CAT {
+            (mut stack).push(nodes[a].b)
+            (mut stack).push(nodes[a].a)
+        } else {
+            return true
+        }
+    }
+    false
+}
+
+/// An empty prefilter.
+fn lit_none() -> ReLit {
+    ReLit {
+        kind: RE_LIT_NONE,
+        n: 0,
+        s: List[byte](),
+        kmp: List[int](),
+        skip: List[int](),
+        has: List[bool](),
+        anchored: false,
+    }
+}
+
+// `build_literal` (`compile.c:447-490`).
+fn build_literal(nodes: List[ReAst], root: int, flags: int) -> ReLit {
+    // Under ICASE literals were folded into classes at parse time, so
+    // there is no CHAR prefix; a prefilter that can miss a match is a
+    // correctness bug, so decline.
+    if flags & RE_ICASE != 0 {
+        return lit_none()
+    }
+    var buf = List[byte]()
+    let done = collect_literal(nodes, root, mut buf)
+    if buf.len == 0 {
+        return lit_none()
+    }
+    // Whole-pattern-literal means the VM is never entered at all.
+    let whole = flags & RE_LITERAL != 0 || !done && buf.len != 0
+    var kind = if buf.len == 1 then RE_LIT_BYTE else RE_LIT_BMH
+    if whole {
+        kind = RE_LIT_WHOLE
+    }
+    lit_prepare(kind, buf, 0, buf.len)
+}
+
+fn literal_raw_meta(c: int) -> bool {
+    c == 92 ||
+        c == 46 ||
+        c == 94 ||
+        c == 36 ||
+        c == 40 ||
+        c == 41 ||
+        c == 91 ||
+        c == 93 ||
+        c == 124 ||
+        c == 42 ||
+        c == 43 ||
+        c == 63 ||
+        c == 123 ||
+        c == 125
+}
+
+fn literal_escaped_punct(c: int) -> bool {
+    c >= 33 && c <= 47 || c >= 58 && c <= 64 || c >= 91 && c <= 96 || c >= 123 && c <= 126
+}
+
+// `literal_scan_hex` (`compile.c:503-541`): answers (ok, cp, next at).
+fn literal_scan_hex(pat: List[byte], at_in: int) -> (bool, int, int) {
+    var at = at_in
+    let len = pat.len
+    var value = 0
+    var digits = 0
+    if at < len && pat[at] as int == 123 {
+        at += 1
+        while at < len && pat[at] as int != 125 {
+            let d = hex_digit(pat[at] as int)
+            if d < 0 || digits == 6 {
+                return (false, 0, at)
+            }
+            value = value * 16 + d
+            digits += 1
+            at += 1
+        }
+        if digits == 0 || at >= len || pat[at] as int != 125 || value > 1114111 {
+            return (false, 0, at)
+        }
+        return (true, value, at + 1)
+    }
+    if len - at < 2 {
+        return (false, 0, at)
+    }
+    let hi = hex_digit(pat[at] as int)
+    let lo = hex_digit(pat[at + 1] as int)
+    if hi < 0 || lo < 0 {
+        return (false, 0, at)
+    }
+    (true, hi * 16 + lo, at + 2)
+}
+
+/// Recognize only patterns whose full meaning is an exact byte string
+/// (`scan_whole_literal`, `compile.c:569-640`): run before the parser
+/// only for patterns long enough to cross the program cap, so
+/// `re_quote`'s output is not refused merely for being longer than a
+/// Thompson program. False means "use the parser", not "invalid".
+/// Answers (whole, codepoints, saw an uppercase literal) with the bytes
+/// in `out`.
+fn scan_whole_literal(pat: List[byte], flags: int, mut out: List[byte]) -> (bool, int, bool) {
+    let len = pat.len
+    var at = 0
+    var codepoints = 0
+    var saw_upper = false
+    if flags & RE_ICASE != 0 {
+        return (false, 0, false)
+    }
+    while at < len {
+        if flags & RE_LITERAL == 0 && pat[at] as int == 92 {
+            at += 1
+            if at == len {
+                return (false, 0, false)
+            }
+            let c = pat[at] as int
+            at += 1
+            var cp = 0
+            if c == 110 {
+                cp = 10
+            } else if c == 116 {
+                cp = 9
+            } else if c == 114 {
+                cp = 13
+            } else if c == 102 {
+                cp = 12
+            } else if c == 118 {
+                cp = 11
+            } else if c == 97 {
+                cp = 7
+            } else if c == 101 {
+                cp = 27
+            } else if c == 48 {
+                cp = 0
+            } else if c == 120 {
+                let (ok, v, next) = literal_scan_hex(pat, at)
+                if !ok {
+                    return (false, 0, false)
+                }
+                cp = v
+                at = next
+            } else {
+                if !literal_escaped_punct(c) {
+                    return (false, 0, false)
+                }
+                cp = c
+            }
+            if unicode.utf8_encode_into(mut out, cp) == 0 {
+                return (false, 0, false)
+            }
+            codepoints += 1
+            continue
+        }
+        if flags & RE_LITERAL == 0 && literal_raw_meta(pat[at] as int) {
+            return (false, 0, false)
+        }
+        let (cp, n0) = unicode.utf8_decode(pat, at, len)
+        let n = if n0 == 0 then 1 else n0
+        var k = 0
+        while k < n {
+            (mut out).push(pat[at + k])
+            k += 1
+        }
+        at += n
+        if unicode.cat_rec(cp) & unicode.CAT_UPPER != 0 {
+            saw_upper = true
+        }
+        codepoints += 1
+    }
+    (out.len != 0, codepoints, saw_upper)
+}
+
+fn inst(op: int, x: int, y: int, arg: int) -> ReInst {
+    ReInst { op: op, x: x, y: y, arg: arg }
+}
+
+// `build_large_literal` (`compile.c:642-669`): the inert three-
+// instruction programs and a whole-literal prefilter.
+fn build_large_literal(bytes: List[byte], codepoints: int, flags: int, saw_upper: bool) -> Re {
+    var prog = List[ReInst]()
+    (mut prog).push(inst(RE_SAVE, 0, 0, 0))
+    (mut prog).push(inst(RE_SAVE, 0, 0, 1))
+    (mut prog).push(inst(RE_MATCH, 0, 0, 0))
+    var rprog = List[ReInst]()
+    (mut rprog).push(inst(RE_SAVE, 0, 0, 1))
+    (mut rprog).push(inst(RE_SAVE, 0, 0, 0))
+    (mut rprog).push(inst(RE_MATCH, 0, 0, 0))
+    Re {
+        prog: prog,
+        rprog: rprog,
+        cls_lo: List[int](),
+        cls_hi: List[int](),
+        cls_start: List[int](),
+        cls_n: List[int](),
+        ngroups: 1,
+        lit: lit_prepare(RE_LIT_WHOLE, bytes, 0, bytes.len),
+        flags: flags,
+        saw_upper_literal: saw_upper,
+        force_icase: false,
+        force_case: false,
+        min_len: codepoints,
+        max_len: codepoints,
+        walked: 0,
+    }
+}
+
+/// Compile `pat` under `flags` (`yew_re_compile`, `compile.c:671-750`):
+/// the program, or `invalid` with `err` holding the offset and message
+/// (and the walk, `err.walked`).
+pub fn re_compile(pat: List[byte], flags: int, mut err: ReErr) -> Re ! {invalid} {
+    var cache = re_cache_new()
+    re_compile_cached(pat, flags, mut cache, mut err)
+}
+
+/// `re_compile` with the owner's property and fold cache (`ReCache`):
+/// the runs and the fold table are built once per cache, not per
+/// compile.
+pub fn re_compile_cached(pat: List[byte], flags: int, mut cache: ReCache, mut err: ReErr) -> Re ! {
+    invalid,
+} {
+    err.off = 0
+    err.msg = ""
+    err.walked = 0
+    let len = pat.len
+    // `re_quote` may spell one control byte as four pattern bytes: admit
+    // that bounded representation only when the conservative scanner
+    // proves it an exact literal within the 64 KiB semantic limit.
+    if len > RE_MAX_PATTERN * 4 {
+        err.off = RE_MAX_PATTERN
+        err.msg = "pattern too long (max 64 KiB)"
+        return invalid
+    }
+    if len > RE_MAX_PROG - 3 {
+        var bytes = List[byte]()
+        let (whole, codepoints, saw_upper) = scan_whole_literal(pat, flags, mut bytes)
+        if whole && bytes.len <= RE_MAX_PATTERN && codepoints > RE_MAX_PROG - 3 {
+            return build_large_literal(bytes, codepoints, flags, saw_upper)
+        }
+    }
+    if len > RE_MAX_PATTERN {
+        err.off = RE_MAX_PATTERN
+        err.msg = "pattern too long (max 64 KiB)"
+        return invalid
+    }
+    var p = parse_new(len, flags)
+    // The owner's cache lent to the parse and handed back (the swap seam).
+    let lent = cache
+    cache = re_cache_new_empty()
+    p.cache = lent
+    let root = re_parse(mut p, pat)
+    let back = p.cache
+    p.cache = re_cache_new_empty()
+    cache = back
+    if root < 0 || p.failed {
+        err.off = p.err_off
+        err.msg = p.err_msg
+        return invalid
+    }
+    note_emits_none(mut p.nodes)
+    var e = Emit {
+        prog: List[ReInst](),
+        overflow: false,
+        reverse: false,
+        walked: 0,
+        splits: List[int](),
+        tasks: List[GenTask](),
+    }
+    if !build_program(mut e, p.nodes, root, false) {
+        err.off = len
+        err.msg = "pattern too complex (program limit 4096)"
+        err.walked = e.walked
+        return invalid
+    }
+    let prog = e.prog
+    e.prog = List[ReInst]()
+    if !build_program(mut e, p.nodes, root, true) {
+        err.off = len
+        err.msg = "pattern too complex (program limit 4096)"
+        err.walked = e.walked
+        return invalid
+    }
+    let rprog = e.prog
+    e.prog = List[ReInst]()
+    let mins = min_lens(p.nodes)
+    let maxs = max_lens(p.nodes)
+    let lit = build_literal(p.nodes, root, flags)
+    err.walked = e.walked
+    Re {
+        prog: prog,
+        rprog: rprog,
+        cls_lo: p.cls_lo,
+        cls_hi: p.cls_hi,
+        cls_start: p.cls_start,
+        cls_n: p.cls_n,
+        ngroups: p.ngroups,
+        lit: lit,
+        flags: flags,
+        saw_upper_literal: p.saw_upper_literal,
+        force_icase: p.force_icase,
+        force_case: p.force_case,
+        min_len: mins[root],
+        max_len: maxs[root],
+        walked: e.walked,
+    }
+}
+
+/// The empty pattern's program, compiled without a parse: matches the
+/// empty string everywhere (what `re_compile` answers for "").
+pub fn re_empty() -> Re {
+    var prog = List[ReInst]()
+    (mut prog).push(inst(RE_SAVE, 0, 0, 0))
+    (mut prog).push(inst(RE_SAVE, 0, 0, 1))
+    (mut prog).push(inst(RE_MATCH, 0, 0, 0))
+    var rprog = List[ReInst]()
+    (mut rprog).push(inst(RE_SAVE, 0, 0, 1))
+    (mut rprog).push(inst(RE_SAVE, 0, 0, 0))
+    (mut rprog).push(inst(RE_MATCH, 0, 0, 0))
+    Re {
+        prog: prog,
+        rprog: rprog,
+        cls_lo: List[int](),
+        cls_hi: List[int](),
+        cls_start: List[int](),
+        cls_n: List[int](),
+        ngroups: 1,
+        lit: lit_none(),
+        flags: 0,
+        saw_upper_literal: false,
+        force_icase: false,
+        force_case: false,
+        min_len: 0,
+        max_len: 0,
+        walked: 0,
+    }
+}
+
+/// `re_compile` over a `str` pattern.
+pub fn re_compile_str(pat: str, flags: int, mut err: ReErr) -> Re ! {invalid} {
+    re_compile(pat.bytes(), flags, mut err)
+}
+
+fn is_class_or_any(i: ReInst) -> bool {
+    i.op == RE_CLASS || i.op == RE_ANY
+}
+
+/// True only for one class-or-any atom, optionally repeated without an
+/// upper bound (`yew_re_is_simple_catch_all`, `compile.c:779-806`).
+pub fn re_is_simple_catch_all(re: Re) -> bool {
+    if re.min_len > 1 {
+        return false
+    }
+    let p = re.prog
+    let n = p.len
+    // SAVE, atom, SAVE, MATCH: `.` or one character class.
+    if n == 4 &&
+        p[0].op == RE_SAVE &&
+        is_class_or_any(copy p[1]) &&
+        p[2].op == RE_SAVE &&
+        p[3].op == RE_MATCH {
+        return true
+    }
+    // SAVE, atom, SPLIT(atom, exit), SAVE, MATCH: `.+` / `class+`.
+    if n == 5 &&
+        p[0].op == RE_SAVE &&
+        is_class_or_any(copy p[1]) &&
+        p[2].op == RE_SPLIT &&
+        (p[2].x == 1 && p[2].y == 3 || p[2].x == 3 && p[2].y == 1) &&
+        p[3].op == RE_SAVE &&
+        p[4].op == RE_MATCH {
+        return true
+    }
+    // SAVE, SPLIT(atom, exit), atom, JMP(split), SAVE, MATCH: `.*`.
+    n == 6 &&
+        p[0].op == RE_SAVE &&
+        p[1].op == RE_SPLIT &&
+        (p[1].x == 2 && p[1].y == 4 || p[1].x == 4 && p[1].y == 2) &&
+        is_class_or_any(copy p[2]) &&
+        p[3].op == RE_JMP &&
+        p[3].x == 1 &&
+        p[4].op == RE_SAVE &&
+        p[5].op == RE_MATCH
+}
+
+fn first_add(mut first: List[bool], b: int) {
+    first[b] = true
+}
+
+fn first_all(mut first: List[bool]) {
+    var i = 0
+    while i < 256 {
+        first[i] = true
+        i += 1
+    }
+}
+
+// `first_class` (`compile.c:822-849`): the exact ASCII portion, the
+// escapes of the raw bytes, every UTF-8 lead when a range reaches past
+// ASCII.
+fn first_class(re: Re, c: int, mut first: List[bool]) {
+    var b = 0
+    while b < 128 {
+        if class_has(re, c, b) {
+            first_add(mut first, b)
+        }
+        b += 1
+    }
+    b = 128
+    while b < 256 {
+        if class_has(re, c, unicode.utf8_escape_of(b)) {
+            first_add(mut first, b)
+        }
+        b += 1
+    }
+    var r = re.cls_start[c]
+    let end = r + re.cls_n[c]
+    while r < end {
+        if re.cls_hi[r] >= 128 {
+            var lead = 194
+            while lead <= 244 {
+                first_add(mut first, lead)
+                lead += 1
+            }
+            return
+        }
+        r += 1
+    }
+}
+
+/// The conservative set of bytes an anchored match at offset zero may
+/// begin with, as 256 flags (`yew_re_first_bytes`, `compile.c:851-
+/// 943`): a set flag means "may"; a false negative would be a bug.
+pub fn re_first_bytes(re: Re) -> List[bool] {
+    var first = List[bool]()
+    var i = 0
+    while i < 256 {
+        (mut first).push(false)
+        i += 1
+    }
+    if re.lit.kind == RE_LIT_WHOLE && re.lit.n != 0 {
+        first_add(mut first, re.lit.s[0] as int)
+        return first
+    }
+    let n = re.prog.len
+    if n == 0 || n > RE_MAX_PROG {
+        first_all(mut first)
+        return first
+    }
+    var seen = List[bool]()
+    i = 0
+    while i < n {
+        (mut seen).push(false)
+        i += 1
+    }
+    var stack = List[int]()
+    (mut stack).push(0)
+    while stack.len != 0 {
+        let pc = (mut stack).pop() else 0
+        if pc >= n || seen[pc] {
+            continue
+        }
+        seen[pc] = true
+        let op = re.prog[pc].op
+        if op == RE_CHAR {
+            let cp = re.prog[pc].arg
+            if unicode.utf8_len(cp) == 0 {
+                first_all(mut first)
+            } else {
+                let enc = unicode.utf8_encode(cp)
+                first_add(mut first, enc[0] as int)
+            }
+        } else if op == RE_CLASS {
+            if re.prog[pc].arg >= re.cls_start.len {
+                first_all(mut first)
+                return first
+            }
+            first_class(re, re.prog[pc].arg, mut first)
+        } else if op == RE_ANY {
+            first_all(mut first)
+            return first
+        } else if op == RE_SPLIT {
+            if stack.len + 2 > RE_MAX_PROG {
+                first_all(mut first)
+                return first
+            }
+            (mut stack).push(re.prog[pc].x)
+            (mut stack).push(re.prog[pc].y)
+        } else if op == RE_JMP {
+            if stack.len == RE_MAX_PROG {
+                first_all(mut first)
+                return first
+            }
+            (mut stack).push(re.prog[pc].x)
+        } else if op == RE_SAVE {
+            if stack.len == RE_MAX_PROG {
+                first_all(mut first)
+                return first
+            }
+            (mut stack).push(pc + 1)
+        } else {
+            // Empty matches are tried only by the engine's guarded BOL
+            // path; all bits keep the set conservative.
+            first_all(mut first)
+            return first
+        }
+    }
+    first
+}
