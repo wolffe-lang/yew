@@ -530,7 +530,7 @@ One paragraph each; yw01's is drafted in full
   prerequisites are Sprint 27's router and drag machinery (`mouse.c`,
   `ctxmenu.c`, yw06's), so yw05's contract proposes them for yw06
   (R-yw05-1). The campaign-04 row's "`:!` PTY goldens" are 40 of the 104;
-  at 0.2.33 22 of those 40 complete or refuse without a child's pipe and
+  at 0.2.33 20 of those 40 complete or refuse without a child's pipe and
   are green (R-yw04-1 holds the rest). s57.21's commands also reach I mode
   (the four `s57_21_insert_*` cases), not only the prompt.
 
