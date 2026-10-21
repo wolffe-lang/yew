@@ -556,3 +556,247 @@ per workspace, so per kill9 case (s25 §8) — and with a state home per run
 SIGKILLs hold, every file old (C's own: 500 old, 0 new — the kill lands
 before the rename in both). In CI's docker step.
 
+### 4.7 The gates (deliverable 7)
+
+- **The goldens**, by name, at the final binaries (sources at `b08119d`:
+  release `b121af5064c1`, native `74f6a4bb38e4`, demo `26ff0683bac0`), in
+  the container on CPUs 0-3: **campaign 04: 83/104 on release and 83/104
+  on native**, the same 83 (`notes/yw04-evidence/gates/
+  sweep-final-c04-cases-*.txt`) — the prompt's 46 of 47, the shell's 20 of
+  40, search's 17 of 17 — and **campaign 03: 62/62 on both**. The 21 red:
+  `s19_badge_while_running`, `s19_exit_footer_{nonzero,ok,signal}`,
+  `s19_jobs_table`, `s19_no_output_message`, `s19_read_at_cursor`,
+  `s19_stream_output`, `s57_24_generator_pending`,
+  `s57_25_help_{negative,pending,subcommands}`, `s57_26_fish_stub_rows`,
+  `s57_27_*` (4) — R-yw04-1 —, `s19_filter_{nonzero_keeps_buffer,
+  replaces_region,typeahead_replays_after_completion}` — R-yw04-1 and
+  R-yw04-3 —, and `s57_29_prompt_select_and_copy` — G30, R-yw04-6. C yew
+  itself passes all 104 in the same container. CI gates the 83 by name
+  ("goldens, campaign 04 (yw04's gate, M-YW4)") and records the 21 by
+  owner (an announced advisory). **M-YW4** ("the regex corpus and the `:!`
+  PTY goldens"): the regex corpus is green in full (§4.4); of the `:!`
+  goldens, the 20 that complete, lex or refuse without a child's pipe are
+  green and the 20 that read one wait on R-yw04-1 by name — met as far as
+  the ruling lets it, as the contract's done-when words it.
+- **`tools/check-test`**, both lanes, at the final binaries in the
+  container: checked "wolf test: 89 passed; 0 failed; 0 rejected; 0
+  unsupported"; natively 89 files `[native] ok`
+  (`notes/yw04-evidence/gates/check-{checked,native}-final.log`). **The
+  per-case checked runs** for every file that falls back to `[native]`
+  (G29) were each fork's, on its files at its final head, with yw03's
+  `percase.py`: grammar (`notes/yw04-evidence/grammar/percase.txt`), comp
+  (`comp/percase-cmdcomp.log`), regex (`regex/checked-percase.log`,
+  `golden-slices.log`), shell (`shell/checked-percase.txt`,
+  `checked-final.txt`), search (`search/percase-3b1926b.txt`), prompt
+  (`prompt/percase.log`): **no case fails on the checked machine**; the
+  `unsupported` ones are the step (or shadow-memory) budget and rest on
+  the native run, which runs every case.
+- **The drift checks**: `tools/check-tables` (the category arrays too),
+  `check-re-golden`, `check-cmdtab`, `check-runtime`,
+  `check-shell-fixtures` and `check-fmt` green on kasumi's host at the
+  final sources.
+- **The 2× gates** (kasumi, in the container on CPUs 0-3, load 3.0–6.1,
+  `notes/yw04-evidence/gates/perf/`; each tool runs C, the port, then C
+  again):
+
+  | row | port/C | C's drift |
+  |---|---|---|
+  | editor: first paint `--clean` (median of 3) | **1.34** (1.29, 1.34, 1.56) | 0.91–1.02 |
+  | editor: first paint default / dumb | 0.18 / 0.17 (C runs `init.fl` in its VM, the port reads it) | |
+  | editor: cold open | **1.25** (1.33, 1.22, 1.25) | 0.98–1.05 |
+  | editor: keypress → paint p99 | **0.97** (0.79, 1.10, 0.97) | 0.65–1.19 |
+  | editor: arrow p99 | **1.56** (1.56, 2.27, 1.35) | 0.85–3.48 |
+  | editor: arrow p99 paced | 0.86 | |
+  | editor: kitty Backspace first / max | 1.38 / 1.16 | |
+  | the search session `latency.search.huge.p99` | **0.14** (C 10.43/10.56 ms, port 1.51 ms) | 1.01 |
+  | the search session p50 (recorded) | **2.77** — over 2× (C 0.22 ms, port 0.60 ms) | 1.01 |
+  | `perf_cmdcomp`, per key, port mean / C max | worst **1.66**, sum **1.35** | |
+  | `perf_re_pathological` at 10⁵ | **1.03–1.07**; scaling 9.79–9.83 (limit 15) | |
+  | `perf_re_throughput` literal / non-literal | **1.63** / **1.04**; RSS delta 188 KB (limit 4 MiB) | |
+  | `perf_search_latency` in process: keypress p99 / step mean | **2.68** — over 2× / **0.93** | |
+
+  Over 2× and named: run 2's arrow p99 (2.27, with C's own two runs 3.48×
+  apart — the rig, as yw03's arrow row), the search session's p50 (2.77:
+  the port's median keystroke is 0.6 ms where C's is 0.2 ms, while its
+  p99 is 7× and its max 4× below C's — where the median's time goes is not
+  yet measured, a yw15 row), and the in-process search keypress
+  p99 (2.68: G8 — the port's harness can only time 1,000 repetitions a
+  prefix with a millisecond clock and report the p99 of those means, C
+  times each sample in ns; the step mean, which both measure the same
+  way, is 0.93). C's own second pathological run tripped its 15× scaling
+  limit once (`/(a|a)*b/` 15.69×) — C's noise, the port's 9.8×. **The
+  contract's prediction** (prompt and search keypress → paint within 2×,
+  regex throughput within 2×): **HIT on every gated row's median**,
+  **MISS on two recorded rows** (the session p50, the in-process p99),
+  each a ratchet row for yw15; `perf_jobstream` is R-yw04-1's (no
+  stream at 0.2.33).
+- **Memory per keystroke** (prediction #7). In the `:` prompt the port
+  keeps **~210 KB a key** to the session's end, linear, against C's
+  0.3–0.5 KB under the same PTY driver: ~182 KB of it is one full repaint
+  of the document, which C's refilter asks for on every key
+  (`cmdline.c:923-965`, ported faithfully) and whose temporaries only the
+  port keeps (G33, R-yw03-7), ~30 KB the prompt's own
+  (`notes/yw04-evidence/prompt/ptymem.txt`); the completion rebuild alone
+  went from 1.9 MB to 386 KB a key by `copy region` (`notes/yw04-evidence/
+  comp/`). I mode is NOT worse than yw03's: the same driver over yw03's
+  editor and yw04's gives byte-identical output and 17,700 against 17,708
+  B a key over 1,500 keys (`notes/yw04-evidence/gates/keydiag.txt`). At
+  2,000 prompt keys a session holds ~0.4 GB: R-yw03-7 (A), scheduled into
+  yw05 by its contract (deliverable 6), must cover the document rows under
+  full damage.
+- **Plants** (RULES §7, draft PRs closed unmerged, each seen red in its
+  own run). **#25 at `22252ca`** (the fine wait and the deadline-first turn
+  off, the search badge one space wider, each new fuzz driver's check
+  answering a planted failure), run **39661232659**: the live-editor
+  torture lane (`torture: atomic invariant failed seed=1 at=6`), "goldens,
+  campaign 04" (`s21_search_count_badge: golden mismatch`), fuzz_cmdparse
+  (`FAIL seed=1 iter=0 … PLANT`), fuzz_fuzzy, fuzz_re_compile, fuzz_shctx,
+  fuzz_search (each `FAIL … PLANT (yw04)`) and the unit lane
+  (`edit_loop_test`, `term_tty_test`). **#26 at `d8885c5`** (one regex
+  golden row, one category table entry and one shell corpus line), run
+  **39661247544**: `check-shell-fixtures: tests/fixtures/shell/
+  shctx_cwd.txt DIFFERS` on all three oracle legs, `check-re-golden: …
+  re_golden.txt DIFFERS from sagitta's re_golden.h`, `gen-unicode-tables:
+  src/unicode/tables_cat.lu DRIFTED`. The campaign-04 gate's steps and the
+  yw04 fuzz steps run `if: !cancelled()`, so one run shows each gate's own
+  verdict.
+- **CI**: the PR run at the final head is the merge run (yew is not
+  tiered; since tl30 a pull request's port runs on linux and the macOS
+  port nightly); the hand-back names it. Earlier runs at this branch, in
+  order: 39509511228 (`283012e`: `notepad_restore_segv` lost G1's restore
+  race on ubuntu once — 10/10 in the container after; green at the next
+  run), 39515360330 (`1bde0cf`, green), 39529886015 (`d9948e9`: the
+  fuzz_cmdparse driver staged no `ws`, `run-fuzz-re`'s `timeout` absent on
+  macOS — both fixed), 39646253800 (`5f18491`: `probe_dumb` on macOS, the
+  demo losing the fine wait's bytes, and the torture determinism of the
+  global history — fixed by `620817e`, `b08119d`, `05391c7`).
+
+### 4.8 The `unsafe` census
+
+**Delta: none in the editor.** Three test files keep a fixture-name
+counter each (`edit_cdaware_test`, `edit_comphelp_test`,
+`edit_compspec_test`: one module `var` behind `unsafe` with its safety
+stated, invariant 8). The census stays `unicode.width`'s
+`ambiguous_wide`, `text.file`'s `temp_counter`, `text.undo`'s
+`text_hash_calls` and `edit.gutter`'s mask. Every registry yw04 added —
+the completion state, the region table, the histories, the specs and
+help cache, the jump and change lists, the regex cache and scratch — is a
+field of the `Ed` value.
+
+## 5. Rulings asked, issues, and what to correct
+
+**Rulings taken at launch**: R-yw04-1 = A, R-yw04-2 = A, R-yw04-3 = A,
+R-yw04-4 = A, R-yw03-6 = B (above). **Asked** (each with the lane's
+recommendation, implemented; the text is `docs/MAP.md` §6):
+
+- **R-yw04-5 — `A-e`'s second tab.** **Recommend A**: the narrow
+  `tab_open_buffer` and `ed.tab.close` (implemented; both goldens green),
+  replaced by yw05's full tabs.
+- **R-yw04-6 — the clipboard writer's STOP in the prompt (G30).**
+  **Recommend B**: the copy refuses with C's deferred status and a message
+  naming G30, the session kept, as R-yw03-6 = B does for the paste — in
+  yw05, or with 0.2.34's `os_fork` (not done here; the golden stays red
+  either way).
+- **R-yw04-7 — `:set NAME VALUE` before the options model.** **Recommend
+  A**: the interim over `Opts` (`edit.option_cmdline`), retired by yw09
+  (implemented).
+- **R-yw05-1..4** are yw05's contract's (drafted in full,
+  `notes/contracts/yw05-panes-tabs-groups.md`): s57.13–s57.15 and s57.22
+  to yw06 after Sprint 27's router (recommend A); the 0.2.34 bump with
+  yw04's job half inside yw05 (recommend A); R-yw03-7's place; the
+  deferred tab's residency.
+
+**Issues to file** (listed, not filed; the orchestrator files):
+
+- **wolf-lang**: G36 (a spawn with an environment and a cwd), G37 (a
+  name-service lookup), G38 (a shift count inferred as `wrapping[u64]`),
+  G39 (a resumable directory read), G40 (`List[byte]` fs paths), G41 (a
+  stack overflow's trap line), G43 (the checked machine's `use-after-move`
+  on a nested read field that the native tier runs) — each with its
+  witness (`docs/MAP.md` §5). G33 gains the prompt's 210 KB a key and
+  E1010's `region { …; copy x }` against `copy region` (the comp fork's
+  witness).
+- **wolf-std**: G42, a vectorized byte search (`memchr`), a candidate.
+- **yew**: the clipboard writer in the prompt (R-yw04-6, if ruled B); the
+  search session's p50 and the in-process search keypress p99 over 2×
+  (§4.7, ratchet rows for yw15); `re_search_ws` still allocates a
+  `TextIter` (~115 B) a call, ~17 KB an overlay refresh (`search.lu:104/
+  192/255`, `pike.lu:41`: a scratch `TextIter` in `ReScratch`); `CmdRange`
+  has no `tok` (C reads `range.tok` as a byte span at `edit_cmds.c:1624,
+  1642`, `flapi_cmds.c:204`, `shell_cmds.c:66`; the port's span commands
+  use `lo`/`hi`); the comphelp refusal answers a pending menu at once
+  where C's spawn-failure path waits for the next key (`comphelp.c:2492`,
+  the shell fork's decision, to review).
+- **sagitta** (the maintainer's, reported not filed): a `YEW_RE_LITERAL`
+  pattern of 33–4,093 bytes matches only its first 32 bytes
+  (`compile.c:420-424`, `:484-486`); `make.fl`'s description is never
+  indexed — C's scan stops at the command list's `]`, and C's own test
+  passes only because NULL equals NULL (the shell fork).
+
+**Closed or unreleased**: wolf-lang#794 (G1, `os_term_restore_at_exit`),
+#795 (G2, `os_signal_wait_fds`), #796 (G3, `fs_sync`/`fs_sync_dir`), #797
+(G4, `fs_realpath`), #802 (G34, the `ICRNL` widening) and `os_fork`
+(G30's half) are in v0.2.34's release notes (read 2026-10-21; published
+after deliverable 3): yw05's bump. #806/#807 (closures across modules) are on
+s251, unreleased: yw03's registry shape kept, yew#17's to retire. #818
+(G30's write side) open.
+
+**Corrections, for the orchestrator** (the lane edits no memory file):
+
+- **The forks' oracle copies bake the lane tree's absolute fixture paths**
+  into the PTY runner (`YEW_TEST_HELPFIX`, `YEW_TEST_FAKECLIP`,
+  `YEW_TEST_MOCKAI`, `tests/pty/registry.c:23-31`): a fork tree mounted
+  alone in a container cannot open them, so a lane that forks should
+  rebuild the runner in each fork's copy (`make CC=gcc BUILD=build-gcc -W
+  tests/pty/registry.c build-gcc/pty_runner`) or build the oracle per fork.
+- **The editor's release build now takes 10–30 minutes a tier** on kasumi
+  and ~10 on the hosted runner; CI's port job is ~2 hours (check-test's
+  two lanes ~25 minutes each, every fuzz driver a release build of
+  `edit`). The job timeouts are 120 and 150 minutes; a lane that grows
+  `edit` again should expect to raise them or to stage the fuzz drivers
+  from one build.
+- The track index's yw04 row "the `:!` PTY goldens" for M-YW4: 40 of the
+  104 are `:!` cases, and at 0.2.33 20 of them can be green; the index row
+  should say M-YW4 is met as far as R-yw04-1 lets it, the rest yw05's.
+- `docs/MAP.md` §2 had `strip` under yw06; it is s23's (yw05). §3 placed
+  s57.13–s57.15 and s57.22 with yw05; their prerequisites are yw06's
+  (corrected in §8, proposed in yw05's contract).
+
+## Evidence index
+
+- `notes/yw04-evidence/gates/` — the final gate at the sources `b08119d`:
+  `sweep-final-c0{3,4}-cases-{release,native}.txt` (62/62 and 83/104 on
+  both tiers), `check-{checked,native}-final.log`, `c04-oracle.txt` (C
+  yew's own 104/104), the case lists, `perf/` (the 2× gates:
+  `editor-{1,2,3}.txt`, `search-session.txt`, `cmdcomp.txt`, `re.txt`,
+  `search-inproc.txt`, `perf-all.log`), `keydiag.txt` (I-mode memory
+  against yw03), and the scripts (`ctr.sh`, `forksetup.sh`, `sweep.sh`,
+  `verify.sh`, `perf-all.sh`, `prebuild-perf.sh`, `keydiag.py`,
+  `keydiag.sh`, `mem-compare.sh`, `c04-baseline.sh`).
+- `notes/yw04-evidence/torture/` — the live lane before and after
+  (`esc-then-s.txt`, `torture-live-{port,c,final}.txt`, `live-one.sh`).
+- `notes/yw04-evidence/{grammar,comp,prompt,shell,regex,search}/` — each
+  fork's suites, per-case checked runs, goldens, fuzz and perf.
+- `notes/yw04-evidence/witness/` — G36 (`spawn-takes-no-env-or-cwd`), G37
+  (`no-user-database`), G38 (`shift-count-infers-wrapping`), G41
+  (`deep-recursion`), G43 (`read-field-move`), G33 (`region-copyout`).
+- CI: the plants' runs 39661232659 and 39661247544; the PR run named in
+  the hand-back.
+
+## Done-when
+
+- [x] Every deliverable with its tests (§4.1–4.6); the job layer's shape
+  and why (§4.3); the `unsafe` census delta (§4.8).
+- [x] `tools/check-test` and `--native` green (89/89 both); the per-case
+  checked run recorded for every `[native]` fallback (each fork's, §4.7).
+- [x] Campaign 04's goldens green by name against the wolf binary as far
+  as the rulings let them: 83/104 on both tiers, the 21 others named by
+  R-yw04-1 (20) and G30 (1), gated and recorded by name in CI (M-YW4);
+  campaign 03's 62 unchanged.
+- [x] The 2× gates recorded on kasumi under `taskset -c 0-3` (§4.7), two
+  recorded rows over 2× named.
+- [x] `docs/MAP.md` §1, §2, §5, §6, §7, §8 updated; yw05's contract drafted
+  in full.
+- [x] Plants seen red and closed unmerged (#25, #26).
+- [ ] CI green at the final head; the PR with the five sections; the lane
+  audit — the hand-back carries them.
