@@ -28,9 +28,12 @@ table.
 
 1. **The toolchain, first.** `gh release list -R wolffe-lang/wolf-lang`
    read and quoted with its time at the lane's start. yw04 finished at
-   wolf 0.2.33 / lupin 0.1.54 / wolf-std `cceda63` (its note says whether
-   0.2.34 landed during it). If v0.2.34 (s247 + s248) is released, the
-   bump is yw05's FIRST commit with its prediction, and it ADOPTS what
+   wolf 0.2.33 / lupin 0.1.54 / wolf-std `cceda63`: **v0.2.34 was
+   published at 2026-10-21T12:58:10Z**, after yw04 had reached its job
+   half (2026-10-20T23:19:20Z), so R-yw04-1 left the bump here. The bump
+   (wolf 0.2.34, lupin 0.1.55 — published 2026-10-20T22:11:27Z — and the
+   std the archive bundles, digests read twice) is yw05's FIRST commit
+   with its prediction, and it ADOPTS what
    yw01–yw04 met as gaps, each with the test that is KNOWN-RED, SKIP or
    interim today turned green: `os_signal_wait_fds` (G2, wolf-lang#795)
    for the loop — the `VTIME` interim (`term.tty_wait`), yw03's drain
