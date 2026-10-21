@@ -671,10 +671,21 @@ before the rename in both). In CI's docker step.
   demo losing the fine wait's bytes, and the torture determinism of the
   global history — fixed by `620817e`, `b08119d`, `05391c7`),
   39661858551 (`7803f84`, the trunk merge: every oracle leg green, campaign
-  04's 83 by name on ubuntu and macOS), 39674542106 (`dcf4d27`: attempt 1
-  lost `notepad_burst_keys` on macOS — "case timed out while writing to
-  child", the same sources green there at `7803f84` and 20/20 burst cases
-  in the container — and was re-run).
+  04's 83 by name on ubuntu and macOS), 39674542106 (`dcf4d27`) and
+  39688445786 (`1ba5f7b`): both lost campaign 03's `notepad_burst_keys` on
+  macOS — "case timed out while writing to child" — at the sources that
+  were green there at `7803f84`, and green with the fine wait OFF in the
+  plant's run 39661232659; 20/20 burst cases in the container on Linux.
+  sagitta's harness writes the 4 KiB burst without reading the child's
+  output (`tests/pty/harness.c:267-298`), and the port's G2 interim
+  switches termios modes in its wait (the tick, the drain, the fine wait),
+  each a `tcsetattr(TCSADRAIN)` that can wait on output nobody reads; the
+  fine wait adds switches, and macOS's small PTY buffers lose the race
+  (the mechanism is read from the code and these runs, not measured on a
+  Mac: the lane builds nothing on nomad-1). The two burst cases are
+  therefore an announced advisory on macOS (gated on Linux), beside the
+  restore cases R-yw01-1 put there; yw05's bump to `os_signal_wait_fds`
+  removes the mode switches and must gate them again on macOS.
 
 ### 4.8 The `unsafe` census
 
@@ -722,7 +733,9 @@ recommendation, implemented; the text is `docs/MAP.md` §6):
   E1010's `region { …; copy x }` against `copy region` (the comp fork's
   witness).
 - **wolf-std**: G42, a vectorized byte search (`memchr`), a candidate.
-- **yew**: the clipboard writer in the prompt (R-yw04-6, if ruled B); the
+- **yew**: `notepad_burst_keys`/`_paste` advisory on macOS (§4.7, until
+  yw05's bump re-gates them); the clipboard writer in the prompt (R-yw04-6,
+  if ruled B); the
   search session's p50 and the in-process search keypress p99 over 2×
   (§4.7, ratchet rows for yw15); `re_search_ws` still allocates a
   `TextIter` (~115 B) a call, ~17 KB an overlay refresh (`search.lu:104/
