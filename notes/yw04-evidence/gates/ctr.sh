@@ -6,4 +6,4 @@
 d=$(cd "$1" && pwd); shift
 s=$(dirname "$d")/scratch-$(basename "$d")
 mkdir -p "$s/home" "$s/state" "$s/config" "$s/cache"
-exec podman run --rm --network none --userns=keep-id --pids-limit 4096   -v "$d:$d" -v "$s:$s" -v $HOME/lanes/yw04/bin:$HOME/lanes/yw04/bin:ro -w "$d"   -e HOME="$s/home" -e XDG_STATE_HOME="$s/state" -e XDG_CONFIG_HOME="$s/config"   -e XDG_CACHE_HOME="$s/cache" -e YEW_LOG="$s/yew.log" -e TERM=xterm-256color   docker.io/library/archlinux:base-devel taskset -c ${CTR_CPUS:-0-3} bash -c "$*"
+exec podman run --rm --network none --userns=keep-id --pids-limit 4096 --ulimit core=0 --memory ${CTR_MEM:-6g}   -v "$d:$d" -v "$s:$s" -v $HOME/lanes/yw04/bin:$HOME/lanes/yw04/bin:ro -w "$d"   -e HOME="$s/home" -e XDG_STATE_HOME="$s/state" -e XDG_CONFIG_HOME="$s/config"   -e XDG_CACHE_HOME="$s/cache" -e YEW_LOG="$s/yew.log" -e TERM=xterm-256color   docker.io/library/archlinux:base-devel taskset -c ${CTR_CPUS:-0-3} bash -c "$*"
