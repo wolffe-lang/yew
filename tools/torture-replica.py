@@ -20,6 +20,15 @@ sagitta's driver, and says so in every line it prints.
                              [--iters 500] [--lanes eintr,enospc,determinism,sigkill]
                              [--live]
 
+`--state-per-run` (yw04) gives each determinism run its own
+`XDG_STATE_HOME`: C's live editor keeps its `:` history per WORKSPACE
+(`cmdline.c:410-422`, `history.scope` defaults to "workspace", s25 §8), and
+each kill9 case is its own workspace (`yew-live-torture.c:133-146`), so C's
+two runs start from an empty history; the port's history is global until
+the workspace state is ported (yw06), so with one shared state home its
+second run finds `ed.quit_force` already last and appends nothing
+(`cmdhist.c:75-80`). Run with the flag, the lane compares like with like.
+
 `--live` (yw04) is kill9's `YEW_TORTURE_LANE=live-editor`: the child is
 sagitta's `yew-live-torture` driving an editor binary (`YEW_TORTURE_YEW`
 in the environment), which reports a failed save in-session and then
@@ -181,7 +190,12 @@ def lane_determinism(a, root, serial):
     ok = True
     for run in range(2):
         dst, old, post, log = fresh_case(root, "determinism", serial + run)
-        code, _ = wait_code(start_save(a.child, a.shim, dst, post, log, 424242, {}))
+        extra = {}
+        if a.state_per_run:
+            state = os.path.join(root, f"state-determinism-{run}")
+            os.makedirs(state, 0o700, exist_ok=True)
+            extra["XDG_STATE_HOME"] = state
+        code, _ = wait_code(start_save(a.child, a.shim, dst, post, log, 424242, extra))
         checked = run_check(a.checker, dst, old, post)
         order, why = atomic_log_order(log)
         with open(log) as f:
@@ -195,6 +209,8 @@ def lane_determinism(a, root, serial):
     same = logs[0] == logs[1]
     print(f"replica: determinism same seed, same log: {'yes' if same else 'NO'}")
     print("replica: determinism log:", " | ".join(logs[0].strip().splitlines()))
+    if not same:
+        print("replica: determinism log of run 1:", " | ".join(logs[1].strip().splitlines()))
     return ok and same
 
 
@@ -253,6 +269,7 @@ def main():
     ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--lanes", default="eintr,enospc,determinism,sigkill")
     ap.add_argument("--live", action="store_true")
+    ap.add_argument("--state-per-run", action="store_true")
     a = ap.parse_args()
     root = tempfile.mkdtemp(prefix="yew-torture-replica-")
     state = os.path.join(root, "state")
