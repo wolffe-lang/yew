@@ -1,0 +1,415 @@
+//! search.regex — the bespoke regex engine's public surface: the flags,
+//! the limits, the compiled program, its input and its match, and the one
+//! literal escaper.
+//!
+//! Ports sagitta `src/search/regex.h` (162 lines), the shared types of
+//! `regex_internal.h` (248) and `regex.c` (76: `yew_re_quote`) at
+//! 9ace98c2, under `s20-regex-engine.md` §1/§5 and `s21-search-replace.md`
+//! §6. Thompson construction into a small program, run by a Pike VM
+//! (NFA simulation with submatch capture, leftmost-first) and a lazy DFA,
+//! with a literal prefilter. THERE IS NO BACKTRACKING ANYWHERE: a
+//! pattern a user types into the incremental search prompt cannot freeze
+//! the editor (`regex.h:4-16`). Lookaround, backreferences and atomic
+//! groups are permanent non-goals, refused with a message that says so
+//! (`parse.lu`), not deferred.
+//!
+//! The port's shapes (docs/MAP.md §1):
+//!
+//! - C's `YewRe *` in an arena is an owned `Re` value; the program and
+//!   the reverse program are `List[ReInst]`, the classes one flat range
+//!   list (`cls_lo`/`cls_hi`) with a start and a count per class.
+//! - C's `YewReInput` holds a `const TextBuf *` or a byte pointer; a
+//!   stored lent value is E1004, so the port's `ReInput` holds only the
+//!   SHAPE (which backing, its length, the window) and every entry point
+//!   takes the backing beside it: `tb: text.TextBuf, bytes: List[byte],
+//!   inp: ReInput`. The backing the input does not name is ignored (a
+//!   bytes caller passes any `TextBuf`, conventionally one empty
+//!   `text.textbuf_new()` it keeps; a buffer caller an empty list).
+//! - C's out-parameter `YewReMatch *out` is a caller-owned `ReMatch` lent
+//!   `mut`, whose 32 group slots are written in place, so a search
+//!   allocates no result storage.
+//! - `UINT32_MAX` (an unbounded repeat or `max_len`) is `RE_UNBOUNDED`,
+//!   the same 32-bit value, so `pack.lu` writes C's bytes; an unset group
+//!   endpoint (C's `UINT64_MAX`) is -1.
+//! - C's process-wide caches (the property run tables, the fold table,
+//!   `parse.c:208-215`, `:325-330`) and the compile-walk counter
+//!   (`compile.c:21`) cannot be module state at 0.2.33 (a `List` is
+//!   refused, `[mem.static.3]`, G15; the walk count would be a run-time
+//!   value, G27): the runs are built per compile from the trie's
+//!   structure (`parse.lu`), and the walk is a field of the compiled `Re`
+//!   and of the error (`walked`), the test seam C reads from a static.
+
+use text
+use unicode
+
+/// Simple case folding from the Unicode tables (`YEW_RE_ICASE`,
+/// `regex.h:52-57`).
+pub const RE_ICASE: int = 1
+
+/// `.` also matches `\n` (`YEW_RE_DOTALL`).
+pub const RE_DOTALL: int = 2
+
+/// The whole pattern is literal text (`YEW_RE_LITERAL`).
+pub const RE_LITERAL: int = 4
+
+/// The caller promises not to read groups (`YEW_RE_NOCAPTURE`).
+pub const RE_NOCAPTURE: int = 8
+
+/// At most 32 groups, group 0 included (`YEW_RE_MAX_GROUPS`,
+/// `regex.h:59-65`).
+pub const RE_MAX_GROUPS: int = 32
+
+/// At most 4,096 instructions (`YEW_RE_MAX_PROG`).
+pub const RE_MAX_PROG: int = 4096
+
+/// The largest `{m,n}` bound (`YEW_RE_MAX_REPEAT`).
+pub const RE_MAX_REPEAT: int = 1000
+
+/// At most 256 character classes (`YEW_RE_MAX_CLASSES`).
+pub const RE_MAX_CLASSES: int = 256
+
+/// The longest pattern, 64 KiB (`YEW_RE_MAX_PATTERN`).
+pub const RE_MAX_PATTERN: int = 65536
+
+/// C's `UINT32_MAX`: an unbounded repeat, an unbounded `max_len`.
+pub const RE_UNBOUNDED: int = 4294967295
+
+/// The §6c skip-ahead window ceiling, in bytes (`YEW_RE_SPAN_WINDOW`,
+/// `regex_internal.h:233`).
+pub const RE_SPAN_WINDOW: int = 65536
+
+// The opcodes (`ReOp`, `regex_internal.h:11-25`), in C's order: the
+// packed form stores them as these numbers.
+
+/// `arg` = codepoint; match and advance.
+pub const RE_CHAR: int = 0
+
+/// `arg` = class index; match if the codepoint is in it; advance.
+pub const RE_CLASS: int = 1
+
+/// Any codepoint (`arg` = 1 to also match `\n`).
+pub const RE_ANY: int = 2
+
+/// Try `x` first, then `y` — priority defines greediness.
+pub const RE_SPLIT: int = 3
+
+/// `pc = x`.
+pub const RE_JMP: int = 4
+
+/// `arg` = slot (2g start, 2g+1 end); consumes no input.
+pub const RE_SAVE: int = 5
+
+/// The line start.
+pub const RE_BOL: int = 6
+
+/// The line end, CRLF-aware.
+pub const RE_EOL: int = 7
+
+/// The window start, `\A`.
+pub const RE_BOT: int = 8
+
+/// The window end, `\z`.
+pub const RE_EOT: int = 9
+
+/// `\b`.
+pub const RE_WORDB: int = 10
+
+/// `\B`.
+pub const RE_NWORDB: int = 11
+
+/// Accept.
+pub const RE_MATCH: int = 12
+
+/// One instruction (`ReInst`, `regex_internal.h:27-33`). C asserts
+/// `sizeof(ReInst) <= 16`; the port's is four `int`s, and `pack.lu` writes
+/// C's 16-byte record.
+pub struct ReInst {
+    op: int,
+    x: int,
+    y: int,
+    arg: int,
+}
+
+// The literal prefilter's kinds (`ReLitKind`, `regex_internal.h:47-52`).
+const RE_LIT_NONE: int = 0
+
+const RE_LIT_BYTE: int = 1
+
+const RE_LIT_BMH: int = 2
+
+const RE_LIT_WHOLE: int = 3
+
+/// C's `sizeof(l->small)`: a literal longer than this keeps a KMP table.
+const RE_LIT_SMALL: int = 32
+
+/// The literal prefilter (`ReLit`, `regex_internal.h:54-62`): the bytes,
+/// the Horspool skip table and, past 32 bytes, the KMP failure table.
+pub struct ReLit {
+    kind: int,
+    n: int,
+    s: List[byte],
+    kmp: List[int],
+    skip: List[int],
+    has: List[bool],
+    anchored: bool,
+}
+
+/// A compiled pattern (`struct YewRe`, `regex_internal.h:64-98`):
+/// immutable once compiled.
+pub struct Re {
+    prog: List[ReInst],
+    rprog: List[ReInst],
+    cls_lo: List[int],
+    cls_hi: List[int],
+    cls_start: List[int],
+    cls_n: List[int],
+    ngroups: int,
+    lit: ReLit,
+    flags: int,
+    saw_upper_literal: bool,
+    force_icase: bool,
+    force_case: bool,
+    min_len: int,
+    max_len: int,
+    walked: int,
+}
+
+/// A compile error (`YewReErr`, `regex.h:67-72`): `off` is a byte offset
+/// into the pattern, so the prompt can point a caret at the construct;
+/// `walked` is the compile's AST walk (`yew_re_last_compile_walk`).
+pub struct ReErr {
+    off: int,
+    msg: str,
+    walked: int,
+}
+
+/// A fresh error record, C's `{0, NULL}`.
+pub fn re_err_new() -> ReErr {
+    ReErr { off: 0, msg: "", walked: 0 }
+}
+
+/// A match (`YewReMatch`, `regex.h:74-79`): group `g` is
+/// `lo[g]..hi[g]`, both -1 when an optional group did not take part;
+/// group 0 is the whole match.
+pub struct ReMatch {
+    lo: List[int],
+    hi: List[int],
+    ngroups: int,
+}
+
+/// A match record with its 32 slots allocated once; the engines write
+/// it in place.
+pub fn re_match_new() -> ReMatch {
+    var lo = List[int]()
+    var hi = List[int]()
+    var i = 0
+    while i < RE_MAX_GROUPS {
+        (mut lo).push(-1)
+        (mut hi).push(-1)
+        i += 1
+    }
+    ReMatch { lo: lo, hi: hi, ngroups: 0 }
+}
+
+// A slotless placeholder, swapped into a scratch while its record is
+// lent out (the swap seam of docs/MAP.md §1).
+fn re_match_new_empty() -> ReMatch {
+    ReMatch { lo: List[int](), hi: List[int](), ngroups: 0 }
+}
+
+// C's `memset(out, 0, sizeof(*out))` before a fill.
+fn match_clear(mut m: ReMatch) {
+    var i = 0
+    while i < RE_MAX_GROUPS {
+        m.lo[i] = 0
+        m.hi[i] = 0
+        i += 1
+    }
+    m.ngroups = 0
+}
+
+/// Copy `src` into `dst`'s slots.
+pub fn re_match_copy(mut dst: ReMatch, src: ReMatch) {
+    var i = 0
+    while i < RE_MAX_GROUPS {
+        dst.lo[i] = src.lo[i]
+        dst.hi[i] = src.hi[i]
+        i += 1
+    }
+    dst.ngroups = src.ngroups
+}
+
+/// Group `g`'s start, -1 when unset.
+pub fn re_group_lo(m: ReMatch, g: int) -> int {
+    m.lo[g]
+}
+
+/// Group `g`'s end, -1 when unset.
+pub fn re_group_hi(m: ReMatch, g: int) -> int {
+    m.hi[g]
+}
+
+/// The shape of an input (`YewReInput`, `regex.h:86-91`): which backing,
+/// its length and the window `[lo, hi)` under consideration — what `\A`
+/// and `\z` anchor to. The backing itself travels beside it.
+pub struct ReInput {
+    tb_backed: bool,
+    len: int,
+    lo: int,
+    hi: int,
+}
+
+/// A flat byte input of `len` bytes, the whole of it the window
+/// (`yew_re_input_bytes`, `compile.c:945-955`).
+pub fn re_input_bytes(len: int) -> ReInput {
+    ReInput { tb_backed: false, len: len, lo: 0, hi: len }
+}
+
+/// A piece-tree input, the whole buffer the window
+/// (`yew_re_input_textbuf`, `compile.c:957-967`).
+pub fn re_input_textbuf(tb: text.TextBuf) -> ReInput {
+    let n = text.textbuf_len(tb)
+    ReInput { tb_backed: true, len: n, lo: 0, hi: n }
+}
+
+/// `inp` with its window narrowed to `[lo, hi)`.
+pub fn re_input_window(inp: ReInput, lo: int, hi: int) -> ReInput {
+    ReInput { tb_backed: inp.tb_backed, len: inp.len, lo: lo, hi: hi }
+}
+
+/// The number of groups, group 0 included (`yew_re_group_count`).
+pub fn re_group_count(re: Re) -> int {
+    re.ngroups
+}
+
+/// Whether the pattern TYPED an uppercase literal (`yew_re_has_upper_
+/// literal`): `\Wfoo`, `\x41` and `[[:upper:]]` do not (s21 §2).
+pub fn re_has_upper_literal(re: Re) -> bool {
+    re.saw_upper_literal
+}
+
+/// `\c` was written (`yew_re_forces_icase`).
+pub fn re_forces_icase(re: Re) -> bool {
+    re.force_icase
+}
+
+/// `\C` was written (`yew_re_forces_case`).
+pub fn re_forces_case(re: Re) -> bool {
+    re.force_case
+}
+
+/// The fewest codepoints any match consumes; 0 when a match may be
+/// empty (`yew_re_min_len`).
+pub fn re_min_len(re: Re) -> int {
+    re.min_len
+}
+
+/// The most codepoints any match consumes; `RE_UNBOUNDED` when there is
+/// no bound.
+pub fn re_max_len(re: Re) -> int {
+    re.max_len
+}
+
+/// The exact byte length when the whole pattern is one literal, else 0
+/// (`yew_re_whole_literal_bytes`, `search.c:483-486`).
+pub fn re_whole_literal_bytes(re: Re) -> int {
+    if re.lit.kind == RE_LIT_WHOLE then re.lit.n else 0
+}
+
+/// The compile's AST walk: the `gen()` calls the compile made, both
+/// directions (`yew_re_last_compile_walk`, `compile.c:21-26`).
+pub fn re_compile_walk(re: Re) -> int {
+    re.walked
+}
+
+/// The opcode of forward instruction `pc` (a test and tool seam; C's
+/// tests read `re->prog[pc].op`).
+pub fn re_prog_len(re: Re) -> int {
+    re.prog.len
+}
+
+/// Forward instruction `pc`.
+pub fn re_prog_at(re: Re, pc: int) -> ReInst {
+    copy re.prog[pc]
+}
+
+/// The reverse program's length.
+pub fn re_rprog_len(re: Re) -> int {
+    re.rprog.len
+}
+
+/// Reverse instruction `pc`.
+pub fn re_rprog_at(re: Re, pc: int) -> ReInst {
+    copy re.rprog[pc]
+}
+
+/// The number of character classes.
+pub fn re_class_count(re: Re) -> int {
+    re.cls_start.len
+}
+
+/// Class `c`'s number of ranges (a test seam: the ranges are sorted,
+/// merged and non-overlapping).
+pub fn re_class_range_count(re: Re, c: int) -> int {
+    re.cls_n[c]
+}
+
+/// Range `i` of class `c` as (lo, hi), inclusive.
+pub fn re_class_range(re: Re, c: int, i: int) -> (int, int) {
+    let k = re.cls_start[c] + i
+    (re.cls_lo[k], re.cls_hi[k])
+}
+
+// `is_ascii_punct` (`regex.c:25-29`).
+fn quote_is_punct(c: int) -> bool {
+    c >= 33 && c <= 47 || c >= 58 && c <= 64 || c >= 91 && c <= 96 || c >= 123 && c <= 126
+}
+
+/// Append `s[at..end)` to `out`, escaped so that compiling the result
+/// yields a pattern matching exactly those bytes (`yew_re_quote`,
+/// `regex.c:31-76`): every ASCII punctuation byte gets a backslash, a
+/// control byte is `\xHH`, bytes >= 0x80 pass through (a stray byte is
+/// the same U+DCxx escape on both sides), letters, digits and space stay
+/// legible. The single escaper (s21 §6).
+pub fn re_quote(mut out: List[byte], s: List[byte], at: int, end: int) {
+    let hex = "0123456789abcdef"
+    var i = at
+    while i < end {
+        let c = s[i] as int
+        if c >= 128 {
+            (mut out).push(s[i])
+        } else if quote_is_punct(c) {
+            (mut out).push(92 as byte)
+            (mut out).push(s[i])
+        } else if c < 32 || c == 127 {
+            (mut out).push(92 as byte)
+            (mut out).push(120 as byte)
+            (mut out).push(hex.bytes()[c >> 4 & 15])
+            (mut out).push(hex.bytes()[c & 15])
+        } else {
+            (mut out).push(s[i])
+        }
+        i += 1
+    }
+}
+
+// The codepoint predicates the engines share (`regex_internal.h:240-
+// 246`): `\w` is Alphabetic ∪ Nd ∪ Pc (`parse.c:28-34`) — deliberately
+// NOT the word-break property W-mode motion uses (Han is word-break
+// Other, so `\w+` would match nothing in Chinese); `\d` is Nd; `\s` is
+// White_Space.
+
+/// `\w` (`yew_re_is_word`).
+pub fn re_is_word(cp: int) -> bool {
+    unicode.cat_rec(cp) & (unicode.CAT_ALPHA | unicode.CAT_ND | unicode.CAT_PC) != 0
+}
+
+/// `\d` (`yew_re_is_digit`).
+pub fn re_is_digit(cp: int) -> bool {
+    unicode.cat_rec(cp) & unicode.CAT_ND != 0
+}
+
+/// `\s` (`yew_re_is_space`).
+pub fn re_is_space(cp: int) -> bool {
+    unicode.unicode_is_white_space(cp)
+}
