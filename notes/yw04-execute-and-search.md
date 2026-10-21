@@ -669,7 +669,12 @@ before the rename in both). In CI's docker step.
   fuzz_cmdparse driver staged no `ws`, `run-fuzz-re`'s `timeout` absent on
   macOS — both fixed), 39646253800 (`5f18491`: `probe_dumb` on macOS, the
   demo losing the fine wait's bytes, and the torture determinism of the
-  global history — fixed by `620817e`, `b08119d`, `05391c7`).
+  global history — fixed by `620817e`, `b08119d`, `05391c7`),
+  39661858551 (`7803f84`, the trunk merge: every oracle leg green, campaign
+  04's 83 by name on ubuntu and macOS), 39674542106 (`dcf4d27`: attempt 1
+  lost `notepad_burst_keys` on macOS — "case timed out while writing to
+  child", the same sources green there at `7803f84` and 20/20 burst cases
+  in the container — and was re-run).
 
 ### 4.8 The `unsafe` census
 
