@@ -173,3 +173,14 @@ the note.
    recorded by owner), the 2× gates on kasumi under `taskset -c 0-3` in
    a container.
 5. **The note and the map** (deliverable 8), yw05's contract, the PR.
+
+## Slips, as they happened (RULES §5; the coordinator's reports)
+
+- **2026-10-20T22:22:36–22:22:43Z**: the regex fork ran a recursion-depth
+  probe (`~/lanes/yw04-regex/yw04-regex-probe/rec/`, `nat` and `rel`, the
+  native and release builds of one program) on kasumi's HOST; it overflowed
+  its stack and systemd-coredump stored ten cores (uid 1000, pids
+  632790–632988), which the coordinator removed. Only the probe's own
+  processes were involved. From then on every fork runs anything that can
+  trap or fault inside the lane's container, which also gained
+  `--ulimit core=0` (`notes/yw04-evidence/gates/ctr.sh`).

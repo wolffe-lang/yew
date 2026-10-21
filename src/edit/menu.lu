@@ -1,0 +1,570 @@
+//! edit.menu — the ranked-list widget.
+//!
+//! Ports sagitta `src/ui/menu.c` (614 lines) and `menu.h` (186) at
+//! 9ace98c2 (Sprint 18.5 §5, `menu.h:4-13`; Sprint 57.17 §2-§3; 57.24
+//! §5.5; 57.32 §4): the selection model (selection by IDENTITY across a
+//! refilter, `explicit_sel` for §6's Enter rule, keyboard focus), the
+//! scroll window with the honest `… and N more` tail, match highlighting
+//! by grapheme cluster, the footer's one count, and the clickable rows —
+//! one `REGION_MENU_ROW` per drawn candidate row over a `REGION_BLOCK`
+//! (R-yw04-2). Everything true of any ranked list lives here; where the
+//! menu sits and what an accepted row does are the host's (the command
+//! line, Sprint 26's picker). C's menu has no host callbacks at the pin:
+//! the host owns the `Menu` and calls in.
+//!
+//! The draw writes the grid and the region registry it is handed
+//! (`menu_draw(mut ed.grid, mut ed.regions, mut menu, …)`), so a host
+//! that keeps its menu inside the `Ed` lends three disjoint fields
+//! rather than the whole editor.
+
+use term
+use text
+use unicode
+
+const MENU_DEFAULT_ROWS: int = 5
+
+const MENU_DETAIL_MIN_COLS: int = 40
+
+/// The widget's shape (`MenuSpec`, `menu.h:24-32`): `title` is ""
+/// for the inline list (C's NULL); `max_rows` 0 means as many as the
+/// area allows.
+pub struct MenuSpec {
+    title: str,
+    max_rows: int,
+    ghost: bool,
+    wrap: bool,
+    detail_col: int,
+}
+
+/// The inline list with C's defaults (`yew_menu_init(m, NULL)`).
+pub fn menuspec_default() -> MenuSpec {
+    MenuSpec { title: "", max_rows: 0, ghost: false, wrap: false, detail_col: 0 }
+}
+
+/// The widget (`Menu`, `menu.h:34-85`). `held` is the selected row's
+/// own copy (`has_held` false for C's NULL); `stem` the text the host
+/// restores on dismissal.
+pub struct Menu {
+    spec: MenuSpec,
+    items: List[CompItem],
+    sel: int,
+    explicit_sel: bool,
+    focus: bool,
+    top: int,
+    replace: text.Span,
+    total: int,
+    stem: List[byte],
+    has_stem: bool,
+    held: List[byte],
+    has_held: bool,
+    scanning: bool,
+    pending: bool,
+    where: str,
+}
+
+/// `yew_menu_init` (`menu.c:24-32`).
+pub fn menu_new(spec: MenuSpec) -> Menu {
+    Menu {
+        spec: copy spec,
+        items: List[CompItem](),
+        sel: -1,
+        explicit_sel: false,
+        focus: false,
+        top: 0,
+        replace: text.Span { lo: 0, hi: 0 },
+        total: 0,
+        stem: List[byte](),
+        has_stem: false,
+        held: List[byte](),
+        has_held: false,
+        scanning: false,
+        pending: false,
+        where: "",
+    }
+}
+
+/// `yew_menu_free` (`menu.c:34-45`): everything but the spec.
+pub fn menu_free(mut m: Menu) {
+    let spec = copy m.spec
+    m = menu_new(spec)
+}
+
+// `menu_hold` (`menu.c:47-60`).
+fn menu_hold(mut m: Menu) {
+    if m.sel >= 0 && m.sel < m.items.len {
+        m.held = copy m.items[m.sel].text
+        m.has_held = true
+    } else {
+        m.held = List[byte]()
+        m.has_held = false
+    }
+}
+
+fn menu_spec_rows(m: Menu) -> int {
+    if m.spec.max_rows == 0 then MENU_DEFAULT_ROWS else m.spec.max_rows
+}
+
+// `menu_candidate_rows_at` (`menu.c:73-80`): the ONE answer to "is the
+// last row the tail?", shared by the draw, the scroll and the regions.
+fn menu_candidate_rows_at(m: Menu, top: int, rows: int) -> int {
+    if rows < 2 || m.scanning || m.pending {
+        return rows
+    }
+    if top + rows >= m.items.len then rows else rows - 1
+}
+
+// `menu_scroll_to_selection` (`menu.c:82-117`).
+fn menu_scroll_to_selection(mut m: Menu, rows: int) {
+    if rows == 0 || m.sel < 0 {
+        m.top = 0
+        return
+    }
+    let sel = m.sel
+    let max_top = if m.items.len > rows then m.items.len - rows else 0
+    if sel < m.top {
+        m.top = sel
+    } else {
+        var want = if sel + 1 >= rows then sel + 1 - rows else 0
+        let cand = menu_candidate_rows_at(m, want, rows)
+        if cand < rows {
+            want = if sel + 1 >= cand then sel + 1 - cand else 0
+        }
+        if want > max_top {
+            want = max_top
+        }
+        if m.top < want {
+            m.top = want
+        }
+    }
+    if m.top > max_top {
+        m.top = max_top
+    }
+}
+
+/// `yew_menu_reset` (`menu.c:119-157`): install a freshly ranked set,
+/// the selection carried across by IDENTITY — a held row gone from the
+/// new set falls to NOTHING selected, never to row 0. The HOST stores
+/// the new rows into `m.items` first, where it built them: a `take`
+/// parameter stored into a field of a `mut` one is E1004 (G35's shape),
+/// and a `copy` would duplicate every row on every keystroke.
+pub fn menu_reset(mut m: Menu, total: int, replace: text.Span) {
+    m.total = total
+    m.replace = copy replace
+    m.sel = -1
+    m.top = 0
+    if m.has_held {
+        var i = 0
+        while i < m.items.len {
+            if comp_bytes_eq(m.items[i].text, m.held) {
+                m.sel = i
+                break
+            }
+            i += 1
+        }
+    }
+    if m.sel < 0 {
+        m.explicit_sel = false
+        m.focus = false
+        m.held = List[byte]()
+        m.has_held = false
+    }
+}
+
+/// `yew_menu_rows` (`menu.c:159-172`): the rows drawn in an area
+/// `height` tall.
+pub fn menu_rows(m: Menu, height: int) -> int {
+    if height <= 0 || m.items.len == 0 {
+        return 0
+    }
+    var want = menu_spec_rows(m)
+    if want > height {
+        want = height
+    }
+    if want > m.items.len {
+        want = m.items.len
+    }
+    want
+}
+
+/// `yew_menu_candidate_rows` (`menu.c:174-183`): the rows carrying
+/// candidates — one fewer than the rows when the tail is drawn.
+pub fn menu_candidate_rows(m: Menu, height: int) -> int {
+    let rows = menu_rows(m, height)
+    if rows == 0 then 0 else menu_candidate_rows_at(m, m.top, rows)
+}
+
+/// `yew_menu_hidden` (`menu.c:185-198`): candidates hidden below the
+/// window, the tail's N; 0 means no tail.
+pub fn menu_hidden(m: Menu, height: int) -> int {
+    let rows = menu_rows(m, height)
+    let cand = if rows == 0 then 0 else menu_candidate_rows_at(m, m.top, rows)
+    if rows == 0 || cand == rows {
+        return 0
+    }
+    m.items.len - m.top - cand
+}
+
+/// `yew_menu_move` (`menu.c:200-238`): by `delta` rows (or pages),
+/// explicit, the window dragged along; the first move enters from
+/// whichever end it came from.
+pub fn menu_move(mut m: Menu, delta_in: int, page: bool) -> bool {
+    if m.items.len == 0 {
+        return false
+    }
+    let count = m.items.len
+    var delta = delta_in
+    if page {
+        let rows = menu_spec_rows(m)
+        delta = delta * (if rows == 0 then 1 else rows)
+    }
+    var next = 0
+    if m.sel < 0 {
+        next = if delta >= 0 then 0 else count - 1
+    } else {
+        next = m.sel + delta
+        if next < 0 {
+            next = if m.spec.wrap then count - 1 else 0
+        } else if next >= count {
+            next = if m.spec.wrap then 0 else count - 1
+        }
+    }
+    m.sel = next
+    m.explicit_sel = true
+    menu_hold(mut m)
+    let rows = menu_spec_rows(m)
+    menu_scroll_to_selection(mut m, rows)
+    true
+}
+
+/// `yew_menu_select` (`menu.c:240-249`): what a click does.
+pub fn menu_select(mut m: Menu, index: int) -> bool {
+    if index < 0 || index >= m.items.len {
+        return false
+    }
+    m.sel = index
+    m.explicit_sel = true
+    menu_hold(mut m)
+    let rows = menu_spec_rows(m)
+    menu_scroll_to_selection(mut m, rows)
+    true
+}
+
+/// `yew_menu_focus` (`menu.c:251-265`): the arrows become the list's,
+/// entering at the best match.
+pub fn menu_focus(mut m: Menu) -> bool {
+    if m.items.len == 0 {
+        return false
+    }
+    if m.sel < 0 {
+        m.sel = 0
+        m.explicit_sel = true
+        menu_hold(mut m)
+        let rows = menu_spec_rows(m)
+        menu_scroll_to_selection(mut m, rows)
+    }
+    m.focus = true
+    true
+}
+
+/// `yew_menu_blur` (`menu.c:267-271`).
+pub fn menu_blur(mut m: Menu) {
+    m.focus = false
+}
+
+/// `yew_menu_unselect` (`menu.c:273-284`): focus AND the choice dropped.
+pub fn menu_unselect(mut m: Menu) {
+    m.focus = false
+    m.sel = -1
+    m.explicit_sel = false
+    m.top = 0
+    m.held = List[byte]()
+    m.has_held = false
+}
+
+/// `yew_menu_focused` (`menu.c:286-289`).
+pub fn menu_focused(m: Menu) -> bool {
+    m.focus && m.items.len != 0 && m.sel >= 0
+}
+
+/// `yew_menu_scroll` (`menu.c:291-313`): the window moved WITHOUT the
+/// selection — what a wheel does.
+pub fn menu_scroll(mut m: Menu, delta: int, height: int) -> bool {
+    if m.items.len == 0 {
+        return false
+    }
+    let rows = menu_rows(m, height)
+    if rows == 0 || m.items.len <= rows {
+        return false
+    }
+    let max_top = m.items.len - rows
+    var top = m.top + delta
+    if top < 0 {
+        top = 0
+    }
+    if top > max_top {
+        top = max_top
+    }
+    if top == m.top {
+        return false
+    }
+    m.top = top
+    true
+}
+
+/// The selected row's index, or -1 (`yew_menu_selected`'s NULL).
+pub fn menu_selected(m: Menu) -> int {
+    if m.sel < 0 || m.sel >= m.items.len then -1 else m.sel
+}
+
+/// `yew_menu_dismiss` (`menu.c:322-338`).
+pub fn menu_dismiss(mut m: Menu) {
+    m.items = List[CompItem]()
+    m.held = List[byte]()
+    m.has_held = false
+    m.sel = -1
+    m.explicit_sel = false
+    m.focus = false
+    m.top = 0
+    m.total = 0
+    m.scanning = false
+    m.pending = false
+    m.where = ""
+}
+
+fn menu_styled_blank(style: UiStyle) -> term.Cell {
+    var c = term.cell_blank()
+    c.fg = copy style.row_fg
+    c.bg = copy style.row_bg
+    c.attrs = style.attrs
+    c.w = 1
+    c
+}
+
+// `highlight_match` (`menu.c:340-397`): a CLUSTER is accented when any of
+// its bytes matched; widths from `unicode`.
+fn menu_highlight(
+    mut g: term.Grid,
+    row: int,
+    col0: int,
+    right: int,
+    t: List[byte],
+    pos: List[int],
+    style: UiStyle,
+) {
+    if pos.len == 0 {
+        return
+    }
+    var accent = menu_styled_blank(style)
+    accent.attrs = accent.attrs | term.ATTR_BOLD | term.ATTR_UNDERLINE
+    var at = 0
+    var col = col0
+    while at < t.len && col < right {
+        let next = unicode.gb_next_bytes(t, t.len, at)
+        if next <= at {
+            break
+        }
+        let measured = unicode.cluster_width(t, at, next)
+        let cells = if measured > 0 then measured else 0
+        var hit = false
+        for p in pos {
+            if p >= at && p < next {
+                hit = true
+                break
+            }
+        }
+        if hit && cells != 0 {
+            let end = col + cells
+            term.grid_overlay(
+                mut g,
+                row,
+                col,
+                if end > right then right else end,
+                accent,
+                term.OVERLAY_ATTRS,
+            )
+        }
+        col = if col + cells > right then right else col + cells
+        at = next
+    }
+}
+
+fn menu_text_cells(s: str) -> int {
+    if s.len == 0 {
+        return 0
+    }
+    let w = unicode.str_width(s.bytes(), 0, s.len, 1)
+    if w > 0 then w else 0
+}
+
+// `where_fit` (`menu.c:410-438`): the note in at most `max` cells, cut
+// from the LEFT, keeping an `in ` lead.
+fn menu_where_fit(where: str, max: int) -> str {
+    if where.len == 0 || max <= 0 {
+        return ""
+    }
+    let lead = if where.starts_with("in ") then "in " else ""
+    if menu_text_cells(where) <= max {
+        return where
+    }
+    let budget = max - menu_text_cells(lead) - 1
+    if budget <= 0 {
+        return ""
+    }
+    var p = lead.len
+    while p < where.len {
+        let b = where.bytes()[p] as int
+        if b & 192 != 128 && menu_text_cells(where[p..]) <= budget {
+            break
+        }
+        p += 1
+    }
+    "{lead}\u{2026}{where[p..]}"
+}
+
+fn menu_puts(mut g: term.Grid, row: int, col: int, s: str, style: UiStyle) -> int {
+    term.grid_puts(mut g, row, col, s.bytes(), 0, s.len, style.row_fg, style.row_bg, style.attrs)
+}
+
+// `draw_tail` (`menu.c:440-466`): `… and N more`, dimmed, no region; the
+// footer's note rides on it.
+fn menu_draw_tail(
+    mut g: term.Grid,
+    row: int,
+    x: int,
+    right: int,
+    hidden: int,
+    where: str,
+    style: UiStyle,
+) {
+    var tail_style = copy style
+    tail_style.attrs = tail_style.attrs | term.ATTR_DIM
+    term.grid_fill(mut g, row, x, right, menu_styled_blank(tail_style))
+    let label = "  \u{2026} and {hidden} more"
+    let col = menu_puts(mut g, row, x, label, tail_style)
+    let note = menu_where_fit(where, right - col - 2)
+    if note.len != 0 {
+        let _ = menu_puts(mut g, row, right - menu_text_cells(note), note, tail_style)
+    }
+}
+
+/// `yew_menu_draw` (`menu.c:468-614`): bottom-aligned in `area`, one
+/// `REGION_MENU_ROW` per drawn CANDIDATE row over one `REGION_BLOCK`
+/// added first (last-added wins), the tail when rows are hidden below,
+/// and the footer's ONE count on the last row otherwise.
+pub fn menu_draw(mut g: term.Grid, mut rs: Regions, mut m: Menu, area: Rect, style: UiStyle) {
+    let rows = menu_rows(m, area.h)
+    if rows == 0 {
+        return
+    }
+    let right = if area.x + area.w > g.cols then g.cols else area.x + area.w
+    menu_scroll_to_selection(mut m, rows)
+    let cand_rows = menu_candidate_rows_at(m, m.top, rows)
+    let hidden = if cand_rows == rows then 0 else m.items.len - m.top - cand_rows
+    let first_row = area.y + area.h - rows
+    region_add(mut rs, REGION_BLOCK, rect(area.x, first_row, area.w, rows), 0)
+    var i = 0
+    while i < rows {
+        let index = m.top + i
+        let row = first_row + i
+        if i >= cand_rows {
+            menu_draw_tail(mut g, row, area.x, right, hidden, m.where, style)
+            break
+        }
+        if index >= m.items.len {
+            break
+        }
+        let selected = index == m.sel
+        var row_style = copy style
+        if selected {
+            let swap = copy row_style.row_fg
+            row_style.row_fg = copy row_style.row_bg
+            row_style.row_bg = swap
+            row_style.attrs = row_style.attrs | term.ATTR_BOLD
+        } else if m.items[index].deferred {
+            row_style.attrs = row_style.attrs | term.ATTR_DIM
+        }
+        term.grid_fill(mut g, row, area.x, right, menu_styled_blank(row_style))
+        var label = List[byte]()
+        (mut label).push(if selected then 62 as byte else 32 as byte)
+        (mut label).push(32 as byte)
+        for b in m.items[index].text {
+            (mut label).push(b)
+        }
+        let col = term.grid_puts(
+            mut g,
+            row,
+            area.x,
+            label,
+            0,
+            label.len,
+            row_style.row_fg,
+            row_style.row_bg,
+            row_style.attrs,
+        )
+        menu_highlight(
+            mut g,
+            row,
+            area.x + 2,
+            right,
+            m.items[index].text,
+            m.items[index].m.pos,
+            row_style,
+        )
+        var footer = ""
+        var footer_cells = 0
+        if i + 1 == rows {
+            if m.scanning {
+                footer = "scanning\u{2026}"
+            } else if m.pending {
+                footer = "\u{2026}"
+            } else if m.total > m.items.len {
+                footer = "{m.items.len}+ of {m.total}"
+            } else if m.sel >= 0 {
+                footer = "{m.sel + 1}/{m.total}"
+            }
+            if m.where.len != 0 {
+                let count = footer
+                let half = (right - area.x) / 2
+                let note = menu_where_fit(
+                    m.where,
+                    half - menu_text_cells(count) - (if count.len != 0 then 1 else 0),
+                )
+                if note.len != 0 {
+                    footer = if count.len != 0 then "{note} {count}" else note
+                }
+            }
+            footer_cells = menu_text_cells(footer)
+        }
+        let detail = m.items[index].detail
+        if detail.len != 0 && area.w >= MENU_DETAIL_MIN_COLS {
+            var at = area.x + m.spec.detail_col
+            let limit = if footer_cells != 0 && right > footer_cells + 1 {
+                right - footer_cells - 1
+            } else {
+                right
+            }
+            if at < col + 1 {
+                at = col + 1
+            }
+            if at < limit {
+                let (keep, _) = unicode.str_clip(detail.bytes(), 0, detail.len, limit - at)
+                let _ = term.grid_puts(
+                    mut g,
+                    row,
+                    at,
+                    detail.bytes(),
+                    0,
+                    keep,
+                    row_style.row_fg,
+                    row_style.row_bg,
+                    row_style.attrs,
+                )
+            }
+        }
+        region_add(mut rs, REGION_MENU_ROW, rect(area.x, row, area.w, 1), index)
+        if footer_cells != 0 && footer_cells < right {
+            let _ = menu_puts(mut g, row, right - footer_cells, footer, row_style)
+        }
+        i += 1
+    }
+}
