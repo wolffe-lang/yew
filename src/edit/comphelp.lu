@@ -1,0 +1,2493 @@
+//! edit.comphelp — learning a command's subcommands and flags from its
+//! `--help` (Sprint 57.25).
+//!
+//! Ports sagitta `src/ui/comphelp.c` (2,787 lines) and `comphelp.h` (194)
+//! at 9ace98c2, in C's order: the parser (§3), the policy (§1), the disk
+//! cache (§5), the in-memory trees and the lazy descent (§4), the request
+//! queue (§2, §6) and `ed.shell.complete_forget`.
+//!
+//! What runs at wolf 0.2.33: everything but the job. A lookup resolves the
+//! command word, checks every §1 rule, answers from memory or from the
+//! disk cache — the cache C yew writes (`$XDG_CACHE_HOME/yew/completions/
+//! help/<key>.fl`, Fletch data read by the literal reader, R-yw04-4, the
+//! key C's FNV-1a over the same identity), so a tool C yew has learned
+//! completes in the port — and otherwise QUEUES the request. The idle
+//! path that spawns `<resolved> [subs] --help` is a job whose two pipes
+//! are read while the loop runs (G2): it takes C's own spawn-failure path
+//! (`comphelp.c:2627-2635`: the negative answer remembered for the
+//! session, not on disk, the request dropped) and logs the refusal by
+//! name (ruling R-yw04-1). The cache writer, the graft and the prune are
+//! C's, ready for the pin whose job layer delivers an answer.
+//!
+//! The port's shape: C's state is module statics (`help`,
+//! `comphelp.c:1404-1420`); here it is the value `CompHelp`, owned by the
+//! editor (`Ed.help`). C's trees are `YewCompSpec *` owned by entries;
+//! here they live in the spec registry's pool (`Ed.specs.pool`) and an
+//! entry holds the index. C reads `st_mtime` (seconds) for the key and the
+//! cache's validation; the port reads `fs.stat`'s `mtime_s`, the same
+//! number.
+
+use std.fs
+use text
+use unicode
+use util
+
+/// A help job's deadline (`YEW_COMPHELP_TIMEOUT_MS`).
+pub const COMPHELP_TIMEOUT_MS: int = 1000
+
+/// At most this many cache files (`YEW_COMPHELP_CACHE_MAX`).
+pub const COMPHELP_CACHE_MAX: int = 2000
+
+/// A prune keeps this many (`YEW_COMPHELP_CACHE_KEEP`).
+pub const COMPHELP_CACHE_KEEP: int = 1800
+
+/// A description keeps its first 60 bytes (`YEW_COMPHELP_DESC_MAX`).
+pub const COMPHELP_DESC_MAX: int = 60
+
+/// Subcommand depth a lazy request may reach (`YEW_COMPHELP_DEPTH_MAX`).
+pub const COMPHELP_DEPTH_MAX: int = 8
+
+/// The collection ceiling (`YEW_COMPHELP_COLLECT_MAX`).
+pub const COMPHELP_COLLECT_MAX: int = 262144
+
+/// `YEW_HELP_POLICY_NATIVE`: only ELF and Mach-O run.
+pub const HELP_POLICY_NATIVE: int = 0
+
+/// `YEW_HELP_POLICY_ALL`: any executable runs.
+pub const HELP_POLICY_ALL: int = 1
+
+/// `YEW_HELP_POLICY_OFF`: nothing runs.
+pub const HELP_POLICY_OFF: int = 2
+
+/// `YEW_HELP_EXE_NONE`: not an executable regular file.
+pub const HELP_EXE_NONE: int = 0
+
+/// `YEW_HELP_EXE_NATIVE`: ELF or Mach-O.
+pub const HELP_EXE_NATIVE: int = 1
+
+/// `YEW_HELP_EXE_SCRIPT`: `#!`.
+pub const HELP_EXE_SCRIPT: int = 2
+
+/// `YEW_HELP_EXE_OTHER`: executable, but neither.
+pub const HELP_EXE_OTHER: int = 3
+
+/// `YEW_HELP_DESCEND_READY`: the node's own help is in the tree.
+pub const HELP_DESCEND_READY: int = 0
+
+/// `YEW_HELP_DESCEND_CHANGED`: just grafted; re-resolve.
+pub const HELP_DESCEND_CHANGED: int = 1
+
+/// `YEW_HELP_DESCEND_PENDING`: asked for (or not allowed).
+pub const HELP_DESCEND_PENDING: int = 2
+
+/// `YEW_HELP_DESCEND_NONE`: not a help tree.
+pub const HELP_DESCEND_NONE: int = 3
+
+// ==================================================================
+// §3: the parser
+// ==================================================================
+
+// `comphelp.c:51-60`.
+const HP_TERM_MAX: int = 256
+
+const HP_DESC_MAX: int = 1024
+
+const HP_SUBS_MAX: int = 512
+
+const HP_FLAGS_MAX: int = 512
+
+const HP_ALIASES_MAX: int = 8
+
+const HP_VALUES_MAX: int = 64
+
+const HP_NAME_MAX: int = 64
+
+const HP_WORDS_MAX: int = 32
+
+// `HelpSection` (`comphelp.c:62-69`).
+const HS_GENERAL: int = 0
+
+const HS_COMMANDS: int = 1
+
+const HS_FLAGS: int = 2
+
+const HS_ARGS: int = 3
+
+const HS_USAGE: int = 4
+
+const HS_IGNORE: int = 5
+
+struct HpSub {
+    name: str,
+    aliases: List[str],
+    desc: str,
+    has_desc: bool,
+}
+
+struct HpFlag {
+    lng: str,
+    has_lng: bool,
+    shrt: int,
+    desc: str,
+    has_desc: bool,
+    has_arg: bool,
+    arg_optional: bool,
+    global: bool,
+    kind: int,
+    values: List[str],
+}
+
+/// `HelpParse` (`comphelp.c:94-117`): C's `term` and `desc` are fixed
+/// buffers of 256 and 1,024 bytes; the port keeps the caps.
+struct HpParse {
+    words: List[str],
+    section: int,
+    global: bool,
+    active: bool,
+    has_desc: bool,
+    tab_gap: bool,
+    indent: int,
+    desc_col: int,
+    term: List[byte],
+    term_cut: bool,
+    desc: List[byte],
+    align_indent: int,
+    align_off: int,
+    choices: List[str],
+    subs: List[HpSub],
+    flags: List[HpFlag],
+}
+
+fn hp_blank(c: int) -> bool {
+    c == 32 || c == 9
+}
+
+fn hp_lower(c: int) -> int {
+    if c >= 65 && c <= 90 then c + 32 else c
+}
+
+fn hp_bytes(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn hp_slice(s: List[byte], at: int, end: int) -> List[byte] {
+    var v = List[byte]()
+    var i = at
+    while i < end {
+        (mut v).push(s[i])
+        i += 1
+    }
+    v
+}
+
+/// ASCII bytes as text (every name the parser keeps is ASCII).
+fn hp_text(s: List[byte], at: int, end: int) -> str {
+    str_from_utf8(hp_slice(s, at, end)) else ""
+}
+
+/// `hp_contains_ci` (`comphelp.c:129-145`): `needle` lower case.
+fn hp_contains_ci(s: List[byte], at: int, n: int, needle: str) -> bool {
+    let k = needle.len
+    var i = 0
+    while i + k <= n {
+        var j = 0
+        while j < k {
+            if hp_lower(s[at + i + j] as int) != needle.bytes()[j] as int {
+                break
+            }
+            j += 1
+        }
+        if j == k {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+/// `hp_strip` (`comphelp.c:154-208`): CSI, OSC and two-byte escapes go,
+/// overstrike keeps the second glyph, CR goes, other C0 but TAB and LF
+/// become spaces; an ESC that starts nothing recognisable is KEPT.
+fn hp_strip(inp: List[byte], len: int) -> List[byte] {
+    var out = List[byte]()
+    var i = 0
+    while i < len {
+        var c = inp[i] as int
+        if c == 27 && i + 1 < len && inp[i + 1] as int == 91 {
+            i += 2
+            while i < len && !(inp[i] as int >= 64 && inp[i] as int <= 126) {
+                i += 1
+            }
+            if i < len {
+                i += 1
+            }
+            continue
+        }
+        if c == 27 && i + 1 < len && inp[i + 1] as int == 93 {
+            i += 2
+            while i < len &&
+                inp[i] as int != 7 &&
+                !(inp[i] as int == 27 && i + 1 < len && inp[i + 1] as int == 92) {
+                i += 1
+            }
+            if i < len {
+                i += if inp[i] as int == 7 then 1 else 2
+            }
+            continue
+        }
+        if c == 27 && i + 1 < len && inp[i + 1] as int >= 64 && inp[i + 1] as int <= 95 {
+            i += 2
+            continue
+        }
+        if c == 8 {
+            while out.len != 0 && out[out.len - 1] as int & 192 == 128 {
+                let _ = (mut out).pop()
+            }
+            if out.len != 0 && out[out.len - 1] as int != 10 {
+                let _ = (mut out).pop()
+            }
+            i += 1
+            continue
+        }
+        if c == 13 {
+            i += 1
+            continue
+        }
+        if c < 32 && c != 9 && c != 10 && c != 27 {
+            c = 32
+        }
+        if c == 127 {
+            c = 32
+        }
+        (mut out).push(c as byte)
+        i += 1
+    }
+    out
+}
+
+/// `hp_field` (`comphelp.c:210-251`): blank runs collapsed, invalid
+/// UTF-8 and controls shown as U+FFFD, cut at `max` bytes on a boundary.
+fn hp_field(s: List[byte], at: int, n: int, max: int) -> str {
+    var b = List[byte]()
+    var i = 0
+    var space = false
+    while i < n && hp_blank(s[at + i] as int) {
+        i += 1
+    }
+    while i < n {
+        let (cp, k0) = unicode.utf8_decode(s, at + i, at + n)
+        let k = if k0 == 0 then 1 else k0
+        if hp_blank(s[at + i] as int) {
+            space = true
+            i += k
+            continue
+        }
+        var enc = List[byte]()
+        if unicode.utf8_is_escape(cp) || cp < 32 || cp == 127 {
+            (mut enc).push(239 as byte)
+            (mut enc).push(191 as byte)
+            (mut enc).push(189 as byte)
+        } else {
+            enc = hp_slice(s, at + i, at + i + k)
+        }
+        let extra = if space then 1 else 0
+        if b.len + extra + enc.len > max {
+            break
+        }
+        if space && b.len != 0 {
+            (mut b).push(32 as byte)
+        }
+        space = false
+        for x in enc {
+            (mut b).push(x)
+        }
+        i += k
+    }
+    str_from_utf8(b) else ""
+}
+
+fn hp_word_char(c: int) -> bool {
+    c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 95 || c == 45
+}
+
+/// `hp_sub_name` (`comphelp.c:260-271`): `^[a-z][a-z0-9_-]*$`.
+fn hp_sub_name(s: List[byte], at: int, n: int) -> bool {
+    if n == 0 || n > HP_NAME_MAX || !(s[at] as int >= 97 && s[at] as int <= 122) {
+        return false
+    }
+    var i = 1
+    while i < n {
+        if !hp_word_char(s[at + i] as int) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `hp_long_name` (`comphelp.c:273-290`).
+fn hp_long_name(s: List[byte], at: int, n: int) -> bool {
+    if n == 0 || n > HP_NAME_MAX {
+        return false
+    }
+    let c0 = s[at] as int
+    if !(c0 >= 97 && c0 <= 122 || c0 >= 65 && c0 <= 90 || c0 >= 48 && c0 <= 57) {
+        return false
+    }
+    var i = 1
+    while i < n {
+        let c = s[at + i] as int
+        if !(
+            c >= 97 && c <= 122 ||
+                c >= 65 && c <= 90 ||
+                c >= 48 && c <= 57 ||
+                c == 45 ||
+                c == 95 ||
+                c == 46
+        ) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn hp_alnum(c: int) -> bool {
+    c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57
+}
+
+/// `hp_set_section` (`comphelp.c:298-325`).
+fn hp_set_section(mut p: HpParse, s: List[byte], at: int, n: int) {
+    p.global = false
+    p.align_off = 0
+    if hp_contains_ci(s, at, n, "example") ||
+        hp_contains_ci(s, at, n, "keys") ||
+        hp_contains_ci(s, at, n, "keybinding") ||
+        hp_contains_ci(s, at, n, "key binding") ||
+        hp_contains_ci(s, at, n, "shortcut") ||
+        hp_contains_ci(s, at, n, "environment") {
+        p.section = HS_IGNORE
+        return
+    }
+    if n >= 5 && hp_contains_ci(s, at, 5, "usage") {
+        p.section = HS_USAGE
+        return
+    }
+    if hp_contains_ci(s, at, n, "option") || hp_contains_ci(s, at, n, "flag") {
+        p.section = HS_FLAGS
+        p.global = hp_contains_ci(s, at, n, "global")
+        return
+    }
+    if hp_contains_ci(s, at, n, "argument") || hp_contains_ci(s, at, n, "positional") {
+        p.section = HS_ARGS
+        return
+    }
+    p.section = if hp_contains_ci(s, at, n, "command") then HS_COMMANDS else HS_GENERAL
+}
+
+/// `hp_find_sub` (`comphelp.c:331-348`): by name or alias, -1 none.
+fn hp_find_sub(p: HpParse, name: str) -> int {
+    var i = 0
+    while i < p.subs.len {
+        if p.subs[i].name == name {
+            return i
+        }
+        for a in p.subs[i].aliases {
+            if a == name {
+                return i
+            }
+        }
+        i += 1
+    }
+    -1
+}
+
+fn hp_in_choices(p: HpParse, name: str) -> bool {
+    for c in p.choices {
+        if c == name {
+            return true
+        }
+    }
+    false
+}
+
+/// `hp_add_sub` (`comphelp.c:362-382`): the row's index, or -1.
+fn hp_add_sub(mut p: HpParse, name: str) -> int {
+    let s = hp_find_sub(p, name)
+    if s >= 0 {
+        return if p.subs[s].name == name then s else -1
+    }
+    if p.words.len != 0 && p.words[0] == name {
+        return -1
+    }
+    if p.subs.len == HP_SUBS_MAX {
+        return -1
+    }
+    (mut p.subs).push(HpSub { name: name, aliases: List[str](), desc: "", has_desc: false })
+    p.subs.len - 1
+}
+
+/// `hp_add_alias` (`comphelp.c:384-411`): answers `s`, which moves down
+/// one slot when an earlier bare choice of the alias's name folds in.
+fn hp_add_alias(mut p: HpParse, s0: int, name: str) -> int {
+    var s = s0
+    let nb = hp_bytes(name)
+    if !hp_sub_name(nb, 0, nb.len) || p.subs[s].aliases.len == HP_ALIASES_MAX {
+        return s
+    }
+    let other = hp_find_sub(p, name)
+    if other >= 0 {
+        if other == s ||
+            p.subs[other].has_desc ||
+            p.subs[other].aliases.len != 0 ||
+            p.subs[other].name != name {
+            return s
+        }
+        if s > other {
+            s -= 1
+        }
+        var keep = List[HpSub]()
+        var k = 0
+        while k < p.subs.len {
+            if k != other {
+                (mut keep).push(copy p.subs[k])
+            }
+            k += 1
+        }
+        p.subs = keep
+    }
+    (mut p.subs[s].aliases).push(name)
+    s
+}
+
+/// `hp_desc_aliases` (`comphelp.c:413-440`): `[aliases: a, b]` (yargs).
+fn hp_desc_aliases(mut p: HpParse, s0: int, d: List[byte], at: int, n: int) -> int {
+    var s = s0
+    let tag = "[aliases:"
+    let tl = tag.len
+    var i = 0
+    var found = false
+    while i + tl <= n {
+        var j = 0
+        var same = true
+        for b in tag.bytes() {
+            if d[at + i + j] != b {
+                same = false
+                break
+            }
+            j += 1
+        }
+        if same {
+            found = true
+            break
+        }
+        i += 1
+    }
+    if !found {
+        return s
+    }
+    i += tl
+    while i < n && d[at + i] as int != 93 {
+        while i < n && (hp_blank(d[at + i] as int) || d[at + i] as int == 44) {
+            i += 1
+        }
+        let start = i
+        while i < n &&
+            d[at + i] as int != 44 &&
+            d[at + i] as int != 93 &&
+            !hp_blank(d[at + i] as int) {
+            i += 1
+        }
+        if i > start {
+            s = hp_add_alias(mut p, s, hp_text(d, at + start, at + i))
+        }
+    }
+    s
+}
+
+/// `hp_sub_row` (`comphelp.c:442-531`): ONE name, then only aliases and
+/// bracketed metas; a second plain word is prose.
+fn hp_sub_row(mut p: HpParse, t: List[byte], ta: int, n: int, d: List[byte], da: int, dn: int) {
+    var aliases = List[str]()
+    var i = 0
+    while i < n && hp_word_char(t[ta + i] as int) {
+        i += 1
+    }
+    let name_end = i
+    if !hp_sub_name(t, ta, name_end) {
+        return
+    }
+    while i < n {
+        let c = t[ta + i] as int
+        if c == 44 || c == 124 || hp_blank(c) {
+            i += 1
+            continue
+        }
+        if c == 40 {
+            i += 1
+            while i < n && t[ta + i] as int != 41 {
+                while i < n && (hp_blank(t[ta + i] as int) || t[ta + i] as int == 44) {
+                    i += 1
+                }
+                let start = i
+                while i < n && hp_word_char(t[ta + i] as int) {
+                    i += 1
+                }
+                if i > start && aliases.len < HP_ALIASES_MAX {
+                    (mut aliases).push(hp_text(t, ta + start, ta + i))
+                } else if i == start && i < n && t[ta + i] as int != 41 {
+                    return
+                }
+            }
+            if i >= n {
+                return
+            }
+            i += 1
+            continue
+        }
+        if c == 91 || c == 60 {
+            let close = if c == 91 then 93 else 62
+            var e = i
+            while e < n && t[ta + e] as int != close {
+                e += 1
+            }
+            if e >= n {
+                return
+            }
+            i = e + 1
+            while i < n && t[ta + i] as int == 46 {
+                i += 1
+            }
+            continue
+        }
+        let prev = if i > 0 then t[ta + i - 1] as int else 0
+        let prev2 = if i > 1 then t[ta + i - 2] as int else 0
+        if i > 0 && (prev == 44 || prev == 124 || i > 1 && prev2 == 44 && hp_blank(prev)) {
+            let start = i
+            while i < n && hp_word_char(t[ta + i] as int) {
+                i += 1
+            }
+            if i == start || aliases.len == HP_ALIASES_MAX {
+                return
+            }
+            (mut aliases).push(hp_text(t, ta + start, ta + i))
+            continue
+        }
+        return
+    }
+    let name = hp_text(t, ta, ta + name_end)
+    if p.section == HS_ARGS && !hp_in_choices(p, name) {
+        return
+    }
+    if dn == 0 && p.section != HS_COMMANDS && !hp_in_choices(p, name) {
+        return
+    }
+    var s = hp_add_sub(mut p, name)
+    if s < 0 {
+        return
+    }
+    for a in aliases {
+        s = hp_add_alias(mut p, s, a)
+    }
+    if dn != 0 {
+        s = hp_desc_aliases(mut p, s, d, da, dn)
+        if !p.subs[s].has_desc || p.subs[s].desc.len == 0 {
+            p.subs[s].desc = hp_field(d, da, dn, COMPHELP_DESC_MAX)
+            p.subs[s].has_desc = true
+        }
+    }
+}
+
+/// `hp_choice_line` (`comphelp.c:534-567`): argparse's `{a,b,c}`.
+fn hp_choice_line(mut p: HpParse, t: List[byte], ta: int, n: int) -> bool {
+    if n < 3 || t[ta] as int != 123 || t[ta + n - 1] as int != 125 {
+        return false
+    }
+    var i = 1
+    while i < n - 1 {
+        let start = i
+        while i < n - 1 && t[ta + i] as int != 44 {
+            i += 1
+        }
+        if hp_sub_name(t, ta + start, i - start) {
+            let name = hp_text(t, ta + start, ta + i)
+            if !hp_in_choices(p, name) && p.choices.len < HP_SUBS_MAX {
+                (mut p.choices).push(name)
+            }
+            let _ = hp_add_sub(mut p, name)
+        }
+        i += 1
+    }
+    true
+}
+
+/// `cobra_types` (`comphelp.c:557-563`).
+fn hp_is_type_word(w: str) -> bool {
+    for t in "string strings stringArray stringSlice stringToString int ints int8 int16 int32 int64 uint uints uint8 uint16 uint32 uint64 float float32 float64 duration durations ip ipSlice ipNet bytesHex bytesBase64 count value list".
+        words() {
+        if t == w {
+            return true
+        }
+    }
+    false
+}
+
+/// `hp_all_caps` (`comphelp.c:580-595`).
+fn hp_all_caps(s: List[byte], at: int, n: int) -> bool {
+    if n == 0 || !(s[at] as int >= 65 && s[at] as int <= 90) {
+        return false
+    }
+    var i = 1
+    while i < n {
+        let c = s[at + i] as int
+        if !(c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 95 || c == 45) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `hp_trim_tail` (`comphelp.c:597-602`).
+fn hp_trim_tail(s: List[byte], at: int, n0: int) -> int {
+    var n = n0
+    while n > 0 && (s[at + n - 1] as int == 44 || s[at + n - 1] as int == 46) {
+        n -= 1
+    }
+    n
+}
+
+/// `hp_is_meta` (`comphelp.c:604-613`).
+fn hp_is_meta(s: List[byte], at: int, n0: int) -> bool {
+    let n = hp_trim_tail(s, at, n0)
+    if n >= 2 {
+        let a = s[at] as int
+        let z = s[at + n - 1] as int
+        if a == 60 && z == 62 || a == 91 && z == 93 || a == 123 && z == 125 {
+            return true
+        }
+    }
+    let w = hp_text(s, at, at + n)
+    hp_all_caps(s, at, n) || hp_is_type_word(w) && n != 0 || w == "bool"
+}
+
+/// `hp_eq_ci` (`comphelp.c:615-627`).
+fn hp_eq_ci(s: List[byte], at: int, n: int, w: str) -> bool {
+    if n != w.len {
+        return false
+    }
+    var i = 0
+    while i < n {
+        if hp_lower(s[at + i] as int) != w.bytes()[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `hp_suffix_ci` (`comphelp.c:629-636`).
+fn hp_suffix_ci(s: List[byte], at: int, n: int, w: str) -> bool {
+    let k = w.len
+    n > k &&
+        hp_eq_ci(s, at + n - k, k, w) &&
+        (s[at + n - k - 1] as int == 95 || s[at + n - k - 1] as int == 45)
+}
+
+/// `hp_split_values` (`comphelp.c:638-682`).
+fn hp_split_values(s: List[byte], at: int, n: int, sep: int, mut f: HpFlag) -> bool {
+    var vals = List[str]()
+    var i = 0
+    while i <= n {
+        while i < n &&
+            (hp_blank(s[at + i] as int) || s[at + i] as int == 34 || s[at + i] as int == 39) {
+            i += 1
+        }
+        let start = i
+        while i < n && s[at + i] as int != sep {
+            i += 1
+        }
+        var end = i
+        while end > start &&
+            (
+                hp_blank(s[at + end - 1] as int) ||
+                    s[at + end - 1] as int == 34 ||
+                    s[at + end - 1] as int == 39
+            ) {
+            end -= 1
+        }
+        if end == start || vals.len == HP_VALUES_MAX {
+            return false
+        }
+        var k = start
+        while k < end {
+            let c = s[at + k] as int
+            if !(hp_alnum(c) || c == 45 || c == 95 || c == 46 || c == 43 || c == 47 || c == 58) {
+                return false
+            }
+            k += 1
+        }
+        (mut vals).push(hp_text(s, at + start, at + end))
+        i += 1
+    }
+    if vals.len < 2 {
+        return false
+    }
+    f.values = vals
+    f.kind = SPEC_ARG_VALUES
+    true
+}
+
+fn hp_find_bytes(s: List[byte], at: int, n: int, from: int, c: int) -> int {
+    var i = from
+    while i < n {
+        if s[at + i] as int == c {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `hp_desc_values` (`comphelp.c:684-716`).
+fn hp_desc_values(d: List[byte], at: int, n: int, mut f: HpFlag) -> bool {
+    for tag in ["[possible values:", "[choices:"] {
+        let k = tag.len
+        var i = 0
+        while i + k <= n {
+            var same = true
+            var j = 0
+            for b in tag.bytes() {
+                if d[at + i + j] != b {
+                    same = false
+                    break
+                }
+                j += 1
+            }
+            if same {
+                let close = hp_find_bytes(d, at, n, i + k, 93)
+                if close >= 0 && hp_split_values(d, at + i + k, close - (i + k), 44, mut f) {
+                    return true
+                }
+            }
+            i += 1
+        }
+    }
+    var i = 0
+    while i < n {
+        if d[at + i] as int == 40 {
+            let close = hp_find_bytes(d, at, n, i, 41)
+            if close >= 0 &&
+                hp_find_bytes(d, at, close, i, 124) >= 0 &&
+                hp_split_values(d, at + i + 1, close - i - 1, 124, mut f) {
+                return true
+            }
+        }
+        i += 1
+    }
+    false
+}
+
+/// `hp_meta_kind` (`comphelp.c:718-748`).
+fn hp_meta_kind(m: List[byte], at0: int, n0: int, d: List[byte], da: int, dn: int, mut f: HpFlag) {
+    var at = at0
+    var n = hp_trim_tail(m, at, n0)
+    f.kind = SPEC_ARG_NONE
+    if n >= 2 &&
+        m[at] as int == 123 &&
+        m[at + n - 1] as int == 125 &&
+        hp_split_values(m, at + 1, n - 2, 44, mut f) {
+        return
+    }
+    if n >= 2 &&
+        (m[at] as int == 91 || m[at] as int == 60) &&
+        hp_find_bytes(m, at, n, 0, 124) >= 0 &&
+        hp_split_values(m, at + 1, n - 2, 124, mut f) {
+        return
+    }
+    if n >= 2 && (m[at] as int == 60 || m[at] as int == 91) {
+        at += 1
+        n -= 2
+    }
+    if hp_eq_ci(m, at, n, "file") ||
+        hp_eq_ci(m, at, n, "path") ||
+        hp_eq_ci(m, at, n, "files") ||
+        hp_eq_ci(m, at, n, "paths") ||
+        hp_eq_ci(m, at, n, "filename") ||
+        hp_eq_ci(m, at, n, "pathname") ||
+        hp_suffix_ci(m, at, n, "file") ||
+        hp_suffix_ci(m, at, n, "path") {
+        f.kind = SPEC_ARG_PATH
+        return
+    }
+    if hp_eq_ci(m, at, n, "dir") ||
+        hp_eq_ci(m, at, n, "directory") ||
+        hp_eq_ci(m, at, n, "dirs") ||
+        hp_eq_ci(m, at, n, "folder") ||
+        hp_suffix_ci(m, at, n, "dir") ||
+        hp_suffix_ci(m, at, n, "directory") {
+        f.kind = SPEC_ARG_DIR
+        return
+    }
+    let _ = hp_desc_values(d, da, dn, mut f)
+}
+
+/// `hp_flag_known` (`comphelp.c:750-764`).
+fn hp_flag_known(p: HpParse, lng: str, has_lng: bool, shrt: int) -> bool {
+    for f in p.flags {
+        if has_lng && f.has_lng && f.lng == lng {
+            return true
+        }
+        if shrt != 0 && f.shrt == shrt {
+            return true
+        }
+    }
+    false
+}
+
+struct HpSpelling {
+    at: int,
+    n: int,
+    is_long: bool,
+}
+
+/// `hp_flag_row` (`comphelp.c:777-917`).
+fn hp_flag_row(
+    mut p: HpParse,
+    t: List[byte],
+    ta: int,
+    n: int,
+    d: List[byte],
+    da: int,
+    dn: int,
+    go: bool,
+) {
+    var sp = List[HpSpelling]()
+    var meta = -1
+    var meta_len = 0
+    var optional = false
+    var i = 0
+    while i < n {
+        while i < n && hp_blank(t[ta + i] as int) {
+            i += 1
+        }
+        let start = i
+        while i < n && !hp_blank(t[ta + i] as int) {
+            i += 1
+        }
+        if i == start {
+            break
+        }
+        let w = ta + start
+        let len = i - start
+        if t[w] as int == 45 && len >= 2 && t[w + 1] as int != 44 {
+            var is_long = t[w + 1] as int == 45
+            let name = if is_long then w + 2 else w + 1
+            var nn = hp_trim_tail(t, name, len - (name - w))
+            let br = hp_find_bytes(t, name, nn, 0, 91)
+            if br >= 0 && br + 1 < nn && t[name + br + 1] as int == 61 {
+                optional = true
+                if meta < 0 {
+                    meta = name + br + 2
+                    meta_len = nn - (br + 2)
+                    if meta_len != 0 && t[meta + meta_len - 1] as int == 93 {
+                        meta_len -= 1
+                    }
+                }
+                nn = br
+            } else {
+                let eq = hp_find_bytes(t, name, nn, 0, 61)
+                if eq >= 0 {
+                    if meta < 0 {
+                        meta = name + eq + 1
+                        meta_len = nn - (eq + 1)
+                    }
+                    nn = eq
+                }
+            }
+            if !is_long && nn > 1 {
+                if !go {
+                    continue
+                }
+                is_long = true
+            }
+            if sp.len < 8 &&
+                (
+                    is_long && hp_long_name(t, name, nn) ||
+                        !is_long && nn == 1 && hp_alnum(t[name] as int)
+                ) {
+                (mut sp).push(HpSpelling { at: name, n: nn, is_long: is_long })
+            }
+            continue
+        }
+        if hp_is_meta(t, w, len) {
+            if meta < 0 {
+                meta = w
+                meta_len = hp_trim_tail(t, w, len)
+            }
+            continue
+        }
+        break
+    }
+    if sp.len == 0 {
+        return
+    }
+    var proto = HpFlag {
+        lng: "",
+        has_lng: false,
+        shrt: 0,
+        desc: "",
+        has_desc: false,
+        has_arg: false,
+        arg_optional: optional,
+        global: p.global,
+        kind: SPEC_ARG_PATH,
+        values: List[str](),
+    }
+    let is_bool = meta >= 0 && meta_len == 4 && hp_text(t, meta, meta + 4) == "bool"
+    if meta >= 0 && meta_len != 0 && !is_bool {
+        proto.has_arg = true
+        hp_meta_kind(t, meta, meta_len, d, da, dn, mut proto)
+    } else {
+        proto.arg_optional = false
+        if hp_contains_ci(d, da, dn, "[string]") ||
+            hp_contains_ci(d, da, dn, "[number]") ||
+            hp_contains_ci(d, da, dn, "[array]") ||
+            hp_contains_ci(d, da, dn, "[choices:") {
+            proto.has_arg = true
+            proto.kind = SPEC_ARG_NONE
+            if hp_contains_ci(d, da, dn, "[choices:") {
+                let _ = hp_desc_values(d, da, dn, mut proto)
+            }
+        }
+    }
+    let has_desc = dn != 0
+    let desc = if has_desc then hp_field(d, da, dn, COMPHELP_DESC_MAX) else ""
+    var first_short = -1
+    var first_long = -1
+    var k = 0
+    while k < sp.len {
+        if sp[k].is_long && first_long < 0 {
+            first_long = k
+        }
+        if !sp[k].is_long && first_short < 0 {
+            first_short = k
+        }
+        k += 1
+    }
+    k = 0
+    while k < sp.len && p.flags.len < HP_FLAGS_MAX {
+        var f = copy proto
+        f.desc = desc
+        f.has_desc = has_desc
+        if k == first_long && first_short >= 0 {
+            k += 1
+            continue
+        }
+        if sp[k].is_long {
+            f.lng = hp_text(t, sp[k].at, sp[k].at + sp[k].n)
+            f.has_lng = true
+        } else {
+            f.shrt = t[sp[k].at] as int
+            if k == first_short && first_long >= 0 {
+                f.lng = hp_text(t, sp[first_long].at, sp[first_long].at + sp[first_long].n)
+                f.has_lng = true
+            }
+        }
+        if f.has_lng && hp_flag_known(p, f.lng, true, 0) {
+            f.has_lng = false
+            f.lng = ""
+        }
+        if f.shrt != 0 && hp_flag_known(p, "", false, f.shrt) {
+            f.shrt = 0
+        }
+        if !f.has_lng && f.shrt == 0 {
+            k += 1
+            continue
+        }
+        (mut p.flags).push(f)
+        k += 1
+    }
+}
+
+/// `hp_classify` (`comphelp.c:919-974`).
+fn hp_classify(mut p: HpParse) {
+    let t = copy p.term
+    let d = copy p.desc
+    var ta = 0
+    var n = t.len
+    let dn = if p.has_desc then d.len else 0
+    var i = 0
+    var prefixed = false
+    if p.section == HS_IGNORE || n == 0 || p.term_cut || hp_find_bytes(t, 0, n, 0, 27) >= 0 {
+        return
+    }
+    for w in p.words {
+        let k = w.len
+        var j = i
+        while j < n && hp_blank(t[j] as int) {
+            j += 1
+        }
+        var same = n - j >= k
+        if same {
+            var q = 0
+            for b in w.bytes() {
+                if t[j + q] != b {
+                    same = false
+                    break
+                }
+                q += 1
+            }
+        }
+        if same && (j + k == n || hp_blank(t[j + k] as int)) {
+            i = j + k
+            prefixed = true
+        } else {
+            break
+        }
+    }
+    if prefixed {
+        while i < n && hp_blank(t[i] as int) {
+            i += 1
+        }
+        ta = i
+        n -= i
+        if n == 0 {
+            return
+        }
+    } else if p.section == HS_USAGE && t[0] as int != 45 {
+        return
+    }
+    if t[ta] as int == 45 {
+        hp_flag_row(mut p, t, ta, n, d, 0, dn, p.tab_gap)
+        return
+    }
+    if !prefixed && hp_choice_line(mut p, t, ta, n) {
+        return
+    }
+    if p.section == HS_FLAGS {
+        return
+    }
+    hp_sub_row(mut p, t, ta, n, d, 0, dn)
+}
+
+fn hp_finish(mut p: HpParse) {
+    if !p.active {
+        return
+    }
+    p.active = false
+    hp_classify(mut p)
+}
+
+/// `hp_desc_append` (`comphelp.c:984-998`): C's buffer holds 1,023.
+fn hp_desc_append(mut p: HpParse, s: List[byte], at: int, n0: int) {
+    if p.desc.len != 0 && p.desc.len < HP_DESC_MAX - 1 {
+        (mut p.desc).push(32 as byte)
+    }
+    let room = HP_DESC_MAX - 1 - p.desc.len
+    let n = if n0 > room then room else n0
+    var i = 0
+    while i < n {
+        (mut p.desc).push(s[at + i])
+        i += 1
+    }
+}
+
+/// `hp_gap` (`comphelp.c:1000-1015`): `(offset, tab)`, `n` for none.
+fn hp_gap(s: List[byte], at: int, n: int) -> (int, bool) {
+    var i = 0
+    while i < n {
+        if s[at + i] as int == 9 {
+            return (i, true)
+        }
+        if s[at + i] as int == 32 && i + 1 < n && s[at + i + 1] as int == 32 {
+            return (i, false)
+        }
+        i += 1
+    }
+    (n, false)
+}
+
+/// `hp_start` (`comphelp.c:1017-1062`): `line` is the stripped text,
+/// `la` its line start, `ws` the body's offset in it.
+fn hp_start(mut p: HpParse, indent: int, s: List[byte], la: int, ws: int, bn: int) {
+    let body = la + ws
+    let (g, tab) = hp_gap(s, body, bn)
+    var tl = g
+    var dstart = bn
+    if g < bn {
+        dstart = g
+        while dstart < bn && hp_blank(s[body + dstart] as int) {
+            dstart += 1
+        }
+    } else if p.align_off > ws &&
+        p.align_indent == indent &&
+        p.align_off < ws + bn &&
+        s[la + p.align_off - 1] as int == 32 &&
+        !hp_blank(s[la + p.align_off] as int) &&
+        hp_find_bytes(s, body, p.align_off - 1 - ws, 0, 32) < 0 {
+        tl = p.align_off - 1 - ws
+        dstart = p.align_off - ws
+    }
+    p.active = true
+    p.indent = indent
+    p.tab_gap = tab
+    p.term_cut = tl >= HP_TERM_MAX
+    if p.term_cut {
+        tl = HP_TERM_MAX - 1
+    }
+    while tl > 0 && hp_blank(s[body + tl - 1] as int) {
+        tl -= 1
+    }
+    p.term = hp_slice(s, body, body + tl)
+    p.desc = List[byte]()
+    p.has_desc = dstart < bn
+    p.desc_col = 0
+    if p.has_desc {
+        hp_desc_append(mut p, s, body + dstart, bn - dstart)
+        p.desc_col = indent + dstart
+        if !tab && hp_find_bytes(s, la, ws + dstart, 0, 9) < 0 {
+            p.align_indent = indent
+            p.align_off = ws + dstart
+        }
+    }
+}
+
+/// `hp_rowlike` (`comphelp.c:1064-1075`).
+fn hp_rowlike(s: List[byte], at: int, n: int) -> bool {
+    let (g, _) = hp_gap(s, at, n)
+    var i = g
+    if g == 0 || g >= n {
+        return false
+    }
+    while i < n && hp_blank(s[at + i] as int) {
+        i += 1
+    }
+    i < n
+}
+
+/// `hp_line` (`comphelp.c:1077-1126`).
+fn hp_line(mut p: HpParse, s: List[byte], la: int, n0: int) {
+    var n = n0
+    var ws = 0
+    var indent = 0
+    while n > 0 && hp_blank(s[la + n - 1] as int) {
+        n -= 1
+    }
+    if n == 0 {
+        hp_finish(mut p)
+        return
+    }
+    while ws < n && hp_blank(s[la + ws] as int) {
+        indent = if s[la + ws] as int == 9 then (indent / 8 + 1) * 8 else indent + 1
+        ws += 1
+    }
+    if ws == 0 || indent < 2 && s[la] as int != 9 {
+        hp_finish(mut p)
+        hp_set_section(mut p, s, la + ws, n - ws)
+        return
+    }
+    if p.active && indent > p.indent {
+        let choice_rows = p.term.len != 0 &&
+            p.term[0] as int == 123 &&
+            hp_rowlike(s, la + ws, n - ws)
+        if !p.has_desc && !choice_rows {
+            p.has_desc = true
+            p.desc_col = indent
+            if s[la + ws - 1] as int == 9 {
+                p.tab_gap = true
+            }
+            hp_desc_append(mut p, s, la + ws, n - ws)
+            return
+        }
+        if !choice_rows &&
+            (indent >= p.desc_col || !hp_rowlike(s, la + ws, n - ws) && s[la + ws] as int != 45) {
+            hp_desc_append(mut p, s, la + ws, n - ws)
+            return
+        }
+    }
+    hp_finish(mut p)
+    hp_start(mut p, indent, s, la, ws, n - ws)
+}
+
+/// `hp_build` (`comphelp.c:1128-1210`): the spec, or `(false, _)` for a
+/// NEGATIVE result (no subcommand and no flag row).
+fn hp_build(p: HpParse, origin: str) -> (bool, CompSpec) {
+    var spec = compspec_new(origin)
+    if p.subs.len == 0 && p.flags.len == 0 {
+        return (false, spec)
+    }
+    var flags = List[SpecFlag]()
+    for f in p.flags {
+        var o = SpecFlag {
+            lng: f.lng,
+            has_lng: f.has_lng,
+            shrt: "",
+            has_shrt: false,
+            desc: "",
+            has_desc: false,
+            arg: -1,
+            arg_optional: false,
+            global: f.global,
+            changes_dir: false,
+        }
+        if f.shrt != 0 {
+            var b = List[byte]()
+            (mut b).push(f.shrt as byte)
+            o.shrt = str_from_utf8(b) else ""
+            o.has_shrt = true
+        }
+        if f.has_desc && f.desc.len != 0 {
+            o.desc = f.desc
+            o.has_desc = true
+        }
+        if f.has_arg {
+            var arg = SpecArg {
+                kind: f.kind,
+                repeat: false,
+                ext: List[str](),
+                values: List[SpecValue](),
+                generator: "",
+                has_generator: false,
+                gen: -1,
+            }
+            if f.kind == SPEC_ARG_VALUES {
+                for v in f.values {
+                    (mut arg.values).push(SpecValue { value: v, desc: "", has_desc: false })
+                }
+            }
+            (mut spec.args).push(arg)
+            o.arg = spec.args.len - 1
+            o.arg_optional = f.arg_optional
+        }
+        (mut flags).push(o)
+    }
+    spec.nodes[0].flags = flags
+    var subs = List[int]()
+    for s in p.subs {
+        var o = SpecNode {
+            name: s.name,
+            has_name: true,
+            aliases: copy s.aliases,
+            desc: "",
+            has_desc: false,
+            flags: List[SpecFlag](),
+            args: List[int](),
+            subs: List[int](),
+            dash_values: -1,
+            after_dashdash: -1,
+            parent: 0,
+        }
+        if s.has_desc && s.desc.len != 0 {
+            o.desc = s.desc
+            o.has_desc = true
+        }
+        (mut spec.nodes).push(o)
+        (mut subs).push(spec.nodes.len - 1)
+    }
+    spec.nodes[0].subs = subs
+    (true, spec)
+}
+
+/// `yew_comphelp_parse` (`comphelp.c:1212-1248`): help text into a spec
+/// whose ROOT is the command at `words` (`words[0]` the program's
+/// basename, then the subcommand path the help was asked for). `(false,
+/// _)` is a NEGATIVE result. Input past `COMPHELP_COLLECT_MAX` is ignored.
+pub fn comphelp_parse(origin: str, words: List[str], text: List[byte]) -> (bool, CompSpec) {
+    let len = if text.len > COMPHELP_COLLECT_MAX then COMPHELP_COLLECT_MAX else text.len
+    let clean = hp_strip(text, len)
+    var ws = List[str]()
+    for w in words {
+        if ws.len < HP_WORDS_MAX {
+            (mut ws).push(w)
+        }
+    }
+    var p = HpParse {
+        words: ws,
+        section: HS_GENERAL,
+        global: false,
+        active: false,
+        has_desc: false,
+        tab_gap: false,
+        indent: 0,
+        desc_col: 0,
+        term: List[byte](),
+        term_cut: false,
+        desc: List[byte](),
+        align_indent: 0,
+        align_off: 0,
+        choices: List[str](),
+        subs: List[HpSub](),
+        flags: List[HpFlag](),
+    }
+    var at = 0
+    while at < clean.len {
+        var e = at
+        while e < clean.len && clean[e] as int != 10 {
+            e += 1
+        }
+        hp_line(mut p, clean, at, e - at)
+        at = e + 1
+    }
+    hp_finish(mut p)
+    hp_build(p, if origin.len == 0 then "help" else origin)
+}
+
+// ==================================================================
+// §1: policy
+// ==================================================================
+
+/// `yew_comphelp_policy` (`comphelp.c:1254-1270`): the option
+/// `shell.complete_help` (the options model is yw09's: the port reads the
+/// literal store `init.fl`'s `set` filled), native by default.
+pub fn comphelp_policy(ed: Ed) -> int {
+    let v = ed.opts.store["shell.complete_help"] else "native"
+    if v == "all" {
+        return HELP_POLICY_ALL
+    }
+    if v == "off" {
+        return HELP_POLICY_OFF
+    }
+    HELP_POLICY_NATIVE
+}
+
+/// `yew_comphelp_denied` (`comphelp.c:1272-1297`): the denylist on a
+/// basename, `mkfs.*` included.
+pub fn comphelp_denied(name: str) -> bool {
+    if name.starts_with("mkfs.") {
+        return true
+    }
+    for d in "rm rmdir dd shred srm wipefs mkfs fdisk diskutil format shutdown reboot halt poweroff kill killall pkill su sudo doas passwd chsh login logout exec reset".
+        words() {
+        if d == name {
+            return true
+        }
+    }
+    false
+}
+
+/// `yew_comphelp_exe_kind` (`comphelp.c:1299-1333`): what the first four
+/// bytes of an executable regular file say it is.
+pub fn comphelp_exe_kind(path: str) -> int {
+    if !job_exec_ok(path) {
+        return HELP_EXE_NONE
+    }
+    var f = fs.open(path) else |_| { return HELP_EXE_NONE }
+    let head = fs.read_chunk(mut f, 4) else List[byte]()
+    fs.close(take f) else |_| {}
+    if head.len >= 2 && head[0] as int == 35 && head[1] as int == 33 {
+        return HELP_EXE_SCRIPT
+    }
+    if head.len < 4 {
+        return HELP_EXE_OTHER
+    }
+    let h0 = head[0] as int
+    let h1 = head[1] as int
+    let h2 = head[2] as int
+    let h3 = head[3] as int
+    if h0 == 127 && h1 == 69 && h2 == 76 && h3 == 70 {
+        return HELP_EXE_NATIVE
+    }
+    // Mach-O 32/64 both orders, and the universal header (`:1301-1304`).
+    if h0 == 254 && h1 == 237 && h2 == 250 && (h3 == 206 || h3 == 207) ||
+        (h0 == 206 || h0 == 207) && h1 == 250 && h2 == 237 && h3 == 254 ||
+        h0 == 202 && h1 == 254 && h2 == 186 && h3 == 190 {
+        return HELP_EXE_NATIVE
+    }
+    HELP_EXE_OTHER
+}
+
+/// `yew_comphelp_kind_allowed` (`comphelp.c:1335-1347`).
+pub fn comphelp_kind_allowed(policy: int, kind: int) -> bool {
+    if policy == HELP_POLICY_NATIVE {
+        return kind == HELP_EXE_NATIVE
+    }
+    if policy == HELP_POLICY_ALL {
+        return kind != HELP_EXE_NONE
+    }
+    false
+}
+
+// ==================================================================
+// State
+// ==================================================================
+
+// `comphelp.c:1353-1363`.
+const CH_MEM_MAX: int = 64
+
+const CH_QUEUE_MAX: int = 8
+
+const CH_MEMO_MAX: int = 64
+
+const CH_INFLIGHT_MAX: int = 1
+
+const CH_FILE_MAX: int = 1048576
+
+struct ChLoaded {
+    path: str,
+    spec: int,
+}
+
+struct ChEntry {
+    real: str,
+    mtime: int,
+    size: int,
+    exec: str,
+    root: int,
+    loaded: List[ChLoaded],
+    used: int,
+}
+
+struct ChReq {
+    key: str,
+    exec: str,
+    real: str,
+    mtime: int,
+    size: int,
+    subs: List[str],
+    inflight: bool,
+    job_id: int,
+}
+
+struct ChMemo {
+    word: str,
+    exec: str,
+    has_exec: bool,
+    real: str,
+    mtime: int,
+    size: int,
+    kind: int,
+}
+
+/// The help layer's state (C's `help`, `comphelp.c:1404-1420`).
+pub struct CompHelp {
+    entries: List[ChEntry],
+    clock: int,
+    q: List[ChReq],
+    memo: List[ChMemo],
+    notice: str,
+    has_notice: bool,
+    write_reported: bool,
+    spawns: int,
+    timeout_ms: int,
+    last_argv: str,
+}
+
+/// An empty help layer.
+pub fn comphelp_new() -> CompHelp {
+    CompHelp {
+        entries: List[ChEntry](),
+        clock: 0,
+        q: List[ChReq](),
+        memo: List[ChMemo](),
+        notice: "",
+        has_notice: false,
+        write_reported: false,
+        spawns: 0,
+        timeout_ms: 0,
+        last_argv: "",
+    }
+}
+
+/// `base_of` (`comphelp.c:1422-1427`).
+fn ch_base_of(path: str) -> str {
+    let slash = path.rfind("/") else -1
+    if slash >= 0 then path[slash + 1..] else path
+}
+
+fn ch_notice_queue(mut h: CompHelp, msg: str) {
+    if !h.has_notice {
+        h.notice = msg
+        h.has_notice = true
+    }
+}
+
+/// `yew_comphelp_notice` (`comphelp.c:1447-1455`).
+pub fn comphelp_notice(mut ed: Ed) -> bool {
+    if !ed.help.has_notice {
+        return false
+    }
+    let m = ed.help.notice
+    ed.help.notice = ""
+    ed.help.has_notice = false
+    ed_msg(mut ed, MSG_WARN, m)
+    true
+}
+
+fn ch_req_drop_at(mut h: CompHelp, at: int) {
+    var keep = List[ChReq]()
+    var i = 0
+    while i < h.q.len {
+        if i != at {
+            (mut keep).push(copy h.q[i])
+        }
+        i += 1
+    }
+    h.q = keep
+}
+
+/// `yew_comphelp_prompt_closed` (`comphelp.c:1500-1513`).
+pub fn comphelp_prompt_closed(mut h: CompHelp) {
+    h.memo = List[ChMemo]()
+    var i = 0
+    while i < h.q.len {
+        if h.q[i].inflight {
+            i += 1
+        } else {
+            ch_req_drop_at(mut h, i)
+        }
+    }
+}
+
+/// `yew_comphelp_reset` (`comphelp.c:1515-1530`): memory, queue, notices
+/// (not the disk).
+pub fn comphelp_reset(mut h: CompHelp) {
+    let t = h.timeout_ms
+    h = comphelp_new()
+    h.timeout_ms = t
+}
+
+/// `yew_comphelp_test_spawns` (`comphelp.c:1532-1535`).
+pub fn comphelp_spawns(h: CompHelp) -> int {
+    h.spawns
+}
+
+/// `yew_comphelp_test_set_timeout_ms` (`comphelp.c:1537-1540`).
+pub fn comphelp_set_timeout_ms(mut h: CompHelp, ms: int) {
+    h.timeout_ms = ms
+}
+
+/// `yew_comphelp_test_last_argv` (`comphelp.c:1542-1545`).
+pub fn comphelp_last_argv(h: CompHelp) -> str {
+    h.last_argv
+}
+
+/// `yew_comphelp_inflight` (`comphelp.c:1547-1557`).
+pub fn comphelp_inflight(h: CompHelp) -> int {
+    var n = 0
+    for r in h.q {
+        if r.inflight {
+            n += 1
+        }
+    }
+    n
+}
+
+/// `yew_comphelp_queued` (`comphelp.c:1559-1562`).
+pub fn comphelp_queued(h: CompHelp) -> int {
+    h.q.len - comphelp_inflight(h)
+}
+
+fn ch_req_find(h: CompHelp, key: str) -> int {
+    var i = 0
+    while i < h.q.len {
+        if h.q[i].key == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_comphelp_awaiting` (`comphelp.c:1575-1578`).
+pub fn comphelp_awaiting(h: CompHelp, key: str) -> bool {
+    key.len != 0 && ch_req_find(h, key) >= 0
+}
+
+// ==================================================================
+// §5: keys and the disk cache
+// ==================================================================
+
+fn ch_fnv(h0: wrapping[u64], data: str) -> wrapping[u64] {
+    var h = h0
+    for b in data.bytes() {
+        h = h ^ b as int as wrapping[u64]
+        h = h * 1099511628211
+    }
+    // C hashes each field with its NUL (`strlen + 1`).
+    h = h ^ 0
+    h * 1099511628211
+}
+
+fn ch_hex16(h: wrapping[u64]) -> str {
+    let digits = "0123456789abcdef"
+    var b = List[byte]()
+    // The digit index is an `int` counted UP: a counter used as a shift of
+    // a `wrapping[u64]` would be inferred unsigned, and `k >= 0` never
+    // false (the probe that found it ran away to 30 GB).
+    var k: int = 0
+    while k < 16 {
+        var v = h
+        var sh = 0
+        while sh < 15 - k {
+            v = v >> 4
+            sh += 1
+        }
+        let nib = (v & 15) as int
+        (mut b).push(digits.bytes()[nib])
+        k += 1
+    }
+    str_from_utf8(b) else ""
+}
+
+/// `yew_comphelp_key` (`comphelp.c:1596-1613`): FNV-1a over `real \0
+/// mtime \0 size \0 sub \0 …`, 16 hex digits.
+pub fn comphelp_key(real: str, mtime: int, size: int, subs: List[str]) -> str {
+    var h: wrapping[u64] = 14695981039346656037
+    h = ch_fnv(h, real)
+    h = ch_fnv(h, "{mtime}")
+    h = ch_fnv(h, "{size}")
+    for s in subs {
+        h = ch_fnv(h, s)
+    }
+    ch_hex16(h)
+}
+
+/// `yew_comphelp_cache_dir` (`comphelp.c:1615-1625`).
+pub fn comphelp_cache_dir() -> (bool, str) {
+    let root = util.xdg_cache_dir() else |_| { return (false, "") }
+    (true, "{root}/completions/help")
+}
+
+/// `cache_file_name` (`comphelp.c:1627-1639`).
+fn ch_cache_file_name(name: str) -> bool {
+    if name.len != 19 || !name.ends_with(".fl") {
+        return false
+    }
+    var i = 0
+    while i < 16 {
+        let c = name.bytes()[i] as int
+        if !(c >= 48 && c <= 57 || c >= 97 && c <= 102) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `read_small` (`comphelp.c:1655-1690`): a regular file of at most
+/// 1 MiB.
+fn ch_read_small(path: str) -> (bool, List[byte]) {
+    let info = fs.stat(path) else |_| { return (false, List[byte]()) }
+    if info.kind != 0 || info.size > CH_FILE_MAX {
+        return (false, List[byte]())
+    }
+    let b = fs.read_bytes(path) else |_| { return (false, List[byte]()) }
+    if b.len > CH_FILE_MAX {
+        return (false, List[byte]())
+    }
+    (true, b)
+}
+
+fn ch_map_str(doc: FlDoc, m: int, key: str) -> (bool, str) {
+    let v = fl_map_find(doc, m, key)
+    if fl_kind(doc, v) != FN_STR {
+        return (false, "")
+    }
+    (true, doc.nodes[v].text)
+}
+
+/// `cache_read` (`comphelp.c:1768-1862`): read and VALIDATE one cache
+/// file against its key's inputs; any mismatch, unknown key or parse
+/// error is a miss. `(hit, has_tree, tree)`: a hit without a tree is a
+/// negative answer.
+fn ch_cache_read(
+    mut reg: CompSpecs,
+    key: str,
+    real: str,
+    mtime: int,
+    size: int,
+    subs: List[str],
+) -> (bool, bool, CompSpec) {
+    let none = compspec_new("")
+    let (has_dir, dir) = comphelp_cache_dir()
+    if !has_dir {
+        return (false, false, none)
+    }
+    let (ok, src) = ch_read_small("{dir}/{key}.fl")
+    if !ok {
+        return (false, false, none)
+    }
+    let doc = fl_read_literal(src)
+    if doc.error.len != 0 || fl_kind(doc, doc.top[0]) != FN_MAP {
+        return (false, false, none)
+    }
+    let m = doc.top[0]
+    for k in doc.nodes[m].keys {
+        let name = doc.nodes[k].text
+        if !(
+            name == "help_cache" ||
+                name == "exe" ||
+                name == "mtime" ||
+                name == "size" ||
+                name == "argv" ||
+                name == "empty" ||
+                name == "node"
+        ) {
+            return (false, false, none)
+        }
+    }
+    let hc = fl_map_find(doc, m, "help_cache")
+    let (has_exe, exe) = ch_map_str(doc, m, "exe")
+    let mt = fl_map_find(doc, m, "mtime")
+    let sz = fl_map_find(doc, m, "size")
+    let em = fl_map_find(doc, m, "empty")
+    if fl_kind(doc, hc) != FN_INT ||
+        doc.nodes[hc].num != 1 ||
+        !has_exe ||
+        exe != real ||
+        fl_kind(doc, mt) != FN_INT ||
+        doc.nodes[mt].num != mtime ||
+        fl_kind(doc, sz) != FN_INT ||
+        doc.nodes[sz].num != size ||
+        fl_kind(doc, em) != FN_BOOL {
+        return (false, false, none)
+    }
+    let empty = doc.nodes[em].num != 0
+    let av = fl_map_find(doc, m, "argv")
+    if fl_kind(doc, av) != FN_LIST || doc.nodes[av].vals.len != subs.len {
+        return (false, false, none)
+    }
+    var i = 0
+    while i < subs.len {
+        let s = doc.nodes[av].vals[i]
+        if fl_kind(doc, s) != FN_STR || doc.nodes[s].text != subs[i] {
+            return (false, false, none)
+        }
+        i += 1
+    }
+    let node = fl_map_find(doc, m, "node")
+    if empty {
+        return (node < 0, false, none)
+    }
+    if node < 0 {
+        return (false, false, none)
+    }
+    let (good, spec, _) = compspec_read_node(mut reg, "help:{real}", doc, node)
+    if !good {
+        return (false, false, none)
+    }
+    (true, true, spec)
+}
+
+/// `cache_prune` (`comphelp.c:1877-1921`): past `COMPHELP_CACHE_MAX`
+/// files the oldest by mtime go until `COMPHELP_CACHE_KEEP` remain.
+fn ch_cache_prune(dir: str) {
+    let names = fs.read_dir(dir) else |_| { return }
+    var rows = List[str]()
+    var times = List[int]()
+    for n in names {
+        if !ch_cache_file_name(n) {
+            continue
+        }
+        let info = fs.stat("{dir}/{n}") else |_| { continue }
+        if info.kind == 0 {
+            (mut rows).push(n)
+            (mut times).push(info.mtime_s)
+        }
+    }
+    if rows.len <= COMPHELP_CACHE_MAX {
+        return
+    }
+    // A stable insertion sort by (mtime, name), C's `prune_cmp`.
+    var i = 1
+    while i < rows.len {
+        let r = rows[i]
+        let t = times[i]
+        var j = i
+        while j > 0 && (times[j - 1] > t || times[j - 1] == t && cs_str_less(r, rows[j - 1])) {
+            rows[j] = rows[j - 1]
+            times[j] = times[j - 1]
+            j -= 1
+        }
+        rows[j] = r
+        times[j] = t
+        i += 1
+    }
+    i = 0
+    while i < rows.len - COMPHELP_CACHE_KEEP {
+        fs.remove("{dir}/{rows[i]}") else |_| {}
+        i += 1
+    }
+}
+
+/// `cache_write` (`comphelp.c:1923-1992`): the atomic write the state
+/// files use. Reached only from a finished help job (R-yw04-1 at 0.2.33).
+fn ch_cache_write(mut h: CompHelp, reg: CompSpecs, r: ChReq, has_spec: bool, spec: int) {
+    let (has_dir, dir) = comphelp_cache_dir()
+    if !has_dir {
+        return
+    }
+    if !util.mkdirs(dir, 448) {
+        if !h.write_reported {
+            h.write_reported = true
+            ch_notice_queue(
+                mut h,
+                "help cache: cannot create its directory; learned completions last one session",
+            )
+        }
+        return
+    }
+    var out = List[byte]()
+    let tail = if r.subs.len == 0 then "" else " \u{2026}"
+    fdw_str(
+        mut out,
+        "# yew: learned from `{ch_base_of(r.exec)}{tail} --help`; ed.shell.complete_forget drops it\n",
+    )
+    fdw_str(mut out, "{{\n")
+    fdw_str(mut out, "  help_cache: 1,\n")
+    fdw_str(mut out, "  exe: ")
+    fdw_string(mut out, r.real)
+    fdw_str(mut out, ",\n  mtime: {r.mtime},\n  size: {r.size},\n  argv: [\n")
+    for s in r.subs {
+        fdw_str(mut out, "    ")
+        fdw_string(mut out, s)
+        fdw_str(mut out, ",\n")
+    }
+    fdw_str(mut out, "  ],\n")
+    fdw_str(mut out, if has_spec then "  empty: false,\n" else "  empty: true,\n")
+    if has_spec {
+        fdw_str(mut out, "  node: ")
+        compspec_write_node(reg.pool[spec], 0, 1, true, mut out)
+    }
+    fdw_str(mut out, "}}\n\n")
+    let err = text.file_write_atomic("{dir}/{r.key}.fl", out, 384)
+    if !text.save_committed(err) && !h.write_reported {
+        h.write_reported = true
+        ch_notice_queue(mut h, "help cache: cannot write; learned completions last one session")
+    }
+    ch_cache_prune(dir)
+}
+
+// ==================================================================
+// In memory: trees, grafts
+// ==================================================================
+
+fn ch_entry_find(mut h: CompHelp, real: str, mtime: int, size: int) -> int {
+    var i = 0
+    while i < h.entries.len {
+        if h.entries[i].mtime == mtime && h.entries[i].size == size && h.entries[i].real == real {
+            h.clock += 1
+            h.entries[i].used = h.clock
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn ch_entry_of_spec(h: CompHelp, spec: int) -> int {
+    var i = 0
+    while spec >= 0 && i < h.entries.len {
+        if h.entries[i].root == spec {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// C's swap-remove (`help.v[i] = help.v[n - 1]`).
+fn ch_entry_remove(mut h: CompHelp, i: int) {
+    let last = h.entries.len - 1
+    if i != last {
+        h.entries[i] = copy h.entries[last]
+    }
+    let _ = (mut h.entries).pop()
+}
+
+/// `entry_add` (`comphelp.c:2022-2059`).
+fn ch_entry_add(mut h: CompHelp, real: str, mtime: int, size: int, exec: str) -> int {
+    var i = 0
+    while i < h.entries.len {
+        if h.entries[i].real == real {
+            ch_entry_remove(mut h, i)
+            break
+        }
+        i += 1
+    }
+    if h.entries.len == CH_MEM_MAX {
+        var oldest = 0
+        i = 1
+        while i < h.entries.len {
+            if h.entries[i].used < h.entries[oldest].used {
+                oldest = i
+            }
+            i += 1
+        }
+        ch_entry_remove(mut h, oldest)
+    }
+    h.clock += 1
+    (mut h.entries).push(ChEntry {
+        real: real,
+        mtime: mtime,
+        size: size,
+        exec: exec,
+        root: -1,
+        loaded: List[ChLoaded](),
+        used: h.clock,
+    })
+    h.entries.len - 1
+}
+
+/// `node_path` (`comphelp.c:2061-2079`): the names from the root down to
+/// `node`, `(ok, names)`; past `COMPHELP_DEPTH_MAX` not ok.
+fn ch_node_path(spec: CompSpec, node: int) -> (bool, List[str]) {
+    var names = List[str]()
+    var n = node
+    while n >= 0 && spec.nodes[n].parent >= 0 {
+        if names.len == COMPHELP_DEPTH_MAX || !spec.nodes[n].has_name {
+            return (false, names)
+        }
+        (mut names).push(spec.nodes[n].name)
+        n = spec.nodes[n].parent
+    }
+    var out = List[str]()
+    var i = names.len - 1
+    while i >= 0 {
+        (mut out).push(names[i])
+        i -= 1
+    }
+    (true, out)
+}
+
+fn ch_path_string(names: List[str]) -> str {
+    var s = ""
+    var i = 0
+    while i < names.len {
+        if i != 0 {
+            s += " "
+        }
+        s += names[i]
+        i += 1
+    }
+    s
+}
+
+fn ch_entry_loaded(e: ChEntry, path: str) -> bool {
+    for l in e.loaded {
+        if l.path == path {
+            return true
+        }
+    }
+    false
+}
+
+/// `entry_node` (`comphelp.c:2113-2140`).
+fn ch_entry_node(spec: CompSpec, names: List[str]) -> int {
+    var node = 0
+    for name in names {
+        var next = -1
+        for k in spec.nodes[node].subs {
+            if spec.nodes[k].name == name {
+                next = k
+                break
+            }
+        }
+        if next < 0 {
+            return -1
+        }
+        node = next
+    }
+    node
+}
+
+/// `entry_graft` (`comphelp.c:2142-2185`): hang a subcommand's own help
+/// under its node (copied into the entry's tree, whose pool indices are
+/// its own); `has_child` false records a negative answer.
+fn ch_entry_graft(
+    mut h: CompHelp,
+    mut reg: CompSpecs,
+    e: int,
+    names: List[str],
+    has_child: bool,
+    child: CompSpec,
+) {
+    let root = h.entries[e].root
+    let node = ch_entry_node(reg.pool[root], names)
+    let path = ch_path_string(names)
+    if node < 0 || ch_entry_loaded(h.entries[e], path) {
+        return
+    }
+    (mut h.entries[e].loaded).push(ChLoaded { path: path, spec: -1 })
+    if !has_child {
+        return
+    }
+    let base_n = reg.pool[root].nodes.len
+    let base_a = reg.pool[root].args.len
+    // The child's args and nodes join the tree, re-indexed.
+    for a in child.args {
+        (mut reg.pool[root].args).push(copy a)
+    }
+    var k = 1
+    while k < child.nodes.len {
+        var c = copy child.nodes[k]
+        c.parent = if c.parent == 0 then node else c.parent - 1 + base_n
+        var subs = List[int]()
+        for s in c.subs {
+            (mut subs).push(s - 1 + base_n)
+        }
+        c.subs = subs
+        var args = List[int]()
+        for a in c.args {
+            (mut args).push(a + base_a)
+        }
+        c.args = args
+        if c.dash_values >= 0 {
+            c.dash_values += base_a
+        }
+        if c.after_dashdash >= 0 {
+            c.after_dashdash += base_a
+        }
+        var fl = List[SpecFlag]()
+        for f in c.flags {
+            var g = copy f
+            if g.arg >= 0 {
+                g.arg += base_a
+            }
+            (mut fl).push(g)
+        }
+        c.flags = fl
+        (mut reg.pool[root].nodes).push(c)
+        k += 1
+    }
+    let croot = copy child.nodes[0]
+    var fl = List[SpecFlag]()
+    for f in croot.flags {
+        var g = copy f
+        if g.arg >= 0 {
+            g.arg += base_a
+        }
+        (mut fl).push(g)
+    }
+    reg.pool[root].nodes[node].flags = fl
+    var args = List[int]()
+    for a in croot.args {
+        (mut args).push(a + base_a)
+    }
+    reg.pool[root].nodes[node].args = args
+    var subs = List[int]()
+    for s in croot.subs {
+        (mut subs).push(s - 1 + base_n)
+    }
+    reg.pool[root].nodes[node].subs = subs
+}
+
+// ==================================================================
+// Resolution of the command word
+// ==================================================================
+
+/// `resolve_exec` (`comphelp.c:2187-2229`): a word with a `/` is the
+/// user's own path from the directory `:!` runs in; otherwise the first
+/// ABSOLUTE `$PATH` element holding an executable regular file.
+fn ch_resolve_exec(ws_root: str, word: str) -> (bool, str) {
+    if word.contains("/") {
+        let path = if word.starts_with("/") then word else "{ws_root}/{word}"
+        if job_exec_ok(path) {
+            return (true, path)
+        }
+        return (false, "")
+    }
+    let env = env_get("PATH") else |_| { return (false, "") }
+    for dir in env.split(":") {
+        if dir.len != 0 && dir.starts_with("/") {
+            let path = "{dir}/{word}"
+            if job_exec_ok(path) {
+                return (true, path)
+            }
+        }
+    }
+    (false, "")
+}
+
+/// `memo_for` (`comphelp.c:2231-2268`).
+fn ch_memo_for(mut h: CompHelp, ws_root: str, word: str) -> int {
+    var i = 0
+    while i < h.memo.len {
+        if h.memo[i].word == word {
+            return i
+        }
+        i += 1
+    }
+    if h.memo.len == CH_MEMO_MAX {
+        var keep = List[ChMemo]()
+        i = 1
+        while i < h.memo.len {
+            (mut keep).push(copy h.memo[i])
+            i += 1
+        }
+        h.memo = keep
+    }
+    var m = ChMemo {
+        word: word,
+        exec: "",
+        has_exec: false,
+        real: "",
+        mtime: 0,
+        size: 0,
+        kind: HELP_EXE_NONE,
+    }
+    let (found, exec) = ch_resolve_exec(ws_root, word)
+    if found {
+        let real = text.file_realpath(exec) else ""
+        if real.len != 0 {
+            let info = fs.stat(real) else |_| {
+                (mut h.memo).push(m)
+                return h.memo.len - 1
+            }
+            m.exec = exec
+            m.has_exec = true
+            m.real = real
+            m.mtime = info.mtime_s
+            m.size = info.size
+            m.kind = comphelp_exe_kind(real)
+        }
+    }
+    (mut h.memo).push(m)
+    h.memo.len - 1
+}
+
+/// `may_ask` (`comphelp.c:2270-2287`).
+fn ch_may_ask(mut ed: Ed, word: str, mi: int) -> bool {
+    let policy = comphelp_policy(ed)
+    let m = copy ed.help.memo[mi]
+    if policy == HELP_POLICY_OFF || !m.has_exec {
+        return false
+    }
+    if comphelp_denied(ch_base_of(word)) ||
+        comphelp_denied(ch_base_of(m.exec)) ||
+        comphelp_denied(ch_base_of(m.real)) {
+        return false
+    }
+    if !comphelp_kind_allowed(policy, m.kind) {
+        return false
+    }
+    if compspec_get(mut ed.specs, ch_base_of(word)) >= 0 ||
+        compspec_get(mut ed.specs, ch_base_of(m.real)) >= 0 {
+        return false
+    }
+    true
+}
+
+/// `queue_request` (`comphelp.c:2289-2323`).
+fn ch_queue_request(
+    mut h: CompHelp,
+    key: str,
+    exec: str,
+    real: str,
+    mtime: int,
+    size: int,
+    subs: List[str],
+) {
+    if ch_req_find(h, key) >= 0 {
+        return
+    }
+    if h.q.len == CH_QUEUE_MAX {
+        var i = 0
+        while i < h.q.len {
+            if !h.q[i].inflight {
+                ch_req_drop_at(mut h, i)
+                break
+            }
+            i += 1
+        }
+        if h.q.len == CH_QUEUE_MAX {
+            return
+        }
+    }
+    (mut h.q).push(ChReq {
+        key: key,
+        exec: exec,
+        real: real,
+        mtime: mtime,
+        size: size,
+        subs: copy subs,
+        inflight: false,
+        job_id: 0,
+    })
+}
+
+/// A help lookup's answer (`YewHelpLookup`, `comphelp.h:110-117`): `spec`
+/// the tree's pool index (-1 none), `key` the request that would answer.
+pub struct HelpLookup {
+    spec: int,
+    key: str,
+    pending: bool,
+}
+
+fn ch_lookup_none() -> HelpLookup {
+    HelpLookup { spec: -1, key: "", pending: false }
+}
+
+/// `yew_comphelp_lookup` (`comphelp.c:2325-2362`): memory, then the disk
+/// cache; a miss QUEUES a root request. Whether `out.spec` is set.
+pub fn comphelp_lookup(mut ed: Ed, word: str) -> (bool, HelpLookup) {
+    var out = ch_lookup_none()
+    if word.len == 0 ||
+        comphelp_policy(ed) == HELP_POLICY_OFF ||
+        comphelp_denied(ch_base_of(word)) {
+        return (false, out)
+    }
+    let mi = ch_memo_for(mut ed.help, shell_ws_root(ed), word)
+    if !ch_may_ask(mut ed, word, mi) {
+        return (false, out)
+    }
+    let m = copy ed.help.memo[mi]
+    let e = ch_entry_find(mut ed.help, m.real, m.mtime, m.size)
+    if e >= 0 {
+        ed.help.entries[e].exec = m.exec
+        out.spec = ed.help.entries[e].root
+        return (out.spec >= 0, out)
+    }
+    let key = comphelp_key(m.real, m.mtime, m.size, List[str]())
+    let (hit, has_tree, tree) = ch_cache_read(
+        mut ed.specs,
+        key,
+        m.real,
+        m.mtime,
+        m.size,
+        List[str](),
+    )
+    if hit {
+        let ne = ch_entry_add(mut ed.help, m.real, m.mtime, m.size, m.exec)
+        if has_tree {
+            ed.help.entries[ne].root = cs_pool_add(mut ed.specs, take tree)
+        }
+        out.spec = ed.help.entries[ne].root
+        return (out.spec >= 0, out)
+    }
+    ch_queue_request(mut ed.help, key, m.exec, m.real, m.mtime, m.size, List[str]())
+    out.key = key
+    out.pending = comphelp_awaiting(ed.help, key)
+    (false, out)
+}
+
+/// `yew_comphelp_lookup_in` (`comphelp.c:2364-2386`): a relative command
+/// word resolved against `cwd` (`has_cwd` false: unknown, nothing).
+pub fn comphelp_lookup_in(mut ed: Ed, word: str, cwd: str, has_cwd: bool) -> (bool, HelpLookup) {
+    if word.starts_with("/") || !word.contains("/") {
+        return comphelp_lookup(mut ed, word)
+    }
+    if !has_cwd {
+        return (false, ch_lookup_none())
+    }
+    comphelp_lookup(mut ed, "{cwd}/{word}")
+}
+
+/// `yew_comphelp_descend` (`comphelp.c:2388-2432`): `(answer, key)`.
+pub fn comphelp_descend(mut ed: Ed, spec: int, node: int) -> (int, str) {
+    let e = ch_entry_of_spec(ed.help, spec)
+    if e < 0 || node < 0 {
+        return (HELP_DESCEND_NONE, "")
+    }
+    let (ok, names) = ch_node_path(ed.specs.pool[spec], node)
+    if names.len == 0 || !ok {
+        return (HELP_DESCEND_READY, "")
+    }
+    if ch_entry_loaded(ed.help.entries[e], ch_path_string(names)) {
+        return (HELP_DESCEND_READY, "")
+    }
+    let en = copy ed.help.entries[e]
+    let k = comphelp_key(en.real, en.mtime, en.size, names)
+    let (hit, has_tree, tree) = ch_cache_read(mut ed.specs, k, en.real, en.mtime, en.size, names)
+    if hit {
+        ch_entry_graft(mut ed.help, mut ed.specs, e, names, has_tree, tree)
+        return (HELP_DESCEND_CHANGED, "")
+    }
+    if comphelp_policy(ed) != HELP_POLICY_OFF {
+        ch_queue_request(mut ed.help, k, en.exec, en.real, en.mtime, en.size, names)
+    }
+    let key = if comphelp_awaiting(ed.help, k) then k else ""
+    (HELP_DESCEND_PENDING, key)
+}
+
+// ==================================================================
+// §2, §6: the jobs
+// ==================================================================
+
+/// `store_answer` (`comphelp.c:2435-2452`).
+fn ch_store_answer(mut ed: Ed, r: ChReq, has_spec: bool, take spec: CompSpec) {
+    if r.subs.len == 0 {
+        let e = ch_entry_add(mut ed.help, r.real, r.mtime, r.size, r.exec)
+        if has_spec {
+            ed.help.entries[e].root = cs_pool_add(mut ed.specs, take spec)
+        }
+        return
+    }
+    let e = ch_entry_find(mut ed.help, r.real, r.mtime, r.size)
+    if e < 0 || ed.help.entries[e].root < 0 {
+        return
+    }
+    ch_entry_graft(mut ed.help, mut ed.specs, e, r.subs, has_spec, spec)
+}
+
+/// `yew_comphelp_idle_ready` (`comphelp.c:2512-2528`): a request is
+/// queued and could be spawned now. `others` is the generator and fish
+/// flights that share the four slots.
+pub fn comphelp_idle_ready(h: CompHelp, others: int) -> bool {
+    let flying = comphelp_inflight(h)
+    if flying >= CH_INFLIGHT_MAX || others + flying >= COMPGEN_MAX_INFLIGHT {
+        return false
+    }
+    for r in h.q {
+        if !r.inflight {
+            return true
+        }
+    }
+    false
+}
+
+/// `still_allowed` (`comphelp.c:2530-2550`).
+fn ch_still_allowed(mut ed: Ed, r: ChReq) -> bool {
+    let policy = comphelp_policy(ed)
+    if policy == HELP_POLICY_OFF ||
+        comphelp_denied(ch_base_of(r.exec)) ||
+        comphelp_denied(ch_base_of(r.real)) ||
+        compspec_get(mut ed.specs, ch_base_of(r.real)) >= 0 ||
+        compspec_get(mut ed.specs, ch_base_of(r.exec)) >= 0 {
+        return false
+    }
+    let real = text.file_realpath(r.exec) else ""
+    if real.len == 0 || real != r.real {
+        return false
+    }
+    let info = fs.stat(real) else |_| { return false }
+    info.mtime_s == r.mtime &&
+        info.size == r.size &&
+        comphelp_kind_allowed(policy, comphelp_exe_kind(r.real))
+}
+
+/// `yew_comphelp_idle` (`comphelp.c:2552-2638`): spawn the next queued
+/// request. At wolf 0.2.33 the help job's two pipes cannot be read while
+/// the loop runs (G2), so the spawn takes C's failure path (`:2627-2635`):
+/// the negative answer remembered for the session — not on disk, it was
+/// not the tool's answer — and the request dropped; the refusal is
+/// logged by name (R-yw04-1). Answers how many jobs it started (0).
+pub fn comphelp_idle(mut ed: Ed, others: int) -> int {
+    if !comphelp_idle_ready(ed.help, others) {
+        return 0
+    }
+    var at = -1
+    var i = 0
+    while i < ed.help.q.len {
+        if !ed.help.q[i].inflight {
+            at = i
+            break
+        }
+        i += 1
+    }
+    if at < 0 {
+        return 0
+    }
+    let r = copy ed.help.q[at]
+    if !ch_still_allowed(mut ed, r) {
+        ch_req_drop_at(mut ed.help, at)
+        return 0
+    }
+    var argv = r.exec
+    for s in r.subs {
+        argv += " {s}"
+    }
+    argv += " --help"
+    ed.help.last_argv = if argv.len > 1000 then argv[0..cs_floor_boundary(argv, 1000)] else argv
+    ed.help.spawns += 1
+    util.log_info("completion help {ch_base_of(r.exec)}: {job_stop_g2("the --help job")}")
+    ch_store_answer(mut ed, r, false, take compspec_new(""))
+    ch_req_drop_at(mut ed.help, at)
+    0
+}
+
+// ==================================================================
+// §5: ed.shell.complete_forget
+// ==================================================================
+
+/// `cache_file_exe` (`comphelp.c:2641-2669`).
+fn ch_cache_file_exe(path: str) -> (bool, str) {
+    let (ok, src) = ch_read_small(path)
+    if !ok {
+        return (false, "")
+    }
+    let doc = fl_read_literal(src)
+    if doc.error.len != 0 || fl_kind(doc, doc.top[0]) != FN_MAP {
+        return (false, "")
+    }
+    ch_map_str(doc, doc.top[0], "exe")
+}
+
+/// `yew_comphelp_forget` (`comphelp.c:2671-2744`): cached help dropped —
+/// every entry when `name` is "", else those whose executable's basename
+/// is `name` or whose executable `name` resolves to. Memory too. `(files
+/// removed, error)`, -1 with the error.
+pub fn comphelp_forget(mut ed: Ed, name: str) -> (int, str) {
+    let all = name.len == 0
+    var real = ""
+    if !all {
+        let (found, exec) = ch_resolve_exec(shell_ws_root(ed), name)
+        if found {
+            real = text.file_realpath(exec) else ""
+        }
+    }
+    var i = 0
+    while i < ed.help.entries.len {
+        let er = ed.help.entries[i].real
+        if all || ch_base_of(er) == name || real.len != 0 && er == real {
+            ch_entry_remove(mut ed.help, i)
+        } else {
+            i += 1
+        }
+    }
+    ed.help.memo = List[ChMemo]()
+    let (has_dir, dir) = comphelp_cache_dir()
+    if !has_dir {
+        return (0, "")
+    }
+    if !fs.exists(dir) {
+        return (0, "")
+    }
+    let names = fs.read_dir(dir) else |e| {
+        return (-1, "cannot read the help cache: {e}")
+    }
+    var removed = 0
+    for n in names {
+        if !ch_cache_file_name(n) {
+            continue
+        }
+        let path = "{dir}/{n}"
+        var hit = all
+        if !hit {
+            let (ok, exe) = ch_cache_file_exe(path)
+            hit = ok && (ch_base_of(exe) == name || real.len != 0 && exe == real)
+        }
+        if hit {
+            fs.remove(path) else |_| { continue }
+            removed += 1
+        }
+    }
+    (removed, "")
+}
+
+/// `yew_comphelp_run_forget` (`comphelp.c:2746-2787`):
+/// `ed.shell.complete_forget [name]`.
+pub fn comphelp_run_forget(mut ed: Ed, sarg: str) -> int {
+    let name = sarg.trim()
+    if name.len >= 256 {
+        ed_msg(mut ed, MSG_ERROR, "ed.shell.complete_forget: name too long")
+        return CMD_ERR_ARG
+    }
+    let (n, err) = comphelp_forget(mut ed, name)
+    if n < 0 {
+        ed_msg(mut ed, MSG_ERROR, "ed.shell.complete_forget: {err}")
+        return CMD_ERR_IO
+    }
+    let s = if n == 1 then "" else "s"
+    if name.len == 0 {
+        ed_msg(mut ed, MSG_INFO, "forgot all learned help ({n} cache file{s})")
+    } else {
+        ed_msg(mut ed, MSG_INFO, "forgot learned help for {name} ({n} cache file{s})")
+    }
+    CMD_OK
+}

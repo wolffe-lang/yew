@@ -1,0 +1,2451 @@
+//! edit.compspec — completion specs (Sprint 57.24 §1-§3, §7).
+//!
+//! Ports sagitta `src/ui/compspec.c` (2,304 lines) and `compspec.h` at
+//! 9ace98c2. A spec is one Fletch DATA document
+//! (`runtime/completions/<cmd>.fl`, copied verbatim and embedded by
+//! `tools/gen-runtime`) describing a command's subcommands, flags,
+//! positional kinds and generators; loaded lazily, validated once, cached;
+//! a rejected file is reported ONCE and the command behaves as if it had
+//! no spec (`compspec.h:4-21`).
+//!
+//! The port's shape, against C's:
+//! - C reads a spec with `fl_data_read` in a Fletch VM (`compspec.c:
+//!   897-948`). Before Fletch (yw07) the port reads it with yw03's literal
+//!   reader `edit.fldata` (ruling R-yw04-4 = A): the specs are one map
+//!   literal of maps, lists, strings, integers and booleans, exactly the
+//!   reader's subset; a document it cannot take is rejected with the
+//!   reader's line and its words, naming yw07, where C names the Fletch
+//!   parser's first diagnostic (`compspec.c:940-942`, "line N: ...").
+//! - C's spec is an arena of `const` pointers (`YewSpecNode.subs`,
+//!   `YewSpecFlag.arg`, `YewSpecArg.gen`, `parent`); here one `CompSpec`
+//!   holds pools — `nodes` (0 the root), `args` — and every reference is
+//!   an index, -1 for C's NULL.
+//! - C's registry is module state (`shipped`, `slots`, `pending_notice`,
+//!   `stale_prefix`, `parse_count`, `compspec.c:1178-1185, 1259-1273,
+//!   1734-1752`); a run-time registry cannot be a module `var` (E1010,
+//!   G27), so it is the VALUE `CompSpecs`, owned by the editor
+//!   (`Ed.specs`) and threaded to every lookup, the shell lexer's
+//!   precommand lookup included (`shctx_at_specs`).
+//! - The port ALWAYS embeds the runtime (`edit.runtime`, R-yw03-2); C's
+//!   default build embeds nothing (`EMBED_RUNTIME=0`). Where C's stale
+//!   install answers "no command specs", the port's answers "using
+//!   built-in specs" — the branch C's own embedded build takes
+//!   (`compspec.c:1842-1846`).
+
+use std.fs
+use util
+
+/// `git -C a -C b` chains past this are unknown (`YEW_SPEC_DIRS_MAX`).
+pub const SPEC_DIRS_MAX: int = 8
+
+/// A spec is a few KiB; a megabyte is a mistake (`SPEC_MAX_BYTES`).
+const CS_MAX_BYTES: int = 1048576
+
+/// `YewSpecArgKind` (`compspec.h:41-55`), in `arg_kind_names`' order.
+pub const SPEC_ARG_PATH: int = 0
+
+/// A directory.
+pub const SPEC_ARG_DIR: int = 1
+
+/// An executable on `$PATH`.
+pub const SPEC_ARG_EXEC: int = 2
+
+/// A whole command (the wrapped command of `sudo`).
+pub const SPEC_ARG_COMMAND: int = 3
+
+/// An environment variable name.
+pub const SPEC_ARG_VAR: int = 4
+
+/// A user name (the `users` generator).
+pub const SPEC_ARG_USER: int = 5
+
+/// A host name (the `hosts` generator).
+pub const SPEC_ARG_HOST: int = 6
+
+/// A process id (the `pids` generator).
+pub const SPEC_ARG_PID: int = 7
+
+/// A signal name (the `signals` generator).
+pub const SPEC_ARG_SIGNAL: int = 8
+
+/// One of a fixed list of values.
+pub const SPEC_ARG_VALUES: int = 9
+
+/// A generator's output lines.
+pub const SPEC_ARG_GENERATOR: int = 10
+
+/// Free text: nothing is offered.
+pub const SPEC_ARG_NONE: int = 11
+
+/// The kind count (`YEW_SPEC_ARG__N`).
+pub const SPEC_ARG_N: int = 12
+
+/// One value of a `values` argument (`YewSpecValue`).
+pub struct SpecValue {
+    value: str,
+    desc: str,
+    has_desc: bool,
+}
+
+/// A spec generator (`YewSpecGen`, `compspec.h:62-70`).
+pub struct SpecGen {
+    name: str,
+    argv: List[str],
+    cache_ms: int,
+    pass_flags: List[str],
+}
+
+/// An argument slot (`YewSpecArg`, `compspec.h:72-87`): `generator` the
+/// built-in or spec generator's name ("" for none), `gen` its index in
+/// the spec's `gens` (-1: a built-in or none).
+pub struct SpecArg {
+    kind: int,
+    repeat: bool,
+    ext: List[str],
+    values: List[SpecValue],
+    generator: str,
+    has_generator: bool,
+    gen: int,
+}
+
+/// A flag (`YewSpecFlag`, `compspec.h:89-101`): `arg` an index into the
+/// spec's `args` pool, -1 when the flag takes no value.
+pub struct SpecFlag {
+    lng: str,
+    has_lng: bool,
+    shrt: str,
+    has_shrt: bool,
+    desc: str,
+    has_desc: bool,
+    arg: int,
+    arg_optional: bool,
+    global: bool,
+    changes_dir: bool,
+}
+
+/// A node of the command tree (`YewSpecNode`, `compspec.h:103-127`):
+/// `args`, `dash_values` and `after_dashdash` index the spec's `args`
+/// pool, `subs` and `parent` its `nodes` pool (-1 for none).
+pub struct SpecNode {
+    name: str,
+    has_name: bool,
+    aliases: List[str],
+    desc: str,
+    has_desc: bool,
+    flags: List[SpecFlag],
+    args: List[int],
+    subs: List[int],
+    dash_values: int,
+    after_dashdash: int,
+    parent: int,
+}
+
+/// One spec (`struct YewCompSpec`, `compspec.c:37-48`): node 0 the root.
+pub struct CompSpec {
+    origin: str,
+    commands: List[str],
+    description: str,
+    has_description: bool,
+    has_precommand: bool,
+    pre_consumes: List[str],
+    pre_operands: int,
+    pre_skips_assign: bool,
+    gens: List[SpecGen],
+    nodes: List[SpecNode],
+    args: List[SpecArg],
+}
+
+/// Where the caret's word sits in the command tree (`YewSpecPoint`,
+/// `compspec.h:150-181`): `node` and `pending_flag` index the spec
+/// (`pending_flag` -1 for none, else `pending_node`'s flag index).
+pub struct SpecPoint {
+    node: int,
+    pending_node: int,
+    pending_flag: int,
+    positional: int,
+    after_equals: bool,
+    subcommands_allowed: bool,
+    flags_ended: bool,
+    command_at: int,
+    value_at: int,
+    dir_at: List[int],
+    dir_off: List[int],
+    dir_flag: List[int],
+    dirs_overflow: bool,
+}
+
+/// `UINT32_MAX` in a positional: nothing is offered.
+pub const SPEC_POS_NONE: int = 4294967295
+
+struct CsShipped {
+    file: str,
+    description: str,
+    has_description: bool,
+    spec: int,
+    error: str,
+    has_error: bool,
+    loaded: bool,
+    reported: bool,
+}
+
+struct CsAlias {
+    name: str,
+    file: int,
+}
+
+struct CsSlot {
+    name: str,
+    spec: int,
+    user: int,
+    user_error: str,
+    has_user_error: bool,
+    user_reported: bool,
+    user_seen: bool,
+    user_mtime: int,
+    user_size: int,
+    epoch: int,
+}
+
+/// The spec registry (C's `shipped`, `slots` and notice statics), a value
+/// the editor owns. `pool` holds every loaded spec; the shipped files and
+/// the per-name slots index it.
+pub struct CompSpecs {
+    pool: List[CompSpec],
+    listed: bool,
+    indexed: bool,
+    dir: str,
+    has_dir: bool,
+    files: List[CsShipped],
+    alias: List[CsAlias],
+    slots: List[CsSlot],
+    epoch: int,
+    stale_prefix: str,
+    has_stale: bool,
+    stale_reported: bool,
+    pending_notice: str,
+    has_notice: bool,
+    parse_count: int,
+    test_prefix: str,
+}
+
+/// An empty registry.
+pub fn compspecs_new() -> CompSpecs {
+    CompSpecs {
+        pool: List[CompSpec](),
+        listed: false,
+        indexed: false,
+        dir: "",
+        has_dir: false,
+        files: List[CsShipped](),
+        alias: List[CsAlias](),
+        slots: List[CsSlot](),
+        epoch: 0,
+        stale_prefix: "",
+        has_stale: false,
+        stale_reported: false,
+        pending_notice: "",
+        has_notice: false,
+        parse_count: 0,
+        test_prefix: "",
+    }
+}
+
+// ------------------------------------------------------------------
+// Reading and validation (§1)
+// ------------------------------------------------------------------
+
+/// `yew_compspec_builtin_generator` (`compspec.c:56-66`).
+pub fn compspec_builtin_generator(name: str) -> bool {
+    name == "hosts" ||
+        name == "signals" ||
+        name == "users" ||
+        name == "make_targets" ||
+        name == "pids"
+}
+
+/// `arg_kind_names` (`compspec.c:68-71`).
+pub fn spec_arg_kind_name(kind: int) -> str {
+    match kind {
+        0 => "path",
+        1 => "dir",
+        2 => "exec",
+        3 => "command",
+        4 => "var",
+        5 => "user",
+        6 => "host",
+        7 => "pid",
+        8 => "signal",
+        9 => "values",
+        10 => "generator",
+        11 => "none",
+        _ => "?",
+    }
+}
+
+fn cs_kind_of(name: str) -> int {
+    var i = 0
+    while i < SPEC_ARG_N {
+        if spec_arg_kind_name(i) == name {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `SpecRead` (`compspec.c:73-82`): the spec being built, the document,
+/// the first failure and the key path for its message.
+struct CsRead {
+    spec: CompSpec,
+    doc: FlDoc,
+    origin: str,
+    failed: bool,
+    err: str,
+    path: str,
+}
+
+/// `read_fail` (`compspec.c:84-102`): the first reason wins.
+fn cs_fail(mut r: CsRead, msg: str) {
+    if r.failed {
+        return
+    }
+    r.failed = true
+    if r.path.len == 0 {
+        r.err = "{r.origin}: {msg}"
+    } else {
+        r.err = "{r.origin}: {msg} (at {r.path})"
+    }
+}
+
+/// `path_push` (`compspec.c:106-125`): C's 256-byte buffer is truncated,
+/// never overrun; the port keeps C's limit.
+fn cs_push(mut r: CsRead, seg: str) -> str {
+    let old = r.path
+    if r.path.len >= 255 {
+        return old
+    }
+    var next = r.path + seg
+    if next.len > 255 {
+        next = next[0..cs_floor_boundary(next, 255)]
+    }
+    r.path = next
+    old
+}
+
+fn cs_floor_boundary(s: str, at0: int) -> int {
+    var at = at0
+    while at > 0 && s.bytes()[at] as int & 192 == 128 {
+        at -= 1
+    }
+    at
+}
+
+fn cs_push_key(mut r: CsRead, key: str) -> str {
+    if r.path.len == 0 then cs_push(mut r, key) else cs_push(mut r, ".{key}")
+}
+
+fn cs_pop(mut r: CsRead, old: str) {
+    r.path = old
+}
+
+/// `as_str` (`compspec.c:133-145`): a string with no NUL.
+fn cs_as_str(doc: FlDoc, v: int) -> (bool, str) {
+    if fl_kind(doc, v) != FN_STR {
+        return (false, "")
+    }
+    let s = doc.nodes[v].text
+    for b in s.bytes() {
+        if b as int == 0 {
+            return (false, "")
+        }
+    }
+    (true, s)
+}
+
+/// A map's entries in C's order (`fl_map_iter`, `fl/value.c:322-339`): a
+/// key written twice keeps its first place with its last value.
+fn cs_entries(doc: FlDoc, m: int) -> (List[int], List[int]) {
+    var ks = List[int]()
+    var vs = List[int]()
+    var i = 0
+    while i < doc.nodes[m].keys.len {
+        let k = doc.nodes[m].keys[i]
+        let v = doc.nodes[m].vals[i]
+        var seen = -1
+        var j = 0
+        while j < ks.len {
+            if doc.nodes[ks[j]].text == doc.nodes[k].text {
+                seen = j
+                break
+            }
+            j += 1
+        }
+        if seen >= 0 {
+            vs[seen] = v
+        } else {
+            (mut ks).push(k)
+            (mut vs).push(v)
+        }
+        i += 1
+    }
+    (ks, vs)
+}
+
+/// `read_string` (`compspec.c:156-170`).
+fn cs_read_string(mut r: CsRead, v: int, key: str) -> (bool, str) {
+    let old = cs_push_key(mut r, key)
+    let (ok, s) = cs_as_str(r.doc, v)
+    if !ok {
+        cs_fail(mut r, "'{key}' must be a string")
+    }
+    cs_pop(mut r, old)
+    (ok, s)
+}
+
+/// `read_bool` (`compspec.c:172-183`).
+fn cs_read_bool(mut r: CsRead, v: int, key: str) -> bool {
+    if fl_kind(r.doc, v) != FN_BOOL {
+        let old = cs_push_key(mut r, key)
+        cs_fail(mut r, "'{key}' must be true or false")
+        cs_pop(mut r, old)
+        return false
+    }
+    r.doc.nodes[v].num != 0
+}
+
+/// `read_strings` (`compspec.c:186-235`): `(present, strings)`; present
+/// false is C's NULL.
+fn cs_read_strings(mut r: CsRead, v: int, key: str, allow_single: bool) -> (bool, List[str]) {
+    var out = List[str]()
+    let old = cs_push_key(mut r, key)
+    if fl_kind(r.doc, v) != FN_LIST {
+        let (ok, s) = cs_as_str(r.doc, v)
+        if allow_single && ok {
+            (mut out).push(s)
+            cs_pop(mut r, old)
+            return (true, out)
+        }
+        if allow_single {
+            cs_fail(mut r, "'{key}' must be a string or a list of strings")
+        } else {
+            cs_fail(mut r, "'{key}' must be a list of strings")
+        }
+        cs_pop(mut r, old)
+        return (false, out)
+    }
+    var i = 0
+    let n = r.doc.nodes[v].vals.len
+    while i < n {
+        let item = r.doc.nodes[v].vals[i]
+        let (ok, s) = cs_as_str(r.doc, item)
+        if !ok {
+            let at = cs_push(mut r, "[{i}]")
+            cs_fail(mut r, "'{key}' must hold only strings")
+            cs_pop(mut r, at)
+            break
+        }
+        (mut out).push(s)
+        i += 1
+    }
+    cs_pop(mut r, old)
+    (true, out)
+}
+
+/// `unknown_key` (`compspec.c:237-246`): C copies at most 63 bytes.
+fn cs_unknown_key(mut r: CsRead, key: str) {
+    let keep = if key.len < 63 then key else key[0..cs_floor_boundary(key, 63)]
+    cs_fail(mut r, "unknown key '{keep}'")
+}
+
+fn cs_find_gen(spec: CompSpec, name: str) -> int {
+    var i = 0
+    while i < spec.gens.len {
+        if spec.gens[i].name == name {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn cs_arg_new() -> SpecArg {
+    SpecArg {
+        kind: SPEC_ARG_PATH,
+        repeat: false,
+        ext: List[str](),
+        values: List[SpecValue](),
+        generator: "",
+        has_generator: false,
+        gen: -1,
+    }
+}
+
+/// `%.*s` of at most `n` bytes.
+fn cs_clip(s: str, n: int) -> str {
+    if s.len <= n then s else s[0..cs_floor_boundary(s, n)]
+}
+
+/// `read_arg` (`compspec.c:270-418`).
+fn cs_read_arg(mut r: CsRead, v: int) -> SpecArg {
+    var out = cs_arg_new()
+    if fl_kind(r.doc, v) != FN_MAP {
+        cs_fail(mut r, "an argument must be a map with a 'kind'")
+        return out
+    }
+    var have_kind = false
+    var have_ext = false
+    var have_values = false
+    var have_gen = false
+    let (ks, vs) = cs_entries(r.doc, v)
+    var e = 0
+    while e < ks.len {
+        let key = r.doc.nodes[ks[e]].text
+        let val = vs[e]
+        e += 1
+        if key == "kind" {
+            let old = cs_push_key(mut r, "kind")
+            have_kind = true
+            let (ok, s) = cs_as_str(r.doc, val)
+            if !ok {
+                cs_fail(mut r, "'kind' must be a string")
+            } else {
+                let k = cs_kind_of(s)
+                if k < 0 {
+                    cs_fail(mut r, "unknown argument kind '{cs_clip(s, 32)}'")
+                } else {
+                    out.kind = k
+                }
+            }
+            cs_pop(mut r, old)
+        } else if key == "ext" {
+            have_ext = true
+            let (_, ext) = cs_read_strings(mut r, val, "ext", false)
+            out.ext = ext
+        } else if key == "values" {
+            let old = cs_push_key(mut r, "values")
+            have_values = true
+            if fl_kind(r.doc, val) != FN_LIST {
+                cs_fail(mut r, "'values' must be a list")
+                cs_pop(mut r, old)
+                continue
+            }
+            var vals = List[SpecValue]()
+            var i = 0
+            let n = r.doc.nodes[val].vals.len
+            while i < n {
+                let item = r.doc.nodes[val].vals[i]
+                let at = cs_push(mut r, "[{i}]")
+                var sv = SpecValue { value: "", desc: "", has_desc: false }
+                var has_value = false
+                let (ok, s) = cs_as_str(r.doc, item)
+                if ok {
+                    sv.value = s
+                    has_value = true
+                } else if fl_kind(r.doc, item) == FN_MAP {
+                    let (vks, vvs) = cs_entries(r.doc, item)
+                    var j = 0
+                    while j < vks.len {
+                        let vkey = r.doc.nodes[vks[j]].text
+                        if vkey == "value" {
+                            let (vok, vs2) = cs_read_string(mut r, vvs[j], "value")
+                            if vok {
+                                sv.value = vs2
+                                has_value = true
+                            }
+                        } else if vkey == "desc" {
+                            let (dok, ds) = cs_read_string(mut r, vvs[j], "desc")
+                            if dok {
+                                sv.desc = ds
+                                sv.has_desc = true
+                            }
+                        } else {
+                            cs_unknown_key(mut r, vkey)
+                        }
+                        j += 1
+                    }
+                    if !has_value {
+                        cs_fail(mut r, "a value map needs 'value'")
+                    }
+                } else {
+                    cs_fail(mut r, "a value must be a string or a {{ value, desc }} map")
+                }
+                (mut vals).push(sv)
+                cs_pop(mut r, at)
+                i += 1
+            }
+            out.values = vals
+            cs_pop(mut r, old)
+        } else if key == "generator" {
+            have_gen = true
+            let (ok, s) = cs_read_string(mut r, val, "generator")
+            if ok {
+                out.generator = s
+                out.has_generator = true
+            }
+        } else if key == "repeat" {
+            out.repeat = cs_read_bool(mut r, val, "repeat")
+        } else {
+            cs_unknown_key(mut r, key)
+        }
+    }
+    if !have_kind {
+        cs_fail(mut r, "an argument needs 'kind'")
+        return out
+    }
+    if have_ext && out.kind != SPEC_ARG_PATH {
+        cs_fail(mut r, "'ext' is only for kind \"path\"")
+    }
+    if have_values != (out.kind == SPEC_ARG_VALUES) {
+        cs_fail(
+            mut r,
+            if have_values {
+                "'values' is only for kind \"values\""
+            } else {
+                "kind \"values\" needs 'values'"
+            },
+        )
+    }
+    if have_gen != (out.kind == SPEC_ARG_GENERATOR) {
+        cs_fail(
+            mut r,
+            if have_gen {
+                "'generator' is only for kind \"generator\""
+            } else {
+                "kind \"generator\" needs 'generator'"
+            },
+        )
+    }
+    if out.kind == SPEC_ARG_HOST {
+        out.generator = "hosts"
+        out.has_generator = true
+    } else if out.kind == SPEC_ARG_PID {
+        out.generator = "pids"
+        out.has_generator = true
+    } else if out.kind == SPEC_ARG_SIGNAL {
+        out.generator = "signals"
+        out.has_generator = true
+    } else if out.kind == SPEC_ARG_USER {
+        out.generator = "users"
+        out.has_generator = true
+    } else if out.kind == SPEC_ARG_GENERATOR && out.has_generator {
+        if !compspec_builtin_generator(out.generator) {
+            out.gen = cs_find_gen(r.spec, out.generator)
+            if out.gen < 0 {
+                let old = cs_push_key(mut r, "generator")
+                cs_fail(
+                    mut r,
+                    "generator '{out.generator}' is neither built in nor in 'generators'",
+                )
+                cs_pop(mut r, old)
+            }
+        }
+    }
+    out
+}
+
+/// `read_arg_at` (`compspec.c:420-429`): the slot, pushed into the pool.
+fn cs_read_arg_at(mut r: CsRead, v: int, key: str) -> int {
+    let old = cs_push_key(mut r, key)
+    let arg = cs_read_arg(mut r, v)
+    cs_pop(mut r, old)
+    (mut r.spec.args).push(arg)
+    r.spec.args.len - 1
+}
+
+fn cs_long_bad(s: str) -> bool {
+    if s.len == 0 || s.bytes()[0] as int == 45 {
+        return true
+    }
+    for b in s.bytes() {
+        let c = b as int
+        if c == 61 || c == 32 || c == 9 {
+            return true
+        }
+    }
+    false
+}
+
+/// `read_flag` (`compspec.c:431-491`).
+fn cs_read_flag(mut r: CsRead, v: int) -> SpecFlag {
+    var out = SpecFlag {
+        lng: "",
+        has_lng: false,
+        shrt: "",
+        has_shrt: false,
+        desc: "",
+        has_desc: false,
+        arg: -1,
+        arg_optional: false,
+        global: false,
+        changes_dir: false,
+    }
+    if fl_kind(r.doc, v) != FN_MAP {
+        cs_fail(mut r, "a flag must be a map")
+        return out
+    }
+    let (ks, vs) = cs_entries(r.doc, v)
+    var e = 0
+    while e < ks.len {
+        let key = r.doc.nodes[ks[e]].text
+        let val = vs[e]
+        e += 1
+        if key == "long" {
+            let (ok, s) = cs_read_string(mut r, val, "long")
+            if ok {
+                out.lng = s
+                out.has_lng = true
+                if cs_long_bad(s) {
+                    let old = cs_push_key(mut r, "long")
+                    cs_fail(mut r, "'long' is the name without dashes, e.g. \"release\"")
+                    cs_pop(mut r, old)
+                }
+            }
+        } else if key == "short" {
+            let (ok, s) = cs_read_string(mut r, val, "short")
+            if ok {
+                out.shrt = s
+                out.has_shrt = true
+                if s.len != 1 || s.bytes()[0] as int == 45 || s.bytes()[0] as int == 32 {
+                    let old = cs_push_key(mut r, "short")
+                    cs_fail(mut r, "'short' is one character without the dash")
+                    cs_pop(mut r, old)
+                }
+            }
+        } else if key == "desc" {
+            let (ok, s) = cs_read_string(mut r, val, "desc")
+            if ok {
+                out.desc = s
+                out.has_desc = true
+            }
+        } else if key == "arg" {
+            out.arg = cs_read_arg_at(mut r, val, "arg")
+        } else if key == "arg_optional" {
+            out.arg_optional = cs_read_bool(mut r, val, "arg_optional")
+        } else if key == "global" {
+            out.global = cs_read_bool(mut r, val, "global")
+        } else if key == "changes_dir" {
+            out.changes_dir = cs_read_bool(mut r, val, "changes_dir")
+        } else {
+            cs_unknown_key(mut r, key)
+        }
+    }
+    if !out.has_lng && !out.has_shrt {
+        cs_fail(mut r, "a flag needs 'long' or 'short'")
+    }
+    if out.arg_optional && out.arg < 0 {
+        cs_fail(mut r, "'arg_optional' needs 'arg'")
+    }
+    if out.changes_dir && (out.arg < 0 || r.spec.args[out.arg].kind != SPEC_ARG_DIR) {
+        cs_fail(mut r, "'changes_dir' needs a 'dir' arg")
+    }
+    out
+}
+
+/// `node_names` (`compspec.c:493-505`).
+fn cs_node_names(n: SpecNode, name: str) -> bool {
+    if n.has_name && n.name == name {
+        return true
+    }
+    for a in n.aliases {
+        if a == name {
+            return true
+        }
+    }
+    false
+}
+
+/// `top_only_key` (`compspec.c:510-515`).
+fn cs_top_only_key(k: str) -> bool {
+    k == "completion" ||
+        k == "command" ||
+        k == "description" ||
+        k == "precommand" ||
+        k == "generators"
+}
+
+fn cs_node_new(parent: int) -> SpecNode {
+    SpecNode {
+        name: "",
+        has_name: false,
+        aliases: List[str](),
+        desc: "",
+        has_desc: false,
+        flags: List[SpecFlag](),
+        args: List[int](),
+        subs: List[int](),
+        dash_values: -1,
+        after_dashdash: -1,
+        parent: parent,
+    }
+}
+
+/// `read_node_key` (`compspec.c:517-638`) for node `ni` of the pool.
+fn cs_read_node_key(mut r: CsRead, key: str, val: int, root: bool, ni: int) {
+    if key == "name" {
+        if root {
+            let old = cs_push_key(mut r, "name")
+            cs_fail(mut r, "'name' is for subcommands, not the top level")
+            cs_pop(mut r, old)
+            return
+        }
+        let (ok, s) = cs_read_string(mut r, val, "name")
+        if ok {
+            r.spec.nodes[ni].name = s
+            r.spec.nodes[ni].has_name = true
+        }
+    } else if key == "aliases" {
+        let (_, a) = cs_read_strings(mut r, val, "aliases", false)
+        r.spec.nodes[ni].aliases = a
+    } else if key == "desc" {
+        let (ok, s) = cs_read_string(mut r, val, "desc")
+        if ok {
+            r.spec.nodes[ni].desc = s
+            r.spec.nodes[ni].has_desc = true
+        }
+    } else if key == "flags" {
+        let old = cs_push_key(mut r, "flags")
+        if fl_kind(r.doc, val) != FN_LIST {
+            cs_fail(mut r, "'flags' must be a list of flag maps")
+            cs_pop(mut r, old)
+            return
+        }
+        var flags = List[SpecFlag]()
+        var i = 0
+        let n = r.doc.nodes[val].vals.len
+        while i < n {
+            let item = r.doc.nodes[val].vals[i]
+            let at = cs_push(mut r, "[{i}]")
+            (mut flags).push(cs_read_flag(mut r, item))
+            cs_pop(mut r, at)
+            i += 1
+        }
+        r.spec.nodes[ni].flags = flags
+        cs_pop(mut r, old)
+    } else if key == "args" {
+        let old = cs_push_key(mut r, "args")
+        if fl_kind(r.doc, val) != FN_LIST {
+            cs_fail(mut r, "'args' must be a list of argument maps")
+            cs_pop(mut r, old)
+            return
+        }
+        var args = List[int]()
+        var i = 0
+        let n = r.doc.nodes[val].vals.len
+        while i < n {
+            let item = r.doc.nodes[val].vals[i]
+            let at = cs_push(mut r, "[{i}]")
+            let arg = cs_read_arg(mut r, item)
+            if arg.repeat && i + 1 < n {
+                cs_fail(mut r, "only the last argument may set 'repeat'")
+            }
+            (mut r.spec.args).push(arg)
+            (mut args).push(r.spec.args.len - 1)
+            cs_pop(mut r, at)
+            i += 1
+        }
+        r.spec.nodes[ni].args = args
+        cs_pop(mut r, old)
+    } else if key == "subcommands" {
+        let old = cs_push_key(mut r, "subcommands")
+        if fl_kind(r.doc, val) != FN_LIST {
+            cs_fail(mut r, "'subcommands' must be a list of maps")
+            cs_pop(mut r, old)
+            return
+        }
+        var subs = List[int]()
+        var i = 0
+        let n = r.doc.nodes[val].vals.len
+        while i < n {
+            let item = r.doc.nodes[val].vals[i]
+            let at = cs_push(mut r, "[{i}]")
+            (mut r.spec.nodes).push(cs_node_new(ni))
+            let child = r.spec.nodes.len - 1
+            (mut subs).push(child)
+            cs_read_node(mut r, item, false, ni, child)
+            cs_pop(mut r, at)
+            i += 1
+        }
+        r.spec.nodes[ni].subs = copy subs
+        i = 0
+        while i < subs.len && !r.failed {
+            var j = i + 1
+            while j < subs.len && !r.failed {
+                var dup = ""
+                var has_dup = false
+                let sj = copy r.spec.nodes[subs[j]]
+                if sj.has_name && cs_node_names(r.spec.nodes[subs[i]], sj.name) {
+                    dup = sj.name
+                    has_dup = true
+                }
+                var a = 0
+                while !has_dup && a < sj.aliases.len {
+                    if cs_node_names(r.spec.nodes[subs[i]], sj.aliases[a]) {
+                        dup = sj.aliases[a]
+                        has_dup = true
+                    }
+                    a += 1
+                }
+                if has_dup {
+                    cs_fail(mut r, "duplicate subcommand name or alias '{dup}'")
+                }
+                j += 1
+            }
+            let si = copy r.spec.nodes[subs[i]]
+            var a = 0
+            while a < si.aliases.len && !r.failed {
+                if si.has_name && si.name == si.aliases[a] {
+                    cs_fail(mut r, "duplicate subcommand name or alias '{si.aliases[a]}'")
+                }
+                var k = a + 1
+                while k < si.aliases.len && !r.failed {
+                    if si.aliases[a] == si.aliases[k] {
+                        cs_fail(mut r, "duplicate subcommand name or alias '{si.aliases[a]}'")
+                    }
+                    k += 1
+                }
+                a += 1
+            }
+            i += 1
+        }
+        cs_pop(mut r, old)
+    } else if key == "dash_values" {
+        r.spec.nodes[ni].dash_values = cs_read_arg_at(mut r, val, "dash_values")
+    } else if key == "after_dashdash" {
+        r.spec.nodes[ni].after_dashdash = cs_read_arg_at(mut r, val, "after_dashdash")
+    } else {
+        cs_unknown_key(mut r, key)
+    }
+}
+
+/// `read_node` (`compspec.c:640-668`).
+fn cs_read_node(mut r: CsRead, v: int, root: bool, parent: int, ni: int) {
+    r.spec.nodes[ni].parent = parent
+    if fl_kind(r.doc, v) != FN_MAP {
+        cs_fail(mut r, if root then "a spec must be one map" else "a subcommand must be a map")
+        return
+    }
+    let (ks, vs) = cs_entries(r.doc, v)
+    var e = 0
+    while e < ks.len {
+        let key = r.doc.nodes[ks[e]].text
+        if !(root && cs_top_only_key(key)) {
+            cs_read_node_key(mut r, key, vs[e], root, ni)
+        }
+        e += 1
+    }
+    if !root && !r.spec.nodes[ni].has_name {
+        cs_fail(mut r, "a subcommand needs 'name'")
+    }
+}
+
+/// `read_generators` (`compspec.c:670-757`).
+fn cs_read_generators(mut r: CsRead, v: int) {
+    let old = cs_push_key(mut r, "generators")
+    if fl_kind(r.doc, v) != FN_MAP {
+        cs_fail(mut r, "'generators' must be a map of name to generator")
+        cs_pop(mut r, old)
+        return
+    }
+    var gens = List[SpecGen]()
+    let (ks, vs) = cs_entries(r.doc, v)
+    var e = 0
+    while e < ks.len {
+        let name = r.doc.nodes[ks[e]].text
+        let g = vs[e]
+        e += 1
+        var gen = SpecGen { name: name, argv: List[str](), cache_ms: 2000, pass_flags: List[str]() }
+        let at = cs_push_key(mut r, name)
+        if compspec_builtin_generator(name) {
+            cs_fail(mut r, "generator '{name}' shadows a built-in")
+        }
+        if fl_kind(r.doc, g) != FN_MAP {
+            cs_fail(mut r, "a generator must be a map with 'argv'")
+            cs_pop(mut r, at)
+            continue
+        }
+        var have_argv = false
+        var argv_present = false
+        let (gks, gvs) = cs_entries(r.doc, g)
+        var j = 0
+        while j < gks.len {
+            let key = r.doc.nodes[gks[j]].text
+            let gv = gvs[j]
+            j += 1
+            if key == "argv" {
+                have_argv = true
+                let (present, a) = cs_read_strings(mut r, gv, "argv", false)
+                argv_present = present
+                gen.argv = a
+            } else if key == "cache_ms" {
+                if fl_kind(r.doc, gv) != FN_INT ||
+                    r.doc.nodes[gv].num < 0 ||
+                    r.doc.nodes[gv].num > 86400000 {
+                    let ck = cs_push_key(mut r, "cache_ms")
+                    cs_fail(mut r, "'cache_ms' must be an integer from 0 to 86400000")
+                    cs_pop(mut r, ck)
+                } else {
+                    gen.cache_ms = r.doc.nodes[gv].num
+                }
+            } else if key == "pass_flags" {
+                let (_, pf) = cs_read_strings(mut r, gv, "pass_flags", false)
+                gen.pass_flags = pf
+            } else {
+                cs_unknown_key(mut r, key)
+            }
+        }
+        if !have_argv || !argv_present || gen.argv.len == 0 || gen.argv[0].len == 0 {
+            cs_fail(mut r, "a generator needs a non-empty 'argv'")
+        }
+        cs_pop(mut r, at)
+        (mut gens).push(gen)
+    }
+    r.spec.gens = gens
+    cs_pop(mut r, old)
+}
+
+/// `read_precommand` (`compspec.c:759-803`).
+fn cs_read_precommand(mut r: CsRead, v: int) {
+    let old = cs_push_key(mut r, "precommand")
+    r.spec.has_precommand = true
+    r.spec.pre_consumes = List[str]()
+    r.spec.pre_operands = 0
+    r.spec.pre_skips_assign = false
+    if fl_kind(r.doc, v) != FN_MAP {
+        cs_fail(mut r, "'precommand' must be a map")
+        cs_pop(mut r, old)
+        return
+    }
+    let (ks, vs) = cs_entries(r.doc, v)
+    var e = 0
+    while e < ks.len {
+        let key = r.doc.nodes[ks[e]].text
+        let val = vs[e]
+        e += 1
+        if key == "flags_with_args" {
+            let (_, c) = cs_read_strings(mut r, val, "flags_with_args", false)
+            r.spec.pre_consumes = c
+        } else if key == "operands" {
+            if fl_kind(r.doc, val) != FN_INT ||
+                r.doc.nodes[val].num < 0 ||
+                r.doc.nodes[val].num > 8 {
+                let at = cs_push_key(mut r, "operands")
+                cs_fail(mut r, "'operands' must be an integer from 0 to 8")
+                cs_pop(mut r, at)
+            } else {
+                r.spec.pre_operands = r.doc.nodes[val].num
+            }
+        } else if key == "assignments" {
+            r.spec.pre_skips_assign = cs_read_bool(mut r, val, "assignments")
+        } else {
+            cs_unknown_key(mut r, key)
+        }
+    }
+    cs_pop(mut r, old)
+}
+
+/// `read_top` (`compspec.c:805-864`).
+fn cs_read_top(mut r: CsRead, root: int) {
+    if fl_kind(r.doc, root) != FN_MAP {
+        cs_fail(mut r, "a spec must be one map literal")
+        return
+    }
+    let (ks, vs) = cs_entries(r.doc, root)
+    var e = 0
+    while e < ks.len {
+        if r.doc.nodes[ks[e]].text == "generators" {
+            cs_read_generators(mut r, vs[e])
+        }
+        e += 1
+    }
+    var have_version = false
+    var have_command = false
+    e = 0
+    while e < ks.len {
+        let key = r.doc.nodes[ks[e]].text
+        let val = vs[e]
+        e += 1
+        if key == "completion" {
+            have_version = true
+            if fl_kind(r.doc, val) != FN_INT || r.doc.nodes[val].num != 1 {
+                let old = cs_push_key(mut r, "completion")
+                cs_fail(mut r, "'completion' must be 1 (the schema version)")
+                cs_pop(mut r, old)
+            }
+        } else if key == "command" {
+            have_command = true
+            let (present, cmds) = cs_read_strings(mut r, val, "command", true)
+            r.spec.commands = copy cmds
+            if present && cmds.len == 0 {
+                let old = cs_push_key(mut r, "command")
+                cs_fail(mut r, "'command' names no command")
+                cs_pop(mut r, old)
+            }
+        } else if key == "description" {
+            let (ok, s) = cs_read_string(mut r, val, "description")
+            if ok {
+                r.spec.description = s
+                r.spec.has_description = true
+            }
+        } else if key == "precommand" {
+            cs_read_precommand(mut r, val)
+        }
+    }
+    if !have_version {
+        cs_fail(mut r, "missing required key 'completion'")
+    } else if !have_command {
+        cs_fail(mut r, "missing required key 'command'")
+    }
+    cs_read_node(mut r, root, true, -1, 0)
+}
+
+fn cs_spec_new(origin: str) -> CompSpec {
+    var nodes = List[SpecNode]()
+    (mut nodes).push(cs_node_new(-1))
+    CompSpec {
+        origin: origin,
+        commands: List[str](),
+        description: "",
+        has_description: false,
+        has_precommand: false,
+        pre_consumes: List[str](),
+        pre_operands: 0,
+        pre_skips_assign: false,
+        gens: List[SpecGen](),
+        nodes: nodes,
+        args: List[SpecArg](),
+    }
+}
+
+/// The first line of the literal reader's error (`L:C: what`) as C's
+/// "line N: msg" (`compspec.c:940-942`).
+fn cs_reader_error(e: str) -> str {
+    let colon = e.find(":") else -1
+    if colon <= 0 {
+        return "line 1: {e}"
+    }
+    let rest = e[colon + 1..]
+    let c2 = rest.find(": ") else -1
+    let msg = if c2 >= 0 then rest[c2 + 2..] else rest
+    "line {e[0..colon]}: {msg} (the literal reader, R-yw04-4; Fletch is yw07's)"
+}
+
+/// `yew_compspec_load_text` (`compspec.c:897-948`): parse and validate
+/// `src` as though it were file `origin`. `(ok, spec, error)`.
+pub fn compspec_load_text(mut reg: CompSpecs, origin: str, src: List[byte]) -> (
+    bool,
+    CompSpec,
+    str,
+) {
+    reg.parse_count += 1
+    let doc = fl_read_literal(src)
+    var r = CsRead {
+        spec: cs_spec_new(origin),
+        doc: doc,
+        origin: origin,
+        failed: false,
+        err: "",
+        path: "",
+    }
+    if r.doc.error.len != 0 {
+        cs_fail(mut r, cs_reader_error(r.doc.error))
+    } else {
+        cs_read_top(mut r, r.doc.top[0])
+    }
+    if r.failed {
+        return (false, cs_spec_new(origin), r.err)
+    }
+    (true, r.spec, "")
+}
+
+/// `yew_compspec_test_parse_count` (`compspec.c:880-883`).
+pub fn compspec_parse_count(reg: CompSpecs) -> int {
+    reg.parse_count
+}
+
+// ------------------------------------------------------------------
+// Sprint 57.25: specs built from `--help`
+// ------------------------------------------------------------------
+
+/// `yew_compspec_new` (`compspec.c:954-966`): an empty spec, its root a
+/// bare node.
+pub fn compspec_new(origin: str) -> CompSpec {
+    cs_spec_new(origin)
+}
+
+// ------------------------------------------------------------------
+// Where the files are (§2)
+// ------------------------------------------------------------------
+
+/// `yew_compspec_test_set_default_root` (`compspec.c:1150-1154`): the
+/// install prefix the shared runtime decision uses ("" restores it), and
+/// every loaded spec dropped.
+pub fn compspec_test_set_default_root(mut reg: CompSpecs, root: str) {
+    reg.test_prefix = root
+    compspec_invalidate_all(mut reg)
+}
+
+/// `shipped_dir` (`compspec.c:1187-1222`): `(on disk, directory)`.
+fn cs_shipped_dir(mut reg: CompSpecs) -> (bool, str) {
+    reg.has_stale = false
+    reg.stale_prefix = ""
+    let (kind, root) = runtime_root_at(reg.test_prefix)
+    if kind == RUNTIME_ROOT_ENV {
+        return (true, "{root}/completions")
+    }
+    if kind == RUNTIME_ROOT_PREFIX {
+        let dir = "{root}/completions"
+        if fs_is_dir(dir) {
+            return (true, dir)
+        }
+        reg.stale_prefix = root
+        reg.has_stale = true
+        return (false, "")
+    }
+    if kind == RUNTIME_ROOT_SOURCE {
+        let dir = "{root}/completions"
+        if fs_is_dir(dir) {
+            return (true, dir)
+        }
+        return (false, "")
+    }
+    (false, "")
+}
+
+/// `read_path` (`compspec.c:1241-1255`): a regular file of at most a
+/// megabyte.
+fn cs_read_path(path: str) -> (bool, List[byte]) {
+    if !fs_is_file(path) {
+        return (false, List[byte]())
+    }
+    let b = fs_read_bytes(path) else |_| { return (false, List[byte]()) }
+    if b.len > CS_MAX_BYTES {
+        return (false, List[byte]())
+    }
+    (true, b)
+}
+
+/// `spec_file_name` (`compspec.c:1289-1295`).
+fn cs_spec_file_name(name: str) -> bool {
+    name.len > 3 && name.ends_with(".fl") && !name.contains("/") && !name.starts_with(".")
+}
+
+fn cs_str_less(a: str, b: str) -> bool {
+    let n = if a.len < b.len then a.len else b.len
+    var i = 0
+    while i < n {
+        let x = a.bytes()[i] as int
+        let y = b.bytes()[i] as int
+        if x != y {
+            return x < y
+        }
+        i += 1
+    }
+    a.len < b.len
+}
+
+/// Insertion sort, stable, by byte order (C's `yew_sort_stable` with
+/// `strcmp`): the lists are a few dozen names.
+fn cs_sort(mut xs: List[str]) {
+    var i = 1
+    while i < xs.len {
+        let x = xs[i]
+        var j = i
+        while j > 0 && cs_str_less(x, xs[j - 1]) {
+            xs[j] = xs[j - 1]
+            j -= 1
+        }
+        xs[j] = x
+        i += 1
+    }
+}
+
+/// `shipped_list` (`compspec.c:1297-1342`).
+fn cs_shipped_list(mut reg: CompSpecs) {
+    if reg.listed {
+        return
+    }
+    reg.listed = true
+    let (on_disk, dir) = cs_shipped_dir(mut reg)
+    reg.has_dir = on_disk
+    reg.dir = dir
+    var names = List[str]()
+    if on_disk {
+        let entries = fs_read_dir(dir) else List[str]()
+        for e in entries {
+            if cs_spec_file_name(e) {
+                (mut names).push(e)
+            }
+        }
+    } else {
+        for asset in runtime_embedded_names() {
+            if asset.starts_with("completions/") && cs_spec_file_name(asset[12..]) {
+                (mut names).push(asset[12..])
+            }
+        }
+    }
+    cs_sort(mut names)
+    reg.files = List[CsShipped]()
+    for n in names {
+        (mut reg.files).push(CsShipped {
+            file: n,
+            description: "",
+            has_description: false,
+            spec: -1,
+            error: "",
+            has_error: false,
+            loaded: false,
+            reported: false,
+        })
+    }
+}
+
+/// `yew_compspec_shipped_count` (`compspec.c:1344-1348`).
+pub fn compspec_shipped_count(mut reg: CompSpecs) -> int {
+    cs_shipped_list(mut reg)
+    reg.files.len
+}
+
+/// `yew_compspec_shipped_name` (`compspec.c:1350-1354`).
+pub fn compspec_shipped_name(mut reg: CompSpecs, i: int) -> str {
+    cs_shipped_list(mut reg)
+    if i < reg.files.len then reg.files[i].file else ""
+}
+
+/// `yew_compspec_shipped_source` (`compspec.c:1356-1360`).
+pub fn compspec_shipped_source(mut reg: CompSpecs) -> str {
+    cs_shipped_list(mut reg)
+    if reg.has_dir then "disk" else "embedded"
+}
+
+/// `shipped_read` (`compspec.c:1362-1381`).
+fn cs_shipped_read(mut reg: CompSpecs, file: str) -> (bool, List[byte]) {
+    cs_shipped_list(mut reg)
+    if reg.has_dir {
+        return cs_read_path("{reg.dir}/{file}")
+    }
+    let (ok, text) = runtime_embedded("completions/{file}")
+    if !ok {
+        return (false, List[byte]())
+    }
+    var out = List[byte]()
+    for b in text.bytes() {
+        (mut out).push(b)
+    }
+    (true, out)
+}
+
+/// The spec put into the pool: its index.
+fn cs_pool_add(mut reg: CompSpecs, take spec: CompSpec) -> int {
+    (mut reg.pool).push(spec)
+    reg.pool.len - 1
+}
+
+/// `shipped_load` (`compspec.c:1399-1424`).
+fn cs_shipped_load(mut reg: CompSpecs, i: int) {
+    if reg.files[i].loaded {
+        return
+    }
+    reg.files[i].loaded = true
+    let origin = "completions/{reg.files[i].file}"
+    let (ok, src) = cs_shipped_read(mut reg, reg.files[i].file)
+    if !ok {
+        reg.files[i].error = "{origin}: cannot read"
+        reg.files[i].has_error = true
+    } else {
+        let (good, spec, err) = compspec_load_text(mut reg, origin, src)
+        if good {
+            reg.files[i].spec = cs_pool_add(mut reg, take spec)
+        } else {
+            reg.files[i].error = if err.len != 0 then err else "rejected"
+            reg.files[i].has_error = true
+        }
+    }
+    if reg.files[i].has_error {
+        util.log_warn("completion spec rejected: {reg.files[i].error}")
+    }
+}
+
+/// `yew_compspec_check_shipped` (`compspec.c:1426-1447`): `(ok, error)`.
+pub fn compspec_check_shipped(mut reg: CompSpecs, file: str) -> (bool, str) {
+    cs_shipped_list(mut reg)
+    var i = 0
+    while i < reg.files.len {
+        if reg.files[i].file == file {
+            cs_shipped_load(mut reg, i)
+            if reg.files[i].spec < 0 {
+                let e = if reg.files[i].has_error then reg.files[i].error else "rejected"
+                return (false, e)
+            }
+            return (true, "")
+        }
+        i += 1
+    }
+    (false, "{file}: not shipped")
+}
+
+/// `shipped_find` (`compspec.c:1449-1468`): a binary search of the
+/// sorted list.
+fn cs_shipped_find(mut reg: CompSpecs, file: str) -> int {
+    cs_shipped_list(mut reg)
+    var lo = 0
+    var hi = reg.files.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        let f = reg.files[mid].file
+        if f == file {
+            return mid
+        }
+        if cs_str_less(file, f) {
+            hi = mid
+        } else {
+            lo = mid + 1
+        }
+    }
+    -1
+}
+
+// §7's index: a SCAN of each shipped file's top level, no parse
+// (`compspec.c:1470-1650`).
+
+struct CsScan {
+    at: int,
+}
+
+fn cs_scan_skip(s: List[byte], mut sc: CsScan) {
+    while sc.at < s.len {
+        let c = s[sc.at] as int
+        if c == 35 {
+            while sc.at < s.len && s[sc.at] as int != 10 {
+                sc.at += 1
+            }
+        } else if c == 32 || c == 9 || c == 13 || c == 10 || c == 44 {
+            sc.at += 1
+        } else {
+            return
+        }
+    }
+}
+
+/// `scan_string` (`compspec.c:1501-1527`): `(is one, bytes)`.
+fn cs_scan_string(s: List[byte], mut sc: CsScan) -> (bool, List[byte]) {
+    if sc.at >= s.len || s[sc.at] as int != 34 {
+        return (false, List[byte]())
+    }
+    sc.at += 1
+    var b = List[byte]()
+    while sc.at < s.len && s[sc.at] as int != 34 {
+        var c = s[sc.at] as int
+        sc.at += 1
+        if c == 92 && sc.at < s.len {
+            let e = s[sc.at] as int
+            sc.at += 1
+            c = if e == 110 then 10 else if e == 116 then 9 else e
+        }
+        (mut b).push(c as byte)
+    }
+    if sc.at < s.len {
+        sc.at += 1
+    }
+    (true, b)
+}
+
+/// `scan_value` (`compspec.c:1530-1563`).
+fn cs_scan_value(s: List[byte], mut sc: CsScan) {
+    var depth = 0
+    loop {
+        cs_scan_skip(s, mut sc)
+        if sc.at >= s.len {
+            return
+        }
+        let c = s[sc.at] as int
+        if c == 34 {
+            let _ = cs_scan_string(s, mut sc)
+        } else if c == 123 || c == 91 {
+            depth += 1
+            sc.at += 1
+        } else if c == 125 || c == 93 {
+            if depth == 0 {
+                return
+            }
+            depth -= 1
+            sc.at += 1
+        } else {
+            while sc.at < s.len {
+                let d = s[sc.at] as int
+                if d == 44 || d == 125 || d == 93 || d == 10 || d == 34 || d == 123 || d == 91 {
+                    break
+                }
+                sc.at += 1
+            }
+        }
+        if depth == 0 {
+            return
+        }
+    }
+}
+
+/// C's `char *` from scanned bytes: up to a NUL, as UTF-8 or none.
+fn cs_scan_text(b: List[byte]) -> (bool, str) {
+    var cut = List[byte]()
+    for x in b {
+        if x as int == 0 {
+            break
+        }
+        (mut cut).push(x)
+    }
+    let s = str_from_utf8(cut) else |_| { return (false, "") }
+    (true, s)
+}
+
+/// `index_add` (`compspec.c:1565-1582`): the first file in name order
+/// keeps a name.
+fn cs_index_add(mut reg: CompSpecs, file: int, name: str) {
+    for a in reg.alias {
+        if a.name == name {
+            return
+        }
+    }
+    (mut reg.alias).push(CsAlias { name: name, file: file })
+}
+
+fn cs_is_key_byte(c: int) -> bool {
+    c == 95 || c >= 97 && c <= 122 || c >= 65 && c <= 90
+}
+
+/// `index_scan_file` (`compspec.c:1584-1650`).
+fn cs_index_scan_file(mut reg: CompSpecs, file: int, s: List[byte]) {
+    var sc = CsScan { at: 0 }
+    cs_scan_skip(s, mut sc)
+    if sc.at >= s.len || s[sc.at] as int != 123 {
+        return
+    }
+    sc.at += 1
+    loop {
+        cs_scan_skip(s, mut sc)
+        if sc.at >= s.len || s[sc.at] as int == 125 {
+            return
+        }
+        let key_at = sc.at
+        while sc.at < s.len && cs_is_key_byte(s[sc.at] as int) {
+            sc.at += 1
+        }
+        let key_len = sc.at - key_at
+        cs_scan_skip(s, mut sc)
+        if key_len == 0 || sc.at >= s.len || s[sc.at] as int != 58 {
+            return
+        }
+        sc.at += 1
+        cs_scan_skip(s, mut sc)
+        var key = List[byte]()
+        var k = key_at
+        while k < key_at + key_len {
+            (mut key).push(s[k])
+            k += 1
+        }
+        let ks = str_from_utf8(key) else ""
+        if ks == "command" {
+            if sc.at < s.len && s[sc.at] as int == 91 {
+                sc.at += 1
+                loop {
+                    cs_scan_skip(s, mut sc)
+                    let (is, name) = cs_scan_string(s, mut sc)
+                    if !is {
+                        break
+                    }
+                    let (ok, n) = cs_scan_text(name)
+                    if ok {
+                        cs_index_add(mut reg, file, n)
+                    }
+                }
+                cs_scan_value(s, mut sc)
+            } else {
+                let (is, name) = cs_scan_string(s, mut sc)
+                if is {
+                    let (ok, n) = cs_scan_text(name)
+                    if ok {
+                        cs_index_add(mut reg, file, n)
+                    }
+                }
+            }
+        } else if ks == "description" {
+            let (is, d) = cs_scan_string(s, mut sc)
+            if is && !reg.files[file].has_description {
+                let (ok, t) = cs_scan_text(d)
+                if ok {
+                    reg.files[file].description = t
+                    reg.files[file].has_description = true
+                }
+            }
+        } else {
+            cs_scan_value(s, mut sc)
+        }
+    }
+}
+
+fn cs_alias_less(a: CsAlias, b: CsAlias) -> bool {
+    cs_str_less(a.name, b.name)
+}
+
+/// `shipped_index` (`compspec.c:1661-1684`): names in byte order, so a
+/// description is a binary search.
+fn cs_shipped_index(mut reg: CompSpecs) {
+    if reg.indexed {
+        return
+    }
+    reg.indexed = true
+    cs_shipped_list(mut reg)
+    var i = 0
+    while i < reg.files.len {
+        let (ok, src) = cs_shipped_read(mut reg, reg.files[i].file)
+        if ok {
+            cs_index_scan_file(mut reg, i, src)
+        }
+        i += 1
+    }
+    var j = 1
+    while j < reg.alias.len {
+        let x = copy reg.alias[j]
+        var k = j
+        while k > 0 && cs_alias_less(x, reg.alias[k - 1]) {
+            reg.alias[k] = copy reg.alias[k - 1]
+            k -= 1
+        }
+        reg.alias[k] = x
+        j += 1
+    }
+}
+
+/// `alias_find` (`compspec.c:1686-1704`): the index entry, or -1.
+fn cs_alias_find(mut reg: CompSpecs, name: str) -> int {
+    cs_shipped_index(mut reg)
+    var lo = 0
+    var hi = reg.alias.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        let a = reg.alias[mid].name
+        if a == name {
+            return mid
+        }
+        if cs_str_less(name, a) {
+            hi = mid
+        } else {
+            lo = mid + 1
+        }
+    }
+    -1
+}
+
+/// `shipped_for` (`compspec.c:1706-1718`): the shipped file answering
+/// `name` (its own file first, then the alias index), loaded; -1 none.
+fn cs_shipped_for(mut reg: CompSpecs, name: str) -> int {
+    let direct = cs_shipped_find(mut reg, "{name}.fl")
+    if direct >= 0 {
+        cs_shipped_load(mut reg, direct)
+        return direct
+    }
+    let e = cs_alias_find(mut reg, name)
+    if e < 0 {
+        return -1
+    }
+    let f = reg.alias[e].file
+    cs_shipped_load(mut reg, f)
+    f
+}
+
+// ------------------------------------------------------------------
+// Per-name lookup and the user override
+// ------------------------------------------------------------------
+
+/// `yew_compspec_invalidate_all` (`compspec.c:1754-1781`).
+pub fn compspec_invalidate_all(mut reg: CompSpecs) {
+    let prefix = reg.test_prefix
+    reg = compspecs_new()
+    reg.test_prefix = prefix
+}
+
+/// `yew_compspec_prompt_closed` (`compspec.c:1783-1786`).
+pub fn compspec_prompt_closed(mut reg: CompSpecs) {
+    reg.epoch += 1
+}
+
+/// `user_path` (`compspec.c:1788-1805`).
+fn cs_user_path(name: str) -> (bool, str) {
+    let dir = util.xdg_config_dir() else |_| { return (false, "") }
+    (true, "{dir}/completions/{name}.fl")
+}
+
+/// `slot_refresh` (`compspec.c:1817-1865`): the user's file when there
+/// is one (whole-file replace: a broken override leaves NO spec), else
+/// shipped; "unchanged" is C's mtime in nanoseconds and size, from
+/// `fs.stat`.
+fn cs_slot_refresh(mut reg: CompSpecs, s: int) {
+    let (has_path, path) = cs_user_path(reg.slots[s].name)
+    var seen = false
+    var mtime = -1
+    var size = -1
+    if has_path && fs_is_file(path) {
+        let info = fs.stat(path) else |_| { return }
+        seen = true
+        mtime = info.mtime_s * 1000000000 + info.mtime_ns
+        size = info.size
+    }
+    reg.slots[s].epoch = reg.epoch
+    if seen &&
+        reg.slots[s].user_seen &&
+        mtime == reg.slots[s].user_mtime &&
+        size == reg.slots[s].user_size {
+        return
+    }
+    reg.slots[s].user = -1
+    reg.slots[s].user_error = ""
+    reg.slots[s].has_user_error = false
+    reg.slots[s].user_reported = false
+    reg.slots[s].user_seen = seen
+    reg.slots[s].spec = -1
+    if seen {
+        reg.slots[s].user_mtime = mtime
+        reg.slots[s].user_size = size
+        let (ok, src) = cs_read_path(path)
+        if !ok {
+            reg.slots[s].user_error = "{path}: cannot read"
+            reg.slots[s].has_user_error = true
+        } else {
+            let (good, spec, err) = compspec_load_text(mut reg, path, src)
+            if good {
+                reg.slots[s].user = cs_pool_add(mut reg, take spec)
+            } else {
+                reg.slots[s].user_error = if err.len != 0 then err else "rejected"
+                reg.slots[s].has_user_error = true
+            }
+        }
+        if reg.slots[s].has_user_error {
+            util.log_warn("completion spec rejected: {reg.slots[s].user_error}")
+        }
+        reg.slots[s].spec = reg.slots[s].user
+    } else {
+        let f = cs_shipped_for(mut reg, reg.slots[s].name)
+        reg.slots[s].spec = if f < 0 then -1 else reg.files[f].spec
+    }
+}
+
+/// `valid_name` (`compspec.c:1867-1873`).
+fn cs_valid_name(name: str) -> bool {
+    name.len != 0 && name.len <= 255 && name != "." && name != ".." && !name.contains("/")
+}
+
+/// `notice_queue` (`compspec.c:1881-1893`).
+fn cs_notice_queue(mut reg: CompSpecs, msg: str) {
+    if reg.has_notice {
+        return
+    }
+    reg.pending_notice = msg
+    reg.has_notice = true
+}
+
+/// `report` (`compspec.c:1895-1933`).
+fn cs_report(mut reg: CompSpecs, s: int) {
+    if reg.has_notice {
+        return
+    }
+    cs_shipped_list(mut reg)
+    if reg.has_stale && !reg.stale_reported {
+        reg.stale_reported = true
+        cs_notice_queue(
+            mut reg,
+            "installed runtime {reg.stale_prefix} has no completions/; reinstall yew (using built-in specs)",
+        )
+        return
+    }
+    if reg.slots[s].has_user_error && !reg.slots[s].user_reported {
+        reg.slots[s].user_reported = true
+        cs_notice_queue(mut reg, "completion spec rejected: {reg.slots[s].user_error}")
+        return
+    }
+    if reg.slots[s].user_seen {
+        return
+    }
+    var f = cs_shipped_find(mut reg, "{reg.slots[s].name}.fl")
+    var i = 0
+    while f < 0 && reg.indexed && i < reg.alias.len {
+        if reg.alias[i].name == reg.slots[s].name {
+            f = reg.alias[i].file
+        }
+        i += 1
+    }
+    if f >= 0 && reg.files[f].has_error && !reg.files[f].reported {
+        reg.files[f].reported = true
+        cs_notice_queue(mut reg, "completion spec rejected: {reg.files[f].error}")
+    }
+}
+
+/// `yew_compspec_notice` (`compspec.c:1935-1943`): the queued report,
+/// taken (`(said, text)`); the caller puts it on the message line as a
+/// warning.
+pub fn compspec_take_notice(mut reg: CompSpecs) -> (bool, str) {
+    if !reg.has_notice {
+        return (false, "")
+    }
+    let m = reg.pending_notice
+    reg.pending_notice = ""
+    reg.has_notice = false
+    (true, m)
+}
+
+/// `yew_compspec_get` (`compspec.c:1945-1977`): the pool index of the
+/// spec for `name`'s BASENAME, or -1.
+pub fn compspec_get(mut reg: CompSpecs, name: str) -> int {
+    let slash = name.rfind("/") else -1
+    let base = if slash >= 0 then name[slash + 1..] else name
+    if !cs_valid_name(base) {
+        return -1
+    }
+    var s = -1
+    var i = 0
+    while i < reg.slots.len {
+        if reg.slots[i].name == base {
+            s = i
+            break
+        }
+        i += 1
+    }
+    if s < 0 {
+        (mut reg.slots).push(CsSlot {
+            name: base,
+            spec: -1,
+            user: -1,
+            user_error: "",
+            has_user_error: false,
+            user_reported: false,
+            user_seen: false,
+            user_mtime: -1,
+            user_size: -1,
+            epoch: 0,
+        })
+        s = reg.slots.len - 1
+        cs_slot_refresh(mut reg, s)
+    } else if reg.slots[s].epoch != reg.epoch {
+        cs_slot_refresh(mut reg, s)
+    }
+    cs_report(mut reg, s)
+    reg.slots[s].spec
+}
+
+/// `yew_compspec_describe` (`compspec.c:2003-2011`): the description of
+/// the shipped spec answering `name`, from the index — no parse.
+pub fn compspec_describe(mut reg: CompSpecs, name: str) -> (bool, str) {
+    let e = cs_alias_find(mut reg, name)
+    if e < 0 {
+        return (false, "")
+    }
+    let f = reg.alias[e].file
+    (reg.files[f].has_description, reg.files[f].description)
+}
+
+/// `yew_compspec_wrapper` (`compspec.c:2013-2023`): 1 a wrapper (`row`
+/// filled), 0 a spec without `precommand`, -1 no spec.
+pub fn compspec_wrapper(mut reg: CompSpecs, name: str) -> (int, ShWrapRow) {
+    let sp = compspec_get(mut reg, name)
+    var row = ShWrapRow {
+        name: List[byte](),
+        verdict: -1,
+        consumes: List[List[byte]](),
+        operands: 0,
+        skips_assign: false,
+    }
+    for b in name.bytes() {
+        (mut row.name).push(b)
+    }
+    if sp < 0 {
+        return (-1, row)
+    }
+    if !reg.pool[sp].has_precommand {
+        row.verdict = 0
+        return (0, row)
+    }
+    row.verdict = 1
+    for c in reg.pool[sp].pre_consumes {
+        var b = List[byte]()
+        for x in c.bytes() {
+            (mut b).push(x)
+        }
+        (mut row.consumes).push(b)
+    }
+    row.operands = reg.pool[sp].pre_operands
+    row.skips_assign = reg.pool[sp].pre_skips_assign
+    (1, row)
+}
+
+// ------------------------------------------------------------------
+// Resolution (§3)
+// ------------------------------------------------------------------
+
+/// `yew_compspec_slot` (`compspec.c:2029-2039`): the arg index of slot
+/// `positional` of node `n`, clamped onto a trailing `repeat`; -1 past
+/// the last slot of a node that does not repeat.
+pub fn compspec_slot(spec: CompSpec, n: int, positional: int) -> int {
+    if n < 0 || spec.nodes[n].args.len == 0 {
+        return -1
+    }
+    let k = spec.nodes[n].args.len
+    if positional < k {
+        return spec.nodes[n].args[positional]
+    }
+    let last = spec.nodes[n].args[k - 1]
+    if spec.args[last].repeat {
+        return last
+    }
+    -1
+}
+
+/// `find_long` (`compspec.c:2042-2059`): `(node, flag)` or `(-1, -1)`.
+fn cs_find_long(spec: CompSpec, node: int, name: str) -> (int, int) {
+    var n = node
+    var own = true
+    while n >= 0 {
+        var i = 0
+        while i < spec.nodes[n].flags.len {
+            if (own || spec.nodes[n].flags[i].global) &&
+                spec.nodes[n].flags[i].has_lng &&
+                spec.nodes[n].flags[i].lng == name {
+                return (n, i)
+            }
+            i += 1
+        }
+        n = spec.nodes[n].parent
+        own = false
+    }
+    (-1, -1)
+}
+
+/// `find_short` (`compspec.c:2061-2076`).
+fn cs_find_short(spec: CompSpec, node: int, c: int) -> (int, int) {
+    var n = node
+    var own = true
+    while n >= 0 {
+        var i = 0
+        while i < spec.nodes[n].flags.len {
+            if (own || spec.nodes[n].flags[i].global) &&
+                spec.nodes[n].flags[i].has_shrt &&
+                spec.nodes[n].flags[i].shrt.bytes()[0] as int == c {
+                return (n, i)
+            }
+            i += 1
+        }
+        n = spec.nodes[n].parent
+        own = false
+    }
+    (-1, -1)
+}
+
+/// `find_child` (`compspec.c:2078-2088`).
+fn cs_find_child(spec: CompSpec, node: int, word: str) -> int {
+    for c in spec.nodes[node].subs {
+        if cs_node_names(spec.nodes[c], word) {
+            return c
+        }
+    }
+    -1
+}
+
+/// `pre_consumes` (`compspec.c:2091-2103`).
+fn cs_pre_consumes(spec: CompSpec, word: str) -> bool {
+    if !spec.has_precommand {
+        return false
+    }
+    for c in spec.pre_consumes {
+        if c == word {
+            return true
+        }
+    }
+    false
+}
+
+/// `is_assignment` (`compspec.c:2105-2121`).
+fn cs_is_assignment(w: str) -> bool {
+    let b = w.bytes()
+    if w.len == 0 {
+        return false
+    }
+    let c0 = b[0] as int
+    if !(c0 >= 65 && c0 <= 90 || c0 >= 97 && c0 <= 122 || c0 == 95) {
+        return false
+    }
+    var i = 1
+    while i < w.len && b[i] as int != 61 {
+        let c = b[i] as int
+        if !(c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 95) {
+            return false
+        }
+        i += 1
+    }
+    i < w.len
+}
+
+/// `point_dir` (`compspec.c:2124-2134`).
+fn cs_point_dir(mut out: SpecPoint, flag_at: int, at: int, off: int) {
+    if out.dir_at.len >= SPEC_DIRS_MAX {
+        out.dirs_overflow = true
+        return
+    }
+    (mut out.dir_flag).push(flag_at)
+    (mut out.dir_at).push(at)
+    (mut out.dir_off).push(off)
+}
+
+fn cs_point_new() -> SpecPoint {
+    SpecPoint {
+        node: -1,
+        pending_node: -1,
+        pending_flag: -1,
+        positional: 0,
+        after_equals: false,
+        subcommands_allowed: false,
+        flags_ended: false,
+        command_at: 0,
+        value_at: 0,
+        dir_at: List[int](),
+        dir_off: List[int](),
+        dir_flag: List[int](),
+        dirs_overflow: false,
+    }
+}
+
+/// A word of the lexer's argv as the spec reads it: C's `const char *`
+/// (bytes), here as text; invalid UTF-8 cannot name a flag or a
+/// subcommand, so it reads as "" — the spec then matches nothing in it.
+fn cs_word(b: List[byte]) -> str {
+    str_from_utf8(b) else ""
+}
+
+/// `yew_compspec_resolve` (`compspec.c:2136-2304`): `(ok, point)`.
+pub fn compspec_resolve(spec: CompSpec, ctx: ShCtx) -> (bool, SpecPoint) {
+    var out = cs_point_new()
+    if ctx.arg_index == 0 || ctx.arg_index > ctx.argc {
+        return (false, out)
+    }
+    var node = 0
+    var pend_n = -1
+    var pend_f = -1
+    var pre_pending = false
+    var ended = false
+    var positional = 0
+    var i = 1
+    while i < ctx.arg_index {
+        let w = cs_word(ctx.argv[i])
+        let wb = w.bytes()
+        if pend_f >= 0 || pre_pending {
+            if pend_f >= 0 && spec.nodes[pend_n].flags[pend_f].changes_dir {
+                cs_point_dir(mut out, i - 1, i, 0)
+            }
+            pend_n = -1
+            pend_f = -1
+            pre_pending = false
+            i += 1
+            continue
+        }
+        if !ended && w == "--" {
+            ended = true
+            i += 1
+            continue
+        }
+        if !ended && w.len >= 2 && wb[0] as int == 45 && wb[1] as int == 45 {
+            let name = w[2..]
+            let eq = name.find("=") else -1
+            if eq >= 0 {
+                let (fn_, fi) = cs_find_long(spec, node, name[0..eq])
+                if fi >= 0 &&
+                    spec.nodes[fn_].flags[fi].changes_dir &&
+                    spec.nodes[fn_].flags[fi].arg >= 0 {
+                    cs_point_dir(mut out, i, i, 2 + eq + 1)
+                }
+                i += 1
+                continue
+            }
+            let (fn_, fi) = cs_find_long(spec, node, name)
+            if fi >= 0 &&
+                spec.nodes[fn_].flags[fi].arg >= 0 &&
+                !spec.nodes[fn_].flags[fi].arg_optional {
+                pend_n = fn_
+                pend_f = fi
+            } else if fi < 0 && cs_pre_consumes(spec, w) {
+                pre_pending = true
+            }
+            i += 1
+            continue
+        }
+        if !ended && w.len >= 2 && wb[0] as int == 45 {
+            var described = false
+            var j = 1
+            while j < w.len {
+                let (fn_, fi) = cs_find_short(spec, node, wb[j] as int)
+                if fi >= 0 {
+                    described = true
+                }
+                if fi < 0 || spec.nodes[fn_].flags[fi].arg < 0 {
+                    j += 1
+                    continue
+                }
+                if j + 1 == w.len && !spec.nodes[fn_].flags[fi].arg_optional {
+                    pend_n = fn_
+                    pend_f = fi
+                } else if j + 1 < w.len && spec.nodes[fn_].flags[fi].changes_dir {
+                    cs_point_dir(mut out, i, i, j + 1)
+                }
+                break
+            }
+            if !described && cs_pre_consumes(spec, w) {
+                pre_pending = true
+            }
+            i += 1
+            continue
+        }
+        if spec.has_precommand {
+            if spec.pre_skips_assign && cs_is_assignment(w) {
+                i += 1
+                continue
+            }
+            if positional < spec.pre_operands {
+                positional += 1
+                i += 1
+                continue
+            }
+            out.command_at = i
+            out.node = node
+            return (true, out)
+        }
+        if !ended && positional == 0 {
+            let child = cs_find_child(spec, node, w)
+            if child >= 0 {
+                node = child
+                i += 1
+                continue
+            }
+        }
+        let slot = compspec_slot(spec, node, positional)
+        if slot >= 0 && spec.args[slot].kind == SPEC_ARG_COMMAND {
+            out.command_at = i
+            out.node = node
+            return (true, out)
+        }
+        if positional < SPEC_POS_NONE {
+            positional += 1
+        }
+        i += 1
+    }
+    ended = ended || ctx.dashdash
+    out.node = node
+    out.positional = positional
+    out.flags_ended = ended
+    let stem = cs_word(ctx.stem)
+    let sb = stem.bytes()
+    if pend_f >= 0 {
+        out.pending_node = pend_n
+        out.pending_flag = pend_f
+        return (true, out)
+    }
+    if pre_pending {
+        out.pending_flag = -1
+        out.positional = SPEC_POS_NONE
+        return (true, out)
+    }
+    if !ended && stem.len >= 2 && sb[0] as int == 45 && sb[1] as int == 45 {
+        let rest = stem[2..]
+        let eq = rest.find("=") else -1
+        if eq >= 0 {
+            let (fn_, fi) = cs_find_long(spec, node, rest[0..eq])
+            if fi >= 0 && spec.nodes[fn_].flags[fi].arg >= 0 {
+                out.pending_node = fn_
+                out.pending_flag = fi
+                out.after_equals = true
+                out.value_at = 2 + eq + 1
+            } else {
+                out.positional = SPEC_POS_NONE
+            }
+            return (true, out)
+        }
+    }
+    let dash = stem.len != 0 && sb[0] as int == 45
+    if spec.has_precommand {
+        if (ended || !dash) &&
+            positional >= spec.pre_operands &&
+            !(spec.pre_skips_assign && cs_is_assignment(stem)) {
+            out.command_at = ctx.arg_index
+        }
+        return (true, out)
+    }
+    out.subcommands_allowed = !ended && positional == 0 && spec.nodes[node].subs.len != 0
+    let slot = compspec_slot(spec, node, positional)
+    if slot >= 0 && spec.args[slot].kind == SPEC_ARG_COMMAND && !(dash && !ended) {
+        out.command_at = ctx.arg_index
+    }
+    (true, out)
+}
+
+/// `yew_compspec_notice` (`compspec.c:1935-1943`): one queued report on
+/// the editor's message line, as a warning; whether it said anything.
+pub fn compspec_notice(mut ed: Ed) -> bool {
+    let (said, text) = compspec_take_notice(mut ed.specs)
+    if said {
+        ed_msg(mut ed, MSG_WARN, text)
+    }
+    said
+}
+
+/// `yew_compspec_read_node` (`compspec.c:977-1023`): a node's data form
+/// (map node `node` of `doc`) read back through the SAME node reader a
+/// spec file goes through — one schema; a top-level-only key is refused,
+/// a node is not a spec. `(ok, spec, error)`.
+pub fn compspec_read_node(mut reg: CompSpecs, origin: str, doc: FlDoc, node: int) -> (
+    bool,
+    CompSpec,
+    str,
+) {
+    reg.parse_count += 0
+    var r = CsRead {
+        spec: cs_spec_new(origin),
+        doc: copy doc,
+        origin: origin,
+        failed: false,
+        err: "",
+        path: "",
+    }
+    if fl_kind(r.doc, node) == FN_MAP {
+        let (ks, _) = cs_entries(r.doc, node)
+        for k in ks {
+            let name = r.doc.nodes[k].text
+            if cs_top_only_key(name) {
+                cs_unknown_key(mut r, name)
+            }
+        }
+    }
+    cs_read_node(mut r, node, true, -1, 0)
+    if r.failed {
+        return (false, cs_spec_new(origin), r.err)
+    }
+    (true, r.spec, "")
+}
+
+// The Fletch data writer's formatting (`fl/data.c:194-372`): two spaces
+// a level, every map entry and list item on its own line ending `,`.
+
+/// Append `s` to `out`.
+pub fn fdw_str(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn fdw_indent(mut out: List[byte], depth: int) {
+    var i = 0
+    while i < depth {
+        (mut out).push(32 as byte)
+        (mut out).push(32 as byte)
+        i += 1
+    }
+}
+
+/// `data_string` (`fl/data.c:200-231`): a quoted Fletch string.
+pub fn fdw_string(mut out: List[byte], s: str) {
+    let hex = "0123456789abcdef"
+    (mut out).push(34 as byte)
+    for b in s.bytes() {
+        let c = b as int
+        if c == 34 {
+            fdw_str(mut out, "\\\"")
+        } else if c == 92 {
+            fdw_str(mut out, "\\\\")
+        } else if c == 10 {
+            fdw_str(mut out, "\\n")
+        } else if c == 9 {
+            fdw_str(mut out, "\\t")
+        } else if c == 13 {
+            fdw_str(mut out, "\\r")
+        } else if c == 0 {
+            fdw_str(mut out, "\\0")
+        } else if c < 32 || c == 127 {
+            fdw_str(mut out, "\\x")
+            (mut out).push(hex.bytes()[c >> 4])
+            (mut out).push(hex.bytes()[c & 15])
+        } else {
+            (mut out).push(b)
+        }
+    }
+    (mut out).push(34 as byte)
+}
+
+fn fdw_end(mut out: List[byte], comma: bool) {
+    if comma {
+        (mut out).push(44 as byte)
+    }
+    (mut out).push(10 as byte)
+}
+
+fn fdw_key(mut out: List[byte], depth: int, key: str) {
+    fdw_indent(mut out, depth)
+    fdw_str(mut out, "{key}: ")
+}
+
+fn fdw_strings(mut out: List[byte], depth: int, xs: List[str], comma: bool) {
+    fdw_str(mut out, "[\n")
+    for x in xs {
+        fdw_indent(mut out, depth + 1)
+        fdw_string(mut out, x)
+        fdw_end(mut out, true)
+    }
+    fdw_indent(mut out, depth)
+    fdw_str(mut out, "]")
+    fdw_end(mut out, comma)
+}
+
+/// `write_arg` (`compspec.c:1048-1077`).
+fn cs_write_arg(spec: CompSpec, a: int, depth: int, comma: bool, mut out: List[byte]) {
+    let arg = copy spec.args[a]
+    fdw_str(mut out, "{{\n")
+    fdw_key(mut out, depth + 1, "kind")
+    fdw_string(mut out, spec_arg_kind_name(arg.kind))
+    fdw_end(mut out, true)
+    if arg.kind == SPEC_ARG_PATH && arg.ext.len != 0 {
+        fdw_key(mut out, depth + 1, "ext")
+        fdw_strings(mut out, depth + 1, arg.ext, true)
+    }
+    if arg.kind == SPEC_ARG_VALUES {
+        fdw_key(mut out, depth + 1, "values")
+        fdw_str(mut out, "[\n")
+        for v in arg.values {
+            fdw_indent(mut out, depth + 2)
+            if !v.has_desc {
+                fdw_string(mut out, v.value)
+            } else {
+                fdw_str(mut out, "{{\n")
+                fdw_key(mut out, depth + 3, "value")
+                fdw_string(mut out, v.value)
+                fdw_end(mut out, true)
+                fdw_key(mut out, depth + 3, "desc")
+                fdw_string(mut out, v.desc)
+                fdw_end(mut out, true)
+                fdw_indent(mut out, depth + 2)
+                fdw_str(mut out, "}}")
+            }
+            fdw_end(mut out, true)
+        }
+        fdw_indent(mut out, depth + 1)
+        fdw_str(mut out, "]")
+        fdw_end(mut out, true)
+    }
+    if arg.kind == SPEC_ARG_GENERATOR && arg.has_generator {
+        fdw_key(mut out, depth + 1, "generator")
+        fdw_string(mut out, arg.generator)
+        fdw_end(mut out, true)
+    }
+    if arg.repeat {
+        fdw_key(mut out, depth + 1, "repeat")
+        fdw_str(mut out, "true")
+        fdw_end(mut out, true)
+    }
+    fdw_indent(mut out, depth)
+    fdw_str(mut out, "}}")
+    fdw_end(mut out, comma)
+}
+
+/// `yew_compspec_write_node` (`compspec.c:1079-1137`) and
+/// `fl_data_write` (`fl/data.c:366-372`): node `n` of `spec` in its data
+/// form, written as C's writer writes it at `depth`.
+pub fn compspec_write_node(spec: CompSpec, n: int, depth: int, comma: bool, mut out: List[byte]) {
+    let node = copy spec.nodes[n]
+    fdw_str(mut out, "{{\n")
+    if node.has_name {
+        fdw_key(mut out, depth + 1, "name")
+        fdw_string(mut out, node.name)
+        fdw_end(mut out, true)
+    }
+    if node.aliases.len != 0 {
+        fdw_key(mut out, depth + 1, "aliases")
+        fdw_strings(mut out, depth + 1, node.aliases, true)
+    }
+    if node.has_desc {
+        fdw_key(mut out, depth + 1, "desc")
+        fdw_string(mut out, node.desc)
+        fdw_end(mut out, true)
+    }
+    if node.flags.len != 0 {
+        fdw_key(mut out, depth + 1, "flags")
+        fdw_str(mut out, "[\n")
+        for f in node.flags {
+            fdw_indent(mut out, depth + 2)
+            fdw_str(mut out, "{{\n")
+            if f.has_lng {
+                fdw_key(mut out, depth + 3, "long")
+                fdw_string(mut out, f.lng)
+                fdw_end(mut out, true)
+            }
+            if f.has_shrt {
+                fdw_key(mut out, depth + 3, "short")
+                fdw_string(mut out, f.shrt)
+                fdw_end(mut out, true)
+            }
+            if f.has_desc {
+                fdw_key(mut out, depth + 3, "desc")
+                fdw_string(mut out, f.desc)
+                fdw_end(mut out, true)
+            }
+            if f.arg >= 0 {
+                fdw_key(mut out, depth + 3, "arg")
+                cs_write_arg(spec, f.arg, depth + 3, true, mut out)
+            }
+            if f.arg_optional {
+                fdw_key(mut out, depth + 3, "arg_optional")
+                fdw_str(mut out, "true")
+                fdw_end(mut out, true)
+            }
+            if f.global {
+                fdw_key(mut out, depth + 3, "global")
+                fdw_str(mut out, "true")
+                fdw_end(mut out, true)
+            }
+            if f.changes_dir {
+                fdw_key(mut out, depth + 3, "changes_dir")
+                fdw_str(mut out, "true")
+                fdw_end(mut out, true)
+            }
+            fdw_indent(mut out, depth + 2)
+            fdw_str(mut out, "}}")
+            fdw_end(mut out, true)
+        }
+        fdw_indent(mut out, depth + 1)
+        fdw_str(mut out, "]")
+        fdw_end(mut out, true)
+    }
+    if node.args.len != 0 {
+        fdw_key(mut out, depth + 1, "args")
+        fdw_str(mut out, "[\n")
+        for a in node.args {
+            fdw_indent(mut out, depth + 2)
+            cs_write_arg(spec, a, depth + 2, true, mut out)
+        }
+        fdw_indent(mut out, depth + 1)
+        fdw_str(mut out, "]")
+        fdw_end(mut out, true)
+    }
+    if node.dash_values >= 0 {
+        fdw_key(mut out, depth + 1, "dash_values")
+        cs_write_arg(spec, node.dash_values, depth + 1, true, mut out)
+    }
+    if node.after_dashdash >= 0 {
+        fdw_key(mut out, depth + 1, "after_dashdash")
+        cs_write_arg(spec, node.after_dashdash, depth + 1, true, mut out)
+    }
+    if node.subs.len != 0 {
+        fdw_key(mut out, depth + 1, "subcommands")
+        fdw_str(mut out, "[\n")
+        for s in node.subs {
+            fdw_indent(mut out, depth + 2)
+            compspec_write_node(spec, s, depth + 2, true, mut out)
+        }
+        fdw_indent(mut out, depth + 1)
+        fdw_str(mut out, "]")
+        fdw_end(mut out, true)
+    }
+    fdw_indent(mut out, depth)
+    fdw_str(mut out, "}}")
+    fdw_end(mut out, comma)
+}
