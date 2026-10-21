@@ -53,7 +53,7 @@ EVERY_LEG_EVENTS = ("schedule", "workflow_dispatch")
 def merge_leg(job, leg):
     """Whether a pull request's run (and a trunk push's) runs this leg:
     every leg but the macOS port, the nightly's."""
-    return not (job == "port" and leg["os"] == "macos-latest")
+    return True  # the plant: a pull request runs the macOS port again, its shape before tl30
 
 
 def legs(event):
