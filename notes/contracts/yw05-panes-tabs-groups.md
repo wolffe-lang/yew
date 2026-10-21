@@ -52,7 +52,14 @@ table.
    the `[os.term.mode]` widening (G34, #802), retiring R-yw03-4's
    LF-as-Enter interim; `os_term_restore_at_exit` (G1, #794) if yw01's
    guard is to retire with it. The filter's write side stays R-yw04-3's
-   (wolf-lang#818) unless that pin also has it.
+   (wolf-lang#818) unless that pin also has it. With `os_fork` the
+   clipboard writer runs as C's (G30's half): `s57_29_prompt_select_
+   and_copy`, yw04's one non-job red golden, turns green, and R-yw04-6
+   (the writer refusing and keeping the session) retires unasked. yw04's
+   interims retire here too: `tools/torture-live`'s G3 acceptance (the
+   tool fails until it is deleted), `edit.loop`'s deadline-first turn and
+   `term.tty`'s fine wait (`3375b51`, `57f47dd`, `620817e`), the
+   LF-as-Enter of R-yw03-4.
 2. **The pane tree** (s22): `edit.layout` — `Rect` in cells and the
    layout/draw split (layout computes rects, drawing consumes them; the
    cells-based law that keeps multibyte text from desyncing clicks), the
@@ -83,7 +90,10 @@ table.
    renditions in truecolor, 256, 16, mono and dumb). Unit: `test_tabs`
    (34), `test_strip` (14), `test_glyphs` (8). PTY: `s23_*` (6),
    `s57_8_click_new_tab` (1). Fuzz: s23 DoD 2's oracle (10,000 ops,
-   pinned seed and a random lane).
+   pinned seed and a random lane). yw04's narrow `tab_open_buffer` and
+   `ed.tab.close` for `A-e` (R-yw04-5) give way to the full open and
+   close, `s57_31_edit_in_buffer_*` staying green; `test_jumplist`'s
+   peer-window half (a SKIP naming yw05) runs once panes split.
 4. **Groups** (s24): facsimile's model ported whole — groups hold NO
    member lists (membership is `group_id` + a compacted `group_ordinal`
    on the tab, computed on demand), `last_active_member` a PATH, empty
@@ -109,7 +119,11 @@ table.
    the prompt's per-keystroke rebuilds (yw04's measurement, its note
    §4) write into storage the `Ed` already owns, digits formatted in
    place, no interpolated `str` per frame — measured with yw03's
-   `ptymem.py` before and after, C beside it from the same run.
+   `ptymem.py` before and after, C beside it from the same run. yw04
+   measured the worst row: a `:` keystroke keeps ~210 KB (C 0.3–0.5 KB),
+   ~182 KB of it one full repaint of the document rows, which C's refilter
+   asks for on every key (`notes/yw04-evidence/prompt/ptymem.txt`), so the
+   document rows under full damage are this deliverable's first target.
 7. **The gates**: `tools/check-test` and `--native` green with the
    per-case checked run for every `[native]` fallback (G29); the
    **30** campaign-05 PTY goldens of deliverables 2–5 (`s22_*` 11,
