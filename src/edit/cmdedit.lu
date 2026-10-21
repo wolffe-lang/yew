@@ -1,0 +1,629 @@
+//! edit.cmdedit — A-e: the prompt's line in a `*command-line*` buffer.
+//!
+//! Ports sagitta `src/ui/cmdedit.c` (666 lines) and `cmdedit.h` (95) at
+//! 9ace98c2 (s57.31 §2): A-e opens the line in a buffer of its own in a
+//! NEW tab, Insert mode, the caret where it was; `:q` (or `:wq`, or the
+//! tab's close) brings it back to the prompt as ONE line — a newline after
+//! a complete shell command a `; `, inside a list opener a blank, a
+//! trailing one dropped — and `:q!` brings back the original. The return
+//! hangs off the buffer's release (`cmdedit_released`, C's
+//! `ed_buffer_release` hook) and runs at the next event boundary
+//! (`cmdedit_settle`), and no text is ever lost (invariant 1): a text that
+//! cannot be one line goes back into a buffer with the message.
+//!
+//! The tab it needs is a second tab, past yw03's one-tab strip
+//! (R-yw03-3): the port adds `tab_open_buffer` (`tabs.c:347-375`), which
+//! the strip already paints, and keeps the buffer as a scratch the editor
+//! owns (C's `yew_ws_scratch_new`/`_drop`, Sprint 25's workspace buffers,
+//! yw06): a dropped buffer stays in the list, empty and non-resident, so
+//! no index moves (ruling R-yw04-5, asked).
+
+use text
+
+// `cmdedit_name` (`cmdedit.c:24`).
+fn cmdedit_name() -> str {
+    "*command-line*"
+}
+
+// `YEW_CMDEDIT_BYTES_MAX`, `YEW_CMDEDIT_LINES_MAX` (`cmdedit.h:22-27`).
+const CMDEDIT_BYTES_MAX: int = 65536
+
+const CMDEDIT_LINES_MAX: int = 1024
+
+/// A-e's state (`YewCmdEdit`, `cmdedit.h:29-45`): `buf_id` 0 is none.
+pub struct CmdEdit {
+    buf_id: int,
+    origin_tab_id: int,
+    origin_buf_id: int,
+    kind: int,
+    return_mode: int,
+    discard: bool,
+    released: bool,
+    settling: bool,
+    prefix: List[byte],
+    original: List[byte],
+    original_caret: int,
+    text: List[byte],
+    has_text: bool,
+}
+
+/// Nothing open.
+pub fn cmdedit_new() -> CmdEdit {
+    CmdEdit {
+        buf_id: 0,
+        origin_tab_id: 0,
+        origin_buf_id: 0,
+        kind: PROMPT_CMD,
+        return_mode: MODE_L,
+        discard: false,
+        released: false,
+        settling: false,
+        prefix: List[byte](),
+        original: List[byte](),
+        original_caret: 0,
+        text: List[byte](),
+        has_text: false,
+    }
+}
+
+// ---- the one-line rule ------------------------------------------------
+
+fn ce_blank(c: int) -> bool {
+    c == 32 || c == 9
+}
+
+// `cmdedit_rest_blank` (`cmdedit.c:33-41`).
+fn ce_rest_blank(s: List[byte], at_in: int) -> bool {
+    var at = at_in
+    while at < s.len {
+        if s[at] as int != 10 && !ce_blank(s[at] as int) {
+            return false
+        }
+        at += 1
+    }
+    true
+}
+
+// `cmdedit_opens_list` (`cmdedit.c:43-63`).
+fn ce_opens_list(w: List[byte]) -> bool {
+    let s = str_from_utf8(w) else ""
+    match s {
+        "if" => true,
+        "then" => true,
+        "else" => true,
+        "elif" => true,
+        "while" => true,
+        "until" => true,
+        "do" => true,
+        "{{" => true,
+        "!" => true,
+        "time" => true,
+        _ => false,
+    }
+}
+
+// `cmdedit_join` (`cmdedit.c:65-88`): the shell's reading of the newline
+// at `at`, as the join it needs: 1 `; `, 0 a blank, -1 refused (`why`).
+fn ce_join(s: List[byte], at: int) -> (int, str) {
+    let (ok, ctx) = shctx_at(s, at)
+    if !ok || ctx.pos == SH_POS_NONE {
+        return (-1, "inside a comment or an unfinished construct")
+    }
+    if ctx.quote != SH_Q_NONE {
+        return (-1, "inside quotes")
+    }
+    if ctx.pos != SH_POS_COMMAND {
+        return (1, "")
+    }
+    if ctx.replace_lo == ctx.replace_hi {
+        return (0, "")
+    }
+    (if ce_opens_list(ctx.stem) then 0 else 1, "")
+}
+
+/// `yew_cmdedit_oneline` (`cmdedit.c:90-193`): `src` as one prompt line
+/// appended to `out`. Answers (ok, the 1-based line at fault or 0, why —
+/// "" when the fault is a plain newline in a non-shell line).
+pub fn cmdedit_oneline(src: List[byte], shell: bool, mut out: List[byte]) -> (bool, int, str) {
+    if src.len > CMDEDIT_BYTES_MAX {
+        return (false, 0, "the text is too long for a one-line prompt")
+    }
+    var norm = List[byte]()
+    var lines = 1
+    var i = 0
+    while i < src.len {
+        let c = src[i] as int
+        if c == 13 && i + 1 < src.len && src[i + 1] as int == 10 {
+            i += 1
+            continue
+        }
+        if c == 0 {
+            return (false, lines, "a prompt cannot hold a NUL byte")
+        }
+        if c == 10 {
+            lines += 1
+        }
+        (mut norm).push(src[i])
+        i += 1
+    }
+    if lines > CMDEDIT_LINES_MAX {
+        return (false, 0, "the text is too long for a one-line prompt")
+    }
+    let s = norm
+    let n = s.len
+    lines = 1
+    i = 0
+    while i < n {
+        if s[i] as int != 10 {
+            (mut out).push(s[i])
+            i += 1
+            continue
+        }
+        if !shell {
+            if ce_rest_blank(s, i) {
+                break
+            }
+            return (false, lines, "")
+        }
+        var run = 0
+        while run < i && s[i - 1 - run] as int == 92 {
+            run += 1
+        }
+        let (join, why) = ce_join(s, i)
+        let rest = ce_rest_blank(s, i)
+        if join < 0 && !(rest && why != "inside quotes") {
+            return (false, lines, why)
+        }
+        if rest && run % 2 == 0 {
+            break
+        }
+        lines += 1
+        i += 1
+        if run % 2 != 0 {
+            let had = out.len > 1 && ce_blank(out[out.len - 2] as int)
+            var j = i
+            let _ = (mut out).pop() else 0 as byte
+            while j < n && ce_blank(s[j] as int) {
+                j += 1
+            }
+            if !had && j > i && j < n && s[j] as int != 10 {
+                (mut out).push(32 as byte)
+            }
+            i = j
+            continue
+        }
+        while out.len != 0 &&
+            ce_blank(out[out.len - 1] as int) &&
+            !(out.len > 1 && out[out.len - 2] as int == 92) {
+            let _ = (mut out).pop() else 0 as byte
+        }
+        if join == 1 {
+            (mut out).push(59 as byte)
+            (mut out).push(32 as byte)
+        } else if out.len != 0 && !ce_blank(out[out.len - 1] as int) {
+            (mut out).push(32 as byte)
+        }
+        while i < n && ce_blank(s[i] as int) {
+            i += 1
+        }
+    }
+    (true, 0, "")
+}
+
+// ---- helpers ----------------------------------------------------------
+
+fn ce_shell(ed: Ed) -> bool {
+    ed.cmdedit.prefix.len != 0
+}
+
+// `cmdedit_line` (`cmdedit.c:244-268`): the whole line the prompt would
+// hold for `body`, or false with the refusal on the message line.
+fn ce_line(mut ed: Ed, body: List[byte], mut out: List[byte]) -> bool {
+    for b in ed.cmdedit.prefix {
+        (mut out).push(b)
+    }
+    let (ok, line, why) = cmdedit_oneline(body, ce_shell(ed), mut out)
+    if ok {
+        return true
+    }
+    if line == 0 {
+        ed_msg(mut ed, MSG_ERROR, why)
+    } else if why.len == 0 {
+        ed_msg(mut ed, MSG_ERROR, "line {line}: a one-line prompt cannot hold a newline")
+    } else if why.starts_with("inside") {
+        ed_msg(mut ed, MSG_ERROR, "line {line}: a one-line prompt cannot hold a newline {why}")
+    } else {
+        ed_msg(mut ed, MSG_ERROR, "line {line}: {why}")
+    }
+    false
+}
+
+// The buffer index of A-e's buffer, or -1.
+fn ce_buf(ed: Ed) -> int {
+    if ed.cmdedit.buf_id == 0 {
+        return -1
+    }
+    let bi = ed_buf_index(ed, ed.cmdedit.buf_id)
+    if bi >= 0 && ed.bufs[bi].resident then bi else -1
+}
+
+/// `yew_cmdedit_owns` (`cmdedit.c:395-399`): is buffer index `bi` A-e's?
+pub fn cmdedit_owns(ed: Ed, bi: int) -> bool {
+    ed.cmdedit.buf_id != 0 &&
+        bi >= 0 &&
+        bi < ed.bufs.len &&
+        ed.bufs[bi].id == ed.cmdedit.buf_id &&
+        ed.bufs[bi].resident
+}
+
+// Some tab shows buffer index `bi` (`cmdedit_shown`, `cmdedit.c:285-300`).
+fn ce_shown(ed: Ed, bi: int) -> bool {
+    for t in ed.tabs {
+        if t.win >= 0 && t.win < ed.wins.len && ed.wins[t.win].buf == bi {
+            return true
+        }
+    }
+    ed.win >= 0 && ed.wins[ed.win].buf == bi
+}
+
+// `cmdedit_unshow` (`cmdedit.c:302-329`): every view of `bi` shows `to`.
+fn ce_unshow(mut ed: Ed, bi: int, to: int) {
+    if ed.win >= 0 && ed.wins[ed.win].buf == bi {
+        ed_show_buffer(mut ed, to)
+    }
+    let from_id = ed.bufs[bi].id
+    let to_id = ed.bufs[to].id
+    var t = 0
+    while t < ed.tabs.len {
+        if ed.tabs[t].buffer_id == from_id {
+            ed.tabs[t].buffer_id = to_id
+        }
+        let w = ed.tabs[t].win
+        if w >= 0 && w < ed.wins.len && ed.wins[w].buf == bi {
+            ed.wins[w].buf = to
+            ed.wins[w].cs = text.cset_init(text.cursor_at(0 as text.ByteOff))
+        }
+        t += 1
+    }
+}
+
+// `cmdedit_fallback` (`cmdedit.c:331-337`): what the window showed before
+// A-e, else the document.
+fn ce_fallback(ed: Ed, bi: int) -> int {
+    let to = if ed.cmdedit.origin_buf_id == 0 {
+        -1
+    } else {
+        ed_buf_index(ed, ed.cmdedit.origin_buf_id)
+    }
+    if to >= 0 && to != bi && ed.bufs[to].resident {
+        return to
+    }
+    ed_doc(ed)
+}
+
+// `cmdedit_back_to_origin` (`cmdedit.c:339-345`).
+fn ce_back_to_origin(mut ed: Ed) {
+    let idx = tab_index_of_id(ed, ed.cmdedit.origin_tab_id)
+    if idx >= 0 && idx != ed.tab_active {
+        tab_switch(mut ed, idx)
+    }
+}
+
+// The scratch buffer (`yew_ws_scratch_new`, ws.c, Sprint 25's): resident,
+// empty, named, its undo at the save point.
+fn ce_scratch_new(mut ed: Ed, bytes: List[byte]) -> int {
+    var ec = text.editctx_new(take text.textbuf_from_bytes(bytes, 0, bytes.len))
+    ec.undo = text.undo_new(ec.tb)
+    ec.has_undo = true
+    text.undo_mark_saved(mut ec.undo, ec.tb)
+    ec.marks = text.marks_new()
+    ec.has_marks = true
+    let id = ed.next_buf_id
+    ed.next_buf_id += 1
+    (mut ed.bufs).push(Buffer {
+        id: id,
+        ec: ec,
+        resident: true,
+        path: "",
+        has_path: false,
+        name: cmdedit_name(),
+        has_name: true,
+        flags: BUF_SCRATCH,
+        tabwidth: ed.opts.tabwidth,
+        recovery_pending: false,
+        pairs: pairstate_new(),
+        named: named_marks_new(),
+    })
+    ed.bufs.len - 1
+}
+
+// `yew_ws_scratch_drop` (ws.c) with the release hook (`ed.c:580-600`):
+// A-e's return hangs off this release; the buffer stays in the list,
+// empty and non-resident, so no index moves.
+fn ce_scratch_drop(mut ed: Ed, bi: int) {
+    if ed.win >= 0 && ed.wins[ed.win].buf == bi {
+        ed_show_buffer(mut ed, ed_doc(ed))
+    }
+    cmdedit_released(mut ed, bi)
+    ed.bufs[bi].ec = text.editctx_new(take text.textbuf_new())
+    ed.bufs[bi].resident = false
+    ed.bufs[bi].has_name = false
+    ed.bufs[bi].name = ""
+}
+
+/// `yew_tab_open_buffer` (`tabs.c:347-375`): a new tab showing buffer
+/// index `bi` in a window of its own; answers its index.
+pub fn tab_open_buffer(mut ed: Ed, bi: int) -> int {
+    if ed.win < 0 || bi < 0 || bi >= ed.bufs.len {
+        return -1
+    }
+    let wid = ed.next_win_id
+    ed.next_win_id += 1
+    var w = win_new(wid, bi)
+    vp_init(mut w)
+    apply_win_opts(ed.opts, mut w)
+    (mut ed.wins).push(w)
+    let tid = ed.next_tab_id
+    ed.next_tab_id += 1
+    (mut ed.tabs).push(Tab {
+        tab_id: tid,
+        buffer_id: ed.bufs[bi].id,
+        win: ed.wins.len - 1,
+        path: "",
+        display_path: "",
+        has_path: false,
+    })
+    ed.tabs.len - 1
+}
+
+// `cmdedit_show` (`cmdedit.c:347-383`): `bi` in a tab of its own, the
+// caret at `caret`, Insert.
+fn ce_show(mut ed: Ed, bi: int, caret: int) -> bool {
+    let idx = tab_open_buffer(mut ed, bi)
+    if idx >= 0 {
+        tab_switch(mut ed, idx)
+    } else {
+        ed_show_buffer(mut ed, bi)
+    }
+    if ed.win < 0 || ed.wins[ed.win].buf != bi {
+        if idx >= 0 && ed.tabs.len > 1 {
+            let _ = tab_close(mut ed, idx)
+        }
+        ce_unshow(mut ed, bi, ed_doc(ed))
+        return false
+    }
+    ed_layout(mut ed)
+    let w = ed.win
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p].pos = caret
+    ed.wins[w].cs.curs[p].anchor = caret
+    ed.wins[w].cs.curs[p].goal_col = 0
+    text.cursor_clamp(ed.bufs[bi].ec.tb, mut ed.wins[w].cs.curs[p])
+    vp_follow(mut ed.wins[w], ed.bufs[bi].ec.tb)
+    let _ = mode_enter(mut ed, MODE_I)
+    ed.layout_dirty = true
+    ed.full_damage = true
+    true
+}
+
+// `cmdedit_open` (`cmdedit.c:385-395`).
+fn ce_open(mut ed: Ed, body: List[byte], caret: int) -> bool {
+    let bi = ce_scratch_new(mut ed, body)
+    if !ce_show(mut ed, bi, caret) {
+        ce_drop_unreleased(mut ed, bi)
+        return false
+    }
+    ed.cmdedit.buf_id = ed.bufs[bi].id
+    true
+}
+
+// A scratch that never became A-e's: dropped without the release hook.
+fn ce_drop_unreleased(mut ed: Ed, bi: int) {
+    ed.bufs[bi].ec = text.editctx_new(take text.textbuf_new())
+    ed.bufs[bi].resident = false
+    ed.bufs[bi].has_name = false
+    ed.bufs[bi].name = ""
+}
+
+// ---- the command ------------------------------------------------------
+
+/// `ed.cmdline.edit_in_buffer` (`yew_cmdedit_cmd_edit_in_buffer`,
+/// `cmdedit.c:401-487`).
+pub fn cmdedit_edit_in_buffer_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    let kind = ed.cmdline.kind
+    if kind == PROMPT_INPUT {
+        ed_msg(mut ed, MSG_WARN, "A-e: this prompt cannot become a buffer")
+        return CMD_OK
+    }
+    cmdline_sync(mut ed)
+    let line = cmdline_text(ed)
+    var caret = cmdline_caret(ed)
+    if caret > line.len {
+        caret = line.len
+    }
+    if ed.cmdedit.released {
+        ed_msg(mut ed, MSG_WARN, "A-e: {cmdedit_name()} is still returning its line")
+        return CMD_OK
+    }
+    let open = ce_buf(ed)
+    if open >= 0 {
+        if line.len != 0 {
+            cl_history_add(mut ed, line)
+        }
+        cmdline_close(mut ed, false)
+        var t = 0
+        while t < ed.tabs.len {
+            let w = ed.tabs[t].win
+            if w >= 0 && ed.wins[w].buf == open {
+                tab_switch(mut ed, t)
+                break
+            }
+            t += 1
+        }
+        if ed.win < 0 || ed.wins[ed.win].buf != open {
+            ed_show_buffer(mut ed, open)
+        }
+        let _ = mode_enter(mut ed, MODE_I)
+        ed_msg(mut ed, MSG_INFO, "{cmdedit_name()} is already open")
+        return CMD_OK
+    }
+    ed.cmdedit = cmdedit_new()
+    var body = 0
+    var bang = false
+    if kind == PROMPT_CMD {
+        let b = cmd_bang_body(ed, line) else -1
+        if b >= 0 && b <= line.len {
+            bang = true
+            body = b
+        }
+    }
+    if !bang {
+        body = 0
+    }
+    ed.cmdedit.kind = kind
+    ed.cmdedit.return_mode = ed.cmdline.return_mode
+    ed.cmdedit.prefix = line[0..body]
+    ed.cmdedit.original = copy line
+    ed.cmdedit.original_caret = caret
+    ed.cmdedit.origin_tab_id = if ed.tab_active >= 0 then ed.tabs[ed.tab_active].tab_id else 0
+    cmdline_close(mut ed, false)
+    ed.cmdedit.origin_buf_id = if ed.win >= 0 then ed.bufs[ed.wins[ed.win].buf].id else 0
+    let within = if caret > body then caret - body else 0
+    if !ce_open(mut ed, line[body..line.len], within) {
+        let original = copy ed.cmdedit.original
+        cmdline_restore(mut ed, kind, original, ed.cmdedit.original_caret, ed.cmdedit.return_mode)
+        ed.cmdedit = cmdedit_new()
+        ed_msg(mut ed, MSG_ERROR, "A-e: cannot open {cmdedit_name()}")
+        return CMD_OK
+    }
+    ed_msg(
+        mut ed,
+        MSG_INFO,
+        "{cmdedit_name()}: :q returns the line to the prompt, :q! discards the edit",
+    )
+    CMD_OK
+}
+
+// ---- close and return -------------------------------------------------
+
+/// `yew_cmdedit_close` (`cmdedit.c:491-535`): `:q`, `:wq` or the tab's
+/// close in A-e's buffer — the line checked first (a text that cannot be
+/// one line refuses, naming the line), the tab closed, the release
+/// returning it.
+pub fn cmdedit_close(mut ed: Ed, discard: bool) -> int {
+    let bi = ce_buf(ed)
+    if bi < 0 {
+        return CMD_ERR_STATE
+    }
+    if !discard {
+        var line = List[byte]()
+        let body = text.textbuf_bytes(ed.bufs[bi].ec.tb)
+        if !ce_line(mut ed, body, mut line) {
+            return CMD_ERR_STATE
+        }
+    }
+    ed.cmdedit.discard = discard
+    var t = ed.tabs.len
+    while t > 0 {
+        t -= 1
+        if ed.tabs.len > 1 && ed.tabs[t].buffer_id == ed.bufs[bi].id {
+            let _ = tab_close(mut ed, t)
+        }
+    }
+    let to = ce_fallback(ed, bi)
+    ce_unshow(mut ed, bi, to)
+    ce_back_to_origin(mut ed)
+    if ed.mode == MODE_I {
+        let _ = mode_enter(mut ed, MODE_L)
+    }
+    ce_scratch_drop(mut ed, bi)
+    CMD_OK
+}
+
+/// `yew_cmdedit_released` (`cmdedit.c:537-553`): A-e's buffer is going;
+/// its bytes are kept for the return.
+pub fn cmdedit_released(mut ed: Ed, bi: int) {
+    if !cmdedit_owns(ed, bi) {
+        return
+    }
+    ed.cmdedit.text = text.textbuf_bytes(ed.bufs[bi].ec.tb)
+    ed.cmdedit.has_text = true
+    ed.cmdedit.released = true
+    ed.cmdedit.buf_id = 0
+}
+
+/// `yew_cmdedit_settle` (`cmdedit.c:555-655`): at an event boundary, a
+/// released buffer gives its line back to the prompt — once the stage is
+/// clear (no prompt open, no question asked, the editor not leaving).
+pub fn cmdedit_settle(mut ed: Ed) {
+    if !ed.model_ready {
+        return
+    }
+    if ed.cmdedit.settling || ed.cmdedit.buf_id == 0 && !ed.cmdedit.released {
+        return
+    }
+    ed.cmdedit.settling = true
+    if ed.cmdedit.buf_id != 0 {
+        let bi = ed_buf_index(ed, ed.cmdedit.buf_id)
+        if bi >= 0 && ed.bufs[bi].resident && !ce_shown(ed, bi) {
+            ce_scratch_drop(mut ed, bi)
+        } else if bi < 0 || !ed.bufs[bi].resident {
+            ed.cmdedit.buf_id = 0
+            ed.cmdedit.released = true
+            ed.cmdedit.discard = true
+        }
+    }
+    if !ed.cmdedit.released || ed.quit || ed.cmdline.active || ed.prompt != PROMPT_NONE {
+        ed.cmdedit.settling = false
+        return
+    }
+    var line = List[byte]()
+    var back = List[byte]()
+    var caret = 0
+    if ed.cmdedit.discard || !ed.cmdedit.has_text {
+        back = copy ed.cmdedit.original
+        caret = ed.cmdedit.original_caret
+    } else {
+        let body = copy ed.cmdedit.text
+        if ce_line(mut ed, body, mut line) {
+            back = line
+            caret = back.len
+        } else {
+            // A route that did not ask first closed it and the text cannot
+            // be one line: back into a buffer, with the message (invariant
+            // 1); failing that, into the prompt folded, mangled but kept.
+            let keep = copy ed.cmdedit.text
+            let said = copy ed.msg
+            ed.cmdedit.text = List[byte]()
+            ed.cmdedit.has_text = false
+            ed.cmdedit.released = false
+            if !ce_open(mut ed, keep, keep.len) {
+                var folded = copy ed.cmdedit.prefix
+                for b in keep {
+                    (mut folded).push(b)
+                }
+                ce_back_to_origin(mut ed)
+                let k = ed.cmdedit.kind
+                let rm = ed.cmdedit.return_mode
+                cmdline_restore(mut ed, k, folded, folded.len, rm)
+                ed.cmdedit = cmdedit_new()
+                return
+            }
+            ed.msg = said
+            ed.cmdedit.settling = false
+            return
+        }
+    }
+    ce_back_to_origin(mut ed)
+    if ed.mode == MODE_I {
+        let _ = mode_enter(mut ed, MODE_L)
+    }
+    let k = ed.cmdedit.kind
+    let rm = ed.cmdedit.return_mode
+    cmdline_restore(mut ed, k, back, caret, rm)
+    ed.cmdedit = cmdedit_new()
+}
