@@ -1,0 +1,372 @@
+//! edit.overlay — viewport-scoped match highlighting and the bounded
+//! match count.
+//!
+//! Ports sagitta `src/search/overlay.c` (436 lines) and `overlay.h` (79)
+//! at 9ace98c2, under `s21-search-replace.md` §3. It lives in `edit`, not
+//! `search`, because it takes the `Ed` and its windows (`overlay.c:11`
+//! includes `edit/ed.h`; a module cycle is E0303 — yw03's module rule).
+//! The scan is bounded twice over (`overlay.h:4-20`): by SCOPE, the
+//! viewport plus a look-ahead and never the file, and by TIME, a
+//! per-keystroke budget whose remainder the idle timer finishes. Damage
+//! is the diff of the old and new span lists, never the viewport.
+//!
+//! C's refresh takes the program as an argument and a NULL one clears;
+//! the port's refresh reads the editor's program (`ed.search.re`, the
+//! engine's scratch match beside it, so a keystroke allocates no match)
+//! and `overlay_clear` is the NULL call.
+//!
+//! The time budget is in microseconds as C's; at 0.2.33 the clock is
+//! `time_now_ms` (G8, no sub-millisecond clock), so a deadline is checked
+//! at millisecond resolution: a budget under 1 ms ends a scan only once
+//! the clock has ticked.
+
+use search
+use text
+
+/// Per-keystroke scan ceiling, microseconds (`YEW_OVERLAY_BUDGET_US`).
+pub const OVERLAY_BUDGET_US: int = 1000
+
+/// Per-keystroke scan ceiling, bytes (`YEW_OVERLAY_BUDGET_BYTES`).
+pub const OVERLAY_BUDGET_BYTES: int = 262144
+
+/// Look-ahead beyond the viewport (`YEW_SEARCH_LOOKAHEAD_MAX`).
+pub const SEARCH_LOOKAHEAD_MAX: int = 65536
+
+/// The interactive count's match cap (`YEW_SEARCH_COUNT_MAX`).
+pub const SEARCH_COUNT_MAX: int = 10000
+
+/// The interactive count's byte ceiling (`YEW_SEARCH_COUNT_BUDGET_BYTES`).
+pub const SEARCH_COUNT_BUDGET_BYTES: int = 16384
+
+/// The overlay (`MatchOverlay`, `overlay.h:52-61`): buffer byte spans,
+/// ascending and disjoint, the range they are complete for, the keys
+/// that invalidate them, the match the cursor is on, and the count.
+/// `prev` is the port's: the spare list a refresh swaps the old spans
+/// into for the damage diff (C copies them into a fresh vector and
+/// frees it; a replaced `List` would be held for the session, G33).
+pub struct MatchOverlay {
+    spans: List[text.Span],
+    prev: List[text.Span],
+    scanned: text.Span,
+    pat_gen: int,
+    buf_gen: int,
+    cur_index: int,
+    count_total: int,
+    count_capped: bool,
+    complete: bool,
+}
+
+/// An empty overlay (`yew_overlay_init`).
+pub fn overlay_new() -> MatchOverlay {
+    MatchOverlay {
+        spans: List[text.Span](),
+        prev: List[text.Span](),
+        scanned: text.span(0, 0),
+        pat_gen: 0,
+        buf_gen: 0,
+        cur_index: -1,
+        count_total: 0,
+        count_capped: false,
+        complete: false,
+    }
+}
+
+// Empty a span list in place (C's `len = 0`): the storage is reused.
+fn ov_spans_clear(mut v: List[text.Span]) {
+    while v.len != 0 {
+        let _ = (mut v).pop()
+    }
+}
+
+/// Drop the spans; the next refresh starts from nothing
+/// (`yew_overlay_invalidate`).
+pub fn overlay_invalidate(mut ov: MatchOverlay) {
+    ov_spans_clear(mut ov.spans)
+    ov.scanned = text.span(0, 0)
+    ov.cur_index = -1
+    ov.complete = false
+}
+
+/// The monotonic clock in microseconds at the clock's resolution (C's
+/// `now_us`, `overlay.c:46-53`; G8: milliseconds at 0.2.33).
+pub fn now_us() -> int {
+    time_now_ms() * 1000
+}
+
+// The visible lines and the scan window (`visible_window`/`scan_window`,
+// `overlay.c:74-151`): reuse is judged against the visible lines, a scan
+// covers them plus the look-ahead.
+fn ov_windows(w: Win, tb: text.TextBuf) -> (text.Span, text.Span) {
+    let len = text.textbuf_len(tb)
+    let nlines = text.textbuf_line_count(tb)
+    if nlines == 0 {
+        return (text.span(0, 0), text.span(0, 0))
+    }
+    var top = w.vp.top
+    let height = if w.rect.h == 0 then 1 else w.rect.h
+    if top >= nlines {
+        top = nlines - 1
+    }
+    var last = top + height
+    if last >= nlines {
+        last = nlines - 1
+    }
+    let lo = text.textbuf_line_start(tb, top as text.LineNo) as int
+    let hi = if last + 1 < nlines {
+        text.textbuf_line_start(tb, (last + 1) as text.LineNo) as int
+    } else {
+        len
+    }
+    var look = if hi > lo then (hi - lo) * 2 else 0
+    if look > SEARCH_LOOKAHEAD_MAX {
+        look = SEARCH_LOOKAHEAD_MAX
+    }
+    let wlo = if lo > look then lo - look else 0
+    let whi = if hi + look < len then hi + look else len
+    (text.span(lo, hi), text.span(wlo, whi))
+}
+
+// `damage_span` (`overlay.c:153-164`): every line `span` touches.
+fn ov_damage_span(mut ed: Ed, b: int, sp: text.Span) {
+    let lo = text.textbuf_line_of(ed.bufs[b].ec.tb, sp.lo as text.ByteOff) as int
+    let last = if sp.hi > sp.lo then sp.hi - 1 else sp.lo
+    let hi = text.textbuf_line_of(ed.bufs[b].ec.tb, last as text.ByteOff) as int
+    var line = lo
+    while line <= hi {
+        ed_damage_line(mut ed, line, false)
+        line += 1
+    }
+}
+
+// `damage_diff` (`overlay.c:166-196`): damage by diffing the old spans
+// (`prev`) against the new (`spans`), so a one-character refinement
+// repaints only the lines whose highlight set changed.
+fn ov_damage_diff(mut ed: Ed, w: int, b: int) {
+    var i = 0
+    var j = 0
+    while i < ed.wins[w].overlay.prev.len || j < ed.wins[w].overlay.spans.len {
+        let np = ed.wins[w].overlay.prev.len
+        let ns = ed.wins[w].overlay.spans.len
+        if i < np && j < ns {
+            let a = copy ed.wins[w].overlay.prev[i]
+            let c = copy ed.wins[w].overlay.spans[j]
+            if a.lo == c.lo && a.hi == c.hi {
+                i += 1
+                j += 1
+                continue
+            }
+            if a.lo < c.lo {
+                ov_damage_span(mut ed, b, a)
+                i += 1
+            } else {
+                ov_damage_span(mut ed, b, c)
+                j += 1
+            }
+        } else if i < np {
+            let a = copy ed.wins[w].overlay.prev[i]
+            ov_damage_span(mut ed, b, a)
+            i += 1
+        } else {
+            let c = copy ed.wins[w].overlay.spans[j]
+            ov_damage_span(mut ed, b, c)
+            j += 1
+        }
+    }
+}
+
+// Move the current spans into `prev` (emptying the old `prev` first) and
+// leave `spans` empty: a swap, no allocation.
+fn ov_spans_to_prev(mut ov: MatchOverlay) {
+    ov_spans_clear(mut ov.prev)
+    let t = ov.prev
+    ov.prev = ov.spans
+    ov.spans = t
+}
+
+// `overlay_track_cursor` (`overlay.c:198-226`): the match the cursor
+// stands on, recomputed on EVERY refresh, the reusing one included.
+fn ov_track_cursor(mut ov: MatchOverlay, pos: int) {
+    ov.cur_index = -1
+    var i = 0
+    while i < ov.spans.len {
+        if pos >= ov.spans[i].lo && pos < ov.spans[i].hi {
+            ov.cur_index = i
+            return
+        }
+        if ov.spans[i].lo == ov.spans[i].hi && pos == ov.spans[i].lo {
+            ov.cur_index = i
+            return
+        }
+        i += 1
+    }
+}
+
+/// Clear window `w`'s highlight, damaging the lines it covered
+/// (`yew_overlay_refresh` with a NULL program, `overlay.c:246-253`).
+pub fn overlay_clear(mut ed: Ed, w: int) {
+    if w < 0 || w >= ed.wins.len || ed.wins[w].buf < 0 {
+        return
+    }
+    let b = ed.wins[w].buf
+    if ed.wins[w].overlay.spans.len != 0 {
+        ov_spans_to_prev(mut ed.wins[w].overlay)
+        ov_damage_diff(mut ed, w, b)
+        overlay_invalidate(mut ed.wins[w].overlay)
+    }
+}
+
+/// Bring window `w`'s overlay up to date for its viewport under the
+/// editor's program (`yew_overlay_refresh`, `overlay.c:228-379`),
+/// damaging exactly the lines whose highlight set changed; with no
+/// program it clears. `budget_us <= 0` means no limit (the idle path and
+/// the tests).
+pub fn overlay_refresh(mut ed: Ed, w: int, pat_gen: int, budget_us: int) {
+    if w < 0 || w >= ed.wins.len || ed.wins[w].buf < 0 {
+        return
+    }
+    if ed.search.re.len == 0 {
+        overlay_clear(mut ed, w)
+        return
+    }
+    let b = ed.wins[w].buf
+    // A recompiled pattern or an edited buffer makes every span suspect;
+    // a scroll does not.
+    let tbgen = ed.bufs[b].ec.tb.gen
+    let invalidated = ed.wins[w].overlay.pat_gen != pat_gen || ed.wins[w].overlay.buf_gen != tbgen
+    if invalidated {
+        // The old highlights are kept for the diff, or a refinement that
+        // removes a match never repaints where it was.
+        ov_spans_to_prev(mut ed.wins[w].overlay)
+        ed.wins[w].overlay.scanned = text.span(0, 0)
+        ed.wins[w].overlay.complete = false
+        ed.wins[w].overlay.pat_gen = pat_gen
+        ed.wins[w].overlay.buf_gen = tbgen
+    }
+    let (vis, want) = ov_windows(ed.wins[w], ed.bufs[b].ec.tb)
+    let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    if ed.wins[w].overlay.complete &&
+        ed.wins[w].overlay.scanned.lo <= vis.lo &&
+        ed.wins[w].overlay.scanned.hi >= vis.hi {
+        // Spans are reusable; the cursor's position is not.
+        ov_track_cursor(mut ed.wins[w].overlay, pos)
+        return
+    }
+    if !invalidated {
+        ov_spans_to_prev(mut ed.wins[w].overlay)
+    }
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    let deadline = if budget_us > 0 then now_us() + budget_us else 0
+    // Start at a line boundary, so `^` is judged against the line.
+    var at = text.textbuf_line_start(
+        ed.bufs[b].ec.tb,
+        text.textbuf_line_of(ed.bufs[b].ec.tb, want.lo as text.ByteOff),
+    ) as int
+    ed.wins[w].overlay.scanned.lo = at
+    ed.wins[w].overlay.complete = true
+    // Bound the ENGINE's window, not just this loop (`overlay.c:305-322`):
+    // narrowing `hi` only makes the engine believe the text ends early.
+    let win_hi = if want.hi < len then want.hi else len
+    loop {
+        if at > len {
+            break
+        }
+        if !engine_search(
+            ed.search.re[0],
+            ed.bufs[b].ec.tb,
+            ed.search.nob,
+            at,
+            0,
+            win_hi,
+            mut ed.search.sc,
+            mut ed.search.m,
+        ) {
+            break
+        }
+        let mlo = ed.search.m.lo[0]
+        let mhi = ed.search.m.hi[0]
+        if mlo >= want.hi {
+            break
+        }
+        // A match ending exactly at the narrowed edge may exist only
+        // because the engine sees the edge as the end.
+        if mhi == want.hi && want.hi < len {
+            break
+        }
+        (mut ed.wins[w].overlay.spans).push(text.span(mlo, mhi))
+        let scanned_bytes = if mhi > want.lo then mhi - want.lo else 0
+        if mhi == mlo {
+            let next = text.grapheme_next(ed.bufs[b].ec.tb, mhi as text.ByteOff) as int
+            if next <= mhi {
+                break
+            }
+            at = next
+        } else {
+            at = mhi
+        }
+        // The budget between matches, never inside one.
+        if scanned_bytes >= OVERLAY_BUDGET_BYTES || deadline != 0 && now_us() >= deadline {
+            ed.wins[w].overlay.complete = false
+            break
+        }
+    }
+    ed.wins[w].overlay.scanned.hi = if ed.wins[w].overlay.complete then want.hi else at
+    ov_damage_diff(mut ed, w, b)
+    ov_track_cursor(mut ed.wins[w].overlay, pos)
+}
+
+/// The bounded count behind `[3/17]` (`yew_overlay_count`,
+/// `overlay.c:381-436`): a positive budget bounds a buffer past the byte
+/// ceiling by bytes and time; a small buffer counts exactly.
+pub fn overlay_count(mut ov: MatchOverlay, re: search.Re, tb: text.TextBuf, budget_us: int) {
+    ov.count_total = 0
+    ov.count_capped = false
+    let len = text.textbuf_len(tb)
+    let byte_bounded = budget_us > 0 && len > SEARCH_COUNT_BUDGET_BYTES
+    let win_hi = if byte_bounded then SEARCH_COUNT_BUDGET_BYTES else len
+    let deadline = if byte_bounded then now_us() + budget_us else 0
+    var at = 0
+    var n = 0
+    var m = search.re_match_new()
+    var sc = search.re_scratch_new()
+    let nob = List[byte]()
+    loop {
+        if at > len {
+            break
+        }
+        let hit = engine_search(re, tb, nob, at, 0, win_hi, mut sc, mut m)
+        let mlo = m.lo[0]
+        let mhi = m.hi[0]
+        if !hit {
+            if byte_bounded {
+                ov.count_capped = true
+            }
+            break
+        }
+        // A match at the artificial edge may exist only because `$` or
+        // `\z` sees the edge as the end: a partial count may undercount,
+        // never report a false match.
+        if byte_bounded && search.re_whole_literal_bytes(re) == 0 && mhi == win_hi {
+            ov.count_capped = true
+            break
+        }
+        n += 1
+        if n >= SEARCH_COUNT_MAX {
+            ov.count_capped = true
+            break
+        }
+        if deadline != 0 && now_us() >= deadline {
+            ov.count_capped = true
+            break
+        }
+        if mhi == mlo {
+            let next = text.grapheme_next(tb, mhi as text.ByteOff) as int
+            if next <= mhi {
+                break
+            }
+            at = next
+        } else {
+            at = mhi
+        }
+    }
+    ov.count_total = n
+}

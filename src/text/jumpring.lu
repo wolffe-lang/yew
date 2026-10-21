@@ -1,0 +1,240 @@
+//! text.jumpring — the ring both navigation histories share, and the
+//! change list's record at the edit choke point.
+//!
+//! Ports the data half of sagitta `src/edit/jumplist.c` (503 lines) and
+//! `jumplist.h` (112) at 9ace98c2, under `s21-search-replace.md` §5: the
+//! entry, the ring, its push rules (`ring_push`, `jumplist.c:70-136`) and
+//! `yew_change_record` (`jumplist.c:286-322`). C records a change from
+//! the text layer's `on_change` callback (`text/edit.c:105-111`, fed to
+//! `ed_on_change`, `ed.c:1051-1068`), a function pointer the editor
+//! installs; the port has no function value across a module boundary
+//! (G19/G20), so the change list rides in the `EditCtx` (`changes`, on
+//! when `change_hook` is) and `edit_apply` records into it at the moment
+//! C's callback runs — the same order, the same marks, nothing deferred.
+//! The walks, the dead-entry compaction and the commands need the
+//! editor's buffers and live in `edit.jumplist`.
+//!
+//! C's `JumpList` and `ChangeList` repeat the ring's four fields; the
+//! port's `ChangeList` holds a `JumpList` as its `ring`, so the rules are
+//! written once over one type. C's fixed `e[100]` is a `List` that grows
+//! to the cap and then wraps: while it is short the oldest entry is slot
+//! 0 and `head == e.len`, so a write past the end appends (`ring_put`) and
+//! the slot arithmetic is C's (`ring_slot`, `jumplist.c:28-32`).
+
+/// `YEW_JUMPLIST_MAX`.
+pub const JUMPLIST_MAX: int = 100
+
+/// `YEW_CHANGELIST_MAX`.
+pub const CHANGELIST_MAX: int = 100
+
+/// `YEW_CHANGE_COALESCE_MS`: consecutive edits within it collapse.
+pub const CHANGE_COALESCE_MS: int = 500
+
+/// An entry (`JumpEntry`, `jumplist.h:31-40`).
+pub struct JumpEntry {
+    buf_id: int,
+    mark: MarkId,
+    state_token: int,
+    line_hint: int,
+    stamp_ms: int,
+}
+
+/// A ring, browser-history model (`JumpList`, `jumplist.h:52-57`): `head`
+/// one past the newest, `len` live, `cur` a LOGICAL index into the
+/// oldest-to-newest sequence, `cur == len` standing at now.
+pub struct JumpList {
+    e: List[JumpEntry],
+    head: int,
+    len: int,
+    cur: int,
+}
+
+/// The change list (`ChangeList`, `jumplist.h:59-67`): the ring and the
+/// previous record's time and line, for coalescing.
+pub struct ChangeList {
+    ring: JumpList,
+    last_ms: int,
+    last_line: int,
+    has_last: bool,
+}
+
+/// A zeroed entry (C's `memset`): its mark is never alive (a mark's
+/// generation starts at 1).
+pub fn jump_entry_zero() -> JumpEntry {
+    JumpEntry {
+        buf_id: 0,
+        mark: MarkId { id: 0, gen: 0 },
+        state_token: 0,
+        line_hint: 0,
+        stamp_ms: 0,
+    }
+}
+
+/// An empty jump list (`yew_jumplist_init`).
+pub fn jumplist_new() -> JumpList {
+    JumpList { e: List[JumpEntry](), head: 0, len: 0, cur: 0 }
+}
+
+/// An empty change list (`yew_changelist_init`).
+pub fn changelist_new() -> ChangeList {
+    ChangeList { ring: jumplist_new(), last_ms: 0, last_line: 0, has_last: false }
+}
+
+/// Logical index (0 = oldest) to slot (`ring_slot`, `jumplist.c:28-32`).
+pub fn ring_slot(head: int, len: int, cap: int, index: int) -> int {
+    (head + cap - len + index) % cap
+}
+
+/// The entry count (`yew_jumplist_len`).
+pub fn jumplist_len(jl: JumpList) -> int {
+    jl.len
+}
+
+/// The entry at logical `index`, oldest first (`yew_jumplist_at`); the
+/// `none` row past the end. The ring's cap is `JUMPLIST_MAX`, which is
+/// `CHANGELIST_MAX` too.
+pub fn jumplist_at(jl: JumpList, index: int) -> JumpEntry ! {none} {
+    if index < 0 || index >= jl.len {
+        return none
+    }
+    copy jl.e[ring_slot(jl.head, jl.len, JUMPLIST_MAX, index)]
+}
+
+/// Write slot `slot` (C's `e[slot] = …`): the list grows to the cap
+/// first.
+pub fn ring_put(mut r: JumpList, slot: int, je: JumpEntry) {
+    if slot < r.e.len {
+        r.e[slot] = je
+    } else {
+        (mut r.e).push(je)
+    }
+}
+
+/// `entry_release` (`jumplist.c:51-56`): the mark deleted, the slot
+/// zeroed.
+pub fn ring_release(mut r: JumpList, slot: int, mut marks: MarkSet) {
+    if mark_alive(marks, r.e[slot].mark) {
+        mark_del(mut marks, r.e[slot].mark)
+    }
+    r.e[slot] = jump_entry_zero()
+}
+
+/// `entry_make` (`jumplist.c:58-68`).
+pub fn ring_entry_make(
+    mut marks: MarkSet,
+    tb: TextBuf,
+    buf_id: int,
+    at: int,
+    now_ms: int,
+) -> JumpEntry {
+    JumpEntry {
+        buf_id: buf_id,
+        mark: mark_add(mut marks, at as ByteOff, BIAS_LEFT),
+        state_token: 0,
+        line_hint: textbuf_line_of(tb, at as ByteOff) as int,
+        stamp_ms: if now_ms < 0 then 0 else now_ms,
+    }
+}
+
+/// The generic push both lists share (`ring_push`, `jumplist.c:70-136`):
+/// `cap` differs and nothing else does.
+pub fn ring_push(
+    mut r: JumpList,
+    cap: int,
+    mut marks: MarkSet,
+    tb: TextBuf,
+    buf_id: int,
+    at: int,
+    now_ms: int,
+) {
+    let line = textbuf_line_of(tb, at as ByteOff) as int
+    // Rule 4: a push while walking truncates the forward tail, which
+    // starts one PAST the walk position (`jumplist.c:79-101`).
+    if r.cur < r.len {
+        let keep = r.cur + 1
+        var i = keep
+        while i < r.len {
+            ring_release(mut r, ring_slot(r.head, r.len, cap, i), mut marks)
+            i += 1
+        }
+        r.head = ring_slot(r.head, r.len, cap, keep % cap)
+        r.len = keep
+    }
+    if r.len > 0 {
+        let newest = ring_slot(r.head, r.len, cap, r.len - 1)
+        let nm = copy r.e[newest].mark
+        if mark_alive(marks, nm) && r.e[newest].buf_id == buf_id {
+            let pos = mark_pos(marks, nm) as int
+            // Rule 2: pushing the position already on top is a no-op.
+            if pos == at {
+                r.cur = r.len
+                return
+            }
+            // Rule 1: same line replaces, keeping the newer column.
+            if textbuf_line_of(tb, pos as ByteOff) as int == line {
+                ring_release(mut r, newest, mut marks)
+                r.e[newest] = ring_entry_make(mut marks, tb, buf_id, at, now_ms)
+                r.cur = r.len
+                return
+            }
+        }
+    }
+    if r.len == cap {
+        // Full: the oldest falls off the back.
+        ring_release(mut r, ring_slot(r.head, r.len, cap, 0), mut marks)
+        r.len -= 1
+    }
+    let je = ring_entry_make(mut marks, tb, buf_id, at, now_ms)
+    ring_put(mut r, r.head, je)
+    r.head = (r.head + 1) % cap
+    r.len += 1
+    r.cur = r.len
+}
+
+/// Record a change at `at` in the context's change list
+/// (`yew_change_record`, `jumplist.c:286-322`): a burst on one line, or
+/// within the coalescing window, is one entry. The context must carry its
+/// marks (C returns early without them).
+pub fn change_record(mut ec: EditCtx, at: int, now_ms: int) {
+    if !ec.has_marks {
+        return
+    }
+    let line = textbuf_line_of(ec.tb, at as ByteOff) as int
+    if ec.changes.has_last &&
+        ec.changes.ring.len > 0 &&
+        (
+            ec.changes.last_line == line ||
+                now_ms >= ec.changes.last_ms && now_ms - ec.changes.last_ms <= CHANGE_COALESCE_MS
+        ) {
+        let newest = ring_slot(
+            ec.changes.ring.head,
+            ec.changes.ring.len,
+            CHANGELIST_MAX,
+            ec.changes.ring.len - 1,
+        )
+        ring_release(mut ec.changes.ring, newest, mut ec.marks)
+        ec.changes.ring.e[newest] = ring_entry_make(
+            mut ec.marks,
+            ec.tb,
+            ec.change_buf_id,
+            at,
+            now_ms,
+        )
+        ec.changes.ring.cur = ec.changes.ring.len
+        ec.changes.last_ms = now_ms
+        ec.changes.last_line = line
+        return
+    }
+    ring_push(
+        mut ec.changes.ring,
+        CHANGELIST_MAX,
+        mut ec.marks,
+        ec.tb,
+        ec.change_buf_id,
+        at,
+        now_ms,
+    )
+    ec.changes.last_ms = now_ms
+    ec.changes.last_line = line
+    ec.changes.has_last = true
+}

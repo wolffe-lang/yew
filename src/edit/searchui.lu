@@ -1,0 +1,1017 @@
+//! edit.searchui — the search surface over the regex engine: the four
+//! options and the smartcase table, the live state and its exact
+//! restore, search-as-you-type with the cooperative literal preview,
+//! n/N, `*`/`#`, the idle count and the wrap indicator.
+//!
+//! Ports sagitta `src/search/searchui.c` (878 lines) and `searchui.h`
+//! (142) at 9ace98c2, under `s21-search-replace.md` §1/§2. It lives in
+//! `edit` (it takes the `Ed`; `searchui.c:6` includes `edit/ed.h`, yw03's
+//! module rule). No pattern logic is here: every match goes through
+//! `search`, and the calls the editor makes into the engine are the
+//! `engine_*` functions at the top (C calls `yew_re_*` at each site).
+//!
+//! The port's shape. C's `SearchState` owns an arena holding every
+//! compiled program and the pattern text; the port's holds the last
+//! program that compiled as a list of none or one (`re`, C's `re ==
+//! NULL` its empty list), the pattern's bytes (`pat`, with `has_pat`
+//! where C has `pat == NULL`), and the scratch the engine writes into:
+//! one match record, the engine's workspace and the empty byte backing a
+//! buffer input passes (`m`, `sc`, `nob` — allocated once and grown in
+//! place, so a keystroke's searches allocate nothing: a fresh scratch a
+//! call measured 2.7 KB held to the session's end, G33).
+//! The overlay and the search read the program from here, never as a
+//! copied argument (a `Re` is lists: a copy would allocate). C's timer callback
+//! (`search_idle`) is a timer KIND the loop matches (`TIMER_SEARCH_COUNT`,
+//! G19/G20). The search prompt IS the s18 widget: `cmdline_open` with the
+//! search kinds, its edits calling `search_input` (`cmdline.c:1121-1126`).
+
+use search
+use text
+
+/// The idle count's timer kind (C's `search_idle` callback).
+pub const TIMER_SEARCH_COUNT: int = 2
+
+// `YEW_SEARCH_PREVIEW_CHUNK_BYTES` (`searchui.c:17`).
+const SUI_PREVIEW_CHUNK_BYTES: int = 1048576
+
+const SUI_PREVIEW_FOUND: int = 0
+
+const SUI_PREVIEW_PENDING: int = 1
+
+const SUI_PREVIEW_MISS: int = 2
+
+/// The four search options (`SearchOpts`, `searchui.h:24-36`).
+pub struct SearchOpts {
+    ignorecase: bool,
+    smartcase: bool,
+    wrapscan: bool,
+    hlsearch: bool,
+}
+
+/// The defaults (`yew_search_opts_init`): exact case unless asked, wrap
+/// and highlight on.
+pub fn search_opts_new() -> SearchOpts {
+    SearchOpts { ignorecase: false, smartcase: true, wrapscan: true, hlsearch: true }
+}
+
+/// Live search state (`SearchState`, `searchui.h:61-96`).
+pub struct SearchState {
+    re: List[search.Re],
+    m: search.ReMatch,
+    sc: search.ReScratch,
+    nob: List[byte],
+    pat: List[byte],
+    has_pat: bool,
+    cache: search.ReCache,
+    reverse: bool,
+    pat_gen: int,
+    save_pos: int,
+    save_goal: int,
+    save_anchor: int,
+    save_top: int,
+    save_top_sub: int,
+    origin: int,
+    wrapped: bool,
+    active: bool,
+    count_timer: int,
+    count_win_id: int,
+    preview_queued: bool,
+    preview_win_id: int,
+    preview_at: int,
+    preview_stop: int,
+    preview_origin: int,
+    preview_buf_gen: int,
+    preview_gen: int,
+    preview_ui_seq: int,
+    preview_pending: bool,
+    preview_backward: bool,
+    preview_wrapped: bool,
+    preview_wrapscan: bool,
+    preview_remaining: int,
+    wrap_until_ms: int,
+    err_set: bool,
+    err_off: int,
+    err_msg: str,
+}
+
+/// A fresh state (`yew_search_state_init`).
+pub fn search_state_new() -> SearchState {
+    SearchState {
+        re: List[search.Re](),
+        m: search.re_match_new(),
+        sc: search.re_scratch_new(),
+        nob: List[byte](),
+        pat: List[byte](),
+        has_pat: false,
+        cache: search.re_cache_new(),
+        reverse: false,
+        pat_gen: 0,
+        save_pos: 0,
+        save_goal: 0,
+        save_anchor: 0,
+        save_top: 0,
+        save_top_sub: 0,
+        origin: 0,
+        wrapped: false,
+        active: false,
+        count_timer: TIMER_NONE,
+        count_win_id: 0,
+        preview_queued: false,
+        preview_win_id: 0,
+        preview_at: 0,
+        preview_stop: 0,
+        preview_origin: 0,
+        preview_buf_gen: 0,
+        preview_gen: 0,
+        preview_ui_seq: 0,
+        preview_pending: false,
+        preview_backward: false,
+        preview_wrapped: false,
+        preview_wrapscan: false,
+        preview_remaining: 0,
+        wrap_until_ms: 0,
+        err_set: false,
+        err_off: 0,
+        err_msg: "",
+    }
+}
+
+// ---- the engine calls ------------------------------------------------
+
+/// Compile `pat` (`yew_re_compile`) with the property and fold cache
+/// `cache` (C keeps them for the process; the port's editor keeps one in
+/// its search state, so a keystroke's recompile builds them once): the
+/// program, or `invalid` with `err` holding the offset and the message.
+pub fn engine_compile(
+    pat: List[byte],
+    icase: bool,
+    mut cache: search.ReCache,
+    mut err: search.ReErr,
+) -> search.Re ! {invalid} {
+    let flags = if icase then search.RE_ICASE else 0
+    search.re_compile_cached(pat, flags, mut cache, mut err)?
+}
+
+/// The leftmost match at or after `from` inside the window `[lo, hi)` of
+/// buffer `tb` (`yew_re_search` over `yew_re_input_textbuf` with its
+/// window narrowed), written into `m` (group 0 is `m.lo[0]..m.hi[0]`).
+pub fn engine_search(
+    re: search.Re,
+    tb: text.TextBuf,
+    nob: List[byte],
+    from: int,
+    lo: int,
+    hi: int,
+    mut sc: search.ReScratch,
+    mut m: search.ReMatch,
+) -> bool {
+    let inp = search.re_input_window(search.re_input_textbuf(tb), lo, hi)
+    search.re_search_ws(mut sc, re, tb, nob, inp, from as text.ByteOff, mut m)
+}
+
+/// The last match starting before `before` inside `[lo, hi)`
+/// (`yew_re_search_back`), written into `m`.
+pub fn engine_search_back(
+    re: search.Re,
+    tb: text.TextBuf,
+    nob: List[byte],
+    before: int,
+    lo: int,
+    hi: int,
+    mut sc: search.ReScratch,
+    mut m: search.ReMatch,
+) -> bool {
+    let inp = search.re_input_window(search.re_input_textbuf(tb), lo, hi)
+    search.re_search_back_ws(mut sc, re, tb, nob, inp, before as text.ByteOff, mut m)
+}
+
+/// Whether the editor holds a program (C's `ed->search.re != NULL`).
+pub fn search_has_re(ed: Ed) -> bool {
+    ed.search.re.len != 0
+}
+
+/// Install `re` as the editor's program (C's `ed->search.re = re`).
+pub fn search_set_re(mut ed: Ed, take re: search.Re) {
+    if ed.search.re.len == 0 {
+        (mut ed.search.re).push(re)
+    } else {
+        ed.search.re[0] = re
+    }
+}
+
+/// Drop the editor's program (C's `ed->search.re = NULL`).
+pub fn search_drop_re(mut ed: Ed) {
+    while ed.search.re.len != 0 {
+        let _ = (mut ed.search.re).pop()
+    }
+}
+
+// ---- options and smartcase (`searchui.c:26-82`) ----------------------
+
+/// The §2 table in one place (`yew_search_wants_icase`): `\C` wins over
+/// `\c`, both over the options; with ignorecase and smartcase on, an
+/// uppercase LITERAL (the parser's answer, never a byte scan) flips it.
+pub fn search_wants_icase(probe: search.Re, o: SearchOpts) -> bool {
+    if search.re_forces_case(probe) {
+        return false
+    }
+    if search.re_forces_icase(probe) {
+        return true
+    }
+    if !o.ignorecase {
+        return false
+    }
+    if !o.smartcase {
+        return true
+    }
+    !search.re_has_upper_literal(probe)
+}
+
+/// Compile under the smartcase rule (`yew_search_compile`): once to learn
+/// what the pattern holds, again with `RE_ICASE` when the table says so;
+/// `cache` is the caller's property and fold cache.
+pub fn search_compile_cached(
+    pat: List[byte],
+    o: SearchOpts,
+    mut cache: search.ReCache,
+    mut err: search.ReErr,
+) -> search.Re ! {invalid} {
+    let probe = engine_compile(pat, false, mut cache, mut err)?
+    if !search_wants_icase(probe, o) {
+        return probe
+    }
+    engine_compile(pat, true, mut cache, mut err)?
+}
+
+/// `search_compile_cached` with a fresh cache, for a one-off compile.
+pub fn search_compile(pat: List[byte], o: SearchOpts, mut err: search.ReErr) -> search.Re ! {
+    invalid,
+} {
+    var cache = search.re_cache_new()
+    search_compile_cached(pat, o, mut cache, mut err)?
+}
+
+// ---- live search -----------------------------------------------------
+
+fn sui_win_index_by_id(ed: Ed, id: int) -> int {
+    var i = 0
+    while i < ed.wins.len {
+        if ed.wins[i].id == id {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn sui_primary(ed: Ed, w: int) -> int {
+    ed.wins[w].cs.primary
+}
+
+// `search_capture_restore_point` (`searchui.c:100-111`).
+fn sui_capture_restore_point(mut ed: Ed, w: int) {
+    let p = sui_primary(ed, w)
+    ed.search.save_pos = ed.wins[w].cs.curs[p].pos
+    ed.search.save_goal = ed.wins[w].cs.curs[p].goal_col
+    ed.search.save_anchor = ed.wins[w].cs.curs[p].anchor
+    ed.search.origin = ed.wins[w].cs.curs[p].pos
+    ed.search.save_top = ed.wins[w].vp.top
+    ed.search.save_top_sub = ed.wins[w].vp.top_sub
+}
+
+/// Open the search prompt (`yew_search_open`, `searchui.c:113-126`).
+pub fn search_open(mut ed: Ed, w: int, reverse: bool) {
+    if w < 0 {
+        return
+    }
+    search_preview_cancel(mut ed)
+    sui_capture_restore_point(mut ed, w)
+    ed.search.reverse = reverse
+    ed.search.wrapped = false
+    ed.search.active = true
+    ed.search.err_set = false
+    cmdline_open(mut ed, if reverse then PROMPT_SEARCH_B else PROMPT_SEARCH_F, "")
+}
+
+// `search_go` (`searchui.c:128-166`): move to `hit`, damaging only the
+// accent's old and new rows unless the view scrolled.
+fn sui_search_go(mut ed: Ed, w: int, hit: int) {
+    let b = ed.wins[w].buf
+    let p = sui_primary(ed, w)
+    let old_top = ed.wins[w].vp.top
+    let old_top_sub = ed.wins[w].vp.top_sub
+    let old_pos = ed.wins[w].cs.curs[p].pos
+    let old_line = text.textbuf_line_of(ed.bufs[b].ec.tb, old_pos as text.ByteOff) as int
+    let old_sub = vp_cursor_subrow(ed.wins[w], ed.bufs[b].ec.tb)
+    ed.wins[w].cs.curs[p].pos = hit
+    ed.wins[w].cs.curs[p].goal_col = 0
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+    if old_top != ed.wins[w].vp.top || old_top_sub != ed.wins[w].vp.top_sub {
+        ed_damage_document(mut ed)
+        return
+    }
+    let new_line = text.textbuf_line_of(ed.bufs[b].ec.tb, hit as text.ByteOff) as int
+    let new_sub = vp_cursor_subrow(ed.wins[w], ed.bufs[b].ec.tb)
+    let (ok_old, row_old) = vp_row_of_line(mut ed.wins[w], ed.bufs[b].ec.tb, old_line, old_sub)
+    if ok_old {
+        ed_damage_rows(mut ed, row_old, row_old + 1)
+    }
+    let (ok_new, row_new) = vp_row_of_line(mut ed.wins[w], ed.bufs[b].ec.tb, new_line, new_sub)
+    if ok_new {
+        ed_damage_rows(mut ed, row_new, row_new + 1)
+    }
+    ed.footer_dirty = true
+}
+
+// `search_find` (`searchui.c:168-207`): one step of the editor's program
+// over window `w`'s buffer, with wrap; answers (found, hit, wrapped).
+fn sui_search_find(mut ed: Ed, w: int, from: int, backward: bool, wrapscan: bool) -> (
+    bool,
+    int,
+    bool,
+) {
+    let b = ed.wins[w].buf
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    if backward {
+        if from > 0 &&
+            engine_search_back(
+                ed.search.re[0],
+                ed.bufs[b].ec.tb,
+                ed.search.nob,
+                from,
+                0,
+                len,
+                mut ed.search.sc,
+                mut ed.search.m,
+            ) {
+            return (true, ed.search.m.lo[0], false)
+        }
+        if !wrapscan {
+            return (false, 0, false)
+        }
+        if !engine_search_back(
+            ed.search.re[0],
+            ed.bufs[b].ec.tb,
+            ed.search.nob,
+            len,
+            0,
+            len,
+            mut ed.search.sc,
+            mut ed.search.m,
+        ) {
+            return (false, 0, false)
+        }
+        return (true, ed.search.m.lo[0], true)
+    }
+    if engine_search(
+        ed.search.re[0],
+        ed.bufs[b].ec.tb,
+        ed.search.nob,
+        from,
+        0,
+        len,
+        mut ed.search.sc,
+        mut ed.search.m,
+    ) {
+        return (true, ed.search.m.lo[0], false)
+    }
+    if !wrapscan {
+        return (false, 0, false)
+    }
+    if !engine_search(
+        ed.search.re[0],
+        ed.bufs[b].ec.tb,
+        ed.search.nob,
+        0,
+        0,
+        len,
+        mut ed.search.sc,
+        mut ed.search.m,
+    ) {
+        return (false, 0, false)
+    }
+    (true, ed.search.m.lo[0], true)
+}
+
+// `search_report_wrap` (`searchui.c:209-222`): a repeat of the shown
+// notice keeps the drawn row.
+fn sui_report_wrap(mut ed: Ed, backward: bool) {
+    let msg = if backward {
+        "search hit TOP, continuing at BOTTOM"
+    } else {
+        "search hit BOTTOM, continuing at TOP"
+    }
+    if ed.msg.active && ed.msg.sev == MSG_INFO && ed.msg.text == msg {
+        return
+    }
+    ed_msg(mut ed, MSG_INFO, msg)
+}
+
+fn sui_pat_text(p: List[byte]) -> str {
+    str_from_utf8(p) else "<pattern>"
+}
+
+// `search_report_miss` (`searchui.c:224-233`).
+fn sui_report_miss(mut ed: Ed, backward: bool, wrapscan: bool) {
+    if !wrapscan {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            if backward then "search hit TOP without match" else "search hit BOTTOM without match",
+        )
+        return
+    }
+    let shown = sui_pat_text(ed.search.pat)
+    ed_msg(mut ed, MSG_ERROR, "pattern not found: {shown}")
+}
+
+/// Retire a queued preview continuation (`yew_search_preview_cancel`,
+/// `searchui.c:235-246`): it belongs to the key that started it.
+pub fn search_preview_cancel(mut ed: Ed) {
+    ed.search.preview_queued = false
+    ed.search.preview_win_id = 0
+    if ed.search.preview_pending {
+        ed.search.preview_pending = false
+        ed.search.preview_remaining = 0
+        ed_msg_clear(mut ed)
+    }
+}
+
+/// Raw input preempts the queued slice but keeps its state, so an Enter
+/// still accepts what it was completing (`yew_search_preview_preempt`).
+pub fn search_preview_preempt(mut ed: Ed) {
+    ed.search.preview_queued = false
+}
+
+/// Whether a preview slice waits for the next idle turn
+/// (`yew_search_preview_queued`): the loop's deadline is then immediate.
+pub fn search_preview_queued(ed: Ed) -> bool {
+    ed.search.preview_queued
+}
+
+/// One slice of the queued preview (`yew_search_preview_tick`,
+/// `searchui.c:262-287`).
+pub fn search_preview_tick(mut ed: Ed) {
+    if !ed.search.preview_queued {
+        return
+    }
+    ed.search.preview_queued = false
+    let w = sui_win_index_by_id(ed, ed.search.preview_win_id)
+    if w < 0 {
+        ed.search.preview_win_id = 0
+        ed.search.preview_pending = false
+        ed.search.preview_remaining = 0
+        ed_msg_clear(mut ed)
+        return
+    }
+    let result = sui_preview_slice(mut ed, w)
+    if result != SUI_PREVIEW_PENDING {
+        ed.search.preview_win_id = 0
+        if result == SUI_PREVIEW_MISS && ed.search.preview_pending {
+            ed.search.preview_pending = false
+            ed.search.preview_remaining = 0
+            ed_msg_clear(mut ed)
+        }
+    }
+}
+
+// `search_preview_schedule` (`searchui.c:289-301`).
+fn sui_preview_schedule(mut ed: Ed, w: int) {
+    if !ed.search.preview_pending {
+        ed.search.preview_pending = true
+        ed.search.preview_ui_seq += 1
+        let dir = if ed.search.preview_backward then "backward" else "forward"
+        let dots = if ed.search.preview_ui_seq & 1 != 0 then "." else ".."
+        ed_msg(mut ed, MSG_INFO, "searching {dir}{dots}")
+    }
+    ed.search.preview_win_id = ed.wins[w].id
+    ed.search.preview_queued = true
+}
+
+// `search_preview_found` (`searchui.c:303-341`).
+fn sui_preview_found(mut ed: Ed, w: int, hit: int) -> int {
+    ed.search.wrapped = ed.search.preview_wrapped
+    sui_search_go(mut ed, w, hit)
+    if ed.search.preview_wrapped {
+        sui_report_wrap(mut ed, ed.search.preview_backward)
+    } else if ed.search.preview_remaining <= 1 {
+        ed_msg_clear(mut ed)
+    }
+    if ed.search_opts.hlsearch {
+        overlay_refresh(mut ed, w, ed.search.pat_gen, OVERLAY_BUDGET_US)
+    }
+    if ed.search.preview_remaining > 1 {
+        let b = ed.wins[w].buf
+        let len = text.textbuf_len(ed.bufs[b].ec.tb)
+        let pos = ed.wins[w].cs.curs[sui_primary(ed, w)].pos
+        ed.search.preview_remaining -= 1
+        var from = if ed.search.preview_backward {
+            pos
+        } else {
+            text.grapheme_next(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+        }
+        if !ed.search.preview_backward && from <= pos {
+            from = if pos < len then pos + 1 else len
+        }
+        ed.search.preview_at = from
+        ed.search.preview_stop = if ed.search.preview_backward then 0 else len
+        ed.search.preview_origin = from
+        ed.search.preview_wrapped = false
+        sui_preview_schedule(mut ed, w)
+        return SUI_PREVIEW_PENDING
+    }
+    ed.search.preview_pending = false
+    ed.search.preview_remaining = 0
+    SUI_PREVIEW_FOUND
+}
+
+// `search_preview_wrap` (`searchui.c:343-363`).
+fn sui_preview_wrap(mut ed: Ed, w: int) -> bool {
+    let b = ed.wins[w].buf
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    let back = ed.search.preview_backward
+    if !ed.search.preview_wrapped &&
+        ed.search.preview_wrapscan &&
+        (!back && ed.search.preview_origin > 0 || back && ed.search.preview_origin < len) {
+        ed.search.preview_wrapped = true
+        ed.search.preview_at = if back then len else 0
+        ed.search.preview_stop = ed.search.preview_origin
+        return true
+    }
+    ed.search.preview_pending = false
+    ed.search.preview_remaining = 0
+    sui_report_miss(mut ed, back, ed.search.preview_wrapscan)
+    false
+}
+
+// `search_preview_slice` (`searchui.c:365-436`): at most one chunk of a
+// whole-literal pattern's search per turn, the slices overlapping by the
+// literal's length less one so a match across an edge is found.
+fn sui_preview_slice(mut ed: Ed, w: int) -> int {
+    let b = ed.wins[w].buf
+    if ed.search.re.len == 0 ||
+        ed.search.preview_gen != ed.search.pat_gen ||
+        ed.search.preview_buf_gen != ed.bufs[b].ec.tb.gen {
+        return SUI_PREVIEW_MISS
+    }
+    let literal_bytes = search.re_whole_literal_bytes(ed.search.re[0])
+    if literal_bytes == 0 {
+        return SUI_PREVIEW_MISS
+    }
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    var budget = SUI_PREVIEW_CHUNK_BYTES
+    loop {
+        if !ed.search.preview_backward {
+            let at = ed.search.preview_at
+            if at >= ed.search.preview_stop {
+                if !sui_preview_wrap(mut ed, w) {
+                    return SUI_PREVIEW_MISS
+                }
+                if budget == 0 {
+                    break
+                }
+                continue
+            }
+            var span = ed.search.preview_stop - at
+            if span > budget {
+                span = budget
+            }
+            let next = at + span
+            let overlap = literal_bytes - 1
+            let scan_hi = if overlap > len - next then len else next + overlap
+            if engine_search(
+                ed.search.re[0],
+                ed.bufs[b].ec.tb,
+                ed.search.nob,
+                at,
+                0,
+                scan_hi,
+                mut ed.search.sc,
+                mut ed.search.m,
+            ) &&
+                ed.search.m.lo[0] < next &&
+                ed.search.m.lo[0] < ed.search.preview_stop {
+                return sui_preview_found(mut ed, w, ed.search.m.lo[0])
+            }
+            ed.search.preview_at = next
+            budget -= span
+        } else {
+            let before = if ed.search.preview_at > len then len else ed.search.preview_at
+            if before <= ed.search.preview_stop {
+                if !sui_preview_wrap(mut ed, w) {
+                    return SUI_PREVIEW_MISS
+                }
+                if budget == 0 {
+                    break
+                }
+                continue
+            }
+            var span = before - ed.search.preview_stop
+            if span > budget {
+                span = budget
+            }
+            let lo = before - span
+            let overlap = literal_bytes - 1
+            let win_lo = if lo > ed.search.preview_stop + overlap {
+                lo - overlap
+            } else {
+                ed.search.preview_stop
+            }
+            if engine_search_back(
+                ed.search.re[0],
+                ed.bufs[b].ec.tb,
+                ed.search.nob,
+                before,
+                win_lo,
+                len,
+                mut ed.search.sc,
+                mut ed.search.m,
+            ) &&
+                ed.search.m.lo[0] >= ed.search.preview_stop {
+                return sui_preview_found(mut ed, w, ed.search.m.lo[0])
+            }
+            ed.search.preview_at = lo
+            budget -= span
+        }
+        if budget == 0 {
+            break
+        }
+    }
+    sui_preview_schedule(mut ed, w)
+    SUI_PREVIEW_PENDING
+}
+
+// `search_preview_start` (`searchui.c:438-457`).
+fn sui_preview_start(
+    mut ed: Ed,
+    w: int,
+    from_in: int,
+    backward: bool,
+    wrapscan: bool,
+    count: int,
+) -> int {
+    let b = ed.wins[w].buf
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    search_preview_cancel(mut ed)
+    let from = if from_in > len then len else from_in
+    ed.search.preview_at = from
+    ed.search.preview_stop = if backward then 0 else len
+    ed.search.preview_origin = from
+    ed.search.preview_buf_gen = ed.bufs[b].ec.tb.gen
+    ed.search.preview_gen = ed.search.pat_gen
+    ed.search.preview_backward = backward
+    ed.search.preview_wrapped = false
+    ed.search.preview_wrapscan = wrapscan
+    ed.search.preview_remaining = if count == 0 then 1 else count
+    sui_preview_slice(mut ed, w)
+}
+
+// Retire the count timer and its window (`searchui.c:483-486` and the
+// three sites like it).
+fn sui_count_retire(mut ed: Ed) {
+    if ed.search.count_timer != TIMER_NONE {
+        let _ = timer_cancel(mut ed.timers, ed.search.count_timer)
+        ed.search.count_timer = TIMER_NONE
+    }
+    ed.search.count_win_id = 0
+}
+
+/// Record `pat` as the live pattern, a new generation (C's `ed->search.pat`
+/// with `pat_gen++`).
+pub fn search_set_pattern(mut ed: Ed, pat: List[byte]) {
+    ed.search.pat = copy pat
+    ed.search.has_pat = true
+    ed.search.pat_gen += 1
+}
+
+/// Search as you type (`yew_search_input`, `searchui.c:459-542`): the
+/// prompt's text compiled on every edit; a half-typed pattern keeps the
+/// LAST GOOD program highlighting and reports the error.
+pub fn search_input(mut ed: Ed, w: int) {
+    if w < 0 || !ed.search.active {
+        return
+    }
+    let prompt_text = cmdline_text(ed)
+    search_preview_cancel(mut ed)
+    if prompt_text.len == 0 {
+        // Empty is a UI state, not a program: retire every artifact of
+        // the previous preview.
+        ed.search.err_set = false
+        search_drop_re(mut ed)
+        ed.search.has_pat = false
+        ed.search.pat_gen += 1
+        search_clear_highlight(mut ed, w)
+        sui_count_retire(mut ed)
+        ed.wins[w].overlay.count_total = 0
+        ed.wins[w].overlay.count_capped = false
+        ed.footer_dirty = true
+        return
+    }
+    var err = search.re_err_new()
+    let re = search_compile_cached(
+        prompt_text,
+        ed.search_opts,
+        mut ed.search.cache,
+        mut err,
+    ) else |_| {
+        ed.search.err_set = true
+        ed.search.err_off = err.off
+        ed.search.err_msg = err.msg
+        ed_msg(mut ed, MSG_ERROR, if err.msg.len != 0 then err.msg else "bad pattern")
+        return
+    }
+    ed.search.err_set = false
+    search_set_re(mut ed, take re)
+    search_set_pattern(mut ed, prompt_text)
+    if search.re_whole_literal_bytes(ed.search.re[0]) != 0 {
+        let _ = sui_preview_start(
+            mut ed,
+            w,
+            ed.search.origin,
+            ed.search.reverse,
+            ed.search_opts.wrapscan,
+            1,
+        )
+    } else {
+        let (found, hit, wrapped) = sui_search_find(
+            mut ed,
+            w,
+            ed.search.origin,
+            ed.search.reverse,
+            ed.search_opts.wrapscan,
+        )
+        if found {
+            ed.search.wrapped = wrapped
+            sui_search_go(mut ed, w, hit)
+            ed_msg_clear(mut ed)
+        } else {
+            let shown = sui_pat_text(prompt_text)
+            ed_msg(mut ed, MSG_ERROR, "pattern not found: {shown}")
+        }
+    }
+    if ed.search_opts.hlsearch {
+        overlay_refresh(mut ed, w, ed.search.pat_gen, OVERLAY_BUDGET_US)
+    }
+    search_schedule_count(mut ed, w)
+}
+
+/// Commit the search (`yew_search_accept`, `searchui.c:544-580`): the
+/// deferred count finishes in Enter's own frame, register `/` takes the
+/// pattern and `origin` becomes a jump.
+pub fn search_accept(mut ed: Ed, w: int) {
+    if w < 0 || !ed.search.active {
+        return
+    }
+    let pending = ed.search.preview_pending
+    if !pending {
+        search_preview_cancel(mut ed)
+    }
+    ed.search.active = false
+    sui_count_retire(mut ed)
+    let b = ed.wins[w].buf
+    if ed.search.re.len != 0 && ed.search.has_pat && ed.search.pat.len > 0 && b >= 0 {
+        overlay_count(mut ed.wins[w].overlay, ed.search.re[0], ed.bufs[b].ec.tb, 1000)
+        ed.footer_dirty = true
+    }
+    if ed.search.has_pat && ed.search.pat.len > 0 {
+        text.reg_set_search(mut ed.regs, ed.search.pat)
+        jump_push(mut ed, w, ed.search.origin, ed.now_ms)
+    }
+    if pending && !ed.search.preview_queued {
+        sui_preview_schedule(mut ed, w)
+    }
+}
+
+/// Cancel exactly (`yew_search_cancel`, `searchui.c:582-627`): the
+/// cursor with its goal column, and the viewport's top, come back; every
+/// trace of the preview goes, the pending count included.
+pub fn search_cancel(mut ed: Ed, w: int) {
+    if w < 0 || !ed.search.active {
+        return
+    }
+    ed.search.active = false
+    let p = sui_primary(ed, w)
+    ed.wins[w].cs.curs[p].pos = ed.search.save_pos
+    ed.wins[w].cs.curs[p].goal_col = ed.search.save_goal
+    ed.wins[w].cs.curs[p].anchor = ed.search.save_anchor
+    ed.wins[w].vp.top = ed.search.save_top
+    ed.wins[w].vp.top_sub = ed.search.save_top_sub
+    search_clear_highlight(mut ed, w)
+    sui_count_retire(mut ed)
+    search_preview_cancel(mut ed)
+    ed.wins[w].overlay.count_total = 0
+    ed.wins[w].overlay.count_capped = false
+    ed.search.wrap_until_ms = 0
+    ed.search.wrapped = false
+    // Nothing accepted: `n` falls back to register `/`.
+    search_drop_re(mut ed)
+    ed.search.has_pat = false
+    ed_msg_clear(mut ed)
+    ed_damage_document(mut ed)
+    ed.full_damage = true
+}
+
+/// Drop the highlight, keeping the pattern register
+/// (`yew_search_clear_highlight`): C's refresh with a NULL program.
+pub fn search_clear_highlight(mut ed: Ed, w: int) {
+    if w < 0 {
+        return
+    }
+    overlay_clear(mut ed, w)
+}
+
+// The pattern `n` repeats when none was searched this session: register
+// `/` (`searchui.c:646-668`). False when there is none or it fails.
+fn sui_adopt_register_pattern(mut ed: Ed) -> bool {
+    let slash = text.reg_get(mut ed.regs, 47) else |_| {
+        ed_msg(mut ed, MSG_ERROR, "no previous search pattern")
+        return false
+    }
+    if slash.bytes.len == 0 {
+        ed_msg(mut ed, MSG_ERROR, "no previous search pattern")
+        return false
+    }
+    var err = search.re_err_new()
+    let re = search_compile_cached(
+        slash.bytes,
+        ed.search_opts,
+        mut ed.search.cache,
+        mut err,
+    ) else |_| {
+        return false
+    }
+    search_set_re(mut ed, take re)
+    search_set_pattern(mut ed, slash.bytes)
+    true
+}
+
+/// n / N (`yew_search_step`, `searchui.c:636-718`): `forward` is
+/// relative to the search's own direction.
+pub fn search_step(mut ed: Ed, w: int, forward: bool, count: int) -> bool {
+    if w < 0 || ed.wins[w].buf < 0 {
+        return false
+    }
+    if ed.search.re.len == 0 && !sui_adopt_register_pattern(mut ed) {
+        return false
+    }
+    let n = if count == 0 then 1 else count
+    var any = false
+    let backward = if forward then ed.search.reverse else !ed.search.reverse
+    let b = ed.wins[w].buf
+    let literal = search.re_whole_literal_bytes(ed.search.re[0]) != 0
+    if literal {
+        let pos = ed.wins[w].cs.curs[sui_primary(ed, w)].pos
+        var from = if backward {
+            pos
+        } else {
+            text.grapheme_next(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+        }
+        if !backward && from <= pos {
+            from = pos + 1
+        }
+        let result = sui_preview_start(mut ed, w, from, backward, ed.search_opts.wrapscan, n)
+        if result == SUI_PREVIEW_PENDING {
+            return true
+        }
+        any = result == SUI_PREVIEW_FOUND
+    }
+    var i = 0
+    while i < n && !literal {
+        let pos = ed.wins[w].cs.curs[sui_primary(ed, w)].pos
+        // Step off the current match first, or `n` finds the one the
+        // cursor is on.
+        var from = if backward {
+            pos
+        } else {
+            text.grapheme_next(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+        }
+        if !backward && from <= pos {
+            from = pos + 1
+        }
+        let (found, hit, wrapped) = sui_search_find(
+            mut ed,
+            w,
+            from,
+            backward,
+            ed.search_opts.wrapscan,
+        )
+        if !found {
+            if !any {
+                sui_report_miss(mut ed, backward, ed.search_opts.wrapscan)
+            }
+            break
+        }
+        sui_search_go(mut ed, w, hit)
+        any = true
+        ed.search.wrapped = wrapped
+        if wrapped {
+            sui_report_wrap(mut ed, backward)
+        }
+        i += 1
+    }
+    if any && ed.search_opts.hlsearch {
+        overlay_refresh(mut ed, w, ed.search.pat_gen, OVERLAY_BUDGET_US)
+    }
+    if any && ed.wins[w].overlay.count_total == 1 {
+        ed_msg(mut ed, MSG_INFO, "1 match")
+    }
+    any
+}
+
+// `search_word_span` (`searchui.c:720-747`): the word under the cursor by
+// the UAX #29 boundary oracle `w`/`b` use.
+fn sui_word_span(tb: text.TextBuf, pos: int) -> (bool, int, int) {
+    let len = text.textbuf_len(tb)
+    if len == 0 {
+        return (false, 0, 0)
+    }
+    var lo = if pos > len then len else pos
+    var hi = pos
+    while lo > 0 && !word_boundary(tb, lo) {
+        lo -= 1
+    }
+    while hi < len && !word_boundary(tb, hi + 1) {
+        hi += 1
+    }
+    if hi < len {
+        hi += 1
+    }
+    (hi > lo, lo, hi)
+}
+
+/// The idle pass (C's `search_idle`, `searchui.c:749-772`, the timer
+/// kind `TIMER_SEARCH_COUNT`): finish a scan the keystroke budget cut
+/// short, then count.
+pub fn search_idle(mut ed: Ed) {
+    ed.search.count_timer = TIMER_NONE
+    let w = sui_win_index_by_id(ed, ed.search.count_win_id)
+    ed.search.count_win_id = 0
+    if w < 0 || ed.search.re.len == 0 {
+        return
+    }
+    if !ed.wins[w].overlay.complete {
+        overlay_refresh(mut ed, w, ed.search.pat_gen, 0)
+    }
+    let b = ed.wins[w].buf
+    overlay_count(mut ed.wins[w].overlay, ed.search.re[0], ed.bufs[b].ec.tb, 1000)
+    ed.footer_dirty = true
+}
+
+/// Schedule the bounded count one tick out, and the wrap indicator
+/// (`yew_search_schedule_count`, `searchui.c:774-788`).
+pub fn search_schedule_count(mut ed: Ed, w: int) {
+    if w < 0 || ed.search.re.len == 0 {
+        return
+    }
+    if ed.search.count_timer != TIMER_NONE {
+        let _ = timer_cancel(mut ed.timers, ed.search.count_timer)
+    }
+    ed.search.count_win_id = ed.wins[w].id
+    ed.search.count_timer = timer_add(mut ed.timers, ed.now_ms + 16, TIMER_SEARCH_COUNT, 0)
+    if ed.search.wrapped {
+        ed.search.wrap_until_ms = ed.now_ms + 2000
+    }
+}
+
+/// The wrap indicator's deadline; 0 when not showing
+/// (`yew_search_wrap_until`).
+pub fn search_wrap_until(ed: Ed) -> int {
+    ed.search.wrap_until_ms
+}
+
+/// `*` and `#` (`yew_search_word`, `searchui.c:794-841`): `\b`, the word
+/// QUOTED by the engine's own quoter, `\b`.
+pub fn search_word(mut ed: Ed, w: int, forward: bool) -> bool {
+    if w < 0 || ed.wins[w].buf < 0 {
+        return false
+    }
+    let b = ed.wins[w].buf
+    let pos = ed.wins[w].cs.curs[sui_primary(ed, w)].pos
+    let (ok, lo, hi) = sui_word_span(ed.bufs[b].ec.tb, pos)
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "no word under the cursor")
+        return false
+    }
+    var pat = List[byte]()
+    (mut pat).push(92 as byte)
+    (mut pat).push(98 as byte)
+    let raw = text.textbuf_copy_range(ed.bufs[b].ec.tb, lo, hi)
+    search.re_quote(mut pat, raw, 0, raw.len)
+    (mut pat).push(92 as byte)
+    (mut pat).push(98 as byte)
+    var err = search.re_err_new()
+    let re = search_compile_cached(pat, ed.search_opts, mut ed.search.cache, mut err) else |_| {
+        search_drop_re(mut ed)
+        return false
+    }
+    search_set_re(mut ed, take re)
+    search_set_pattern(mut ed, pat)
+    ed.search.reverse = !forward
+    text.reg_set_search(mut ed.regs, pat)
+    jump_push(mut ed, w, pos, ed.now_ms)
+    let stepped = search_step(mut ed, w, true, 1)
+    if stepped {
+        search_schedule_count(mut ed, w)
+    }
+    stepped
+}

@@ -1,0 +1,785 @@
+//! fuzz-search — Sprint 21's interleaving fuzz (s21 DoD 13): the port of
+//! sagitta `tests/fuzz/fuzz_search.c` (379 lines) over the generator of
+//! `tests/fuzz/fuzzlib.c` (`yew_fuzz_main`) at 9ace98c2.
+//!
+//! wolf 0.2.33 has no `fuzz` verb, so this is the bounded, seeded driver.
+//! The generator is fuzz-cmdparse's, C's bit for bit (xorshift64*, the
+//! five built-in seeds sorted by name, ten mutators, the 64 KiB cap, the
+//! FNV-1a hash over every input), so a seed's `hash=` is C's for the same
+//! seed and iterations — the witness that the port ran the same sessions.
+//!
+//! The check is C's `run_session` (`fuzz_search.c:157-372`): a fresh
+//! editor seeded from the input, 40 to 79 operations drawn from the
+//! input's own LCG — search and step, refresh the overlay (with a
+//! 1 ms budget or none), replace (and one undo must revert it), a wrapped
+//! edit, a jump push/back/forward, an undo — and after EVERY operation
+//! the overlay's spans ascending, disjoint, inside the buffer and on
+//! codepoint boundaries and every live jump list mark inside its buffer;
+//! at the end undo all the way back restores the empty start. C passes
+//! the overlay its own program; the port's overlay reads the editor's, so
+//! the refresh installs it there first (the next search drops it, as C's
+//! `ed.search.re = NULL` does). A trap anywhere is the crash C reports.
+//!
+//!   fuzz-search [--iters=N] [--seed=N]
+//!
+//! Defaults are C's (`--iters=200000 --seed=1`, sagitta's `make
+//! fuzz-iter`). Each session builds its own editor inside its own
+//! `region`, and the generator's epochs have theirs, so the driver's
+//! memory is flat (G33).
+
+use edit
+use search
+use text
+
+const MAX_INPUT: int = 65536
+
+const EPOCH: int = 4096
+
+struct Run {
+    state: wrapping[u64],
+    hash: wrapping[u64],
+}
+
+fn u(x: int) -> wrapping[u64] {
+    x as wrapping[u64]
+}
+
+// `prng_next` (`fuzzlib.c:726-735`): xorshift64*.
+fn prng_next(mut r: Run) -> wrapping[u64] {
+    var x = r.state
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    r.state = x
+    x * 2685821657736338717
+}
+
+// `choose` (`fuzzlib.c:737-740`).
+fn choose(mut r: Run, limit: int) -> int {
+    if limit == 0 {
+        return 0
+    }
+    (prng_next(mut r) % u(limit)) as int
+}
+
+fn insert_at(b: List[byte], at_in: int, data: List[byte], lo: int, n_in: int) -> List[byte] {
+    let at = if at_in > b.len then b.len else at_in
+    var n = n_in
+    if n > MAX_INPUT - b.len {
+        n = MAX_INPUT - b.len
+    }
+    if n <= 0 {
+        return copy b
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < at {
+        (mut out).push(b[i])
+        i += 1
+    }
+    var k = 0
+    while k < n {
+        (mut out).push(data[lo + k])
+        k += 1
+    }
+    while i < b.len {
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+fn delete_at(b: List[byte], at: int, n_in: int) -> List[byte] {
+    if at >= b.len {
+        return copy b
+    }
+    var n = n_in
+    if n > b.len - at {
+        n = b.len - at
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < b.len {
+        if i < at || i >= at + n {
+            (mut out).push(b[i])
+        }
+        i += 1
+    }
+    out
+}
+
+fn one(x: int) -> List[byte] {
+    var out = List[byte]()
+    (mut out).push(x as byte)
+    out
+}
+
+// The mutators (`fuzzlib.c:742-893`), C's choose calls in C's order.
+fn mutate_flip(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        let x = (prng_next(mut r) & 255) as int
+        return insert_at(b, 0, one(x), 0, 1)
+    }
+    let at = choose(mut r, b.len)
+    var out = copy b
+    out[at] = (b[at] as int ^ 1 << choose(mut r, 8)) as byte
+    out
+}
+
+fn mutate_delete(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let at = choose(mut r, b.len)
+    let n = 1 + choose(mut r, b.len - at)
+    delete_at(b, at, n)
+}
+
+fn mutate_duplicate(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let from = choose(mut r, b.len)
+    var n = 1 + choose(mut r, b.len - from)
+    if n > MAX_INPUT - b.len {
+        n = MAX_INPUT - b.len
+    }
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, b, from, n)
+}
+
+fn mutate_swap(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len < 2 {
+        return copy b
+    }
+    let a = choose(mut r, b.len - 1)
+    let c = a + 1 + choose(mut r, b.len - a - 1)
+    var max_len = c - a
+    if max_len > b.len - c {
+        max_len = b.len - c
+    }
+    if max_len == 0 {
+        return copy b
+    }
+    let n = 1 + choose(mut r, max_len)
+    var out = copy b
+    var i = 0
+    while i < n {
+        out[a + i] = b[c + i]
+        out[c + i] = b[a + i]
+        i += 1
+    }
+    out
+}
+
+fn mutate_truncate(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let n = choose(mut r, b.len + 1)
+    if n == b.len {
+        return copy b
+    }
+    b[0..n]
+}
+
+fn mutate_splice(mut r: Run, b: List[byte], corpus: List[List[byte]]) -> List[byte] {
+    let which = choose(mut r, corpus.len)
+    let at = choose(mut r, b.len + 1)
+    let other = copy corpus[which]
+    if other.len == 0 {
+        return copy b
+    }
+    let from = choose(mut r, other.len + 1)
+    var n = other.len - from
+    if n != 0 {
+        n = 1 + choose(mut r, n)
+    }
+    insert_at(b, at, other, from, n)
+}
+
+fn mutate_split_utf8(mut r: Run, b: List[byte]) -> List[byte] {
+    let start = choose(mut r, b.len + 1)
+    var i = 0
+    while i < b.len {
+        let at = (start + i) % b.len
+        let x = b[at] as int
+        var tails = 0
+        if x >= 194 && x <= 223 {
+            tails = 1
+        } else if x >= 224 && x <= 239 {
+            tails = 2
+        } else if x >= 240 && x <= 244 {
+            tails = 3
+        }
+        if tails != 0 && at + 1 < b.len {
+            var cut = 1 + choose(mut r, tails)
+            if cut > b.len - at - 1 {
+                cut = b.len - at - 1
+            }
+            return delete_at(b, at + 1, cut)
+        }
+        i += 1
+    }
+    mutate_flip(mut r, b)
+}
+
+fn lead(i: int) -> int {
+    match i {
+        0 => 128,
+        1 => 192,
+        2 => 194,
+        3 => 224,
+        4 => 225,
+        5 => 237,
+        6 => 240,
+        7 => 241,
+        8 => 244,
+        9 => 245,
+        _ => 255,
+    }
+}
+
+fn mutate_lead_class(mut r: Run, b: List[byte]) -> List[byte] {
+    let x = lead(choose(mut r, 11))
+    if b.len == 0 {
+        return insert_at(b, 0, one(x), 0, 1)
+    }
+    let at = choose(mut r, b.len)
+    var out = copy b
+    out[at] = x as byte
+    out
+}
+
+fn mutate_continuation(mut r: Run, b: List[byte]) -> List[byte] {
+    let x = 128 | choose(mut r, 64)
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, one(x), 0, 1)
+}
+
+fn mutate_surrogate(mut r: Run, b: List[byte]) -> List[byte] {
+    var s = List[byte]()
+    (mut s).push(237 as byte)
+    (mut s).push(160 as byte)
+    (mut s).push(128 as byte)
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, s, 0, 3)
+}
+
+fn op_name(op: int) -> str {
+    match op {
+        0 => "byte-flip",
+        1 => "chunk-delete",
+        2 => "chunk-duplicate",
+        3 => "chunk-swap",
+        4 => "truncate",
+        5 => "corpus-splice",
+        6 => "utf8-split",
+        7 => "lead-class",
+        8 => "lone-continuation",
+        _ => "surrogate-inject",
+    }
+}
+
+// `mutate` (`fuzzlib.c:895-913`): ten mutators (no dictionary).
+fn mutate(mut r: Run, b: List[byte], corpus: List[List[byte]]) -> (List[byte], int) {
+    let op = choose(mut r, 10)
+    let out = match op {
+        0 => mutate_flip(mut r, b),
+        1 => mutate_delete(mut r, b),
+        2 => mutate_duplicate(mut r, b),
+        3 => mutate_swap(mut r, b),
+        4 => mutate_truncate(mut r, b),
+        5 => mutate_splice(mut r, b, corpus),
+        6 => mutate_split_utf8(mut r, b),
+        7 => mutate_lead_class(mut r, b),
+        8 => mutate_continuation(mut r, b),
+        _ => mutate_surrogate(mut r, b),
+    }
+    (out, op)
+}
+
+// `hash_bytes` (`fuzzlib.c:915-930`): FNV-1a (C seeds it with
+// 1469598103934665603, `fuzzlib.c:1711`) over the length's eight
+// bytes, low first, then the input.
+fn hash_bytes(mut r: Run, b: List[byte]) {
+    let prime: wrapping[u64] = 1099511628211
+    var h = r.hash
+    var len = u(b.len)
+    var i = 0
+    while i < 8 {
+        h = (h ^ len & 255) * prime
+        len = len >> 8
+        i += 1
+    }
+    for x in b {
+        h = (h ^ u(x as int)) * prime
+    }
+    r.hash = h
+}
+
+fn bytes_of(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+    out
+}
+
+fn from_ints(xs: List[int]) -> List[byte] {
+    var out = List[byte]()
+    for x in xs {
+        (mut out).push(x as byte)
+    }
+    out
+}
+
+// `add_builtin_corpus` (`fuzzlib.c:1590-1606`), sorted by name as
+// `corpus_sort` leaves it: ascii, empty, grapheme, invalid, valid.
+fn builtin_corpus() -> List[List[byte]] {
+    var c = List[List[byte]]()
+    (mut c).push(bytes_of("yew\n"))
+    (mut c).push(List[byte]())
+    (mut c).push(from_ints([101, 204, 129, 240, 159, 135, 166, 240, 159, 135, 186]))
+    (mut c).push(from_ints([128, 192, 128, 237, 160, 128, 255]))
+    (mut c).push(from_ints([226, 130, 172, 240, 159, 145, 141]))
+    c
+}
+
+fn corpus_name(i: int) -> str {
+    match i {
+        0 => "builtin/ascii",
+        1 => "builtin/empty",
+        2 => "builtin/grapheme",
+        3 => "builtin/invalid",
+        _ => "builtin/valid",
+    }
+}
+
+fn hex_of(b: List[byte]) -> str {
+    let digits = "0123456789abcdef"
+    var out = List[byte]()
+    for x in b {
+        (mut out).push(digits.bytes()[x as int >> 4])
+        (mut out).push(digits.bytes()[x as int & 15])
+    }
+    str_from_utf8(out) else ""
+}
+
+fn digit_of(b: int, radix: int) -> int {
+    var d = -1
+    if b >= 48 && b <= 57 {
+        d = b - 48
+    } else if b >= 97 && b <= 102 {
+        d = b - 87
+    } else if b >= 65 && b <= 70 {
+        d = b - 55
+    }
+    if d >= radix {
+        return -1
+    }
+    d
+}
+
+// `strtoull(text, &end, 0)` with C's checks (`parse_u64_option`).
+fn parse_u64(s: str) -> (bool, wrapping[u64]) {
+    var v = u(0)
+    var bs = List[int]()
+    for b in s.bytes() {
+        (mut bs).push(b as int)
+    }
+    if bs.len == 0 || bs[0] == 45 {
+        return (false, v)
+    }
+    var i = 0
+    if bs[0] == 43 {
+        i = 1
+    }
+    var radix = 10
+    if i + 1 < bs.len && bs[i] == 48 && (bs[i + 1] == 120 || bs[i + 1] == 88) {
+        if i + 2 >= bs.len || digit_of(bs[i + 2], 16) < 0 {
+            return (false, v)
+        }
+        radix = 16
+        i += 2
+    } else if i < bs.len && bs[i] == 48 {
+        radix = 8
+    }
+    if i >= bs.len {
+        return (false, v)
+    }
+    let max: wrapping[u64] = 18446744073709551615
+    while i < bs.len {
+        let d = digit_of(bs[i], radix)
+        if d < 0 {
+            return (false, v)
+        }
+        if v > (max - u(d)) / u(radix) {
+            return (false, v)
+        }
+        v = v * u(radix) + u(d)
+        i += 1
+    }
+    (true, v)
+}
+
+// The session's own generator (`Rng`, `fuzz_search.c:33-45`): an LCG.
+struct Lcg {
+    s: wrapping[u64],
+}
+
+fn lcg_next(mut r: Lcg) -> int {
+    r.s = r.s * 6364136223846793005 + 1442695040888963407
+    (r.s >> 33) as int
+}
+
+fn lcg_below(mut r: Lcg, n: int) -> int {
+    if n == 0 then 0 else lcg_next(mut r) % n
+}
+
+fn pattern(i: int) -> str {
+    match i {
+        0 => "a",
+        1 => "ab",
+        2 => "a+",
+        3 => "a*b",
+        4 => "[a-c]",
+        5 => "^",
+        6 => "$",
+        7 => "\\w+",
+        8 => "x",
+        9 => "(a)(b)",
+        10 => "a|b",
+        11 => "\\b",
+        12 => "needle",
+        13 => ".",
+        _ => "a{{2}}",
+    }
+}
+
+fn template(i: int) -> str {
+    match i {
+        0 => "X",
+        1 => "",
+        2 => "\\0\\0",
+        3 => "&",
+        4 => "\\U\\0\\E",
+        5 => "y",
+        6 => "\\n",
+        _ => "zz",
+    }
+}
+
+fn buf_of(ed: edit.Ed) -> int {
+    ed.wins[ed.win].buf
+}
+
+fn read_all(ed: edit.Ed) -> List[byte] {
+    text.textbuf_bytes(ed.bufs[buf_of(ed)].ec.tb)
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `on_cp_boundary` (`fuzz_search.c:82-94`).
+fn on_cp_boundary(ed: edit.Ed, off: int) -> bool {
+    let b = buf_of(ed)
+    if off == 0 || off >= text.textbuf_len(ed.bufs[b].ec.tb) {
+        return true
+    }
+    text.textbuf_byte_at(ed.bufs[b].ec.tb, off) & 192 != 128
+}
+
+// `check_invariants` (`fuzz_search.c:96-155`): "" when they hold.
+fn check_invariants(ed: edit.Ed) -> str {
+    let w = ed.win
+    let b = buf_of(ed)
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    var i = 0
+    while i < ed.wins[w].overlay.spans.len {
+        let s = copy ed.wins[w].overlay.spans[i]
+        if s.lo > s.hi || s.hi > len {
+            return "overlay span {i} is {s.lo}..{s.hi} in a {len}-byte buffer"
+        }
+        if i > 0 && ed.wins[w].overlay.spans[i - 1].hi > s.lo {
+            return "overlay spans {i - 1} and {i} overlap"
+        }
+        if !on_cp_boundary(ed, s.lo) || !on_cp_boundary(ed, s.hi) {
+            return "overlay span {i} ({s.lo}..{s.hi}) is not on codepoint boundaries"
+        }
+        i += 1
+    }
+    var j = 0
+    while j < text.jumplist_len(ed.wins[w].jumps) {
+        let je = text.jumplist_at(ed.wins[w].jumps, j) else text.jump_entry_zero()
+        let bi = edit.ed_buf_index(ed, je.buf_id)
+        if bi >= 0 && text.mark_alive(ed.bufs[bi].ec.marks, je.mark) {
+            if text.mark_pos(ed.bufs[bi].ec.marks, je.mark) as int >
+                text.textbuf_len(ed.bufs[bi].ec.tb) {
+                return "jumplist entry {j} points past the end of its buffer"
+            }
+        }
+        j += 1
+    }
+    ""
+}
+
+fn undo_once(mut ed: edit.Ed) -> bool {
+    let w = ed.win
+    let b = buf_of(ed)
+    edit.edit_take(mut ed, w)
+    let ok = text.undo(mut ed.bufs[b].ec)
+    edit.edit_give(mut ed, w)
+    edit.ed_finish_edit(mut ed, w)
+    ok
+}
+
+fn compile(pat: str, o: edit.SearchOpts) -> search.Re ! {invalid} {
+    var bytes = List[byte]()
+    for x in pat.bytes() {
+        (mut bytes).push(x)
+    }
+    var err = search.re_err_new()
+    edit.search_compile(bytes, o, mut err)?
+}
+
+// `run_session` (`fuzz_search.c:157-372`): "" when every invariant held.
+fn run_session(data: List[byte]) -> str {
+    var rng = Lcg { s: 11400714819323198485 }
+    for x in data {
+        rng.s = rng.s * 31 + x as int as wrapping[u64]
+    }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let w = ed.win
+    ed.wins[w].rect = edit.rect(0, 1, 80, 12)
+    ed.wins[w].vp.rows = 12
+    ed.wins[w].vp.cols = 80
+    let opts = edit.search_opts_new()
+    ed.search_opts = copy opts
+    // Seed content from the input, kept text-like; the seed insert is
+    // itself undoable, so the true initial state is empty.
+    var seed = List[byte]()
+    let alphabet = "ab c\nxyneedl"
+    for x in data {
+        (mut seed).push(alphabet.bytes()[x as int % 12])
+    }
+    if seed.len == 0 {
+        for x in "abc\n".bytes() {
+            (mut seed).push(x)
+        }
+    }
+    let _ = edit.ed_edit_insert(mut ed, w, 0, seed, 0, seed.len)
+    let original = List[byte]()
+    let ops = 40 + data.len % 40
+    var op = 0
+    while op < ops {
+        let kind = lcg_below(mut rng, 6)
+        if kind == 0 {
+            // Search and step.
+            let pat = pattern(lcg_below(mut rng, 15))
+            var pb = List[byte]()
+            for x in pat.bytes() {
+                (mut pb).push(x)
+            }
+            text.reg_set_search(mut ed.regs, pb)
+            edit.search_drop_re(mut ed)
+            ed.search.reverse = lcg_below(mut rng, 2) != 0
+            let fwd = lcg_below(mut rng, 2) != 0
+            let n = 1 + lcg_below(mut rng, 3)
+            let _ = edit.search_step(mut ed, w, fwd, n)
+        } else if kind == 1 {
+            // Refresh the overlay with a pattern of its own.
+            let pat = pattern(lcg_below(mut rng, 15))
+            let budget = lcg_below(mut rng, 2)
+            let re = compile(pat, opts) else |_| {
+                return "pattern {pat} did not compile"
+            }
+            edit.search_set_re(mut ed, take re)
+            edit.overlay_refresh(mut ed, w, op + 1, if budget != 0 then 1000 else 0)
+        } else if kind == 2 {
+            // Replace: one undo must revert the whole run.
+            let pat = pattern(lcg_below(mut rng, 15))
+            let tpl = template(lcg_below(mut rng, 8))
+            let nlines = text.textbuf_line_count(ed.bufs[buf_of(ed)].ec.tb)
+            let re = compile(pat, opts) else |_| {
+                return "pattern {pat} did not compile"
+            }
+            if nlines != 0 {
+                var tb = List[byte]()
+                for x in tpl.bytes() {
+                    (mut tb).push(x)
+                }
+                let (ok, plan, _) = search.repl_plan_build(
+                    re,
+                    ed.bufs[buf_of(ed)].ec.tb,
+                    0,
+                    nlines - 1,
+                    tb,
+                    search.SUB_GLOBAL,
+                )
+                if ok {
+                    let before = read_all(ed)
+                    let applied = edit.search_plan_apply(mut ed, w, plan)
+                    if applied > 0 {
+                        let _ = undo_once(mut ed)
+                        let after = read_all(ed)
+                        if !same(after, before) {
+                            return "one undo did not revert a {applied}-match replace ({after.len} vs {before.len})"
+                        }
+                    }
+                }
+            }
+        } else if kind == 3 {
+            // A wrapped edit on codepoint boundaries.
+            edit.ed_undo_begin(mut ed, w, text.TXN_TYPE)
+            let blen = text.textbuf_len(ed.bufs[buf_of(ed)].ec.tb)
+            var at = if blen == 0 then 0 else lcg_below(mut rng, blen)
+            while at > 0 && !on_cp_boundary(ed, at) {
+                at -= 1
+            }
+            if lcg_below(mut rng, 2) != 0 {
+                var nb = List[byte]()
+                for x in "needle\n".bytes() {
+                    (mut nb).push(x)
+                }
+                let _ = edit.ed_edit_insert(mut ed, w, at, nb, 0, nb.len)
+            } else if blen > 0 {
+                var hi = at + 1 + lcg_below(mut rng, 8)
+                if hi > blen {
+                    hi = blen
+                }
+                while hi > at && !on_cp_boundary(ed, hi) {
+                    hi -= 1
+                }
+                if hi > at {
+                    let _ = edit.ed_edit_delete(mut ed, w, at, hi)
+                }
+            }
+            edit.ed_undo_end(mut ed, w)
+            edit.ed_finish_edit(mut ed, w)
+        } else if kind == 4 {
+            // A jump.
+            if lcg_below(mut rng, 2) != 0 {
+                edit.jump_push(mut ed, w, edit.ed_cursor_pos(ed), op * 100)
+            } else if lcg_below(mut rng, 2) != 0 {
+                let _ = edit.jump_back(mut ed, w, 1)
+            } else {
+                let _ = edit.jump_fwd(mut ed, w, 1)
+            }
+        } else {
+            let _ = undo_once(mut ed)
+        }
+        let why = check_invariants(ed)
+        if why.len != 0 {
+            return why
+        }
+        op += 1
+    }
+    // Undo all the way back: the bytes we began with.
+    var guard = 0
+    while guard < 100000 && undo_once(mut ed) {
+        guard += 1
+    }
+    let replayed = read_all(ed)
+    if !same(replayed, original) {
+        return "undoing everything did not restore the original bytes ({replayed.len} vs {original.len})"
+    }
+    ""
+}
+
+fn usage() -> int {
+    eprint("usage: fuzz-search [--seed=N] [--iters=N]")
+    2
+}
+
+fn main() -> int {
+    var seed = u(1)
+    var iters = 200000
+    for a in env_args() {
+        if a.starts_with("--seed=") {
+            let (ok, v) = parse_u64(a[7..])
+            if !ok {
+                return usage()
+            }
+            seed = v
+        } else if a.starts_with("--iters=") {
+            let (ok, v) = parse_u64(a[8..])
+            if !ok || v > u(1000000000000) {
+                return usage()
+            }
+            iters = v as int
+        } else {
+            return usage()
+        }
+    }
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let corpus = builtin_corpus()
+    var state = seed
+    if seed == u(0) {
+        state = 11400714819323198485
+    }
+    var hash: wrapping[u64] = 1469598103934665603
+    var done = 0
+    var failed = false
+    var ops_total = 0
+    while done < iters && !failed {
+        let n = if iters - done > EPOCH then EPOCH else iters - done
+        region epoch {
+            var r = Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = choose(mut r, corpus.len)
+                var input = copy corpus[which]
+                let mutations = 1 + choose(mut r, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, o) = mutate(mut r, input, corpus)
+                    input = next
+                    op = o
+                    m += 1
+                }
+                hash_bytes(mut r, input)
+                ops_total += 40 + input.len % 40
+                // One region a session: its editor dies with it (G33).
+                var bad = false
+                region session {
+                    let why = run_session(input)
+                    if why.len != 0 {
+                        print(
+                            "fuzz_search: FAIL seed={seed} iter={done + k} corpus={corpus_name(which)} op={op_name(op)}: {why}",
+                        )
+                        print("fuzz_search: input={hex_of(input)}")
+                        bad = true
+                    }
+                }
+                if bad {
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = r.state
+            hash = r.hash
+        }
+        done += n
+    }
+    if failed {
+        return 1
+    }
+    eprint("fuzz_search: {ops_total} operations")
+    print("fuzz_search: seed={seed} iters={iters} corpus={corpus.len} hash={text.hex16(hash)} ok")
+    0
+}
