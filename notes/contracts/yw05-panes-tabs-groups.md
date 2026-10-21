@@ -59,7 +59,11 @@ table.
    interims retire here too: `tools/torture-live`'s G3 acceptance (the
    tool fails until it is deleted), `edit.loop`'s deadline-first turn and
    `term.tty`'s fine wait (`3375b51`, `57f47dd`, `620817e`), the
-   LF-as-Enter of R-yw03-4.
+   LF-as-Enter of R-yw03-4 — and with them every termios mode switch in
+   the wait, so campaign 03's `notepad_burst_keys` and `_paste`, which
+   yw04 moved to an announced advisory on macOS (the harness writes a
+   burst without reading while a `tcsetattr(TCSADRAIN)` waits on output),
+   are gated on macOS again.
 2. **The pane tree** (s22): `edit.layout` — `Rect` in cells and the
    layout/draw split (layout computes rects, drawing consumes them; the
    cells-based law that keeps multibyte text from desyncing clicks), the
