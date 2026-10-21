@@ -184,3 +184,17 @@ the note.
   processes were involved. From then on every fork runs anything that can
   trap or fault inside the lane's container, which also gained
   `--ulimit core=0` (`notes/yw04-evidence/gates/ctr.sh`).
+- The regex fork, reported by itself: it piped its own host-side `perf
+  record` through `head` (SIGPIPE to its own profiler, a process it
+  started), and stopped two of its own stale campaign containers — one by
+  its recorded container id, and one picked out by its `8-11` CPU set after
+  checking it was only the fork's (a selection by pattern, which RULES §4
+  forbids even when it hits only one's own). After the cores, a re-run of
+  its stack-overflow witness inside the container left systemd-coredump
+  journal entries at 2026-10-20T23:23:27Z with `COREFILE none` — no core
+  stored, the `--ulimit core=0` working.
+- **The usage limit** (2026-10-21, before 01:50Z): the lane and three
+  forks (prompt, shell, search) were cut off mid-turn; on the reset the lane
+  re-checked its branch, worktrees, uncommitted edits, kasumi jobs and
+  containers by recorded pid (none live) and CI on `yw04`, then resumed the
+  forks from their saved state.

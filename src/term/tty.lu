@@ -394,6 +394,8 @@ pub struct Tty {
     raw: bool,
     resume_raw: bool,
     poll_mode: bool,
+    fine: bool,
+    fine_bytes: List[byte],
     drain: bool,
     alt: bool,
     motion: bool,
@@ -421,6 +423,8 @@ pub fn tty_new() -> Tty {
         raw: false,
         resume_raw: false,
         poll_mode: false,
+        fine: false,
+        fine_bytes: List[byte](),
         drain: false,
         alt: false,
         motion: false,
@@ -1035,6 +1039,7 @@ pub fn tty_raw(mut t: Tty) -> () ! {io} {
     t.resume_raw = true
     t.raw = true
     t.poll_mode = false
+    t.fine = false
     guard_note(t, GUARD_RAW)
     std_term.set_mode(tin, rawios()) else |_| {
         tty_restore(mut t)
@@ -1078,6 +1083,7 @@ pub fn tty_restore(mut t: Tty) {
     t.raw = false
     t.motion = false
     t.poll_mode = false
+    t.fine = false
     t.drain = false
     guard_note(t, GUARD_CLEAN)
 }
@@ -1228,6 +1234,7 @@ pub fn tty_on_signal(mut t: Tty, meaning: int) -> int {
         if t.resume_raw && !t.raw {
             t.raw = true
             t.poll_mode = false
+            t.fine = false
             guard_note(t, GUARD_RAW)
             std_term.set_mode(fs.stdin(), rawios()) else |_| {
                 t.raw = false
@@ -1252,38 +1259,121 @@ pub fn tty_on_signal(mut t: Tty, meaning: int) -> int {
     SIG_NONE
 }
 
-// Switch between the parked wait (VMIN=1) and the VTIME tick (VMIN=0,
-// VTIME=1) only when the deadline state changes.
-fn set_poll(mut t: Tty, on: bool) {
-    if !t.raw || t.poll_mode == on {
+/// The `VTIME` tick in ms: a `pollios` read waits at most this long
+/// (`VTIME=1`, a tenth of a second).
+pub const TTY_TICK_MS: int = 100
+
+/// The wait's three shapes at 0.2.33 (G2): parked (`VMIN=1`), the tick
+/// (`VTIME=1`) and the fine wait (`VMIN=0`, `VTIME=0`, polled each ms).
+pub const WAIT_PARK: int = 0
+
+/// The `VTIME` tick: a deadline at least a tick away.
+pub const WAIT_TICK: int = 1
+
+/// The fine wait: a deadline under a tick away (or due).
+pub const WAIT_FINE: int = 2
+
+/// Which wait a deadline gets (`tty_wait`): none parks, one under a tick
+/// waits finely so it fires on time (an ESC's 25 ms, a 16 ms idle timer),
+/// a farther one ticks until it is under a tick away.
+pub fn tty_wait_kind(deadline_ms: int) -> int {
+    if deadline_ms < 0 {
+        return WAIT_PARK
+    }
+    if deadline_ms < TTY_TICK_MS then WAIT_FINE else WAIT_TICK
+}
+
+// Switch between the parked wait (VMIN=1), the VTIME tick (VMIN=0,
+// VTIME=1) and the fine wait (VMIN=0, VTIME=0) only when the state
+// changes.
+fn set_wait(mut t: Tty, kind: int) {
+    if !t.raw {
         return
     }
-    std_term.set_mode(fs.stdin(), if on then pollios() else rawios()) else |_| {
+    let tick = kind == WAIT_TICK
+    let fine = kind == WAIT_FINE
+    if t.poll_mode == tick && t.fine == fine {
         return
     }
-    t.poll_mode = on
+    let mode = if fine then drainios() else if tick then pollios() else rawios()
+    std_term.set_mode(fs.stdin(), mode) else |_| {
+        return
+    }
+    t.poll_mode = tick
+    t.fine = fine
 }
 
 /// THE wait (ruling #93 R2 interim; the swap point for `os_signal_wait_fds`).
 /// `deadline_ms < 0`: park until a key or a meaning (`signal.wait_fd`),
-/// answering the meaning or 0 for input. `deadline_ms >= 0`: VTIME
-/// polling — a queued meaning is answered at once, else 0 and the read
-/// that follows returns within 100 ms (a tick when it brings nothing).
+/// answering the meaning or 0 for input. A deadline at least a tick away:
+/// `VTIME` polling — a queued meaning is answered at once, else 0 and the
+/// read that follows returns within 100 ms (a tick when it brings
+/// nothing). A deadline under a tick away (yw04): the fine wait — the
+/// signal set and the terminal polled each millisecond until a meaning, a
+/// byte (held for `tty_take_fine`) or the deadline, so a 25 ms ESC or a 16
+/// ms timer fires on time as C's `poll(2)` timeout does (`loop.c:568`);
+/// the wait cannot sleep below the tick otherwise (G2, wolf-lang#795).
 pub fn tty_wait(mut t: Tty, deadline_ms: int) -> int ! {io} {
     assert(!t.poisoned, "terminal access in --batch: tty_wait")
     let set = tty_signal_set()
-    if deadline_ms < 0 {
-        set_poll(mut t, false)
+    var kind = tty_wait_kind(deadline_ms)
+    if kind == WAIT_FINE && !t.raw {
+        kind = WAIT_TICK
+    }
+    set_wait(mut t, kind)
+    if kind == WAIT_PARK {
         let m = signal.wait_fd(fs.stdin(), set) else |_| {
             return io
         }
         return m
     }
-    set_poll(mut t, true)
-    let m = signal.poll(set) else |_| {
-        return io
+    if kind == WAIT_TICK {
+        let m = signal.poll(set) else |_| {
+            return io
+        }
+        return m
     }
-    m
+    let start = time_now_ms()
+    var tin = fs.stdin()
+    loop {
+        let m = signal.poll(set) else |_| {
+            return io
+        }
+        if m != 0 {
+            return m
+        }
+        let got = fs.read_chunk(mut tin, 4096) else |e| match e {
+            eof => List[byte](),
+            io => { return io },
+        }
+        if got.len > 0 {
+            for b in got {
+                (mut t.fine_bytes).push(b)
+            }
+            return 0
+        }
+        if time_now_ms() - start >= deadline_ms {
+            return 0
+        }
+        time_sleep_ms(1)
+    }
+    0
+}
+
+/// Whether the last wait was the fine one (`tty_wait`): its bytes, if any,
+/// are `tty_take_fine`'s, and a read must not block.
+pub fn tty_waited_fine(t: Tty) -> bool {
+    t.fine
+}
+
+/// The bytes the fine wait read (empty when it timed out), handed over
+/// once; the storage is kept for the next wait (G33).
+pub fn tty_take_fine(mut t: Tty) -> List[byte] {
+    let out = copy t.fine_bytes
+    while t.fine_bytes.len > 0 {
+        let _ = (mut t.fine_bytes).pop()
+    }
+    out
 }
 
 /// Read what the terminal has (`read(2)` on `t->rfd`): the bytes, an empty
@@ -1325,19 +1415,24 @@ pub fn tty_drain_begin(mut t: Tty) {
     if !t.raw || t.drain {
         return
     }
+    if t.fine {
+        t.drain = true
+        return
+    }
     std_term.set_mode(fs.stdin(), drainios()) else |_| {
         return
     }
     t.drain = true
 }
 
-/// Leave the drain: the wait's mode again (parked or the tick).
+/// Leave the drain: the wait's mode again (parked, the tick, or the fine
+/// wait, whose mode the drain's already is).
 pub fn tty_drain_end(mut t: Tty) {
     if !t.drain {
         return
     }
     t.drain = false
-    if !t.raw {
+    if !t.raw || t.fine {
         return
     }
     std_term.set_mode(fs.stdin(), if t.poll_mode then pollios() else rawios()) else |_| {
