@@ -1,0 +1,684 @@
+//! fuzzgen — sagitta's fuzz generator (`tests/fuzz/fuzzlib.c`,
+//! `yew_fuzz_main`, at 9ace98c2) as a module the shell fuzz drivers
+//! share (`tools/fuzz-shctx`, `tools/fuzz-comphelp`; their build scripts
+//! stage it beside the driver, D32).
+//!
+//! C's bit for bit where C's run is deterministic: the xorshift64*
+//! generator (`prng_next`, `choose`), the five built-in seeds, the guided
+//! corpus `tests/fuzz/corpus/<target>/` read line by line (`load_dir`,
+//! `load_file_lines`, `parse_hex_field`; a `.bin` file whole), every
+//! entry named `<path>:<line>` and the whole corpus insertion-sorted by
+//! name (`corpus_sort`), the ten mutators chosen as C chooses them
+//! (`mutate`, `fuzzlib.c:742-913`), the 64 KiB cap, and the FNV-1a hash
+//! over every input (`hash_bytes`) — so a seed's `hash=` is C's for the
+//! same seed and iterations, the witness that the port fed its check the
+//! inputs C feeds C's. The mutators are `tools/fuzz-cmdparse`'s (the
+//! grammar fork's port of the same lines), lifted into a module.
+//!
+//! Not ported: C's watchdog, crash minimiser and crash files,
+//! `--seconds`, `--corpus-only`, coverage admission. A dictionary
+//! (`tests/fuzz/dict/<target>.txt`, the eleventh mutator) is REFUSED with
+//! exit 2 rather than silently changing the stream: neither shell target
+//! has one at the pin.
+
+use std.fs
+
+/// `YEW_FUZZ_MAX_INPUT` (`fuzzlib.c:27`).
+pub const MAX_INPUT: int = 65536
+
+/// The generator's state (C's `FuzzRun.state`, `.hash`).
+pub struct Run {
+    state: wrapping[u64],
+    hash: wrapping[u64],
+}
+
+/// One seed: its name (C's sort key) and bytes.
+pub struct Seed {
+    name: str,
+    bytes: List[byte],
+}
+
+fn u(x: int) -> wrapping[u64] {
+    x as wrapping[u64]
+}
+
+/// A run at `seed` (0 is C's golden-ratio state), the hash at C's basis.
+pub fn run_new(seed: wrapping[u64]) -> Run {
+    var state = seed
+    if seed == u(0) {
+        state = 11400714819323198485
+    }
+    Run { state: state, hash: 1469598103934665603 }
+}
+
+/// `prng_next` (`fuzzlib.c:726-735`): xorshift64*.
+pub fn prng_next(mut r: Run) -> wrapping[u64] {
+    var x = r.state
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    r.state = x
+    x * 2685821657736338717
+}
+
+/// `choose` (`fuzzlib.c:737-740`).
+pub fn choose(mut r: Run, limit: int) -> int {
+    if limit == 0 {
+        return 0
+    }
+    (prng_next(mut r) % u(limit)) as int
+}
+
+fn insert_at(b: List[byte], at_in: int, data: List[byte], lo: int, n_in: int) -> List[byte] {
+    let at = if at_in > b.len then b.len else at_in
+    var n = n_in
+    if n > MAX_INPUT - b.len {
+        n = MAX_INPUT - b.len
+    }
+    if n <= 0 {
+        return copy b
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < at {
+        (mut out).push(b[i])
+        i += 1
+    }
+    var k = 0
+    while k < n {
+        (mut out).push(data[lo + k])
+        k += 1
+    }
+    while i < b.len {
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+fn delete_at(b: List[byte], at: int, n_in: int) -> List[byte] {
+    if at >= b.len {
+        return copy b
+    }
+    var n = n_in
+    if n > b.len - at {
+        n = b.len - at
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < b.len {
+        if i < at || i >= at + n {
+            (mut out).push(b[i])
+        }
+        i += 1
+    }
+    out
+}
+
+fn one(x: int) -> List[byte] {
+    var out = List[byte]()
+    (mut out).push(x as byte)
+    out
+}
+
+fn mutate_flip(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        let x = (prng_next(mut r) & 255) as int
+        return insert_at(b, 0, one(x), 0, 1)
+    }
+    let at = choose(mut r, b.len)
+    var out = copy b
+    out[at] = (b[at] as int ^ 1 << choose(mut r, 8)) as byte
+    out
+}
+
+fn mutate_delete(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let at = choose(mut r, b.len)
+    let n = 1 + choose(mut r, b.len - at)
+    delete_at(b, at, n)
+}
+
+fn mutate_duplicate(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let from = choose(mut r, b.len)
+    var n = 1 + choose(mut r, b.len - from)
+    if n > MAX_INPUT - b.len {
+        n = MAX_INPUT - b.len
+    }
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, b, from, n)
+}
+
+fn mutate_swap(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len < 2 {
+        return copy b
+    }
+    let a = choose(mut r, b.len - 1)
+    let c = a + 1 + choose(mut r, b.len - a - 1)
+    var max_len = c - a
+    if max_len > b.len - c {
+        max_len = b.len - c
+    }
+    if max_len == 0 {
+        return copy b
+    }
+    let n = 1 + choose(mut r, max_len)
+    var out = copy b
+    var i = 0
+    while i < n {
+        out[a + i] = b[c + i]
+        out[c + i] = b[a + i]
+        i += 1
+    }
+    out
+}
+
+fn mutate_truncate(mut r: Run, b: List[byte]) -> List[byte] {
+    if b.len == 0 {
+        return copy b
+    }
+    let n = choose(mut r, b.len + 1)
+    if n == b.len {
+        return copy b
+    }
+    b[0..n]
+}
+
+fn mutate_splice(mut r: Run, b: List[byte], corpus: List[Seed]) -> List[byte] {
+    let which = choose(mut r, corpus.len)
+    let at = choose(mut r, b.len + 1)
+    let other = copy corpus[which].bytes
+    if other.len == 0 {
+        return copy b
+    }
+    let from = choose(mut r, other.len + 1)
+    var n = other.len - from
+    if n != 0 {
+        n = 1 + choose(mut r, n)
+    }
+    insert_at(b, at, other, from, n)
+}
+
+fn mutate_split_utf8(mut r: Run, b: List[byte]) -> List[byte] {
+    let start = choose(mut r, b.len + 1)
+    var i = 0
+    while i < b.len {
+        let at = (start + i) % b.len
+        let x = b[at] as int
+        var tails = 0
+        if x >= 194 && x <= 223 {
+            tails = 1
+        } else if x >= 224 && x <= 239 {
+            tails = 2
+        } else if x >= 240 && x <= 244 {
+            tails = 3
+        }
+        if tails != 0 && at + 1 < b.len {
+            var cut = 1 + choose(mut r, tails)
+            if cut > b.len - at - 1 {
+                cut = b.len - at - 1
+            }
+            return delete_at(b, at + 1, cut)
+        }
+        i += 1
+    }
+    mutate_flip(mut r, b)
+}
+
+fn lead(i: int) -> int {
+    match i {
+        0 => 128,
+        1 => 192,
+        2 => 194,
+        3 => 224,
+        4 => 225,
+        5 => 237,
+        6 => 240,
+        7 => 241,
+        8 => 244,
+        9 => 245,
+        _ => 255,
+    }
+}
+
+fn mutate_lead_class(mut r: Run, b: List[byte]) -> List[byte] {
+    let x = lead(choose(mut r, 11))
+    if b.len == 0 {
+        return insert_at(b, 0, one(x), 0, 1)
+    }
+    let at = choose(mut r, b.len)
+    var out = copy b
+    out[at] = x as byte
+    out
+}
+
+fn mutate_continuation(mut r: Run, b: List[byte]) -> List[byte] {
+    let x = 128 | choose(mut r, 64)
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, one(x), 0, 1)
+}
+
+fn mutate_surrogate(mut r: Run, b: List[byte]) -> List[byte] {
+    var s = List[byte]()
+    (mut s).push(237 as byte)
+    (mut s).push(160 as byte)
+    (mut s).push(128 as byte)
+    let at = choose(mut r, b.len + 1)
+    insert_at(b, at, s, 0, 3)
+}
+
+/// The mutator C names in a FAIL line.
+pub fn op_name(op: int) -> str {
+    match op {
+        0 => "byte-flip",
+        1 => "chunk-delete",
+        2 => "chunk-duplicate",
+        3 => "chunk-swap",
+        4 => "truncate",
+        5 => "corpus-splice",
+        6 => "utf8-split",
+        7 => "lead-class",
+        8 => "lone-continuation",
+        _ => "surrogate-inject",
+    }
+}
+
+/// `mutate` (`fuzzlib.c:895-913`): ten mutators (no dictionary).
+pub fn mutate(mut r: Run, b: List[byte], corpus: List[Seed]) -> (List[byte], int) {
+    let op = choose(mut r, 10)
+    let out = match op {
+        0 => mutate_flip(mut r, b),
+        1 => mutate_delete(mut r, b),
+        2 => mutate_duplicate(mut r, b),
+        3 => mutate_swap(mut r, b),
+        4 => mutate_truncate(mut r, b),
+        5 => mutate_splice(mut r, b, corpus),
+        6 => mutate_split_utf8(mut r, b),
+        7 => mutate_lead_class(mut r, b),
+        8 => mutate_continuation(mut r, b),
+        _ => mutate_surrogate(mut r, b),
+    }
+    (out, op)
+}
+
+/// `hash_bytes` (`fuzzlib.c:915-930`): FNV-1a over the length's eight
+/// bytes, low first, then the input.
+pub fn hash_bytes(mut r: Run, b: List[byte]) {
+    let prime: wrapping[u64] = 1099511628211
+    var h = r.hash
+    var len = u(b.len)
+    var i = 0
+    while i < 8 {
+        h = (h ^ len & 255) * prime
+        len = len >> 8
+        i += 1
+    }
+    for x in b {
+        h = (h ^ u(x as int)) * prime
+    }
+    r.hash = h
+}
+
+fn from_ints(xs: List[int]) -> List[byte] {
+    var out = List[byte]()
+    for x in xs {
+        (mut out).push(x as byte)
+    }
+    out
+}
+
+fn capped(b: List[byte]) -> List[byte] {
+    if b.len > MAX_INPUT then b[0..MAX_INPUT] else copy b
+}
+
+// `add_builtin_corpus` (`fuzzlib.c:1590-1606`).
+fn add_builtins(mut c: List[Seed]) {
+    (mut c).push(Seed { name: "builtin/empty", bytes: List[byte]() })
+    (mut c).push(Seed { name: "builtin/ascii", bytes: from_ints([121, 101, 119, 10]) })
+    (mut c).push(Seed {
+        name: "builtin/valid",
+        bytes: from_ints([226, 130, 172, 240, 159, 145, 141]),
+    })
+    (mut c).push(Seed {
+        name: "builtin/invalid",
+        bytes: from_ints([128, 192, 128, 237, 160, 128, 255]),
+    })
+    (mut c).push(Seed {
+        name: "builtin/grapheme",
+        bytes: from_ints([101, 204, 129, 240, 159, 135, 166, 240, 159, 135, 186]),
+    })
+}
+
+fn hex_nibble(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    -1
+}
+
+// `parse_hex_field` (`fuzzlib.c:356-387`): the bytes between the first
+// two `|` of a C string (the line up to its first NUL), as hex pairs;
+// none unless an even, non-zero count.
+fn parse_hex_field(line: List[byte]) -> (bool, List[byte]) {
+    var end = 0
+    while end < line.len && line[end] as int != 0 {
+        end += 1
+    }
+    var begin = 0
+    while begin < end && line[begin] as int != 124 {
+        begin += 1
+    }
+    if begin >= end {
+        return (false, List[byte]())
+    }
+    begin += 1
+    var stop = begin
+    while stop < end && line[stop] as int != 124 {
+        stop += 1
+    }
+    if stop >= end {
+        return (false, List[byte]())
+    }
+    var out = List[byte]()
+    var high = 0
+    var have_high = false
+    var i = begin
+    while i < stop {
+        let nib = hex_nibble(line[i] as int)
+        i += 1
+        if nib < 0 {
+            continue
+        }
+        if !have_high {
+            high = nib
+            have_high = true
+        } else {
+            (mut out).push((high * 16 + nib) as byte)
+            have_high = false
+        }
+    }
+    (!have_high && out.len != 0, out)
+}
+
+// `load_file_lines` (`fuzzlib.c:434-494`): each line (trailing CR/LF
+// stripped; empty and `#` lines skipped) a seed named `<path>:<line>`,
+// its hex field when it has one. GraphemeBreakTest.txt is not a shell
+// corpus and is not handled.
+fn load_lines(mut c: List[Seed], path: str) -> bool {
+    let text = fs.read_bytes(path) else |_| {
+        eprint("fuzz: cannot open corpus {path}")
+        return false
+    }
+    var at = 0
+    var line_no = 0
+    while at < text.len {
+        var e = at
+        while e < text.len && text[e] as int != 10 {
+            e += 1
+        }
+        line_no += 1
+        var len = e - at
+        // getline keeps the '\n'; C strips every trailing '\n' and '\r'.
+        while len != 0 && text[at + len - 1] as int == 13 {
+            len -= 1
+        }
+        if len != 0 && text[at] as int != 35 {
+            let line = text[at..at + len]
+            let name = "{path}:{line_no}"
+            let (hex, parsed) = parse_hex_field(line)
+            if hex {
+                (mut c).push(Seed { name: name, bytes: capped(parsed) })
+            } else {
+                (mut c).push(Seed { name: name, bytes: capped(line) })
+            }
+        }
+        at = e + 1
+    }
+    true
+}
+
+// `load_dir` (`fuzzlib.c:550-613`): every regular file (a `.bin` whole,
+// else by lines), every subdirectory recursively.
+fn load_dir(mut c: List[Seed], path: str) -> bool {
+    let rows = fs_read_dir_entries(path) else |_| {
+        eprint("fuzz: cannot open corpus directory {path}")
+        return false
+    }
+    for row in rows {
+        let nm = str_from_utf8(row[1..]) else |_| {
+            eprint("fuzz: a corpus name is not UTF-8 in {path}")
+            return false
+        }
+        let child = "{path}/{nm}"
+        let info = fs.stat(child) else |_| {
+            eprint("fuzz: cannot stat corpus {child}")
+            return false
+        }
+        if info.kind == 1 {
+            if !load_dir(mut c, child) {
+                return false
+            }
+        } else if info.kind == 0 {
+            if child.ends_with(".bin") {
+                let b = fs.read_bytes(child) else |_| {
+                    eprint("fuzz: cannot open corpus {child}")
+                    return false
+                }
+                (mut c).push(Seed { name: child, bytes: capped(b) })
+            } else if !load_lines(mut c, child) {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn name_less(a: str, b: str) -> bool {
+    let x = a.bytes()
+    let y = b.bytes()
+    var i = 0
+    while i < x.len && i < y.len {
+        if x[i] as int != y[i] as int {
+            return x[i] as int < y[i] as int
+        }
+        i += 1
+    }
+    x.len < y.len
+}
+
+/// The corpus C's `yew_fuzz_main` builds for `target`: the built-ins, the
+/// guided directory when it exists, insertion-sorted by name. `(ok,
+/// seeds)`; not ok is C's exit 2 (an unreadable corpus, or a dictionary
+/// this port does not drive).
+pub fn corpus_for(target: str) -> (bool, List[Seed]) {
+    var c = List[Seed]()
+    add_builtins(mut c)
+    let dict = "tests/fuzz/dict/{target}.txt"
+    let _ = fs.stat(dict) else |_| {
+        let guided = "tests/fuzz/corpus/{target}"
+        let g = fs.stat(guided) else |_| {
+            return (true, sort_seeds(c))
+        }
+        if g.kind != 1 {
+            eprint("fuzz: corpus path is not a directory: {guided}")
+            return (false, c)
+        }
+        if !load_dir(mut c, guided) {
+            return (false, c)
+        }
+        return (true, sort_seeds(c))
+    }
+    eprint("fuzz: {dict} exists: the dictionary mutator is not ported (it would change the stream)")
+    (false, c)
+}
+
+// `corpus_sort` (`fuzzlib.c:321-337`): a stable insertion sort by name.
+// Merged here (the same stable order) — 279 files of lines is too many
+// rows to insert one by one.
+fn sort_seeds(xs: List[Seed]) -> List[Seed] {
+    let n = xs.len
+    var idx = List[int]()
+    var i = 0
+    while i < n {
+        (mut idx).push(i)
+        i += 1
+    }
+    var width = 1
+    while width < n {
+        var dst = List[int]()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if lo + 2 * width < n then lo + 2 * width else n
+            var a = lo
+            var b = mid
+            while a < mid && b < hi {
+                if name_less(xs[idx[b]].name, xs[idx[a]].name) {
+                    (mut dst).push(idx[b])
+                    b += 1
+                } else {
+                    (mut dst).push(idx[a])
+                    a += 1
+                }
+            }
+            while a < mid {
+                (mut dst).push(idx[a])
+                a += 1
+            }
+            while b < hi {
+                (mut dst).push(idx[b])
+                b += 1
+            }
+            lo = hi
+        }
+        idx = dst
+        width *= 2
+    }
+    var out = List[Seed]()
+    for k in idx {
+        (mut out).push(copy xs[k])
+    }
+    out
+}
+
+/// Bytes as lowercase hex (a FAIL line's input).
+pub fn hex_of(b: List[byte]) -> str {
+    let digits = "0123456789abcdef"
+    var out = List[byte]()
+    for x in b {
+        (mut out).push(digits.bytes()[x as int >> 4])
+        (mut out).push(digits.bytes()[x as int & 15])
+    }
+    str_from_utf8(out) else ""
+}
+
+/// `%016llx`.
+pub fn hex16(h: wrapping[u64]) -> str {
+    let digits = "0123456789abcdef"
+    var b = List[byte]()
+    var k: int = 0
+    while k < 16 {
+        var v = h
+        var sh = 0
+        while sh < 15 - k {
+            v = v >> 4
+            sh += 1
+        }
+        (mut b).push(digits.bytes()[(v & 15) as int])
+        k += 1
+    }
+    str_from_utf8(b) else ""
+}
+
+fn digit_of(b: int, radix: int) -> int {
+    var d = -1
+    if b >= 48 && b <= 57 {
+        d = b - 48
+    } else if b >= 97 && b <= 102 {
+        d = b - 87
+    } else if b >= 65 && b <= 70 {
+        d = b - 55
+    }
+    if d >= radix {
+        return -1
+    }
+    d
+}
+
+/// `strtoull(text, &end, 0)` with C's checks (`parse_u64_option`).
+pub fn parse_u64(s: str) -> (bool, wrapping[u64]) {
+    var v = u(0)
+    var bs = List[int]()
+    for b in s.bytes() {
+        (mut bs).push(b as int)
+    }
+    if bs.len == 0 || bs[0] == 45 {
+        return (false, v)
+    }
+    var i = 0
+    if bs[0] == 43 {
+        i = 1
+    }
+    var radix = 10
+    if i + 1 < bs.len && bs[i] == 48 && (bs[i + 1] == 120 || bs[i + 1] == 88) {
+        if i + 2 >= bs.len || digit_of(bs[i + 2], 16) < 0 {
+            return (false, v)
+        }
+        radix = 16
+        i += 2
+    } else if i < bs.len && bs[i] == 48 {
+        radix = 8
+    }
+    if i >= bs.len {
+        return (false, v)
+    }
+    let max: wrapping[u64] = 18446744073709551615
+    while i < bs.len {
+        let d = digit_of(bs[i], radix)
+        if d < 0 {
+            return (false, v)
+        }
+        if v > (max - u(d)) / u(radix) {
+            return (false, v)
+        }
+        v = v * u(radix) + u(d)
+        i += 1
+    }
+    (true, v)
+}
+
+/// The arguments C's harness takes that this driver runs: `--seed=N`,
+/// `--iters=N`. `(ok, seed, iters)`.
+pub fn parse_args(args: List[str]) -> (bool, wrapping[u64], int) {
+    var seed = u(1)
+    var iters = 200000
+    for a in args {
+        if a.starts_with("--seed=") {
+            let (ok, v) = parse_u64(a[7..])
+            if !ok {
+                return (false, seed, iters)
+            }
+            seed = v
+        } else if a.starts_with("--iters=") {
+            let (ok, v) = parse_u64(a[8..])
+            if !ok || v > u(1000000000000) {
+                return (false, seed, iters)
+            }
+            iters = v as int
+        } else {
+            return (false, seed, iters)
+        }
+    }
+    (true, seed, iters)
+}
