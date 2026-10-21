@@ -1,0 +1,260 @@
+//! fuzz-shctx — Sprint 57.23's shell context lexer under arbitrary bytes:
+//! the port of sagitta `tests/fuzz/fuzz_shctx.c` (230 lines) over C's
+//! generator (`tools/fuzzgen`, `fuzzlib.c`'s bit for bit) at 9ace98c2.
+//!
+//! The input is a `:!` body. If it holds the corpus's caret marker `‸`
+//! (the guided corpus `tests/fuzz/corpus/fuzz_shctx/`, verbatim), the
+//! first one is removed and marks the caret; the lexer also runs with the
+//! caret at the end and at a byte-derived position. Asserted, as C
+//! asserts (`check_one`, `check_cwd`): the lexer answers every caret in
+//! the line; `replace.lo <= replace.hi == caret`; `arg_index <= argc` and
+//! the argv/dirv shapes (C's NULL terminators are the lists' lengths);
+//! `depth <= 64`; a known cwd is lexically normal and an unknown one
+//! empty; the fixed environment (HOME, OLDPWD, CDPATH, base
+//! `/fuzz/base`) changes where, never what; every stem quotes in every
+//! state; and the `:!` point parser rebases the body's span onto the
+//! prompt. A trap anywhere is the crash C's harness reports.
+//!
+//!   fuzz-shctx [--iters=N] [--seed=N]
+//!
+//! Defaults are C's (`--iters=200000 --seed=1`); sagitta's `make
+//! fuzz-shctx` runs `SHCTX_FUZZ_ITERS=1000000` (`Makefile:148`). The
+//! report line is C's (`hash=` the witness). The iterations run in
+//! epochs of 4,096 inside a `region`, the editor rebuilt per epoch, so
+//! the driver's memory is flat (G33).
+
+use edit
+use fuzzgen
+use term
+
+const EPOCH: int = 4096
+
+fn caret_marker_at(data: List[byte]) -> int {
+    var i = 0
+    while i + 3 <= data.len {
+        if data[i] as int == 226 && data[i + 1] as int == 128 && data[i + 2] as int == 184 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `cwd_normal` (`fuzz_shctx.c:42-73`).
+fn cwd_normal(cwd: List[byte]) -> bool {
+    if cwd.len == 0 || cwd.len == 1 && cwd[0] as int == 47 {
+        return true
+    }
+    let abs = cwd[0] as int == 47
+    var lead = !abs
+    var p = if abs then 1 else 0
+    loop {
+        var q = p
+        while q < cwd.len && cwd[q] as int != 47 {
+            q += 1
+        }
+        let n = q - p
+        if n == 0 || n == 1 && cwd[p] as int == 46 {
+            return false
+        }
+        if n == 2 && cwd[p] as int == 46 && cwd[p + 1] as int == 46 {
+            if !lead {
+                return false
+            }
+        } else {
+            lead = false
+        }
+        if q >= cwd.len {
+            return true
+        }
+        p = q + 1
+    }
+    true
+}
+
+fn show(b: List[byte]) -> str {
+    str_from_utf8(b) else "<bytes>"
+}
+
+// `check_cwd` (`fuzz_shctx.c:75-99`).
+fn check_cwd(ctx: edit.ShCtx) -> str {
+    if !ctx.cwd_known && ctx.cwd.len != 0 || ctx.cwd_known && !cwd_normal(ctx.cwd) {
+        let k = if ctx.cwd_known then 1 else 0
+        return "cwd `{show(ctx.cwd)}` known={k}"
+    }
+    if ctx.dirv.len != ctx.argc ||
+        ctx.dirv_known.len != ctx.argc ||
+        ctx.argc != 0 && ctx.arg_index < ctx.dirv_known.len && ctx.dirv_known[ctx.arg_index] {
+        return "dirv shape"
+    }
+    var i = 0
+    while i < ctx.argc {
+        if ctx.dirv_known[i] && ctx.dirv[i].len == 0 {
+            return "empty dirv[{i}]"
+        }
+        i += 1
+    }
+    ""
+}
+
+fn fuzz_env() -> edit.ShEnv {
+    var vars = Map[str, str]()
+    vars["HOME"] = "/home/fuzz"
+    vars["OLDPWD"] = "/prev"
+    vars["CDPATH"] = ":/nonexistent-yew-fuzz:rel"
+    edit.shenv_of(term.env_of(vars), "/fuzz/base", true)
+}
+
+// `check_one` (`fuzz_shctx.c:101-152`): "" when it holds.
+fn check_one(line: List[byte], caret: int, env: edit.ShEnv) -> str {
+    let (ok, ctx) = edit.shctx_at(line, caret)
+    if !ok {
+        return "refused caret {caret} of {line.len}"
+    }
+    if ctx.replace_lo > ctx.replace_hi || ctx.replace_hi != caret {
+        return "replace [{ctx.replace_lo},{ctx.replace_hi}) caret {caret}"
+    }
+    if ctx.arg_index > ctx.argc || ctx.argv.len != ctx.argc {
+        return "argv shape argc={ctx.argc} arg_index={ctx.arg_index}"
+    }
+    if ctx.depth > edit.SH_DEPTH_MAX {
+        return "depth {ctx.depth}"
+    }
+    let why = check_cwd(ctx)
+    if why.len != 0 {
+        return why
+    }
+    var none = edit.compspecs_new()
+    let (wok, with) = edit.shctx_at_env(line, caret, mut none, false, env)
+    if !wok {
+        return "refused caret {caret} with an environment"
+    }
+    let why2 = check_cwd(with)
+    if why2.len != 0 {
+        return why2
+    }
+    // The environment changes where, never what.
+    if with.pos != ctx.pos || with.argc != ctx.argc || with.replace_lo != ctx.replace_lo {
+        return "env changed the context"
+    }
+    var q = edit.SH_Q_NONE
+    while q <= edit.SH_Q_DOLLAR {
+        let _ = edit.shq_insert(ctx.stem, 0, q)
+        q += 1
+    }
+    ""
+}
+
+// `check_shctx` (`fuzz_shctx.c:154-218`).
+fn check(mut ed: edit.Ed, data: List[byte], env: edit.ShEnv) -> str {
+    let len = data.len
+    var line = copy data
+    var caret = len
+    let mark = caret_marker_at(data)
+    if mark >= 0 {
+        line = List[byte]()
+        var k = 0
+        while k < len {
+            if k < mark || k >= mark + 3 {
+                (mut line).push(data[k])
+            }
+            k += 1
+        }
+        caret = mark
+    }
+    let n = line.len
+    var why = check_one(line, caret, env)
+    if why.len == 0 {
+        why = check_one(line, n, env)
+    }
+    if why.len == 0 {
+        let at = if n == 0 then 0 else data[0] as int % (n + 1)
+        why = check_one(line, at, env)
+    }
+    if why.len != 0 {
+        return why
+    }
+    // The point parser rebases the body's span onto the prompt.
+    var has_nul = false
+    for x in line {
+        if x as int == 0 {
+            has_nul = true
+            break
+        }
+    }
+    if !has_nul && n < 4096 {
+        var prompt = List[byte]()
+        (mut prompt).push(58 as byte)
+        (mut prompt).push(33 as byte)
+        for x in line {
+            (mut prompt).push(x)
+        }
+        let point = edit.cmd_parse_point(mut ed, prompt, caret + 2) else {
+            return ""
+        }
+        if point.bang_body &&
+            (!point.has_shell || point.token.hi != caret + 2 || point.token.lo < 2) {
+            return "point token [{point.token.lo},{point.token.hi})"
+        }
+    }
+    ""
+}
+
+fn main() -> int {
+    let (ok, seed, iters) = fuzzgen.parse_args(env_args())
+    if !ok {
+        eprint("usage: fuzz-shctx [--seed=N] [--iters=N]")
+        return 2
+    }
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let (cok, corpus) = fuzzgen.corpus_for("fuzz_shctx")
+    if !cok {
+        return 2
+    }
+    let env = fuzz_env()
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > EPOCH then EPOCH else iters - done
+        region epoch {
+            var r = fuzzgen.Run { state: state, hash: hash }
+            var ed = edit.ed_new()
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut r, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut r, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, o) = fuzzgen.mutate(mut r, input, corpus)
+                    input = next
+                    op = o
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut r, input)
+                let why = check(mut ed, input, env)
+                if why.len != 0 {
+                    eprint(
+                        "fuzz_shctx: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                    )
+                    eprint("fuzz_shctx: input={fuzzgen.hex_of(input)}")
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = r.state
+            hash = r.hash
+        }
+        done += n
+    }
+    if failed {
+        return 1
+    }
+    print("fuzz_shctx: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok")
+    0
+}

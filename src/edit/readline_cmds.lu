@@ -1,0 +1,513 @@
+//! edit.readline_cmds — the readline/Emacs editing keys Insert mode and
+//! the `:` prompt bind.
+//!
+//! Ports sagitta `src/edit/readline_cmds.c` (676 lines) and
+//! `readline_cmds.h` at 9ace98c2 (s57.21's insert keys, landed unsprinted
+//! at `d52250b9`, and s57.28's yank stack). They act on whatever window
+//! the dispatcher hands them: the document in I mode, the prompt's
+//! one-line window in E mode. Every one is an AGGREGATE command
+//! (`CMD_MULTI_AGGREGATE`): it plans one span per cursor in ascending
+//! order and replays the plan through `sel_apply_edits`, so the whole
+//! fan-out is one edit, one undo transaction and one yank-stack entry
+//! (`readline_cmds.h:6-36`). Word and grapheme boundaries are the editor's
+//! one definition (`unit_*` over `UNIT_WORD`, `text.grapheme_*`). The
+//! kills push onto `Ed.yank` (readline's kill ring) and `C-y`/`A-y` read
+//! it — never a register (`text.yankstack`). C's span and plan function
+//! pointers (`RlSpanFn`, `RlEditFn`) are a KIND matched in one place
+//! (G19/G20). A no-op answers `CMD_OK`, never an error: an error status
+//! makes `ed_cmd_invoke` abort I mode's open typing transaction
+//! (`readline_cmds.c:37-49`).
+
+use text
+use unicode
+
+// The kill spans (`RlSpanFn`, `readline_cmds.c:19-21`).
+const RL_WORD_PREV: int = 0
+
+const RL_WORD_NEXT: int = 1
+
+const RL_TO_HOME: int = 2
+
+const RL_TO_END: int = 3
+
+const RL_WS_WORD_PREV: int = 4
+
+// The rewrite plans (`RlEditFn`, `readline_cmds.c:395-401`).
+const RL_TRANSPOSE_CHARS: int = 0
+
+const RL_TRANSPOSE_WORDS: int = 1
+
+const RL_UPPER: int = 2
+
+const RL_LOWER: int = 3
+
+const RL_CAP: int = 4
+
+// `rl_context` (`readline_cmds.c:23-35`): (ok, window, buffer).
+fn rl_context(ed: Ed, cx: CmdCtx) -> (bool, int, int) {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len {
+        return (false, 0, 0)
+    }
+    let b = ed.wins[w].buf
+    if b < 0 || b >= ed.bufs.len || !ed.bufs[b].resident || ed.wins[w].cs.curs.len == 0 {
+        return (false, 0, 0)
+    }
+    (true, w, b)
+}
+
+fn rl_unit(ed: Ed, b: int) -> UnitCtx {
+    UnitCtx { has_buf: true, tabwidth: ed.bufs[b].tabwidth, has_lang: false, has_win: true }
+}
+
+// `rl_promote_multi` (`readline_cmds.c:51-66`).
+fn rl_promote_multi(mut ed: Ed, w: int) {
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].ec.has_undo || ed.wins[w].cs.curs.len < 2 || ed.bufs[b].ec.undo.depth == 0 {
+        return
+    }
+    let why = ed.bufs[b].ec.undo.pending_reason
+    if why != text.TXN_TYPE && why != text.TXN_ERASE {
+        return
+    }
+    ed_undo_promote_multi(mut ed, w)
+}
+
+// `rl_cluster_white` (`readline_cmds.c:68-75`) over the whole buffer
+// (`rl_all`, `readline_cmds.c:77-82`).
+fn rl_span_is_white(tb: text.TextBuf, sp: text.Span) -> bool {
+    if sp.lo >= sp.hi {
+        return true
+    }
+    let all = text.span(0, text.textbuf_len(tb))
+    let (ok, cl) = text.text_cluster_next(tb, all, sp.lo as text.ByteOff)
+    ok && unicode.unicode_is_white_space(cl.base_cp)
+}
+
+// `rl_line_content_end` (`readline_cmds.c:89-101`): one grapheme back over
+// the terminator, CRLF included (GB3).
+fn rl_line_content_end(mut tb: text.TextBuf, pos: int) -> int {
+    let line = text.textbuf_line_of(tb, pos as text.ByteOff)
+    let ls = text.textbuf_line_span(tb, line)
+    var end = ls.hi
+    if line as int + 1 < text.textbuf_line_count(tb) {
+        end = text.grapheme_prev_boundary(mut tb, end as text.ByteOff) as int
+    }
+    end
+}
+
+fn rl_is_blank(c: int) -> bool {
+    c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+// The kill span of `kind` for a cursor at `pos` (`rl_span_*`,
+// `readline_cmds.c:199-298`); `ok` false when it has nothing to do.
+fn rl_span_of(mut ed: Ed, w: int, b: int, kind: int, pos: int) -> (bool, text.Span) {
+    let u = rl_unit(ed, b)
+    match kind {
+        0 => {
+            let start = unit_prev(UNIT_WORD, mut ed.bufs[b].ec.tb, u, ed.wins[w], pos, false)
+            (start < pos, text.span(start, pos))
+        },
+        1 => {
+            let end = unit_next(UNIT_WORD, mut ed.bufs[b].ec.tb, u, ed.wins[w], pos, false)
+            (end > pos, text.span(pos, end))
+        },
+        2 => {
+            let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
+            let lo = text.textbuf_line_span(ed.bufs[b].ec.tb, line).lo
+            (lo < pos, text.span(lo, pos))
+        },
+        3 => {
+            let end = rl_line_content_end(mut ed.bufs[b].ec.tb, pos)
+            if pos < end {
+                return (true, text.span(pos, end))
+            }
+            let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
+            let hi = text.textbuf_line_span(ed.bufs[b].ec.tb, line).hi
+            (pos < hi, text.span(pos, hi))
+        },
+        _ => {
+            // bash's unix-word-rubout (`rl_span_ws_word_prev`,
+            // `readline_cmds.c:224-247`): blanks, then to the previous blank.
+            let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
+            let home = text.textbuf_line_span(ed.bufs[b].ec.tb, line).lo
+            var at = pos
+            while at > home && rl_is_blank(text.textbuf_byte_at(ed.bufs[b].ec.tb, at - 1)) {
+                at -= 1
+            }
+            while at > home && !rl_is_blank(text.textbuf_byte_at(ed.bufs[b].ec.tb, at - 1)) {
+                at -= 1
+            }
+            (at < pos, text.span(at, pos))
+        },
+    }
+}
+
+// `rl_plan_kill` (`readline_cmds.c:103-140`): an overlap is MERGED into
+// the previous span.
+fn rl_plan_kill(mut ed: Ed, w: int, b: int, kind: int) -> List[SelEdit] {
+    var edits = List[SelEdit]()
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let pos = ed.wins[w].cs.curs[i].pos
+        let (ok, sp) = rl_span_of(mut ed, w, b, kind, pos)
+        i += 1
+        if !ok || sp.lo >= sp.hi {
+            continue
+        }
+        if edits.len != 0 {
+            let last = edits.len - 1
+            if sp.lo <= edits[last].span.hi {
+                if sp.hi > edits[last].span.hi {
+                    edits[last].span.hi = sp.hi
+                }
+                continue
+            }
+        }
+        let _ = sel_edit_push(mut edits, sp)
+    }
+    edits
+}
+
+// `rl_kill_apply` (`readline_cmds.c:142-182`): one entry for the whole
+// fan-out, `KILL_ALONE` over several cursors.
+fn rl_kill_apply(mut ed: Ed, cx: CmdCtx, w: int, b: int, edits: List[SelEdit], dir_in: int) -> int {
+    if edits.len == 0 {
+        return CMD_OK
+    }
+    var dir = dir_in
+    if ed.wins[w].cs.curs.len > 1 {
+        dir = text.KILL_ALONE
+    }
+    rl_promote_multi(mut ed, w)
+    var killed = List[byte]()
+    for e in edits {
+        let part = sel_copy_span(ed.bufs[b].ec.tb, e.span)
+        for x in part {
+            (mut killed).push(x)
+        }
+    }
+    let (ok, _) = sel_apply_edits(mut ed, cx, edits)
+    if !ok {
+        return CMD_ERR_IO
+    }
+    text.yank_kill(mut ed.yank, killed, dir, ed.invoke_seq, ed.wins[w].id)
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    follow(mut ed, w)
+    CMD_OK
+}
+
+// `rl_kill` (`readline_cmds.c:184-196`).
+fn rl_kill(mut ed: Ed, cx: CmdCtx, kind: int, dir: int) -> int {
+    let (ok, w, b) = rl_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let edits = rl_plan_kill(mut ed, w, b, kind)
+    rl_kill_apply(mut ed, cx, w, b, edits, dir)
+}
+
+/// `ed.edit.kill.word_prev` (`yew_rl_cmd_kill_word_prev`).
+pub fn rl_kill_word_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_kill(mut ed, cx, RL_WORD_PREV, text.KILL_BACKWARD)
+}
+
+/// `ed.edit.kill.word_next` (`yew_rl_cmd_kill_word_next`).
+pub fn rl_kill_word_next(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_kill(mut ed, cx, RL_WORD_NEXT, text.KILL_FORWARD)
+}
+
+/// `ed.edit.kill.to_home` (`yew_rl_cmd_kill_to_home`).
+pub fn rl_kill_to_home(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_kill(mut ed, cx, RL_TO_HOME, text.KILL_BACKWARD)
+}
+
+/// `ed.edit.kill.to_end` (`yew_rl_cmd_kill_to_end`).
+pub fn rl_kill_to_end(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_kill(mut ed, cx, RL_TO_END, text.KILL_FORWARD)
+}
+
+/// `ed.edit.kill.ws_word_prev` (`yew_rl_cmd_kill_ws_word_prev`).
+pub fn rl_kill_ws_word_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_kill(mut ed, cx, RL_WS_WORD_PREV, text.KILL_BACKWARD)
+}
+
+// `rl_yank_put` (`readline_cmds.c:310-358`): `entry` at every caret over
+// the `replace` bytes before it (0 for a yank, the last yank's length for
+// a pop); into the prompt as any paste there is (`cmdline_clean`).
+fn rl_yank_put(mut ed: Ed, cx: CmdCtx, entry: List[byte], replace: int, k: int) -> int {
+    let (ok, w, b) = rl_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    let (clean_ok, put) = cmdline_clean(mut ed, w, entry)
+    if !clean_ok {
+        return CMD_ERR_ARG
+    }
+    var edits = List[SelEdit]()
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let at = ed.wins[w].cs.curs[i].pos
+        if at < replace {
+            return CMD_ERR_STATE
+        }
+        let e = sel_edit_push(mut edits, text.span(at - replace, at))
+        for x in put {
+            (mut edits[e].replacement).push(x)
+        }
+        i += 1
+    }
+    rl_promote_multi(mut ed, w)
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    ed.yank.yank_seq = ed.invoke_seq
+    ed.yank.yank_owner = ed.wins[w].id
+    ed.yank.yank_len = put.len
+    ed.yank.yank_k = k
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.edit.kill.yank` (`yew_rl_cmd_kill_yank`, `readline_cmds.c:360-378`):
+/// the newest entry at every caret; an empty stack is a no-op.
+pub fn rl_kill_yank(mut ed: Ed, cx: CmdCtx) -> int {
+    let entry = text.yank_at(ed.yank, 0) else {
+        return CMD_OK
+    }
+    if entry.len == 0 {
+        return CMD_OK
+    }
+    rl_yank_put(mut ed, cx, entry, 0, 0)
+}
+
+/// `ed.edit.kill.yank_pop` (`yew_rl_cmd_kill_yank_pop`,
+/// `readline_cmds.c:380-402`): straight after a yank in the same window,
+/// the next older entry, wrapping; otherwise it says why it did nothing.
+pub fn rl_kill_yank_pop(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len {
+        return CMD_ERR_STATE
+    }
+    if ed.yank.len == 0 ||
+        ed.yank.yank_owner != ed.wins[w].id ||
+        ed.invoke_seq != ed.yank.yank_seq + 1 {
+        ed_msg(mut ed, MSG_WARN, "A-y follows a yank")
+        return CMD_OK
+    }
+    let k = (ed.yank.yank_k + 1) % ed.yank.len
+    let entry = text.yank_at(ed.yank, k) else {
+        return CMD_OK
+    }
+    rl_yank_put(mut ed, cx, entry, ed.yank.yank_len, k)
+}
+
+// The word at or after `pos`, blanks skipped (`rl_word_forward`,
+// `readline_cmds.c:507-530`).
+fn rl_word_forward(mut ed: Ed, w: int, b: int, pos_in: int) -> (bool, text.Span) {
+    let len = text.textbuf_len(ed.bufs[b].ec.tb)
+    let u = rl_unit(ed, b)
+    if pos_in >= len {
+        return (false, text.span(0, 0))
+    }
+    let sp = unit_span(UNIT_WORD, mut ed.bufs[b].ec.tb, u, pos_in, false)
+    if sp.hi > pos_in && !rl_span_is_white(ed.bufs[b].ec.tb, sp) {
+        return (true, sp)
+    }
+    let pos = unit_next(UNIT_WORD, mut ed.bufs[b].ec.tb, u, ed.wins[w], pos_in, false)
+    if pos >= len {
+        return (false, text.span(0, 0))
+    }
+    let next = unit_span(UNIT_WORD, mut ed.bufs[b].ec.tb, u, pos, false)
+    if rl_span_is_white(ed.bufs[b].ec.tb, next) {
+        return (false, text.span(0, 0))
+    }
+    (true, next)
+}
+
+// The word ending at or before `limit` (`rl_word_backward`,
+// `readline_cmds.c:532-547`).
+fn rl_word_backward(mut ed: Ed, w: int, b: int, limit: int) -> (bool, text.Span) {
+    if limit == 0 {
+        return (false, text.span(0, 0))
+    }
+    let u = rl_unit(ed, b)
+    let at = unit_prev(UNIT_WORD, mut ed.bufs[b].ec.tb, u, ed.wins[w], limit, false)
+    let sp = unit_span(UNIT_WORD, mut ed.bufs[b].ec.tb, u, at, false)
+    if rl_span_is_white(ed.bufs[b].ec.tb, sp) || sp.hi > limit {
+        return (false, text.span(0, 0))
+    }
+    (true, sp)
+}
+
+fn rl_append(mut out: List[byte], tb: text.TextBuf, sp: text.Span) {
+    if sp.hi > sp.lo {
+        text.textbuf_append_range(mut out, tb, sp.lo, sp.hi)
+    }
+}
+
+// `rl_plan_transpose_chars` (`readline_cmds.c:466-495`): the two graphemes
+// around the caret, or the two before it at the line's end; never across
+// the line end.
+fn rl_plan_transpose_chars(mut ed: Ed, b: int, pos: int, mut out: List[byte]) -> (bool, text.Span) {
+    let line = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
+    let lo = text.textbuf_line_span(ed.bufs[b].ec.tb, line).lo
+    let hi = rl_line_content_end(mut ed.bufs[b].ec.tb, pos)
+    if pos <= lo || hi <= lo {
+        return (false, text.span(0, 0))
+    }
+    var left = pos
+    var right = pos
+    if pos >= hi {
+        right = hi
+        left = text.grapheme_prev_boundary(mut ed.bufs[b].ec.tb, right as text.ByteOff) as int
+    } else {
+        right = text.grapheme_next_boundary(ed.bufs[b].ec.tb, pos as text.ByteOff) as int
+        left = pos
+    }
+    let start = text.grapheme_prev_boundary(mut ed.bufs[b].ec.tb, left as text.ByteOff) as int
+    if start >= left {
+        return (false, text.span(0, 0))
+    }
+    rl_append(mut out, ed.bufs[b].ec.tb, text.span(left, right))
+    rl_append(mut out, ed.bufs[b].ec.tb, text.span(start, left))
+    (true, text.span(start, right))
+}
+
+// `rl_plan_transpose_words` (`readline_cmds.c:556-574`).
+fn rl_plan_transpose_words(mut ed: Ed, w: int, b: int, pos: int, mut out: List[byte]) -> (
+    bool,
+    text.Span,
+) {
+    let (ok2, second) = rl_word_forward(mut ed, w, b, pos)
+    if !ok2 {
+        return (false, text.span(0, 0))
+    }
+    let (ok1, first) = rl_word_backward(mut ed, w, b, second.lo)
+    if !ok1 {
+        return (false, text.span(0, 0))
+    }
+    rl_append(mut out, ed.bufs[b].ec.tb, second)
+    rl_append(mut out, ed.bufs[b].ec.tb, text.span(first.hi, second.lo))
+    rl_append(mut out, ed.bufs[b].ec.tb, first)
+    (true, text.span(first.lo, second.hi))
+}
+
+// `rl_plan_case` (`readline_cmds.c:576-643`): from the CARET to the word's
+// end, the blanks before the word copied through so the caret is carried
+// past it.
+fn rl_plan_case(
+    mut ed: Ed,
+    w: int,
+    b: int,
+    pos: int,
+    mut out: List[byte],
+    kind: int,
+    capitalize: bool,
+) -> (bool, text.Span) {
+    let (ok, word) = rl_word_forward(mut ed, w, b, pos)
+    if !ok {
+        return (false, text.span(0, 0))
+    }
+    let sp = text.span(pos, word.hi)
+    if sp.lo >= sp.hi {
+        return (false, text.span(0, 0))
+    }
+    let head = (if word.lo > sp.lo then word.lo else sp.lo) - sp.lo
+    let source = sel_copy_span(ed.bufs[b].ec.tb, sp)
+    var i = 0
+    while i < head {
+        (mut out).push(source[i])
+        i += 1
+    }
+    var at = head
+    var first = true
+    while at < source.len {
+        let (cp, used) = unicode.utf8_decode(source, at, source.len)
+        var use_kind = kind
+        if capitalize {
+            use_kind = if first then unicode.CASE_UPPER else unicode.CASE_LOWER
+        }
+        let _ = unicode.case_map_utf8(cp, use_kind, mut out)
+        at += if used > 0 then used else 1
+        first = false
+    }
+    (true, sp)
+}
+
+fn rl_plan(mut ed: Ed, w: int, b: int, kind: int, pos: int, mut out: List[byte]) -> (
+    bool,
+    text.Span,
+) {
+    match kind {
+        0 => rl_plan_transpose_chars(mut ed, b, pos, mut out),
+        1 => rl_plan_transpose_words(mut ed, w, b, pos, mut out),
+        2 => rl_plan_case(mut ed, w, b, pos, mut out, unicode.CASE_UPPER, false),
+        3 => rl_plan_case(mut ed, w, b, pos, mut out, unicode.CASE_LOWER, false),
+        _ => rl_plan_case(mut ed, w, b, pos, mut out, unicode.CASE_LOWER, true),
+    }
+}
+
+// `rl_rewrite` (`readline_cmds.c:403-455`): an overlap is DROPPED — the
+// cursor that reached it first wins.
+fn rl_rewrite(mut ed: Ed, cx: CmdCtx, kind: int) -> int {
+    let (ok, w, b) = rl_context(ed, cx)
+    if !ok {
+        return CMD_ERR_STATE
+    }
+    var edits = List[SelEdit]()
+    var i = 0
+    while i < ed.wins[w].cs.curs.len {
+        let pos = ed.wins[w].cs.curs[i].pos
+        var out = List[byte]()
+        let (planned, sp) = rl_plan(mut ed, w, b, kind, pos, mut out)
+        i += 1
+        if !planned {
+            continue
+        }
+        if edits.len != 0 && sp.lo < edits[edits.len - 1].span.hi {
+            continue
+        }
+        let e = sel_edit_push(mut edits, sp)
+        edits[e].replacement = out
+    }
+    if edits.len == 0 {
+        return CMD_OK
+    }
+    rl_promote_multi(mut ed, w)
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if !applied {
+        return CMD_ERR_IO
+    }
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    follow(mut ed, w)
+    CMD_OK
+}
+
+/// `ed.edit.transpose.chars` (`yew_rl_cmd_transpose_chars`).
+pub fn rl_transpose_chars(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_rewrite(mut ed, cx, RL_TRANSPOSE_CHARS)
+}
+
+/// `ed.edit.transpose.words` (`yew_rl_cmd_transpose_words`).
+pub fn rl_transpose_words(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_rewrite(mut ed, cx, RL_TRANSPOSE_WORDS)
+}
+
+/// `ed.edit.case.upper_word` (`yew_rl_cmd_case_upper_word`).
+pub fn rl_case_upper_word(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_rewrite(mut ed, cx, RL_UPPER)
+}
+
+/// `ed.edit.case.lower_word` (`yew_rl_cmd_case_lower_word`).
+pub fn rl_case_lower_word(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_rewrite(mut ed, cx, RL_LOWER)
+}
+
+/// `ed.edit.case.cap_word` (`yew_rl_cmd_case_cap_word`).
+pub fn rl_case_cap_word(mut ed: Ed, cx: CmdCtx) -> int {
+    rl_rewrite(mut ed, cx, RL_CAP)
+}

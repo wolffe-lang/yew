@@ -1,0 +1,975 @@
+//! edit.cmdline_comp — the prompt's completion: the live table, Tab, the
+//! menu's commands, the ghost, the parser's hint, the click.
+//!
+//! Ports the completion half of sagitta `src/ui/cmdline.c` at 9ace98c2 —
+//! `menu_discard` (`cmdline.c:174-189`), the hint (`hint_arg_name`,
+//! `hint_session_dir`, `cmdline_set_hint`, `cmdline.c:712-857`), the live
+//! refilter (`cmdline_refilter_as`, `cmdline.c:871-952`), the arrival of a
+//! generator's answer (`yew_cmdline_compgen_arrived`, `cmdline.c:965-990`),
+//! Tab (`complete`, `insert_completion`, `completion_cycle`,
+//! `menu_preview`, `cmdline.c:1731-1982`), the menu's commands and the
+//! arrows' one rule (`menu_page`, `table_row`, `typed_text`,
+//! `table_top_to_history`, `yew_cmdline_cmd_up/down`, `menu_accept`,
+//! `menu_click`, `menu_scroll`, `menu_dismiss`, `cmdline.c:1984-2270`),
+//! the ghost (`token_ghost`, `history_ghost`, `cmdline_ghost_of`,
+//! `ghost_word_len`, `ghost_take`, `cmdline.c:2298-2627`) and Enter's
+//! fuzzy fallback (`cmdline_fuzzy_line`, `cmdline.c:3322-3399`) — over the
+//! comp fork's engine (`edit.cmdcomp`) and widget (`edit.menu`). C keeps
+//! the candidate strings in an arena that dies with the menu; the port's
+//! rows are values in `Menu.items`.
+
+use text
+use ws
+
+// The inline menu's geometry (`MenuSpec spec = {NULL, 5U, true, true,
+// 31U}`, `cmdline.c:510-514`).
+fn cl_menu_spec() -> MenuSpec {
+    MenuSpec { title: "", max_rows: 5, ghost: true, wrap: true, detail_col: 31 }
+}
+
+fn cl_menu_open(mut ed: Ed) {
+    ed.cmdline.menu = menu_new(cl_menu_spec())
+    ed.cmdline.filter = compfilter_new()
+    ed.cmdline.click_row = -1
+}
+
+// `menu_discard` (`cmdline.c:174-189`): the menu, the cached set and the
+// directory listing go; the stem with them.
+fn cl_menu_discard(mut ed: Ed) {
+    let was_open = ed.cmdline.menu.items.len != 0 || ed.cmdline.menu.sel >= 0
+    menu_dismiss(mut ed.cmdline.menu)
+    comp_filter_invalidate(mut ed.cmdline.filter)
+    comp_listing_invalidate(mut ed)
+    ed.cmdline.has_menu_stem = false
+    ed.cmdline.menu_stem = List[byte]()
+    ed.cmdline.menu_original = text.span(0, 0)
+    ed.cmdline.comp_total = 0
+    ed.cmdline.comp_asked = false
+    if was_open {
+        ed.full_damage = true
+    }
+}
+
+fn cl_menu_dismiss(mut ed: Ed) {
+    menu_dismiss(mut ed.cmdline.menu)
+}
+
+fn cl_menu_blur(mut ed: Ed) {
+    menu_blur(mut ed.cmdline.menu)
+}
+
+// §6's Enter rule: a row the user CHOSE.
+fn cl_menu_chosen(ed: Ed) -> bool {
+    ed.cmdline.menu.explicit_sel && ed.cmdline.menu.sel >= 0
+}
+
+// Enter on a chosen row inserts it and does not run (`cmdline.c:3443-
+// 3452`).
+fn cl_menu_take_chosen(mut ed: Ed) -> int {
+    let sel = menu_selected(ed.cmdline.menu)
+    if sel >= 0 {
+        let item = copy ed.cmdline.menu.items[sel]
+        let replace = copy ed.cmdline.menu.replace
+        if !insert_completion(mut ed, replace, item, true) {
+            return CMD_ERR_IO
+        }
+    }
+    cl_menu_discard(mut ed)
+    CMD_OK
+}
+
+// Esc dismisses a menu the user opened or entered (`cmdline.c:3568-3596`).
+fn cl_menu_owned(ed: Ed) -> bool {
+    ed.cmdline.menu.items.len != 0 && (ed.cmdline.menu.explicit_sel || ed.cmdline.has_menu_stem)
+}
+
+fn cl_menu_cancel(mut ed: Ed) -> int {
+    let has_stem = ed.cmdline.has_menu_stem
+    let stem = copy ed.cmdline.menu_stem
+    let replace = copy ed.cmdline.menu.replace
+    cl_menu_discard(mut ed)
+    if has_stem {
+        return if replace_span(mut ed, replace, stem, true) then CMD_OK else CMD_ERR_IO
+    }
+    CMD_OK
+}
+
+fn cl_menu_open_rows(ed: Ed) -> bool {
+    ed.cmdline.menu.items.len != 0
+}
+
+// `draw_menu` (`cmdline.c:3618-3627`): every row above the prompt is the
+// menu's; the widget bottom-aligns itself and registers its rows.
+fn cl_draw_menu(mut ed: Ed, footer: int, style: UiStyle) {
+    if footer == 0 {
+        return
+    }
+    let area = rect(0, 0, ed.grid.cols, footer)
+    menu_draw(mut ed.grid, mut ed.regions, mut ed.cmdline.menu, area, style)
+}
+
+// What the prompt's close tells the completion caches (`cmdline.c:620-
+// 630`): the generator answers and the user specs live one prompt.
+fn cl_prompt_closed(mut ed: Ed) {
+    compgen_cache_clear(mut ed.gen)
+    compspec_prompt_closed(mut ed.specs)
+}
+
+// ---- the hint (s18.5 §9) ----------------------------------------------
+
+// `hint_arg_name` (`cmdline.c:723-765`): the argument being asked for.
+fn hint_arg_name(argspec: str, token_index: int) -> (str, bool) {
+    var len = argspec.len
+    var repeats = false
+    if len != 0 && argspec.ends_with("*") {
+        repeats = true
+        len -= 1
+    }
+    if len == 0 {
+        return ("", repeats)
+    }
+    var at = if token_index == 0 then 0 else token_index - 1
+    if at >= len {
+        if !repeats {
+            return ("", repeats)
+        }
+        at = len - 1
+    }
+    let code = argspec.bytes()[at] as int
+    let name = match code {
+        102 => "<file>",
+        98 => "<buffer>",
+        111 => "<option>",
+        118 => "<value>",
+        112 => "<plugin>",
+        115 => "<text>",
+        _ => "",
+    }
+    (name, repeats)
+}
+
+// `hint_session_dir` (`cmdline.c:774-808`): a shell command starts where
+// the shell session is; the session is R-yw04-1's (it STOPs until
+// `os_signal_wait_fds` is pinned), so it is always at the workspace root
+// and there is no `in DIR/` note to add.
+fn hint_session_dir(ed: Ed, name: str, hint: str) -> str {
+    let _ = ed.cmdline.active
+    let _ = name.len
+    hint
+}
+
+// `cmdline_set_hint` (`cmdline.c:810-857`).
+fn cl_set_hint(mut ed: Ed, point: CmdParsePoint) {
+    ed.cmdline.hint = ""
+    if !point.command_known {
+        if point.bang_body {
+            ed.cmdline.hint = hint_session_dir(ed, "ed.shell.run", "")
+        }
+        return
+    }
+    let id = point.command
+    if !cmd_active(ed.reg, id) {
+        return
+    }
+    let name = ed.reg.entries[id - 1].name
+    let shown = if name.starts_with("ed.") then name[3..] else name
+    let stem = str_from_utf8(point.stem) else ""
+    var hint = ""
+    if stem.len != 0 && stem != shown && point.token_index == 0 {
+        hint = "{stem} \u{2192} {shown}"
+    } else {
+        hint = shown
+    }
+    let (arg, repeats) = hint_arg_name(ed.reg.entries[id - 1].argspec, point.token_index)
+    if arg.len != 0 {
+        hint = "{hint} \u{b7} {arg}{if repeats then "\u{2026}" else ""}"
+    }
+    hint = hint_session_dir(ed, name, hint)
+    if point.range.given {
+        if point.range.kind == RANGE_BUFFER {
+            hint = "{hint} \u{b7} whole buffer"
+        } else if point.range.kind == RANGE_SELECTION {
+            hint = "{hint} \u{b7} selection"
+        } else {
+            let lines = point.range.hi - point.range.lo + 1
+            hint = "{hint} \u{b7} {lines} line{if lines == 1 then "" else "s"}"
+        }
+    }
+    ed.cmdline.hint = clip_bytes(hint, 159)
+}
+
+// ---- the live table (s18.5 §6) ----------------------------------------
+
+// The shell context at the caret completes nothing (§3 row 1): a comment,
+// a heredoc delimiter, arithmetic, a case body. The lexer is
+// deterministic, so re-lexing the body is the point parser's answer.
+fn cl_point_shell_none(ed: Ed, point: CmdParsePoint, line: List[byte], cursor: int) -> bool {
+    let _ = ed.cmdline.active
+    if !point.bang_body || point.body > line.len || cursor < point.body {
+        return false
+    }
+    let (ok, ctx) = shctx_at(line[point.body..line.len], cursor - point.body)
+    ok && ctx.pos == SH_POS_NONE
+}
+
+// `yew_comp_query_at` over a point (`cmdcomp.c:3760-3791`).
+fn cl_query_at(ed: Ed, point: CmdParsePoint, line: List[byte], cursor: int) -> (bool, CompQuery) {
+    comp_query_point(
+        ed,
+        point.bang_body,
+        point.token_index,
+        point.command_known,
+        point.command,
+        point.stem,
+        point.token.lo,
+        point.token.hi,
+        cl_point_shell_none(ed, point, line, cursor),
+        line,
+        cursor,
+    )
+}
+
+// `menu_where` (`cmdline.c:861-866`): the filter's `in DIR/` note.
+fn cl_menu_where(mut ed: Ed) {
+    ed.cmdline.menu.where = clip_bytes(ed.cmdline.filter.where, COMP_WHERE_MAX - 1)
+}
+
+// `yew_comp_filter_run` over the prompt's own cached set: the filter is
+// swapped out of the `Ed` for the call (the engine also takes the `Ed`)
+// and back, every path restoring it (yw03's seam idiom).
+fn cl_filter_run(mut ed: Ed, q: CompQuery, budget_us: int, mut out: List[CompItem]) -> int {
+    var f = compfilter_new()
+    let held = ed.cmdline.filter
+    ed.cmdline.filter = f
+    f = held
+    let total = comp_filter_run(mut ed, mut f, q, budget_us, mut out)
+    ed.cmdline.filter = f
+    total
+}
+
+fn cl_refilter(mut ed: Ed) {
+    cl_refilter_as(mut ed, false)
+}
+
+// The notices a shell query may raise (`yew_compspec_notice ||
+// yew_comphelp_notice`, `cmdline.c:953`, `1852`): a broken spec, then a
+// help cache that could not be written.
+fn cl_shell_notices(mut ed: Ed) -> bool {
+    compspec_notice(mut ed) || comphelp_notice(mut ed)
+}
+
+// `cmdline_refilter_as` (`cmdline.c:877-952`): ONE tolerant parse a
+// keystroke, read by the hint and the filter; a live filter that finds
+// nothing says nothing.
+fn cl_refilter_as(mut ed: Ed, asked: bool) {
+    if !ed.cmdline.active {
+        return
+    }
+    if ed.cmdline.hsearch {
+        hsearch_refilter(mut ed)
+        return
+    }
+    if ed.cmdline.kind != PROMPT_CMD {
+        menu_dismiss(mut ed.cmdline.menu)
+        ed.cmdline.hint = ""
+        return
+    }
+    let line = cmdline_text(ed)
+    let caret = cmdline_caret(ed)
+    let point = cmd_parse_point(mut ed, line, caret) else {
+        menu_dismiss(mut ed.cmdline.menu)
+        ed.cmdline.hint = ""
+        ed.full_damage = true
+        return
+    }
+    cl_set_hint(mut ed, point)
+    if walk_showing(ed) {
+        cl_menu_discard(mut ed)
+        ed.full_damage = true
+        return
+    }
+    let (ok, q) = cl_query_at(ed, point, line, caret)
+    if !ok || !asked && q.replace.hi <= q.replace.lo {
+        menu_dismiss(mut ed.cmdline.menu)
+        ed.full_damage = true
+        return
+    }
+    var items = List[CompItem]()
+    ed.cmdline.comp_total = cl_filter_run(mut ed, q, CMDLINE_LIVE_BUDGET_US, mut items)
+    if q.kind == COMP_SHELL && cl_shell_notices(mut ed) {
+        ed.footer_dirty = true
+    }
+    if items.len == 0 {
+        menu_dismiss(mut ed.cmdline.menu)
+    } else {
+        ed.cmdline.menu.items = items
+        menu_reset(mut ed.cmdline.menu, ed.cmdline.comp_total, q.replace)
+        ed.cmdline.menu.pending = ed.cmdline.filter.gen_pending
+        cl_menu_where(mut ed)
+    }
+    ed.full_damage = true
+}
+
+/// `yew_cmdline_compgen_arrived` (`cmdline.c:965-990`): a generator
+/// answered; an open `:` menu that asked for exactly `key` re-ranks — and
+/// the arrival NEVER edits the line.
+pub fn cmdline_compgen_arrived(mut ed: Ed, key: str) {
+    if !ed.cmdline.active || ed.cmdline.kind != PROMPT_CMD || ed.cmdline.hsearch {
+        return
+    }
+    if !ed.cmdline.filter.has_gen_key || ed.cmdline.filter.gen_key != key {
+        return
+    }
+    comp_filter_invalidate(mut ed.cmdline.filter)
+    let asked = ed.cmdline.comp_asked || ed.cmdline.menu.items.len != 0
+    cl_refilter_as(mut ed, asked)
+    ed.cmdline.comp_asked = false
+    ed.footer_dirty = true
+}
+
+// ---- Tab (s18 §4, s18.5 §6) -------------------------------------------
+
+// `insert_completion` (`cmdline.c:1731-1761`): a COMMITTED shell word
+// closes what it opened (its suffix) and gets its space; a directory
+// gets neither.
+fn insert_completion(mut ed: Ed, replace: text.Span, item: CompItem, trailing_space: bool) -> bool {
+    var bytes = List[byte]()
+    sanitize_bytes(item.text, mut bytes)
+    if trailing_space && !item.is_dir {
+        sanitize_bytes(item.suffix, mut bytes)
+        (mut bytes).push(32 as byte)
+    }
+    let ok = replace_span(mut ed, replace, bytes, true)
+    if ok {
+        ed.cmdline.menu.replace = text.span(replace.lo, replace.lo + bytes.len)
+    }
+    ok
+}
+
+fn cl_insert_selected(mut ed: Ed, trailing_space: bool) -> int {
+    let sel = menu_selected(ed.cmdline.menu)
+    if sel < 0 {
+        return CMD_OK
+    }
+    let item = copy ed.cmdline.menu.items[sel]
+    let replace = copy ed.cmdline.menu.replace
+    if insert_completion(mut ed, replace, item, trailing_space) then CMD_OK else CMD_ERR_IO
+}
+
+// `completion_cycle` (`cmdline.c:1763-1780`).
+fn completion_cycle(mut ed: Ed, previous: bool) -> int {
+    if !menu_move(mut ed.cmdline.menu, if previous then -1 else 1, false) {
+        return CMD_OK
+    }
+    let _ = menu_focus(mut ed.cmdline.menu)
+    let status = cl_insert_selected(mut ed, false)
+    if status == CMD_OK {
+        ed.full_damage = true
+    }
+    status
+}
+
+// `menu_preview` (`cmdline.c:1782-1820`): a LOOK, the line untouched.
+fn menu_preview(mut ed: Ed, previous: bool) -> int {
+    if ed.cmdline.hsearch {
+        return hsearch_move(mut ed, if previous then -1 else 1)
+    }
+    if ed.cmdline.menu.items.len == 0 {
+        return CMD_OK
+    }
+    if !menu_focused(ed.cmdline.menu) {
+        if !menu_focus(mut ed.cmdline.menu) {
+            return CMD_OK
+        }
+    } else if previous && ed.cmdline.menu.sel == 0 {
+        menu_unselect(mut ed.cmdline.menu)
+    } else {
+        let _ = menu_move(mut ed.cmdline.menu, if previous then -1 else 1, false)
+    }
+    ed.full_damage = true
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+// `complete` (`cmdline.c:1822-1982`).
+fn complete(mut ed: Ed, previous: bool) -> int {
+    cl_walk_end(mut ed)
+    if ed.cmdline.hsearch {
+        hsearch_end(mut ed)
+    }
+    if ed.cmdline.menu.explicit_sel {
+        return completion_cycle(mut ed, previous)
+    }
+    let line = cmdline_text(ed)
+    let caret = cmdline_caret(ed)
+    let point = cmd_parse_point(mut ed, line, caret) else {
+        return insert_sanitized(mut ed, bytes_of("\t"))
+    }
+    let (qok, q) = cl_query_at(ed, point, line, caret)
+    if !qok {
+        return insert_sanitized(mut ed, bytes_of("\t"))
+    }
+    var items = List[CompItem]()
+    ed.cmdline.comp_total = cl_filter_run(mut ed, q, 0, mut items)
+    if q.kind == COMP_SHELL && cl_shell_notices(mut ed) {
+        ed.footer_dirty = true
+    }
+    if items.len == 0 && ed.cmdline.filter.gen_pending {
+        ed.cmdline.comp_asked = true
+        return CMD_OK
+    }
+    if items.len == 0 {
+        if q.kind == COMP_SHELL && ed.cmdline.filter.where.len != 0 {
+            ed_msg(mut ed, MSG_INFO, "no completions ({ed.cmdline.filter.where})")
+        } else {
+            ed_msg(mut ed, MSG_INFO, "no completions")
+        }
+        ed.full_damage = true
+        ed.footer_dirty = true
+        return CMD_OK
+    }
+    let stem_bytes = line[q.replace.lo..q.replace.hi]
+    if ed.cmdline.filter.gen_pending {
+        ed.cmdline.menu_stem = stem_bytes
+        ed.cmdline.has_menu_stem = true
+        ed.cmdline.menu_original = copy q.replace
+        ed.cmdline.menu.items = items
+        menu_reset(mut ed.cmdline.menu, ed.cmdline.comp_total, q.replace)
+        ed.cmdline.menu.pending = true
+        cl_menu_where(mut ed)
+        ed.cmdline.comp_asked = true
+        ed.full_damage = true
+        ed.footer_dirty = true
+        return CMD_OK
+    }
+    if comp_sole(items, COMP_KIND_N) >= 0 {
+        let item = copy items[0]
+        if !insert_completion(mut ed, q.replace, item, true) {
+            return CMD_ERR_IO
+        }
+        cl_refilter(mut ed)
+        return CMD_OK
+    }
+    ed.cmdline.menu_stem = stem_bytes
+    ed.cmdline.has_menu_stem = true
+    ed.cmdline.menu_original = copy q.replace
+    ed.cmdline.menu.items = items
+    menu_reset(mut ed.cmdline.menu, ed.cmdline.comp_total, q.replace)
+    ed.cmdline.menu.pending = ed.cmdline.filter.gen_pending
+    cl_menu_where(mut ed)
+    var tiered = List[CompItem]()
+    for it in ed.cmdline.menu.items {
+        if it.score >= ws.FZ_BASENAME_TIER {
+            (mut tiered).push(copy it)
+        }
+    }
+    let lcp = comp_lcp(tiered)
+    var stem_len = q.stem.len
+    if q.kind == COMP_SHELL {
+        stem_len = q.replace.hi - q.replace.lo
+    }
+    if lcp.len > stem_len {
+        if !replace_span(mut ed, q.replace, lcp, true) {
+            cl_menu_discard(mut ed)
+            return CMD_ERR_IO
+        }
+        ed.cmdline.menu.replace = text.span(q.replace.lo, q.replace.lo + lcp.len)
+    } else {
+        let _ = menu_move(mut ed.cmdline.menu, if previous then -1 else 1, false)
+        let _ = menu_focus(mut ed.cmdline.menu)
+        if cl_insert_selected(mut ed, false) != CMD_OK {
+            return CMD_ERR_IO
+        }
+    }
+    ed.full_damage = true
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+/// `ed.cmdline.complete_next` (`yew_cmdline_cmd_complete_next`).
+pub fn cmdline_complete_next_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    complete(mut ed, false)
+}
+
+/// `ed.cmdline.complete_prev` (`yew_cmdline_cmd_complete_prev`).
+pub fn cmdline_complete_prev_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    complete(mut ed, true)
+}
+
+// ---- the menu's commands (s18.5 §10, s57.17, s57.30 §1) ---------------
+
+// `menu_page` (`cmdline.c:1990-2008`).
+fn menu_page(mut ed: Ed, previous: bool) -> int {
+    if ed.cmdline.hsearch {
+        return hsearch_page(mut ed, previous)
+    }
+    if !menu_move(mut ed.cmdline.menu, if previous then -1 else 1, true) {
+        return CMD_OK
+    }
+    let _ = menu_focus(mut ed.cmdline.menu)
+    let status = cl_insert_selected(mut ed, false)
+    if status == CMD_OK {
+        ed.full_damage = true
+    }
+    status
+}
+
+/// `ed.cmdline.menu.next` (`yew_cmdline_cmd_menu_next`).
+pub fn cmdline_menu_next_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    menu_preview(mut ed, false)
+}
+
+/// `ed.cmdline.menu.prev` (`yew_cmdline_cmd_menu_prev`).
+pub fn cmdline_menu_prev_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    menu_preview(mut ed, true)
+}
+
+// `table_row` (`cmdline.c:2054-2066`).
+fn table_row(mut ed: Ed, delta: int) -> int {
+    if !menu_move(mut ed.cmdline.menu, delta, false) {
+        return CMD_OK
+    }
+    let status = cl_insert_selected(mut ed, false)
+    if status != CMD_OK {
+        return status
+    }
+    ed.full_damage = true
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+// `typed_text` (`cmdline.c:2074-2093`): the line with the table's span
+// put back to its stem — what the user TYPED.
+fn typed_text(ed: Ed) -> List[byte] {
+    let line = cmdline_text(ed)
+    let r = ed.cmdline.menu.replace
+    if !ed.cmdline.has_menu_stem || r.lo > r.hi || r.hi > line.len {
+        return line
+    }
+    var out = line[0..r.lo]
+    for b in ed.cmdline.menu_stem {
+        (mut out).push(b)
+    }
+    var i = r.hi
+    while i < line.len {
+        (mut out).push(line[i])
+        i += 1
+    }
+    out
+}
+
+// `table_top_to_history` (`cmdline.c:2095-2111`).
+fn table_top_to_history(mut ed: Ed) -> int {
+    let typed = typed_text(ed)
+    cl_menu_discard(mut ed)
+    if !replace_all(mut ed, typed, true) {
+        return CMD_ERR_IO
+    }
+    walk_begin(mut ed, typed)
+    let status = history_move(mut ed, true)
+    if status == CMD_OK && !walk_showing(ed) {
+        cl_refilter(mut ed)
+    }
+    status
+}
+
+/// `ed.cmdline.up` (`yew_cmdline_cmd_up`, `cmdline.c:2113-2127`): history
+/// unless the user ENTERED the table; its top row leaves it for history.
+pub fn cmdline_up_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if ed.cmdline.hsearch {
+        return hsearch_move(mut ed, -1)
+    }
+    if !menu_focused(ed.cmdline.menu) {
+        return history_move(mut ed, true)
+    }
+    if ed.cmdline.menu.sel > 0 {
+        return table_row(mut ed, -1)
+    }
+    table_top_to_history(mut ed)
+}
+
+/// `ed.cmdline.down` (`yew_cmdline_cmd_down`, `cmdline.c:2129-2146`): off
+/// the true last row it leaves the table, the candidate kept.
+pub fn cmdline_down_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if ed.cmdline.hsearch {
+        return hsearch_move(mut ed, 1)
+    }
+    if !menu_focused(ed.cmdline.menu) {
+        return history_move(mut ed, false)
+    }
+    if ed.cmdline.menu.sel + 1 < ed.cmdline.menu.items.len {
+        return table_row(mut ed, 1)
+    }
+    menu_blur(mut ed.cmdline.menu)
+    ed.full_damage = true
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+/// `ed.cmdline.menu.page_next` (`yew_cmdline_cmd_menu_page_next`).
+pub fn cmdline_menu_page_next_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    menu_page(mut ed, false)
+}
+
+/// `ed.cmdline.menu.page_prev` (`yew_cmdline_cmd_menu_page_prev`).
+pub fn cmdline_menu_page_prev_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    menu_page(mut ed, true)
+}
+
+/// `ed.cmdline.menu.accept` (`yew_cmdline_cmd_menu_accept`,
+/// `cmdline.c:2162-2182`): how a click and Fletch commit a row.
+pub fn cmdline_menu_accept_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if ed.cmdline.hsearch {
+        return cl_hsearch_accept(mut ed)
+    }
+    let sel = menu_selected(ed.cmdline.menu)
+    if sel < 0 {
+        return CMD_OK
+    }
+    if cl_insert_selected(mut ed, true) != CMD_OK {
+        return CMD_ERR_IO
+    }
+    cl_menu_discard(mut ed)
+    cl_refilter(mut ed)
+    CMD_OK
+}
+
+/// `yew_cmdline_menu_click` (`cmdline.c:2196-2233`): the first click on a
+/// row SELECTS it (shown in the line, as Tab does), a second click on the
+/// same row ACCEPTS — state, never a timer.
+pub fn cmdline_menu_click(mut ed: Ed, row: int) -> bool {
+    if !ed.cmdline.active {
+        return false
+    }
+    if !menu_select(mut ed.cmdline.menu, row) {
+        return false
+    }
+    if ed.cmdline.click_row == row {
+        ed.cmdline.click_row = -1
+        var cx = cmdctx_new(cmdline_target(ed), SRC_MOUSE)
+        cx.count = 1
+        let _ = cmdline_menu_accept_cmd(mut ed, cx)
+        ed.full_damage = true
+        return true
+    }
+    ed.cmdline.click_row = row
+    if ed.cmdline.hsearch {
+        ed.full_damage = true
+        return true
+    }
+    let _ = cl_insert_selected(mut ed, false)
+    ed.full_damage = true
+    true
+}
+
+/// `yew_cmdline_menu_scroll` (`cmdline.c:2235-2245`): the wheel moves the
+/// list, never the selection.
+pub fn cmdline_menu_scroll(mut ed: Ed, delta: int) -> bool {
+    if !ed.cmdline.active || ed.footer_rect.h == 0 {
+        return false
+    }
+    if !menu_scroll(mut ed.cmdline.menu, delta, ed.footer_rect.y) {
+        return false
+    }
+    ed.full_damage = true
+    true
+}
+
+/// `ed.cmdline.menu.dismiss` (`yew_cmdline_cmd_menu_dismiss`,
+/// `cmdline.c:2247-2259`).
+pub fn cmdline_menu_dismiss_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if ed.cmdline.hsearch {
+        ed.cmdline.hsearch = false
+        ed.cmdline.hsearch_line = List[byte]()
+        ed.cmdline.hint = ""
+    }
+    cl_menu_discard(mut ed)
+    CMD_OK
+}
+
+// ---- the ghost (s18.5 §7, s57.26 §3, s57.28 §3) -----------------------
+
+// The ghost's providers (`GhostKind`, `cmdline.c:2417-2421`).
+const GHOST_NONE: int = 0
+
+const GHOST_TOKEN: int = 1
+
+const GHOST_HISTORY: int = 2
+
+// `token_ghost` (`cmdline.c:2298-2335`): the rest of the chosen (or top)
+// row after what was typed — a PREFIX match only, the caret at the end.
+fn token_ghost(ed: Ed) -> List[byte] {
+    if ed.cmdline.menu.items.len == 0 {
+        return List[byte]()
+    }
+    let len = cmdline_len(ed)
+    let r = copy ed.cmdline.menu.replace
+    if cmdline_caret(ed) != len || r.hi != len {
+        return List[byte]()
+    }
+    var sel = menu_selected(ed.cmdline.menu)
+    if sel < 0 {
+        sel = 0
+    }
+    let line = cmdline_text(ed)
+    let tlen = ed.cmdline.menu.items[sel].text.len
+    let stem_len = r.hi - r.lo
+    if stem_len == 0 || stem_len >= tlen || stem_len > 256 {
+        return List[byte]()
+    }
+    var i = 0
+    while i < stem_len {
+        if line[r.lo + i] != ed.cmdline.menu.items[sel].text[i] {
+            return List[byte]()
+        }
+        i += 1
+    }
+    ed.cmdline.menu.items[sel].text[stem_len..tlen]
+}
+
+// `history_ghost` (`cmdline.c:2389-2415`): the newest snapshot entry
+// beginning with the bang body supplies its remainder.
+fn history_ghost(mut ed: Ed) -> List[byte] {
+    if ed.cmdline.kind != PROMPT_CMD {
+        return List[byte]()
+    }
+    let len = cmdline_len(ed)
+    if len == 0 || cmdline_caret(ed) != len {
+        return List[byte]()
+    }
+    let line = cmdline_text(ed)
+    let body = cmd_bang_body(ed, line) else {
+        return List[byte]()
+    }
+    if body >= len {
+        return List[byte]()
+    }
+    suggest_ensure(mut ed)
+    let (at, i) = hist_suggest_match(ed.cmdline.suggest, line, body, len - body) else {
+        return List[byte]()
+    }
+    hist_suggest_rest(ed.cmdline.suggest, i, at)
+}
+
+// `cmdline_ghost_of` (`cmdline.c:2423-2441`): an EXPLICIT selection is
+// the menu's row; otherwise the history ghost when there is one, else the
+// top row's rest.
+fn ghost_of(mut ed: Ed) -> (List[byte], int) {
+    if walk_showing(ed) || ed.cmdline.hsearch {
+        return (List[byte](), GHOST_NONE)
+    }
+    if menu_selected(ed.cmdline.menu) < 0 {
+        let h = history_ghost(mut ed)
+        if h.len != 0 {
+            return (h, GHOST_HISTORY)
+        }
+    }
+    let t = token_ghost(ed)
+    let n = t.len
+    (t, if n != 0 then GHOST_TOKEN else GHOST_NONE)
+}
+
+/// The ghost the prompt draws after the caret, dim (`yew_cmdline_ghost`,
+/// `cmdline.c:2443-2455`): what `<right>` would accept — never part of the
+/// prompt's text.
+pub fn cmdline_ghost(mut ed: Ed) -> List[byte] {
+    if !ed.cmdline.active {
+        return List[byte]()
+    }
+    let (g, _) = ghost_of(mut ed)
+    g
+}
+
+// `ghost_word_len` (`cmdline.c:2464-2501`): any leading blanks, the next
+// word, and the run of UNQUOTED blanks after it; quoting read from the
+// typed line onwards.
+fn ghost_word_len(typed: List[byte], t0: int, ghost: List[byte]) -> int {
+    var q = 0
+    var i = t0
+    while i < typed.len {
+        let c = typed[i] as int
+        if q != 39 && c == 92 && i + 1 < typed.len {
+            i += 1
+        } else if q == 0 && (c == 39 || c == 34) {
+            q = c
+        } else if q != 0 && c == q {
+            q = 0
+        }
+        i += 1
+    }
+    var word = false
+    i = 0
+    while i < ghost.len {
+        let c = ghost[i] as int
+        if q == 0 && is_blank(c) {
+            if word {
+                break
+            }
+            i += 1
+            continue
+        }
+        word = true
+        if q != 39 && c == 92 && i + 1 < ghost.len {
+            i += 1
+        } else if q == 0 && (c == 39 || c == 34) {
+            q = c
+        } else if q != 0 && c == q {
+            q = 0
+        }
+        i += 1
+    }
+    while i < ghost.len && is_blank(ghost[i] as int) {
+        i += 1
+    }
+    i
+}
+
+// `ghost_motion` (`cmdline.c:2503-2513`).
+fn ghost_motion(mut ed: Ed, source: int, command: str) -> int {
+    var cx = cmdctx_new(cmdline_target(ed), source)
+    cx.count = 1
+    ed_cmd_invoke(mut ed, cmd_lookup(ed.reg, command), mut cx)
+}
+
+// `ghost_take` (`cmdline.c:2515-2580`).
+fn ghost_take(mut ed: Ed, source: int, one_word: bool) -> int {
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    let (ghost, kind) = ghost_of(mut ed)
+    if ghost.len == 0 {
+        return ghost_motion(
+            mut ed,
+            source,
+            if one_word then "ed.move.word.next" else "ed.move.char.next",
+        )
+    }
+    var take_n = ghost.len
+    let end = cmdline_len(ed)
+    if one_word {
+        let line = cmdline_text(ed)
+        let body = cmd_bang_body(ed, line) else 0
+        take_n = ghost_word_len(line, body, ghost)
+    }
+    if kind == GHOST_TOKEN && take_n == ghost.len {
+        var sel = menu_selected(ed.cmdline.menu)
+        if sel < 0 {
+            sel = 0
+        }
+        let item = copy ed.cmdline.menu.items[sel]
+        let replace = copy ed.cmdline.menu.replace
+        if !insert_completion(mut ed, replace, item, true) {
+            return CMD_ERR_IO
+        }
+        cl_menu_discard(mut ed)
+        cl_refilter(mut ed)
+        return CMD_OK
+    }
+    var bytes = List[byte]()
+    sanitize_bytes(ghost[0..take_n], mut bytes)
+    if !replace_span(mut ed, text.span(end, end), bytes, true) {
+        return CMD_ERR_IO
+    }
+    cl_menu_discard(mut ed)
+    cmdline_edited(mut ed)
+    CMD_OK
+}
+
+/// `ed.cmdline.ghost.accept` (`yew_cmdline_cmd_ghost_accept`): the ghost,
+/// or one grapheme right.
+pub fn cmdline_ghost_accept_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    ghost_take(mut ed, cx.source, false)
+}
+
+/// `ed.cmdline.ghost.accept_word` (`yew_cmdline_cmd_ghost_accept_word`):
+/// one word of it, or a word motion.
+pub fn cmdline_ghost_accept_word_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    ghost_take(mut ed, cx.source, true)
+}
+
+/// `ed.cmdline.ghost.accept_line` (`yew_cmdline_cmd_ghost_accept_line`,
+/// `cmdline.c:2590-2600`): the whole ghost, or the line end.
+pub fn cmdline_ghost_accept_line_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    let (g, _) = ghost_of(mut ed)
+    if g.len != 0 {
+        return ghost_take(mut ed, cx.source, false)
+    }
+    ghost_motion(mut ed, cx.source, "ed.move.line.end")
+}
+
+// ---- Enter's fuzzy fallback (s57.17 §1) -------------------------------
+
+// `cmdline_fuzzy_line` (`cmdline.c:3346-3399`): when the name does not
+// resolve, a SOLE survivor of the command source ranked against it is the
+// command; the line with the name token replaced, or `none`.
+fn cmdline_fuzzy_line(mut ed: Ed, line: List[byte]) -> List[byte] ! {none} {
+    let point = cmd_parse_point(mut ed, line, line.len)?
+    if point.command_known ||
+        point.name.len == 0 ||
+        point.name_tok.hi > line.len ||
+        point.name_tok.hi <= point.name_tok.lo {
+        return none
+    }
+    var req = compreq_new(COMP_CMD, point.name)
+    req.budget_us = 0
+    req.allow_cache = false
+    var items = List[CompItem]()
+    let _ = comp_request(mut ed, req, mut items)
+    let sole = comp_sole(items, COMP_CMD)
+    if sole < 0 {
+        return none
+    }
+    var out = line[0..point.name_tok.lo]
+    for b in items[sole].text {
+        (mut out).push(b)
+    }
+    var i = point.name_tok.hi
+    while i < line.len {
+        (mut out).push(line[i])
+        i += 1
+    }
+    out
+}

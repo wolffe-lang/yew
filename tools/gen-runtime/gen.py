@@ -14,7 +14,17 @@ Usage: gen.py REPO_ROOT OUT
 """
 import sys
 
+import os
+
 FILES = ["init.fl", "themes/quiver-dark.fl", "themes/quiver-light.fl"]
+
+
+def completions(root):
+    """The completion specs (yw04, Sprint 57.24): every `*.fl` of
+    runtime/completions/, in name order."""
+    d = f"{root}/runtime/completions"
+    return sorted("completions/" + n for n in os.listdir(d)
+                  if n.endswith(".fl") and not n.startswith("."))
 
 
 def literal(text):
@@ -46,7 +56,7 @@ def main():
         f.write("//! repository's `runtime/` (sagitta's, copied verbatim); do not\n")
         f.write("//! edit. `tools/check-runtime` regenerates it and diffs.\n\n")
         names = []
-        for i, rel in enumerate(FILES):
+        for i, rel in enumerate(FILES + completions(root)):
             text = open(f"{root}/runtime/{rel}", encoding="utf-8").read()
             name = f"RUNTIME_FILE_{i}"
             names.append((rel, name))
@@ -58,7 +68,13 @@ def main():
         for rel, name in names:
             f.write(f'        "{rel}" => (true, {name}),\n')
         f.write('        _ => (false, ""),\n')
-        f.write("    }\n}\n")
+        f.write("    }\n}\n\n")
+        f.write("/// Every embedded runtime file's relative path, in the order above.\n")
+        f.write("pub fn runtime_embedded_names() -> List[str] {\n")
+        f.write("    var out = List[str]()\n")
+        for rel, _ in names:
+            f.write(f'    (mut out).push("{rel}")\n')
+        f.write("    out\n}\n")
 
 
 main()

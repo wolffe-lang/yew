@@ -1,24 +1,90 @@
 //! edit.cmdcomp_shell — the `:!` half of the completion engine.
 //!
-//! PLACEHOLDER on the fork branches only (yw04-comp): the shell work
-//! owns this file and replaces it whole — sagitta `src/ui/cmdcomp.c`'s
-//! $PATH executable source (`:1113-1647`, Sprint 57.18 §2), the generic
-//! shell sources (`:1686-1912`, 57.23 §4), the router and the dispatcher
-//! (`:1913-3228`, 57.23 §3/§5, 57.24, 57.25, 57.26, 57.32). `edit.cmdcomp`
-//! calls exactly the functions below; each body here refuses LOUDLY by
-//! name (on the log and as an empty answer), never silently, and the
-//! lane's integration removes the placeholder.
+//! Ports sagitta `src/ui/cmdcomp.c` at 9ace98c2: the $PATH executable
+//! source (`:1113-1647`, Sprint 57.18 §2), the generic shell sources —
+//! the environment, the accounts, the builtins (`:1686-1912`, 57.23 §4)
+//! — and the router and the SHELL dispatcher (`:1913-3228`, 57.23 §3/§5,
+//! specs 57.24, help 57.25, fish 57.26, cd-aware 57.32), with the
+//! filter's context key (`shell_ctx_key`, `:3542-3590`). `edit.cmdcomp`
+//! calls in through the functions its placeholder named.
+//!
+//! **The context is re-derived, not carried.** C's `CompReq.shell` and
+//! `YewCompQuery.shell` point at the parse point's lexed context; the
+//! port's request carries the prompt line and caret instead
+//! (`CompReq.shell_line`), and this half asks the tolerant parse again
+//! (`cmd_parse_point`): the same lexer over the same bytes and the same
+//! environment, so the key, the hint and the menu agree.
+//!
+//! **Kinds, not callbacks.** C's `ShellPlan` holds pointers into a spec
+//! (`spec`, `node`, `arg`); the port holds indices into `ed.specs.pool`
+//! and the spec's `nodes` and `args` pools. C's generator key, help key
+//! and fish key ride the plan as strings, as in C.
+//!
+//! **The $PATH cache** is C's `exec_cache` (`:1132-1172`) in
+//! `CompState.shell`: one sliced `DirListing` per element, kept while the
+//! element's `(dev, ino, mtime)` holds, merged first-element-wins. C's
+//! open-addressed dedup table is a `Map` over the names (a kept name is
+//! always UTF-8: a name that is not cannot be stat'ed through wolf's
+//! `str` paths, so `exec_keep` refused it).
+//!
+//! **What 0.2.33 cannot run.** Generators, `--help` and fish answer
+//! through their units, whose jobs refuse by name (R-yw04-1): a spec
+//! generator's rows are its (empty) cached answer, the help tree is the
+//! one already on disk, fish's rows the ones already cached. The
+//! accounts come from `/etc/passwd` through `std.os.users` (no name
+//! service, G37).
 
+use std.fs
+use std.os.users
+use unicode
 use util
+use ws
 
-/// The shell half's own state (C's `exec_cache` and friends).
+// ------------------------------------------------------------------
+// The $PATH executable source (`cmdcomp.c:1113-1647`)
+// ------------------------------------------------------------------
+
+// One $PATH element and what was read out of it (`ExecDir`,
+// `cmdcomp.c:1134-1145`).
+struct CcsExecDir {
+    listing: DirListing,
+    dir: str,
+    dev: int,
+    ino: int,
+    mtime: int,
+    stat_ok: bool,
+    done: bool,
+}
+
+/// The shell half's own state: C's `exec_cache` (`cmdcomp.c:1147-1172`).
+/// `rows` are the merged, deduplicated names as listing rows (byte 0 the
+/// kind, the rest the name), `from` the element each came from.
+/// `refused` counts `:!` completion queries refused by name: none since
+/// the shell half landed (the placeholder's counter, kept for the
+/// prompt's tests that gate on it).
 pub struct CompShellState {
     refused: int,
+    has_env: bool,
+    path_env: str,
+    dirs: List[CcsExecDir],
+    rows: List[List[byte]],
+    from: List[int],
+    index: Map[str, int],
+    merged: bool,
 }
 
 /// The shell half before its first use.
 pub fn compshell_new() -> CompShellState {
-    CompShellState { refused: 0 }
+    CompShellState {
+        refused: 0,
+        has_env: false,
+        path_env: "",
+        dirs: List[CcsExecDir](),
+        rows: List[List[byte]](),
+        from: List[int](),
+        index: Map[str, int](),
+        merged: false,
+    }
 }
 
 /// A SHELL answer's identity beyond head and pattern (`shell_ctx_key`,
@@ -37,23 +103,421 @@ pub fn compshellkey_none() -> CompShellKey {
     CompShellKey { key: "", has_key: false, gen_key: "", has_gen: false, where: "" }
 }
 
-fn shell_refuse(mut ed: Ed, what: str, sprint: str) {
-    ed.comp.shell.refused += 1
-    util.log_error("yew: error: not yet ported: {what}: sagitta Sprint {sprint} (yw04)")
+// `exec_merged_free` (`cmdcomp.c:1178-1193`).
+fn ccs_merged_free(mut st: CompShellState) {
+    st.rows = List[List[byte]]()
+    st.from = List[int]()
+    st.index = Map[str, int]()
+    st.merged = false
 }
 
-/// `shell_ctx_key` (`cmdcomp.c:3542-3590`).
-pub fn comp_shell_ctx_key(mut ed: Ed, q: CompQuery) -> CompShellKey {
-    shell_refuse(mut ed, "the :! completion context", "57.23")
-    var k = compshellkey_none()
-    k.key = "refused|{q.shell_cursor}"
-    k.has_key = true
-    k
+/// `exec_cache_free` (`cmdcomp.c:1206-1214`): the element vector, the
+/// variable it was read from and the merged set.
+pub fn comp_shell_cache_free(mut ed: Ed) {
+    ed.comp.shell.dirs = List[CcsExecDir]()
+    ed.comp.shell.has_env = false
+    ed.comp.shell.path_env = ""
+    ccs_merged_free(mut ed.comp.shell)
 }
 
-/// `yew_compgen_awaiting || yew_comphelp_awaiting || yew_compfish_awaiting`.
-pub fn comp_shell_awaiting(ed: Ed, gen_key: str) -> bool {
+/// `exec_scan_pending` (`cmdcomp.c:1216-1225`).
+pub fn comp_shell_scan_pending(ed: Ed) -> bool {
+    for d in ed.comp.shell.dirs {
+        if !d.done {
+            return true
+        }
+    }
     false
+}
+
+/// `exec_keep` (`cmdcomp.c:1237-1260`): something the shell would run —
+/// a regular file (through a link) this user may execute. A kind that
+/// already decides saves the stat (`[os.fs.readdir]`'s codes: 0 a file,
+/// 3 a link, 2 none given); a directory is X_OK only by being
+/// searchable, so the stat's kind excludes it. `access(2)` is the mode
+/// bits by the real ids (G32, `comp_access_x`).
+pub fn comp_exec_keep(scan_dir: str, row: List[byte], force_unknown: bool) -> bool {
+    let kind = if force_unknown then 2 else listing_kind_of(row)
+    if kind != 0 && kind != 3 && kind != 2 {
+        return false
+    }
+    let path = comp_entry_path(scan_dir, row) else {
+        return false
+    }
+    let w = stat_words(path) else {
+        return false
+    }
+    w[0] == 0 && comp_access_x(w[4], w[6], w[7])
+}
+
+// `exec_scan_step` (`cmdcomp.c:1269-1303`): one slice across the elements
+// that still need reading; the budget is spent across ELEMENTS.
+fn ccs_scan_step(mut ed: Ed, slice_us: int) -> int {
+    let started = if slice_us > 0 then time_now_ms() else 0
+    let limit = comp_list_limit(ed)
+    let force = ed.comp.force_dtype_unknown
+    var i = 0
+    while i < ed.comp.shell.dirs.len {
+        if ed.comp.shell.dirs[i].done {
+            i += 1
+            continue
+        }
+        var left = 0
+        if slice_us > 0 {
+            left = slice_us - (time_now_ms() - started) * 1000
+            if left <= 0 {
+                return LISTING_PARTIAL
+            }
+        }
+        var d = copy ed.comp.shell.dirs[i]
+        let dir = d.dir
+        let (state, opened) = listing_step(
+            mut d.listing,
+            dir,
+            left,
+            LISTING_KEEP_EXEC,
+            limit,
+            force,
+        )
+        if opened {
+            ed.comp.opendirs += 1
+        }
+        ed.comp.shell.merged = false
+        if state == LISTING_PARTIAL {
+            ed.comp.shell.dirs[i] = d
+            return LISTING_PARTIAL
+        }
+        // COMPLETE or UNUSABLE: nothing more here (`cmdcomp.c:1291-1300`).
+        d.done = true
+        ed.comp.shell.dirs[i] = d
+        i += 1
+    }
+    LISTING_COMPLETE
+}
+
+/// `exec_scan_advance` (`cmdcomp.c:1305-1310`).
+pub fn comp_shell_scan_advance(mut ed: Ed, slice_us: int) -> bool {
+    if !comp_shell_scan_pending(ed) {
+        return false
+    }
+    ccs_scan_step(mut ed, slice_us) == LISTING_PARTIAL
+}
+
+// `exec_merge` (`cmdcomp.c:1386-1419`): every element's listing into one
+// set, the FIRST element winning a name (what the shell would run).
+fn ccs_merge(mut st: CompShellState) {
+    if st.merged {
+        return
+    }
+    ccs_merged_free(mut st)
+    st.merged = true
+    var i = 0
+    while i < st.dirs.len {
+        for ri in st.dirs[i].listing.idx {
+            let row = copy st.dirs[i].listing.rows[ri]
+            let name = str_from_utf8(row[1..]) else |_| { continue }
+            let seen = st.index[name] else -1
+            if seen >= 0 {
+                continue
+            }
+            st.index[name] = st.rows.len
+            (mut st.rows).push(row)
+            (mut st.from).push(i)
+        }
+        i += 1
+    }
+}
+
+// `exec_dir_stat` (`cmdcomp.c:1434-1447`). Second-granularity mtime is
+// C's known limit, kept.
+fn ccs_dir_stat(mut d: CcsExecDir) {
+    let info = fs.stat(d.dir) else |_| {
+        d.stat_ok = false
+        d.dev = 0
+        d.ino = 0
+        d.mtime = 0
+        return
+    }
+    d.stat_ok = true
+    d.dev = info.dev
+    d.ino = info.ino
+    d.mtime = info.mtime_s
+}
+
+// `exec_dir_unchanged` (`cmdcomp.c:1449-1459`).
+fn ccs_dir_unchanged(d: CcsExecDir) -> bool {
+    if !d.stat_ok {
+        return false
+    }
+    let info = fs.stat(d.dir) else |_| { return false }
+    info.dev == d.dev && info.ino == d.ino && info.mtime_s == d.mtime
+}
+
+fn ccs_exec_dir(dir: str) -> CcsExecDir {
+    CcsExecDir {
+        listing: listing_new(),
+        dir: dir,
+        dev: 0,
+        ino: 0,
+        mtime: 0,
+        stat_ok: false,
+        done: false,
+    }
+}
+
+// `exec_reconcile` (`cmdcomp.c:1461-1540`): the element vector in line
+// with the current $PATH; an unchanged element keeps its listing.
+fn ccs_reconcile(mut st: CompShellState) {
+    let env = env_get("PATH") else ""
+    if st.has_env && st.path_env == env {
+        var changed = false
+        var i = 0
+        while i < st.dirs.len {
+            if ccs_dir_unchanged(st.dirs[i]) {
+                i += 1
+                continue
+            }
+            var d = copy st.dirs[i]
+            d.listing = listing_new()
+            ccs_dir_stat(mut d)
+            d.done = false
+            st.dirs[i] = d
+            changed = true
+            i += 1
+        }
+        if changed {
+            st.merged = false
+        }
+        return
+    }
+    if env.len == 0 {
+        // No $PATH is no candidates, not a compiled-in default.
+        st.dirs = List[CcsExecDir]()
+        ccs_merged_free(mut st)
+        st.has_env = true
+        st.path_env = ""
+        return
+    }
+    var fresh = List[CcsExecDir]()
+    for part in env.split(":") {
+        var d = ccs_exec_dir(if part.len == 0 then "." else part)
+        ccs_dir_stat(mut d)
+        var at = 0
+        while at < st.dirs.len {
+            if !st.dirs[at].listing.has_dir || st.dirs[at].dir != d.dir {
+                at += 1
+                continue
+            }
+            let old = copy st.dirs[at]
+            if !old.stat_ok ||
+                !d.stat_ok ||
+                old.dev != d.dev ||
+                old.ino != d.ino ||
+                old.mtime != d.mtime {
+                break
+            }
+            // Unchanged on disk: move the listing rather than re-read it.
+            d.listing = copy old.listing
+            d.done = old.done
+            var emptied = copy old
+            emptied.listing = listing_new()
+            st.dirs[at] = emptied
+            break
+        }
+        (mut fresh).push(d)
+    }
+    st.dirs = fresh
+    st.has_env = true
+    st.path_env = env
+    ccs_merged_free(mut st)
+}
+
+// `exec_candidates_finish` + `enumerate_exec`'s ranking loop
+// (`cmdcomp.c:1542-1646`), a pure function whose heap dies at its
+// `copy region` (G33, `rank_paths`).
+fn ccs_exec_rank(st: CompShellState, req: CompReq) -> (List[CompItem], int) {
+    copy region rank {
+        var heap = List[PathCand]()
+        var total = 0
+        let any = compreq_new(COMP_PATH, List[byte]())
+        var i = 0
+        while i < st.rows.len {
+            // Sprint 57.32: `.` on $PATH is where the shell will be, which
+            // is not the directory this element was read from.
+            let f = st.from[i]
+            if req.cwd_moved && f < st.dirs.len && !st.dirs[f].dir.starts_with("/") {
+                i += 1
+                continue
+            }
+            path_rank_one(mut heap, st.rows, i, req.stem, 0, mut total, "", any, false)
+            i += 1
+        }
+        sort_pathcands(mut heap, st.rows)
+        var items = List[CompItem]()
+        for c in heap {
+            let rlen = st.rows[c.row].len
+            let name = comp_slice(st.rows[c.row], 1, rlen)
+            // Quoted on the way out like a path (DoD 2).
+            let shown = comp_quote(name)
+            let f = st.from[c.row]
+            let detail = if f < st.dirs.len then copy st.dirs[f].dir else ""
+            var pos = List[int]()
+            let _ = comp_key(req.stem, 0, req.stem.len, st.rows[c.row], 1, rlen, true, mut pos)
+            var off = 0
+            if !comp_bytes_eq(shown, name) {
+                pos = List[int]()
+                off = COMP_NO_HIGHLIGHT
+            }
+            (mut items).push(CompItem {
+                text: shown,
+                detail: detail,
+                kind: COMP_EXEC,
+                is_dir: false,
+                deferred: false,
+                score: c.score,
+                m: ws.FzMatch { pos: pos },
+                ranked: name,
+                match_off: off,
+                suffix: List[byte](),
+            })
+        }
+        (items, total)
+    }
+}
+
+/// `enumerate_exec` (`cmdcomp.c:1605-1646`): the executables on $PATH
+/// matching the stem, ranked; a partial scan ranks what has been read and
+/// the idle tick brings the rest. A fresh request retires the cache.
+pub fn comp_enumerate_exec(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    if !req.allow_cache {
+        comp_shell_cache_free(mut ed)
+    }
+    ccs_reconcile(mut ed.comp.shell)
+    let _ = ccs_scan_step(mut ed, if req.allow_cache then req.budget_us else 0)
+    ccs_merge(mut ed.comp.shell)
+    let (items, total) = ccs_exec_rank(ed.comp.shell, req)
+    out = items
+    total
+}
+
+// ------------------------------------------------------------------
+// The generic shell sources (`cmdcomp.c:1686-1912`, 57.23 §4)
+// ------------------------------------------------------------------
+
+// `candidate_dedupe` (`cmdcomp.c:1692-1716`): a later row whose ranked
+// name repeats an earlier one is dropped; the FIRST wins.
+fn ccs_dedupe(mut v: List[Candidate]) {
+    var keep = List[Candidate]()
+    for c in v {
+        var dup = false
+        for k in keep {
+            if comp_bytes_eq(k.ranked, c.ranked) {
+                dup = true
+                break
+            }
+        }
+        if !dup {
+            (mut keep).push(copy c)
+        }
+    }
+    v = keep
+}
+
+// `valid_var_name` (`cmdcomp.c:1718-1730`).
+fn ccs_valid_var_name(s: str) -> bool {
+    let b = s.bytes()
+    if b.len == 0 {
+        return false
+    }
+    let c0 = b[0] as int
+    if !(c0 >= 65 && c0 <= 90 || c0 >= 97 && c0 <= 122 || c0 == 95) {
+        return false
+    }
+    var i = 1
+    while i < b.len {
+        let c = b[i] as int
+        if !(c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 95) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// §4's value preview (`var_preview`, `cmdcomp.c:1732-1767`): the first
+/// 40 bytes backed off to a UTF-8 boundary, every C0, DEL and C1 byte
+/// drawn as `·`, the whole value `•••` when the NAME says secret.
+pub fn comp_var_preview(name: str, value: str) -> str {
+    var nb = List[byte]()
+    for x in name.bytes() {
+        (mut nb).push(x)
+    }
+    if util.secret_name(nb, 0, nb.len) {
+        return "\u{2022}\u{2022}\u{2022}"
+    }
+    var v = List[byte]()
+    for x in value.bytes() {
+        (mut v).push(x)
+    }
+    let len = v.len
+    var n = if len < 40 then len else 40
+    while n > 0 && n < len && !unicode.utf8_is_boundary(v, 0, len, n) {
+        n -= 1
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < n {
+        let c = v[i] as int
+        if c < 32 || c == 127 {
+            (mut out).push(194 as byte)
+            (mut out).push(183 as byte)
+        } else if c == 194 && i + 1 < n && v[i + 1] as int >= 128 && v[i + 1] as int <= 159 {
+            (mut out).push(194 as byte)
+            (mut out).push(183 as byte)
+            i += 1
+        } else {
+            (mut out).push(v[i])
+        }
+        i += 1
+    }
+    str_from_utf8(out) else ""
+}
+
+fn ccs_vars_rows(env: List[str], req: CompReq) -> (List[CompItem], int) {
+    copy region rows {
+        var matches = List[Candidate]()
+        for row in env {
+            let eq = row.find("=") else -1
+            if eq < 0 {
+                continue
+            }
+            let name = row[0..eq]
+            if !ccs_valid_var_name(name) {
+                continue
+            }
+            let nb = bytes_of(name)
+            let _ = candidate_add(
+                mut matches,
+                req.stem,
+                nb,
+                nb,
+                comp_var_preview(name, row[eq + 1..]),
+                false,
+                false,
+            )
+        }
+        ccs_dedupe(mut matches)
+        candidate_finish(COMP_VAR, mut matches)
+    }
+}
+
+/// `enumerate_vars` (`cmdcomp.c:1771-1799`): the names a `:!` child will
+/// see — the job layer's environment, so a name it drops is not offered.
+pub fn comp_enumerate_vars(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    let env = job_env(mut ed, false)
+    let (items, total) = ccs_vars_rows(env, req)
+    out = items
+    total
 }
 
 /// `users_underscore_last` (`cmdcomp.c:1801-1820`): `~_name` accounts
@@ -80,82 +544,1609 @@ pub fn comp_users_underscore_last(mut items: List[CompItem]) {
     items = head
 }
 
-/// `exec_scan_pending` (`cmdcomp.c:1220-1229`).
-pub fn comp_shell_scan_pending(ed: Ed) -> bool {
+// `setpwent`/`getpwent` over the files source: `std.os.users` parses the
+// `passwd(5)` text the port reads, and asks no name service (G37: wolf
+// 0.2.33 has none, so an account kept only in a directory service is not
+// offered).
+fn ccs_passwd_rows() -> List[users.User] {
+    let text = fs.read_text("/etc/passwd") else |_| { return List[users.User]() }
+    users.users(text)
+}
+
+fn ccs_users_rows(accounts: List[users.User], req: CompReq) -> (List[CompItem], int) {
+    copy region rows {
+        var matches = List[Candidate]()
+        for u in accounts {
+            let m = bytes_of("~{u.name}")
+            let t = bytes_of("~{u.name}/")
+            let _ = candidate_add(mut matches, req.stem, m, t, u.home, true, false)
+        }
+        ccs_dedupe(mut matches)
+        candidate_finish(COMP_USER, mut matches)
+    }
+}
+
+/// `enumerate_users` (`cmdcomp.c:1822-1865`): `~name/` for every
+/// account; the detail is its home directory.
+pub fn comp_enumerate_users(ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    let _ = ed.win
+    let (items, total) = ccs_users_rows(ccs_passwd_rows(), req)
+    out = items
+    comp_users_underscore_last(mut out)
+    total
+}
+
+// §4's list (`sh_builtins`, `cmdcomp.c:1872-1889`): the sh-family
+// builtins, then the reserved words.
+const CCS_BUILTINS: str = "alias bg break builtin cd command continue declare dirs echo eval exec exit export false fc fg getopts hash history jobs kill let local popd printf pushd pwd read readonly return set shift source test times trap true type typeset ulimit umask unalias unset wait . ["
+
+const CCS_KEYWORDS: str = "if then else elif fi case esac for select while until do done function time {{ }} ! [[ ]]"
+
+/// `sh_builtin_name` (`cmdcomp.c:1891-1898`): a name the shell runs
+/// itself, whatever $PATH holds.
+pub fn comp_sh_builtin_name(name: List[byte]) -> bool {
+    for w in CCS_BUILTINS.words() {
+        if comp_bytes_is(name, w) {
+            return true
+        }
+    }
+    for w in CCS_KEYWORDS.words() {
+        if comp_bytes_is(name, w) {
+            return true
+        }
+    }
     false
 }
 
-/// `exec_scan_advance` (`cmdcomp.c:1308-1313`).
-pub fn comp_shell_scan_advance(ed: Ed, slice_us: int) -> bool {
+fn ccs_builtins_rows(req: CompReq) -> (List[CompItem], int) {
+    copy region rows {
+        var matches = List[Candidate]()
+        for w in CCS_BUILTINS.words() {
+            let b = bytes_of(w)
+            let _ = candidate_add(mut matches, req.stem, b, b, "builtin", false, false)
+        }
+        for w in CCS_KEYWORDS.words() {
+            let b = bytes_of(w)
+            let _ = candidate_add(mut matches, req.stem, b, b, "keyword", false, false)
+        }
+        candidate_finish(COMP_BUILTIN, mut matches)
+    }
+}
+
+/// `enumerate_builtins` (`cmdcomp.c:1900-1911`).
+pub fn comp_enumerate_builtins(ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    let _ = ed.win
+    let (items, total) = ccs_builtins_rows(req)
+    out = items
+    total
+}
+
+// ------------------------------------------------------------------
+// Routing — shape beats position (`cmdcomp.c:1913-2058`, 57.23 §3)
+// ------------------------------------------------------------------
+
+/// `SRC_BIT(k)`: a sub-source's bit in a route's source set.
+pub fn comp_src_bit(kind: int) -> int {
+    1 << kind
+}
+
+/// The row reported when a spec, not §3's table, decided
+/// (`SHELL_ROW_SPEC`).
+pub const SHELL_ROW_SPEC: int = 10
+
+/// Fish's rows answered (`SHELL_ROW_FISH`, Sprint 57.26 rung 2).
+pub const SHELL_ROW_FISH: int = 11
+
+// `sudo env nice xargs git …` re-enters COMMAND at most this often.
+const CCS_REENTRY_MAX: int = 8
+
+fn ccs_b0(s: List[byte]) -> int {
+    if s.len == 0 then 0 else s[0] as int
+}
+
+fn ccs_has_slash(s: List[byte]) -> bool {
+    for b in s {
+        if b as int == 47 {
+            return true
+        }
+    }
     false
 }
 
-/// `exec_cache_free` (`cmdcomp.c:1210-1218`).
-pub fn comp_shell_cache_free(ed: Ed) {}
+// `arg_defaults[]` and `arg_default_of` (`cmdcomp.c:1921-1955`): §4's
+// argument-kind defaults, row 8. `(found, sources, mask)`.
+fn ccs_arg_default(ctx: ShCtx) -> (bool, int, int) {
+    if ctx.argc == 0 || ctx.argv.len == 0 {
+        return (false, 0, PATH_ANY)
+    }
+    let w = ctx.argv[0]
+    for d in ["cd", "pushd", "rmdir", "mkdir"] {
+        if comp_bytes_is(w, d) {
+            return (true, comp_src_bit(COMP_PATH), PATH_DIRS)
+        }
+    }
+    for d in ["which", "type", "whence", "where", "command"] {
+        if comp_bytes_is(w, d) {
+            return (true, comp_src_bit(COMP_EXEC) | comp_src_bit(COMP_BUILTIN), PATH_ANY)
+        }
+    }
+    (false, 0, PATH_ANY)
+}
+
+/// `yew_comp_shell_route` (`cmdcomp.c:1957-2058`): §3's table, top row
+/// first, first match wins; `(row, sources, path_filter)`. Row 0 is the
+/// guard between rows 2 and 3 (an active expansion offers nothing).
+pub fn comp_shell_route(ctx: ShCtx) -> (int, int, int) {
+    if ctx.pos == SH_POS_NONE {
+        return (1, 0, PATH_ANY)
+    }
+    let stem = copy ctx.stem
+    if ctx.pos == SH_POS_VARIABLE && ctx.quote != SH_Q_SINGLE {
+        return (2, comp_src_bit(COMP_VAR), PATH_ANY)
+    }
+    // Departure 1: a word holding an active expansion offers nothing.
+    if ctx.expands {
+        return (0, 0, PATH_ANY)
+    }
+    let slash = ccs_has_slash(stem)
+    let operand = ctx.pos == SH_POS_ARGUMENT ||
+        ctx.pos == SH_POS_REDIRECT ||
+        ctx.pos == SH_POS_ASSIGN
+    // Row 3; only a LEADING, UNQUOTED `~` names a user.
+    if ccs_b0(stem) == 126 && !slash && ctx.tilde {
+        return (3, comp_src_bit(COMP_USER), PATH_ANY)
+    }
+    if (slash || comp_bytes_is(stem, ".") || comp_bytes_is(stem, "..")) &&
+        ctx.pos == SH_POS_COMMAND {
+        return (4, comp_src_bit(COMP_PATH), PATH_EXEC_OR_DIR)
+    }
+    if slash && operand {
+        // Departure 2: row 5 keeps PATH but takes row 8's mask.
+        var mask = PATH_ANY
+        if ctx.pos == SH_POS_ARGUMENT {
+            let (found, src, m) = ccs_arg_default(ctx)
+            if found && src == comp_src_bit(COMP_PATH) {
+                mask = m
+            }
+        }
+        return (5, comp_src_bit(COMP_PATH), mask)
+    }
+    if ccs_b0(stem) == 45 && !ctx.dashdash && ctx.pos == SH_POS_ARGUMENT {
+        return (6, 0, PATH_ANY)
+    }
+    if ctx.pos == SH_POS_COMMAND {
+        return (7, comp_src_bit(COMP_EXEC) | comp_src_bit(COMP_BUILTIN), PATH_ANY)
+    }
+    if ctx.pos == SH_POS_ARGUMENT {
+        let (found, src, m) = ccs_arg_default(ctx)
+        if found {
+            return (8, src, m)
+        }
+    }
+    if operand {
+        return (9, comp_src_bit(COMP_PATH), PATH_ANY)
+    }
+    (1, 0, PATH_ANY)
+}
+
+// ------------------------------------------------------------------
+// The SHELL dispatcher's encoder (`cmdcomp.c:2060-2152`, 57.23 §5/§6)
+// ------------------------------------------------------------------
+
+// `closing_of` (`cmdcomp.c:2064-2077`).
+fn ccs_closing_of(q: int) -> str {
+    if q == SH_Q_SINGLE || q == SH_Q_DOLLAR {
+        return "'"
+    }
+    if q == SH_Q_DOUBLE {
+        return "\""
+    }
+    ""
+}
+
+// `shell_push` (`cmdcomp.c:2079-2125`): one sub-source row re-encoded for
+// the caret's quote state and appended. `raw` is the unquoted word,
+// `hl_off` where `ranked` sits inside it.
+fn ccs_push(
+    ctx: ShCtx,
+    sub: CompItem,
+    raw: List[byte],
+    literal_prefix: int,
+    hl_off: int,
+    pattern: List[byte],
+    mut out: List[CompItem],
+) {
+    var item = copy sub
+    if sub.kind == COMP_VAR {
+        // A name is [A-Za-z0-9_] in every state: nothing to quote.
+        item.text = copy raw
+        let suffix = if ctx.brace_var {
+            if ctx.quote == SH_Q_DOUBLE then "}}\"" else "}}"
+        } else {
+            ccs_closing_of(ctx.quote)
+        }
+        item.suffix = bytes_of(suffix)
+    } else if sub.kind == COMP_BUILTIN && ctx.quote == SH_Q_NONE {
+        // Reserved words lose their meaning when quoted.
+        item.text = copy raw
+        item.suffix = List[byte]()
+    } else {
+        let (t, closing) = shq_insert(raw, literal_prefix, ctx.quote)
+        item.text = t
+        item.suffix = bytes_of(closing)
+    }
+    if comp_bytes_eq(item.text, raw) && hl_off < COMP_NO_HIGHLIGHT {
+        var pos = List[int]()
+        let _ = comp_key(pattern, 0, pattern.len, item.ranked, 0, item.ranked.len, true, mut pos)
+        item.match_off = hl_off
+        var p = 0
+        while p < pos.len {
+            let at = pos[p] + hl_off
+            pos[p] = if at > 65535 then 65535 else at
+            p += 1
+        }
+        item.m = ws.FzMatch { pos: pos }
+    } else {
+        item.m = ws.fzmatch_none()
+        item.match_off = COMP_NO_HIGHLIGHT
+    }
+    (mut out).push(item)
+}
+
+// `shell_sub` (`cmdcomp.c:2130-2152`): one sub-source with the
+// dispatcher's budget and directory.
+fn ccs_sub(
+    mut ed: Ed,
+    req: CompReq,
+    kind: int,
+    stem: List[byte],
+    mask: int,
+    ext: List[str],
+    mut got: List[CompItem],
+) -> int {
+    var sub = copy req
+    sub.kind = kind
+    sub.stem = copy stem
+    sub.has_shell = false
+    sub.shell_line = List[byte]()
+    sub.path_filter = mask
+    sub.path_ext = copy ext
+    got = List[CompItem]()
+    if kind == COMP_VAR {
+        return comp_enumerate_vars(mut ed, sub, mut got)
+    }
+    if kind == COMP_USER {
+        return comp_enumerate_users(ed, sub, mut got)
+    }
+    if kind == COMP_BUILTIN {
+        return comp_enumerate_builtins(ed, sub, mut got)
+    }
+    if kind == COMP_EXEC {
+        return comp_enumerate_exec(mut ed, sub, mut got)
+    }
+    if kind == COMP_PATH {
+        return comp_enumerate_paths(mut ed, sub, mut got)
+    }
+    0
+}
+
+// ------------------------------------------------------------------
+// The plan — routing with specs (`cmdcomp.c:2154-2700`, 57.24-57.32)
+// ------------------------------------------------------------------
+
+const CCS_WHERE_ROOT: int = 0
+
+const CCS_WHERE_MOVED: int = 1
+
+const CCS_WHERE_UNKNOWN: int = 2
+
+// `ShellPlan` (`cmdcomp.c:2168-2216`): `spec` an `ed.specs.pool` index,
+// `node` and `arg` the spec's node and arg pool indices (-1 for C's
+// NULL); `cwd` the directory the command will run in (`has_cwd` false:
+// unknown); `cwd_exists` -1 not yet asked.
+struct CcsPlan {
+    eff: ShCtx,
+    row: int,
+    sources: int,
+    mask: int,
+    ext: List[str],
+    spec: int,
+    node: int,
+    arg: int,
+    subs: bool,
+    flags: bool,
+    dash: bool,
+    value_at: int,
+    builtin: str,
+    has_builtin: bool,
+    make_cwd: str,
+    makefile: str,
+    has_makefile: bool,
+    has_key: bool,
+    key: GenKey,
+    id: str,
+    has_id: bool,
+    help_key: str,
+    has_help_key: bool,
+    fish_rows: List[FishRow],
+    has_fish: bool,
+    fish_key: str,
+    has_fish_key: bool,
+    cwd: str,
+    has_cwd: bool,
+    root: str,
+    where: int,
+    cwd_exists: int,
+    skip: List[int],
+}
+
+fn ccs_plan_new(ctx: ShCtx) -> CcsPlan {
+    CcsPlan {
+        eff: copy ctx,
+        row: 0,
+        sources: 0,
+        mask: PATH_ANY,
+        ext: List[str](),
+        spec: -1,
+        node: -1,
+        arg: -1,
+        subs: false,
+        flags: false,
+        dash: false,
+        value_at: 0,
+        builtin: "",
+        has_builtin: false,
+        make_cwd: "",
+        makefile: "",
+        has_makefile: false,
+        has_key: false,
+        key: GenKey {
+            name: "",
+            argv: List[str](),
+            cwd: "",
+            has_cwd: false,
+            cache_ms: 0,
+            ps_columns: false,
+        },
+        id: "",
+        has_id: false,
+        help_key: "",
+        has_help_key: false,
+        fish_rows: List[FishRow](),
+        has_fish: false,
+        fish_key: "",
+        has_fish_key: false,
+        cwd: "",
+        has_cwd: false,
+        root: "",
+        where: CCS_WHERE_ROOT,
+        cwd_exists: -1,
+        skip: List[int](),
+    }
+}
+
+fn ccs_str(b: List[byte]) -> str {
+    str_from_utf8(b) else ""
+}
+
+// `plan_cwd_usable` (`cmdcomp.c:2224-2236`): the directory is known and
+// (unless it is the prompt's own) exists.
+fn ccs_cwd_usable(mut p: CcsPlan) -> bool {
+    if !p.has_cwd {
+        return false
+    }
+    if p.cwd_exists < 0 {
+        var ok = p.cwd == p.root
+        if !ok {
+            let info = fs.stat(p.cwd) else |_| {
+                p.cwd_exists = 0
+                return false
+            }
+            ok = info.kind == 1
+        }
+        p.cwd_exists = if ok then 1 else 0
+    }
+    p.cwd_exists != 0
+}
+
+// `plan_dirs` (`cmdcomp.c:2238-2266`): apply the `changes_dir` values the
+// resolution walked (Sprint 57.32 §2).
+fn ccs_plan_dirs(mut p: CcsPlan, pt: SpecPoint) {
+    if pt.dirs_overflow {
+        p.has_cwd = false
+    }
+    var i = 0
+    while i < pt.dir_at.len && p.has_cwd {
+        let at = pt.dir_at[i]
+        let off = pt.dir_off[i]
+        var has_v = false
+        var v = List[byte]()
+        if at < p.eff.arg_index && at < p.eff.dirv_known.len && p.eff.dirv_known[at] {
+            if off == 0 {
+                v = copy p.eff.dirv[at]
+                has_v = true
+            } else {
+                // An attached value (`-Csub`, `--directory=sub`) is plain
+                // text: no tilde after the flag.
+                v = comp_slice(p.eff.argv[at], off, p.eff.argv[at].len)
+                has_v = v.len != 0 && v[0] as int != 126
+            }
+        }
+        if has_v {
+            let jb = sh_dir_join(bytes_of(p.cwd), v)
+            let joined = str_from_utf8(jb) else |_| { "" }
+            if joined.len == 0 && jb.len != 0 {
+                // Not UTF-8: wolf's fs takes `str` paths, so unknown.
+                p.has_cwd = false
+            }
+            p.cwd = joined
+        } else {
+            p.has_cwd = false
+            p.cwd = ""
+        }
+        p.cwd_exists = -1
+        if p.skip.len + 2 <= 2 * SPEC_DIRS_MAX {
+            (mut p.skip).push(pt.dir_flag[i])
+            (mut p.skip).push(at)
+        }
+        i += 1
+    }
+}
+
+// `plan_skipped` (`cmdcomp.c:2268-2277`).
+fn ccs_skipped(p: CcsPlan, i: int) -> bool {
+    for k in p.skip {
+        if k == i {
+            return true
+        }
+    }
+    false
+}
+
+// `plan_make_flags` (`cmdcomp.c:2279-2307`): `-f file` / `--file=` /
+// `--makefile=` already typed on a `make` line.
+fn ccs_make_flags(ctx: ShCtx, mut p: CcsPlan) {
+    var file = ""
+    var has_file = false
+    var i = 1
+    while i < ctx.arg_index && i < ctx.argv.len {
+        let w = copy ctx.argv[i]
+        if ccs_skipped(p, i) {
+            i += 1
+            continue
+        }
+        if comp_bytes_is(w, "-f") || comp_bytes_is(w, "--file") || comp_bytes_is(w, "--makefile") {
+            has_file = i + 1 < ctx.arg_index && i + 1 < ctx.argv.len
+            file = if has_file then ccs_str(ctx.argv[i + 1]) else ""
+            i += 1
+        } else if ccs_starts(w, "--file=") {
+            file = ccs_str(comp_slice(w, 7, w.len))
+            has_file = true
+        } else if ccs_starts(w, "--makefile=") {
+            file = ccs_str(comp_slice(w, 11, w.len))
+            has_file = true
+        }
+        i += 1
+    }
+    p.make_cwd = p.cwd
+    p.makefile = file
+    p.has_makefile = has_file
+}
+
+fn ccs_starts(w: List[byte], s: str) -> bool {
+    let b = s.bytes()
+    if w.len < b.len {
+        return false
+    }
+    var i = 0
+    while i < b.len {
+        if w[i] as int != b[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn ccs_base_of(path: str) -> str {
+    let slash = path.rfind("/") else -1
+    if slash >= 0 then path[slash + 1..] else path
+}
+
+// `plan_gen_key` (`cmdcomp.c:2309-2363`): a spec generator's argv —
+// argv[0], every pass flag the line already carries before the caret
+// (with its value), then the rest — run where the command will.
+fn ccs_gen_key(origin: str, gen: SpecGen, ctx: ShCtx, mut p: CcsPlan) {
+    var argv = List[str]()
+    (mut argv).push(gen.argv[0])
+    var i = 1
+    while i < ctx.arg_index && i < ctx.argv.len {
+        let w = ccs_str(ctx.argv[i])
+        // A `changes_dir` flag is already the generator's cwd.
+        if ccs_skipped(p, i) {
+            i += 1
+            continue
+        }
+        for pf in gen.pass_flags {
+            if w == pf && i + 1 < ctx.arg_index && i + 1 < ctx.argv.len && !ccs_skipped(p, i + 1) {
+                (mut argv).push(w)
+                (mut argv).push(ccs_str(ctx.argv[i + 1]))
+                i += 1
+                break
+            }
+            if w.starts_with(pf) && w.len > pf.len && w.bytes()[pf.len] as int == 61 {
+                (mut argv).push(w)
+                break
+            }
+        }
+        i += 1
+    }
+    var k = 1
+    while k < gen.argv.len {
+        (mut argv).push(gen.argv[k])
+        k += 1
+    }
+    p.has_key = true
+    p.key = GenKey {
+        name: "{ccs_base_of(origin)}:{gen.name}",
+        argv: argv,
+        cwd: p.cwd,
+        has_cwd: p.has_cwd,
+        cache_ms: gen.cache_ms,
+        ps_columns: false,
+    }
+}
+
+// `plan_arg` (`cmdcomp.c:2365-2427`): what an argument slot offers; `arg`
+// indexes the plan's spec's `args` (-1 for none).
+fn ccs_plan_arg(ed: Ed, ctx: ShCtx, arg: int, mut p: CcsPlan) {
+    if arg < 0 || p.spec < 0 {
+        return
+    }
+    let a = copy ed.specs.pool[p.spec].args[arg]
+    if a.kind == SPEC_ARG_PATH {
+        p.sources = p.sources | comp_src_bit(COMP_PATH)
+        p.ext = copy a.ext
+    } else if a.kind == SPEC_ARG_DIR {
+        p.sources = p.sources | comp_src_bit(COMP_PATH)
+        p.mask = PATH_DIRS
+    } else if a.kind == SPEC_ARG_EXEC {
+        p.sources = p.sources | comp_src_bit(COMP_EXEC) | comp_src_bit(COMP_BUILTIN)
+    } else if a.kind == SPEC_ARG_VAR {
+        p.sources = p.sources | comp_src_bit(COMP_VAR)
+    } else if a.kind == SPEC_ARG_VALUES {
+        p.arg = arg
+    } else if a.kind == SPEC_ARG_USER ||
+        a.kind == SPEC_ARG_HOST ||
+        a.kind == SPEC_ARG_SIGNAL ||
+        a.kind == SPEC_ARG_PID ||
+        a.kind == SPEC_ARG_GENERATOR {
+        p.arg = arg
+        if a.gen >= 0 {
+            // Sprint 57.32 §3: a spec generator runs where the command
+            // will; unknown or not yet created, it has nothing to say.
+            if ccs_cwd_usable(mut p) {
+                let origin = ed.specs.pool[p.spec].origin
+                let g = copy ed.specs.pool[p.spec].gens[a.gen]
+                ccs_gen_key(origin, g, ctx, mut p)
+            }
+        } else if a.generator == "pids" {
+            // `ps` answers the same from any directory.
+            var argv = List[str]()
+            for w in ["ps", "-A", "-o", "pid=", "-o", "comm="] {
+                (mut argv).push(w)
+            }
+            p.has_key = true
+            p.key = GenKey {
+                name: "pids",
+                argv: argv,
+                cwd: shell_ws_root(ed),
+                has_cwd: true,
+                cache_ms: COMPGEN_DEFAULT_CACHE_MS,
+                ps_columns: true,
+            }
+        } else if a.generator == "make_targets" {
+            if ccs_cwd_usable(mut p) {
+                p.builtin = a.generator
+                p.has_builtin = true
+                ccs_make_flags(ctx, mut p)
+            }
+        } else {
+            p.builtin = a.generator // hosts, signals, users
+            p.has_builtin = true
+        }
+    }
+}
+
+// `plan_reenter` (`cmdcomp.c:2429-2458`): the context of the command
+// that starts at argv[k].
+fn ccs_reenter(mut eff: ShCtx, k: int) {
+    if k >= eff.arg_index {
+        eff.pos = SH_POS_COMMAND
+        eff.argv = List[List[byte]]()
+        eff.dirv = List[List[byte]]()
+        eff.dirv_known = List[bool]()
+        eff.argc = 0
+        eff.arg_index = 0
+        eff.dashdash = false
+        return
+    }
+    var argv = List[List[byte]]()
+    var dirv = List[List[byte]]()
+    var known = List[bool]()
+    var i = k
+    while i < eff.argv.len {
+        (mut argv).push(copy eff.argv[i])
+        i += 1
+    }
+    i = k
+    while i < eff.dirv.len {
+        (mut dirv).push(copy eff.dirv[i])
+        i += 1
+    }
+    i = k
+    while i < eff.dirv_known.len {
+        (mut known).push(eff.dirv_known[i])
+        i += 1
+    }
+    eff.argv = argv
+    eff.dirv = dirv
+    eff.dirv_known = known
+    eff.argc -= k
+    eff.arg_index -= k
+    eff.dashdash = false
+    i = 1
+    while i < eff.arg_index && i < eff.argv.len {
+        if comp_bytes_is(eff.argv[i], "--") {
+            eff.dashdash = true
+        }
+        i += 1
+    }
+}
+
+// `plan_id` (`cmdcomp.c:2460-2484`): the node path, slot and flags.
+fn ccs_plan_id(ed: Ed, p: CcsPlan, pt: SpecPoint) -> str {
+    var s = ed.specs.pool[p.spec].origin
+    var n = p.node
+    while n >= 0 && ed.specs.pool[p.spec].nodes[n].parent >= 0 {
+        s += "<{ed.specs.pool[p.spec].nodes[n].name}"
+        n = ed.specs.pool[p.spec].nodes[n].parent
+    }
+    let su = if p.subs then 1 else 0
+    let fl = if p.flags then 1 else 0
+    let da = if p.dash then 1 else 0
+    s += "|{pt.positional}|{su}{fl}{da}|{p.value_at}|"
+    if pt.pending_flag >= 0 {
+        let f = copy ed.specs.pool[p.spec].nodes[pt.pending_node].flags[pt.pending_flag]
+        let lng = if f.has_lng then f.lng else ""
+        let shrt = if f.has_shrt then f.shrt else ""
+        s += "{lng}/{shrt}"
+    }
+    s
+}
+
+// `help_pending_matters` (`cmdcomp.c:2486-2502`).
+fn ccs_help_pending_matters(ctx: ShCtx) -> bool {
+    if ccs_b0(ctx.stem) == 45 && !ctx.dashdash {
+        return true
+    }
+    var i = 1
+    while i < ctx.arg_index && i < ctx.argv.len {
+        if ccs_b0(ctx.argv[i]) != 45 {
+            return false
+        }
+        i += 1
+    }
+    !ctx.dashdash
+}
+
+fn ccs_argv0(ctx: ShCtx) -> List[byte] {
+    if ctx.argv.len == 0 then List[byte]() else copy ctx.argv[0]
+}
+
+// `plan_help` (`cmdcomp.c:2504-2573`, 57.25 §7 rung 3): an operand of a
+// command with no spec, read against the tree its `--help` taught us.
+fn ccs_plan_help(mut ed: Ed, mut p: CcsPlan) {
+    if p.row != 6 && p.row != 9 || comp_sh_builtin_name(ccs_argv0(p.eff)) {
+        return
+    }
+    let word = ccs_str(ccs_argv0(p.eff))
+    let (found, hl) = comphelp_lookup_in(mut ed, word, p.cwd, p.has_cwd)
+    if !found {
+        if hl.pending && ccs_help_pending_matters(p.eff) {
+            p.help_key = copy hl.key
+            p.has_help_key = true
+        }
+        return
+    }
+    var d = HELP_DESCEND_READY
+    var key = ""
+    var have = false
+    var pt = copy ccs_resolve_none()
+    var tries = 0
+    while tries <= COMPHELP_DEPTH_MAX {
+        let (ok, rpt) = compspec_resolve(ed.specs.pool[hl.spec], p.eff)
+        if !ok || rpt.command_at != 0 {
+            return
+        }
+        pt = rpt
+        have = true
+        let (dd, kk) = comphelp_descend(mut ed, hl.spec, pt.node)
+        d = dd
+        key = kk
+        if d != HELP_DESCEND_CHANGED {
+            break
+        }
+        tries += 1
+    }
+    if !have {
+        return
+    }
+    let stem = copy p.eff.stem
+    if d == HELP_DESCEND_PENDING {
+        // The node's own help is coming: 57.23's row answers meanwhile.
+        if key.len != 0 &&
+            (
+                ccs_b0(stem) == 45 && !pt.flags_ended ||
+                    pt.pending_flag < 0 && pt.positional == 0 && !pt.flags_ended
+            ) {
+            p.help_key = key
+            p.has_help_key = true
+        }
+        return
+    }
+    var arg = -1
+    if pt.pending_flag >= 0 {
+        arg = ed.specs.pool[hl.spec].nodes[pt.pending_node].flags[pt.pending_flag].arg
+        p.value_at = if pt.after_equals then pt.value_at else 0
+    } else if ccs_b0(stem) == 45 && !pt.flags_ended && pt.positional != SPEC_POS_NONE {
+        p.flags = true
+    } else if pt.subcommands_allowed {
+        p.subs = true
+    } else {
+        return // a plain positional: 57.23's row stands
+    }
+    p.spec = hl.spec
+    p.node = pt.node
+    p.row = SHELL_ROW_SPEC
+    p.sources = 0
+    p.mask = PATH_ANY
+    let eff = copy p.eff
+    ccs_plan_arg(ed, eff, arg, mut p)
+    p.id = ccs_plan_id(ed, p, pt)
+    p.has_id = true
+}
+
+fn ccs_resolve_none() -> SpecPoint {
+    SpecPoint {
+        node: -1,
+        pending_node: -1,
+        pending_flag: -1,
+        positional: SPEC_POS_NONE,
+        after_equals: false,
+        subcommands_allowed: false,
+        flags_ended: false,
+        command_at: 0,
+        value_at: 0,
+        dir_at: List[int](),
+        dir_off: List[int](),
+        dir_flag: List[int](),
+        dirs_overflow: false,
+    }
+}
+
+// `plan_fish` (`cmdcomp.c:2575-2621`, 57.26 §2 rung 2): true when fish
+// decided the slot — its rows, or (while its answer is on the way)
+// 57.23's rows with the pending key.
+fn ccs_plan_fish(mut ed: Ed, mut p: CcsPlan) -> bool {
+    if p.row != 6 && p.row != 9 || comp_sh_builtin_name(ccs_argv0(p.eff)) {
+        return false
+    }
+    // Sprint 57.32: with the directory unknown fish is not asked.
+    if !ccs_cwd_usable(mut p) {
+        return false
+    }
+    let eff = copy p.eff
+    let fl = compfish_lookup_in(mut ed, eff, p.cwd, p.has_cwd, time_now_ms())
+    if fl.state == FISH_PENDING {
+        p.fish_key = copy fl.key
+        p.has_fish_key = true
+        return true
+    }
+    if fl.state == FISH_ROWS {
+        p.fish_rows = copy fl.rows
+        p.has_fish = true
+        p.fish_key = copy fl.key
+        p.has_fish_key = true
+        p.row = SHELL_ROW_FISH
+        p.sources = 0
+        p.mask = PATH_ANY
+        p.id = copy fl.key
+        p.has_id = true
+        return true
+    }
+    false
+}
+
+// `shell_plan_walk` (`cmdcomp.c:2623-2700`): §3's table first — the
+// SHAPE rows win in every position — then, for an operand of a command
+// that has a spec, the spec's answer.
+fn ccs_plan_walk(mut ed: Ed, mut p: CcsPlan) {
+    var depth = 0
+    while depth <= CCS_REENTRY_MAX {
+        let (row, src, mask) = comp_shell_route(p.eff)
+        p.row = row
+        p.sources = src
+        p.mask = mask
+        if p.row <= 4 || p.eff.pos != SH_POS_ARGUMENT || p.eff.argc == 0 || p.eff.argv.len == 0 {
+            return
+        }
+        let spec = compspec_get(mut ed.specs, ccs_str(p.eff.argv[0]))
+        if spec < 0 {
+            // §7's ladder: 2. fish, 3. the `--help` tree, 4. 57.23's rows.
+            if !ccs_plan_fish(mut ed, mut p) {
+                ccs_plan_help(mut ed, mut p)
+            }
+            return
+        }
+        let (ok, pt) = compspec_resolve(ed.specs.pool[spec], p.eff)
+        if !ok {
+            return // 57.23's rows 6, 8 and 9 stand
+        }
+        // Sprint 57.32 §2: `git -C sub …`, `env -C sub cmd …`.
+        ccs_plan_dirs(mut p, pt)
+        if pt.command_at != 0 {
+            ccs_reenter(mut p.eff, pt.command_at)
+            depth += 1
+            continue
+        }
+        p.spec = spec
+        p.node = pt.node
+        let stem = copy p.eff.stem
+        var arg = -1
+        if pt.pending_flag >= 0 {
+            arg = ed.specs.pool[spec].nodes[pt.pending_node].flags[pt.pending_flag].arg
+            p.value_at = if pt.after_equals then pt.value_at else 0
+        } else if pt.flags_ended && ed.specs.pool[spec].nodes[pt.node].after_dashdash >= 0 {
+            arg = ed.specs.pool[spec].nodes[pt.node].after_dashdash
+        } else if pt.positional != SPEC_POS_NONE {
+            arg = compspec_slot(ed.specs.pool[spec], pt.node, pt.positional)
+        }
+        if p.row == 5 {
+            // An explicit path keeps PATH, but the spec still narrows it.
+            if arg >= 0 && ed.specs.pool[spec].args[arg].kind == SPEC_ARG_DIR {
+                p.mask = PATH_DIRS
+            }
+            if arg >= 0 && ed.specs.pool[spec].args[arg].kind == SPEC_ARG_PATH {
+                p.ext = copy ed.specs.pool[spec].args[arg].ext
+            }
+            p.id = ccs_plan_id(ed, p, pt)
+            p.has_id = true
+            return
+        }
+        p.row = SHELL_ROW_SPEC
+        p.sources = 0
+        p.mask = PATH_ANY
+        if pt.pending_flag < 0 &&
+            pt.positional != SPEC_POS_NONE &&
+            ccs_b0(stem) == 45 &&
+            !pt.flags_ended {
+            p.flags = true
+            p.dash = ed.specs.pool[spec].nodes[pt.node].dash_values >= 0
+            arg = -1
+        } else if pt.pending_flag < 0 {
+            p.subs = pt.subcommands_allowed
+        }
+        let eff = copy p.eff
+        ccs_plan_arg(ed, eff, arg, mut p)
+        if p.dash {
+            let dv = ed.specs.pool[spec].nodes[pt.node].dash_values
+            ccs_plan_arg(ed, eff, dv, mut p)
+        }
+        p.id = ccs_plan_id(ed, p, pt)
+        p.has_id = true
+        return
+    }
+    // Re-entered too often: offer nothing.
+    p.row = 1
+    p.sources = 0
+}
+
+// `shell_plan` (`cmdcomp.c:2702-2726`): where the lexer says the command
+// will run — from the shell session's directory (57.27 §4) — then the
+// walk; `where` against the workspace root.
+fn ccs_plan(mut ed: Ed, ctx: ShCtx) -> CcsPlan {
+    var p = ccs_plan_new(ctx)
+    p.root = shell_ws_root(ed)
+    let (cwd, known) = shctx_dir(ctx, shsession_cwd(ed))
+    if known {
+        let s = str_from_utf8(cwd) else |_| { "" }
+        p.has_cwd = cwd.len == 0 || s.len != 0
+        p.cwd = s
+    }
+    ccs_plan_walk(mut ed, mut p)
+    if !p.has_cwd {
+        p.where = CCS_WHERE_UNKNOWN
+    } else if comp_bytes_eq(
+        sh_dir_join(List[byte](), bytes_of(p.cwd)),
+        sh_dir_join(List[byte](), bytes_of(p.root)),
+    ) {
+        p.where = CCS_WHERE_ROOT
+    } else {
+        p.where = CCS_WHERE_MOVED
+    }
+    p
+}
+
+// `plan_note` (`cmdcomp.c:2728-2742`): the pager's note, or why nothing
+// path-like was offered.
+fn ccs_plan_note(p: CcsPlan) -> str {
+    if p.where == CCS_WHERE_ROOT {
+        return ""
+    }
+    if p.where == CCS_WHERE_UNKNOWN {
+        return "cd target unknown"
+    }
+    comp_where_note(p.root, p.cwd, COMP_WHERE_MAX)
+}
+
+/// `yew_comp_where_note` (`cmdcomp.c:2744-2808`, 57.32 §4): `in ch7/`
+/// relative to the `:!` directory when `cwd` is inside it, `in ../`
+/// above it, the absolute path elsewhere; the tail kept (after `in …`)
+/// when it would not fit `cap` bytes with C's NUL.
+pub fn comp_where_note(root_in: str, cwd_in: str, cap: int) -> str {
+    if cap < 16 {
+        return ""
+    }
+    let root = sh_dir_join(List[byte](), bytes_of(root_in))
+    let cwd = sh_dir_join(List[byte](), bytes_of(cwd_in))
+    let nr = root.len
+    let nc = cwd.len
+    var b = bytes_of("in ")
+    if nr == 0 && ccs_b0(cwd) != 47 {
+        for x in cwd {
+            (mut b).push(x)
+        }
+    } else if nc > nr &&
+        ccs_prefix(cwd, root) &&
+        (cwd[nr] as int == 47 || comp_bytes_is(root, "/")) {
+        var at = nr
+        if cwd[nr] as int == 47 {
+            at += 1
+        }
+        while at < nc {
+            (mut b).push(cwd[at])
+            at += 1
+        }
+    } else if nr > nc &&
+        ccs_prefix(root, cwd) &&
+        (root[nc] as int == 47 || comp_bytes_is(cwd, "/")) {
+        var q = if comp_bytes_is(cwd, "/") then 0 else nc
+        // An ancestor: one `..` per component below it.
+        while q < nr {
+            while q < nr && root[q] as int == 47 {
+                q += 1
+            }
+            if q >= nr {
+                break
+            }
+            for x in (if b.len > 3 then "/.." else "..").bytes() {
+                (mut b).push(x)
+            }
+            while q < nr && root[q] as int != 47 {
+                q += 1
+            }
+        }
+    } else {
+        for x in cwd {
+            (mut b).push(x)
+        }
+    }
+    if b[b.len - 1] as int != 47 {
+        (mut b).push(47 as byte)
+    }
+    if b.len >= cap {
+        // Keep the tail, the part that names the directory.
+        let keep = cap - 1 - 6
+        var from = b.len - keep
+        while from < b.len && b[from] as int & 192 == 128 {
+            from += 1
+        }
+        var o = bytes_of("in \u{2026}")
+        while from < b.len {
+            (mut o).push(b[from])
+            from += 1
+        }
+        return ccs_str(o)
+    }
+    ccs_str(b)
+}
+
+fn ccs_prefix(s: List[byte], pre: List[byte]) -> bool {
+    if s.len < pre.len {
+        return false
+    }
+    var i = 0
+    while i < pre.len {
+        if s[i] as int != pre[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_comp_shell_prewarm` (`cmdcomp.c:2810-2826`, 57.25 §6): plan the
+/// caret's word as a keystroke would — where a missing help tree is
+/// asked for — from the idle path. Only the request is made here.
+pub fn comp_shell_prewarm(mut ed: Ed, ctx: ShCtx) {
+    if ctx.pos != SH_POS_ARGUMENT {
+        return
+    }
+    let _ = ccs_plan(mut ed, ctx)
+}
+
+/// `yew_comp_shell_describe` (`cmdcomp.c:2828-2868`): the plan for `ctx`
+/// as a stable string — `sub`, `flags`, `dash`, `fish`, `exec`, `var`,
+/// `user`, `path`/`dir`/`execpath` with `:ext,…`, `values`, `gen:NAME` —
+/// joined by `+`, or `none`.
+pub fn comp_shell_describe(mut ed: Ed, ctx: ShCtx) -> str {
+    let p = ccs_plan(mut ed, ctx)
+    var parts = List[str]()
+    if p.subs {
+        (mut parts).push("sub")
+    }
+    if p.flags {
+        (mut parts).push("flags")
+    }
+    if p.dash {
+        (mut parts).push("dash")
+    }
+    if p.has_fish {
+        (mut parts).push("fish")
+    }
+    if p.sources & comp_src_bit(COMP_EXEC) != 0 {
+        (mut parts).push("exec")
+    }
+    if p.sources & comp_src_bit(COMP_VAR) != 0 {
+        (mut parts).push("var")
+    }
+    if p.sources & comp_src_bit(COMP_USER) != 0 {
+        (mut parts).push("user")
+    }
+    if p.sources & comp_src_bit(COMP_PATH) != 0 {
+        var w = if p.mask == PATH_DIRS {
+            "dir"
+        } else if p.mask == PATH_EXEC_OR_DIR {
+            "execpath"
+        } else {
+            "path"
+        }
+        var i = 0
+        while i < p.ext.len {
+            w += if i == 0 then ":{p.ext[i]}" else ",{p.ext[i]}"
+            i += 1
+        }
+        (mut parts).push(w)
+    }
+    if p.arg >= 0 && p.spec >= 0 {
+        let a = copy ed.specs.pool[p.spec].args[p.arg]
+        if a.kind == SPEC_ARG_VALUES {
+            (mut parts).push("values")
+        } else {
+            let g = if a.has_generator then a.generator else "?"
+            (mut parts).push("gen:{g}")
+        }
+    }
+    if parts.len == 0 {
+        return "none"
+    }
+    var s = parts[0]
+    var i = 1
+    while i < parts.len {
+        s += "+{parts[i]}"
+        i += 1
+    }
+    s
+}
+
+// ------------------------------------------------------------------
+// The spec and generator rows (`cmdcomp.c:2870-2978`)
+// ------------------------------------------------------------------
+
+// `spec_candidate` (`cmdcomp.c:2870-2885`): `raw` is the whole word; it
+// ranks by the part after the stem's directory head, and a row that does
+// not share the head is dropped.
+fn ccs_spec_candidate(
+    mut v: List[Candidate],
+    stem: List[byte],
+    head_len: int,
+    raw: List[byte],
+    detail: str,
+) {
+    if raw.len < head_len {
+        return
+    }
+    var i = 0
+    while i < head_len {
+        if raw[i] as int != stem[i] as int {
+            return
+        }
+        i += 1
+    }
+    let _ = candidate_add(
+        mut v,
+        comp_slice(stem, head_len, stem.len),
+        comp_slice(raw, head_len, raw.len),
+        raw,
+        detail,
+        false,
+        false,
+    )
+}
+
+// C formats a flag word into `char word[160]`: 159 bytes at most.
+fn ccs_word160(s: str) -> List[byte] {
+    var b = bytes_of(s)
+    if b.len > 159 {
+        b = comp_slice(b, 0, 159)
+    }
+    b
+}
+
+// `spec_flag_rows` (`cmdcomp.c:2887-2911`): the node's flags and its
+// ancestors' global ones.
+fn ccs_flag_rows(
+    mut v: List[Candidate],
+    spec: CompSpec,
+    node: int,
+    stem: List[byte],
+    head_len: int,
+) {
+    var n = node
+    var own = true
+    while n >= 0 {
+        for f in spec.nodes[n].flags {
+            if !own && !f.global {
+                continue
+            }
+            let d = if f.has_desc then f.desc else ""
+            if f.has_lng {
+                ccs_spec_candidate(mut v, stem, head_len, ccs_word160("--{f.lng}"), d)
+            }
+            if f.has_shrt {
+                ccs_spec_candidate(mut v, stem, head_len, ccs_word160("-{f.shrt}"), d)
+            }
+        }
+        n = spec.nodes[n].parent
+        own = false
+    }
+}
+
+// `spec_value_rows` (`cmdcomp.c:2913-2958`): a value-bearing slot's rows —
+// fixed values, a built-in generator, or a subprocess generator's cache
+// (in flight or not: the filter asks for the pager's marker itself).
+fn ccs_value_rows(
+    mut ed: Ed,
+    p: CcsPlan,
+    prefix: List[byte],
+    stem: List[byte],
+    head_len: int,
+    mut v: List[Candidate],
+    mut gv: List[Candidate],
+) {
+    let a = copy ed.specs.pool[p.spec].args[p.arg]
+    if a.kind == SPEC_ARG_VALUES {
+        for val in a.values {
+            var word = copy prefix
+            for x in val.value.bytes() {
+                (mut word).push(x)
+            }
+            ccs_spec_candidate(mut v, stem, head_len, word, if val.has_desc then val.desc else "")
+        }
+        return
+    }
+    var rows = List[GenItem]()
+    if p.has_builtin {
+        let _ = compgen_builtin(a.generator, p.make_cwd, p.makefile, p.has_makefile, mut rows)
+    } else if p.has_key {
+        let others = comphelp_inflight(ed.help) + compfish_inflight(ed.fish)
+        let _ = compgen_rows(mut ed.gen, p.key, time_now_ms(), others, mut rows)
+    }
+    for r in rows {
+        var word = copy prefix
+        for x in r.text.bytes() {
+            (mut word).push(x)
+        }
+        ccs_spec_candidate(mut gv, stem, head_len, word, if r.has_detail then r.detail else "")
+    }
+}
+
+// `spec_finish` (`cmdcomp.c:2960-2978`): ranked spec/gen rows through the
+// shell encoder.
+fn ccs_spec_finish(
+    ctx: ShCtx,
+    kind: int,
+    mut v: List[Candidate],
+    head_len: int,
+    pattern: List[byte],
+    mut out: List[CompItem],
+) -> int {
+    ccs_dedupe(mut v)
+    let (got, total) = candidate_finish(kind, mut v)
+    for it in got {
+        ccs_push(ctx, it, it.text, 0, head_len, pattern, mut out)
+    }
+    total
+}
+
+// ------------------------------------------------------------------
+// The dispatcher (`cmdcomp.c:2980-3227`)
+// ------------------------------------------------------------------
+
+/// The caret's shell context for a SHELL request's line and caret: the
+/// tolerant parse's (`cmd_parse_point`), exactly what the query read.
+/// False when the line is not a bang line at the caret.
+pub fn comp_shell_ctx_of(mut ed: Ed, line: List[byte], cursor: int) -> (bool, ShCtx) {
+    let point = cmd_parse_point(mut ed, line, cursor) else {
+        return (false, shctx_empty())
+    }
+    if !point.bang_body || !point.has_shell {
+        return (false, shctx_empty())
+    }
+    (true, copy point.shell)
+}
+
+/// `enumerate_shell` (`cmdcomp.c:2980-3196`): ONE source for all of
+/// `:!` — the plan's spec and generator rows, fish's, then the generic
+/// sub-sources (VAR, USER, BUILTIN, EXEC shadowed by a builtin, PATH
+/// where the command runs), each re-encoded for the caret's quoting.
+pub fn comp_enumerate_shell(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    out = List[CompItem]()
+    if !req.has_shell {
+        return 0
+    }
+    let (ok, ctx) = comp_shell_ctx_of(mut ed, req.shell_line, req.shell_cursor)
+    if !ok {
+        return 0
+    }
+    let plan = ccs_plan(mut ed, ctx)
+    let stem = copy ctx.stem
+    var sources = plan.sources
+    let mask = plan.mask
+    var total = 0
+    // Sprint 57.32 §3: every sub-source lists where the command runs.
+    var at = copy req
+    at.cwd = plan.cwd
+    at.has_cwd = plan.has_cwd
+    at.cwd_moved = plan.where != CCS_WHERE_ROOT
+    var items = List[CompItem]()
+    if plan.subs || plan.flags || plan.arg >= 0 {
+        let head_len = comp_path_head_len(stem)
+        let pattern = comp_slice(stem, head_len, stem.len)
+        var spec_rows = List[Candidate]()
+        var gen_rows = List[Candidate]()
+        if plan.subs {
+            let node = copy ed.specs.pool[plan.spec].nodes[plan.node]
+            for k in node.subs {
+                let sub = copy ed.specs.pool[plan.spec].nodes[k]
+                let d = if sub.has_desc then sub.desc else ""
+                ccs_spec_candidate(mut spec_rows, stem, head_len, bytes_of(sub.name), d)
+                for al in sub.aliases {
+                    ccs_spec_candidate(mut spec_rows, stem, head_len, bytes_of(al), d)
+                }
+            }
+        }
+        if plan.flags {
+            ccs_flag_rows(mut spec_rows, ed.specs.pool[plan.spec], plan.node, stem, head_len)
+        }
+        if plan.arg >= 0 {
+            var prefix = comp_slice(
+                stem,
+                0,
+                if plan.value_at < stem.len then plan.value_at else stem.len,
+            )
+            if plan.dash {
+                prefix = bytes_of("-")
+            }
+            ccs_value_rows(mut ed, plan, prefix, stem, head_len, mut spec_rows, mut gen_rows)
+        }
+        total += ccs_spec_finish(ctx, COMP_SPEC, mut spec_rows, head_len, pattern, mut items)
+        total += ccs_spec_finish(ctx, COMP_GEN, mut gen_rows, head_len, pattern, mut items)
+    }
+    if plan.has_fish {
+        // Sprint 57.26 §2: fish's rows rank as GEN rows; the REAL stem
+        // filters here; a directory carries its `/` back into the word.
+        let head_len = comp_path_head_len(stem)
+        var fish_rows = List[Candidate]()
+        for r in plan.fish_rows {
+            let tb = bytes_of(r.text)
+            var raw = copy tb
+            if r.is_dir {
+                (mut raw).push(47 as byte)
+            }
+            if tb.len < head_len || !ccs_prefix(tb, comp_slice(stem, 0, head_len)) {
+                continue
+            }
+            let _ = candidate_add(
+                mut fish_rows,
+                comp_slice(stem, head_len, stem.len),
+                comp_slice(tb, head_len, tb.len),
+                raw,
+                if r.has_desc then r.desc else "",
+                r.is_dir,
+                false,
+            )
+        }
+        total += ccs_spec_finish(
+            ctx,
+            COMP_GEN,
+            mut fish_rows,
+            head_len,
+            comp_slice(stem, head_len, stem.len),
+            mut items,
+        )
+    }
+    var got = List[CompItem]()
+    if sources & comp_src_bit(COMP_VAR) != 0 {
+        total += ccs_sub(mut ed, at, COMP_VAR, stem, PATH_ANY, List[str](), mut got)
+        for it in got {
+            ccs_push(ctx, it, it.ranked, 0, 0, stem, mut items)
+        }
+    }
+    if sources & comp_src_bit(COMP_USER) != 0 {
+        total += ccs_sub(mut ed, at, COMP_USER, stem, PATH_ANY, List[str](), mut got)
+        for it in got {
+            let raw = copy it.text // `~name/`
+            ccs_push(ctx, it, raw, raw.len, 0, stem, mut items)
+        }
+    }
+    var builtins_start = 0
+    var builtins_end = 0
+    if sources & comp_src_bit(COMP_BUILTIN) != 0 {
+        total += ccs_sub(mut ed, at, COMP_BUILTIN, stem, PATH_ANY, List[str](), mut got)
+        builtins_start = items.len
+        for it in got {
+            ccs_push(ctx, it, it.ranked, 0, 0, stem, mut items)
+        }
+        builtins_end = items.len
+    }
+    if sources & comp_src_bit(COMP_EXEC) != 0 {
+        total += ccs_sub(mut ed, at, COMP_EXEC, stem, PATH_ANY, List[str](), mut got)
+        for it0 in got {
+            var it = copy it0
+            // The shell runs a builtin before anything on $PATH.
+            var shadowed = false
+            var b = builtins_start
+            while b < builtins_end {
+                if comp_bytes_eq(items[b].ranked, it.ranked) {
+                    shadowed = true
+                    break
+                }
+                b += 1
+            }
+            if shadowed {
+                if total != 0 {
+                    total -= 1
+                }
+                continue
+            }
+            // §7: a command with a spec shows its description, from the
+            // index — never a parse per keystroke.
+            let (has, described) = compspec_describe(mut ed.specs, ccs_str(it.ranked))
+            if has {
+                it.detail = described
+            }
+            let raw = copy it.ranked
+            ccs_push(ctx, it, raw, 0, 0, stem, mut items)
+        }
+    }
+    // Sprint 57.32 §3: with the directory unknown a relative path could
+    // name a file in the wrong place; an absolute or `~` path cannot.
+    let va = if plan.value_at < stem.len then plan.value_at else stem.len
+    let vb = if va < stem.len then stem[va] as int else 0
+    if sources & comp_src_bit(COMP_PATH) != 0 &&
+        !plan.has_cwd &&
+        vb != 47 &&
+        !(vb == 126 && plan.eff.tilde && va == 0) {
+        sources -= comp_src_bit(COMP_PATH)
+    }
+    if sources & comp_src_bit(COMP_PATH) != 0 {
+        // A QUOTED leading `~` is a literal name: ask for `./~x` and take
+        // the `./` back off every row. After `--flag=` the path is the
+        // VALUE; the flag rides in front of every row.
+        let value = comp_slice(stem, va, stem.len)
+        let pre = va
+        var sub_stem = copy value
+        var strip = 0
+        if ccs_b0(value) == 126 && (!plan.eff.tilde || pre != 0) {
+            sub_stem = bytes_of("./")
+            for x in value {
+                (mut sub_stem).push(x)
+            }
+            strip = 2
+        }
+        let head_len = comp_path_head_len(sub_stem)
+        total += ccs_sub(mut ed, at, COMP_PATH, sub_stem, mask, plan.ext, mut got)
+        for it in got {
+            var raw = comp_slice(stem, 0, pre)
+            var k = strip
+            while k < head_len {
+                (mut raw).push(sub_stem[k])
+                k += 1
+            }
+            for x in it.ranked {
+                (mut raw).push(x)
+            }
+            if it.is_dir {
+                (mut raw).push(47 as byte)
+            }
+            var prefix = 0
+            if pre == 0 && plan.eff.tilde && ccs_b0(raw) == 126 {
+                var s = 0
+                while s < raw.len && raw[s] as int != 47 {
+                    s += 1
+                }
+                prefix = if s < raw.len then s + 1 else 0
+            }
+            ccs_push(
+                ctx,
+                it,
+                raw,
+                prefix,
+                pre + head_len - strip,
+                comp_slice(sub_stem, head_len, sub_stem.len),
+                mut items,
+            )
+        }
+    }
+    out = items
+    total
+}
+
+// `enumerate_spec_kind` (`cmdcomp.c:3198-3217`): the dispatcher's rows of
+// that one kind, for a request that carries a shell context.
+fn ccs_spec_kind(mut ed: Ed, req: CompReq, kind: int, mut out: List[CompItem]) -> int {
+    out = List[CompItem]()
+    if !req.has_shell {
+        return 0
+    }
+    var all = List[CompItem]()
+    let _ = comp_enumerate_shell(mut ed, req, mut all)
+    var kept = 0
+    var keep = List[CompItem]()
+    for it in all {
+        if it.kind == kind {
+            (mut keep).push(copy it)
+            kept += 1
+        }
+    }
+    out = keep
+    kept
+}
+
+/// `enumerate_spec` (`cmdcomp.c:3219-3222`).
+pub fn comp_enumerate_spec(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    ccs_spec_kind(mut ed, req, COMP_SPEC, mut out)
+}
+
+/// `enumerate_gen` (`cmdcomp.c:3224-3227`).
+pub fn comp_enumerate_gen(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
+    ccs_spec_kind(mut ed, req, COMP_GEN, mut out)
+}
+
+// ------------------------------------------------------------------
+// The filter's half (`cmdcomp.c:3536-3590`, `3776-3780`)
+// ------------------------------------------------------------------
+
+// A key's bytes as text: argv[0] verbatim when it is UTF-8, else hex
+// (C appends the raw bytes; the port's key is a `str`).
+fn ccs_key_bytes(b: List[byte]) -> str {
+    let s = str_from_utf8(b) else |_| {
+        let hex = "0123456789abcdef"
+        var h = List[byte]()
+        (mut h).push(0 as byte)
+        for x in b {
+            (mut h).push(hex.bytes()[x as int >> 4])
+            (mut h).push(hex.bytes()[x as int & 15])
+        }
+        return str_from_utf8(h) else ""
+    }
+    s
+}
+
+/// `shell_ctx_key` (`cmdcomp.c:3542-3590`, 57.23 §5): the SHELL answer's
+/// identity beyond head and pattern — the routing row, the position, the
+/// quote state, the brace, tilde and `--` flags, the sources and mask,
+/// argv[0], the resolved node path and slot (57.24), the directory the
+/// command runs in (57.32), and the pending generator, fish or help key
+/// (57.24-57.26); with the pager's `where` note.
+pub fn comp_shell_ctx_key(mut ed: Ed, q: CompQuery) -> CompShellKey {
+    var k = compshellkey_none()
+    if q.kind != COMP_SHELL || !q.has_shell {
+        return k
+    }
+    let (ok, ctx) = comp_shell_ctx_of(mut ed, q.shell_line, q.shell_cursor)
+    if !ok {
+        return k
+    }
+    let plan = ccs_plan(mut ed, ctx)
+    k.where = ccs_plan_note(plan)
+    let bv = if ctx.brace_var then 1 else 0
+    let ti = if ctx.tilde then 1 else 0
+    let dd = if ctx.dashdash then 1 else 0
+    var key = "{plan.row}|{ctx.pos}|{ctx.quote}|{bv}|{ti}|{dd}|{plan.sources}|{plan.mask}|"
+    if ctx.argc != 0 && ctx.argv.len != 0 {
+        key += ccs_key_bytes(ctx.argv[0])
+    }
+    if plan.has_id {
+        key += "|{plan.id}"
+    }
+    let cwd = if plan.has_cwd then plan.cwd else "?"
+    key += "|cwd:{cwd}"
+    if plan.has_key {
+        k.gen_key = compgen_key_string(plan.key)
+        k.has_gen = true
+        key += "|{k.gen_key}"
+    } else if plan.has_fish_key {
+        k.gen_key = plan.fish_key
+        k.has_gen = true
+        key += "|{k.gen_key}"
+    } else if plan.has_help_key {
+        k.gen_key = plan.help_key
+        k.has_gen = true
+        key += "|help:{k.gen_key}"
+    }
+    k.key = key
+    k.has_key = true
+    k
+}
+
+/// `yew_compgen_awaiting || yew_comphelp_awaiting ||
+/// yew_compfish_awaiting` (`cmdcomp.c:3683-3686`): a job that would
+/// change these rows is in flight.
+pub fn comp_shell_awaiting(ed: Ed, gen_key: str) -> bool {
+    compgen_awaiting(ed.gen, gen_key) ||
+        comphelp_awaiting(ed.help, gen_key) ||
+        compfish_awaiting(ed.fish, gen_key)
+}
+
+/// `yew_compfish_idle_ready() || yew_comphelp_idle_ready()`
+/// (`cmdline.c:1062-1063`): a fish or `--help` request is queued and
+/// could be spawned now (the four completion slots shared with the
+/// generators). The prompt's idle predicate reads it.
+pub fn comp_shell_idle_ready(ed: Ed) -> bool {
+    let gen = compgen_inflight(ed.gen)
+    compfish_idle_ready(ed.fish, gen + comphelp_inflight(ed.help)) ||
+        comphelp_idle_ready(ed.help, gen + compfish_inflight(ed.fish))
+}
+
+/// The tail of `yew_cmdline_comp_idle` (`cmdline.c:1088-1094`): fish is
+/// the rung above help, so its request goes first; one spawn a turn.
+/// Each refuses by name at 0.2.33 (R-yw04-1) and its refusal re-ranks
+/// the menu that waited. Answers the jobs started (0).
+pub fn comp_shell_idle(mut ed: Ed) -> int {
+    let gen = compgen_inflight(ed.gen)
+    if compfish_idle(mut ed, gen + comphelp_inflight(ed.help)) != 0 {
+        return 1
+    }
+    comphelp_idle(mut ed, compgen_inflight(ed.gen) + compfish_inflight(ed.fish))
+}
 
 /// The caret's shell context completes nothing (`point->shell->pos ==
 /// YEW_SH_POS_NONE`, `cmdcomp.c:3776-3780`: a comment, a heredoc
-/// delimiter, arithmetic, a case body).
+/// delimiter, arithmetic, a case body): Tab inserts a literal tab. A
+/// point the parser built carries its context; one without (C's NULL
+/// `point->shell`, a host's hand-made point) is lexed from `line`.
 pub fn comp_shell_point_none(
     mut ed: Ed,
     point: CmdParsePoint,
     line: List[byte],
     cursor: int,
 ) -> bool {
-    shell_refuse(mut ed, "the :! shell context at {cursor} of {line.len} ({point.body})", "57.23")
-    false
-}
-
-/// `exec_keep` (`cmdcomp.c:1241-1272`).
-pub fn comp_exec_keep(scan_dir: str, row: List[byte], force_unknown: bool) -> bool {
-    false
-}
-
-/// `enumerate_exec` (`cmdcomp.c:1605-1646`).
-pub fn comp_enumerate_exec(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    shell_refuse(mut ed, "the $PATH executable source", "57.18")
-    out = List[CompItem]()
-    0
-}
-
-/// `enumerate_shell` (`cmdcomp.c:2980-3196`).
-pub fn comp_enumerate_shell(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    shell_refuse(mut ed, "the :! dispatcher", "57.23")
-    out = List[CompItem]()
-    0
-}
-
-/// `enumerate_vars` (`cmdcomp.c:1771-1799`).
-pub fn comp_enumerate_vars(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    shell_refuse(mut ed, "the environment source", "57.23")
-    out = List[CompItem]()
-    0
-}
-
-/// `enumerate_users` (`cmdcomp.c:1822-1865`).
-pub fn comp_enumerate_users(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    shell_refuse(mut ed, "the user source", "57.23")
-    out = List[CompItem]()
-    0
-}
-
-/// `enumerate_builtins` (`cmdcomp.c:1900-1911`).
-pub fn comp_enumerate_builtins(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    shell_refuse(mut ed, "the builtin source", "57.23")
-    out = List[CompItem]()
-    0
-}
-
-/// `enumerate_spec` (`cmdcomp.c:3219-3222`).
-pub fn comp_enumerate_spec(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    shell_refuse(mut ed, "the completion spec source", "57.24")
-    out = List[CompItem]()
-    0
-}
-
-/// `enumerate_gen` (`cmdcomp.c:3224-3227`).
-pub fn comp_enumerate_gen(mut ed: Ed, req: CompReq, mut out: List[CompItem]) -> int {
-    shell_refuse(mut ed, "the generator source", "57.24")
-    out = List[CompItem]()
-    0
+    if point.has_shell {
+        return point.shell.pos == SH_POS_NONE
+    }
+    let (ok, ctx) = comp_shell_ctx_of(mut ed, line, cursor)
+    ok && ctx.pos == SH_POS_NONE
 }

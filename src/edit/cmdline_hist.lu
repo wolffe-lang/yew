@@ -1,0 +1,830 @@
+//! edit.cmdline_hist — the prompt's history: open and release, the smart
+//! walk, C-r's history pager, A-. and the token walk, A-s.
+//!
+//! Ports the history half of sagitta `src/ui/cmdline.c` at 9ace98c2:
+//! `history_open`/`history_release`/`history_add_closed_prompt`
+//! (`cmdline.c:372-461`), the s57.30 walk (`walk_begin`, `history_move`,
+//! `yew_cmdline_hist_match`, `cmdline.c:1369-1514`), C-r
+//! (`hsearch_*`, `cmdline.c:1516-1700`), the s57.26 snapshot
+//! (`suggest_ensure`, `cmdline.c:2349-2387`), A-. (`last_word`,
+//! `yew_cmdline_cmd_last_arg`, `cmdline.c:2629-2717`), the token walk
+//! (`tok_*`, `token_walk`, `cmdline.c:2719-2960`) and A-s (`sudo_prefix`,
+//! `yew_cmdline_cmd_toggle_sudo`, `cmdline.c:2962-3068`), over the
+//! grammar fork's `edit.cmdhist` and `edit.cmdparse`. C's history is a
+//! pointer the prompt holds and three cached in-memory histories; the
+//! port's is a value in `CmdLine` with a `has_` flag, and the cache is a
+//! list of three. A history scoped to the workspace's state
+//! (`yew_hist_open_scoped` under `ed->state.ready`, Sprint 25) waits for
+//! the workspace state (yw06): until then the global history is the one,
+//! which is C's own answer without a ready state (`cmdline.c:418`).
+
+use text
+use ws
+
+// `history_kind` (`cmdline.c:376-388`).
+fn history_kind(kind: int) -> str {
+    if kind == PROMPT_SEARCH_F || kind == PROMPT_SEARCH_B {
+        return "search"
+    }
+    if kind == PROMPT_INPUT then "input" else "cmd"
+}
+
+// `history_slot` (`cmdline.c:390-395`).
+fn history_slot(kind: int) -> int {
+    if kind == PROMPT_SEARCH_F || kind == PROMPT_SEARCH_B {
+        return 1
+    }
+    if kind == PROMPT_INPUT then 2 else 0
+}
+
+// `history_open` (`cmdline.c:397-422`): a cached in-memory history comes
+// back; `--clean` keeps one in memory; otherwise the global file.
+fn cl_history_open(mut ed: Ed, kind: int) {
+    let slot = history_slot(kind)
+    if ed.cmdline.memory_has[slot] {
+        ed.cmdline.history = ed.cmdline.memory_history[slot]
+        ed.cmdline.memory_history[slot] = hist_open_memory()
+        ed.cmdline.memory_has[slot] = false
+        ed.cmdline.has_history = true
+        return
+    }
+    if ed.clean {
+        ed.cmdline.history = hist_open_memory()
+    } else {
+        ed.cmdline.history = hist_open(history_kind(kind))
+    }
+    ed.cmdline.has_history = true
+}
+
+// `history_release` (`cmdline.c:424-441`): flushed; an in-memory one
+// goes back to its cache slot.
+fn cl_history_release(mut ed: Ed, kind: int) {
+    if !ed.cmdline.has_history {
+        return
+    }
+    hist_flush(mut ed.cmdline.history)
+    ed.cmdline.has_history = false
+    if !hist_is_memory(ed.cmdline.history) {
+        ed.cmdline.history = hist_open_memory()
+        return
+    }
+    let slot = history_slot(kind)
+    if ed.cmdline.memory_has[slot] {
+        bug("two live in-memory histories for one prompt kind")
+    }
+    ed.cmdline.memory_history[slot] = ed.cmdline.history
+    ed.cmdline.memory_has[slot] = true
+    ed.cmdline.history = hist_open_memory()
+}
+
+fn cl_history_dispose(mut ed: Ed) {
+    var i = 0
+    while i < ed.cmdline.memory_has.len {
+        ed.cmdline.memory_has[i] = false
+        ed.cmdline.memory_history[i] = hist_open_memory()
+        i += 1
+    }
+}
+
+fn cl_history_add(mut ed: Ed, line: List[byte]) {
+    if ed.cmdline.has_history {
+        hist_add(mut ed.cmdline.history, line)
+    }
+}
+
+// `history_add_closed_prompt` (`cmdline.c:443-461`): a command that
+// replaced its prompt with another of the same family adds there.
+fn cl_history_add_closed(mut ed: Ed, kind: int, line: List[byte]) {
+    if ed.cmdline.active && history_slot(ed.cmdline.kind) == history_slot(kind) {
+        cl_history_add(mut ed, line)
+        return
+    }
+    let slot = history_slot(kind)
+    var h = hist_open_memory()
+    if ed.cmdline.memory_has[slot] {
+        h = ed.cmdline.memory_history[slot]
+        ed.cmdline.memory_history[slot] = hist_open_memory()
+        ed.cmdline.memory_has[slot] = false
+    } else if !ed.clean {
+        h = hist_open(history_kind(kind))
+    }
+    hist_add(mut h, line)
+    hist_flush(mut h)
+    if hist_is_memory(h) {
+        ed.cmdline.memory_history[slot] = h
+        ed.cmdline.memory_has[slot] = true
+    }
+}
+
+// ---- the snapshot (s57.26 §3) -----------------------------------------
+
+fn cl_suggest_reset(mut ed: Ed) {
+    ed.cmdline.suggest = hist_suggest_new()
+    ed.cmdline.suggest_loaded = false
+}
+
+// `suggest_all_shells` (`cmdline.c:2337-2347`): `shell.suggest_history`
+// is `all` (the default) or `yew`.
+fn suggest_all_shells(ed: Ed) -> bool {
+    let v = ed.opts.store["shell.suggest_history"] else "all"
+    v != "yew"
+}
+
+// `suggest_ensure` (`cmdline.c:2360-2387`): yew's own bang bodies newest
+// first, then (under `all`) the shells' files; once per prompt.
+fn suggest_ensure(mut ed: Ed) {
+    if ed.cmdline.suggest_loaded {
+        return
+    }
+    ed.cmdline.suggest_loaded = true
+    ed.cmdline.suggest = hist_suggest_new()
+    if ed.cmdline.has_history {
+        var i = hist_len(ed.cmdline.history)
+        while i > 0 {
+            i -= 1
+            let entry = hist_at(ed.cmdline.history, i) else {
+                continue
+            }
+            let body = cmd_bang_body(ed, entry) else {
+                continue
+            }
+            let _ = hist_suggest_add(mut ed.cmdline.suggest, entry, body, entry.len - body)
+        }
+    }
+    if suggest_all_shells(ed) {
+        hist_suggest_read_shells(mut ed.cmdline.suggest)
+    }
+}
+
+// ---- the smart walk (s57.30 §2) ---------------------------------------
+
+fn cl_walk_end(mut ed: Ed) {
+    hist_walk_end(mut ed.cmdline.walk)
+}
+
+fn is_blank(c: int) -> bool {
+    c == 32 || c == 9
+}
+
+// `walk_begin` (`cmdline.c:1381-1399`): a bang line walks the snapshot
+// from its body (leading blanks dropped); any other line its own history.
+fn walk_begin(mut ed: Ed, line: List[byte]) {
+    var body = 0
+    var bang = false
+    if ed.cmdline.kind == PROMPT_CMD {
+        let b = cmd_bang_body(ed, line) else -1
+        if b >= 0 && b <= line.len {
+            bang = true
+            body = b
+        }
+    }
+    ed.cmdline.walk_bang = bang
+    ed.cmdline.walk_prefix = body
+    var term = body
+    if bang {
+        while term < line.len && is_blank(line[term] as int) {
+            term += 1
+        }
+    }
+    hist_walk_begin(mut ed.cmdline.walk, line, line[term..line.len])
+}
+
+fn walk_view(mut ed: Ed) -> int {
+    if ed.cmdline.walk_bang {
+        suggest_ensure(mut ed)
+        return VIEW_SUGGEST
+    }
+    VIEW_HIST
+}
+
+fn walk_showing(ed: Ed) -> bool {
+    ed.cmdline.walk.on && ed.cmdline.walk.seen.len != 0
+}
+
+// `walk_show` (`cmdline.c:1428-1450`): the draft's prefix and `entry`,
+// the walk kept; the hint refreshed (the table stays closed).
+fn walk_show(mut ed: Ed, entry: List[byte]) -> int {
+    var bytes = List[byte]()
+    let prefix = ed.cmdline.walk_prefix
+    var i = 0
+    while i < prefix && i < ed.cmdline.walk.draft.len {
+        (mut bytes).push(ed.cmdline.walk.draft[i])
+        i += 1
+    }
+    sanitize_bytes(entry, mut bytes)
+    if !replace_span(mut ed, text.span(0, cmdline_len(ed)), bytes, false) {
+        return CMD_ERR_IO
+    }
+    cl_refilter(mut ed)
+    CMD_OK
+}
+
+// `history_move` (`cmdline.c:1452-1476`).
+fn history_move(mut ed: Ed, previous: bool) -> int {
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if !ed.cmdline.walk.on {
+        walk_begin(mut ed, cmdline_text(ed))
+    }
+    let v = walk_view(mut ed)
+    if previous {
+        let found = hist_walk_older(
+            mut ed.cmdline.walk,
+            ed.cmdline.history,
+            ed.cmdline.suggest,
+            v,
+        ) else {
+            return CMD_OK
+        }
+        return walk_show(mut ed, found)
+    }
+    let (found, at_draft) = hist_walk_newer(
+        mut ed.cmdline.walk,
+        ed.cmdline.history,
+        ed.cmdline.suggest,
+        v,
+    ) else {
+        return CMD_OK
+    }
+    if !at_draft {
+        return walk_show(mut ed, found)
+    }
+    let draft = copy ed.cmdline.walk.draft
+    if !replace_all(mut ed, draft, false) {
+        return CMD_ERR_IO
+    }
+    cl_refilter(mut ed)
+    CMD_OK
+}
+
+/// `yew_cmdline_hist_match` (`cmdline.c:1478-1504`): the bytes of the
+/// line the history highlight covers — the first occurrence of the walk's
+/// term in the walked entry. STATE, never text.
+pub fn cmdline_hist_match(ed: Ed) -> (bool, text.Span) {
+    if !ed.cmdline.active || !walk_showing(ed) || ed.cmdline.walk.term.len == 0 {
+        return (false, text.span(0, 0))
+    }
+    let line = cmdline_text(ed)
+    let prefix = ed.cmdline.walk_prefix
+    if prefix > line.len {
+        return (false, text.span(0, 0))
+    }
+    let at = hist_find(line[prefix..line.len], ed.cmdline.walk.term) else {
+        return (false, text.span(0, 0))
+    }
+    (true, text.span(prefix + at, prefix + at + ed.cmdline.walk.term.len))
+}
+
+/// `ed.cmdline.hist_prev` (`yew_cmdline_cmd_hist_prev`).
+pub fn cmdline_hist_prev_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    history_move(mut ed, true)
+}
+
+/// `ed.cmdline.hist_next` (`yew_cmdline_cmd_hist_next`).
+pub fn cmdline_hist_next_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    history_move(mut ed, false)
+}
+
+// ---- C-r (s57.30 §4) --------------------------------------------------
+
+// `YEW_CMDLINE_HSEARCH_ROWS` (`cmdline.c:1525`).
+const HSEARCH_ROWS: int = 512
+
+fn hsearch_mode() -> str {
+    "history search"
+}
+
+// `history_source` (`cmdline.c:1531-1553`): (the view, the prefix the
+// entry goes after, where the term starts).
+fn history_source(mut ed: Ed, line: List[byte]) -> (int, int, int) {
+    if ed.cmdline.kind == PROMPT_CMD {
+        let b = cmd_bang_body(ed, line) else -1
+        if b >= 0 && b <= line.len {
+            var term = b
+            while term < line.len && is_blank(line[term] as int) {
+                term += 1
+            }
+            suggest_ensure(mut ed)
+            return (VIEW_SUGGEST, b, term)
+        }
+    }
+    (VIEW_HIST, 0, 0)
+}
+
+// `hsearch_refilter` (`cmdline.c:1555-1612`): every entry holding the
+// line's term, newest first, its match highlighted; the newest selected.
+fn hsearch_refilter(mut ed: Ed) {
+    let line = cmdline_text(ed)
+    let (v, _, term) = history_source(mut ed, line)
+    let pat = line[term..line.len]
+    let n = hist_view_len(ed.cmdline.history, ed.cmdline.suggest, v)
+    var items = List[CompItem]()
+    var total = 0
+    var i = 0
+    while i < n {
+        let entry = hist_view_at(ed.cmdline.history, ed.cmdline.suggest, v, i) else {
+            i += 1
+            continue
+        }
+        i += 1
+        let at = hist_find(entry, pat) else {
+            continue
+        }
+        total += 1
+        if items.len < HSEARCH_ROWS {
+            var item = compitem_text(entry, COMP_CMD)
+            var k = 0
+            while k < pat.len && k < ws.FZ_MAX_POS && at + k <= 65535 {
+                (mut item.m.pos).push(at + k)
+                k += 1
+            }
+            (mut items).push(item)
+        }
+    }
+    menu_unselect(mut ed.cmdline.menu)
+    if items.len == 0 {
+        menu_dismiss(mut ed.cmdline.menu)
+        ed.cmdline.hint = "{hsearch_mode()}: no match"
+    } else {
+        ed.cmdline.menu.items = items
+        menu_reset(mut ed.cmdline.menu, total, text.span(0, line.len))
+        let _ = menu_select(mut ed.cmdline.menu, 0)
+        ed.cmdline.hint = hsearch_mode()
+    }
+    ed.cmdline.menu.where = hsearch_mode()
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+// `hsearch_end` (`cmdline.c:1614-1625`).
+fn hsearch_end(mut ed: Ed) {
+    ed.cmdline.hsearch = false
+    ed.cmdline.hsearch_line = List[byte]()
+    cl_menu_discard(mut ed)
+    ed.cmdline.hint = ""
+    cl_refilter(mut ed)
+}
+
+// `hsearch_select` (`cmdline.c:1627-1646`).
+fn hsearch_select(mut ed: Ed, index_in: int) -> int {
+    let n = ed.cmdline.menu.items.len
+    if n == 0 {
+        return CMD_OK
+    }
+    var index = index_in
+    if index < 0 {
+        index = 0
+    }
+    if index > n - 1 {
+        index = n - 1
+    }
+    let _ = menu_select(mut ed.cmdline.menu, index)
+    ed.full_damage = true
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+fn hsearch_move(mut ed: Ed, delta: int) -> int {
+    hsearch_select(mut ed, ed.cmdline.menu.sel + delta)
+}
+
+fn hsearch_page(mut ed: Ed, previous: bool) -> int {
+    let rows = if ed.cmdline.menu.spec.max_rows == 0 then 1 else ed.cmdline.menu.spec.max_rows
+    hsearch_select(mut ed, ed.cmdline.menu.sel + (if previous then -rows else rows))
+}
+
+// `hsearch_accept` (`cmdline.c:1660-1685`): the row into the line (after
+// a bang line's `!`), NOT run.
+fn cl_hsearch_accept(mut ed: Ed) -> int {
+    var status = CMD_OK
+    let sel = menu_selected(ed.cmdline.menu)
+    if sel >= 0 {
+        let line = cmdline_text(ed)
+        let (_, prefix, _) = history_source(mut ed, line)
+        var bytes = line[0..prefix]
+        sanitize_bytes(ed.cmdline.menu.items[sel].text, mut bytes)
+        if !replace_span(mut ed, text.span(0, line.len), bytes, true) {
+            status = CMD_ERR_IO
+        }
+    }
+    hsearch_end(mut ed)
+    status
+}
+
+// `hsearch_cancel` (`cmdline.c:1687-1699`): the line as C-r found it.
+fn cl_hsearch_cancel(mut ed: Ed) -> int {
+    var status = CMD_OK
+    let saved = copy ed.cmdline.hsearch_line
+    if !replace_all(mut ed, saved, true) {
+        status = CMD_ERR_IO
+    }
+    hsearch_end(mut ed)
+    status
+}
+
+/// `ed.cmdline.hist_search` (`yew_cmdline_cmd_hist_search`,
+/// `cmdline.c:1701-1720`): C-r opens the pager on history matching the
+/// line, or, open already, moves to the next OLDER match.
+pub fn cmdline_hist_search_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if ed.cmdline.hsearch {
+        return hsearch_move(mut ed, 1)
+    }
+    cl_walk_end(mut ed)
+    cl_menu_discard(mut ed)
+    ed.cmdline.hsearch = true
+    ed.cmdline.hsearch_line = cmdline_text(ed)
+    hsearch_refilter(mut ed)
+    CMD_OK
+}
+
+// ---- A-. (s57.28 §4) --------------------------------------------------
+
+// `last_word` (`cmdline.c:2629-2658`): a bang entry's last shell word
+// (raw, quotes and escapes honoured, `cl_shell_word_before`), else the
+// last blank-delimited token; empty when the entry ends in a blank.
+fn last_word(ed: Ed, entry: List[byte]) -> text.Span {
+    let n = entry.len
+    let body = cmd_bang_body(ed, entry) else -1
+    if body >= 0 {
+        return cl_shell_word_before(entry, body, n)
+    }
+    var lo = n
+    while lo > 0 && !is_blank(entry[lo - 1] as int) {
+        lo -= 1
+    }
+    text.span(lo, n)
+}
+
+/// `ed.cmdline.last_arg` (`yew_cmdline_cmd_last_arg`,
+/// `cmdline.c:2669-2717`): the newest entry's last word at the caret;
+/// each further consecutive A-. replaces it with the next older entry's;
+/// past the oldest it stays.
+pub fn cmdline_last_arg_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    if !ed.cmdline.has_history {
+        return CMD_OK
+    }
+    let again = ed.cmdline.last_arg_seq != 0 &&
+        ed.cmdline.last_arg_gen == ed.cmdline.generation &&
+        ed.invoke_seq == ed.cmdline.last_arg_seq + 1
+    var i = if again then ed.cmdline.last_arg_entry else hist_len(ed.cmdline.history)
+    let caret = cmdline_caret(ed)
+    var replace = text.span(caret, caret)
+    if again {
+        replace = copy ed.cmdline.last_arg_span
+    } else {
+        let (has, sel) = cmdline_selection(ed)
+        if has {
+            replace = sel
+        }
+    }
+    while i > 0 {
+        i -= 1
+        let entry = hist_at(ed.cmdline.history, i) else {
+            continue
+        }
+        if entry.len == 0 {
+            continue
+        }
+        let word = last_word(ed, entry)
+        if word.lo >= word.hi {
+            continue
+        }
+        if !replace_span(mut ed, replace, entry[word.lo..word.hi], true) {
+            return CMD_ERR_IO
+        }
+        ed.cmdline.last_arg_entry = i
+        ed.cmdline.last_arg_span = text.span(replace.lo, replace.lo + word.hi - word.lo)
+        ed.cmdline.last_arg_seq = ed.invoke_seq
+        ed.cmdline.last_arg_gen = ed.cmdline.generation
+        cl_menu_discard(mut ed)
+        cmdline_edited(mut ed)
+        return CMD_OK
+    }
+    if again {
+        ed.cmdline.last_arg_seq = ed.invoke_seq
+    }
+    CMD_OK
+}
+
+// ---- the token walk (s57.30 §5) ---------------------------------------
+
+// `YEW_TOK_WORDS_MAX` (`cmdline.c:2731`).
+const TOK_WORDS_MAX: int = 256
+
+// `tok_words` (`cmdline.c:2738-2771`): the raw words of `s[at..end)` —
+// split at UNQUOTED blanks when `shell`; at most `cap`; offsets absolute.
+fn tok_words(s: List[byte], at: int, end: int, shell: bool, cap: int) -> List[text.Span] {
+    var out = List[text.Span]()
+    var i = at
+    while i < end && out.len < cap {
+        while i < end && is_blank(s[i] as int) {
+            i += 1
+        }
+        if i >= end {
+            break
+        }
+        let lo = i
+        var q = 0
+        while i < end && (q != 0 || !is_blank(s[i] as int)) {
+            let c = s[i] as int
+            if shell && q != 39 && c == 92 && i + 1 < end {
+                i += 1
+            } else if shell && q == 0 && (c == 39 || c == 34) {
+                q = c
+            } else if shell && q != 0 && c == q {
+                q = 0
+            }
+            i += 1
+        }
+        (mut out).push(text.span(lo, i))
+    }
+    out
+}
+
+// `tok_at` (`cmdline.c:2773-2810`): the token under the caret; empty at
+// the caret between words. Answers (span, bang).
+fn tok_at(ed: Ed, line: List[byte], caret: int) -> (text.Span, bool) {
+    var bang = false
+    var body = 0
+    if ed.cmdline.kind == PROMPT_CMD {
+        let b = cmd_bang_body(ed, line) else -1
+        if b >= 0 && b <= caret {
+            bang = true
+            body = b
+        }
+    }
+    if bang {
+        let lo = cl_shell_word_start(line, body, caret)
+        let words = tok_words(line, lo, line.len, true, 1)
+        if words.len == 1 && words[0].lo == lo {
+            return (text.span(lo, words[0].hi), true)
+        }
+        return (text.span(lo, caret), true)
+    }
+    for w in tok_words(line, 0, line.len, false, TOK_WORDS_MAX) {
+        if w.lo <= caret && caret <= w.hi {
+            return (w, false)
+        }
+    }
+    (text.span(caret, caret), false)
+}
+
+fn cl_tok_forget(mut ed: Ed) {
+    ed.cmdline.tok_term = List[byte]()
+    ed.cmdline.tok_seen = List[TokHit]()
+    ed.cmdline.tok_seq = 0
+}
+
+fn tok_view(mut ed: Ed) -> int {
+    if ed.cmdline.tok_bang {
+        suggest_ensure(mut ed)
+        return VIEW_SUGGEST
+    }
+    VIEW_HIST
+}
+
+fn tok_same(a: List[byte], a0: int, a1: int, b: List[byte]) -> bool {
+    if a1 - a0 != b.len {
+        return false
+    }
+    var i = 0
+    while i < b.len {
+        if a[a0 + i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `tok_repeat` (`cmdline.c:2850-2866`).
+fn tok_repeat(ed: Ed, v: int, entry: List[byte], lo: int, hi: int) -> bool {
+    if tok_same(entry, lo, hi, ed.cmdline.tok_term) {
+        return true
+    }
+    for h in ed.cmdline.tok_seen {
+        let e = hist_view_at(ed.cmdline.history, ed.cmdline.suggest, v, h.entry) else {
+            continue
+        }
+        if tok_same(entry, lo, hi, e[h.lo..h.hi]) {
+            return true
+        }
+    }
+    false
+}
+
+// `tok_older` (`cmdline.c:2868-2900`).
+fn tok_older(ed: Ed, v: int) -> (bool, TokHit) {
+    let n = hist_view_len(ed.cmdline.history, ed.cmdline.suggest, v)
+    let resume = ed.cmdline.tok_seen.len != 0
+    var e = 0
+    if resume {
+        e = ed.cmdline.tok_seen[ed.cmdline.tok_seen.len - 1].entry
+    }
+    while e < n {
+        let entry = hist_view_at(ed.cmdline.history, ed.cmdline.suggest, v, e) else {
+            e += 1
+            continue
+        }
+        let words = tok_words(entry, 0, entry.len, ed.cmdline.tok_bang, TOK_WORDS_MAX)
+        var k = words.len
+        if resume && e == ed.cmdline.tok_seen[ed.cmdline.tok_seen.len - 1].entry {
+            k = ed.cmdline.tok_seen[ed.cmdline.tok_seen.len - 1].word
+        }
+        while k > 0 {
+            k -= 1
+            let lo = words[k].lo
+            let hi = words[k].hi
+            let found = hist_find(entry[lo..hi], ed.cmdline.tok_term) else -1
+            if found < 0 || tok_repeat(ed, v, entry, lo, hi) {
+                continue
+            }
+            return (true, TokHit { entry: e, word: k, lo: lo, hi: hi })
+        }
+        e += 1
+    }
+    (false, TokHit { entry: 0, word: 0, lo: 0, hi: 0 })
+}
+
+// `tok_put` (`cmdline.c:2902-2913`).
+fn tok_put(mut ed: Ed, bytes: List[byte]) -> int {
+    let sp = copy ed.cmdline.tok_span
+    if !replace_span(mut ed, sp, bytes, true) {
+        return CMD_ERR_IO
+    }
+    ed.cmdline.tok_span = text.span(sp.lo, sp.lo + bytes.len)
+    cl_menu_discard(mut ed)
+    cmdline_edited(mut ed)
+    CMD_OK
+}
+
+// `token_walk` (`cmdline.c:2915-2960`).
+fn token_walk(mut ed: Ed, older: bool) -> int {
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    var status = CMD_OK
+    let again = ed.cmdline.tok_seq != 0 &&
+        ed.cmdline.tok_gen == ed.cmdline.generation &&
+        ed.invoke_seq == ed.cmdline.tok_seq + 1
+    if !again {
+        let line = cmdline_text(ed)
+        let (tok, bang) = tok_at(ed, line, cmdline_caret(ed))
+        cl_tok_forget(mut ed)
+        ed.cmdline.tok_bang = bang
+        ed.cmdline.tok_term = line[tok.lo..tok.hi]
+        ed.cmdline.tok_span = tok
+    }
+    let v = tok_view(mut ed)
+    if older {
+        let (found, hit) = tok_older(ed, v)
+        if found {
+            let entry = hist_view_at(
+                ed.cmdline.history,
+                ed.cmdline.suggest,
+                v,
+                hit.entry,
+            ) else List[byte]()
+            (mut ed.cmdline.tok_seen).push(copy hit)
+            status = tok_put(mut ed, entry[hit.lo..hit.hi])
+        }
+    } else if again && ed.cmdline.tok_seen.len != 0 {
+        let _ = (mut ed.cmdline.tok_seen).pop() else TokHit { entry: 0, word: 0, lo: 0, hi: 0 }
+        if ed.cmdline.tok_seen.len == 0 {
+            let term = copy ed.cmdline.tok_term
+            status = tok_put(mut ed, term)
+        } else {
+            let h = copy ed.cmdline.tok_seen[ed.cmdline.tok_seen.len - 1]
+            let entry = hist_view_at(ed.cmdline.history, ed.cmdline.suggest, v, h.entry) else {
+                ed.cmdline.tok_seq = ed.invoke_seq
+                ed.cmdline.tok_gen = ed.cmdline.generation
+                return status
+            }
+            status = tok_put(mut ed, entry[h.lo..h.hi])
+        }
+    }
+    ed.cmdline.tok_seq = ed.invoke_seq
+    ed.cmdline.tok_gen = ed.cmdline.generation
+    status
+}
+
+/// `ed.cmdline.token_prev` (`yew_cmdline_cmd_token_prev`).
+pub fn cmdline_token_prev_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    token_walk(mut ed, true)
+}
+
+/// `ed.cmdline.token_next` (`yew_cmdline_cmd_token_next`).
+pub fn cmdline_token_next_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    token_walk(mut ed, false)
+}
+
+// ---- A-s (s57.31 §1) --------------------------------------------------
+
+// `sudo_prefix` (`cmdline.c:2980-2998`): `sudo` or `doas` at `at`, alone
+// or with one blank; answers where it ends.
+fn sudo_prefix(s: List[byte], at: int) -> int ! {none} {
+    let n = s.len
+    if n - at < 4 {
+        return none
+    }
+    let w = s[at..at + 4]
+    let is_word = tok_same(w, 0, 4, bytes_of("sudo")) || tok_same(w, 0, 4, bytes_of("doas"))
+    if !is_word {
+        return none
+    }
+    if at + 4 == n {
+        return n
+    }
+    if is_blank(s[at + 4] as int) {
+        return at + 5
+    }
+    none
+}
+
+/// `ed.cmdline.toggle_sudo` (`yew_cmdline_cmd_toggle_sudo`,
+/// `cmdline.c:3000-3068`): `sudo ` toggled at the front of a bang line's
+/// command; an empty body takes the newest bang entry; one replace, so
+/// one undo step; the caret stays on the text it was on.
+pub fn cmdline_toggle_sudo_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.cmdline.active {
+        return CMD_ERR_STATE
+    }
+    let line = cmdline_text(ed)
+    let len = line.len
+    var caret = cmdline_caret(ed)
+    var body = -1
+    if ed.cmdline.kind == PROMPT_CMD {
+        body = cmd_bang_body(ed, line) else -1
+    }
+    if body < 0 || body > len {
+        ed_msg(mut ed, MSG_WARN, "A-s: not a shell command")
+        return CMD_OK
+    }
+    var at = body
+    while at < len && is_blank(line[at] as int) {
+        at += 1
+    }
+    var put = List[byte]()
+    var sp = text.span(at, at)
+    if at == len {
+        suggest_ensure(mut ed)
+        var prev = List[byte]()
+        var has_prev = false
+        if hist_suggest_len(ed.cmdline.suggest) != 0 {
+            prev = hist_suggest_at(ed.cmdline.suggest, 0) else List[byte]()
+            has_prev = true
+        }
+        var prefixed = -1
+        if has_prev {
+            prefixed = sudo_prefix(prev, 0) else -1
+        }
+        if prefixed < 0 {
+            for b in "sudo ".bytes() {
+                (mut put).push(b)
+            }
+        }
+        if has_prev {
+            sanitize_bytes(prev, mut put)
+        }
+        sp = text.span(at, len)
+        caret = at + put.len
+    } else {
+        let end = sudo_prefix(line, at) else -1
+        if end >= 0 {
+            sp = text.span(at, end)
+            if caret >= end {
+                caret -= end - at
+            } else if caret > at {
+                caret = at
+            }
+        } else {
+            for b in "sudo ".bytes() {
+                (mut put).push(b)
+            }
+            if caret >= at {
+                caret += put.len
+            }
+        }
+    }
+    if !replace_span(mut ed, sp, put, true) {
+        return CMD_ERR_IO
+    }
+    cl_set_caret(mut ed, caret)
+    cl_menu_discard(mut ed)
+    cmdline_edited(mut ed)
+    CMD_OK
+}
