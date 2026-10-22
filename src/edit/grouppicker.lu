@@ -1,0 +1,1047 @@
+//! edit.grouppicker — the New/Edit tab-group dialog.
+//!
+//! Ports sagitta `src/ui/grouppicker.c` (1,164 lines) and
+//! `ui/grouppicker.h` (109) at 9ace98c2 under `s24-tab-groups.md` §4 (and
+//! s57.13 §4's two row commands, `ed.group.pick.toggle` and `.confirm`,
+//! which share the key handler's two functions).
+//!
+//! ONE DIALOG, TWO MODES (`grouppicker.h:4-22`): creating and editing a
+//! group are the same act — choose files, name the result — so Edit is
+//! the same list opened with the current members ticked, and the mode
+//! reaches no further than the title and the footer hint. The dialog
+//! knows NOTHING about groups; what a confirmed result MEANS lives in
+//! `gp_apply` (create, versus diff against the current members).
+//!
+//! THE DECISION THIS FILE IS BUILT AROUND: ticks are a SET OF CANONICAL
+//! PATHS, never a flag on a listed row. Walking to `../` re-lists a
+//! different directory, and per-row flags would drop every tick the
+//! moment you moved — defeating the `../` row, which exists to assemble a
+//! group that spans directories. The set keeps insertion order (C's
+//! `Strmap`), so the confirmed list is deterministic (invariant 5); an
+//! untick rebuilds it, as C's does, keeping every survivor's order.
+//!
+//! C's module-local singleton (`grouppicker.c:40-67`, and `gp_edit_gid`,
+//! `:896`) is `Ed.gp`, a value of the `Ed` (E1010). The accessors C
+//! answers with no editor take the `Ed` here. Byte-level as C is where a
+//! golden can see it: the name field is bytes (Backspace drops one byte,
+//! as C's does), each drawn line is cut at C's 125-byte buffer. Where a
+//! `str` must carry a C string the cut backs off to a code point
+//! (`group_utf8_prefix`): a path past `YEW_GP_PATH_MAX`, a group name
+//! whose last sequence a Backspace split. A listed name that is not
+//! UTF-8 is not offered (a `str` path is UTF-8: no tab, save or load in
+//! the port can name such a file).
+
+use term
+use text
+use unicode
+
+/// `YEW_GP_PENDING` (`GpResult`, `grouppicker.h:31-35`).
+pub const GP_PENDING: int = 0
+
+/// `YEW_GP_CANCELLED`.
+pub const GP_CANCELLED: int = 1
+
+/// `YEW_GP_CONFIRMED`.
+pub const GP_CONFIRMED: int = 2
+
+/// `YEW_GP_WIDTH_MAX` (`grouppicker.h:37-42`).
+pub const GP_WIDTH_MAX: int = 62
+
+/// `YEW_GP_VISIBLE_ROWS`.
+pub const GP_VISIBLE_ROWS: int = 12
+
+/// `YEW_GP_PATH_MAX`: a path at or past it is no path (`gp_join`).
+pub const GP_PATH_MAX: int = 1024
+
+/// `YEW_GP_NAME_MAX`: the name field's buffer.
+pub const GP_NAME_MAX: int = 64
+
+// `GP_ROWS_MAX` (`grouppicker.c:25-28`), and `GpRow.name`'s buffer: a
+// name that does not fit is not listed (a truncated row could name a
+// different file when selected).
+const GP_ROWS_MAX: int = 512
+
+const GP_ROW_NAME_MAX: int = 256
+
+// C's draw buffer, `char line[YEW_GP_WIDTH_MAX + 64]`.
+const GP_LINE_MAX: int = 126
+
+/// A listed row (`GpRow`, `grouppicker.c:30-34`).
+pub struct GpRow {
+    name: str,
+    is_dir: bool,
+    is_parent: bool,
+}
+
+/// The dialog (`grouppicker.c:40-67`'s `gp`, with `gp_edit_gid`).
+pub struct GroupPicker {
+    active: bool,
+    edit_mode: bool,
+    result: int,
+    dir: str,
+    display_dir: str,
+    name: List[byte],
+    ticked: List[str],
+    dirty: List[str],
+    rows: List[GpRow],
+    cursor: int,
+    scroll: int,
+    on_name: bool,
+    note: str,
+    result_paths: List[str],
+    box: Rect,
+    edit_gid: int,
+}
+
+/// A dialog that has never been shown (C's zeroed static).
+pub fn grouppicker_new() -> GroupPicker {
+    GroupPicker {
+        active: false,
+        edit_mode: false,
+        result: GP_PENDING,
+        dir: "",
+        display_dir: "",
+        name: List[byte](),
+        ticked: List[str](),
+        dirty: List[str](),
+        rows: List[GpRow](),
+        cursor: 0,
+        scroll: 0,
+        on_name: false,
+        note: "",
+        result_paths: List[str](),
+        box: rect(0, 0, 0, 0),
+        edit_gid: 0,
+    }
+}
+
+/// `yew_gp_active` (`grouppicker.c:69-72`).
+pub fn gp_active(ed: Ed) -> bool {
+    ed.gp.active
+}
+
+/// `yew_gp_result` (`grouppicker.c:74-77`).
+pub fn gp_result(ed: Ed) -> int {
+    ed.gp.result
+}
+
+/// `yew_gp_name` (`grouppicker.c:79-82`): the name field as a `str` (a
+/// sequence a Backspace split is dropped from the end).
+pub fn gp_name(ed: Ed) -> str {
+    gp_bytes_str(ed.gp.name)
+}
+
+/// `yew_gp_count` (`grouppicker.c:84-87`): the confirmed paths.
+pub fn gp_count(ed: Ed) -> int {
+    ed.gp.result_paths.len
+}
+
+/// `yew_gp_path` (`grouppicker.c:89-94`): confirmed path `i`, "" for
+/// none (C's NULL).
+pub fn gp_path(ed: Ed, i: int) -> str {
+    if i < 0 || i >= ed.gp.result_paths.len {
+        return ""
+    }
+    ed.gp.result_paths[i]
+}
+
+// The longest valid UTF-8 prefix of `b` as a `str`.
+fn gp_bytes_str(b: List[byte]) -> str {
+    var n = b.len
+    while n > 0 {
+        let s = str_from_utf8(b[0..n]) else {
+            n -= 1
+            continue
+        }
+        return s
+    }
+    ""
+}
+
+// `snprintf(out, cap, "%s", s)`: at most `cap - 1` bytes, on a code
+// point.
+fn gp_cap(s: str, cap: int) -> str {
+    group_utf8_prefix(s, cap - 1)
+}
+
+// ---- paths ------------------------------------------------------------
+
+// `gp_canonical` (`grouppicker.c:109-130`): canonical HERE, the one
+// place a path enters the tick set — two spellings of one file would
+// tick twice and open twice (two claims on one save destination). A path
+// that does not resolve is still a legitimate selection: kept as asked.
+fn gp_canonical(path: str) -> str {
+    if path.len == 0 {
+        return ""
+    }
+    let resolved = text.file_realpath(path) else {
+        return gp_cap(path, GP_PATH_MAX)
+    }
+    gp_cap(resolved, GP_PATH_MAX)
+}
+
+// `gp_join` (`grouppicker.c:132-146`): a path too long to represent must
+// not become a TRUNCATED path naming a different file — it is no path.
+fn gp_join(dir: str, name: str) -> str {
+    let out = if dir.len > 0 && dir.ends_with("/") then "{dir}{name}" else "{dir}/{name}"
+    if out.len >= GP_PATH_MAX then "" else out
+}
+
+// `gp_parent` (`grouppicker.c:148-182`): the displayed parent.
+fn gp_parent(dir: str) -> str {
+    if dir.len == 0 {
+        return ""
+    }
+    var end = dir.len
+    while end > 1 && dir.bytes()[end - 1] as int == 47 {
+        end -= 1
+    }
+    var base = end
+    while base > 0 && dir.bytes()[base - 1] as int != 47 {
+        base -= 1
+    }
+    if base == 0 {
+        if dir == "." {
+            return ".."
+        }
+        if dir == ".." || dir.starts_with("../") {
+            return gp_join(dir, "..")
+        }
+        return "."
+    }
+    if base == 1 {
+        return "/"
+    }
+    let len = base - 1
+    if len >= GP_PATH_MAX {
+        return ""
+    }
+    dir[0..len]
+}
+
+fn gp_has(xs: List[str], s: str) -> bool {
+    for x in xs {
+        if x == s {
+            return true
+        }
+    }
+    false
+}
+
+// `gp_is_ticked` (`grouppicker.c:184-187`).
+fn gp_is_ticked(gp: GroupPicker, path: str) -> bool {
+    gp_has(gp.ticked, path)
+}
+
+// `gp_tick` (`grouppicker.c:189-194`): a set — ticking twice is once.
+fn gp_tick(mut gp: GroupPicker, path: str) {
+    if path.len == 0 || gp_has(gp.ticked, path) {
+        return
+    }
+    (mut gp.ticked).push(path)
+}
+
+// `gp_untick` (`grouppicker.c:196-220`): rebuilt rather than deleted in
+// place, keeping every surviving key's insertion order.
+fn gp_untick(mut gp: GroupPicker, path: str) {
+    if !gp_has(gp.ticked, path) {
+        return
+    }
+    var fresh = List[str]()
+    for k in gp.ticked {
+        if k != path {
+            (mut fresh).push(k)
+        }
+    }
+    gp.ticked = fresh
+}
+
+/// `yew_gp_preselect` (`grouppicker.c:222-229`): tick a path WITHOUT
+/// listing it — an Edit-mode member may live outside the directory, and
+/// no index into the listing could name it.
+pub fn gp_preselect(mut ed: Ed, path: str) {
+    let canon = gp_canonical(path)
+    if canon.len != 0 {
+        gp_tick(mut ed.gp, canon)
+    }
+}
+
+/// `yew_gp_mark_dirty` (`grouppicker.c:231-239`): a ticked row with
+/// unsaved changes shows the `•` — in Edit mode unticking closes that
+/// member's tab, so the warning must be readable BEFORE Enter.
+pub fn gp_mark_dirty(mut ed: Ed, path: str) {
+    let canon = gp_canonical(path)
+    if canon.len != 0 && !gp_has(ed.gp.dirty, canon) {
+        (mut ed.gp.dirty).push(canon)
+    }
+}
+
+// ---- the listing ------------------------------------------------------
+
+// `gp_casecmp` (`grouppicker.c:245-264`): ASCII case folded, byte order,
+// the shorter first on a common prefix (C's NUL). True when a < b.
+fn gp_case_less(a: str, b: str) -> bool {
+    let n = if a.len < b.len then a.len else b.len
+    var i = 0
+    while i < n {
+        var ca = a.bytes()[i] as int
+        var cb = b.bytes()[i] as int
+        if ca >= 65 && ca <= 90 {
+            ca += 32
+        }
+        if cb >= 65 && cb <= 90 {
+            cb += 32
+        }
+        if ca != cb {
+            return ca < cb
+        }
+        i += 1
+    }
+    a.len < b.len
+}
+
+// `gp_row_cmp` (`grouppicker.c:266-277`): directories first, then files,
+// each case-insensitively. True when x sorts before y.
+fn gp_row_less(x: GpRow, y: GpRow) -> bool {
+    if x.is_dir != y.is_dir {
+        return x.is_dir
+    }
+    gp_case_less(x.name, y.name)
+}
+
+// `gp_list_dir` (`grouppicker.c:279-346`): `../` pinned on top (absent
+// at `/`), then the directory's DIRECTORIES (to walk) and REGULAR FILES
+// (to tick) and nothing else — the fuzzer once walked to /dev and ticked
+// a block device. `stat` decides, never the entry's own type (a link to
+// a file is a file). Dotfiles stay out of the way. A stable insertion
+// sort below the pinned row (`yew_sort_stable`'s order).
+fn gp_list_dir(mut gp: GroupPicker) {
+    var rows = List[GpRow]()
+    gp.cursor = 0
+    gp.scroll = 0
+    if gp.dir != "/" {
+        (mut rows).push(GpRow { name: "..", is_dir: true, is_parent: true })
+    }
+    let base = rows.len
+    let entries = fs_read_dir_entries(gp.dir) else {
+        gp.rows = rows
+        return
+    }
+    for e in entries {
+        if rows.len >= GP_ROWS_MAX {
+            break
+        }
+        if e.len < 2 || e[1] as int == 46 || e.len - 1 >= GP_ROW_NAME_MAX {
+            continue
+        }
+        let name = str_from_utf8(e[1..e.len]) else {
+            continue
+        }
+        let full = gp_join(gp.dir, name)
+        let st = fs_stat(full) else {
+            continue
+        }
+        if st[0] != 0 && st[0] != 1 {
+            continue
+        }
+        let row = GpRow { name: name, is_dir: st[0] == 1, is_parent: false }
+        var at = rows.len
+        while at > base && gp_row_less(row, rows[at - 1]) {
+            at -= 1
+        }
+        (mut rows).push(copy row)
+        var j = rows.len - 1
+        while j > at {
+            rows[j] = copy rows[j - 1]
+            j -= 1
+        }
+        rows[at] = row
+    }
+    gp.rows = rows
+}
+
+// `gp_walk_to` (`grouppicker.c:348-365`): the ticks survive — they are
+// paths, and a walk only changes which ones are on screen.
+fn gp_walk_to(mut gp: GroupPicker, dir: str, display: str) {
+    let canon = gp_canonical(dir)
+    if canon.len == 0 {
+        return
+    }
+    gp.dir = canon
+    let shown = if display.len != 0 then display else canon
+    gp.display_dir = if shown.len >= GP_PATH_MAX then canon else shown
+    gp_list_dir(mut gp)
+}
+
+// ---- show / close ------------------------------------------------------
+
+// `gp_default_name` (`grouppicker.c:371-395`): `basename(dir)/`, else
+// `group/` (no name, or one that would not fit the 64-byte field).
+fn gp_default_name(dir: str) -> List[byte] {
+    if dir.len == 0 {
+        return bytes_of("group/")
+    }
+    var end = dir.len
+    while end > 0 && dir.bytes()[end - 1] as int == 47 {
+        end -= 1
+    }
+    var base = end
+    while base > 0 && dir.bytes()[base - 1] as int != 47 {
+        base -= 1
+    }
+    let len = end - base
+    if len == 0 || len > GP_NAME_MAX - 2 {
+        return bytes_of("group/")
+    }
+    bytes_of("{dir[base..end]}/")
+}
+
+// `gp_open` (`grouppicker.c:397-423`): a fresh dialog invalidates the last
+// one's answer (an accessor must not report paths from a dialog since
+// dismissed); at `dir`, else the workspace root; New's name pre-filled
+// `basename(dir)/` so the happy path is Enter-Enter, Edit's the label.
+fn gp_open(mut ed: Ed, dir: str, name: str, edit: bool) -> bool {
+    gp_close(mut ed)
+    ed.gp.result_paths = List[str]()
+    ed.gp.ticked = List[str]()
+    ed.gp.dirty = List[str]()
+    ed.gp.active = true
+    ed.gp.edit_mode = edit
+    ed.gp.result = GP_PENDING
+    ed.gp.on_name = false
+    ed.gp.note = ""
+    if dir.len != 0 {
+        gp_walk_to(mut ed.gp, dir, dir)
+    } else {
+        // C walks to `yew_ws_root` shown as `yew_ws_display_root`: the
+        // port's workspace has one spelling until Sprint 25 (yw06).
+        let root = shell_ws_root(ed)
+        gp_walk_to(mut ed.gp, root, root)
+    }
+    ed.gp.name = if name.len != 0 {
+        bytes_of(gp_cap(name, GP_NAME_MAX))
+    } else {
+        gp_default_name(ed.gp.display_dir)
+    }
+    ed.full_damage = true
+    true
+}
+
+/// `yew_gp_show` (`grouppicker.c:425-428`): New mode.
+pub fn gp_show(mut ed: Ed, dir: str) -> bool {
+    gp_open(mut ed, dir, "", false)
+}
+
+/// `yew_gp_show_edit` (`grouppicker.c:430-433`): Edit mode, the same
+/// list, the current members ticked by the caller.
+pub fn gp_show_edit(mut ed: Ed, dir: str, name: str) -> bool {
+    gp_open(mut ed, dir, name, true)
+}
+
+/// `yew_gp_close` (`grouppicker.c:435-446`).
+pub fn gp_close(mut ed: Ed) {
+    ed.gp.ticked = List[str]()
+    ed.gp.dirty = List[str]()
+    ed.gp.active = false
+    ed.gp.rows = List[GpRow]()
+    ed.gp.cursor = 0
+    ed.gp.scroll = 0
+    ed.gp.note = ""
+    ed.full_damage = true
+}
+
+// ---- confirm ------------------------------------------------------------
+
+// `gp_confirm` (`grouppicker.c:452-491`): REFUSED with a note, not
+// silently accepted — a group with no members would auto-dissolve the
+// moment it was created; a nameless one sends the focus to the name. The
+// ticks become the result in insertion order (at most `GP_ROWS_MAX`).
+fn gp_confirm(mut ed: Ed) {
+    if ed.gp.ticked.len == 0 {
+        ed.gp.note = "tick at least one file (space)"
+        return
+    }
+    if ed.gp.name.len == 0 {
+        ed.gp.note = "the group needs a name"
+        ed.gp.on_name = true
+        return
+    }
+    var paths = List[str]()
+    for k in ed.gp.ticked {
+        if paths.len < GP_ROWS_MAX {
+            (mut paths).push(k)
+        }
+    }
+    ed.gp.result_paths = paths
+    ed.gp.result = GP_CONFIRMED
+    ed.gp.active = false
+    ed.full_damage = true
+}
+
+// ---- keys ------------------------------------------------------------------
+
+// `gp_cursor_to` (`grouppicker.c:497-514`): clamped, with the minimal
+// scroll (moving the list further than needed shifts rows being read).
+fn gp_cursor_to(mut gp: GroupPicker, at_in: int) {
+    if gp.rows.len == 0 {
+        return
+    }
+    var at = at_in
+    if at < 0 {
+        at = 0
+    }
+    if at >= gp.rows.len {
+        at = gp.rows.len - 1
+    }
+    gp.cursor = at
+    if gp.cursor < gp.scroll {
+        gp.scroll = gp.cursor
+    }
+    if gp.cursor >= gp.scroll + GP_VISIBLE_ROWS {
+        gp.scroll = gp.cursor - GP_VISIBLE_ROWS + 1
+    }
+    if gp.scroll < 0 {
+        gp.scroll = 0
+    }
+}
+
+/// `yew_gp_scroll` (`grouppicker.c:516-534`, Sprint 27 §2's wheel): it
+/// moves the CURSOR — the scroll is derived from it, and a second writer
+/// would be reverted by the next move.
+pub fn gp_scroll(mut ed: Ed, rows: int) {
+    if !ed.gp.active || rows == 0 {
+        return
+    }
+    ed.gp.on_name = false
+    gp_cursor_to(mut ed.gp, ed.gp.cursor + rows)
+    ed.full_damage = true
+}
+
+// `gp_enter_row` (`grouppicker.c:536-551`): walk into a directory row,
+// or up through `../`.
+fn gp_enter_row(mut gp: GroupPicker, r: GpRow) {
+    if r.is_parent {
+        let full = gp_join(gp.dir, "..")
+        let display = gp_parent(gp.display_dir)
+        gp_walk_to(mut gp, full, display)
+        return
+    }
+    let full = gp_join(gp.dir, r.name)
+    let display = gp_join(gp.display_dir, r.name)
+    gp_walk_to(mut gp, full, display)
+}
+
+// `gp_toggle_row` (`grouppicker.c:553-575`): a directory is WALKED, not
+// ticked (a group is a set of files); a file toggles and the cursor
+// ADVANCES, so a run of files ticks without moving the other hand.
+fn gp_toggle_row(mut gp: GroupPicker, r: GpRow) {
+    if r.is_dir {
+        gp_enter_row(mut gp, r)
+        return
+    }
+    let canon = gp_canonical(gp_join(gp.dir, r.name))
+    if gp_is_ticked(gp, canon) {
+        gp_untick(mut gp, canon)
+    } else {
+        gp_tick(mut gp, canon)
+    }
+    gp.note = ""
+    gp_cursor_to(mut gp, gp.cursor + 1)
+}
+
+// `gp_toggle_current` (`grouppicker.c:587-594`): exactly what Space does,
+// shared with `ed.group.pick.toggle` so a row and a key cannot drift.
+fn gp_toggle_current(mut ed: Ed) -> bool {
+    if !ed.gp.active || ed.gp.cursor < 0 || ed.gp.cursor >= ed.gp.rows.len {
+        return false
+    }
+    ed.gp.on_name = false
+    let r = copy ed.gp.rows[ed.gp.cursor]
+    gp_toggle_row(mut ed.gp, r)
+    true
+}
+
+/// `yew_gp_select_row` (`grouppicker.c:605-614`): the focus to a LISTING
+/// INDEX (a `REGION_GP_ROW` payload); false when the dialog is down or
+/// the row has gone (a re-list can leave a captured index naming
+/// nothing).
+pub fn gp_select_row(mut ed: Ed, idx: int) -> bool {
+    if !ed.gp.active || idx < 0 || idx >= ed.gp.rows.len {
+        return false
+    }
+    ed.gp.on_name = false
+    gp_cursor_to(mut ed.gp, idx)
+    ed.full_damage = true
+    true
+}
+
+// `gp_name_key` (`grouppicker.c:616-633`): Backspace drops a BYTE (C's);
+// a printable key's text appends while it fits the 64-byte field.
+fn gp_name_key(mut gp: GroupPicker, key: term.Key) {
+    if key.code == term.KEY_BACKSPACE {
+        if gp.name.len > 0 {
+            let _ = (mut gp.name).pop()
+        }
+        return
+    }
+    if key.text.len == 0 || key.code < 32 {
+        return
+    }
+    if gp.name.len + key.text.len + 1 >= GP_NAME_MAX {
+        return
+    }
+    for b in key.text {
+        (mut gp.name).push(b)
+    }
+    gp.note = ""
+}
+
+/// `yew_gp_key` (`grouppicker.c:635-712`): the picker is MODAL — true for
+/// every key while it is up (a key let through would edit the document
+/// behind it), and every key it takes repaints it. Esc cancels; Tab
+/// toggles the name field; on the name, Enter confirms and Down returns
+/// to the list; in the list, Up off the top goes to the name, Left walks
+/// to the parent, Space ticks or walks, Enter and Right walk into a
+/// directory or confirm on a file.
+pub fn gp_key(mut ed: Ed, key: term.Key) -> bool {
+    if !ed.gp.active {
+        return false
+    }
+    if key.ev == term.KEY_RELEASE {
+        return true
+    }
+    ed.full_damage = true
+    if key.code == term.KEY_ESCAPE {
+        ed.gp.result = GP_CANCELLED
+        gp_close(mut ed)
+        return true
+    }
+    if key.code == term.KEY_TAB {
+        ed.gp.on_name = !ed.gp.on_name
+        return true
+    }
+    if ed.gp.on_name {
+        if key.code == term.KEY_ENTER {
+            gp_confirm(mut ed)
+            return true
+        }
+        if key.code == term.KEY_DOWN {
+            ed.gp.on_name = false
+            return true
+        }
+        gp_name_key(mut ed.gp, key)
+        return true
+    }
+    if key.code == term.KEY_UP {
+        if ed.gp.cursor == 0 {
+            ed.gp.on_name = true
+        } else {
+            gp_cursor_to(mut ed.gp, ed.gp.cursor - 1)
+        }
+        return true
+    }
+    if key.code == term.KEY_DOWN {
+        gp_cursor_to(mut ed.gp, ed.gp.cursor + 1)
+        return true
+    }
+    if key.code == term.KEY_LEFT {
+        let full = gp_join(ed.gp.dir, "..")
+        let display = gp_parent(ed.gp.display_dir)
+        gp_walk_to(mut ed.gp, full, display)
+        return true
+    }
+    let has_row = ed.gp.cursor >= 0 && ed.gp.cursor < ed.gp.rows.len
+    if key.code == 32 {
+        if has_row {
+            let _ = gp_toggle_current(mut ed)
+        }
+        return true
+    }
+    if key.code == term.KEY_ENTER || key.code == term.KEY_RIGHT {
+        if has_row && ed.gp.rows[ed.gp.cursor].is_dir {
+            let r = copy ed.gp.rows[ed.gp.cursor]
+            gp_enter_row(mut ed.gp, r)
+        } else {
+            gp_confirm(mut ed)
+        }
+        return true
+    }
+    true
+}
+
+// ---- drawing ------------------------------------------------------------
+
+// `gp_row_at` (`grouppicker.c:718-737`): ONE function computes row ->
+// listing index, and the renderer and the click both use it (deriving it
+// twice is the Sprint 22 drift: click one name, tick another). The rows
+// start at the box's top + 4 (border, title, name, separator).
+fn gp_row_at(gp: GroupPicker, y: int) -> int {
+    if gp.box.h == 0 {
+        return -1
+    }
+    var rel = y - gp.box.y - 4
+    if rel < 0 || rel >= GP_VISIBLE_ROWS {
+        return -1
+    }
+    rel += gp.scroll
+    if rel < gp.rows.len then rel else -1
+}
+
+// One drawn line, cut at C's 126-byte buffer (`snprintf` keeps 125
+// bytes, byte-wise).
+fn gp_line(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() {
+        if out.len >= GP_LINE_MAX - 1 {
+            break
+        }
+        (mut out).push(b)
+    }
+    out
+}
+
+fn gp_puts(mut ed: Ed, y: int, x: int, line: List[byte], fg: term.Color, attrs: int) {
+    if y < 0 {
+        return
+    }
+    let _ = term.grid_puts(mut ed.grid, y, x, line, 0, line.len, fg, term.color_default(), attrs)
+}
+
+/// `yew_gp_draw` (`grouppicker.c:739-862`): the centered box (62 cells
+/// at most, 12 visible rows, 19 tall), blanked; `REGION_BLOCK` over it so
+/// a click never falls through; the title by mode; the name field
+/// (reversed with a `_` while focused, `REGION_GP_NAME`); the directory
+/// clipped through the width tables; each listed row with its box (`[ ]`
+/// is the affordance, a directory has none), the ticked accent and the
+/// dirty `•`, `REGION_GP_ROW` = its listing index; the count ALWAYS
+/// visible (ticks elsewhere have scrolled out of sight); the note or the
+/// mode's hint.
+pub fn gp_draw(mut ed: Ed) {
+    if !ed.gp.active || ed.grid.cols == 0 {
+        return
+    }
+    let w = if ed.grid.cols < GP_WIDTH_MAX then ed.grid.cols else GP_WIDTH_MAX
+    var h = GP_VISIBLE_ROWS + 7
+    if h > ed.grid.rows {
+        h = ed.grid.rows
+    }
+    let x0 = (ed.grid.cols - w) / 2
+    let y0 = if ed.grid.rows > h then (ed.grid.rows - h) / 2 else 0
+    ed.gp.box = rect(x0, y0, w, h)
+    let fg = term.color_default()
+    let accent = term.color_rgb(120, 180, 255)
+    let dim = term.color_rgb(120, 120, 120)
+    // C's zeroed `Cell`: width 0, so the fill writes styled blanks.
+    var blank = term.cell_blank()
+    blank.w = 0
+    var i = 0
+    while i < h {
+        term.grid_fill(mut ed.grid, y0 + i, x0, x0 + w, copy blank)
+        i += 1
+    }
+    let b = copy ed.gp.box
+    region_add(mut ed.regions, REGION_BLOCK, b, 0)
+    let title = if ed.gp.edit_mode then "Edit Tab Group" else "New Tab Group"
+    gp_puts(mut ed, y0, x0, gp_line(" {title} "), copy fg, term.ATTR_BOLD)
+    var nline = bytes_of(" name: ")
+    for c in ed.gp.name {
+        (mut nline).push(c)
+    }
+    if ed.gp.on_name {
+        (mut nline).push(95 as byte)
+    }
+    while nline.len > GP_LINE_MAX - 1 {
+        let _ = (mut nline).pop()
+    }
+    gp_puts(mut ed, y0 + 1, x0, nline, copy fg, if ed.gp.on_name then term.ATTR_REVERSE else 0)
+    region_add(mut ed.regions, REGION_GP_NAME, rect(x0, y0 + 1, w, 1), 0)
+    let dd = bytes_of(ed.gp.display_dir)
+    let (fit, _) = unicode.str_clip(dd, 0, dd.len, if w > 1 then w - 1 else 0)
+    if y0 + 2 >= 0 {
+        let _ = term.grid_puts(
+            mut ed.grid,
+            y0 + 2,
+            x0 + 1,
+            dd,
+            0,
+            fit,
+            copy dim,
+            term.color_default(),
+            term.ATTR_DIM,
+        )
+    }
+    i = 0
+    while i < GP_VISIBLE_ROWS {
+        let idx = ed.gp.scroll + i
+        let y = y0 + 4 + i
+        if idx >= ed.gp.rows.len {
+            break
+        }
+        let r = copy ed.gp.rows[idx]
+        var ticked = false
+        var is_dirty = false
+        if !r.is_dir {
+            let canon = gp_canonical(gp_join(ed.gp.dir, r.name))
+            ticked = gp_is_ticked(ed.gp, canon)
+            is_dirty = gp_has(ed.gp.dirty, canon)
+        }
+        let mark = if r.is_dir {
+            "   "
+        } else {
+            glyph(if ticked then GLYPH_TICKED else GLYPH_UNTICKED)
+        }
+        let shown = if r.is_parent then "../" else r.name
+        let slash = if r.is_dir && !r.is_parent then "/" else ""
+        let gap = if ticked && is_dirty then " " else ""
+        let bullet = if ticked && is_dirty then glyph(GLYPH_DIRTY_TICK) else ""
+        let attrs = if idx == ed.gp.cursor && !ed.gp.on_name then term.ATTR_REVERSE else 0
+        gp_puts(
+            mut ed,
+            y,
+            x0,
+            gp_line(" {mark} {shown}{slash}{gap}{bullet}"),
+            if ticked then copy accent else copy fg,
+            attrs,
+        )
+        region_add(mut ed.regions, REGION_GP_ROW, rect(x0, y, w, 1), idx)
+        i += 1
+    }
+    gp_puts(
+        mut ed,
+        y0 + h - 2,
+        x0,
+        gp_line(" {ed.gp.ticked.len} selected"),
+        copy fg,
+        term.ATTR_BOLD,
+    )
+    let verb = if ed.gp.edit_mode then "save" else "create"
+    let foot = if ed.gp.note.len != 0 {
+        " {ed.gp.note}"
+    } else {
+        " tab focus · space tick · enter {verb} · esc cancel"
+    }
+    gp_puts(mut ed, y0 + h - 1, x0, gp_line(foot), copy dim, term.ATTR_DIM)
+}
+
+/// `yew_gp_click` (`grouppicker.c:864-888`): the name field focuses it; a
+/// row is the same two steps the row menu's `Toggle` takes, through the
+/// same row arithmetic the renderer used; anything else inside the dialog
+/// is swallowed by its BLOCK. True when consumed.
+pub fn gp_click(mut ed: Ed, x: int, y: int) -> bool {
+    if !ed.gp.active {
+        return false
+    }
+    let hit = region_hit(mut ed.regions, x, y)
+    ed.full_damage = true
+    if hit.kind == REGION_GP_NAME {
+        ed.gp.on_name = true
+        return true
+    }
+    if hit.kind == REGION_GP_ROW {
+        let idx = gp_row_at(ed.gp, y)
+        if gp_select_row(mut ed, idx) {
+            let _ = gp_toggle_current(mut ed)
+        }
+        return true
+    }
+    hit.kind == REGION_BLOCK
+}
+
+// ---- where a confirmed result MEANS something ---------------------------
+
+// `gp_apply_new` (`grouppicker.c:898-932`): create, then ADOPT or open
+// each ticked path — `tab_find_by_path` first (a second tab on one path
+// is two claims on one save destination); an opened one is born
+// deferred, so the group costs no reads. Empty only if every open
+// failed: pruned (DoD 10).
+fn gp_apply_new(mut ed: Ed) {
+    let gid = group_create(mut ed, ed.gp.dir, gp_name(ed))
+    if gid == 0 {
+        return
+    }
+    let paths = copy ed.gp.result_paths
+    for path in paths {
+        if path.len == 0 {
+            continue
+        }
+        var idx = tab_find_by_path(ed, path)
+        if idx < 0 {
+            idx = tab_open(mut ed, path)
+        }
+        if idx >= 0 {
+            group_add_member(mut ed, gid, idx)
+        }
+    }
+    group_prune_empty(mut ed)
+}
+
+// `gp_apply_edit` (`grouppicker.c:934-1007`): the DIFF — additions first
+// (so the group never passes through empty and dissolves under the
+// edit), then every member not in the result leaves and its tab closes,
+// by tab ID (a close compacts the array); never the last tab.
+fn gp_apply_edit(mut ed: Ed) {
+    let gid = ed.gp.edit_gid
+    if group_find(ed, gid) < 0 {
+        return
+    }
+    var keep = List[int]()
+    let paths = copy ed.gp.result_paths
+    for path in paths {
+        if path.len == 0 {
+            continue
+        }
+        var idx = tab_find_by_path(ed, path)
+        if idx < 0 {
+            idx = tab_open(mut ed, path)
+        }
+        if idx < 0 {
+            continue
+        }
+        group_add_member(mut ed, gid, idx)
+        (mut keep).push(ed.tabs[idx].tab_id)
+    }
+    let members = group_members(ed, gid)
+    var drop = List[int]()
+    for m in members {
+        let id = ed.tabs[m].tab_id
+        var kept = false
+        for k in keep {
+            if k == id {
+                kept = true
+            }
+        }
+        if !kept {
+            (mut drop).push(id)
+        }
+    }
+    for id in drop {
+        let idx = tab_index_of_id(ed, id)
+        if idx < 0 {
+            continue
+        }
+        if ed.tabs.len <= 1 {
+            break
+        }
+        group_remove_member(mut ed, idx)
+        let _ = tab_close(mut ed, idx)
+    }
+    group_prune_empty(mut ed)
+}
+
+/// `yew_gp_apply` (`grouppicker.c:1009-1024`): a CONFIRMED result applied
+/// once (it runs after every key the dialog took; a result left standing
+/// would create the group again on the next keystroke); nothing while the
+/// dialog is up or after a cancel.
+pub fn gp_apply(mut ed: Ed) {
+    if ed.gp.result != GP_CONFIRMED {
+        return
+    }
+    ed.gp.result = GP_PENDING
+    if ed.gp.edit_mode {
+        gp_apply_edit(mut ed)
+    } else {
+        gp_apply_new(mut ed)
+    }
+    ed.gp.result_paths = List[str]()
+    ed.layout_dirty = true
+    ed.full_damage = true
+}
+
+/// `ed.group.new` (`yew_gp_cmd_new`, `grouppicker.c:1026-1057`): the
+/// picker at the argument, else the active tab's directory (the files
+/// wanted are almost always beside the one in view), else the workspace
+/// root.
+pub fn gp_cmd_new(mut ed: Ed, cx: CmdCtx) -> int {
+    var dir = if cx.has_sarg then cx.sarg else ""
+    if dir.len == 0 {
+        var here = ""
+        let t = ed.tab_active
+        if t >= 0 && t < ed.tabs.len && ed.tabs[t].has_path {
+            let p = ed.tabs[t].path
+            let slash = p.rfind("/") else -1
+            if slash > 0 && slash < GP_PATH_MAX {
+                here = p[0..slash]
+            }
+        }
+        dir = if here.len != 0 then here else shell_ws_root(ed)
+    }
+    ed.gp.edit_gid = 0
+    if gp_show(mut ed, dir) then CMD_OK else CMD_ERR_STATE
+}
+
+/// `ed.group.edit` (`yew_gp_cmd_edit`, `grouppicker.c:1059-1098`): the
+/// active group's dialog with every current member ticked — including
+/// those outside its origin directory, which is why preselect takes a
+/// PATH — and each modified one bulleted.
+pub fn gp_cmd_edit(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let gid = active_group_id(ed)
+    if gid == 0 {
+        ed_msg(mut ed, MSG_ERROR, "not in a tab group")
+        return CMD_ERR_STATE
+    }
+    let at = group_find(ed, gid)
+    if at < 0 {
+        return CMD_ERR_STATE
+    }
+    let dir = ed.groups[at].dir_path
+    let label = ed.groups[at].label
+    if !gp_show_edit(mut ed, dir, label) {
+        return CMD_ERR_STATE
+    }
+    ed.gp.edit_gid = gid
+    let members = group_members(ed, gid)
+    for m in members {
+        if !ed.tabs[m].has_path {
+            continue
+        }
+        let p = ed.tabs[m].path
+        gp_preselect(mut ed, p)
+        if tab_modified(ed, m) {
+            gp_mark_dirty(mut ed, p)
+        }
+    }
+    CMD_OK
+}
+
+// `gp_require` (`grouppicker.c:1104-1121`): the row commands REFUSE with
+// the dialog down — the palette and a script reach them with nothing
+// open, and OK having done nothing would read as a tick.
+fn gp_require(mut ed: Ed) -> bool {
+    if !ed.gp.active {
+        ed_msg(mut ed, MSG_ERROR, "no group picker is open")
+        return false
+    }
+    true
+}
+
+/// `ed.group.pick.toggle` (`yew_gp_cmd_toggle`, `grouppicker.c:1123-
+/// 1144`): exactly Space, then the apply the key loop runs.
+pub fn gp_cmd_toggle(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !gp_require(mut ed) {
+        return CMD_ERR_STATE
+    }
+    if !gp_toggle_current(mut ed) {
+        ed_msg(mut ed, MSG_ERROR, "no row is selected")
+        return CMD_ERR_STATE
+    }
+    ed.full_damage = true
+    gp_apply(mut ed)
+    CMD_OK
+}
+
+/// `ed.group.pick.confirm` (`yew_gp_cmd_confirm`, `grouppicker.c:1146-
+/// 1164`): `gp_confirm`, not Enter's branch — Enter on a directory WALKS
+/// INTO IT, and a row labelled Confirm that changed directory would be
+/// the label lying. Refusals come back as the dialog's own note.
+pub fn gp_cmd_confirm(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !gp_require(mut ed) {
+        return CMD_ERR_STATE
+    }
+    gp_confirm(mut ed)
+    ed.full_damage = true
+    gp_apply(mut ed)
+    CMD_OK
+}

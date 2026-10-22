@@ -1,24 +1,131 @@
-//! edit.groups — the half of sagitta's tab-group model the tab strip
-//! asks, before Sprint 24 lands.
+//! edit.groups — the tab-group model: facsimile's, whole.
 //!
-//! Ports the readers of sagitta `src/ui/groups.c` (507 lines) at 9ace98c2
-//! that `src/ui/tabs.c` calls — `yew_active_group_id`, the COMPUTED
-//! `yew_group_member_count` and `yew_group_members`, and
-//! `yew_group_remove_member`'s ordinal compaction — because membership
-//! lives on the TAB (`Tab.group_id`, `Tab.group_ordinal`, `groups.h:4-
-//! 20`) and every one of them is a question about the tabs array. The
-//! group VALUES (the label, the dir, the resume path), their creation,
-//! dissolution and every `ed.group.*` command are Sprint 24's and the
-//! groups fork's (yw05): until it lands nothing can set a `group_id`, so
-//! the paths that need a group value are unreachable and refuse by name
-//! if ever reached (invariant 3), never answering a guess.
+//! Ports sagitta `src/ui/groups.c` (507 lines) and `ui/groups.h` (128) at
+//! 9ace98c2 under `s24-tab-groups.md` §1/§2, with §3's defer half
+//! (`yew_tab_defer`, `tabs.c:625-636`, and `yew_buf_defer`, `ed.c:486-
+//! 509`), kept beside the model it serves so `edit.tabs` stays the tabs
+//! fork's file.
+//!
+//! THE ONE THING THIS FILE IS ABOUT: a group holds NO MEMBER LIST
+//! (`groups.h:7-22`). Closing a tab compacts the tabs array and renumbers
+//! every index above it, so any membership stored on the group side is
+//! stale exactly one close later — and it would not fail loudly, it would
+//! quietly name a different file. Membership lives on the TAB: `group_id`
+//! (0 ungrouped, authoritative) and `group_ordinal` (1-based within the
+//! group, compacted when a member leaves). Counts and member lists are
+//! COMPUTED on every ask; a cached count is a label that can lie.
+//! `last_active_member` is a PATH, not an index, and is explicitly
+//! non-authoritative: it may dangle, and every reader falls back to the
+//! lowest ordinal. An empty group auto-dissolves (the only place DoD 10's
+//! guarantee comes from is `group_remove_member`).
+//!
+//! Residency is asked of the buffer, never of a tab flag (s24 §3, ruling
+//! R-yw05-4 = A): a deferred tab's buffer is a slot whose piece tree is
+//! not built (`Buffer.resident`, set only where `buf_hydrate` builds the
+//! tree and cleared only here, where the tree is released — the port's
+//! `b->tb != NULL`, `ed.c:419-424`). `Tab` carries no residency field.
+//!
+//! The groups are a VALUE of the `Ed` (`Ed.groups`, `Ed.next_group_id`),
+//! never module state (E1010). What C calls here that later campaigns
+//! own: `yew_state_mark_dirty` (the workspace state, Sprint 25, yw06) and,
+//! in the defer, `yew_lsp_buffer_close` (yw11) and `yew_syn_detach`
+//! (yw10) — notifications to subsystems the port does not have yet, so
+//! there is nothing to tell.
 
-fn groups_unported(what: str) {
-    bug("not yet ported: {what}: sagitta Sprint 24 (tab groups) (yw05)")
+use text
+
+/// A group (`TabGroup`, `groups.h:29-45`). Deliberately no member list,
+/// no member count (DoD 2's grep: `grep -n member src/edit/groups.lu`
+/// finds no member field here). `dir_path` is a LABEL OF ORIGIN, not a
+/// constraint — members may live anywhere; "" is C's NULL. The resume
+/// point is a path that may dangle (`has_last` false is C's NULL).
+pub struct TabGroup {
+    id: int,
+    label: str,
+    dir_path: str,
+    last_active_member: str,
+    has_last: bool,
+}
+
+// `default_label` (`groups.c:57-86`): `basename(dir)/` — the trailing
+// slash makes a group entry read as a directory. C writes into a 64-byte
+// buffer (`YEW_TAB_LABEL_MAX`), keeping at most 62 bytes of the name; a
+// cut that would split a UTF-8 sequence backs off to its start (a `str`
+// is UTF-8; C's cut is byte-wise, and only a basename past 62 bytes
+// meets it).
+fn group_default_label(dir: str) -> str {
+    if dir.len == 0 {
+        return "group/"
+    }
+    var end = dir.len
+    while end > 0 && dir.bytes()[end - 1] as int == 47 {
+        end -= 1
+    }
+    var base = end
+    while base > 0 && dir.bytes()[base - 1] as int != 47 {
+        base -= 1
+    }
+    if end == base {
+        // The root directory has no basename to take.
+        return "/"
+    }
+    var keep = end - base
+    if keep > TAB_LABEL_MAX - 2 {
+        keep = TAB_LABEL_MAX - 2
+    }
+    "{group_utf8_prefix(dir[base..end], keep)}/"
+}
+
+/// The longest prefix of `s` of at most `n` bytes that ends on a UTF-8
+/// boundary (C's byte cut, kept on a code point).
+pub fn group_utf8_prefix(s: str, n: int) -> str {
+    if n >= s.len {
+        return s
+    }
+    var cut = n
+    while cut > 0 && s.bytes()[cut] as int & 192 == 128 {
+        cut -= 1
+    }
+    s[0..cut]
+}
+
+/// `yew_group_create` (`groups.c:88-112`): a fresh id (monotonic, never
+/// reused, 0 invalid); an empty `name` labels it `basename(dir)/`. Groups
+/// may be created EMPTY — the picker names the group first and adds
+/// members after.
+pub fn group_create(mut ed: Ed, dir_path: str, name: str) -> int {
+    let id = ed.next_group_id
+    ed.next_group_id += 1
+    let label = if name.len != 0 then name else group_default_label(dir_path)
+    (mut ed.groups).push(TabGroup {
+        id: id,
+        label: label,
+        dir_path: dir_path,
+        last_active_member: "",
+        has_last: false,
+    })
+    id
+}
+
+/// `yew_group_find` (`groups.c:114-125`): the index into `ed.groups`, or
+/// -1. Id 0 is never a group.
+pub fn group_find(ed: Ed, gid: int) -> int {
+    if gid == 0 {
+        return -1
+    }
+    var i = 0
+    while i < ed.groups.len {
+        if ed.groups[i].id == gid {
+            return i
+        }
+        i += 1
+    }
+    -1
 }
 
 /// `yew_active_group_id` (`groups.c:305-311`): DERIVED from the active
-/// tab, never stored.
+/// tab, never stored — the active index is assigned raw in several places
+/// and a cached copy drifts silently.
 pub fn active_group_id(ed: Ed) -> int {
     if ed.tab_active < 0 || ed.tab_active >= ed.tabs.len {
         return 0
@@ -43,9 +150,9 @@ pub fn group_member_count(ed: Ed, gid: int) -> int {
 
 /// `yew_group_members` (`groups.c:167-195`): the member tab indices
 /// ordered by ordinal — SORTED, not indexed (mid-removal the ordinals
-/// have a hole), stably, so equal ordinals keep array order (invariant
-/// 5). C caps the scan at `YEW_TAB_MAX` refs, which the tab cap makes the
-/// whole array.
+/// have a hole, and `out[ordinal - 1] = idx` writes outside the run),
+/// stably, so equal ordinals keep array order (invariant 5). C caps the
+/// scan at `YEW_TAB_MAX` refs, which the tab cap makes the whole array.
 pub fn group_members(ed: Ed, gid: int) -> List[int] {
     var out = List[int]()
     if gid == 0 {
@@ -78,11 +185,37 @@ pub fn group_members(ed: Ed, gid: int) -> List[int] {
     out
 }
 
-/// `yew_group_remove_member` (`groups.c:229-257`): the tab leaves its
-/// group and the ordinals above the vacated one compact; an emptied group
-/// auto-dissolves (`yew_group_dissolve`, the group value's — Sprint 24).
-/// Tab close calls this BEFORE the array compaction, while `idx` still
-/// names the right tab.
+/// `yew_group_add_member` (`groups.c:197-227`): a tab belongs to exactly
+/// one group — an already-grouped tab LEAVES its old group first, so both
+/// groups' ordinals stay consistent (skipping the removal leaves the old
+/// group a permanent hole); then its ordinal is the target's max + 1.
+/// Re-adding a member is a no-op, not a renumber to the end.
+pub fn group_add_member(mut ed: Ed, gid: int, idx: int) {
+    if idx < 0 || idx >= ed.tabs.len || gid == 0 || group_find(ed, gid) < 0 {
+        return
+    }
+    if ed.tabs[idx].group_id == gid {
+        return
+    }
+    if ed.tabs[idx].group_id != 0 {
+        group_remove_member(mut ed, idx)
+    }
+    var max = 0
+    for t in ed.tabs {
+        if t.group_id == gid && t.group_ordinal > max {
+            max = t.group_ordinal
+        }
+    }
+    ed.tabs[idx].group_id = gid
+    ed.tabs[idx].group_ordinal = max + 1
+}
+
+/// `yew_group_remove_member` (`groups.c:229-257`): the tab's fields
+/// zeroed, every ordinal above the vacated one decremented, then the
+/// group AUTO-DISSOLVES if that was its last member — an empty group is a
+/// row-1 entry that resolves to nothing, and this is the only place DoD
+/// 10's guarantee comes from. Tab close calls this BEFORE the array
+/// compaction, while `idx` still names the right tab.
 pub fn group_remove_member(mut ed: Ed, idx: int) {
     if idx < 0 || idx >= ed.tabs.len || ed.tabs[idx].group_id == 0 {
         return
@@ -99,33 +232,287 @@ pub fn group_remove_member(mut ed: Ed, idx: int) {
         i += 1
     }
     if group_member_count(ed, gid) == 0 {
-        groups_unported("yew_group_dissolve")
+        group_dissolve(mut ed, gid)
     }
 }
 
-/// `yew_group_label` (`groups.c:289-303`): "label (N)" — the group
-/// value's label (Sprint 24); unreachable while no group exists.
+/// `yew_group_dissolve` (`groups.c:259-287`): stragglers become UNGROUPED
+/// rather than orphaned — a tab still naming a freed id answers "grouped"
+/// everywhere and resolves to no group, so row 1 skips it as a member,
+/// row 2 never lists it, and the file is unreachable by any navigation.
+pub fn group_dissolve(mut ed: Ed, gid: int) {
+    let at = group_find(ed, gid)
+    if at < 0 {
+        return
+    }
+    var i = 0
+    while i < ed.tabs.len {
+        if ed.tabs[i].group_id == gid {
+            ed.tabs[i].group_id = 0
+            ed.tabs[i].group_ordinal = 0
+        }
+        i += 1
+    }
+    var k = at
+    while k + 1 < ed.groups.len {
+        ed.groups[k] = copy ed.groups[k + 1]
+        k += 1
+    }
+    let _ = (mut ed.groups).pop()
+}
+
+/// `yew_group_label` (`groups.c:289-303`): "label (N)", the count
+/// computed HERE, at the moment of display, so a label cannot survive
+/// the close that made it wrong; "" for no such group.
 pub fn group_label(ed: Ed, gid: int) -> str {
-    if gid == 0 {
+    let at = group_find(ed, gid)
+    if at < 0 {
         return ""
     }
-    groups_unported("yew_group_label")
-    ""
+    "{ed.groups[at].label} ({group_member_count(ed, gid)})"
 }
 
-/// `yew_group_note_position` (`groups.c:482-496`): records the active
-/// tab's path as its group's resume point; nothing when ungrouped.
-pub fn group_note_position(ed: Ed) {
+// `group_path_below` (`groups.c:313-327`): `path` strictly inside `root`
+// (trailing slashes on the root ignored; "/" holds every absolute path).
+fn group_path_below(path: str, root: str) -> bool {
+    if root.len == 0 {
+        return false
+    }
+    var n = root.len
+    while n > 1 && root.bytes()[n - 1] as int == 47 {
+        n -= 1
+    }
+    if path.len <= n || !path.starts_with(root[0..n]) {
+        return false
+    }
+    if n == 1 && root.bytes()[0] as int == 47 {
+        return path.bytes()[0] as int == 47
+    }
+    path.bytes()[n] as int == 47
+}
+
+/// `yew_group_for_path` (`groups.c:329-355`): the most specific group
+/// root containing `path`; equal roots prefer the active group, else the
+/// first. A suggested destination (the shell's self-open), never a
+/// membership constraint. 0 for none.
+pub fn group_for_path(ed: Ed, path: str) -> int {
+    if path.len == 0 {
+        return 0
+    }
+    let active = active_group_id(ed)
+    var best = 0
+    var best_len = 0
+    for g in ed.groups {
+        if !group_path_below(path, g.dir_path) {
+            continue
+        }
+        var n = g.dir_path.len
+        while n > 1 && g.dir_path.bytes()[n - 1] as int == 47 {
+            n -= 1
+        }
+        if n > best_len || n == best_len && g.id == active && best != active {
+            best = g.id
+            best_len = n
+        }
+    }
+    best
+}
+
+/// `yew_group_prune_empty` (`groups.c:357-373`): every memberless group
+/// dissolved (the restore path's and the picker's net).
+pub fn group_prune_empty(mut ed: Ed) {
+    var i = 0
+    while i < ed.groups.len {
+        let gid = ed.groups[i].id
+        if group_member_count(ed, gid) == 0 {
+            // The list compacts under `i`: do not advance.
+            group_dissolve(mut ed, gid)
+            continue
+        }
+        i += 1
+    }
+}
+
+/// `yew_group_set_ordinal` (`groups.c:375-419`): `pos` is 1-based in the
+/// FINAL list the user sees, clamped to 1..n. "Skip the moved member,
+/// insert at pos" is off by one whenever the member moves RIGHT (its
+/// vacated slot is still counted), so the final order is built first —
+/// the member removed BEFORE the insertion point is chosen — then
+/// renumbered 1..n.
+pub fn group_set_ordinal(mut ed: Ed, idx: int, pos_in: int) {
+    if idx < 0 || idx >= ed.tabs.len || ed.tabs[idx].group_id == 0 {
+        return
+    }
+    let members = group_members(ed, ed.tabs[idx].group_id)
+    let n = members.len
+    var at = -1
+    var i = 0
+    while i < n {
+        if members[i] == idx {
+            at = i
+        }
+        i += 1
+    }
+    if at < 0 {
+        return
+    }
+    var pos = pos_in
+    if pos < 1 {
+        pos = 1
+    }
+    if pos > n {
+        pos = n
+    }
+    var order = List[int]()
+    i = 0
+    while i < n {
+        if i != at {
+            (mut order).push(members[i])
+        }
+        i += 1
+    }
+    (mut order).push(0)
+    var k = order.len - 1
+    while k > pos - 1 {
+        order[k] = order[k - 1]
+        k -= 1
+    }
+    order[pos - 1] = idx
+    i = 0
+    while i < order.len {
+        ed.tabs[order[i]].group_ordinal = i + 1
+        i += 1
+    }
+}
+
+/// `yew_group_reorder_block` (`groups.c:421-480`): a group is ONE row-1
+/// entry but several array entries, so moving it moves every member,
+/// made contiguous at `to_idx` (clamped) among the other tabs. The ENTIRE
+/// destination order is computed first, AS TAB IDS, then placed position
+/// by position: moving members one at a time drags already-placed ones
+/// back down and interleaves the group with the tabs it passed, and
+/// recorded indices go stale at the first move. The active tab is a
+/// POSITION, re-resolved from the id it named before the move.
+pub fn group_reorder_block(mut ed: Ed, gid: int, to_in: int) {
+    if gid == 0 {
+        return
+    }
+    let n = ed.tabs.len
+    let members = group_members(ed, gid)
+    if members.len == 0 {
+        return
+    }
+    var others = List[int]()
+    for t in ed.tabs {
+        if t.group_id != gid {
+            (mut others).push(t.tab_id)
+        }
+    }
+    var to = to_in
+    if to < 0 {
+        to = 0
+    }
+    if to > others.len {
+        to = others.len
+    }
+    var order = List[int]()
+    var i = 0
+    while i < to {
+        (mut order).push(others[i])
+        i += 1
+    }
+    for m in members {
+        (mut order).push(ed.tabs[m].tab_id)
+    }
+    i = to
+    while i < others.len {
+        (mut order).push(others[i])
+        i += 1
+    }
+    let active_id = if ed.tab_active >= 0 && ed.tab_active < n {
+        ed.tabs[ed.tab_active].tab_id
+    } else {
+        0
+    }
+    i = 0
+    while i < order.len {
+        let q = tab_index_of_id(ed, order[i])
+        if q >= 0 && q != i {
+            let tmp = copy ed.tabs[i]
+            ed.tabs[i] = copy ed.tabs[q]
+            ed.tabs[q] = tmp
+        }
+        i += 1
+    }
+    if active_id != 0 {
+        ed.tab_active = tab_index_of_id(ed, active_id)
+    }
+}
+
+/// `yew_group_note_position` (`groups.c:482-496`): the active tab's path
+/// recorded as its group's resume point — called when leaving a group,
+/// before the switch that changes what "active" means. Nothing when
+/// ungrouped or pathless.
+pub fn group_note_position(mut ed: Ed) {
     let gid = active_group_id(ed)
     if gid == 0 {
         return
     }
-    groups_unported("yew_group_note_position")
+    let at = group_find(ed, gid)
+    let t = ed.tab_active
+    if at < 0 || t < 0 || t >= ed.tabs.len || !ed.tabs[t].has_path {
+        return
+    }
+    ed.groups[at].last_active_member = ed.tabs[t].path
+    ed.groups[at].has_last = true
 }
 
-/// `yew_group_enter` (`groupnav.c`): entering a group at its resume
-/// member — Sprint 24's; reached only through a negative strip payload,
-/// which no row-1 entry carries while no group exists.
-pub fn group_enter(ed: Ed, gid: int) {
-    groups_unported("yew_group_enter of group {gid}")
+/// `yew_group_set_last_member` (`groups.c:498-507`): Sprint 25 §6's
+/// restore of a remembered member — a PATH (indices shift; a dangling one
+/// already falls back to the lowest ordinal). `has` false clears it.
+pub fn group_set_last_member(mut ed: Ed, gid: int, path: str, has: bool) {
+    let at = group_find(ed, gid)
+    if at < 0 {
+        return
+    }
+    ed.groups[at].last_active_member = if has then path else ""
+    ed.groups[at].has_last = has
+}
+
+// ---- s24 §3: lazy hydration, the defer half -----------------------------
+
+/// `yew_buf_defer` (`ed.c:486-509`): a resident file buffer's text
+/// released — its journal closed (kept on disk for recovery, as C's
+/// `yew_journal_close`), its undo tree, marks and pairs dropped (dirtiness
+/// is DERIVED from the undo tree, so a buffer read from nowhere reports
+/// clean without anyone assigning a flag), the piece tree released — and
+/// the slot is the shape `ws_file_buf` gives a file buffer born
+/// non-resident, so the next `buf_hydrate` reads the file again. A
+/// buffer with no path, or already deferred, is left alone.
+pub fn buf_defer(mut ed: Ed, bi: int) {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident || !ed.bufs[bi].has_path {
+        return
+    }
+    if ed.bufs[bi].ec.has_jrnl {
+        text.journal_close(mut ed.journals, mut ed.bufs[bi].ec.jrnl)
+        ed.bufs[bi].ec.has_jrnl = false
+    }
+    pairs_clear(mut ed.bufs[bi])
+    let id = ed.bufs[bi].id
+    var ec = text.editctx_new(take text.textbuf_new())
+    ec.meta = text.filemeta_new()
+    ec.change_hook = true
+    ec.change_buf_id = id
+    ed.bufs[bi].ec = ec
+    ed.bufs[bi].resident = false
+}
+
+/// `yew_tab_defer` (`tabs.c:625-636`): never the tab being looked at —
+/// the window would be left pointing at no text with a cursor in it.
+pub fn tab_defer(mut ed: Ed, idx: int) {
+    let bi = tab_buffer(ed, idx)
+    if bi < 0 || idx == ed.tab_active {
+        return
+    }
+    buf_defer(mut ed, bi)
 }
