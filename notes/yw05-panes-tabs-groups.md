@@ -182,3 +182,32 @@ commit naming what landed (yw03's and yw04's shape).
 3. **The hot paths** (deliverable 6), after the merges.
 4. **The gates** (deliverable 7) on kasumi in a container under
    `taskset -c 0-3`; the note, the map and yw06's contract; the PR.
+
+## 1. Forbidden
+
+The seven standing rules and `sprints/RULES.md`, as the brief gave them:
+sagitta read freely and cited (`layout*`, `region*`, `tabs*`, `strip*`,
+`groups*`, `groupnav*`, `grouppicker*`, `groupfromdir*`, `glyphs*`,
+`draw.c`, `pane_cmds.c`, and for the bump `job.c`, `shsession.c`,
+`shell*.c`, `compgen.c`, `comphelp.c`, `compfish.c`, `clipboard.c`,
+`tty.c`, `loop.c`); facsimile's model only as sagitta's C states it; no
+other editor's or multiplexer's source; no dependency but wolf-std; no
+golden edited. Builds, runs, signals, children and every golden on kasumi
+in a container (`notes/yw05-evidence/lane/ctr.sh`: `archlinux:base-devel`
+under podman, the host's `/usr` read-only for its compilers, `taskset`
+per fork, `ulimit -c 0`, an 8 GB cap, no network), never on nomad-1; git
+work in the lane's and the forks' worktrees on nomad-1; no merge, tag,
+issue filed or closed; no trailer.
+
+## 2. Inputs, verified
+
+| input | re-derived (2026-10-22) | drift from the draft |
+|---|---|---|
+| the sprint files | `s22` 279, `s23` 249, `s24` 366 (894), `s57_8` 279 lines | none |
+| the C | the header's twenty files: 7,535 lines; `draw.c` 1,348 (its border half is s22 §7's) | none |
+| the unit files | 10 files, 194 tests, every one in `tests/unit/registry.c` (layout 45, region 7, draw 4, tabs 34, strip 14, glyphs 8, groups 23, groupnav 35, grouppicker 19, groupfromdir 5) | none |
+| the PTY cases | `s22_*` 11, `s23_*` 6, `s24_*` 4, `s57_8_*` 1, `startup_multiple_files`: **23** | the draft's "30" is a miscount |
+| the fuzz lanes | `tests/fuzz/fuzz_panes.c`, `fuzz_tabs.c`, `fuzz_groups.c` | named here |
+| the budgets | `budgets.txt` has no pane or tab-switch row; `startup.first_paint.workspace50` and `mem.workspace50` are s25's deferred tabs (yw06) | the 2× gates here are the port/C ratio from the same run |
+| the oracle | C yew at `9ace98c2`, gcc: 3,047 unit tests, 0 failures in the lane's container once `YEW_LOG` is unset (one failure under it, the variable's, `notes/yw05-evidence/lane/pin-baseline.txt`) | none |
+| the yew trunk | `5889a8b` (yw04's merge) | none |

@@ -1,0 +1,773 @@
+//! edit.layout — the pane tree and the layout/draw split.
+//!
+//! Ports sagitta `src/ui/layout.c` (745 lines) and `ui/layout.h` (210) at
+//! 9ace98c2, under `s22-layout-panes.md` §1-§5 (and the edge zones of
+//! `s57_22-drag-to-spawn-pane.md` §2, which live in the same file and in
+//! `test_layout`; the gesture that uses them is yw06's, R-yw05-1).
+//!
+//! THE LAW (`layout.h:4-19`): layout computes `Rect`s in CELLS; drawing
+//! consumes them; hit-testing consumes the same values. The split point is
+//! rounded at ONE site (`split_cells`), from a stored ratio, never from
+//! stored cells, so a resize is idempotent (invariant 5).
+//!
+//! **The tree's shape in the port.** C's `Pane` is a `malloc`ed node with
+//! `parent`/`a`/`b` pointers and a `Win *` leaf. The port keeps the tree
+//! as a NODE POOL of the `Ed`, `Ed.panes: List[Pane]`, every link an index
+//! (-1 none), with a free list threaded through `next_free` (yw02's piece
+//! tree shape, `docs/MAP.md` §1): a freed node goes on the list and the
+//! next split takes it, so a split/close storm grows nothing past its
+//! high-water mark (G33). A leaf's `win` indexes `Ed.wins`. Each `Tab`
+//! owns a tree by its root and focus indices (`Tab.root`, `Tab.focus`,
+//! `tabs.h:36-41`); the active tab's are mirrored as `Ed.pane_root` and
+//! `Ed.focus` (C's `ed->pane_root`, `ed->focus`), and `Ed.win` is the
+//! focused leaf's window. C mutates a leaf IN PLACE into the split node so
+//! every pointer at it stays valid; the port does the same with indices,
+//! so `Ed.focus` and a tab's `focus` survive a split without a fixup.
+//!
+//! **The ratio is C's `float`** (`layout.h:62`), kept as `f32` and
+//! computed in single precision exactly as `split_cells` and
+//! `yew_pane_resize` write it (`(float)usable * ratio + 0.5f`,
+//! `(float)want / (float)usable`), so a ratio a resize stored lays out to
+//! the same cell C's does at every span (`edit_layout_test`'s rounding
+//! boundary case).
+//!
+//! C's `yew_pane_tree_walk(root, fn, ctx)` takes a function pointer (no
+//! function value crosses a module boundary in the port, G19/G20): the
+//! port answers the nodes in the walk's order (`pane_tree_nodes`) and the
+//! caller loops. `layout_leaf_win`'s FUSS drawer, diff-peer scroll link
+//! and floating panel (`layout.c:649-662`) are yw13's and yw11's.
+
+use text
+
+/// Side by side, the border COLUMN between (`YEW_SPLIT_H`).
+pub const SPLIT_H: int = 0
+
+/// Stacked, the border ROW between (`YEW_SPLIT_V`).
+pub const SPLIT_V: int = 1
+
+/// `YEW_DIR_LEFT` (`layout.h:36-41`).
+pub const DIR_LEFT: int = 0
+
+/// `YEW_DIR_RIGHT`.
+pub const DIR_RIGHT: int = 1
+
+/// `YEW_DIR_UP`.
+pub const DIR_UP: int = 2
+
+/// `YEW_DIR_DOWN`.
+pub const DIR_DOWN: int = 3
+
+/// Leaf CONTENT columns, excluding the border the parent split owns
+/// (`YEW_PANE_MIN_W`, `layout.h:43-50`).
+pub const PANE_MIN_W: int = 12
+
+/// Leaf content rows (`YEW_PANE_MIN_H`).
+pub const PANE_MIN_H: int = 3
+
+/// The hard cap on one tab's leaves; a split refuses past it
+/// (`YEW_PANE_MAX_LEAVES`).
+pub const PANE_MAX_LEAVES: int = 16
+
+/// No edge zone (`YEW_PANE_ZONE_NONE`, `layout.h:132-137`).
+pub const ZONE_NONE: int = 0
+
+/// The leaf's left edge band.
+pub const ZONE_LEFT: int = 1
+
+/// The right edge band.
+pub const ZONE_RIGHT: int = 2
+
+/// The bottom edge band (there is no top zone: the strip is up there).
+pub const ZONE_BOTTOM: int = 3
+
+/// A node of the pane tree (`Pane`, `layout.h:52-71`): a leaf showing
+/// window `win`, or a split of `dir` whose first child `a` takes `ratio`
+/// of the cells (stored, never the cells). `live` and `next_free` are the
+/// pool's own.
+pub struct Pane {
+    is_leaf: bool,
+    rect: Rect,
+    state_token: int,
+    parent: int,
+    dir: int,
+    ratio: f32,
+    a: int,
+    b: int,
+    win: int,
+    live: bool,
+    next_free: int,
+}
+
+/// An edge zone's answer (`PaneZoneHit`, `layout.h:139-152`).
+pub struct PaneZoneHit {
+    zone: int,
+    dir: int,
+    new_first: bool,
+    band: Rect,
+    preview: Rect,
+}
+
+/// The zone answer for "none" (C's zeroed struct).
+pub fn zonehit_none() -> PaneZoneHit {
+    PaneZoneHit {
+        zone: ZONE_NONE,
+        dir: SPLIT_H,
+        new_first: false,
+        band: rect(0, 0, 0, 0),
+        preview: rect(0, 0, 0, 0),
+    }
+}
+
+/// The border drag in flight (`PaneDrag`, `pane_cmds.h:58-63`): the split
+/// being dragged, the ratio it had when the drag began (Esc restores it),
+/// and the cell the boundary was at.
+pub struct PaneDrag {
+    split: int,
+    entry_ratio: f32,
+    origin: int,
+    active: bool,
+}
+
+/// No drag.
+pub fn panedrag_none() -> PaneDrag {
+    PaneDrag { split: -1, entry_ratio: 0.5, origin: 0, active: false }
+}
+
+// C's `yew_xcalloc(1, sizeof(Pane))` then the fields `yew_pane_new_leaf`
+// sets: a leaf showing nothing, ratio 0.5.
+fn pane_blank() -> Pane {
+    Pane {
+        is_leaf: true,
+        rect: rect(0, 0, 0, 0),
+        state_token: 0,
+        parent: -1,
+        dir: SPLIT_H,
+        ratio: 0.5,
+        a: -1,
+        b: -1,
+        win: -1,
+        live: true,
+        next_free: -1,
+    }
+}
+
+// A node from the free list, else a new one at the pool's end. Replacing
+// a freed element is a struct of scalars, so nothing is held (G33).
+fn pane_alloc(mut ed: Ed) -> int {
+    let p = ed.pane_free_head
+    if p >= 0 {
+        ed.pane_free_head = ed.panes[p].next_free
+        ed.panes[p] = pane_blank()
+        return p
+    }
+    (mut ed.panes).push(pane_blank())
+    ed.panes.len - 1
+}
+
+// `yew_xfree(p)`: the node back on the free list.
+fn pane_release(mut ed: Ed, p: int) {
+    if p < 0 || p >= ed.panes.len || !ed.panes[p].live {
+        return
+    }
+    var blank = pane_blank()
+    blank.live = false
+    blank.next_free = ed.pane_free_head
+    ed.panes[p] = blank
+    ed.pane_free_head = p
+}
+
+/// `yew_pane_new_leaf` (`layout.c:21-29`): a leaf showing window `win`.
+pub fn pane_new_leaf(mut ed: Ed, win: int) -> int {
+    let p = pane_alloc(mut ed)
+    ed.panes[p].is_leaf = true
+    ed.panes[p].win = win
+    ed.panes[p].ratio = 0.5
+    p
+}
+
+// `pane_free_rec` (`layout.c:31-40`).
+fn pane_free_rec(mut ed: Ed, p: int) {
+    if p < 0 || p >= ed.panes.len || !ed.panes[p].live {
+        return
+    }
+    if !ed.panes[p].is_leaf {
+        let a = ed.panes[p].a
+        let b = ed.panes[p].b
+        pane_free_rec(mut ed, a)
+        pane_free_rec(mut ed, b)
+    }
+    pane_release(mut ed, p)
+}
+
+/// `yew_pane_free` (`layout.c:42-62`): the subtree's nodes freed, and the
+/// per-frame pane tables with them — they address nodes by index and must
+/// not outlive them (the use-after-free `fuzz_mouse` found in C). The
+/// leaves' windows are the caller's to release first (`tab_destroy`).
+pub fn pane_free(mut ed: Ed, root: int) {
+    pane_tables_reset(mut ed)
+    pane_free_rec(mut ed, root)
+}
+
+/// Whether `p` names a live node of the pool.
+pub fn pane_live(ed: Ed, p: int) -> bool {
+    p >= 0 && p < ed.panes.len && ed.panes[p].live
+}
+
+/// `yew_pane_leaf_count` (`layout.c:64-71`).
+pub fn pane_leaf_count(ed: Ed, root: int) -> int {
+    if !pane_live(ed, root) {
+        return 0
+    }
+    if ed.panes[root].is_leaf {
+        return 1
+    }
+    pane_leaf_count(ed, ed.panes[root].a) + pane_leaf_count(ed, ed.panes[root].b)
+}
+
+fn collect_into(ed: Ed, p: int, cap: int, collapsed_too: bool, mut out: List[int]) {
+    if !pane_live(ed, p) || out.len >= cap {
+        return
+    }
+    if ed.panes[p].is_leaf {
+        if collapsed_too || ed.panes[p].rect.w != 0 && ed.panes[p].rect.h != 0 {
+            (mut out).push(p)
+        }
+        return
+    }
+    collect_into(ed, ed.panes[p].a, cap, collapsed_too, mut out)
+    collect_into(ed, ed.panes[p].b, cap, collapsed_too, mut out)
+}
+
+/// `yew_pane_collect_leaves` (`layout.c:73-83`): every leaf in tree order,
+/// at most `cap`.
+pub fn pane_collect_leaves(ed: Ed, root: int, cap: int) -> List[int] {
+    var out = List[int]()
+    collect_into(ed, root, cap, true, mut out)
+    out
+}
+
+/// `yew_pane_first_leaf` (`layout.c:85-92`): what anything that must land
+/// focus after a mutation uses (a caller that walks down itself gets it
+/// wrong on the first tree whose surviving child is a split).
+pub fn pane_first_leaf(ed: Ed, root: int) -> int {
+    var at = root
+    while pane_live(ed, at) && !ed.panes[at].is_leaf {
+        at = ed.panes[at].a
+    }
+    if pane_live(ed, at) then at else -1
+}
+
+fn nodes_into(ed: Ed, p: int, mut out: List[int]) {
+    if !pane_live(ed, p) {
+        return
+    }
+    (mut out).push(p)
+    if !ed.panes[p].is_leaf {
+        nodes_into(ed, ed.panes[p].a, mut out)
+        nodes_into(ed, ed.panes[p].b, mut out)
+    }
+}
+
+/// `yew_pane_tree_walk` (`layout.c:94-103`) as the nodes it visits, in
+/// its order (pre-order: the node, then `a`'s subtree, then `b`'s).
+pub fn pane_tree_nodes(ed: Ed, root: int) -> List[int] {
+    var out = List[int]()
+    nodes_into(ed, root, mut out)
+    out
+}
+
+// `clamp_u16` (`layout.c:105-114`).
+fn clamp_u16(v_in: int, lo: int, hi: int) -> int {
+    if hi < lo {
+        return if lo < 0 then 0 else lo
+    }
+    var v = v_in
+    if v < lo {
+        v = lo
+    }
+    if v > hi {
+        v = hi
+    }
+    if v < 0 then 0 else v
+}
+
+/// `split_cells` (`layout.c:116-136`): the split point in cells, from the
+/// ratio — THE single rounding site, in C's single precision. `span`
+/// counts the one border cell the split node owns.
+pub fn split_cells(span: int, ratio: f32, min_a: int, min_b: int) -> int {
+    let usable = span - 1
+    if usable <= 0 {
+        return 0
+    }
+    let u: f32 = usable as f32
+    let cells = (u * ratio + 0.5) as int
+    clamp_u16(cells, min_a, usable - min_b)
+}
+
+// `layout_rec` (`layout.c:138-175`): when the area cannot hold both minima
+// the DEEPER subtree collapses to zero size (never freed), so growing the
+// terminal back restores it.
+fn layout_rec(mut ed: Ed, p: int, r: Rect) {
+    ed.panes[p].rect = copy r
+    if ed.panes[p].is_leaf {
+        return
+    }
+    let a = ed.panes[p].a
+    let b = ed.panes[p].b
+    let ratio = ed.panes[p].ratio
+    if ed.panes[p].dir == SPLIT_H {
+        if r.w < PANE_MIN_W * 2 + 1 {
+            layout_rec(mut ed, a, r)
+            layout_rec(mut ed, b, rect(r.x, r.y, 0, 0))
+            return
+        }
+        let aw = split_cells(r.w, ratio, PANE_MIN_W, PANE_MIN_W)
+        layout_rec(mut ed, a, rect(r.x, r.y, aw, r.h))
+        // The border column at r.x + aw belongs to the split node.
+        layout_rec(mut ed, b, rect(r.x + aw + 1, r.y, r.w - aw - 1, r.h))
+    } else {
+        if r.h < PANE_MIN_H * 2 + 1 {
+            layout_rec(mut ed, a, r)
+            layout_rec(mut ed, b, rect(r.x, r.y, 0, 0))
+            return
+        }
+        let ah = split_cells(r.h, ratio, PANE_MIN_H, PANE_MIN_H)
+        layout_rec(mut ed, a, rect(r.x, r.y, r.w, ah))
+        layout_rec(mut ed, b, rect(r.x, r.y + ah + 1, r.w, r.h - ah - 1))
+    }
+}
+
+/// `yew_layout_compute` (`layout.c:177-182`).
+pub fn layout_compute(mut ed: Ed, root: int, area: Rect) {
+    if !pane_live(ed, root) {
+        return
+    }
+    layout_rec(mut ed, root, area)
+}
+
+/// `rect_contains` (`layout.c:184-188`): a collapsed rect contains
+/// nothing.
+pub fn rect_contains(r: Rect, x: int, y: int) -> bool {
+    r.w != 0 && r.h != 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+/// `yew_pane_leaf_at` (`layout.c:190-205`): -1 off the tree or on a
+/// border cell, which belongs to the split node.
+pub fn pane_leaf_at(ed: Ed, root: int, x: int, y: int) -> int {
+    if !pane_live(ed, root) || !rect_contains(ed.panes[root].rect, x, y) {
+        return -1
+    }
+    if ed.panes[root].is_leaf {
+        return root
+    }
+    let hit = pane_leaf_at(ed, ed.panes[root].a, x, y)
+    if hit >= 0 {
+        return hit
+    }
+    pane_leaf_at(ed, ed.panes[root].b, x, y)
+}
+
+// `split_fits` (`layout.c:207-216`): both halves at or above the minimum
+// at the leaf's current size.
+fn split_fits(ed: Ed, leaf: int, dir: int) -> bool {
+    if dir == SPLIT_H {
+        return ed.panes[leaf].rect.w >= PANE_MIN_W * 2 + 1
+    }
+    ed.panes[leaf].rect.h >= PANE_MIN_H * 2 + 1
+}
+
+/// `yew_pane_split_side` (`layout.c:218-271`): the new leaf (a clone of
+/// `leaf`'s window) goes in child `a` when `new_first`, else `b`; -1 when
+/// refused — no room at the current size, or the active tree's leaf cap.
+/// The old window's `state_token` follows THAT WINDOW. The leaf becomes
+/// the split node in place, so every index at it stays valid.
+pub fn pane_split_side(mut ed: Ed, leaf: int, dir: int, new_first: bool) -> int {
+    if !pane_live(ed, leaf) || !ed.panes[leaf].is_leaf {
+        return -1
+    }
+    if pane_leaf_count(ed, ed.pane_root) >= PANE_MAX_LEAVES {
+        return -1
+    }
+    if !split_fits(ed, leaf, dir) {
+        return -1
+    }
+    let win = ed_win_clone(mut ed, ed.panes[leaf].win)
+    if win < 0 {
+        return -1
+    }
+    let a = pane_alloc(mut ed)
+    let b = pane_alloc(mut ed)
+    let fresh = if new_first then a else b
+    let keep = if new_first then b else a
+    ed.panes[keep].is_leaf = true
+    ed.panes[keep].win = ed.panes[leaf].win
+    ed.panes[keep].parent = leaf
+    ed.panes[keep].ratio = 0.5
+    ed.panes[keep].state_token = ed.panes[leaf].state_token
+    ed.panes[fresh].is_leaf = true
+    ed.panes[fresh].win = win
+    ed.panes[fresh].parent = leaf
+    ed.panes[fresh].ratio = 0.5
+    ed.panes[fresh].state_token = 0
+    ed.panes[leaf].is_leaf = false
+    ed.panes[leaf].win = -1
+    ed.panes[leaf].dir = dir
+    ed.panes[leaf].ratio = 0.5
+    ed.panes[leaf].a = a
+    ed.panes[leaf].b = b
+    ed.panes[leaf].state_token = 0
+    fresh
+}
+
+/// `yew_pane_split` (`layout.c:273-277`): the existing window stays in
+/// child `a`; the clone takes `b` (and, from the command, focus).
+pub fn pane_split(mut ed: Ed, leaf: int, dir: int) -> int {
+    pane_split_side(mut ed, leaf, dir, false)
+}
+
+/// `yew_pane_zone_depth` (`layout.c:283-292`): `clamp(dimension / 5, 3,
+/// 12)`.
+pub fn pane_zone_depth(dimension: int) -> int {
+    let d = dimension / 5
+    if d < 3 {
+        return 3
+    }
+    if d > 12 {
+        return 12
+    }
+    d
+}
+
+// `zone_split_possible` (`layout.c:294-310`): the split's own two
+// questions, in its order.
+fn zone_split_possible(ed: Ed, leaf: int, dir: int) -> bool {
+    if !pane_live(ed, leaf) || !ed.panes[leaf].is_leaf {
+        return false
+    }
+    if pane_leaf_count(ed, ed.pane_root) >= PANE_MAX_LEAVES {
+        return false
+    }
+    split_fits(ed, leaf, dir)
+}
+
+// `zone_preview` (`layout.c:312-337`): through `split_cells`.
+fn zone_preview(r: Rect, dir: int, new_first: bool) -> Rect {
+    if dir == SPLIT_H {
+        let aw = split_cells(r.w, 0.5, PANE_MIN_W, PANE_MIN_W)
+        if new_first {
+            return rect(r.x, r.y, aw, r.h)
+        }
+        return rect(r.x + aw + 1, r.y, r.w - aw - 1, r.h)
+    }
+    let ah = split_cells(r.h, 0.5, PANE_MIN_H, PANE_MIN_H)
+    if new_first {
+        return rect(r.x, r.y, r.w, ah)
+    }
+    rect(r.x, r.y + ah + 1, r.w, r.h - ah - 1)
+}
+
+// `zone_fill` (`layout.c:339-347`).
+fn zone_fill(r: Rect, zone: int, band: Rect) -> PaneZoneHit {
+    let dir = if zone == ZONE_BOTTOM then SPLIT_V else SPLIT_H
+    let new_first = zone == ZONE_LEFT
+    PaneZoneHit {
+        zone: zone,
+        dir: dir,
+        new_first: new_first,
+        band: band,
+        preview: zone_preview(r, dir, new_first),
+    }
+}
+
+/// `yew_pane_zone_at` (`layout.c:349-391`): the live edge zone at (`x`,
+/// `y`) on `leaf`; a corner belongs to the left or right band.
+pub fn pane_zone_at(ed: Ed, leaf: int, x: int, y: int) -> (bool, PaneZoneHit) {
+    if !pane_live(ed, leaf) || !ed.panes[leaf].is_leaf {
+        return (false, zonehit_none())
+    }
+    let r = copy ed.panes[leaf].rect
+    if !rect_contains(r, x, y) {
+        return (false, zonehit_none())
+    }
+    var hit = zonehit_none()
+    if zone_split_possible(ed, leaf, SPLIT_H) {
+        let depth = pane_zone_depth(r.w)
+        if depth * 2 < r.w {
+            if x < r.x + depth {
+                hit = zone_fill(r, ZONE_LEFT, rect(r.x, r.y, depth, r.h))
+            } else if x >= r.x + r.w - depth {
+                hit = zone_fill(r, ZONE_RIGHT, rect(r.x + r.w - depth, r.y, depth, r.h))
+            }
+        }
+    }
+    if hit.zone == ZONE_NONE && zone_split_possible(ed, leaf, SPLIT_V) {
+        let depth = pane_zone_depth(r.h)
+        if y >= r.y + r.h - depth {
+            hit = zone_fill(r, ZONE_BOTTOM, rect(r.x, r.y + r.h - depth, r.w, depth))
+        }
+    }
+    if hit.zone == ZONE_NONE {
+        return (false, zonehit_none())
+    }
+    (true, hit)
+}
+
+/// `yew_pane_close` (`layout.c:393-440`): the sibling's CONTENT moves
+/// into the parent node (its index stays valid for focus and a drag), the
+/// sibling and the leaf nodes are freed, the leaf's window released. The
+/// root leaf refuses (Sprint 23 owns the last pane of a tab). Focus on the
+/// leaf or on the freed sibling moves to the parent's first leaf.
+pub fn pane_close(mut ed: Ed, leaf: int) -> bool {
+    if !pane_live(ed, leaf) || !ed.panes[leaf].is_leaf {
+        return false
+    }
+    let parent = ed.panes[leaf].parent
+    if parent < 0 {
+        return false
+    }
+    let sibling = if ed.panes[parent].a == leaf then ed.panes[parent].b else ed.panes[parent].a
+    ed_win_release(mut ed, ed.panes[leaf].win)
+    ed.panes[parent].is_leaf = ed.panes[sibling].is_leaf
+    ed.panes[parent].dir = ed.panes[sibling].dir
+    ed.panes[parent].ratio = ed.panes[sibling].ratio
+    ed.panes[parent].state_token = ed.panes[sibling].state_token
+    ed.panes[parent].win = ed.panes[sibling].win
+    ed.panes[parent].a = ed.panes[sibling].a
+    ed.panes[parent].b = ed.panes[sibling].b
+    if !ed.panes[parent].is_leaf {
+        let a = ed.panes[parent].a
+        let b = ed.panes[parent].b
+        ed.panes[a].parent = parent
+        ed.panes[b].parent = parent
+    }
+    if ed.focus == sibling || ed.focus == leaf {
+        ed.focus = pane_first_leaf(ed, parent)
+    }
+    pane_tables_reset(mut ed)
+    pane_release(mut ed, sibling)
+    pane_release(mut ed, leaf)
+    true
+}
+
+/// `yew_pane_dir` (`layout.c:464-532`): spatial directional focus — from
+/// the focused leaf's centre, among the drawn leaves strictly beyond it in
+/// `dir`, the one whose facing edge is nearest, ties by how close its
+/// perpendicular centre is. -1 is a no-op: it never wraps.
+pub fn pane_dir(ed: Ed, root: int, from: int, dir: int) -> int {
+    if !pane_live(ed, root) || !pane_live(ed, from) || !ed.panes[from].is_leaf {
+        return -1
+    }
+    var leaves = List[int]()
+    collect_into(ed, root, PANE_MAX_LEAVES * 2, false, mut leaves)
+    let fr = copy ed.panes[from].rect
+    let cx = fr.x + fr.w / 2
+    let cy = fr.y + fr.h / 2
+    var best = -1
+    var best_gap = 0
+    var best_off = 0
+    for c in leaves {
+        if c == from {
+            continue
+        }
+        let r = copy ed.panes[c].rect
+        var gap = 0
+        var off = 0
+        if dir == DIR_LEFT {
+            if r.x + r.w > cx {
+                continue
+            }
+            gap = cx - (r.x + r.w)
+            off = r.y + r.h / 2 - cy
+        } else if dir == DIR_RIGHT {
+            if r.x < cx {
+                continue
+            }
+            gap = r.x - cx
+            off = r.y + r.h / 2 - cy
+        } else if dir == DIR_UP {
+            if r.y + r.h > cy {
+                continue
+            }
+            gap = cy - (r.y + r.h)
+            off = r.x + r.w / 2 - cx
+        } else {
+            if r.y < cy {
+                continue
+            }
+            gap = r.y - cy
+            off = r.x + r.w / 2 - cx
+        }
+        if off < 0 {
+            off = 0 - off
+        }
+        if best < 0 || gap < best_gap || gap == best_gap && off < best_off {
+            best = c
+            best_gap = gap
+            best_off = off
+        }
+    }
+    best
+}
+
+/// `yew_pane_next` (`layout.c:534-548`): the tree-order cycle over the
+/// drawn leaves.
+pub fn pane_next(ed: Ed, root: int, from: int) -> int {
+    var leaves = List[int]()
+    collect_into(ed, root, PANE_MAX_LEAVES * 2, false, mut leaves)
+    if leaves.len == 0 {
+        return -1
+    }
+    var i = 0
+    while i < leaves.len {
+        if leaves[i] == from {
+            return leaves[(i + 1) % leaves.len]
+        }
+        i += 1
+    }
+    leaves[0]
+}
+
+/// `yew_pane_prev` (`layout.c:550-564`).
+pub fn pane_prev(ed: Ed, root: int, from: int) -> int {
+    var leaves = List[int]()
+    collect_into(ed, root, PANE_MAX_LEAVES * 2, false, mut leaves)
+    if leaves.len == 0 {
+        return -1
+    }
+    var i = 0
+    while i < leaves.len {
+        if leaves[i] == from {
+            return leaves[(i + leaves.len - 1) % leaves.len]
+        }
+        i += 1
+    }
+    leaves[leaves.len - 1]
+}
+
+/// `yew_pane_ancestor_split` (`layout.c:570-580`): the nearest ancestor
+/// split on `axis`, or -1.
+pub fn pane_ancestor_split(ed: Ed, leaf: int, axis: int) -> int {
+    var at = leaf
+    while pane_live(ed, at) && ed.panes[at].parent >= 0 {
+        let up = ed.panes[at].parent
+        if ed.panes[up].dir == axis && !ed.panes[up].is_leaf {
+            return up
+        }
+        at = up
+    }
+    -1
+}
+
+/// `yew_pane_resize` (`layout.c:582-609`): the split's boundary moved by
+/// `cells`, refused (false) when either side would go under the minimum;
+/// the cells back to a ratio ONCE, in single precision.
+pub fn pane_resize(mut ed: Ed, split: int, cells: int) -> bool {
+    if !pane_live(ed, split) || ed.panes[split].is_leaf {
+        return false
+    }
+    let horiz = ed.panes[split].dir == SPLIT_H
+    let span = if horiz then ed.panes[split].rect.w else ed.panes[split].rect.h
+    let floor = if horiz then PANE_MIN_W else PANE_MIN_H
+    let usable = span - 1
+    if usable <= 0 {
+        return false
+    }
+    let now = split_cells(span, ed.panes[split].ratio, floor, floor)
+    let want = now + cells
+    if want < floor || want > usable - floor {
+        return false
+    }
+    let wf: f32 = want as f32
+    let uf: f32 = usable as f32
+    ed.panes[split].ratio = wf / uf
+    true
+}
+
+// `layout_leaf_win` (`layout.c:611-663`): the leaf's window takes its
+// pane's geometry; the gutter is per pane. A collapsed leaf keeps its
+// state for when the terminal grows back.
+fn layout_leaf_win(mut ed: Ed, wi: int, r: Rect) {
+    if wi < 0 || wi >= ed.wins.len {
+        return
+    }
+    let bi = ed.wins[wi].buf
+    if r.w == 0 || r.h == 0 {
+        ed.wins[wi].rect = copy r
+        ed.wins[wi].vp.rows = 0
+        ed.wins[wi].vp.cols = 0
+        return
+    }
+    let old_cols = ed.wins[wi].vp.cols
+    let old_gutter = ed.wins[wi].gutter_width
+    var gutter = if r.w < 20 {
+        0
+    } else {
+        gutter_width_for(text.textbuf_line_count(ed.bufs[bi].ec.tb), ed.wins[wi].number_style)
+    }
+    if gutter >= r.w {
+        gutter = 0
+    }
+    ed.wins[wi].gutter_width = gutter
+    ed.wins[wi].rect = rect(r.x + gutter, r.y, r.w - gutter, r.h)
+    ed.wins[wi].vp.rows = r.h
+    ed.wins[wi].vp.cols = r.w - gutter
+    if old_cols != ed.wins[wi].vp.cols || old_gutter != gutter {
+        vp_invalidate(mut ed.wins[wi])
+        ed.full_damage = true
+        ed.footer_dirty = true
+    }
+    vp_clamp(mut ed.wins[wi], ed.bufs[bi].ec.tb)
+    vp_follow(mut ed.wins[wi], ed.bufs[bi].ec.tb)
+}
+
+/// `yew_layout` / `yew_ed_layout` (`layout.c:671-745`): the footer row off
+/// the bottom, the tab strip's rows off the top (a PARAMETER here, not a
+/// renderer), the active tab's tree laid out over what is left and each
+/// leaf's window given its pane's geometry. With no tree (a fixture that
+/// built the editor by hand) the one window takes the area, which is what
+/// the one-leaf tree computes anyway.
+pub fn ed_layout(mut ed: Ed) {
+    if ed.win < 0 {
+        bug("editor layout: missing window")
+    }
+    let cols = ed.grid.cols
+    var content_rows = ed.grid.rows
+    ed.footer_rect = rect(0, 0, 0, 0)
+    if ed.grid.rows > 1 {
+        content_rows = ed.grid.rows - 1
+        ed.footer_rect = rect(0, content_rows, cols, 1)
+    }
+    var strip = tab_strip_rows(ed)
+    if cols == 0 {
+        strip = 0
+    }
+    if strip > content_rows {
+        strip = content_rows
+    }
+    ed.tab_strip_rect = rect(0, 0, cols, strip)
+    content_rows -= strip
+    let area = rect(0, strip, cols, content_rows)
+    if pane_live(ed, ed.pane_root) {
+        layout_compute(mut ed, ed.pane_root, area)
+        // `yew_pane_tree_walk(root, layout_leaf_visit, ed)`: the leaves in
+        // the walk's order.
+        let nodes = pane_tree_nodes(ed, ed.pane_root)
+        for p in nodes {
+            if ed.panes[p].is_leaf {
+                let r = copy ed.panes[p].rect
+                layout_leaf_win(mut ed, ed.panes[p].win, r)
+            }
+        }
+    } else {
+        layout_leaf_win(mut ed, ed.win, area)
+    }
+    ed.layout_dirty = false
+}
+
+/// The per-frame pane tables emptied (`yew_pane_tables_reset`,
+/// `pane_cmds.c:517-523`): every region payload that indexes them dies
+/// with the frame, and with any node they could name.
+pub fn pane_tables_reset(mut ed: Ed) {
+    ed.nleaf_tab = 0
+    ed.nsplit_tab = 0
+}
