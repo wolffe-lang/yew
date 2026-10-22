@@ -353,3 +353,45 @@ suites yw04 ported to the STOP, each now run: see the jobs evidence README
 for the commits. **Campaign 04: 104/104 on both tiers** (the 21 rows
 red at yw04's end all green; CI gates the 104 by name, `b77f12c`). Every
 turned-green suite was seen red under one planted break (`red-*.txt`).
+
+### 4.2 The pane tree (deliverable 2, s22) — the panes fork
+
+**The tree's shape, and why** (`e38c6de`, then `edit.layout`'s header): C's
+`Pane` is a `malloc`ed node with parent/child pointers mutated in place;
+the port keeps the tree as a NODE POOL in the `Ed` (`Ed.panes`, every link
+an index, a free list through `next_free`: yw02's piece-tree shape), so a
+split/close storm grows nothing past its high-water mark (G33) and a
+leaf mutated in place into a split keeps every index at it valid, as C's
+pointers. Each `Tab` owns its tree by root and focus indices (`tabs.h:36-
+41`); the active tab's are mirrored in `Ed.pane_root`/`Ed.focus`, and
+`Ed.win` is the focused leaf's window. A layout node, a tab and a region
+are values threaded through the `Ed`, never module state (E1010). C's tree
+walk takes a function pointer; the port answers the nodes in the walk's
+order and the caller loops (G19/G20).
+
+What landed: `edit.region` in full (`96730bc`: every kind, `remove_rect`,
+`frozen`, the 256 cap warning once a frame, cleared at frame start, the TAB
+payload's sign convention), `edit.glyphs` (`660ffeb`: the chrome
+vocabulary, ASCII decided once from the locale), `edit.pane_cmds`
+(`1b42dd1`: every `ed.pane.*` command, the tab splits, the border drag
+and click-to-focus through the registry), the draw half of s22 §7
+(`912d1ca`: the tree, its borders and crossings, dim-inactive, the
+regions; partial damage with more than one pane redraws the tree, as
+`ed.c:2705-2711`), the mouse route's Sprint-22 half (`94ccbc1`:
+click-to-focus, the border drag with Esc and focus-out restoring the entry
+ratio, the strip's press and release), every other view of a buffer
+following its edits and undo replay (`0e400bd`, `test_jumplist`'s
+peer-window half running), an inactive diff peer clamping (`7df0578`), and
+**the ratio as C's float bits** (`ef7ad62`, §3 prediction 11, G44).
+
+Tests: `test_layout` 45 (+1 port: the ratio rounds in C's float),
+`test_region` 7, `test_glyphs` 8, `test_draw` 3 of 4 (the git diff rows
+SKIP by name: yw13). Per case on the checked machine at `ef7ad62`:
+`edit_layout_test` 45 of 46 (one on the step budget), `edit_region_test` 7
+of 7, `edit_glyphs_test` 8 of 8, `edit_draw_test` 3 of 4,
+`edit_jumplist_test` 18 of 18 (`notes/yw05-evidence/panes/f32-bits/`).
+Goldens: **s22's 11 by name on both tiers** at `6b9797b` (gate g2) and at
+`ef7ad62` (gate g3), campaign 03 62/62 and 04 unchanged. Fuzz: s22 DoD 10's
+layout fuzz is `tools/fuzz-panes` over C's own generator: the four-seed
+campaign × 10,000 operations on both tiers and 200,000 at seed 1, every
+report hash equal to C's driver (`gate-g3/g3.log`).
