@@ -83,12 +83,19 @@ pub fn statusline_mode_style(mode: int) -> UiStyle {
 }
 
 fn cells_of(s: List[byte]) -> int {
-    let w = unicode.str_width(s, 0, s.len, STATUS_TABWIDTH)
+    range_cells(s, 0, s.len)
+}
+
+// The cells of bytes `[lo, hi)` of `s` (C's `cells`, `statusline.c:23-29`).
+fn range_cells(s: List[byte], lo: int, hi: int) -> int {
+    let w = unicode.str_width(s, lo, hi, STATUS_TABWIDTH)
     if w < 0 then 0 else w
 }
 
+// A `str`'s cells, its bytes read in place (a bound `.bytes()` copies).
 fn str_cells(s: str) -> int {
-    cells_of(bytes_of(s))
+    let w = unicode.str_width(s.bytes(), 0, s.len, STATUS_TABWIDTH)
+    if w < 0 then 0 else w
 }
 
 // `mode_theme_role` (`statusline.c:84-97`).
@@ -149,7 +156,6 @@ fn unambiguous_path(ed: Ed, bi: int) -> str {
         return "[no name]"
     }
     let path = ed.bufs[bi].path
-    let pb = path.bytes()
     var start = path.len - base_name(path).len
     loop {
         let suffix = path[start..]
@@ -168,7 +174,7 @@ fn unambiguous_path(ed: Ed, bi: int) -> str {
             return path
         }
         start -= 1
-        while start > 0 && pb[start - 1] as int != 47 {
+        while start > 0 && path.bytes()[start - 1] as int != 47 {
             start -= 1
         }
     }
@@ -189,24 +195,28 @@ fn eol_text(eol: int) -> str {
     "mixed!"
 }
 
-// `percent_text` (`statusline.c:205-230`).
-fn percent_text(mut w: Win, tb: text.TextBuf) -> str {
+// `percent_text` (`statusline.c:205-230`), appended to `out` in place.
+fn percent_into(mut out: List[byte], mut w: Win, tb: text.TextBuf) {
     let lines = text.textbuf_line_count(tb)
     let rows = w.vp.rows
     if lines <= rows {
-        return "all"
+        push_str(mut out, "all")
+        return
     }
     if w.vp.top == 0 {
-        return "top"
+        push_str(mut out, "top")
+        return
     }
     if vp_last_visible_line(mut w, tb) + 1 >= lines {
-        return "bot"
+        push_str(mut out, "bot")
+        return
     }
     var percent = w.vp.top * 100 / (lines - rows)
     if percent > 100 {
         percent = 100
     }
-    "{percent}%"
+    push_dec(mut out, percent)
+    push_str(mut out, "%")
 }
 
 // `highlight_unit` (`statusline.c:232-245`).
@@ -229,65 +239,99 @@ fn highlight_unit(w: Win) -> str {
     "C"
 }
 
-fn chip_text(ed: Ed, w: Win) -> str {
-    if ed.mode == MODE_H {
-        return " H\u{b7}{highlight_unit(w)} "
+// `chip_text` (`statusline.c:247-254`), into `out` (emptied first).
+fn chip_into(mut out: List[byte], mode: int, w: Win) {
+    clear_bytes(mut out)
+    push_str(mut out, " ")
+    if mode == MODE_H {
+        push_str(mut out, "H\u{b7}")
+        push_str(mut out, highlight_unit(w))
+    } else {
+        push_str(mut out, mode_name(mode))
     }
-    " {mode_name(ed.mode)} "
+    push_str(mut out, " ")
 }
 
-// A statusline segment (`Segment`, `statusline.c:31-35`).
-struct Segment {
-    text: str,
+/// C's `Segment segments[16]` (`statusline.c:395`): the slots in C's order.
+pub const STATUS_SEGS: int = 16
+
+/// A statusline segment (`Segment`, `statusline.c:31-35`): its text is
+/// bytes `[lo, hi)` of the frame's segment pool (`ed.dbuf.seg_text`).
+pub struct StatusSeg {
+    lo: int,
+    hi: int,
     priority: int,
     shown: bool,
 }
 
-fn right_width(segments: List[Segment]) -> int {
+// Slot `i`: the pool's bytes from `lo` to its end, appended just before.
+fn seg_put(mut d: DrawBufs, i: int, lo: int, priority: int, shown: bool) {
+    let sg = StatusSeg { lo: lo, hi: d.seg_text.len, priority: priority, shown: shown }
+    if i < d.segs.len {
+        d.segs[i] = sg
+    } else {
+        (mut d.segs).push(sg)
+    }
+}
+
+// Slot `i` holding the constant `t`.
+fn seg_str(mut d: DrawBufs, i: int, t: str, priority: int, shown: bool) {
+    let lo = d.seg_text.len
+    push_str(mut d.seg_text, t)
+    seg_put(mut d, i, lo, priority, shown)
+}
+
+fn right_width(d: DrawBufs) -> int {
     var width = 0
-    for s in segments {
-        if !s.shown || s.text.len == 0 {
-            continue
+    var i = 0
+    while i < STATUS_SEGS {
+        if d.segs[i].shown && d.segs[i].hi != d.segs[i].lo {
+            if width != 0 {
+                width += 2
+            }
+            width += range_cells(d.seg_text, d.segs[i].lo, d.segs[i].hi)
         }
-        if width != 0 {
-            width += 2
-        }
-        width += str_cells(s.text)
+        i += 1
     }
     width
 }
 
-fn drop_priority(mut segments: List[Segment], priority: int) {
+fn drop_priority(mut d: DrawBufs, priority: int) {
     var i = 0
-    while i < segments.len {
-        if segments[i].priority == priority {
-            segments[i].shown = false
+    while i < STATUS_SEGS {
+        if d.segs[i].priority == priority {
+            d.segs[i].shown = false
         }
         i += 1
     }
 }
 
-// `path_clip` (`statusline.c:292-344`).
-fn path_clip(path: str, max_cells: int) -> str {
+// `path_clip` (`statusline.c:292-344`) into `dst` (emptied first; C's
+// `dst`/`cap`).
+fn path_clip_into(mut dst: List[byte], path: str, max_cells: int) {
     let ellipsis = "\u{2026}"
+    clear_bytes(mut dst)
     if max_cells <= 0 {
-        return ""
+        return
     }
-    if str_cells(path) <= max_cells {
-        return path
+    // Measured through `dst` (a `str`'s `.bytes()` handed to a call can
+    // be a list made a frame); it is the answer when it fits.
+    push_str(mut dst, path)
+    if cells_of(dst) <= max_cells {
+        return
     }
+    clear_bytes(mut dst)
     let base = base_name(path)
     let base_at = path.len - base.len
     if base_at != 0 && str_cells(base) + 2 <= max_cells {
-        let pb = path.bytes()
         var suffix = base_at
         var component = base_at
         while component > 0 {
             var previous = component - 1
-            while previous > 0 && pb[previous - 1] as int != 47 {
+            while previous > 0 && path.bytes()[previous - 1] as int != 47 {
                 previous -= 1
             }
-            if previous == 0 && pb[0] as int == 47 {
+            if previous == 0 && path.bytes()[0] as int == 47 {
                 previous = 1
             }
             if previous >= component || str_cells(path[previous..]) + 2 > max_cells {
@@ -296,14 +340,18 @@ fn path_clip(path: str, max_cells: int) -> str {
             suffix = previous
             component = previous
         }
-        return "{ellipsis}/{path[suffix..]}"
+        push_str(mut dst, ellipsis)
+        push_str(mut dst, "/")
+        push_str(mut dst, path[suffix..])
+        return
     }
     if max_cells == 1 {
-        return ellipsis
+        push_str(mut dst, ellipsis)
+        return
     }
-    let bb = bytes_of(base)
-    let (keep, _) = unicode.str_clip(bb, 0, bb.len, max_cells - 1)
-    "{base[0..keep]}{ellipsis}"
+    let (keep, _) = unicode.str_clip(base.bytes(), 0, base.len, max_cells - 1)
+    push_str(mut dst, base[0..keep])
+    push_str(mut dst, ellipsis)
 }
 
 /// What the statusline shows (`StatuslineText`, `statusline.h:20-41`).
@@ -318,24 +366,48 @@ pub struct StatusText {
     warn_len: int,
 }
 
-/// `yew_statusline_build` (`statusline.c:362-749`) for window `wi` at
-/// `cols` cells.
-pub fn statusline_build(mut ed: Ed, wi: int, cols: int) -> StatusText {
-    let bi = ed.wins[wi].buf
-    let chip = bytes_of(chip_text(ed, ed.wins[wi]))
-    let chip_cells = cells_of(chip)
-    var out = StatusText {
-        chip: chip,
+/// An empty statusline text (C's `memset(out, 0, …)`).
+pub fn statustext_new() -> StatusText {
+    StatusText {
+        chip: List[byte](),
         recording: List[byte](),
         recording_cells: 0,
-        chip_cells: chip_cells,
+        chip_cells: 0,
         body: List[byte](),
         body_cells: 0,
         warn_at: 0,
         warn_len: 0,
     }
+}
+
+/// `yew_statusline_build` (`statusline.c:362-749`) for window `wi` at
+/// `cols` cells, as a value (the tests' form): `statusline_build_into`'s
+/// text, copied out.
+pub fn statusline_build(mut ed: Ed, wi: int, cols: int) -> StatusText {
+    statusline_build_into(mut ed, wi, cols)
+    copy ed.dbuf.status
+}
+
+/// `yew_statusline_build` (`statusline.c:362-749`) for window `wi` at
+/// `cols` cells into the editor's `ed.dbuf.status` — C's caller-owned
+/// `StatuslineText *out` with its inline body (`statusline.c:404-414`).
+/// The segments' texts (C's `position[112]`, `percent[16]`, the badges'
+/// `char[]`s) are written into one pool, `ed.dbuf.seg_text`, the digits
+/// in place: a frame's statusline builds no `str` (deliverable 6).
+pub fn statusline_build_into(mut ed: Ed, wi: int, cols: int) {
+    let bi = ed.wins[wi].buf
+    let mode = ed.mode
+    chip_into(mut ed.dbuf.status.chip, mode, ed.wins[wi])
+    clear_bytes(mut ed.dbuf.status.recording)
+    clear_bytes(mut ed.dbuf.status.body)
+    let chip_cells = cells_of(ed.dbuf.status.chip)
+    ed.dbuf.status.recording_cells = 0
+    ed.dbuf.status.chip_cells = chip_cells
+    ed.dbuf.status.body_cells = 0
+    ed.dbuf.status.warn_at = 0
+    ed.dbuf.status.warn_len = 0
     if cols <= chip_cells {
-        return out
+        return
     }
     let available = cols - chip_cells
     let path = unambiguous_path(ed, bi)
@@ -344,98 +416,119 @@ pub fn statusline_build(mut ed: Ed, wi: int, cols: int) -> StatusText {
     let line = text.textbuf_line_of(ed.bufs[bi].ec.tb, cursor.pos as text.ByteOff) as int
     let lspan = text.textbuf_line_span(ed.bufs[bi].ec.tb, line as text.LineNo)
     let gcol = text.off_to_gcol(mut ed.bufs[bi].ec.tb, lspan, cursor.pos as text.ByteOff) as int
-    var position = "{line + 1}:{gcol + 1}"
-    if ed.wins[wi].cs.selstacks[p].n != 0 && cursor.anchor != cursor.pos {
-        let aline = text.textbuf_line_of(ed.bufs[bi].ec.tb, cursor.anchor as text.ByteOff) as int
+    let anchored = ed.wins[wi].cs.selstacks[p].n != 0 && cursor.anchor != cursor.pos
+    var aline = 0
+    var agcol = 0
+    if anchored {
+        aline = text.textbuf_line_of(ed.bufs[bi].ec.tb, cursor.anchor as text.ByteOff) as int
         let aspan = text.textbuf_line_span(ed.bufs[bi].ec.tb, aline as text.LineNo)
-        let agcol = text.off_to_gcol(
-            mut ed.bufs[bi].ec.tb,
-            aspan,
-            cursor.anchor as text.ByteOff,
-        ) as int
-        position = "{line + 1}:{gcol + 1}@{aline + 1}:{agcol + 1}"
+        agcol = text.off_to_gcol(mut ed.bufs[bi].ec.tb, aspan, cursor.anchor as text.ByteOff) as int
     }
-    let percent = percent_text(mut ed.wins[wi], ed.bufs[bi].ec.tb)
-    let meta = copy ed.bufs[bi].ec.meta
-    let encoding = if meta.binary then "utf-8 bin" else "utf-8"
+    let eol = ed.bufs[bi].ec.meta.eol
     let ncurs = ed.wins[wi].cs.curs.len
-    var segments = List[Segment]()
     let ro = read_only(ed.bufs[bi])
-    (mut segments).push(Segment { text: if ro then "[ro]" else "", priority: 4, shown: ro })
-    (mut segments).push(Segment { text: encoding, priority: 3, shown: true })
-    (mut segments).push(Segment { text: eol_text(meta.eol), priority: 3, shown: true })
-    (mut segments).push(Segment { text: "bom", priority: 3, shown: meta.had_bom })
-    (mut segments).push(Segment { text: "!utf8", priority: 2, shown: meta.had_invalid_utf8 })
-    (mut segments).push(Segment { text: position, priority: 1, shown: true })
-    (mut segments).push(Segment { text: percent, priority: 5, shown: true })
-    (mut segments).push(Segment {
-        text: if ncurs > 1 then "\u{d7}{ncurs}" else "",
-        priority: 1,
-        shown: ncurs > 1,
-    })
+    clear_bytes(mut ed.dbuf.seg_text)
+    seg_str(mut ed.dbuf, 0, if ro then "[ro]" else "", 4, ro)
+    seg_str(mut ed.dbuf, 1, if ed.bufs[bi].ec.meta.binary then "utf-8 bin" else "utf-8", 3, true)
+    seg_str(mut ed.dbuf, 2, eol_text(eol), 3, true)
+    seg_str(mut ed.dbuf, 3, "bom", 3, ed.bufs[bi].ec.meta.had_bom)
+    seg_str(mut ed.dbuf, 4, "!utf8", 2, ed.bufs[bi].ec.meta.had_invalid_utf8)
+    // `position[112]`: `%llu:%llu`, `@%llu:%llu` with a selection
+    // (`statusline.c:448-462`).
+    var lo = ed.dbuf.seg_text.len
+    push_dec(mut ed.dbuf.seg_text, line + 1)
+    push_str(mut ed.dbuf.seg_text, ":")
+    push_dec(mut ed.dbuf.seg_text, gcol + 1)
+    if anchored {
+        push_str(mut ed.dbuf.seg_text, "@")
+        push_dec(mut ed.dbuf.seg_text, aline + 1)
+        push_str(mut ed.dbuf.seg_text, ":")
+        push_dec(mut ed.dbuf.seg_text, agcol + 1)
+    }
+    seg_put(mut ed.dbuf, 5, lo, 1, true)
+    lo = ed.dbuf.seg_text.len
+    percent_into(mut ed.dbuf.seg_text, mut ed.wins[wi], ed.bufs[bi].ec.tb)
+    seg_put(mut ed.dbuf, 6, lo, 5, true)
+    lo = ed.dbuf.seg_text.len
+    if ncurs > 1 {
+        push_str(mut ed.dbuf.seg_text, "\u{d7}")
+        push_dec(mut ed.dbuf.seg_text, ncurs)
+    }
+    seg_put(mut ed.dbuf, 7, lo, 1, ncurs > 1)
     // Sprint 19 §8 (`statusline.c:490-503`): the job badge is present iff
     // something is running, and goes at zero — a badge that lingers at
-    // "0 jobs" trains people to ignore it.
+    // "0 jobs" trains people to ignore it. `⟨N⟩`, the count in place
+    // (C's `job_badge[32]`).
     let running = job_running_count(ed)
-    (mut segments).push(Segment {
-        text: if running != 0 then "\u{27e8}{running}\u{27e9}" else "",
-        priority: 2,
-        shown: running != 0,
-    })
+    lo = ed.dbuf.seg_text.len
+    if running != 0 {
+        push_str(mut ed.dbuf.seg_text, "\u{27e8}")
+        push_dec(mut ed.dbuf.seg_text, running)
+        push_str(mut ed.dbuf.seg_text, "\u{27e9}")
+    }
+    seg_put(mut ed.dbuf, 8, lo, 2, running != 0)
     // The search count (s21) and wrap glyph (s20), the syntax badge
     // (s39), diagnostics (s46), the Fortran language (s42), git (s51) and
     // AI (s48): C's slots 9-15, empty before their campaigns.
     // Sprint 21 §3 (`statusline.c:504-530`): `[3/17]`, `[3/10000+]` past
     // the cap; the `+` says the editor stopped counting.
     let ov_total = ed.wins[wi].overlay.count_total
-    let ov_plus = if ed.wins[wi].overlay.count_capped then "+" else ""
+    let ov_capped = ed.wins[wi].overlay.count_capped
     let ov_cur = ed.wins[wi].overlay.cur_index
-    let badge = if ov_total == 0 {
-        ""
-    } else if ov_cur >= 0 {
-        "[{ov_cur + 1}/{ov_total}{ov_plus}]"
-    } else {
-        "[{ov_total}{ov_plus}]"
+    lo = ed.dbuf.seg_text.len
+    if ov_total != 0 {
+        push_str(mut ed.dbuf.seg_text, "[")
+        if ov_cur >= 0 {
+            push_dec(mut ed.dbuf.seg_text, ov_cur + 1)
+            push_str(mut ed.dbuf.seg_text, "/")
+        }
+        push_dec(mut ed.dbuf.seg_text, ov_total)
+        if ov_capped {
+            push_str(mut ed.dbuf.seg_text, "+")
+        }
+        push_str(mut ed.dbuf.seg_text, "]")
     }
-    (mut segments).push(Segment { text: badge, priority: 2, shown: ov_total != 0 })
+    seg_put(mut ed.dbuf, 9, lo, 2, ov_total != 0)
     // The wrap indicator for the two seconds after a search came round
     // (`statusline.c:531-542`).
     let wrap_shown = search_wrap_until(ed) > ed.now_ms
-    (mut segments).push(Segment {
-        text: if wrap_shown then "\u{21bb}" else "",
-        priority: 2,
-        shown: wrap_shown,
-    })
-    (mut segments).push(Segment { text: "", priority: 4, shown: false })
-    (mut segments).push(Segment { text: "", priority: 5, shown: false })
-    (mut segments).push(Segment { text: "", priority: 3, shown: false })
-    (mut segments).push(Segment { text: "", priority: 5, shown: false })
-    (mut segments).push(Segment { text: "", priority: 5, shown: false })
-    var path_cells = str_cells(path)
+    seg_str(mut ed.dbuf, 10, if wrap_shown then "\u{21bb}" else "", 2, wrap_shown)
+    seg_str(mut ed.dbuf, 11, "", 4, false)
+    seg_str(mut ed.dbuf, 12, "", 5, false)
+    seg_str(mut ed.dbuf, 13, "", 3, false)
+    seg_str(mut ed.dbuf, 14, "", 5, false)
+    seg_str(mut ed.dbuf, 15, "", 5, false)
+    clear_bytes(mut ed.dbuf.path)
+    push_str(mut ed.dbuf.path, path)
+    var path_cells = cells_of(ed.dbuf.path)
     let dirty = buf_dirty(ed.bufs[bi])
     let dirty_cells = if dirty then 2 else 0
-    var right_cells = right_width(segments)
+    var right_cells = right_width(ed.dbuf)
     var min_cells = 1 + path_cells + dirty_cells + (if right_cells == 0 then 0 else 2 + right_cells)
     var priority = 5
     while priority >= 1 && min_cells > available {
-        drop_priority(mut segments, priority)
-        right_cells = right_width(segments)
+        drop_priority(mut ed.dbuf, priority)
+        right_cells = right_width(ed.dbuf)
         min_cells = 1 + path_cells + dirty_cells + (if right_cells == 0 then 0 else 2 + right_cells)
         priority -= 1
     }
-    right_cells = right_width(segments)
+    right_cells = right_width(ed.dbuf)
     let reserved = 1 + dirty_cells + (if right_cells == 0 then 0 else 2 + right_cells)
     var path_budget = available - reserved
     if path_budget < 0 {
         path_budget = 0
     }
-    let clipped = path_clip(path, path_budget)
-    path_cells = str_cells(clipped)
-    var body = List[byte]()
-    push_str(mut body, " ")
-    push_str(mut body, clipped)
+    path_clip_into(mut ed.dbuf.path, path, path_budget)
+    path_cells = cells_of(ed.dbuf.path)
+    push_str(mut ed.dbuf.status.body, " ")
+    var k = 0
+    while k < ed.dbuf.path.len {
+        let b = ed.dbuf.path[k]
+        (mut ed.dbuf.status.body).push(b)
+        k += 1
+    }
     if dirty {
-        push_str(mut body, " *")
+        push_str(mut ed.dbuf.status.body, " *")
     }
     if right_cells != 0 {
         let used = 1 + path_cells + dirty_cells
@@ -444,31 +537,35 @@ pub fn statusline_build(mut ed: Ed, wi: int, cols: int) -> StatusText {
             gap = 2
         }
         while gap > 0 {
-            push_str(mut body, " ")
+            push_str(mut ed.dbuf.status.body, " ")
             gap -= 1
         }
         var prior = false
         var i = 0
-        while i < segments.len {
-            if segments[i].shown && segments[i].text.len != 0 {
+        while i < STATUS_SEGS {
+            let sg = copy ed.dbuf.segs[i]
+            if sg.shown && sg.hi != sg.lo {
                 if prior {
-                    push_str(mut body, "  ")
+                    push_str(mut ed.dbuf.status.body, "  ")
                 }
-                if i == 2 && meta.eol == text.EOL_MIXED {
-                    out.warn_at = body.len
+                if i == 2 && eol == text.EOL_MIXED {
+                    ed.dbuf.status.warn_at = ed.dbuf.status.body.len
                 }
-                push_str(mut body, segments[i].text)
-                if i == 2 && meta.eol == text.EOL_MIXED {
-                    out.warn_len = body.len - out.warn_at
+                var j = sg.lo
+                while j < sg.hi {
+                    let b = ed.dbuf.seg_text[j]
+                    (mut ed.dbuf.status.body).push(b)
+                    j += 1
+                }
+                if i == 2 && eol == text.EOL_MIXED {
+                    ed.dbuf.status.warn_len = ed.dbuf.status.body.len - ed.dbuf.status.warn_at
                 }
                 prior = true
             }
             i += 1
         }
     }
-    out.body_cells = cells_of(body)
-    out.body = body
-    out
+    ed.dbuf.status.body_cells = cells_of(ed.dbuf.status.body)
 }
 
 /// `yew_statusline_draw` (`statusline.c:843-885`).
@@ -479,7 +576,12 @@ pub fn statusline_draw(mut ed: Ed, wi: int) {
     let row = ed.footer_rect.y
     var style = statusline_mode_style(ed.mode)
     statusline_apply_theme(ed, ed.mode, mut style)
-    let st = statusline_build(mut ed, wi, ed.footer_rect.w)
+    let fw = ed.footer_rect.w
+    statusline_build_into(mut ed, wi, fw)
+    let chip_len = ed.dbuf.status.chip.len
+    let body_len = ed.dbuf.status.body.len
+    let warn_at = ed.dbuf.status.warn_at
+    let warn_len = ed.dbuf.status.warn_len
     var blank = copy ed.grid.blank
     blank.fg = copy style.row_fg
     blank.bg = copy style.row_bg
@@ -489,22 +591,22 @@ pub fn statusline_draw(mut ed: Ed, wi: int) {
         mut ed.grid,
         row,
         ed.footer_rect.x,
-        st.chip,
+        ed.dbuf.status.chip,
         0,
-        st.chip.len,
+        chip_len,
         copy style.chip_fg,
         copy style.chip_bg,
         style.attrs,
     )
-    if col < ed.grid.cols && st.body.len != 0 {
-        if st.warn_len != 0 {
+    if col < ed.grid.cols && body_len != 0 {
+        if warn_len != 0 {
             col = term.grid_puts(
                 mut ed.grid,
                 row,
                 col,
-                st.body,
+                ed.dbuf.status.body,
                 0,
-                st.warn_at,
+                warn_at,
                 copy style.row_fg,
                 copy style.row_bg,
                 0,
@@ -513,9 +615,9 @@ pub fn statusline_draw(mut ed: Ed, wi: int) {
                 mut ed.grid,
                 row,
                 col,
-                st.body,
-                st.warn_at,
-                st.warn_at + st.warn_len,
+                ed.dbuf.status.body,
+                warn_at,
+                warn_at + warn_len,
                 term.color_indexed(STATUS_WARN_COLOR),
                 copy style.row_bg,
                 term.ATTR_BOLD,
@@ -524,9 +626,9 @@ pub fn statusline_draw(mut ed: Ed, wi: int) {
                 mut ed.grid,
                 row,
                 col,
-                st.body,
-                st.warn_at + st.warn_len,
-                st.body.len,
+                ed.dbuf.status.body,
+                warn_at + warn_len,
+                body_len,
                 copy style.row_fg,
                 copy style.row_bg,
                 0,
@@ -536,9 +638,9 @@ pub fn statusline_draw(mut ed: Ed, wi: int) {
                 mut ed.grid,
                 row,
                 col,
-                st.body,
+                ed.dbuf.status.body,
                 0,
-                st.body.len,
+                body_len,
                 copy style.row_fg,
                 copy style.row_bg,
                 0,
