@@ -14,17 +14,13 @@
 //! mode copied, and renamed over the target; EXDEV and a refused chown of
 //! a foreign-owned file fall back to in place.
 //!
-//! **What wolf 0.2.33 cannot do, named where the code meets it:**
-//! - **G3, no `fsync` (wolf-lang#796).** C syncs the temporary before the
-//!   rename, the directory after it, the backup before it is published,
-//!   and the target after an in-place write. 0.2.33 has no sync call, so
-//!   the port makes NONE of them: `no_sync_g3` is where each would be, and
-//!   it syncs nothing. The rename is still atomic — a crash leaves the old
-//!   bytes or the new, never a mix — but durability across a power loss is
-//!   the host's write-back alone. sagitta's torture driver sees it: its
-//!   determinism check wants `fsync-file` before the rename and
-//!   `fsync-dir` after, and its in-place rollback check is armed by a
-//!   directory sync (notes/yw02-the-text-engine.md).
+//! **The syncs (G3, wolf-lang#796; since the 0.2.34 pin, yw05).** C syncs
+//! the temporary before the rename, the directory after it, the backup
+//! before it is published, and the target after an in-place write; each is
+//! a call here, `fsync_full` (`fs_sync`: `fsync(2)` on linux,
+//! `F_FULLFSYNC` on macOS, where C's `fsync(2)` leaves the bytes in the
+//! drive's cache) and `fsync_directory` (`fs_sync_dir`), at C's sites.
+//! **What wolf cannot do, named where the code meets it:**
 //! - **G4, no `realpath` (wolf-lang#797).** The journal and the backup are
 //!   keyed by the realpath's hash; `realpath_walk` resolves a path a
 //!   component at a time with `fs_lstat` and `fs_read_link`.
@@ -259,17 +255,25 @@ fn next_temp_counter() -> int {
     }
 }
 
-// G3 (wolf-lang#796): wolf 0.2.33 has no fsync of a file or a directory.
-// Every sync sagitta's save makes is a call here, and this call SYNCS
-// NOTHING: it answers true so the decision table runs as C's does. The
-// module doc says what that costs. When the pin has `fs_sync`/
-// `fs_sync_dir`, these two are the only lines that change.
-fn no_sync_g3(fd: int) -> bool {
-    fd >= 0
+// `fsync_full`, `file.c:459-467` (and `journal.c:354-362`'s
+// `fsync_retry`, the same call): the bytes and the metadata behind a
+// handle on the disk. EINTR is the runtime's (`[os.fs.sync]`: every host
+// refusal is `io`).
+fn fsync_full(fd: int) -> bool {
+    fs_sync(fd) else {
+        return false
+    }
+    true
 }
 
-fn no_sync_dir_g3(path: str) -> bool {
-    path.len >= 0
+// `fsync_directory`, `file.c:469-484` (and `journal.c:374-385`'s
+// `fsync_dir`): a directory's entries on the disk, opened for reading and
+// synced; a refusal of any kind is C's false.
+fn fsync_directory(path: str) -> bool {
+    fs_sync_dir(path) else {
+        return false
+    }
+    true
 }
 
 /// An empty metadata record (`yew_filemeta_init`).
@@ -1087,7 +1091,7 @@ fn prune_backups(base: str, keep: int) -> bool {
 }
 
 fn discard_backup(path: str) -> bool {
-    remove_quiet(path) && no_sync_dir_g3(path_dirname(path))
+    remove_quiet(path) && fsync_directory(path_dirname(path))
 }
 
 // `link_recovery_unique`, `file.c:887-913`: a hard link that keeps a backup
@@ -1130,7 +1134,7 @@ fn preserve_rotation_history(base: str, keep: int, dir: str) -> (bool, List[str]
             for r in recoveries {
                 let _ = remove_quiet(r)
             }
-            let _ = no_sync_dir_g3(dir)
+            let _ = fsync_directory(dir)
             return (false, List[str]())
         }
         if st.kind != KIND_FILE {
@@ -1139,7 +1143,7 @@ fn preserve_rotation_history(base: str, keep: int, dir: str) -> (bool, List[str]
                     for r in recoveries {
                         let _ = remove_quiet(r)
                     }
-                    let _ = no_sync_dir_g3(dir)
+                    let _ = fsync_directory(dir)
                     return (false, List[str]())
                 }
                 continue
@@ -1147,19 +1151,19 @@ fn preserve_rotation_history(base: str, keep: int, dir: str) -> (bool, List[str]
             for r in recoveries {
                 let _ = remove_quiet(r)
             }
-            let _ = no_sync_dir_g3(dir)
+            let _ = fsync_directory(dir)
             return (false, List[str]())
         }
         let rec = link_recovery_unique(source) else {
             for r in recoveries {
                 let _ = remove_quiet(r)
             }
-            let _ = no_sync_dir_g3(dir)
+            let _ = fsync_directory(dir)
             return (false, List[str]())
         }
         (mut recoveries).push(rec)
     }
-    if !no_sync_dir_g3(dir) {
+    if !fsync_directory(dir) {
         return (false, recoveries)
     }
     (true, recoveries)
@@ -1187,7 +1191,7 @@ fn commit_backup_rotation(pending: str, base: str, keep: int) -> bool {
     }
     if ok {
         let pruned = prune_backups(base, keep)
-        let synced = no_sync_dir_g3(dir)
+        let synced = fsync_directory(dir)
         ok = pruned && synced
     }
     if ok && recoveries.len != 0 {
@@ -1197,7 +1201,7 @@ fn commit_backup_rotation(pending: str, base: str, keep: int) -> bool {
             }
         }
         recoveries = List[str]()
-        if !no_sync_dir_g3(dir) {
+        if !fsync_directory(dir) {
             ok = false
         }
     }
@@ -1281,7 +1285,7 @@ fn copy_path_to_backup(src_path: str, bak_path: str, meta: FileMeta) -> int {
         bak_st.dev == src_st.dev && bak_st.ino == src_st.ino {
         ok = false
     }
-    if ok && (!copy_fd(src, bak) || !no_sync_g3(bak)) {
+    if ok && (!copy_fd(src, bak) || !fsync_full(bak)) {
         ok = false
     }
     fs_close(bak) else {
@@ -1320,7 +1324,7 @@ fn copy_path_to_backup(src_path: str, bak_path: str, meta: FileMeta) -> int {
     if !remove_quiet(tmp) {
         return COPY_IO
     }
-    if !no_sync_dir_g3(dir) {
+    if !fsync_directory(dir) {
         return COPY_IO
     }
     COPY_OK
@@ -1349,7 +1353,7 @@ fn restore_backup(bak_path: str, dst_path: str) -> bool {
             fs_truncate(dst, end) else {
                 ok = false
             }
-            if ok && !no_sync_g3(dst) {
+            if ok && !fsync_full(dst) {
                 ok = false
             }
         }
@@ -1376,7 +1380,7 @@ fn write_and_cut(fd: int, tb: TextBuf, had_bom: bool) -> bool {
     fs_truncate(fd, end) else {
         return false
     }
-    no_sync_g3(fd)
+    fsync_full(fd)
 }
 
 // `inplace_save`, `file.c:1152-1260`: answers (error, saved stat).
@@ -1398,7 +1402,7 @@ fn inplace_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts) -> (int, 
         fs_close(fd) else {
             ok = false
         }
-        if ok && !no_sync_dir_g3(path_dirname(dst)) {
+        if ok && !fsync_directory(path_dirname(dst)) {
             ok = false
         }
         if !ok {
@@ -1499,7 +1503,7 @@ pub fn file_write_atomic_result(path: str, bytes: List[byte], mode: int) -> Atom
             committed: false,
         }
     }
-    var ok = write_full(fd, bytes, 0, bytes.len) && no_sync_g3(fd)
+    var ok = write_full(fd, bytes, 0, bytes.len) && fsync_full(fd)
     fs_close(fd) else {
         ok = false
     }
@@ -1529,7 +1533,7 @@ pub fn file_write_atomic_result(path: str, bytes: List[byte], mode: int) -> Atom
             return AtomicWriteResult { error: SAVE_IO, committed: false }
         },
     }
-    if !no_sync_dir_g3(dir) {
+    if !fsync_directory(dir) {
         return AtomicWriteResult { error: SAVE_IO, committed: true }
     }
     AtomicWriteResult { error: SAVE_OK, committed: true }
@@ -1577,7 +1581,7 @@ fn atomic_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts, force_atom
     if fd < 0 {
         return (if why == COPY_PERM then SAVE_PERM else SAVE_IO, stat_none(false, false))
     }
-    if !write_text(fd, tb, meta.had_bom) || !no_sync_g3(fd) {
+    if !write_text(fd, tb, meta.had_bom) || !fsync_full(fd) {
         fs_close(fd) else {}
         let _ = remove_quiet(tmp)
         return (SAVE_IO, stat_none(false, false))
@@ -1656,7 +1660,7 @@ fn atomic_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts, force_atom
         }
         return (if perm then SAVE_PERM else SAVE_IO, saved)
     }
-    if !no_sync_dir_g3(dir) {
+    if !fsync_directory(dir) {
         return (SAVE_IO, saved)
     }
     (SAVE_OK, saved)
