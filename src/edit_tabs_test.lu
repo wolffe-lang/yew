@@ -1,0 +1,920 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_tabs.c` (1,172 lines) at 9ace98c2,
+//! one test per C test in registry order (`tests/unit/registry.c:1721-1741`,
+//! then `:2554-2566`): the tab model (Sprint 23 §1/§2) — nearly every row
+//! about ONE hazard, that a close compacts the array, so the tests hold IDS
+//! across mutations and assert what they point at — s57.8's row-1 labels
+//! and new-tab control, the commands and the dirty-close prompt (§5/§6),
+//! and Sprint 57.22 §5's `ed.tab.split_*`. C's fixture (`tb_fixture`,
+//! `:30-40`) is `yew_ed_init` + `yew_ed_open_scratch` + an 80x24 layout;
+//! the port's is `edit.ed_new` + `edit.ed_open_scratch` +
+//! `edit.layout_compute`. A C `Buffer *` is a buffer index here and a
+//! `Pane *` a pool index (-1 for NULL); `ed.tabs.active` is
+//! `ed.tab_active`, `ed.tab_prompt.{active,tab_id}` are
+//! `ed.tab_prompt_active` and `ed.tab_prompt_id`.
+//!
+//! SKIP by name, both streams: `tabs_group_label_clips_before_trailing_
+//! padding` and `tabs_negative_region_payload_enters_the_group` create a
+//! group (`yew_group_create`, `yew_group_add_member`): the group values
+//! are sagitta Sprint 24's, the groups fork's (`yw05-groups`), which
+//! `edit.groups` does not hold on this branch.
+
+use edit
+use std.env as std_env
+use std.fs
+use term
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn label_is(label: List[byte], want: str) -> bool {
+    let w = bytes_of(want)
+    if label.len != w.len {
+        return false
+    }
+    var i = 0
+    while i < w.len {
+        if label[i] as int != w[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn has_byte(label: List[byte], c: int) -> bool {
+    for b in label {
+        if b as int == c {
+            return true
+        }
+    }
+    false
+}
+
+fn skip(why: str) {
+    print(why)
+    eprint(why)
+}
+
+// `tb_fixture` (`test_tabs.c:30-40`): the editor always has exactly one
+// tab.
+fn fixture() -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    assert(edit.tab_count(ed) == 1, "one tab")
+    assert(ed.tab_active == 0, "it is active")
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    ed
+}
+
+// `tb_open_many` (`test_tabs.c:42-57`): `n` extra tabs, their ids.
+fn open_many(mut ed: edit.Ed, n: int) -> List[int] {
+    var ids = List[int]()
+    var i = 0
+    while i < n {
+        let idx = edit.tab_open(mut ed, "/tmp/yew-tab-{i}.txt")
+        assert(idx >= 0, "open {i}")
+        (mut ids).push(ed.tabs[idx].tab_id)
+        i += 1
+    }
+    ids
+}
+
+// C's `yew_ed_edit_ctx` + `yew_edit_insert(&ec, 0, s)` +
+// `yew_ed_finish_edit`, through the focused window's seam.
+fn insert0(mut ed: edit.Ed, s: str) {
+    let w = ed.win
+    let bytes = bytes_of(s)
+    edit.ed_undo_begin(mut ed, w, text.TXN_TYPE)
+    assert(edit.ed_edit_insert(mut ed, w, 0, bytes, 0, bytes.len), "insert {s}")
+    edit.ed_undo_end(mut ed, w)
+    edit.ed_finish_edit(mut ed, w)
+}
+
+// `yew_undo` / `yew_redo` on the focused window's buffer, then
+// `yew_ed_finish_edit`.
+fn undo_step(mut ed: edit.Ed, redo: bool) -> bool {
+    let w = ed.win
+    let b = ed.wins[w].buf
+    edit.edit_take(mut ed, w)
+    let ok = if redo then text.redo(mut ed.bufs[b].ec) else text.undo(mut ed.bufs[b].ec)
+    edit.edit_give(mut ed, w)
+    edit.ed_finish_edit(mut ed, w)
+    ok
+}
+
+// `tb_invoke` (`test_tabs.c:745-762`): count 1 (not given), the integer
+// argument.
+fn invoke(mut ed: edit.Ed, name: str, iarg: int) -> int {
+    let id = edit.cmd_lookup(ed.reg, name)
+    assert(id != 0, "{name} is registered")
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = 1
+    cx.iarg = iarg
+    edit.ed_cmd_invoke(mut ed, id, mut cx)
+}
+
+// `mkdtemp("/tmp/PREFIX-XXXXXX")`.
+fn fresh_dir(prefix: str) -> str {
+    var tries = 0
+    while tries < 100 {
+        var suffix = ""
+        for r in os_random(6) {
+            suffix = suffix + "{r % 10}"
+        }
+        let dir = "/tmp/{prefix}-{suffix}"
+        fs_create_dir_mode(dir, 448) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            denied => { assert(false, "mkdtemp denied") },
+            invalid => { assert(false, "mkdtemp invalid") },
+            not_found => { assert(false, "mkdtemp not found") },
+            unsupported => { assert(false, "mkdtemp unsupported") },
+            io => { assert(false, "mkdtemp io") },
+        }
+        return dir
+    }
+    assert(false, "mkdtemp exhausted")
+    ""
+}
+
+fn touch(path: str) {
+    fs.write_text(path, "") else |_| { assert(false, "create {path}") }
+}
+
+// The port's stand-in for `yew_ws_scratch_new(ed, name, 0)` (ws.c, Sprint
+// 25's workspace buffers, yw06): a resident, empty, named scratch buffer
+// at its save point, as `edit.cmdedit`'s scratch is built. Answers its
+// index.
+fn scratch_new(mut ed: edit.Ed, name: str) -> int {
+    var ec = text.editctx_new(take text.textbuf_new())
+    ec.undo = text.undo_new(ec.tb)
+    ec.has_undo = true
+    text.undo_mark_saved(mut ec.undo, ec.tb)
+    ec.marks = text.marks_new()
+    ec.has_marks = true
+    let id = ed.next_buf_id
+    ed.next_buf_id += 1
+    (mut ed.bufs).push(edit.Buffer {
+        id: id,
+        ec: ec,
+        resident: true,
+        path: "",
+        has_path: false,
+        name: name,
+        has_name: true,
+        flags: edit.BUF_SCRATCH,
+        tabwidth: ed.opts.tabwidth,
+        recovery_pending: false,
+        pairs: edit.pairstate_new(),
+        named: edit.named_marks_new(),
+    })
+    ed.bufs.len - 1
+}
+
+// `test_tabs_ids_are_monotonic_and_never_reused` (`:174-205`).
+fn t_tabs_ids_are_monotonic_and_never_reused() {
+    var ed = fixture()
+    let ids = open_many(mut ed, 4)
+    assert(edit.tab_count(ed) == 5, "five tabs")
+    // Strictly increasing, and none is the invalid 0.
+    assert(ids[0] != 0, "not 0")
+    assert(ids[1] > ids[0], "1 > 0")
+    assert(ids[2] > ids[1], "2 > 1")
+    assert(ids[3] > ids[2], "3 > 2")
+    let first = ids[0]
+    assert(edit.tab_close(mut ed, edit.tab_index_of_id(ed, first)), "close the first")
+    // A stale id resolves to NOTHING, not to whatever took the slot.
+    assert(edit.tab_index_of_id(ed, first) == -1, "the stale id names nothing")
+    // And the next id issued is not the freed one.
+    let idx = edit.tab_open(mut ed, "/tmp/yew-tab-new.txt")
+    assert(idx >= 0, "open")
+    assert(ed.tabs[idx].tab_id > ids[3], "a fresh id: {ed.tabs[idx].tab_id}")
+}
+
+// `test_tabs_modern_labels_and_single_tab_strip` (`:59-84`).
+fn t_tabs_modern_labels_and_single_tab_strip() {
+    var ed = fixture()
+    var entries = edit.tab_row1_entries(ed)
+    assert(entries.len == 1, "one entry")
+    assert(label_is(entries[0].label, " 1 untitled "), "the untitled pill")
+    assert(!entries[0].modified, "clean")
+    assert(edit.tab_strip_rows(ed) == 1, "one tab still owns a row")
+    let idx = edit.tab_open(mut ed, "/tmp/yew-modern-tab.c")
+    assert(idx >= 0, "open")
+    entries = edit.tab_row1_entries(ed)
+    assert(entries.len == 2, "two entries")
+    assert(label_is(entries[1].label, " 2 yew-modern-tab.c "), "the file's pill")
+    let first = copy entries[0].label
+    assert(first[0] as int == 32, "padded on the left")
+    assert(first[first.len - 1] as int == 32, "padded on the right")
+    assert(!has_byte(first, '[' as int), "no bracket")
+    assert(!has_byte(first, ':' as int), "no colon")
+}
+
+// `test_tabs_group_label_clips_before_trailing_padding` (`:86-111`).
+fn t_tabs_group_label_clips_before_trailing_padding() {
+    skip(
+        "SKIP: tabs_group_label_clips_before_trailing_padding: yew_group_create and yew_group_add_member are sagitta Sprint 24 (tab groups) (yw05, the groups fork)",
+    )
+}
+
+// `test_tabs_new_control_uses_exact_tail_geometry` (`:113-144`).
+fn t_tabs_new_control_uses_exact_tail_geometry() {
+    var ed = fixture()
+    let strip = edit.rect(7, 0, 40, 1)
+    ed.grid = term.grid_new(4, 80)
+    ed.grid_ready = true
+    edit.region_frame_begin(mut ed.regions)
+    edit.tab_strip_draw(mut ed, strip)
+    var found = false
+    var add = edit.rect(0, 0, 0, 0)
+    var x = strip.x
+    while x < strip.x + strip.w {
+        let hit = edit.region_hit(mut ed.regions, x, strip.y)
+        if hit.kind == edit.REGION_TAB_NEW {
+            found = true
+            add = copy hit.rect
+            break
+        }
+        x += 1
+    }
+    assert(found, "the new-tab control is registered")
+    assert(add.x == 19, "x {add.x}")
+    assert(add.y == 0, "y {add.y}")
+    assert(add.w == 3, "w {add.w}")
+    assert(add.h == 1, "h {add.h}")
+    assert(edit.strip_slot_at(ed, add.x, add.y) == -1, "the control is no tab slot")
+    var cell = List[byte]()
+    term.cell_bytes_into(mut cell, ed.grid, term.grid_back(ed.grid, add.y, add.x + 1))
+    assert(cell.len == 1 && cell[0] as int == '+' as int, "a + in the middle cell")
+}
+
+// `test_tabs_new_control_yields_to_overflow` (`:146-172`).
+fn t_tabs_new_control_yields_to_overflow() {
+    var ed = fixture()
+    let strip = edit.rect(5, 0, 18, 1)
+    ed.grid = term.grid_new(4, 80)
+    ed.grid_ready = true
+    let _ = open_many(mut ed, 3)
+    edit.region_frame_begin(mut ed.regions)
+    edit.tab_strip_draw(mut ed, strip)
+    var saw_right = false
+    var saw_new = false
+    var x = strip.x
+    while x < strip.x + strip.w {
+        let hit = edit.region_hit(mut ed.regions, x, strip.y)
+        if hit.kind == edit.REGION_TAB_SCROLL && hit.payload > 0 {
+            saw_right = true
+        }
+        if hit.kind == edit.REGION_TAB_NEW {
+            saw_new = true
+        }
+        x += 1
+    }
+    assert(saw_right, "the right chevron")
+    assert(!saw_new, "no new-tab control under right overflow")
+}
+
+// `test_tabs_ids_survive_a_close_storm` (`:207-249`): close three of
+// seven; every survivor's id still names the same tab at its new index.
+fn t_tabs_ids_survive_a_close_storm() {
+    var ed = fixture()
+    let ids = open_many(mut ed, 6)
+    assert(edit.tab_count(ed) == 7, "seven tabs")
+    // Survivors: the original tab plus ids 0, 3, 5.
+    let keep = [ed.tabs[0].tab_id, ids[0], ids[3], ids[5]]
+    // Close 1, 2 and 4 — by id, resolved fresh each time.
+    assert(edit.tab_close(mut ed, edit.tab_index_of_id(ed, ids[1])), "close 1")
+    assert(edit.tab_close(mut ed, edit.tab_index_of_id(ed, ids[2])), "close 2")
+    assert(edit.tab_close(mut ed, edit.tab_index_of_id(ed, ids[4])), "close 4")
+    assert(edit.tab_count(ed) == 4, "four left")
+    for k in keep {
+        let at = edit.tab_index_of_id(ed, k)
+        assert(at >= 0, "survivor {k} found")
+        assert(ed.tabs[at].tab_id == k, "survivor {k} is itself")
+    }
+    // The closed ids are gone rather than aliased onto survivors.
+    assert(edit.tab_index_of_id(ed, ids[1]) == -1, "1 gone")
+    assert(edit.tab_index_of_id(ed, ids[2]) == -1, "2 gone")
+    assert(edit.tab_index_of_id(ed, ids[4]) == -1, "4 gone")
+}
+
+// `test_tabs_survivor_is_chosen_by_id_before_compaction` (`:251-283`).
+fn t_tabs_survivor_is_chosen_by_id_before_compaction() {
+    var ed = fixture()
+    let ids = open_many(mut ed, 3)
+    // Tabs: [orig, A, B, C]. Make B active and close it.
+    edit.tab_switch(mut ed, 2)
+    assert(ed.tab_active == 2, "B active")
+    let right_id = ids[2]
+    assert(edit.tab_close(mut ed, 2), "close B")
+    // C becomes active — by id.
+    assert(ed.tabs[ed.tab_active].tab_id == right_id, "the right neighbour")
+    // Closing the last tab falls back to the LEFT neighbour.
+    let last = edit.tab_count(ed) - 1
+    let left_id = ed.tabs[last - 1].tab_id
+    edit.tab_switch(mut ed, last)
+    assert(edit.tab_close(mut ed, last), "close the last")
+    assert(ed.tabs[ed.tab_active].tab_id == left_id, "the left neighbour")
+}
+
+// `test_tabs_closing_another_tab_keeps_the_active_one` (`:285-306`).
+fn t_tabs_closing_another_tab_keeps_the_active_one() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 3)
+    edit.tab_switch(mut ed, 3)
+    let active_id = ed.tabs[3].tab_id
+    // Close a tab to its LEFT, which shifts it down one index.
+    assert(edit.tab_close(mut ed, 1), "close 1")
+    assert(ed.tabs[ed.tab_active].tab_id == active_id, "the same tab active")
+    assert(ed.tab_active == 2, "at its new index")
+}
+
+// `test_tabs_shifted_index_matches_a_naive_simulation` (`:308-357`):
+// exhaustively over n = 6, against a simulation that moves elements.
+fn t_tabs_shifted_index_matches_a_naive_simulation() {
+    let n = 6
+    var from = 0
+    while from < n {
+        var to = 0
+        while to < n {
+            var model = List[int]()
+            var i = 0
+            while i < n {
+                (mut model).push(i)
+                i += 1
+            }
+            // Naive: remove then insert ("insertion, not swap").
+            let moved = model[from]
+            if to > from {
+                var j = from
+                while j < to {
+                    model[j] = model[j + 1]
+                    j += 1
+                }
+            } else {
+                var j = from
+                while j > to {
+                    model[j] = model[j - 1]
+                    j -= 1
+                }
+            }
+            model[to] = moved
+            i = 0
+            while i < n {
+                var want = -1
+                var k = 0
+                while k < n {
+                    if model[k] == i {
+                        want = k
+                        break
+                    }
+                    k += 1
+                }
+                let got = edit.tab_shifted_index(i, from, to)
+                if got != want {
+                    eprint("shifted_index({i}, {from}, {to}) = {got}, simulation says {want}")
+                }
+                assert(got == want, "shifted_index({i}, {from}, {to})")
+                i += 1
+            }
+            to += 1
+        }
+        from += 1
+    }
+}
+
+// `test_tabs_reorder_is_insertion_not_swap` (`:359-381`).
+fn t_tabs_reorder_is_insertion_not_swap() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 4)
+    var order = List[int]()
+    var i = 0
+    while i < 5 {
+        (mut order).push(ed.tabs[i].tab_id)
+        i += 1
+    }
+    // Move the first tab three places right.
+    edit.tab_reorder(mut ed, 0, 3)
+    assert(ed.tabs[0].tab_id == order[1], "0 is the old 1")
+    assert(ed.tabs[1].tab_id == order[2], "1 is the old 2")
+    assert(ed.tabs[2].tab_id == order[3], "2 is the old 3")
+    assert(ed.tabs[3].tab_id == order[0], "3 is the moved one")
+    // A swap would have put order[3] at 0.
+    assert(ed.tabs[4].tab_id == order[4], "4 untouched")
+}
+
+// `test_tabs_reorder_remaps_the_active_position` (`:383-406`): active is
+// a position, so it rides the shift.
+fn t_tabs_reorder_remaps_the_active_position() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 4)
+    edit.tab_switch(mut ed, 2)
+    let active_id = ed.tabs[2].tab_id
+    edit.tab_reorder(mut ed, 0, 4)
+    // Everything above 0 shifted down by one, including the active.
+    assert(ed.tab_active == 1, "active rode the shift: {ed.tab_active}")
+    assert(ed.tabs[ed.tab_active].tab_id == active_id, "the same tab")
+    // Moving the active tab itself takes the active index with it.
+    edit.tab_reorder(mut ed, 1, 3)
+    assert(ed.tab_active == 3, "active moved with it: {ed.tab_active}")
+    assert(ed.tabs[3].tab_id == active_id, "the same tab at 3")
+}
+
+// `test_tabs_open_switches_when_the_path_is_already_open` (`:408-442`):
+// one tab per file.
+fn t_tabs_open_switches_when_the_path_is_already_open() {
+    var ed = fixture()
+    let first = edit.tab_open(mut ed, "/tmp/yew-tab-dup.txt")
+    assert(first >= 0, "open")
+    assert(edit.tab_count(ed) == 2, "two tabs")
+    edit.tab_switch(mut ed, first)
+    let file = edit.ed_buf_index(ed, ed.tabs[first].buffer_id)
+    assert(file >= 0, "the file's buffer")
+    assert(ed.wins[ed.win].buf == file, "shown")
+    let scratch = scratch_new(mut ed, "*tab-open-scratch*")
+    edit.ed_show_buffer(mut ed, scratch)
+    assert(ed.wins[ed.win].buf == scratch, "the scratch shown")
+    let again = edit.tab_open(mut ed, "/tmp/yew-tab-dup.txt")
+    assert(again == first, "the same tab: {again}")
+    // No second tab, and it switched rather than opening.
+    assert(edit.tab_count(ed) == 2, "still two")
+    assert(ed.tab_active == first, "switched")
+    assert(ed.wins[ed.win].buf == file, "the file shown again")
+}
+
+// `test_tabs_find_by_path_canonicalizes` (`:444-463`).
+fn t_tabs_find_by_path_canonicalizes() {
+    var ed = fixture()
+    // A path that exists, so realpath resolves it.
+    let idx = edit.tab_open(mut ed, "/tmp/.")
+    assert(idx >= 0, "open")
+    assert(edit.tab_find_by_path(ed, "/tmp") == idx, "/tmp")
+    assert(edit.tab_find_by_path(ed, "/tmp/./.") == idx, "/tmp/./.")
+    assert(edit.tab_find_by_path(ed, "/nonexistent-xyz") == -1, "none")
+}
+
+// `test_tabs_case_aliases_follow_filesystem_identity` (`:465-509`): the
+// model follows the filesystem's identity, not the spelling.
+fn t_tabs_case_aliases_follow_filesystem_identity() {
+    let root = fresh_dir("yew-tab-case")
+    let upper = "{root}/Foo.c"
+    let lower = "{root}/foo.c"
+    touch(upper)
+    let aliases = fs.exists(lower)
+    if !aliases {
+        touch(lower)
+    }
+    var ed = fixture()
+    let first = edit.tab_open(mut ed, upper)
+    let second = edit.tab_open(mut ed, lower)
+    assert(first >= 0, "open upper")
+    assert(second >= 0, "open lower")
+    if aliases {
+        assert(second == first, "one file")
+        assert(edit.tab_count(ed) == 2, "two tabs")
+    } else {
+        assert(second != first, "two files")
+        assert(edit.tab_count(ed) == 3, "three tabs")
+    }
+    fs.remove(lower) else |_| {}
+    fs.remove(upper) else |_| {}
+    fs.remove_dir(root) else |_| {}
+}
+
+// `test_tabs_hardlink_aliases_share_one_file` (`:511-546`): distinct
+// pathnames for one inode are still one save destination.
+fn t_tabs_hardlink_aliases_share_one_file() {
+    let root = fresh_dir("yew-tab-link")
+    let first_path = "{root}/first.c"
+    let second_path = "{root}/second.c"
+    touch(first_path)
+    fs.link(first_path, second_path) else |_| { assert(false, "link") }
+    var ed = fixture()
+    let first = edit.tab_open(mut ed, first_path)
+    let second = edit.tab_open(mut ed, second_path)
+    assert(first >= 0, "open first")
+    assert(second == first, "one tab: {second}")
+    assert(edit.tab_count(ed) == 2, "two tabs")
+    fs.remove(second_path) else |_| {}
+    fs.remove(first_path) else |_| {}
+    fs.remove_dir(root) else |_| {}
+}
+
+// `test_tabs_display_path_preserves_workspace_spelling` (`:548-604`):
+// identity follows the canonical target; the UI keeps the logical
+// spelling the user opened from the workspace.
+fn t_tabs_display_path_preserves_workspace_spelling() {
+    let root0 = fresh_dir("yew-tab-root")
+    let target0 = fresh_dir("yew-tab-target")
+    let root = text.file_realpath(root0) else root0
+    let target = text.file_realpath(target0) else target0
+    let cwd = std_env.cwd() else "."
+    let link_path = "{root}/linked"
+    let file_path = "{target}/note.txt"
+    touch(file_path)
+    fs.symlink(target, link_path) else |_| { assert(false, "symlink") }
+    var ed = fixture()
+    // `yew_ed_set_workspace_root(&ed, root)`: the canonical root.
+    ed.ws_dir = root
+    os_chdir(root) else |_| { assert(false, "chdir root") }
+    let idx = edit.tab_open(mut ed, "./linked/note.txt")
+    os_chdir(cwd) else |_| { assert(false, "chdir back") }
+    assert(idx >= 0, "open")
+    assert(ed.tabs[idx].path == file_path, "the canonical path: {ed.tabs[idx].path}")
+    assert(
+        edit.tab_display_path(ed.tabs[idx]) == "linked/note.txt",
+        "the logical spelling: {edit.tab_display_path(ed.tabs[idx])}",
+    )
+    edit.tab_set_path(mut ed, idx, file_path)
+    assert(ed.tabs[idx].path == file_path, "renamed: the canonical path")
+    assert(edit.tab_display_path(ed.tabs[idx]) == file_path, "renamed: as typed")
+    fs.remove(link_path) else |_| {}
+    fs.remove(file_path) else |_| {}
+    fs.remove_dir(root) else |_| {}
+    fs.remove_dir(target) else |_| {}
+}
+
+// `test_tabs_cap_refuses_and_mutates_nothing` (`:606-641`), DoD 6: the
+// cap fails LOUDLY and changes nothing — no tab, no active change, no id
+// burned.
+fn t_tabs_cap_refuses_and_mutates_nothing() {
+    var ed = fixture()
+    while edit.tab_count(ed) < edit.TAB_MAX {
+        let idx = edit.tab_open(mut ed, "/tmp/yew-cap-{edit.tab_count(ed)}.txt")
+        if idx < 0 {
+            break
+        }
+    }
+    let before_count = edit.tab_count(ed)
+    let before_active = ed.tab_active
+    let before_next_id = ed.next_tab_id
+    assert(edit.tab_open(mut ed, "/tmp/yew-cap-over.txt") == -1, "refused at the cap")
+    assert(edit.tab_count(ed) == before_count, "no tab")
+    assert(ed.tab_active == before_active, "no active change")
+    assert(ed.next_tab_id == before_next_id, "no id burned")
+}
+
+// `test_tabs_modified_derives_from_undo_state` (`:643-668`), DoD 4: the
+// marker is DERIVED — undo back to clean clears it, redo sets it again.
+fn t_tabs_modified_derives_from_undo_state() {
+    var ed = fixture()
+    assert(!edit.tab_modified(ed, 0), "clean")
+    insert0(mut ed, "hello")
+    assert(edit.tab_modified(ed, 0), "modified")
+    assert(undo_step(mut ed, false), "undo")
+    assert(!edit.tab_modified(ed, 0), "clean again")
+    assert(undo_step(mut ed, true), "redo")
+    assert(edit.tab_modified(ed, 0), "modified again")
+}
+
+// `test_tabs_quit_checks_the_active_buffer` (`:670-697`).
+fn t_tabs_quit_checks_the_active_buffer() {
+    var ed = fixture()
+    let primary = edit.ed_buf_index(ed, ed.tabs[0].buffer_id)
+    let idx = edit.tab_open(mut ed, "")
+    assert(idx >= 0, "open untitled")
+    edit.tab_switch(mut ed, idx)
+    let active = edit.ed_doc(ed)
+    assert(active >= 0, "a document")
+    assert(active != primary, "not the bootstrap buffer")
+    assert(!edit.buf_dirty(ed.bufs[primary]), "the bootstrap buffer is clean")
+    insert0(mut ed, "x")
+    assert(edit.buf_dirty(ed.bufs[active]), "the active buffer is dirty")
+    assert(edit.ed_request_quit(mut ed, false) == edit.CMD_OK, "quit asks")
+    assert(!ed.quit, "not quitting")
+    assert(ed.prompt == edit.PROMPT_QUIT_DIRTY, "the dirty question")
+}
+
+// `test_tabs_switch_swaps_the_pane_tree` (`:699-723`): each Win keeps its
+// own cursor and viewport with no save/restore choreography.
+fn t_tabs_switch_swaps_the_pane_tree() {
+    var ed = fixture()
+    let root0 = ed.pane_root
+    let _ = open_many(mut ed, 2)
+    edit.tab_switch(mut ed, 1)
+    let root1 = ed.pane_root
+    assert(root1 != root0, "another tree")
+    assert(ed.focus == ed.tabs[1].focus, "its focus")
+    assert(ed.win == ed.panes[ed.focus].win, "its window")
+    edit.tab_switch(mut ed, 0)
+    assert(ed.pane_root == root0, "the first tree back")
+    assert(ed.focus == ed.tabs[0].focus, "its focus back")
+}
+
+// `test_tabs_open_leaves_a_tab_ungrouped` (`:725-743`): the DEFAULT.
+fn t_tabs_open_leaves_a_tab_ungrouped() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 2)
+    var i = 0
+    while i < edit.tab_count(ed) {
+        assert(ed.tabs[i].group_id == 0, "tab {i} ungrouped")
+        assert(ed.tabs[i].group_ordinal == 0, "tab {i} ordinal 0")
+        i += 1
+    }
+}
+
+// `test_tabs_goto_maps_zero_to_ten_and_refuses_out_of_range` (`:764-786`),
+// DoD 8: 0 reaches tab 10.
+fn t_tabs_goto_maps_zero_to_ten_and_refuses_out_of_range() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 9)
+    assert(edit.tab_count(ed) == 10, "ten tabs")
+    assert(invoke(mut ed, "ed.tab.goto", 1) == edit.CMD_OK, "goto 1")
+    assert(ed.tab_active == 0, "tab 1")
+    assert(invoke(mut ed, "ed.tab.goto", 3) == edit.CMD_OK, "goto 3")
+    assert(ed.tab_active == 2, "tab 3")
+    // 0 is the tenth key on the digit row, so it means tab 10.
+    assert(invoke(mut ed, "ed.tab.goto", 0) == edit.CMD_OK, "goto 0")
+    assert(ed.tab_active == 9, "tab 10: {ed.tab_active}")
+    // Out of range: refused, and the active tab does not move.
+    assert(invoke(mut ed, "ed.tab.goto", 99) != edit.CMD_OK, "goto 99 refused")
+    assert(ed.tab_active == 9, "still tab 10")
+}
+
+// `test_tabs_split_commands_place_the_new_pane_on_each_side`
+// (`:988-1043`): every row asserts the new leaf's rect, not just that a
+// leaf appeared.
+fn t_tabs_split_commands_place_the_new_pane_on_each_side() {
+    let cmds = ["ed.tab.split_left", "ed.tab.split_right", "ed.tab.split_down"]
+    let firsts = [true, false, false]
+    let verticals = [false, false, true]
+    var i = 0
+    while i < cmds.len {
+        var ed = fixture()
+        let doc = edit.tab_buffer(ed, ed.tab_active)
+        assert(doc >= 0, "the tab's buffer")
+        assert(invoke(mut ed, cmds[i], 0) == edit.CMD_OK, "{cmds[i]}")
+        let root = ed.pane_root
+        assert(edit.pane_leaf_count(ed, root) == 2, "two leaves")
+        assert(!ed.panes[root].is_leaf, "the root splits")
+        let want_dir = if verticals[i] then edit.SPLIT_V else edit.SPLIT_H
+        assert(ed.panes[root].dir == want_dir, "{cmds[i]}: the axis")
+        let nu = if firsts[i] then ed.panes[root].a else ed.panes[root].b
+        let old = if firsts[i] then ed.panes[root].b else ed.panes[root].a
+        // The new pane takes focus and shows the tab's buffer.
+        assert(ed.focus == nu, "focus on the new pane")
+        assert(ed.win == ed.panes[nu].win, "its window")
+        assert(ed.wins[ed.panes[nu].win].buf == doc, "the new pane shows the tab's buffer")
+        assert(ed.wins[ed.panes[old].win].buf == doc, "the old pane still does")
+        assert(ed.panes[nu].win != ed.panes[old].win, "two windows")
+        edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+        if verticals[i] {
+            // Below: the new leaf starts after the border row.
+            assert(ed.panes[nu].rect.y == 13, "below: {ed.panes[nu].rect.y}")
+            assert(ed.panes[old].rect.y == 0, "the old on top")
+        } else if firsts[i] {
+            assert(ed.panes[nu].rect.x == 0, "left: {ed.panes[nu].rect.x}")
+            assert(ed.panes[old].rect.x == 41, "the old on the right")
+        } else {
+            assert(ed.panes[nu].rect.x == 41, "right: {ed.panes[nu].rect.x}")
+            assert(ed.panes[old].rect.x == 0, "the old on the left")
+        }
+        i += 1
+    }
+}
+
+// `test_tabs_split_commands_prefer_the_tab_buffer` (`:1045-1077`): the
+// subject is the TAB's buffer, not whatever the focused pane is parked
+// on.
+fn t_tabs_split_commands_prefer_the_tab_buffer() {
+    var ed = fixture()
+    let idx = edit.tab_open(mut ed, "/tmp/yew-tab-sided-other.txt")
+    assert(idx >= 0, "open")
+    let other = edit.tab_buffer(ed, idx)
+    assert(other >= 0, "the other buffer")
+    edit.tab_switch(mut ed, 0)
+    let first = edit.tab_buffer(ed, ed.tab_active)
+    assert(first >= 0, "the first buffer")
+    assert(first != other, "two buffers")
+    // Park the focused pane on a foreign buffer, the way a job or diff
+    // view leaves it.
+    edit.ed_win_set_buffer(mut ed, ed.win, other)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    assert(invoke(mut ed, "ed.tab.split_left", 0) == edit.CMD_OK, "split_left")
+    assert(ed.wins[ed.win].buf == first, "the new pane shows the tab's buffer")
+    assert(
+        ed.wins[ed.panes[ed.panes[ed.pane_root].a].win].buf == first,
+        "the left pane is the tab's buffer",
+    )
+}
+
+// `test_tabs_split_in_pane_is_addressed_by_tab_id` (`:1079-1114`): THE
+// IDENTITY RULE — the split re-finds the tab by id.
+fn t_tabs_split_in_pane_is_addressed_by_tab_id() {
+    var ed = fixture()
+    let ids = open_many(mut ed, 2)
+    // Three tabs; the one we want is the LAST and is not active.
+    edit.tab_switch(mut ed, 0)
+    let wanted = edit.tab_buffer(ed, edit.tab_index_of_id(ed, ids[1]))
+    assert(wanted >= 0, "the wanted buffer")
+    assert(ed.wins[ed.win].buf != wanted, "not shown yet")
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    let (status, nu) = edit.pane_open_tab_in_split(mut ed, ids[1], -1, edit.SPLIT_H, true)
+    assert(status == edit.CMD_OK, "opened in a split")
+    assert(nu >= 0, "a new leaf")
+    assert(nu == ed.panes[ed.pane_root].a, "on the left")
+    assert(ed.wins[ed.panes[nu].win].buf == wanted, "showing the wanted buffer")
+    // The strip is untouched.
+    assert(edit.tab_count(ed) == 3, "still three tabs")
+    assert(ed.tab_active == 0, "the active tab unchanged")
+    assert(edit.tab_index_of_id(ed, ids[1]) == 2, "the tab where it was")
+    // An id that names nothing is a refusal, not a crash.
+    let (bad, none) = edit.pane_open_tab_in_split(mut ed, 2989, -1, edit.SPLIT_H, false)
+    assert(bad != edit.CMD_OK, "refused")
+    assert(none == -1, "no leaf")
+}
+
+// `test_tabs_split_commands_refuse_when_there_is_no_room` (`:1116-1137`).
+fn t_tabs_split_commands_refuse_when_there_is_no_room() {
+    for name in ["ed.tab.split_left", "ed.tab.split_right", "ed.tab.split_down"] {
+        var ed = fixture()
+        // Too narrow for two panes and a border, and too short too.
+        edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 20, 4))
+        assert(invoke(mut ed, name, 0) != edit.CMD_OK, "{name} refused")
+        assert(edit.pane_leaf_count(ed, ed.pane_root) == 1, "one leaf")
+        assert(ed.panes[ed.pane_root].is_leaf, "still a leaf")
+        assert(ed.msg.sev == edit.MSG_ERROR, "an error message")
+    }
+}
+
+// `test_tabs_split_commands_refuse_at_the_leaf_cap` (`:1139-1172`): the
+// refusal names the cap rather than the room.
+fn t_tabs_split_commands_refuse_at_the_leaf_cap() {
+    var ed = fixture()
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 200, 200))
+    while edit.pane_leaf_count(ed, ed.pane_root) < edit.PANE_MAX_LEAVES {
+        let leaves = edit.pane_collect_leaves(ed, ed.pane_root, edit.PANE_MAX_LEAVES)
+        assert(leaves.len > 0, "leaves")
+        // Always halve the ROOMIEST leaf.
+        var tallest = 0
+        var i = 1
+        while i < leaves.len {
+            if ed.panes[leaves[i]].rect.h > ed.panes[leaves[tallest]].rect.h {
+                tallest = i
+            }
+            i += 1
+        }
+        let tid = ed.tabs[ed.tab_active].tab_id
+        let (status, _) = edit.pane_open_tab_in_split(
+            mut ed,
+            tid,
+            leaves[tallest],
+            edit.SPLIT_V,
+            false,
+        )
+        assert(status == edit.CMD_OK, "split {leaves.len}")
+        edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 200, 200))
+    }
+    assert(invoke(mut ed, "ed.tab.split_right", 0) != edit.CMD_OK, "refused at the cap")
+    assert(edit.pane_leaf_count(ed, ed.pane_root) == edit.PANE_MAX_LEAVES, "the cap")
+    assert(ed.msg.sev == edit.MSG_ERROR, "an error message")
+}
+
+// `test_tabs_next_and_prev_are_cyclic` (`:788-807`).
+fn t_tabs_next_and_prev_are_cyclic() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 2)
+    edit.tab_switch(mut ed, 0)
+    assert(invoke(mut ed, "ed.tab.next", 0) == edit.CMD_OK, "next")
+    assert(ed.tab_active == 1, "1")
+    assert(invoke(mut ed, "ed.tab.next", 0) == edit.CMD_OK, "next")
+    assert(ed.tab_active == 2, "2")
+    // Round the ring rather than stopping at the end.
+    assert(invoke(mut ed, "ed.tab.next", 0) == edit.CMD_OK, "next")
+    assert(ed.tab_active == 0, "wrapped to 0")
+    assert(invoke(mut ed, "ed.tab.prev", 0) == edit.CMD_OK, "prev")
+    assert(ed.tab_active == 2, "wrapped to 2")
+}
+
+// `test_tabs_move_reorders_the_active_tab` (`:809-826`).
+fn t_tabs_move_reorders_the_active_tab() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 3)
+    edit.tab_switch(mut ed, 0)
+    let active_id = ed.tabs[0].tab_id
+    assert(invoke(mut ed, "ed.tab.move", 3) == edit.CMD_OK, "move to 3")
+    assert(ed.tab_active == 2, "the active at 2")
+    assert(ed.tabs[2].tab_id == active_id, "the same tab")
+    assert(invoke(mut ed, "ed.tab.move", 99) != edit.CMD_OK, "move to 99 refused")
+}
+
+// `test_tabs_close_command_is_silent_when_clean` (`:828-848`).
+fn t_tabs_close_command_is_silent_when_clean() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 1)
+    edit.tab_switch(mut ed, 1)
+    assert(invoke(mut ed, "ed.tab.close", 0) == edit.CMD_OK, "close")
+    assert(edit.tab_count(ed) == 1, "one tab")
+    assert(!ed.tab_prompt_active, "no question")
+    // The last tab refuses to close.
+    assert(invoke(mut ed, "ed.tab.close", 0) != edit.CMD_OK, "the last tab stays")
+}
+
+// `test_tabs_dirty_prompt_holds_the_id_not_the_index` (`:850-886`): a tab
+// gone while the question is up dissolves the question.
+fn t_tabs_dirty_prompt_holds_the_id_not_the_index() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 2)
+    edit.tab_switch(mut ed, 2)
+    insert0(mut ed, "x")
+    assert(edit.tab_modified(ed, 2), "dirty")
+    assert(invoke(mut ed, "ed.tab.close", 0) == edit.CMD_OK, "close asks")
+    assert(ed.tab_prompt_active, "the question is up")
+    let asked_id = ed.tab_prompt_id
+    assert(asked_id == ed.tabs[2].tab_id, "it holds the id")
+    // Something else closes a LOWER tab while the question is up.
+    let other_id = ed.tabs[1].tab_id
+    assert(edit.tab_close(mut ed, 1), "close 1")
+    assert(edit.tab_index_of_id(ed, other_id) == -1, "1 gone")
+    // The question still refers to the tab it asked about, now at 1.
+    assert(edit.tab_index_of_id(ed, asked_id) == 1, "the asked tab at 1")
+    // Discard answers for THAT tab.
+    assert(edit.tab_prompt_key(mut ed, 'd' as int), "d consumed")
+    assert(edit.tab_index_of_id(ed, asked_id) == -1, "the asked tab closed")
+    assert(!ed.tab_prompt_active, "the question gone")
+}
+
+// `test_tabs_dirty_prompt_esc_cancels_the_close` (`:888-914`).
+fn t_tabs_dirty_prompt_esc_cancels_the_close() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 1)
+    edit.tab_switch(mut ed, 1)
+    insert0(mut ed, "x")
+    let id = ed.tabs[1].tab_id
+    assert(invoke(mut ed, "ed.tab.close", 0) == edit.CMD_OK, "close asks")
+    assert(ed.tab_prompt_active, "the question is up")
+    assert(edit.tab_prompt_key(mut ed, 27), "esc consumed")
+    // Cancelled: the tab is still there, with its text.
+    assert(!ed.tab_prompt_active, "the question gone")
+    assert(edit.tab_index_of_id(ed, id) == 1, "the tab survives")
+    assert(edit.tab_modified(ed, 1), "with its text")
+}
+
+// `test_tabs_dirty_prompt_swallows_other_keys` (`:916-945`).
+fn t_tabs_dirty_prompt_swallows_other_keys() {
+    var ed = fixture()
+    let _ = open_many(mut ed, 1)
+    edit.tab_switch(mut ed, 1)
+    insert0(mut ed, "x")
+    assert(invoke(mut ed, "ed.tab.close", 0) == edit.CMD_OK, "close asks")
+    // `j` would normally move the cursor; here it is consumed.
+    assert(edit.tab_prompt_key(mut ed, 'j' as int), "j consumed")
+    assert(ed.tab_prompt_active, "still asking")
+    assert(edit.tab_count(ed) == 2, "nothing closed")
+}
+
+// `test_tabs_negative_region_payload_enters_the_group` (`:947-986`).
+fn t_tabs_negative_region_payload_enters_the_group() {
+    skip(
+        "SKIP: tabs_negative_region_payload_enters_the_group: yew_group_create and yew_group_add_member are sagitta Sprint 24 (tab groups) (yw05, the groups fork)",
+    )
+}
+
+fn main() {
+    t_tabs_ids_are_monotonic_and_never_reused()
+    t_tabs_modern_labels_and_single_tab_strip()
+    t_tabs_group_label_clips_before_trailing_padding()
+    t_tabs_new_control_uses_exact_tail_geometry()
+    t_tabs_new_control_yields_to_overflow()
+    t_tabs_ids_survive_a_close_storm()
+    t_tabs_survivor_is_chosen_by_id_before_compaction()
+    t_tabs_closing_another_tab_keeps_the_active_one()
+    t_tabs_shifted_index_matches_a_naive_simulation()
+    t_tabs_reorder_is_insertion_not_swap()
+    t_tabs_reorder_remaps_the_active_position()
+    t_tabs_open_switches_when_the_path_is_already_open()
+    t_tabs_find_by_path_canonicalizes()
+    t_tabs_case_aliases_follow_filesystem_identity()
+    t_tabs_hardlink_aliases_share_one_file()
+    t_tabs_display_path_preserves_workspace_spelling()
+    t_tabs_cap_refuses_and_mutates_nothing()
+    t_tabs_modified_derives_from_undo_state()
+    t_tabs_quit_checks_the_active_buffer()
+    t_tabs_switch_swaps_the_pane_tree()
+    t_tabs_open_leaves_a_tab_ungrouped()
+    t_tabs_goto_maps_zero_to_ten_and_refuses_out_of_range()
+    t_tabs_split_commands_place_the_new_pane_on_each_side()
+    t_tabs_split_commands_prefer_the_tab_buffer()
+    t_tabs_split_in_pane_is_addressed_by_tab_id()
+    t_tabs_split_commands_refuse_when_there_is_no_room()
+    t_tabs_split_commands_refuse_at_the_leaf_cap()
+    t_tabs_next_and_prev_are_cyclic()
+    t_tabs_move_reorders_the_active_tab()
+    t_tabs_close_command_is_silent_when_clean()
+    t_tabs_dirty_prompt_holds_the_id_not_the_index()
+    t_tabs_dirty_prompt_esc_cancels_the_close()
+    t_tabs_dirty_prompt_swallows_other_keys()
+    t_tabs_negative_region_payload_enters_the_group()
+    print("tabs_test: 32 cases pass, 2 SKIP by name (the group values, Sprint 24, the groups fork)")
+}
