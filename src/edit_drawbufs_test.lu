@@ -1,0 +1,287 @@
+//! member: false
+//!
+//! yw05-hot (deliverable 6, R-yw05-3 = R-yw03-7 A): the port's own cases
+//! for the draw paths' reused storage (`edit.drawbufs`). sagitta has no
+//! counterpart: C draws through stack buffers and frees what it mallocs
+//! per frame, so it has nothing to prove here. The port does: at wolf
+//! 0.2.34 every byte a frame allocates in the editor's loop lives to the
+//! session's end (G33), so a frame's document rows, gutter, cursor
+//! overlay, statusline and prompt row must allocate NOTHING once their
+//! buffers have grown. Each such case builds its editor inside a named
+//! region and reads the region's ledger (`region_bytes`) around repeated
+//! draws: every byte a callee allocates lands in that region, so a zero
+//! delta is exact on every tier (the ledger's units differ by tier; zero
+//! does not). The other cases hold the in-place writers to the values
+//! they replace (digits against interpolation, a held reader's
+//! boundaries against fresh queries, a reused statusline against a fresh
+//! editor's).
+
+use edit
+use term
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn str_of(b: List[byte]) -> str {
+    str_from_utf8(b) else ""
+}
+
+// A document no row of which is ASCII-only throughout: the slow path's
+// per-cluster query (an em dash, a combining mark, CJK, an emoji ZWJ
+// sequence, a regional-indicator pair, a tab) on every screen row.
+fn doc_text() -> str {
+    var s = ""
+    var i = 0
+    while i < 40 {
+        s = "{s}row {i} \u{2014} cafe\u{301} \u{6F22}\u{5B57}\tx \u{1F469}\u{200D}\u{1F4BB} \u{1F1EB}\u{1F1F7} end\n"
+        i += 1
+    }
+    s
+}
+
+// The driver's frame without the terminal: `init.fl`, the default theme,
+// 24x80 in truecolor, a document in the window (memprobe's `init`).
+fn fixture(doc: str) -> edit.Ed {
+    var ed = edit.ed_new_test(fs_read_bytes("runtime/init.fl") else List[byte](), "")
+    let name = ed.opts.theme
+    edit.ed_theme_set(mut ed, name)
+    ed.clean = true
+    ed.regs.clipboard_sync = text.CLIP_SYNC_OFF
+    ed.grid = term.grid_new(24, 80)
+    ed.grid_ready = true
+    var caps = term.caps_new()
+    caps.truecolor = true
+    ed.render = term.render_new(caps, term.env_process())
+    ed.render_ready = true
+    edit.ed_open_memory(mut ed, bytes_of(doc), "m.txt")
+    edit.ed_layout(mut ed)
+    edit.ed_render(mut ed)
+    ed
+}
+
+// One draw of `what` (the editor's state left as it is).
+fn draw(mut ed: edit.Ed, what: int) {
+    let wi = ed.win
+    if what == 0 {
+        edit.draw_document_rows(mut ed, wi, 0, ed.wins[wi].rect.h)
+    } else if what == 1 {
+        edit.gutter_draw(mut ed, wi, 0, ed.wins[wi].rect.h)
+    } else if what == 2 {
+        edit.draw_footer(mut ed, wi)
+    } else if what == 3 {
+        edit.draw_cursor(mut ed, wi)
+    }
+}
+
+// The bytes `n` prompt rows allocate with `seed` typed at a `:` prompt
+// (the menu open over it when the seed has completions), after three
+// warm draws.
+fn prompt_ledger(seed: str, n: int) -> int {
+    var grew = -1
+    region probe {
+        var ed = fixture(doc_text())
+        edit.cmdline_open(mut ed, edit.PROMPT_CMD, seed)
+        edit.ed_render(mut ed)
+        let wi = ed.win
+        var i = 0
+        while i < 3 {
+            edit.draw_footer(mut ed, wi)
+            i += 1
+        }
+        let before = region_bytes(probe)
+        i = 0
+        while i < n {
+            edit.draw_footer(mut ed, wi)
+            i += 1
+        }
+        grew = region_bytes(probe) - before
+    }
+    print("edit_drawbufs_test: prompt row '{seed}' x{n}: {grew} ledger bytes")
+    grew
+}
+
+// The bytes `n` draws of `what` allocate after three warm ones, read from
+// the ledger of the region the editor lives in (printed: a trap's message
+// is not).
+fn ledger_of(what: int, n: int, prompt: bool) -> int {
+    var grew = -1
+    region probe {
+        var ed = fixture(doc_text())
+        if prompt {
+            edit.cmdline_open(mut ed, edit.PROMPT_CMD, "")
+            edit.ed_render(mut ed)
+        }
+        var i = 0
+        while i < 3 {
+            draw(mut ed, what)
+            i += 1
+        }
+        let before = region_bytes(probe)
+        i = 0
+        while i < n {
+            draw(mut ed, what)
+            i += 1
+        }
+        grew = region_bytes(probe) - before
+    }
+    print("edit_drawbufs_test: draw {what} x{n}: {grew} ledger bytes")
+    grew
+}
+
+fn t_push_dec_matches_interpolation() {
+    var v = 0
+    while v < 2100 {
+        var b = List[byte]()
+        edit.push_dec(mut b, v)
+        assert(str_of(b) == "{v}", "push_dec {v}")
+        v += 1
+    }
+    var p = 1
+    while p < 1000000000000000000 {
+        for x in [p - 1, p, p + 1, 9 * p] {
+            var b = List[byte]()
+            (mut b).push(33 as byte)
+            edit.push_dec(mut b, x)
+            assert(str_of(b) == "!{x}", "push_dec {x} appends")
+        }
+        p = p * 10
+    }
+}
+
+fn t_gutter_number_into_matches_the_str() {
+    var dst = bytes_of("stale bytes")
+    for style in [edit.NUM_ABS, edit.NUM_REL, edit.NUM_HYBRID, edit.NUM_NONE] {
+        var line = 0
+        while line < 120 {
+            for cont in [false, true] {
+                let n = edit.gutter_number_into(mut dst, style, line, 57, cont)
+                let want = edit.gutter_number(style, line, 57, cont)
+                assert(n == dst.len && str_of(dst) == want, "gutter number {style} {line} {cont}")
+            }
+            line += 1
+        }
+    }
+    let n = edit.gutter_number_into(mut dst, edit.NUM_ABS, 99999, 0, false)
+    assert(n == 6 && str_of(dst) == "100000", "six digits")
+}
+
+fn t_held_reader_matches_fresh_queries() {
+    var tb = text.textbuf_from_str(doc_text())
+    // An edit splits the one piece: the queries cross piece seams.
+    text.textbuf_insert(mut tb, 7 as text.ByteOff, "\u{301}\u{6F22}".bytes())
+    var bad = List[byte]()
+    (mut bad).push(255 as byte)
+    (mut bad).push(254 as byte)
+    (mut bad).push(33 as byte)
+    text.textbuf_insert(mut tb, 120 as text.ByteOff, bad)
+    let len = text.textbuf_len(tb)
+    var cr = text.cluster_reader_new()
+    var pos = 0
+    var clusters = 0
+    while pos < len {
+        let fresh = text.grapheme_next_boundary(tb, pos as text.ByteOff) as int
+        let held = text.grapheme_next_boundary_with(mut cr, tb, pos as text.ByteOff) as int
+        assert(fresh == held, "boundary after {pos}")
+        pos = held
+        clusters += 1
+    }
+    assert(clusters > 1000, "the document's clusters walked")
+    let sp = text.span(0, len)
+    pos = 0
+    while pos < len {
+        let (ok1, a) = text.text_cluster_next(tb, sp, pos as text.ByteOff)
+        let (ok2, b) = text.text_cluster_next_with(mut cr, tb, sp, pos as text.ByteOff)
+        assert(ok1 && ok2, "a cluster at {pos}")
+        assert(
+            a.lo == b.lo &&
+                a.hi == b.hi &&
+                a.base_cp == b.base_cp &&
+                a.cells == b.cells &&
+                a.tab == b.tab,
+            "cluster at {pos}",
+        )
+        pos = b.hi
+    }
+}
+
+// A statusline built into the reused buffers after a wider one is the
+// statusline a fresh editor builds: no byte of the earlier frame stays.
+fn t_reused_statusline_is_a_fresh_one() {
+    var ed = fixture(doc_text())
+    let wi = ed.win
+    ed.wins[wi].cs.curs[0].pos = 300
+    ed.wins[wi].cs.curs[0].anchor = 300
+    let wide = edit.statusline_build(mut ed, wi, 80)
+    assert(wide.body.len > 20, "a statusline")
+    ed.wins[wi].cs.curs[0].pos = 0
+    ed.wins[wi].cs.curs[0].anchor = 0
+    let narrow = edit.statusline_build(mut ed, wi, 21)
+    var fresh = fixture(doc_text())
+    let want = edit.statusline_build(mut fresh, fresh.win, 21)
+    assert(str_of(narrow.chip) == str_of(want.chip), "chip")
+    assert(str_of(narrow.body) == str_of(want.body), "body '{str_of(narrow.body)}'")
+    assert(narrow.body_cells == want.body_cells && narrow.chip_cells == want.chip_cells, "cells")
+    assert(narrow.warn_at == want.warn_at && narrow.warn_len == want.warn_len, "warn span")
+    let again = edit.statusline_build(mut ed, wi, 80)
+    assert(str_of(again.body) != str_of(wide.body), "the position moved")
+}
+
+fn t_document_rows_allocate_nothing() {
+    let grew = ledger_of(0, 30, false)
+    assert(grew == 0, "30 full document draws allocated {grew} ledger bytes")
+}
+
+fn t_gutter_allocates_nothing() {
+    let grew = ledger_of(1, 30, false)
+    assert(grew == 0, "30 gutter draws allocated {grew} ledger bytes")
+}
+
+fn t_statusline_allocates_nothing() {
+    let grew = ledger_of(2, 30, false)
+    assert(grew == 0, "30 statusline draws allocated {grew} ledger bytes")
+}
+
+fn t_cursor_overlay_allocates_nothing() {
+    let grew = ledger_of(3, 30, false)
+    assert(grew == 0, "30 cursor draws allocated {grew} ledger bytes")
+}
+
+fn t_prompt_row_allocates_nothing() {
+    var total = 0
+    for seed in ["", "wri", "zzzz no such command", "e READ"] {
+        total += prompt_ledger(seed, 30)
+    }
+    assert(total == 0, "30 prompt rows allocated {total} ledger bytes")
+}
+
+// The ghost the draw writes into `ed.dbuf.ghost` is `cmdline_ghost`'s.
+fn t_ghost_into_is_the_ghost() {
+    for seed in ["", "wri", "e READ", "zz", "q"] {
+        var ed = fixture(doc_text())
+        edit.cmdline_open(mut ed, edit.PROMPT_CMD, seed)
+        edit.ed_render(mut ed)
+        let want = edit.cmdline_ghost(mut ed)
+        edit.cmdline_ghost_into(mut ed)
+        assert(str_of(ed.dbuf.ghost) == str_of(want), "ghost of '{seed}': '{str_of(want)}'")
+    }
+}
+
+fn main() {
+    t_push_dec_matches_interpolation()
+    t_gutter_number_into_matches_the_str()
+    t_held_reader_matches_fresh_queries()
+    t_reused_statusline_is_a_fresh_one()
+    t_document_rows_allocate_nothing()
+    t_gutter_allocates_nothing()
+    t_statusline_allocates_nothing()
+    t_cursor_overlay_allocates_nothing()
+    t_prompt_row_allocates_nothing()
+    t_ghost_into_is_the_ghost()
+    print("edit_drawbufs_test: ok")
+}
