@@ -455,7 +455,14 @@ One paragraph each; yw01's is drafted in full
   `s57_8_` cases and `startup_multiple_files`. **Drafted in full by
   yw04** (`notes/contracts/yw05-panes-tabs-groups.md`), with s57.13–
   s57.15 and s57.22 proposed for yw06 after Sprint 27's router (R-yw05-1:
-  their prerequisites are `mouse.c`'s).
+  their prerequisites are `mouse.c`'s). **Landed by yw05**
+  (`notes/yw05-panes-tabs-groups.md`): the 0.2.34 bump with every
+  G1/G2/G3/G4/G30/G34 interim retired and yw04's job half (campaign 04
+  104/104); the pane tree (its ratio C's float bits, G44), the region
+  registry in full, tabs, the strip, s57.8 and groups — 22 of the 23
+  campaign-05 goldens by name, `startup_multiple_files` to yw06 with the
+  buffer picker (R-yw05-5); the pane, tab and group fuzzers equal to C's
+  drivers; the allocation-free hot paths (a `:` key 208 KB → 21 KB).
 - **yw06 — workspace, finder and mouse** (s25, s26, s27, s56.5,
   s57.5–s57.7, s57.9–s57.12, s57.20; `src/ws/`, `src/ui/picker*`,
   `mouse.c`, `typejump.c`). Workspace state under XDG in Fletch data
