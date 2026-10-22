@@ -1,12 +1,37 @@
-//! edit.job — the child-process layer (Sprint 19), as far as wolf 0.2.33
-//! lets it run.
+//! edit.job — the child-process layer (Sprint 19, 57.24-57.27).
 //!
 //! Ports sagitta `src/edit/job.c` (1,961 lines) and `job.h` (379) at
-//! 9ace98c2. This file holds the leaf half that needs no job pipe:
-//! `yew_shell_quote` (§9, `job.c:214-235`), the byte-boundary safety rule
-//! a streamed read obeys (§3, `job.c:125-210`), the state names and the
-//! shell's choice (`job.c:390-429`). The table, the spawn and the three
-//! consumption modes are `edit.jobs` (R-yw04-1).
+//! 9ace98c2: the job table, a spawn whose pipes the loop reads while it
+//! paints (`os_signal_wait_fds`, wolf 0.2.34, G2 wolf-lang#795), the
+//! byte-boundary safety rule a streamed read obeys (§3, `job.c:125-210`),
+//! the reap, the settle, the deadlines and the escalation, the proxy jobs
+//! the shell session feeds (57.27 §2), `yew_shell_quote` (§9), the
+//! environment (§7, 57.23 §4, 57.27 §3) and the synchronous terminal
+//! handover (57.18 §4).
+//!
+//! **The shape, and why.** C's sinks carry callback tables
+//! (`YewJobFramedOps`, `YewJobCallbackOps`, `YewJobProxyOps`) and an
+//! opaque owner; no function value crosses a module boundary here
+//! (G19/G20), so each is a KIND on the job with the owner's identity as
+//! data, and ONE `match` per seam names every owner (`jb_framed_*`,
+//! `jb_callback_complete`, `jb_proxy_signal`): the session's link, the
+//! completion generator, the `--help` parser, the fish oracle, a test
+//! witness. The table is a field of the `Ed` (`ed.jobs`), never module
+//! state (E1010). A pipe end is a raw descriptor (`os_pipe`), read with
+//! `fs_read_chunk` only after `os_signal_wait_fds` says it is ready —
+//! C's nonblocking read and its EAGAIN become "ready, read once, ask
+//! again with a zero deadline". The child is started by `os_spawn_job`
+//! (a new process group, the editor's dispositions put back) with the
+//! environment and working directory the spawn gives it applied to THIS
+//! process for the instant of the spawn and restored (G36: a spawn takes
+//! neither; the core is one thread, invariant 8); an exec failure is the
+//! spawn's own row (`not_found`, `denied`), so the job is born
+//! `JOB_EXECFAIL` where C learns it from its exec-status pipe. A child's
+//! stdin is a pipe: a payload that fits a fresh pipe (4,096 bytes) is
+//! written at the spawn, a larger one by a forked writer child
+//! (`os_fork`, s247), because wolf has no nonblocking pipe write and no
+//! write-readiness wait (G30, wolf-lang#818); the checked machine answers
+//! `os_fork` `unsupported`, and such a spawn refuses by name there.
 
 use std.env as std_env
 use std.fs
@@ -14,6 +39,7 @@ use std.os.users
 use std.process
 use std.signal
 use term
+use util
 use text
 use unicode
 
@@ -160,7 +186,7 @@ pub fn job_safe_prefix(b: List[byte], n: int, at_eof: bool) -> int {
 }
 
 /// `yew_job_shell` (`job.c:415-429`): `$SHELL`, the user database's
-/// shell, `/bin/sh`. C asks `getpwuid(getuid())`; wolf 0.2.33 has the uid
+/// shell, `/bin/sh`. C asks `getpwuid(getuid())`; wolf has the uid
 /// (`os_uid`) but no name service (G37), so the port reads `/etc/passwd`
 /// by uid through `std.os.users`.
 pub fn job_shell() -> str {
@@ -179,19 +205,7 @@ pub fn job_shell() -> str {
     "/bin/sh"
 }
 
-/// The refusal every surface of the job half answers at wolf 0.2.33
-/// (ruling R-yw04-1): C reads a child's pipes inside the loop's one
-/// `poll(2)` over the tty, the signal pipe and every job's descriptors
-/// (`job.h:4-11`); wolf 0.2.33 waits on ONE descriptor
-/// (`os_signal_wait_fd`), so a job that streams, filters, collects or
-/// keeps a session cannot run without blocking the loop (invariant 4).
-/// `what` names the surface. Retired by the pin that carries
-/// `os_signal_wait_fds` (G2, wolf-lang#795, wolf 0.2.34).
-pub fn job_stop_g2(what: str) -> str {
-    "not yet ported: {what}: needs os_signal_wait_fds (G2, wolf-lang#795), sagitta Sprint 19 (yw04, R-yw04-1)"
-}
-
-/// `access(path, X_OK) == 0 && stat(path) == 0 && S_ISREG`: wolf 0.2.33
+/// `access(path, X_OK) == 0 && stat(path) == 0 && S_ISREG`: wolf
 /// has no `access(2)` (G32), so the mode bits are read against the real
 /// ids as `access` does (`text.clipboard`'s `access_x`, yw02); an ACL
 /// or a `noexec` mount is not seen.
@@ -230,76 +244,6 @@ pub fn shell_ws_root(ed: Ed) -> str {
     if ed.ws_dir.len == 0 then "." else ed.ws_dir
 }
 
-// ------------------------------------------------------------------
-// The environment a job runs with (§7)
-// ------------------------------------------------------------------
-
-/// `yew_job_env` / `job_build_env` (`job.c:581-695`): the environment a
-/// plain `:!` command runs with — the process environment (the shell
-/// session's exports once there are any: none at 0.2.33, R-yw04-1) less
-/// the rows the job layer owns, then `YEW_FILE`, `YEW_LINE`, `YEW_COL`
-/// (the grapheme column, the number the statusline shows), `YEW_WORKSPACE`
-/// and `YEW_JOB=1`; `PAGER=cat` and `GIT_PAGER=cat` unless the child is
-/// handed the real terminal (57.31 §3: it keeps the user's pagers).
-/// NAME=value rows in C's order.
-pub fn job_env(mut ed: Ed, inherit_tty: bool) -> List[str] {
-    var out = List[str]()
-    for row in std_env.vars() {
-        var skip = false
-        for d in [
-            "COLUMNS=",
-            "LINES=",
-            "YEW_FILE=",
-            "YEW_LINE=",
-            "YEW_COL=",
-            "YEW_WORKSPACE=",
-            "YEW_JOB=",
-            "PAGER=",
-            "GIT_PAGER=",
-        ] {
-            if inherit_tty && (d == "PAGER=" || d == "GIT_PAGER=") {
-                continue
-            }
-            if row.starts_with(d) {
-                skip = true
-                break
-            }
-        }
-        if !skip {
-            (mut out).push(row)
-        }
-    }
-    var path = ""
-    var line = 0
-    var col = 0
-    if ed.win >= 0 && ed.win < ed.wins.len {
-        let b = ed.wins[ed.win].buf
-        if b >= 0 && b < ed.bufs.len {
-            if ed.bufs[b].has_path {
-                path = ed.bufs[b].path
-            }
-            let w = ed.win
-            if ed.wins[w].cs.curs.len != 0 {
-                let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
-                let ln = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
-                line = copy ln as int
-                let span = text.textbuf_line_span(ed.bufs[b].ec.tb, ln)
-                col = text.off_to_gcol(mut ed.bufs[b].ec.tb, span, pos as text.ByteOff) as int
-            }
-        }
-    }
-    (mut out).push("YEW_FILE={path}")
-    (mut out).push("YEW_LINE={line + 1}")
-    (mut out).push("YEW_COL={col + 1}")
-    (mut out).push("YEW_WORKSPACE={shell_ws_root(ed)}")
-    (mut out).push("YEW_JOB=1")
-    if !inherit_tty {
-        (mut out).push("PAGER=cat")
-        (mut out).push("GIT_PAGER=cat")
-    }
-    out
-}
-
 /// `YewJobWait` (`job.h:221-226`): how a synchronous child ended.
 pub struct JobWait {
     state: int,
@@ -315,7 +259,7 @@ fn jb_wait_none() -> JobWait {
 /// The environment and directory a spawn gives its child, applied to
 /// THIS process around the spawn and put back after it. C builds `envp`
 /// for `execve` and `chdir`s in the forked child (`job.c:870-900`);
-/// wolf 0.2.33's spawn takes neither an environment nor a directory
+/// wolf's spawn (0.2.34) takes neither an environment nor a directory
 /// (G36), and the child inherits both at the spawn, so the core — one
 /// thread, invariant 8 — swaps its own for the instant of the spawn.
 struct JbSaved {
@@ -486,4 +430,1408 @@ fn jb_resume(mut ed: Ed, handed: bool) -> bool {
 fn jb_signals_back() {
     signal.reset(signal.interrupt() | signal.quit()) else |_| {}
     signal.listen(term.tty_signal_set()) else |_| {}
+}
+
+// ------------------------------------------------------------------
+// The table (§1, `job.h:115-379`)
+// ------------------------------------------------------------------
+
+/// `YEW_SINK_BUFFER`: append to a job buffer (mode a).
+pub const SINK_BUFFER: int = 0
+
+/// `YEW_SINK_COLLECT`: accumulate, deliver when the job ends (b and c).
+pub const SINK_COLLECT: int = 1
+
+/// `YEW_SINK_FRAMED`: raw stdout to the owner; stderr kept apart.
+pub const SINK_FRAMED: int = 2
+
+/// `YEW_SINK_STREAM`: raw stdout and stderr to the owner (AI, yw12).
+pub const SINK_STREAM: int = 3
+
+/// `YEW_SINK_CALLBACK`: split collect to a completion, then released.
+pub const SINK_CALLBACK: int = 4
+
+/// `YEW_SINK_DISCARD`.
+pub const SINK_DISCARD: int = 5
+
+/// No framed owner.
+pub const FRAMED_NONE: int = 0
+
+/// The persistent shell session's link (`shsession.c`'s `link_ops`).
+pub const FRAMED_SESSION: int = 1
+
+/// No callback owner.
+pub const CB_NONE: int = 0
+
+/// A completion generator (`compgen.c`'s `gen_ops`, 57.24).
+pub const CB_COMPGEN: int = 1
+
+/// A `--help` parse (`comphelp.c`'s `help_ops`, 57.25).
+pub const CB_COMPHELP: int = 2
+
+/// The fish oracle (`compfish.c`'s ops, 57.26).
+pub const CB_COMPFISH: int = 3
+
+/// The unit tests' witness (`test_job.c`'s `job_callback_test_*`).
+pub const CB_TEST: int = 4
+
+/// No proxy owner.
+pub const PROXY_NONE: int = 0
+
+/// A command run inside the shell session (`shsession.c`'s `proxy_ops`).
+pub const PROXY_SESSION: int = 1
+
+/// The bytes a fresh pipe takes without its reader (`PIPE_BUF` on
+/// linux): a stdin payload this size or less is written at the spawn.
+pub const JOB_STDIN_INLINE_MAX: int = 4096
+
+/// How a job ended, as the reap sees it (`YewJobWait`, `job.h:221-226`)
+/// is `JobWait` above.
+
+/// `YewJobSpec` (`job.h:136-219`): what to run and where its output goes.
+pub struct JobSpec {
+    cmdline: str,
+    has_cmdline: bool,
+    argv: List[str],
+    cwd: str,
+    has_cwd: bool,
+    sink: int,
+    in_bytes: List[byte],
+    has_in: bool,
+    timeout_ms: int,
+    target_win: int,
+    display: str,
+    has_display: bool,
+    internal: bool,
+    evictable: bool,
+    collect_max: int,
+    env_set: List[str],
+    env_unset: List[str],
+    env_unset_prefix: List[str],
+    env_base: List[str],
+    has_env_base: bool,
+    inherit_tty: bool,
+    framed: int,
+    callback: int,
+    cb_key: str,
+    cb_name: str,
+    cb_ms: int,
+    cb_flag: bool,
+    proxy: int,
+}
+
+/// An empty spec (C's `YewJobSpec spec = {0}`).
+pub fn job_spec_new() -> JobSpec {
+    JobSpec {
+        cmdline: "",
+        has_cmdline: false,
+        argv: List[str](),
+        cwd: "",
+        has_cwd: false,
+        sink: SINK_BUFFER,
+        in_bytes: List[byte](),
+        has_in: false,
+        timeout_ms: 0,
+        target_win: 0,
+        display: "",
+        has_display: false,
+        internal: false,
+        evictable: false,
+        collect_max: 0,
+        env_set: List[str](),
+        env_unset: List[str](),
+        env_unset_prefix: List[str](),
+        env_base: List[str](),
+        has_env_base: false,
+        inherit_tty: false,
+        framed: FRAMED_NONE,
+        callback: CB_NONE,
+        cb_key: "",
+        cb_name: "",
+        cb_ms: 0,
+        cb_flag: false,
+        proxy: PROXY_NONE,
+    }
+}
+
+/// `struct YewJob` (`job.h:228-307`). The pipe ends are raw descriptors,
+/// -1 once closed; `child` is the process's handle in the runtime's child
+/// table (`os_spawn_job`'s slot), -1 for none (a proxy, an exec failure).
+pub struct Job {
+    id: int,
+    pid: int,
+    pgid: int,
+    child: int,
+    writer: int,
+    in_fd: int,
+    out_fd: int,
+    err_fd: int,
+    state: int,
+    exit_code: int,
+    termsig: int,
+    exec_errno: int,
+    sink: int,
+    hold: List[byte],
+    collect: List[byte],
+    collect_err: List[byte],
+    collect_max: int,
+    framed_err: List[byte],
+    framed: int,
+    callback: int,
+    cb_key: str,
+    cb_name: str,
+    cb_ms: int,
+    cb_flag: bool,
+    proxy: int,
+    in_bytes: List[byte],
+    in_off: int,
+    bytes_out: int,
+    bytes_err: int,
+    start_ms: int,
+    end_ms: int,
+    timeout_ms: int,
+    kill_at_ms: int,
+    buf: int,
+    origin_buf_id: int,
+    follow_tail: bool,
+    collect_capped: bool,
+    framed_failed: bool,
+    framed_destroyed: bool,
+    callback_called: bool,
+    callback_destroyed: bool,
+    reaped: bool,
+    drained: bool,
+    synchronous: bool,
+    internal: bool,
+    evictable: bool,
+    mark: text.MarkId,
+    has_mark: bool,
+    label: str,
+}
+
+fn jb_job_new() -> Job {
+    Job {
+        id: 0,
+        pid: 0,
+        pgid: 0,
+        child: -1,
+        writer: -1,
+        in_fd: -1,
+        out_fd: -1,
+        err_fd: -1,
+        state: JOB_RUNNING,
+        exit_code: 0,
+        termsig: 0,
+        exec_errno: 0,
+        sink: SINK_BUFFER,
+        hold: List[byte](),
+        collect: List[byte](),
+        collect_err: List[byte](),
+        collect_max: JOB_COLLECT_MAX,
+        framed_err: List[byte](),
+        framed: FRAMED_NONE,
+        callback: CB_NONE,
+        cb_key: "",
+        cb_name: "",
+        cb_ms: 0,
+        cb_flag: false,
+        proxy: PROXY_NONE,
+        in_bytes: List[byte](),
+        in_off: 0,
+        bytes_out: 0,
+        bytes_err: 0,
+        start_ms: 0,
+        end_ms: 0,
+        timeout_ms: 0,
+        kill_at_ms: 0,
+        buf: -1,
+        origin_buf_id: 0,
+        follow_tail: true,
+        collect_capped: false,
+        framed_failed: false,
+        framed_destroyed: false,
+        callback_called: false,
+        callback_destroyed: false,
+        reaped: false,
+        drained: false,
+        synchronous: false,
+        internal: false,
+        evictable: false,
+        mark: text.MarkId { id: 0, gen: 0 },
+        has_mark: false,
+        label: "",
+    }
+}
+
+/// What the unit tests' witness owner saw (`JobCallbackWitness`,
+/// `test_job.c:162-173`): the completion's view of the job.
+pub struct JobWitness {
+    key: str,
+    out: List[byte],
+    err: List[byte],
+    state: int,
+    exit_code: int,
+    completes: int,
+    destroys: int,
+    reaped: bool,
+    pipes_eof: bool,
+    destroyed_after_complete: bool,
+    collect_capped: bool,
+}
+
+/// `JobTable` (`job.h:309-319`): the jobs, compacted on release; public
+/// ids count up from 1, internal ones down from `JOB_INTERNAL_ID_TOP` so
+/// background plumbing makes no visible gap.
+pub struct JobTable {
+    v: List[Job],
+    next_id: int,
+    next_internal_id: int,
+    dirty: bool,
+    sigpipe_ignored: bool,
+    child_seen: bool,
+    witness: List[JobWitness],
+}
+
+/// `UINT32_MAX` (`job.c:243`): the first internal id.
+pub const JOB_INTERNAL_ID_TOP: int = 4294967295
+
+/// `yew_jobs_init` (`job.c:240-246`).
+pub fn jobs_new() -> JobTable {
+    JobTable {
+        v: List[Job](),
+        next_id: 1,
+        next_internal_id: JOB_INTERNAL_ID_TOP,
+        dirty: false,
+        sigpipe_ignored: false,
+        child_seen: false,
+        witness: List[JobWitness](),
+    }
+}
+
+fn jb_close_fd(fd: int) -> int {
+    if fd >= 0 {
+        fs_close(fd) else |_| {}
+    }
+    -1
+}
+
+fn jb_wipe(mut b: List[byte]) {
+    var i = 0
+    while i < b.len {
+        b[i] = 0 as byte
+        i += 1
+    }
+    while b.len > 0 {
+        let _ = (mut b).pop()
+    }
+}
+
+/// `job_dispose` (`job.c:303-322`) for slot `i`: every descriptor closed,
+/// the stdin bytes wiped, each owner's destroy run once.
+fn jb_dispose(mut ed: Ed, i: int) {
+    ed.jobs.v[i].in_fd = jb_close_fd(ed.jobs.v[i].in_fd)
+    ed.jobs.v[i].out_fd = jb_close_fd(ed.jobs.v[i].out_fd)
+    ed.jobs.v[i].err_fd = jb_close_fd(ed.jobs.v[i].err_fd)
+    jb_wipe(mut ed.jobs.v[i].in_bytes)
+    jb_framed_destroy(mut ed, i)
+    jb_callback_destroy(mut ed, i)
+}
+
+/// `yew_jobs_free` (`job.c:324-341`): editor teardown kills every live
+/// group (no orphan may hold the terminal) and reaps it.
+pub fn jobs_free(mut ed: Ed) {
+    shsession_free(mut ed)
+    var i = 0
+    while i < ed.jobs.v.len {
+        if ed.jobs.v[i].state == JOB_RUNNING && ed.jobs.v[i].pgid > 0 {
+            os_signal_send_group(ed.jobs.v[i].pgid, signal.kill()) else |_| {}
+        }
+        if ed.jobs.v[i].child >= 0 && !ed.jobs.v[i].reaped {
+            let _ = os_wait_status(ed.jobs.v[i].child) else 0
+            ed.jobs.v[i].child = -1
+            ed.jobs.v[i].reaped = true
+        }
+        jb_dispose(mut ed, i)
+        i += 1
+    }
+    ed.jobs.v = List[Job]()
+}
+
+/// `yew_job_find` (`job.c:343-355`): the slot of job `id`, or -1.
+pub fn job_find(ed: Ed, id: int) -> int {
+    if id == 0 {
+        return -1
+    }
+    var i = 0
+    while i < ed.jobs.v.len {
+        if ed.jobs.v[i].id == id {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_job_release` (`job.c:357-376`): drop a finished job's slot,
+/// compacting the table; a live child is never dropped (it would orphan).
+pub fn job_release(mut ed: Ed, i: int) {
+    if i < 0 || i >= ed.jobs.v.len {
+        return
+    }
+    if ed.jobs.v[i].state == JOB_RUNNING {
+        return
+    }
+    jb_dispose(mut ed, i)
+    var keep = List[Job]()
+    var k = 0
+    while k < ed.jobs.v.len {
+        if k != i {
+            (mut keep).push(copy ed.jobs.v[k])
+        }
+        k += 1
+    }
+    ed.jobs.v = keep
+    ed.jobs.dirty = true
+}
+
+/// `yew_job_running_count` (`job.c:378-388`): the user-visible jobs
+/// still running.
+pub fn job_running_count(ed: Ed) -> int {
+    var n = 0
+    for j in ed.jobs.v {
+        if j.state == JOB_RUNNING && !j.internal {
+            n += 1
+        }
+    }
+    n
+}
+
+/// `yew_job_pending` (`job.c:1838-1843`): the job still owes output or a
+/// wait status.
+pub fn job_pending(j: Job) -> bool {
+    !j.reaped || j.out_fd >= 0 || j.err_fd >= 0
+}
+
+/// `yew_job_self_exe` (`job.c:103-128`): this yew, for nested-editor
+/// handovers and the session's `--yew-env0`.
+pub fn job_self_exe() -> (bool, str) {
+    let exe = os_exe() else |_| { return (false, "") }
+    (exe.len != 0, exe)
+}
+
+// ------------------------------------------------------------------
+// The environment (§7)
+// ------------------------------------------------------------------
+
+fn jb_name_eq(row: str, name: str) -> bool {
+    name.len != 0 &&
+        row.starts_with(name) &&
+        row.len > name.len &&
+        row.bytes()[name.len] as int == 61
+}
+
+fn jb_name_has_prefix(row: str, prefix: str) -> bool {
+    if prefix.len == 0 {
+        return false
+    }
+    let eq = row.find("=") else -1
+    eq >= prefix.len && row.starts_with(prefix)
+}
+
+fn jb_env_removed(row: str, spec: JobSpec) -> bool {
+    for n in spec.env_unset {
+        if jb_name_eq(row, n) {
+            return true
+        }
+    }
+    for p in spec.env_unset_prefix {
+        if jb_name_has_prefix(row, p) {
+            return true
+        }
+    }
+    for set in spec.env_set {
+        let eq = set.find("=") else -1
+        if eq > 0 && row.starts_with(set[0..eq + 1]) {
+            return true
+        }
+    }
+    false
+}
+
+fn jb_env_spec_valid(spec: JobSpec) -> bool {
+    for set in spec.env_set {
+        let eq = set.find("=") else -1
+        if eq <= 0 {
+            return false
+        }
+    }
+    for n in spec.env_unset {
+        if n.len == 0 || n.contains("=") {
+            return false
+        }
+    }
+    for p in spec.env_unset_prefix {
+        if p.len == 0 || p.contains("=") {
+            return false
+        }
+    }
+    true
+}
+
+// environ's row for the NAME `row` names (`job_environ_row`).
+fn jb_environ_row(row: str) -> (bool, str) {
+    let eq = row.find("=") else row.len
+    let name = row[0..eq]
+    for r in std_env.vars() {
+        if r.starts_with(name) && r.len > name.len && r.bytes()[name.len] as int == 61 {
+            return (true, r)
+        }
+    }
+    (false, "")
+}
+
+/// `job_build_env` (`job.c:581-695`): the base (the session's exports
+/// when the spec hands them in, else the process environment) less the
+/// rows the job layer owns, then `YEW_FILE`, `YEW_LINE`, `YEW_COL` (the
+/// grapheme column the statusline shows), `YEW_WORKSPACE`, `YEW_JOB=1`,
+/// the pagers unless the child owns the terminal (57.31 §3), then the
+/// caller's sets. NAME=value rows in C's order.
+pub fn job_build_env(mut ed: Ed, spec: JobSpec) -> List[str] {
+    var out = List[str]()
+    let base = if spec.has_env_base then copy spec.env_base else std_env.vars()
+    for row0 in base {
+        var row = row0
+        if spec.inherit_tty && spec.has_env_base && (row == "PAGER=cat" || row == "GIT_PAGER=cat") {
+            let (found, r) = jb_environ_row(row)
+            if !found {
+                continue
+            }
+            row = r
+        }
+        var skip = false
+        for d in [
+            "COLUMNS=",
+            "LINES=",
+            "YEW_FILE=",
+            "YEW_LINE=",
+            "YEW_COL=",
+            "YEW_WORKSPACE=",
+            "YEW_JOB=",
+            "PAGER=",
+            "GIT_PAGER=",
+        ] {
+            if spec.inherit_tty && (d == "PAGER=" || d == "GIT_PAGER=") {
+                continue
+            }
+            if row.starts_with(d) {
+                skip = true
+                break
+            }
+        }
+        if !skip && !jb_env_removed(row, spec) {
+            (mut out).push(row)
+        }
+    }
+    var path = ""
+    var line = 0
+    var col = 0
+    if ed.win >= 0 && ed.win < ed.wins.len {
+        let b = ed.wins[ed.win].buf
+        if b >= 0 && b < ed.bufs.len {
+            if ed.bufs[b].has_path {
+                path = ed.bufs[b].path
+            }
+            let w = ed.win
+            if ed.wins[w].cs.curs.len != 0 {
+                let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+                let ln = text.textbuf_line_of(ed.bufs[b].ec.tb, pos as text.ByteOff)
+                line = copy ln as int
+                let span = text.textbuf_line_span(ed.bufs[b].ec.tb, ln)
+                col = text.off_to_gcol(mut ed.bufs[b].ec.tb, span, pos as text.ByteOff) as int
+            }
+        }
+    }
+    for row in [
+        "YEW_FILE={path}",
+        "YEW_LINE={line + 1}",
+        "YEW_COL={col + 1}",
+        "YEW_WORKSPACE={shell_ws_root(ed)}",
+        "YEW_JOB=1",
+    ] {
+        if !jb_env_removed(row, spec) {
+            (mut out).push(row)
+        }
+    }
+    if !spec.inherit_tty {
+        for row in ["PAGER=cat", "GIT_PAGER=cat"] {
+            if !jb_env_removed(row, spec) {
+                (mut out).push(row)
+            }
+        }
+    }
+    for row in spec.env_set {
+        (mut out).push(row)
+    }
+    out
+}
+
+/// `yew_job_env` (`job.c:697-709`): the environment a plain `:!` runs
+/// with — the session's exports once there are any (57.27).
+pub fn job_env(mut ed: Ed, inherit_tty: bool) -> List[str] {
+    var spec = job_spec_new()
+    spec.inherit_tty = inherit_tty
+    let (has, base) = shsession_env(ed)
+    if has {
+        spec.env_base = base
+        spec.has_env_base = true
+    }
+    job_build_env(mut ed, spec)
+}
+
+// ------------------------------------------------------------------
+// Spawning (§2)
+// ------------------------------------------------------------------
+
+/// `job_evict_one` (`job.c:1083-1101`, 57.24 §5): kill and release one
+/// evictable job (a completion's) so a user's own command can start.
+fn jb_evict_one(mut ed: Ed) -> bool {
+    var i = 0
+    while i < ed.jobs.v.len {
+        if ed.jobs.v[i].evictable {
+            if job_pending(ed.jobs.v[i]) && ed.jobs.v[i].pgid > 0 {
+                os_signal_send_group(ed.jobs.v[i].pgid, signal.kill()) else |_| {}
+            }
+            if ed.jobs.v[i].state == JOB_RUNNING {
+                ed.jobs.v[i].state = JOB_CANCELLED
+            }
+            job_release(mut ed, i)
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn jb_next_id(mut ed: Ed, internal: bool) -> int {
+    if internal {
+        let id = ed.jobs.next_internal_id
+        ed.jobs.next_internal_id -= 1
+        return id
+    }
+    let id = ed.jobs.next_id
+    ed.jobs.next_id += 1
+    id
+}
+
+/// `job_spawn_proxy` (`job.c:1109-1149`): a table entry with no process —
+/// pid 0 and every descriptor -1, so nothing that signals, reaps or polls
+/// reaches a process through it.
+fn jb_spawn_proxy(mut ed: Ed, spec: JobSpec) -> (int, str) {
+    if spec.sink != SINK_BUFFER {
+        return (0, "proxy job needs a buffer and an owner")
+    }
+    var j = jb_job_new()
+    j.id = jb_next_id(mut ed, spec.internal)
+    j.sink = SINK_BUFFER
+    j.internal = spec.internal
+    j.proxy = spec.proxy
+    j.start_ms = now_ms()
+    j.label = if spec.has_display then spec.display else spec.cmdline
+    let id = j.id
+    (mut ed.jobs.v).push(j)
+    ed.jobs.dirty = true
+    (id, "")
+}
+
+// The editor ignores SIGPIPE so a write to a pipe whose reader left
+// answers `io` instead of ending the editor (C's `tty.c:312-315`); the
+// child gets the default back (`jb_child_defaults`).
+fn jb_ignore_sigpipe(mut ed: Ed) {
+    if ed.jobs.sigpipe_ignored {
+        return
+    }
+    signal.ignore(signal.broken_pipe()) else |_| {
+        util.log_warn("job: cannot ignore SIGPIPE")
+    }
+    ed.jobs.sigpipe_ignored = true
+}
+
+/// The forked stdin writer (G30's half, s247): the child writes `bytes`
+/// to `w` — blocking is the child's, never the loop's — and ends; `r` is
+/// closed in it first so a reader that leaves early is EPIPE (an `io`
+/// row: SIGPIPE stays ignored across the fork), never a writer blocked
+/// for ever. Answers the child's handle, or the refusal: `busy` while a
+/// task is live, `unsupported` on the checked machine.
+pub fn job_fork_writer(r: int, w: int, bytes: List[byte]) -> (int, str) {
+    let (pid, h) = os_fork() else |e| match e {
+        busy => { return (-1, "a stdin writer cannot fork while a task is live (os_fork: busy)") },
+        io => { return (-1, "cannot fork the stdin writer") },
+        unsupported => {
+            return (
+                -1,
+                "a job's stdin over {JOB_STDIN_INLINE_MAX} bytes needs a forked writer (no nonblocking pipe write, G30, wolf-lang#818), and os_fork is unsupported here",
+            )
+        },
+    }
+    if pid == 0 {
+        if r >= 0 {
+            fs_close(r) else |_| {}
+        }
+        fs_write_chunk(w, bytes) else |_| {}
+        fs_close(w) else |_| {}
+        os_exit(0)
+    }
+    (h, "")
+}
+
+fn jb_spawn_err(e: int) -> str {
+    if e == 2 then "No such file or directory" else "Permission denied"
+}
+
+/// `yew_job_spawn` (`job.c:1151-1337`): the new job's id, or 0 and why.
+pub fn job_spawn(mut ed: Ed, spec: JobSpec) -> (int, str) {
+    if spec.inherit_tty {
+        return (0, "inherited-tty job requires synchronous runner")
+    }
+    if ed.jobs.v.len >= JOB_MAX && (spec.evictable || !jb_evict_one(mut ed)) {
+        return (0, "too many jobs ({JOB_MAX}); finish or kill one first")
+    }
+    if spec.proxy != PROXY_NONE {
+        return jb_spawn_proxy(mut ed, spec)
+    }
+    if spec.argv.len == 0 && !spec.has_cmdline {
+        return (0, "no command")
+    }
+    if !jb_env_spec_valid(spec) {
+        return (0, "invalid job environment override")
+    }
+    if spec.sink == SINK_FRAMED && spec.framed == FRAMED_NONE {
+        return (0, "framed job has no transport")
+    }
+    if spec.sink == SINK_STREAM {
+        return (0, "not yet ported: a stream job's transport (curl): sagitta Sprint 48 (yw12)")
+    }
+    if spec.sink == SINK_CALLBACK && spec.callback == CB_NONE {
+        return (0, "callback job has no completion owner")
+    }
+    var argv = copy spec.argv
+    if argv.len == 0 {
+        (mut argv).push(job_shell())
+        (mut argv).push("-c")
+        (mut argv).push(spec.cmdline)
+    }
+    let envp = job_build_env(mut ed, spec)
+    let cwd = if spec.has_cwd then spec.cwd else shell_ws_root(ed)
+    let want_stdin = spec.has_in && spec.in_bytes.len != 0
+    jb_ignore_sigpipe(mut ed)
+    let (in_r, in_w) = os_pipe() else |_| { return (0, "cannot create pipe") }
+    var in_w2 = in_w
+    var writer = -1
+    if want_stdin && spec.in_bytes.len <= JOB_STDIN_INLINE_MAX {
+        // A fresh pipe takes PIPE_BUF bytes without its reader.
+        fs_write_chunk(in_w, spec.in_bytes) else |_| {}
+        in_w2 = jb_close_fd(in_w)
+    } else if want_stdin {
+        let (h, why) = job_fork_writer(in_r, in_w, spec.in_bytes)
+        if h < 0 {
+            let _ = jb_close_fd(in_r)
+            let _ = jb_close_fd(in_w)
+            return (0, why)
+        }
+        writer = h
+        in_w2 = jb_close_fd(in_w)
+    }
+    let (out_r, out_w) = os_pipe() else |_| {
+        let _ = jb_close_fd(in_r)
+        let _ = jb_close_fd(in_w2)
+        return (0, "cannot create pipe")
+    }
+    let (err_r, err_w) = os_pipe() else |_| {
+        let _ = jb_close_fd(in_r)
+        let _ = jb_close_fd(in_w2)
+        let _ = jb_close_fd(out_r)
+        let _ = jb_close_fd(out_w)
+        return (0, "cannot create pipe")
+    }
+    var fds = List[int]()
+    for x in [0, in_r, 1, out_w, 2, err_w] {
+        (mut fds).push(x)
+    }
+    var args = List[str]()
+    var k = 1
+    while k < argv.len {
+        (mut args).push(argv[k])
+        k += 1
+    }
+    var exec_errno = 0
+    var spawn_err = ""
+    let saved = jb_apply(envp, cwd)
+    let started = os_spawn_job(argv[0], args, fds, 0, -1, jb_child_defaults())
+    jb_restore(saved)
+    let slot = started else |e| {
+        match e {
+            not_found => { exec_errno = 2 },
+            denied => { exec_errno = 13 },
+            invalid => { spawn_err = "cannot fork: invalid" },
+            unsupported => { spawn_err = "cannot fork: unsupported" },
+            io => { spawn_err = "cannot fork" },
+        }
+        -1
+    }
+    let _ = jb_close_fd(in_r)
+    let _ = jb_close_fd(out_w)
+    let _ = jb_close_fd(err_w)
+    if slot < 0 && exec_errno == 0 {
+        let _ = jb_close_fd(in_w2)
+        let _ = jb_close_fd(out_r)
+        let _ = jb_close_fd(err_r)
+        if writer >= 0 {
+            os_kill(writer) else |_| {}
+            let _ = os_wait_status(writer) else 0
+        }
+        return (0, spawn_err)
+    }
+    var j = jb_job_new()
+    j.id = jb_next_id(mut ed, spec.internal)
+    j.start_ms = now_ms()
+    j.sink = spec.sink
+    j.internal = spec.internal
+    j.evictable = spec.evictable
+    j.framed = spec.framed
+    j.callback = spec.callback
+    j.cb_key = spec.cb_key
+    j.cb_name = spec.cb_name
+    j.cb_ms = spec.cb_ms
+    j.cb_flag = spec.cb_flag
+    j.timeout_ms = spec.timeout_ms
+    j.collect_max = if spec.collect_max != 0 then spec.collect_max else JOB_COLLECT_MAX
+    j.writer = writer
+    j.label = if spec.has_display {
+        spec.display
+    } else if spec.has_cmdline {
+        spec.cmdline
+    } else {
+        argv[0]
+    }
+    if slot < 0 {
+        // The spawn's own row is C's exec-status pipe (`job.c:1640-1660`):
+        // the job is born an exec failure, its exit 127 as C's reap sees it.
+        let _ = jb_close_fd(in_w2)
+        let _ = jb_close_fd(out_r)
+        let _ = jb_close_fd(err_r)
+        j.state = JOB_EXECFAIL
+        j.exec_errno = exec_errno
+        j.exit_code = 127
+        j.reaped = true
+        j.end_ms = j.start_ms
+    } else {
+        j.child = slot
+        j.pid = os_proc_pid(slot) else 0
+        j.pgid = j.pid
+        j.in_fd = in_w2
+        j.out_fd = out_r
+        j.err_fd = err_r
+    }
+    // No stdin to write closes it at once: a child whose read never sees
+    // EOF is this subsystem's signature hang (`job.c:1318-1321`).
+    if j.sink != SINK_FRAMED {
+        j.in_fd = jb_close_fd(j.in_fd)
+    }
+    let id = j.id
+    (mut ed.jobs.v).push(j)
+    ed.jobs.dirty = true
+    (id, "")
+}
+
+/// `yew_job_signal` (`job.c:1339-1355`): the job's process GROUP — the
+/// pid alone would leave the shell's children running; a proxy's signal
+/// goes to its owner. `meaning` is a `std.signal` meaning.
+pub fn job_signal(mut ed: Ed, id: int, meaning: int) -> bool {
+    let i = job_find(ed, id)
+    if i >= 0 && ed.jobs.v[i].proxy != PROXY_NONE {
+        if ed.jobs.v[i].state != JOB_RUNNING {
+            return false
+        }
+        return jb_proxy_signal(mut ed, id, meaning)
+    }
+    if i < 0 || ed.jobs.v[i].pgid <= 0 || ed.jobs.v[i].state != JOB_RUNNING {
+        return false
+    }
+    os_signal_send_group(ed.jobs.v[i].pgid, meaning) else |_| { return false }
+    if meaning == signal.terminate() {
+        ed.jobs.v[i].kill_at_ms = now_ms() + JOB_TERM_GRACE_MS
+    }
+    true
+}
+
+// The owners behind the kinds: ONE match each (G19/G20).
+fn jb_proxy_signal(mut ed: Ed, id: int, meaning: int) -> bool {
+    let i = job_find(ed, id)
+    match ed.jobs.v[i].proxy {
+        1 => shsession_proxy_signal(mut ed, id, meaning),
+        _ => false,
+    }
+}
+
+fn jb_framed_feed(mut ed: Ed, i: int, bytes: List[byte]) -> bool {
+    match ed.jobs.v[i].framed {
+        1 => shsession_link_feed(mut ed, ed.jobs.v[i].id, bytes),
+        _ => true,
+    }
+}
+
+fn jb_framed_finish(mut ed: Ed, i: int) -> bool {
+    match ed.jobs.v[i].framed {
+        1 => shsession_link_finish(mut ed, ed.jobs.v[i].id),
+        _ => true,
+    }
+}
+
+fn jb_framed_destroy(mut ed: Ed, i: int) {
+    if ed.jobs.v[i].framed_destroyed || ed.jobs.v[i].framed == FRAMED_NONE {
+        return
+    }
+    ed.jobs.v[i].framed_destroyed = true
+    match ed.jobs.v[i].framed {
+        1 => shsession_link_destroy(mut ed, ed.jobs.v[i].id),
+        _ => {},
+    }
+}
+
+fn jb_callback_complete(mut ed: Ed, i: int) {
+    let j = copy ed.jobs.v[i]
+    match j.callback {
+        1 => compgen_job_complete(mut ed, j),
+        2 => comphelp_job_complete(mut ed, j),
+        3 => compfish_job_complete(mut ed, j),
+        4 => jb_witness_complete(mut ed, j),
+        _ => {},
+    }
+}
+
+fn jb_callback_destroy(mut ed: Ed, i: int) {
+    if ed.jobs.v[i].callback_destroyed || ed.jobs.v[i].callback == CB_NONE {
+        return
+    }
+    ed.jobs.v[i].callback_destroyed = true
+    let key = ed.jobs.v[i].cb_key
+    let completed = ed.jobs.v[i].callback_called
+    match ed.jobs.v[i].callback {
+        1 => compgen_job_destroy(mut ed, key, completed),
+        2 => comphelp_job_destroy(mut ed, key, completed),
+        3 => compfish_job_destroy(mut ed, key, completed),
+        4 => jb_witness_destroy(mut ed, key),
+        _ => {},
+    }
+}
+
+fn jb_witness_at(ed: Ed, key: str) -> int {
+    var i = 0
+    while i < ed.jobs.witness.len {
+        if ed.jobs.witness[i].key == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// A test witness owner (`job_callback_test_complete`): what the
+/// completion saw, by key.
+pub fn job_witness_new(mut ed: Ed, key: str) {
+    (mut ed.jobs.witness).push(JobWitness {
+        key: key,
+        out: List[byte](),
+        err: List[byte](),
+        state: JOB_RUNNING,
+        exit_code: 0,
+        completes: 0,
+        destroys: 0,
+        reaped: false,
+        pipes_eof: false,
+        destroyed_after_complete: false,
+        collect_capped: false,
+    })
+}
+
+fn jb_witness_complete(mut ed: Ed, j: Job) {
+    let w = jb_witness_at(ed, j.cb_key)
+    if w < 0 {
+        return
+    }
+    ed.jobs.witness[w].completes += 1
+    ed.jobs.witness[w].state = j.state
+    ed.jobs.witness[w].exit_code = j.exit_code
+    ed.jobs.witness[w].reaped = j.reaped
+    ed.jobs.witness[w].pipes_eof = j.out_fd == -1 && j.err_fd == -1
+    ed.jobs.witness[w].collect_capped = j.collect_capped
+    for b in j.collect {
+        (mut ed.jobs.witness[w].out).push(b)
+    }
+    for b in j.collect_err {
+        (mut ed.jobs.witness[w].err).push(b)
+    }
+}
+
+fn jb_witness_destroy(mut ed: Ed, key: str) {
+    let w = jb_witness_at(ed, key)
+    if w < 0 {
+        return
+    }
+    ed.jobs.witness[w].destroys += 1
+    ed.jobs.witness[w].destroyed_after_complete = ed.jobs.witness[w].completes == 1
+}
+
+// ------------------------------------------------------------------
+// Reading (§3)
+// ------------------------------------------------------------------
+
+/// The descriptors the loop's wait takes beside the terminal (C's
+/// `yew_job_collect_fds`, `job.c:1376-1405`): every job's open stdout
+/// and stderr end. A job's stdin needs no write-readiness (the writer is
+/// inline or forked), so no `POLLOUT` row exists.
+pub fn job_wait_fds(ed: Ed) -> List[int] {
+    var out = List[int]()
+    for j in ed.jobs.v {
+        if j.out_fd >= 0 {
+            (mut out).push(j.out_fd)
+        }
+        if j.err_fd >= 0 {
+            (mut out).push(j.err_fd)
+        }
+    }
+    out
+}
+
+/// Descriptor `k` of `job_wait_fds` is readable (the loop's wait said
+/// so): the turn's pump reads every job that is ready.
+pub fn job_fd_ready(mut ed: Ed, k: int) {
+    let _ = k
+    job_pump(mut ed)
+}
+
+/// `job_deliver` (`job.c:1424-1503`): `bytes` to wherever slot `i`'s sink
+/// points.
+fn jb_deliver(mut ed: Ed, i: int, bytes: List[byte], is_err: bool) {
+    if bytes.len == 0 {
+        return
+    }
+    let sink = ed.jobs.v[i].sink
+    if sink == SINK_COLLECT {
+        if bytes.len > ed.jobs.v[i].collect_max - ed.jobs.v[i].collect.len {
+            if !ed.jobs.v[i].collect_capped {
+                ed.jobs.v[i].collect_capped = true
+                let _ = job_signal(mut ed, ed.jobs.v[i].id, signal.terminate())
+            }
+            return
+        }
+        for b in bytes {
+            (mut ed.jobs.v[i].collect).push(b)
+        }
+        return
+    }
+    if sink == SINK_CALLBACK {
+        let collected = ed.jobs.v[i].collect.len + ed.jobs.v[i].collect_err.len
+        if collected > ed.jobs.v[i].collect_max ||
+            bytes.len > ed.jobs.v[i].collect_max - collected {
+            if !ed.jobs.v[i].collect_capped {
+                ed.jobs.v[i].collect_capped = true
+                let _ = job_signal(mut ed, ed.jobs.v[i].id, signal.terminate())
+            }
+            return
+        }
+        if is_err {
+            for b in bytes {
+                (mut ed.jobs.v[i].collect_err).push(b)
+            }
+        } else {
+            for b in bytes {
+                (mut ed.jobs.v[i].collect).push(b)
+            }
+        }
+        return
+    }
+    if sink == SINK_BUFFER {
+        job_buffer_append(mut ed, i, bytes, is_err)
+        return
+    }
+    if sink == SINK_FRAMED {
+        if is_err {
+            if bytes.len > JOB_COLLECT_MAX - ed.jobs.v[i].framed_err.len {
+                if !ed.jobs.v[i].collect_capped {
+                    ed.jobs.v[i].collect_capped = true
+                    let _ = job_signal(mut ed, ed.jobs.v[i].id, signal.terminate())
+                }
+                return
+            }
+            for b in bytes {
+                (mut ed.jobs.v[i].framed_err).push(b)
+            }
+            return
+        }
+        if !jb_framed_feed(mut ed, i, bytes) {
+            // The feed may have compacted nothing (C's rule: a feed never
+            // releases), so `i` still names the job.
+            ed.jobs.v[i].framed_failed = true
+            if ed.jobs.v[i].state == JOB_RUNNING {
+                let _ = job_signal(mut ed, ed.jobs.v[i].id, signal.terminate())
+            }
+        }
+    }
+}
+
+/// `job_deliver_text` (`job.c:1505-1533`): the held bytes lead, only the
+/// safe prefix goes out, the rest waits for more or for EOF.
+fn jb_deliver_text(mut ed: Ed, i: int, bytes: List[byte], at_eof: bool, is_err: bool) {
+    var view = copy ed.jobs.v[i].hold
+    for b in bytes {
+        (mut view).push(b)
+    }
+    let safe = job_safe_prefix(view, view.len, at_eof)
+    if safe == view.len {
+        while ed.jobs.v[i].hold.len > 0 {
+            let _ = (mut ed.jobs.v[i].hold).pop()
+        }
+        jb_deliver(mut ed, i, view, is_err)
+        return
+    }
+    var head = List[byte]()
+    var k = 0
+    while k < safe {
+        (mut head).push(view[k])
+        k += 1
+    }
+    while ed.jobs.v[i].hold.len > 0 {
+        let _ = (mut ed.jobs.v[i].hold).pop()
+    }
+    while k < view.len {
+        (mut ed.jobs.v[i].hold).push(view[k])
+        k += 1
+    }
+    jb_deliver(mut ed, i, head, is_err)
+}
+
+/// `yew_job_proxy_output` (`job.c:1535-1543`): a proxy job's output,
+/// through the same UTF-8 and cluster hold (invariant 2).
+pub fn job_proxy_output(mut ed: Ed, id: int, bytes: List[byte]) {
+    let i = job_find(ed, id)
+    if i < 0 || ed.jobs.v[i].proxy == PROXY_NONE || ed.jobs.v[i].reaped || bytes.len == 0 {
+        return
+    }
+    ed.jobs.v[i].bytes_out += bytes.len
+    jb_deliver_text(mut ed, i, bytes, false, false)
+}
+
+/// `yew_job_proxy_end` (`job.c:1545-1568`): the tail flushed, the job
+/// reaped with `wait`'s verdict (one already recorded, a cancel, kept);
+/// the settle finishes it like any other.
+pub fn job_proxy_end(mut ed: Ed, id: int, has_wait: bool, wait: JobWait) {
+    let i = job_find(ed, id)
+    if i < 0 || ed.jobs.v[i].proxy == PROXY_NONE || ed.jobs.v[i].reaped {
+        return
+    }
+    if ed.jobs.v[i].hold.len != 0 {
+        let tail = copy ed.jobs.v[i].hold
+        while ed.jobs.v[i].hold.len > 0 {
+            let _ = (mut ed.jobs.v[i].hold).pop()
+        }
+        jb_deliver(mut ed, i, tail, false)
+    }
+    ed.jobs.v[i].reaped = true
+    ed.jobs.v[i].end_ms = now_ms()
+    if ed.jobs.v[i].state == JOB_RUNNING && has_wait {
+        ed.jobs.v[i].state = if wait.state == JOB_RUNNING then JOB_EXITED else wait.state
+        ed.jobs.v[i].exit_code = wait.exit_code
+        ed.jobs.v[i].termsig = wait.termsig
+        ed.jobs.v[i].exec_errno = wait.exec_errno
+    } else if ed.jobs.v[i].state == JOB_RUNNING {
+        ed.jobs.v[i].state = JOB_EXITED
+    }
+    ed.jobs.dirty = true
+}
+
+// One read of slot `i`'s descriptor (`is_err` its stderr) once the wait
+// said it is ready: C's `job_drain` loop, one iteration (`job.c:1570-
+// 1636`). Answers the bytes read (0 at EOF, when the end is closed).
+fn jb_read_once(mut ed: Ed, i: int, is_err: bool, want: int) -> int {
+    let fd = if is_err then ed.jobs.v[i].err_fd else ed.jobs.v[i].out_fd
+    let sink = ed.jobs.v[i].sink
+    let raw = sink == SINK_FRAMED || sink == SINK_STREAM || sink == SINK_CALLBACK
+    var eof = false
+    let got = fs_read_chunk(fd, want) else |e| match e {
+        eof => {
+            eof = true
+            List[byte]()
+        },
+        io => {
+            eof = true
+            List[byte]()
+        },
+    }
+    if is_err {
+        ed.jobs.v[i].bytes_err += got.len
+    } else {
+        ed.jobs.v[i].bytes_out += got.len
+    }
+    if raw {
+        if got.len != 0 {
+            jb_deliver(mut ed, i, got, is_err)
+        }
+        if eof && sink == SINK_FRAMED && !is_err {
+            if !jb_framed_finish(mut ed, i) {
+                ed.jobs.v[i].framed_failed = true
+            }
+        }
+    } else {
+        jb_deliver_text(mut ed, i, got, eof, is_err)
+    }
+    if eof {
+        if is_err {
+            ed.jobs.v[i].err_fd = jb_close_fd(ed.jobs.v[i].err_fd)
+        } else {
+            ed.jobs.v[i].out_fd = jb_close_fd(ed.jobs.v[i].out_fd)
+        }
+        return 0
+    }
+    got.len
+}
+
+/// `yew_job_pump` (`job.c:1764-1790`): every ready job descriptor read
+/// until it has nothing more (C's EAGAIN: asked again with a zero
+/// deadline) or until its turn's budget (`JOB_READ_BUDGET`) is spent, so
+/// `yes` cannot starve the keys (invariant 4). A child meaning the
+/// zero-deadline ask answers instead is kept for the turn's reap.
+pub fn job_pump(mut ed: Ed) {
+    var ids = List[int]()
+    var errs = List[bool]()
+    var fds = List[int]()
+    var spent = List[int]()
+    for j in ed.jobs.v {
+        if j.out_fd >= 0 {
+            (mut ids).push(j.id)
+            (mut errs).push(false)
+            (mut fds).push(j.out_fd)
+            (mut spent).push(0)
+        }
+        if j.err_fd >= 0 {
+            (mut ids).push(j.id)
+            (mut errs).push(true)
+            (mut fds).push(j.err_fd)
+            (mut spent).push(0)
+        }
+    }
+    var guard = 0
+    while fds.len > 0 && guard < 100000 {
+        guard += 1
+        let (which, m) = os_signal_wait_fds(fds, signal.child(), 0) else |_| { (-1, 0) }
+        if which < 0 && m != 0 {
+            ed.jobs.child_seen = true
+            continue
+        }
+        if which < 0 {
+            break
+        }
+        let i = job_find(ed, ids[which])
+        var done = i < 0
+        if !done {
+            let fd = if errs[which] then ed.jobs.v[i].err_fd else ed.jobs.v[i].out_fd
+            done = fd != fds[which]
+        }
+        if !done {
+            var want = JOB_READ_BUDGET - spent[which]
+            if want > 16384 {
+                want = 16384
+            }
+            let n = jb_read_once(mut ed, i, errs[which], want)
+            spent[which] = spent[which] + n
+            done = n == 0 || spent[which] >= JOB_READ_BUDGET
+        }
+        if done {
+            var nids = List[int]()
+            var nerrs = List[bool]()
+            var nfds = List[int]()
+            var nspent = List[int]()
+            var k = 0
+            while k < fds.len {
+                if k != which {
+                    (mut nids).push(ids[k])
+                    (mut nerrs).push(errs[k])
+                    (mut nfds).push(fds[k])
+                    (mut nspent).push(spent[k])
+                }
+                k += 1
+            }
+            ids = nids
+            errs = nerrs
+            fds = nfds
+            spent = nspent
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Reaping and deadlines (§2, §5)
+// ------------------------------------------------------------------
+
+/// `yew_job_reap` (`job.c:1796-1836`): every ended child the runtime's
+/// table reports (`os_wait_poll`, the first in start order, reaped), its
+/// job marked reaped with the wait status's verdict — a timeout or cancel
+/// already recorded is kept. NOT finished: the pipes may still hold a
+/// bufferful; `job_settle` finishes it once they EOF. A stdin writer's
+/// end is noted; a child no job owns (another unit's, waited elsewhere)
+/// is C's `waitpid(-1)` rule: reaped and ignored.
+pub fn job_reap(mut ed: Ed) {
+    ed.jobs.child_seen = false
+    var guard = 0
+    while guard < 4096 {
+        guard += 1
+        let (h, st) = os_wait_poll() else |_| { return }
+        if h < 0 {
+            return
+        }
+        if st > 255 && st < 512 {
+            // A stop: the child lives; nothing ends.
+            continue
+        }
+        var i = 0
+        while i < ed.jobs.v.len {
+            if ed.jobs.v[i].writer == h {
+                ed.jobs.v[i].writer = -1
+                break
+            }
+            if ed.jobs.v[i].child == h {
+                ed.jobs.v[i].child = -1
+                ed.jobs.v[i].reaped = true
+                ed.jobs.v[i].end_ms = now_ms()
+                if ed.jobs.v[i].state == JOB_RUNNING {
+                    if st >= 0 {
+                        ed.jobs.v[i].state = JOB_EXITED
+                        ed.jobs.v[i].exit_code = st
+                    } else {
+                        ed.jobs.v[i].state = JOB_SIGNALED
+                        ed.jobs.v[i].termsig = 0 - st
+                    }
+                } else if ed.jobs.v[i].state == JOB_EXECFAIL {
+                    ed.jobs.v[i].exit_code = if st >= 0 then st else 127
+                }
+                ed.jobs.dirty = true
+                break
+            }
+            i += 1
+        }
+    }
+}
+
+/// `yew_job_settle` (`job.c:1845-1885`): completion for every job reaped
+/// AND drained; a callback job's owner runs then the job is released (it
+/// may spawn another, so the table is re-walked from the top). Answers
+/// how many settled.
+pub fn job_settle(mut ed: Ed) -> int {
+    var settled = 0
+    var i = 0
+    while i < ed.jobs.v.len {
+        if ed.jobs.v[i].drained || job_pending(ed.jobs.v[i]) {
+            i += 1
+            continue
+        }
+        ed.jobs.v[i].drained = true
+        settled += 1
+        ed.jobs.v[i].in_fd = jb_close_fd(ed.jobs.v[i].in_fd)
+        jb_wipe(mut ed.jobs.v[i].in_bytes)
+        if ed.jobs.v[i].sink == SINK_CALLBACK {
+            let id = ed.jobs.v[i].id
+            ed.jobs.v[i].callback_called = true
+            jb_callback_complete(mut ed, i)
+            let at = job_find(ed, id)
+            if at >= 0 {
+                job_release(mut ed, at)
+            }
+            i = 0
+            continue
+        }
+        jb_framed_destroy(mut ed, i)
+        job_finish(mut ed, i)
+        i += 1
+    }
+    settled
+}
+
+/// `yew_job_deadline` (`job.c:1887-1932`): ms until the next timeout or
+/// SIGTERM-to-SIGKILL escalation, -1 for none, 0 when one is due.
+pub fn job_deadline(ed: Ed, now: int) -> int {
+    var best = -1
+    for j in ed.jobs.v {
+        if j.state != JOB_RUNNING && j.kill_at_ms == 0 {
+            continue
+        }
+        var at = -1
+        if j.kill_at_ms != 0 {
+            at = j.kill_at_ms
+        } else if j.timeout_ms > 0 {
+            at = j.start_ms + j.timeout_ms
+        }
+        if at < 0 {
+            continue
+        }
+        if at <= now {
+            return 0
+        }
+        if best < 0 || at - now < best {
+            best = at - now
+        }
+    }
+    best
+}
+
+/// `yew_job_tick` (`job.c:1934-1961`): the escalation first (a timed-out
+/// or cancelled job's group may live until SIGKILL lands), then each
+/// running job's timeout: SIGTERM, a grace, SIGKILL.
+pub fn job_tick(mut ed: Ed, now: int) {
+    var i = 0
+    while i < ed.jobs.v.len {
+        if ed.jobs.v[i].kill_at_ms != 0 && now >= ed.jobs.v[i].kill_at_ms {
+            if job_pending(ed.jobs.v[i]) && ed.jobs.v[i].pgid > 0 {
+                os_signal_send_group(ed.jobs.v[i].pgid, signal.kill()) else |_| {}
+            }
+            ed.jobs.v[i].kill_at_ms = 0
+            i += 1
+            continue
+        }
+        if ed.jobs.v[i].state != JOB_RUNNING {
+            i += 1
+            continue
+        }
+        if ed.jobs.v[i].timeout_ms > 0 && now - ed.jobs.v[i].start_ms >= ed.jobs.v[i].timeout_ms {
+            ed.jobs.v[i].state = JOB_TIMEOUT
+            ed.jobs.dirty = true
+            if ed.jobs.v[i].pgid > 0 {
+                os_signal_send_group(ed.jobs.v[i].pgid, signal.terminate()) else |_| {}
+            }
+            ed.jobs.v[i].kill_at_ms = now + JOB_TERM_GRACE_MS
+        }
+        i += 1
+    }
+}
+
+/// The loop's job turn (`loop.c:598-620`): pump before dispatch so a
+/// burst of output is one render, reap on a child meaning (or one the
+/// pump's zero-deadline asks answered), tick, settle (with the session's
+/// own settle, `yew_loop_settle_jobs`), and one table refresh and footer
+/// redraw a turn however many jobs changed.
+pub fn job_turn(mut ed: Ed, chld: bool, now: int) {
+    if ed.jobs.v.len == 0 && !chld {
+        return
+    }
+    job_pump(mut ed)
+    if chld || ed.jobs.child_seen {
+        job_reap(mut ed)
+    }
+    job_tick(mut ed, now)
+    let _ = job_settle(mut ed)
+    shsession_settle(mut ed)
+    if ed.jobs.dirty {
+        ed.jobs.dirty = false
+        jobs_table_refresh(mut ed)
+        ed.footer_dirty = true
+    }
 }
