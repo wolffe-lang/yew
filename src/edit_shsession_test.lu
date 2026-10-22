@@ -1,17 +1,21 @@
 //! member: false
 //!
 //! The port of sagitta `tests/unit/test_shsession.c` (1,125 lines), one
-//! test per C test in registry order. Every one of C's seventeen drives
-//! the persistent `$SHELL -s` session — a framed job whose pipes the loop
-//! reads while it paints — the job half that STOPs at wolf 0.2.33: ruling
-//! R-yw04-1 (G2, wolf-lang#795). Each SKIPs loudly by name. Port-only
-//! cases prove the surface 0.2.33 answers: with no session state the
-//! session's directory is the workspace root (`shsession.h:93-99`),
-//! `shell.session` defaults to persistent, `ed.shell.reset` says C's
-//! line, and a `:!` that would enter the session refuses by name.
+//! test per C test in registry order (`tests/unit/registry.c:1258-1274`).
+//! Every test runs a real shell — a fixture `$SHELL`, never the user's —
+//! and drives it the way the loop does: wait on the jobs' descriptors,
+//! pump, reap, tick, settle, and the session's own settle. This binary is
+//! the session's `self` (`os_exe()`), so its `main` answers `--yew-env0`
+//! first, as C's `unit_main.c:14-19` does. Children, groups and signals:
+//! it runs inside the container (RULES §5). Under `wolf test` `os_exe()`
+//! is `wolf` (G23): a session there has no env helper, so the file says
+//! SKIP by name on both streams and the native run covers every case.
 
 use edit
+use std.env as std_env
 use std.fs
+use std.signal
+use text
 
 fn bytes_of(s: str) -> List[byte] {
     var v = List[byte]()
@@ -21,8 +25,192 @@ fn bytes_of(s: str) -> List[byte] {
     v
 }
 
-fn run_line(mut ed: edit.Ed, line: str) -> int {
-    let parsed = edit.cmd_parse(mut ed, bytes_of(line))
+fn raw(xs: List[int]) -> List[byte] {
+    var v = List[byte]()
+    for x in xs {
+        (mut v).push(x as byte)
+    }
+    v
+}
+
+fn cat(a: List[byte], b: List[byte]) -> List[byte] {
+    var v = copy a
+    for x in b {
+        (mut v).push(x)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `ShFix` (`test_shsession.c:47-52`).
+struct ShFix {
+    ed: edit.Ed,
+    root: str,
+}
+
+// `sh_fix_make` (`test_shsession.c:62-85`): a fresh workspace root (its
+// physical spelling), `$SHELL` the fixture's, an editor over scratch.
+fn fix_make(shell: str, tag: str) -> ShFix {
+    let made = "/tmp/yew-shs-{os_pid()}-{tag}"
+    fs.remove_dir_all(made) else |_| {}
+    fs.create_dir_all(made) else |_| { assert(false, "mkdir {made}") }
+    let root = fs_realpath(made) else made
+    env_set("SHELL", shell) else |_| {}
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    ed.ws_dir = root
+    ShFix { ed: ed, root: root }
+}
+
+// `sh_fix_free` (`test_shsession.c:87-97`).
+fn fix_free(mut f: ShFix) {
+    edit.jobs_free(mut f.ed)
+    fs.remove_dir_all(f.root) else |_| {}
+}
+
+fn mkdir(path: str) {
+    fs.create_dir(path) else |_| { assert(false, "mkdir {path}") }
+}
+
+// `sh_step` (`test_shsession.c:117-135`): one turn of the loop's job half.
+fn step(mut ed: edit.Ed, wait_ms: int) {
+    let fds = edit.job_wait_fds(ed)
+    if fds.len != 0 {
+        let _ = os_signal_wait_fds(fds, signal.child(), wait_ms) else |_| { (-1, 0) }
+    } else {
+        time_sleep_ms(if wait_ms < 5 then wait_ms else 5)
+    }
+    ed.now_ms = time_now_ms()
+    edit.job_pump(mut ed)
+    edit.job_reap(mut ed)
+    edit.job_tick(mut ed, time_now_ms())
+    let _ = edit.job_settle(mut ed)
+    edit.shsession_settle(mut ed)
+}
+
+// `sh_wait` (`test_shsession.c:137-151`): until job `id` is finished and
+// settled; false after 10 s.
+fn wait_job(mut ed: edit.Ed, id: int) -> bool {
+    let start = time_now_ms()
+    loop {
+        let i = edit.job_find(ed, id)
+        if i < 0 {
+            return false
+        }
+        if ed.jobs.v[i].drained {
+            return true
+        }
+        step(mut ed, 20)
+        if time_now_ms() - start > 10000 {
+            return false
+        }
+    }
+    false
+}
+
+// `sh_wait_ended` (`test_shsession.c:153-170`): until the session has no
+// shell at all, live or dying.
+fn wait_ended(mut ed: edit.Ed) -> bool {
+    let start = time_now_ms()
+    loop {
+        var internal = false
+        for j in ed.jobs.v {
+            internal = internal || j.internal
+        }
+        if edit.shsession_job(ed) == 0 && !internal {
+            return true
+        }
+        step(mut ed, 20)
+        if time_now_ms() - start > 10000 {
+            return false
+        }
+    }
+    false
+}
+
+// `sh_start` (`test_shsession.c:172-183`): a plain `:!` without focus.
+fn start(mut f: ShFix, cmd: str) -> int {
+    let (id, err) = edit.shell_run(mut f.ed, cmd, false)
+    if id == 0 {
+        eprint("sh_start({cmd}): {err}")
+    }
+    assert(id != 0, "sh_start({cmd}): {err}")
+    id
+}
+
+// `start` then `wait_job`: the `:!` and its settle in one call.
+fn go(mut f: ShFix, cmd: str) -> bool {
+    let id = start(mut f, cmd)
+    wait_job(mut f.ed, id)
+}
+
+// `sh_output` (`test_shsession.c:185-215`): the job buffer's bytes, up to
+// (not including) the footer line.
+fn output(f: ShFix, id: int) -> List[byte] {
+    let i = edit.job_find(f.ed, id)
+    assert(i >= 0, "job {id}")
+    let bi = f.ed.jobs.v[i].buf
+    var out = List[byte]()
+    if bi >= 0 {
+        out = text.textbuf_bytes(f.ed.bufs[bi].ec.tb)
+    }
+    // Output then "\n[...]\n": cut at the footer's bracket line.
+    var k = out.len
+    var cut = -1
+    while k > 0 {
+        k -= 1
+        if out[k] as int == 91 {
+            cut = k
+            break
+        }
+    }
+    if cut >= 0 && (cut == 0 || out[cut - 1] as int == 10) {
+        var head = List[byte]()
+        var m = 0
+        while m < cut {
+            (mut head).push(out[m])
+            m += 1
+        }
+        return head
+    }
+    out
+}
+
+// `sh_do` and `sh_expect` (`test_shsession.c:217-232`).
+fn run_cmd(mut f: ShFix, cmd: str) -> List[byte] {
+    let id = start(mut f, cmd)
+    assert(wait_job(mut f.ed, id), "{cmd} finishes")
+    output(f, id)
+}
+
+fn expect(mut f: ShFix, cmd: str, want: List[byte]) {
+    let got = run_cmd(mut f, cmd)
+    assert(
+        same(got, want),
+        "{cmd}: `{str_from_utf8(got) else "?"}` want `{str_from_utf8(want) else "?"}`",
+    )
+}
+
+fn expect_s(mut f: ShFix, cmd: str, want: str) {
+    expect(mut f, cmd, bytes_of(want))
+}
+
+// `sh_line` (`test_shsession.c:246-263`).
+fn line(mut f: ShFix, l: str) -> int {
+    let parsed = edit.cmd_parse(mut f.ed, bytes_of(l))
     if !edit.cmd_parse_ok(parsed) {
         return edit.CMD_ERR_ARG
     }
@@ -31,11 +219,615 @@ fn run_line(mut ed: edit.Ed, line: str) -> int {
         argv: copy parsed.argv,
         count: 0,
         bang: parsed.bang,
-        win: ed.win,
+        win: f.ed.win,
     }
-    edit.ed_invoke_parsed(mut ed, parsed.command, inv)
+    edit.ed_invoke_parsed(mut f.ed, parsed.command, inv)
 }
 
+// `sh_env_has` / `sh_env_names` (`test_shsession.c:265-289`).
+fn env_has(ed: edit.Ed, row: str) -> bool {
+    let (has, env) = edit.shsession_env(ed)
+    if !has {
+        return false
+    }
+    for r in env {
+        if r == row {
+            return true
+        }
+    }
+    false
+}
+
+fn env_names(ed: edit.Ed, name: str) -> bool {
+    let (has, env) = edit.shsession_env(ed)
+    if !has {
+        return false
+    }
+    for r in env {
+        if r.starts_with("{name}=") {
+            return true
+        }
+    }
+    false
+}
+
+// DoD 1 (`test_shsession.c:296-325`): `:!cd sub` then `:!pwd` prints sub;
+// the state is exposed.
+fn t_shsession_cd_persists() {
+    var f = fix_make("/bin/sh", "cd")
+    let sub = "{f.root}/sub"
+    mkdir(sub)
+    assert(edit.shsession_cwd(f.ed) == f.root, "before: the workspace root")
+    let (has, _) = edit.shsession_env(f.ed)
+    assert(!has, "before: environ")
+    assert(!edit.shsession_busy(f.ed), "not busy")
+    let id = start(mut f, "cd sub")
+    assert(wait_job(mut f.ed, id), "cd")
+    let shell = edit.shsession_job(f.ed)
+    assert(shell != 0, "a shell")
+    assert(edit.shsession_cwd(f.ed) == sub, "the state's directory")
+    expect_s(mut f, "pwd", "{sub}\n")
+    assert(edit.shsession_job(f.ed) == shell, "one shell served both")
+    assert(!env_has(f.ed, "PWD="), "no empty PWD")
+    assert(env_has(f.ed, "PWD={sub}"), "PWD")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:327-349`.
+fn t_shsession_exports_functions_and_locals() {
+    var f = fix_make("/bin/sh", "exports")
+    assert(go(mut f, "export X=1"), "export")
+    expect_s(mut f, "echo \"x=$X\"", "x=1\n")
+    assert(env_has(f.ed, "X=1"), "X exported")
+    assert(go(mut f, "f() {{ echo hi; }}"), "a function")
+    expect_s(mut f, "f", "hi\n")
+    assert(go(mut f, "L=local"), "a local")
+    expect_s(mut f, "echo \"l=$L\"", "l=local\n")
+    assert(!env_names(f.ed, "L"), "a local is not exported")
+    assert(!env_names(f.ed, "_"), "`_` is not a row")
+    assert(!env_names(f.ed, "__yew_w"), "the frame's variable does not leak")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:351-371`: the per-command rows follow the caret.
+fn t_shsession_job_rows_are_per_command() {
+    var f = fix_make("/bin/sh", "rows")
+    let w = f.ed.win
+    edit.ed_undo_begin(mut f.ed, w, text.TXN_TYPE)
+    assert(edit.ed_edit_insert(mut f.ed, w, 0, bytes_of("a\nb\nc\n"), 0, 6), "insert")
+    edit.ed_undo_end(mut f.ed, w)
+    edit.ed_finish_edit(mut f.ed, w)
+    let p = f.ed.wins[w].cs.primary
+    f.ed.wins[w].cs.curs[p].pos = 0
+    f.ed.wins[w].cs.curs[p].anchor = 0
+    expect_s(mut f, "echo \"$YEW_LINE\"", "1\n")
+    f.ed.wins[w].cs.curs[p].pos = 4
+    f.ed.wins[w].cs.curs[p].anchor = 4
+    expect_s(mut f, "echo \"$YEW_LINE $YEW_COL\"", "3 1\n")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:379-408`.
+fn t_shsession_exit_recovers_last_directory() {
+    var f = fix_make("/bin/sh", "exit")
+    let sub = "{f.root}/sub"
+    mkdir(sub)
+    assert(go(mut f, "cd sub; export KEEP=yes"), "cd")
+    let first = edit.shsession_job(f.ed)
+    let id = start(mut f, "exit 3")
+    assert(wait_job(mut f.ed, id), "exit")
+    assert(wait_ended(mut f.ed), "the session ends")
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id)].exit_code == 3, "exit 3")
+    assert(
+        f.ed.msg.text == "shell session ended; the next :! starts a new one",
+        "C's line: {f.ed.msg.text}",
+    )
+    assert(edit.shsession_job(f.ed) == 0, "no shell")
+    assert(edit.shsession_cwd(f.ed) == sub, "the state survives the shell")
+    expect_s(mut f, "echo \"$PWD $KEEP\"", "{sub} yes\n")
+    assert(edit.shsession_job(f.ed) != 0 && edit.shsession_job(f.ed) != first, "a new shell")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:412-430`.
+fn t_shsession_reset_returns_to_workspace_root() {
+    var f = fix_make("/bin/sh", "reset")
+    mkdir("{f.root}/sub")
+    assert(go(mut f, "cd sub; export GONE=1"), "cd")
+    assert(line(mut f, "shreset") == edit.CMD_OK, ":shreset")
+    assert(edit.shsession_job(f.ed) == 0, "no shell")
+    assert(edit.shsession_cwd(f.ed) == f.root, "the root")
+    let (has, _) = edit.shsession_env(f.ed)
+    assert(!has, "the standard environment")
+    assert(wait_ended(mut f.ed), "ended")
+    expect_s(mut f, "echo \"$(pwd) ${{GONE:--}}\"", "{f.root} -\n")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:434-473`.
+fn t_shsession_fresh_is_sprint19() {
+    var f = fix_make("/bin/sh", "fresh")
+    let sub = "{f.root}/sub"
+    mkdir(sub)
+    assert(go(mut f, "cd sub"), "cd")
+    assert(edit.shsession_job(f.ed) != 0, "a session")
+    edit.opt_shell_session_set(mut f.ed, "fresh")
+    assert(edit.shsession_job(f.ed) == 0, "fresh ends it")
+    assert(wait_ended(mut f.ed), "ended")
+    assert(edit.shsession_cwd(f.ed) == f.root, "the state is not consulted")
+    let (has, _) = edit.shsession_env(f.ed)
+    assert(!has, "nor its env")
+    let id = start(mut f, "cd sub")
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id)].pid > 0, "a process of its own")
+    assert(wait_job(mut f.ed, id), "cd")
+    expect_s(mut f, "pwd", "{f.root}\n")
+    assert(edit.shsession_job(f.ed) == 0, "still no session")
+    let e = start(mut f, "echo e >&2")
+    assert(wait_job(mut f.ed, e), "stderr")
+    let j = copy f.ed.jobs.v[edit.job_find(f.ed, e)]
+    assert(j.bytes_err == 2 && j.bytes_out == 0, "stderr is its own pipe again")
+    edit.opt_shell_session_set(mut f.ed, "persistent")
+    expect_s(mut f, "pwd", "{sub}\n")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:477-504`: a `fish` $SHELL runs every `:!` fresh.
+fn t_shsession_non_sh_shell_falls_back_to_fresh() {
+    var f = fix_make("/bin/sh", "fish")
+    let fish = "{f.root}/fish"
+    fs.write_text(fish, "#!/bin/sh\nexec /bin/sh \"$@\"\n") else |_| { assert(false, "write") }
+    fs.set_mode(fish, 493) else |_| { assert(false, "chmod") }
+    env_set("SHELL", fish) else |_| {}
+    assert(!edit.shsession_wanted(mut f.ed), "not wanted")
+    assert(
+        f.ed.msg.text == "shell session needs a POSIX-family $SHELL; running each :! fresh",
+        "C's line: {f.ed.msg.text}",
+    )
+    edit.ed_msg_clear(mut f.ed)
+    assert(!edit.shsession_wanted(mut f.ed), "still not")
+    assert(!f.ed.msg.active, "said once")
+    let id = start(mut f, "cd /")
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id)].pid > 0, "fresh")
+    assert(wait_job(mut f.ed, id), "cd")
+    expect_s(mut f, "pwd", "{f.root}\n")
+    assert(edit.shsession_job(f.ed) == 0, "no session")
+    fix_free(mut f)
+}
+
+// `sh_printf_bytes` (`test_shsession.c:510-519`).
+fn printf_bytes(b: List[byte]) -> str {
+    var out = "printf '"
+    for x in b {
+        let v = x as int
+        out += "\\{v / 64}{(v / 8) % 8}{v % 8}"
+    }
+    out + "'"
+}
+
+// DoD 3 (`test_shsession.c:526-551`): a marker with the wrong nonce is
+// output; the frame ends at the real one.
+fn t_shsession_forged_marker_is_output() {
+    var f = fix_make("/bin/sh", "forged")
+    var forged = raw([30])
+    forged = cat(forged, bytes_of("0123456789abcdef0123456789abcdef-1 0"))
+    forged = cat(forged, raw([30, 30]))
+    forged = cat(forged, bytes_of("0123456789abcdef0123456789abcdef-1."))
+    forged = cat(forged, raw([30]))
+    let cmd = printf_bytes(forged) + "; echo after; exit_is_not=1; false"
+    let id = start(mut f, cmd)
+    assert(wait_job(mut f.ed, id), "finishes")
+    let got = output(f, id)
+    assert(same(got, cat(forged, bytes_of("after\n"))), "the forged marker is output")
+    let j = copy f.ed.jobs.v[edit.job_find(f.ed, id)]
+    assert(j.state == edit.JOB_EXITED && j.exit_code == 1, "exit 1")
+    expect_s(mut f, "echo next", "next\n")
+    fix_free(mut f)
+}
+
+// DoD 3 (`test_shsession.c:558-579`): a syntax error is eval's error.
+fn t_shsession_syntax_error_cannot_swallow_frames() {
+    var f = fix_make("/bin/sh", "syntax")
+    assert(go(mut f, "true"), "true")
+    let shell = edit.shsession_job(f.ed)
+    for bad in ["echo \"unterminated", "if true", "echo 'half", "a)", "echo $(", "fi"] {
+        let id = start(mut f, bad)
+        assert(wait_job(mut f.ed, id), "{bad} finishes")
+        let j = copy f.ed.jobs.v[edit.job_find(f.ed, id)]
+        assert(j.state == edit.JOB_EXITED && j.exit_code != 0, "{bad}: an error status")
+        expect_s(mut f, "echo still", "still\n")
+    }
+    assert(edit.shsession_job(f.ed) == shell, "never a restart")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:582-605`: no trailing newline, 1 MiB, bytes.
+fn t_shsession_output_shapes() {
+    var f = fix_make("/bin/sh", "shapes")
+    expect_s(mut f, "printf abc", "abc\n")
+    let id = start(mut f, "head -c 1048576 /dev/zero | tr '\\0' a")
+    assert(wait_job(mut f.ed, id), "1 MiB")
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id)].bytes_out == 1048576, "every byte counted")
+    let got = output(f, id)
+    assert(got.len == 1048577, "the bytes and the newline: {got.len}")
+    var i = 0
+    while i < 1048576 && got[i] as int == 97 {
+        i += 1
+    }
+    assert(i == 1048576, "all a")
+    expect(mut f, "printf 'x\\377\\036y\\n'", raw([120, 255, 30, 121, 10]))
+    fix_free(mut f)
+}
+
+// DoD 3 / §1 (b) (`test_shsession.c:612-640`): a directory and a value
+// holding a newline, 0x1e and a byte >= 0x80 come back exactly. wolf's
+// paths and environment rows are `str` (G40): the directory takes C's
+// APFS spelling (`é`, valid UTF-8) on every host, and the value's `\377`
+// row, which no `str` can hold, is KNOWN-RED by name — asserted DROPPED,
+// so the day G40 is fixed this fails and the row is asserted adopted.
+fn t_shsession_state_survives_any_bytes() {
+    var f = fix_make("/bin/sh", "bytes")
+    let path = "{f.root}/a\nb\u{e9}\u{1e}c"
+    mkdir(path)
+    let cd = "cd \"$(printf 'a\\nb\\303\\251\\036c')\""
+    assert(go(mut f, cd), "cd")
+    assert(edit.shsession_cwd(f.ed) == path, "the directory, exactly")
+    assert(go(mut f, "export Z=\"$(printf 'x\\ny\\303\\251\\036=')\""), "export")
+    assert(env_has(f.ed, "Z=x\ny\u{e9}\u{1e}="), "a multibyte value, exactly")
+    assert(go(mut f, "export Z=\"$(printf 'x\\ny\\377\\036=')\""), "export")
+    assert(
+        !env_names(f.ed, "Z"),
+        "KNOWN-RED: a value that is not UTF-8 cannot be a wolf env row (G40)",
+    )
+    print(
+        "shsession_test: KNOWN-RED state_survives_any_bytes: the \\377 value row is dropped (G40: env rows and paths are str)",
+    )
+    eprint(
+        "shsession_test: KNOWN-RED state_survives_any_bytes: the \\377 value row is dropped (G40: env rows and paths are str)",
+    )
+    assert(edit.shsession_cwd(f.ed) == path, "the directory stays")
+    fix_free(mut f)
+}
+
+// `sh_step_split` (`test_shsession.c:647-686`): the session shell's output
+// read HERE and fed to its parser `chunk` bytes at a time.
+fn step_split(mut ed: edit.Ed, chunk: int, mut got_raw: List[byte]) {
+    let fds = edit.job_wait_fds(ed)
+    if fds.len != 0 {
+        let _ = os_signal_wait_fds(fds, signal.child(), 20) else |_| { (-1, 0) }
+    }
+    let sid = edit.shsession_job(ed)
+    let si = edit.job_find(ed, sid)
+    var skip = -1
+    if si >= 0 && ed.jobs.v[si].out_fd >= 0 {
+        let fd = ed.jobs.v[si].out_fd
+        let (w, _) = os_signal_wait_fds([fd], signal.child(), 0) else |_| { (-1, 0) }
+        if w == 0 {
+            let got = fs_read_chunk(fd, 4096) else List[byte]()
+            if got.len > 0 {
+                skip = fd
+                for b in got {
+                    (mut got_raw).push(b)
+                }
+                var off = 0
+                while off < got.len {
+                    var piece = List[byte]()
+                    var k = off
+                    while k < got.len && k < off + chunk {
+                        (mut piece).push(got[k])
+                        k += 1
+                    }
+                    if !edit.shsession_link_feed(mut ed, sid, piece) {
+                        assert(false, "session parser refused a chunk")
+                    }
+                    off += chunk
+                }
+            }
+        }
+    }
+    edit.job_pump_except(mut ed, skip)
+    edit.job_reap(mut ed)
+    edit.job_tick(mut ed, time_now_ms())
+    let _ = edit.job_settle(mut ed)
+    edit.shsession_settle(mut ed)
+}
+
+fn wait_split(mut ed: edit.Ed, id: int, chunk: int, mut got_raw: List[byte]) -> bool {
+    let start_ms = time_now_ms()
+    loop {
+        let i = edit.job_find(ed, id)
+        if i < 0 {
+            return false
+        }
+        if ed.jobs.v[i].drained {
+            return true
+        }
+        step_split(mut ed, chunk, mut got_raw)
+        if time_now_ms() - start_ms > 10000 {
+            return false
+        }
+    }
+    false
+}
+
+// `sh_find_mark` (`test_shsession.c:701-718`): the stream's first
+// `\036<nonce>-<seq> ` marker for `seq`.
+fn find_mark(got_raw: List[byte], seq: int) -> List[byte] {
+    let tail = bytes_of("-{seq} ")
+    var i = 0
+    while i + 33 + tail.len <= got_raw.len {
+        if got_raw[i] as int == 30 {
+            var ok = true
+            var k = 0
+            while k < tail.len {
+                if got_raw[i + 33 + k] != tail[k] {
+                    ok = false
+                }
+                k += 1
+            }
+            if ok {
+                var m = List[byte]()
+                var j = 0
+                while j < 33 + tail.len {
+                    (mut m).push(got_raw[i + j])
+                    j += 1
+                }
+                return m
+            }
+        }
+        i += 1
+    }
+    List[byte]()
+}
+
+// `test_shsession.c:725-779`: split reads frame exactly as one read; a
+// replayed marker of an earlier frame is output.
+fn t_shsession_split_reads_and_replayed_markers() {
+    var f = fix_make("/bin/sh", "split")
+    var c = 0
+    for chunk in [1, 7] {
+        var got_raw = List[byte]()
+        let sub = "{f.root}/d{c}"
+        mkdir(sub)
+        let cmd = "printf 'one\\036two'; cd '{sub}'; echo; echo x"
+        let id = start(mut f, cmd)
+        assert(wait_split(mut f.ed, id, chunk, mut got_raw), "split {chunk}")
+        let got = output(f, id)
+        assert(
+            same(got, cat(cat(bytes_of("one"), raw([30])), bytes_of("two\nx\n"))),
+            "framed exactly",
+        )
+        assert(edit.shsession_cwd(f.ed) == sub, "the state's directory")
+        let mark = find_mark(got_raw, 2 * c + 1)
+        assert(mark.len != 0, "the status marker was read")
+        let cmd2 = printf_bytes(mark) + "; printf '0\\036'; echo tail"
+        var raw2 = List[byte]()
+        let id2 = start(mut f, cmd2)
+        assert(wait_split(mut f.ed, id2, chunk, mut raw2), "replay {chunk}")
+        let got2 = output(f, id2)
+        assert(
+            same(got2, cat(cat(mark, bytes_of("0")), cat(raw([30]), bytes_of("tail\n")))),
+            "the replay is output",
+        )
+        c += 1
+    }
+    fix_free(mut f)
+}
+
+// `sh_wait_output` (`test_shsession.c:785-799`).
+fn wait_output(mut ed: edit.Ed, id: int) {
+    let s = time_now_ms()
+    while edit.job_find(ed, id) >= 0 && ed.jobs.v[edit.job_find(ed, id)].bytes_out == 0 {
+        step(mut ed, 20)
+        if time_now_ms() - s >= 10000 {
+            assert(false, "command wrote nothing in 10 s")
+        }
+    }
+}
+
+// `sh_cancel_until_done` (`test_shsession.c:806-829`).
+fn cancel_until_done(mut ed: edit.Ed, id: int) {
+    let s = time_now_ms()
+    var last = 0
+    loop {
+        let i = edit.job_find(ed, id)
+        let now = time_now_ms()
+        assert(i >= 0, "cancelled job vanished")
+        if ed.jobs.v[i].drained {
+            return
+        }
+        if ed.jobs.v[i].state == edit.JOB_RUNNING &&
+            (last == 0 || now - last > edit.SHSESSION_ESCALATE_MS + 500) {
+            assert(edit.job_signal(mut ed, id, signal.terminate()), "cancel was refused")
+            last = now
+        }
+        step(mut ed, 20)
+        assert(now - s < 20000, "cancel did not finish in 20 s")
+    }
+}
+
+// `test_shsession.c:838-893`: a SIGINT kills the command and the rest of
+// the frame still runs, on every sh-family shell here.
+fn t_shsession_cancel_keeps_the_session_on_every_shell() {
+    var seen = List[str]()
+    var tested = 0
+    var n = 0
+    let int_no = signal.number(signal.interrupt()) else 2
+    for sh in [
+        "/bin/sh",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/opt/homebrew/bin/bash",
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/bin/dash",
+        "/usr/bin/dash",
+        "/bin/ksh",
+        "/usr/bin/ksh",
+    ] {
+        n += 1
+        if !edit.job_exec_ok(sh) {
+            continue
+        }
+        let real = fs_realpath(sh) else |_| { continue }
+        var dup = false
+        for s in seen {
+            dup = dup || s == real
+        }
+        if dup && sh != "/bin/sh" {
+            continue
+        }
+        (mut seen).push(real)
+        var f = fix_make(sh, "cancel{n}")
+        assert(go(mut f, "true"), "{sh}: true")
+        let shell = edit.shsession_job(f.ed)
+        let id = start(mut f, "echo started; sleep 30; echo not-reached")
+        wait_output(mut f.ed, id)
+        cancel_until_done(mut f.ed, id)
+        let j = copy f.ed.jobs.v[edit.job_find(f.ed, id)]
+        if j.state != edit.JOB_SIGNALED || j.termsig != int_no {
+            eprint("cancel on {sh}: state {j.state} code {j.exit_code} sig {j.termsig}")
+        }
+        assert(j.state == edit.JOB_SIGNALED && j.termsig == int_no, "{sh}: a SIGINT")
+        assert(same(output(f, id), bytes_of("started\n")), "{sh}: the output before it")
+        assert(edit.shsession_job(f.ed) == shell, "{sh}: the session survived")
+        expect_s(mut f, "echo after", "after\n")
+        assert(edit.shsession_job(f.ed) == shell, "{sh}: same shell")
+        fix_free(mut f)
+        tested += 1
+    }
+    assert(tested >= 1, "at least one shell")
+    print("shsession_test: note: cancel_keeps_the_session_on_every_shell: {tested} shells")
+}
+
+// `test_shsession.c:898-929`.
+fn t_shsession_double_cancel_ends_the_session() {
+    var f = fix_make("/bin/sh", "double")
+    let id = start(mut f, "trap '' INT; echo started; sleep 30")
+    wait_output(mut f.ed, id)
+    let shell = edit.shsession_job(f.ed)
+    assert(edit.job_signal(mut f.ed, id, signal.terminate()), "cancel")
+    step(mut f.ed, 50)
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id)].state == edit.JOB_RUNNING, "it ignores INT")
+    assert(edit.job_signal(mut f.ed, id, signal.terminate()), "cancel again")
+    assert(edit.shsession_job(f.ed) == 0, "the session ends at once")
+    assert(wait_job(mut f.ed, id), "finished")
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id)].state == edit.JOB_CANCELLED, "cancelled")
+    assert(wait_ended(mut f.ed), "ended")
+    assert(
+        f.ed.msg.text == "shell session ended; the next :! starts a new one",
+        "C's line: {f.ed.msg.text}",
+    )
+    expect_s(mut f, "echo fresh-shell", "fresh-shell\n")
+    assert(edit.shsession_job(f.ed) != shell, "a new shell")
+    let id2 = start(mut f, "sleep 30")
+    assert(edit.job_signal(mut f.ed, id2, signal.kill()), "kill_force")
+    assert(wait_job(mut f.ed, id2), "finished")
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id2)].state == edit.JOB_CANCELLED, "cancelled")
+    assert(wait_ended(mut f.ed), "ended")
+    fix_free(mut f)
+}
+
+// `test_shsession.c:937-967`.
+fn t_shsession_busy_runs_alongside() {
+    var f = fix_make("/bin/sh", "busy")
+    let sub = "{f.root}/sub"
+    mkdir(sub)
+    assert(go(mut f, "cd sub; export B=1"), "cd")
+    let slow = start(mut f, "echo started; sleep 30")
+    wait_output(mut f.ed, slow)
+    assert(edit.shsession_busy(f.ed), "busy")
+    let id = start(mut f, "pwd; echo \"b=$B\"; cd /")
+    assert(
+        f.ed.msg.text == "session busy: ran outside it (a cd here will not persist)",
+        "C's line: {f.ed.msg.text}",
+    )
+    assert(f.ed.jobs.v[edit.job_find(f.ed, id)].pid > 0, "a process of its own")
+    assert(wait_job(mut f.ed, id), "finished")
+    assert(same(output(f, id), bytes_of("{sub}\nb=1\n")), "from the session's state")
+    cancel_until_done(mut f.ed, slow)
+    expect_s(mut f, "pwd", "{sub}\n")
+    fix_free(mut f)
+}
+
+// §3 (`test_shsession.c:1005-1101`): `:r !`, `:%!` and `:!!` spawn in the
+// session's directory with its exports; `:!!` keeps the user's pager
+// unless the session exported one.
+fn t_shsession_other_forms_inherit_state() {
+    let saved = env_get("PAGER") else ""
+    let had = std_env.has("PAGER")
+    env_set("PAGER", "my-pager") else |_| {}
+    var f = fix_make("/bin/sh", "forms")
+    let sub = "{f.root}/sub"
+    mkdir(sub)
+    assert(go(mut f, "cd sub; export Y=2"), "cd")
+    let doc = f.ed.wins[f.ed.win].buf
+    // :r !
+    let (rid, rerr) = edit.shell_read(mut f.ed, "echo \"$(pwd) $Y\"")
+    assert(rid != 0, ":r !: {rerr}")
+    assert(wait_job(mut f.ed, rid), ":r ! finishes")
+    assert(same(text.textbuf_bytes(f.ed.bufs[doc].ec.tb), bytes_of("{sub} 2\n")), ":r !'s text")
+    // :%!
+    let len = text.textbuf_len(f.ed.bufs[doc].ec.tb)
+    let r = edit.shell_filter(mut f.ed, f.ed.win, 0, len, "cat >/dev/null; echo \"f $(pwd) $Y\"")
+    assert(r == edit.FILT_OK, ":%!: {r}")
+    assert(same(text.textbuf_bytes(f.ed.bufs[doc].ec.tb), bytes_of("f {sub} 2\n")), ":%!'s text")
+    // :!! (no controlling terminal here, so no handover — 57.18)
+    let (ok, w, err) = edit.shell_term_run(mut f.ed, "echo \"$(pwd) $Y $PAGER\" > out.txt")
+    assert(ok && w.exit_code == 0, ":!!: {err}")
+    let out = "{sub}/out.txt"
+    assert((fs.read_text(out) else "") == "{sub} 2 my-pager\n", ":!!'s line")
+    assert(go(mut f, "export PAGER=less"), "export PAGER")
+    let (ok2, _, err2) = edit.shell_term_run(mut f.ed, "echo \"$PAGER\" > out.txt")
+    assert(ok2, ":!!: {err2}")
+    assert((fs.read_text(out) else "") == "less\n", "the session's pager is the user's")
+    expect_s(mut f, "echo \"$PAGER\"", "less\n")
+    let (rid2, _) = edit.shell_read(mut f.ed, "echo \"$PAGER\"")
+    assert(wait_job(mut f.ed, rid2), ":r ! finishes")
+    let t = str_from_utf8(text.textbuf_bytes(f.ed.bufs[doc].ec.tb)) else ""
+    assert(t.contains("cat\n"), "a job with no terminal gets PAGER=cat: {t}")
+    var y = false
+    for row in edit.job_env(mut f.ed, false) {
+        y = y || row == "Y=2"
+    }
+    assert(y, "the environment completion offers is the session's")
+    fix_free(mut f)
+    if had {
+        env_set("PAGER", saved) else |_| {}
+    } else {
+        env_unset("PAGER") else |_| {}
+    }
+}
+
+// §5 (`test_shsession.c:1103-1125`): the `:!` prompt's hint says where
+// the session is.
+fn t_shsession_prompt_hint_names_the_directory() {
+    var f = fix_make("/bin/sh", "hint")
+    mkdir("{f.root}/ch7")
+    edit.cmdline_open(mut f.ed, edit.PROMPT_CMD, "")
+    edit.cmdline_paste(mut f.ed, bytes_of("!ls"))
+    edit.cmdline_edited(mut f.ed)
+    assert(f.ed.cmdline.hint == "", "no hint at the root: `{f.ed.cmdline.hint}`")
+    edit.cmdline_close(mut f.ed, false)
+    assert(go(mut f, "cd ch7"), "cd")
+    edit.cmdline_open(mut f.ed, edit.PROMPT_CMD, "")
+    edit.cmdline_paste(mut f.ed, bytes_of("!ls"))
+    edit.cmdline_edited(mut f.ed)
+    assert(f.ed.cmdline.hint == "in ch7/", "the hint: `{f.ed.cmdline.hint}`")
+    edit.cmdline_close(mut f.ed, false)
+    edit.cmdline_open(mut f.ed, edit.PROMPT_CMD, "")
+    edit.cmdline_paste(mut f.ed, bytes_of("shell.run ls"))
+    edit.cmdline_edited(mut f.ed)
+    assert(
+        f.ed.cmdline.hint == "shell.run \u{b7} <text> \u{b7} in ch7/",
+        "after what it says: `{f.ed.cmdline.hint}`",
+    )
+    edit.cmdline_close(mut f.ed, false)
+    fix_free(mut f)
+}
+
+// Port-only, kept from yw04: with no session state the session's
+// directory is the workspace root (`shsession.h:93-99`), `shell.session`
+// defaults to persistent and `:shreset` says C's line.
 fn t_port_shsession_queries_without_a_session() {
     var ed = edit.ed_new()
     edit.ed_open_scratch(mut ed)
@@ -45,50 +837,49 @@ fn t_port_shsession_queries_without_a_session() {
     assert(edit.shsession_persistent(ed), "persistent by default")
     ed.opts.store["shell.session"] = "fresh"
     assert(!edit.shsession_persistent(ed), "fresh when set")
-    assert(run_line(mut ed, ":shreset") == edit.CMD_OK, ":shreset")
+    var f = ShFix { ed: ed, root: "/tmp/yew-shsession-root" }
+    assert(line(mut f, ":shreset") == edit.CMD_OK, ":shreset")
     assert(
-        ed.msg.text == "shell session reset; the next :! starts in the workspace root",
-        "C's line: {ed.msg.text}",
+        f.ed.msg.text == "shell session reset; the next :! starts in the workspace root",
+        "C's line: {f.ed.msg.text}",
     )
-    assert(run_line(mut ed, ":!cd /tmp") == edit.CMD_ERR_DEFERRED, "a :! refuses")
-    assert(
-        ed.msg.text.contains("needs os_signal_wait_fds (G2, wolf-lang#795)"),
-        "by name: {ed.msg.text}",
-    )
-}
-
-fn skip(name: str) -> int {
-    let why = "the persistent shell session is a framed job whose pipes are read while the loop runs: needs os_signal_wait_fds (G2, wolf-lang#795), R-yw04-1"
-    print("shsession_test: SKIP {name}: {why}")
-    eprint("shsession_test: SKIP {name}: {why}")
-    1
+    edit.jobs_free(mut f.ed)
 }
 
 fn main() {
+    // The session's `--yew-env0` runs this binary (`unit_main.c:14-19`).
+    if edit.shsession_env0_requested() {
+        os_exit(edit.shsession_env0_main())
+    }
     fs.create_dir_all("target/tests") else |_| {}
     env_set("YEW_LOG", "/dev/null") else |_| {}
-    var skips = 0
-    for name in [
-        "shsession_cd_persists",
-        "shsession_exports_functions_and_locals",
-        "shsession_job_rows_are_per_command",
-        "shsession_exit_recovers_last_directory",
-        "shsession_reset_returns_to_workspace_root",
-        "shsession_fresh_is_sprint19",
-        "shsession_non_sh_shell_falls_back_to_fresh",
-        "shsession_forged_marker_is_output",
-        "shsession_syntax_error_cannot_swallow_frames",
-        "shsession_output_shapes",
-        "shsession_state_survives_any_bytes",
-        "shsession_split_reads_and_replayed_markers",
-        "shsession_cancel_keeps_the_session_on_every_shell",
-        "shsession_double_cancel_ends_the_session",
-        "shsession_busy_runs_alongside",
-        "shsession_other_forms_inherit_state",
-        "shsession_prompt_hint_names_the_directory",
-    ] {
-        skips += skip(name)
+    signal.listen(signal.child()) else |_| {}
+    let exe = os_exe() else ""
+    if exe.ends_with("/wolf") || exe == "wolf" {
+        let why = "the session's env helper is os_exe(), which is `wolf` under wolf test (G23): the native run covers all 17"
+        print("shsession_test: SKIP all 17: {why}")
+        eprint("shsession_test: SKIP all 17: {why}")
+        return
     }
+    t_shsession_cd_persists()
+    t_shsession_exports_functions_and_locals()
+    t_shsession_job_rows_are_per_command()
+    t_shsession_exit_recovers_last_directory()
+    t_shsession_reset_returns_to_workspace_root()
+    t_shsession_fresh_is_sprint19()
+    t_shsession_non_sh_shell_falls_back_to_fresh()
+    t_shsession_forged_marker_is_output()
+    t_shsession_syntax_error_cannot_swallow_frames()
+    t_shsession_output_shapes()
+    t_shsession_state_survives_any_bytes()
+    t_shsession_split_reads_and_replayed_markers()
+    t_shsession_cancel_keeps_the_session_on_every_shell()
+    t_shsession_double_cancel_ends_the_session()
+    t_shsession_busy_runs_alongside()
+    t_shsession_other_forms_inherit_state()
+    t_shsession_prompt_hint_names_the_directory()
     t_port_shsession_queries_without_a_session()
-    print("shsession_test: {17 - skips} C cases pass, {skips} SKIP; 1 port case passes")
+    print(
+        "shsession_test: 17 C cases pass (state_survives_any_bytes with its \\377 row KNOWN-RED by name, G40); 1 port case passes",
+    )
 }
