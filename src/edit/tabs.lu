@@ -1,38 +1,187 @@
-//! edit.tabs — the tab model the startup path needs, and the strip.
+//! edit.tabs — the tab model, the tab strip and the tab commands.
 //!
-//! Ports the parts of sagitta `src/ui/tabs.c` (2,197 lines) and
-//! `src/ui/strip.c` (134) at 9ace98c2 that every campaign-03 frame
-//! reaches: C's editor ALWAYS has a tab and its row-0 strip ("even one tab
-//! owns a row because its tail carries the always-reachable new-untitled
-//! action", `tabs.c:812-830`), so the goldens of campaign 03 paint the
-//! strip in the default theme (ruling R-yw03-3 asks for this to stand as
-//! yw03's). Ported: `canonical_path`/`logical_path`, `yew_tab_open`
-//! (a tab per file, the buffer born non-resident), `yew_tab_hydrate`
-//! (the read and the journal probe), `yew_tab_switch`, `yew_tab_close`,
-//! the row-1 entries and `strip_render` with `yew_strip_layout`'s
-//! placement and the `+` tail. yw04 adds `ed.tab.close` as far as A-e's
-//! `*command-line*` tab needs it (R-yw04-5): that tab, the last tab and an
-//! unmodified one. Tab groups, the row-2 member strip, drag, the dwell
-//! flash, scroll ownership, a modified tab's close and the other tab
-//! commands (`ed.tab.*`) are campaign 05's (yw05) and refuse by name until
-//! then.
+//! Ports sagitta `src/ui/tabs.c` (2,197 lines) and `ui/tabs.h` (327) at
+//! 9ace98c2 whole as far as campaign 05's first half reaches, under
+//! `s23-tabs.md`, `s24-tab-groups.md` §3/§7 and `s57_8-modern-tabs.md`:
+//! a `Tab` owns a pane tree and carries a STABLE `tab_id` (monotonic,
+//! never reused) that survives the array's compaction, so anything that
+//! must name "this tab" across a mutation holds the id (`tabs.h:4-16`);
+//! closing decides the survivor BY ID before compacting; reorder is an
+//! insertion; the modified `*` is ASKED of the undo tree every time,
+//! never cached (s23 DoD 4); the 512-tab cap refuses loudly and every
+//! `tab_open` result is checked; a file tab is born non-resident and is
+//! read at its first switch (`tab_hydrate`, s24 §3); the row-1 entry
+//! list is built in one place (`tab_row1_entries`), laid out by the ONE
+//! strip engine (`edit.strip`) and registered with the cells it drew;
+//! s57.8's padded, bracket-free pills, the theme roles and the ` + `
+//! tail; the dirty-close prompt holds the tab ID; numbered jumps jump
+//! now and arm the 500 ms digit window. Replaces yw03's one-tab strip
+//! (R-yw03-3) and yw04's narrow open and close (R-yw04-5).
+//!
+//! C's file statics — the jump window, the two strip slot tables, the
+//! chevron flag — are fields of the `Ed` (E1010: module state of a
+//! run-time value). What is NOT here, by owner: the drag preview, the
+//! float, the dwell flash and the hover preview (Sprint 27, yw06 — with
+//! no drag in flight C's paths through them are the ones taken here),
+//! the group values and `ed.group.*` (Sprint 24: `edit.groups`), the
+//! FUSS inset (s57.7, yw13), the Fletch hooks (yw09), workspace state
+//! (s25, yw06), `ed.tab.split_*` (`pane_cmds.c`, `edit.pane_cmds`).
 
 use term
 use text
-use unicode
 
-/// `YEW_STRIP_LABEL_CELLS` (`strip.h:24`): a label's cell cap.
-pub const STRIP_LABEL_CELLS: int = 24
+/// `YEW_TAB_MAX` (`tabs.h:30-35`): a directory opened as a group
+/// routinely exceeds a small cap.
+pub const TAB_MAX: int = 512
 
-/// `canonical_path` (`tabs.c:166-183`): the realpath, or the path as
-/// typed when it does not exist yet.
+/// `YEW_TAB_LABEL_MAX` (`tabs.h:34`).
+pub const TAB_LABEL_MAX: int = 64
+
+/// `YEW_JUMP_WINDOW_MS` (`tabs.h:290-292`): the digit-extension window.
+pub const JUMP_WINDOW_MS: int = 500
+
+/// The jump window's expiry (`jump_expire`, `tabs.c:1796-1811`), a kind
+/// on the loop's timer heap.
+pub const TIMER_TAB_JUMP: int = 30
+
+/// `JUMP_ROW1` (`tabs.c:1734-1737`): a number counts row 1.
+pub const JUMP_ROW1: int = 0
+
+/// `JUMP_MEMBER`: a number counts the active group's members.
+pub const JUMP_MEMBER: int = 1
+
+/// One row's slot table (`StripSlots`, `tabs.c:880-897`): the half-open
+/// screen cells each entry was drawn in (0/0 when the layout scrolled it
+/// off) and the payload that occupied the position before a drag's
+/// permutation. The lists keep their storage across frames; `n` is the
+/// live length (G33: a rebuilt list is held to the session's end).
+pub struct StripSlots {
+    col0: List[int],
+    col1: List[int],
+    pre: List[int],
+    n: int,
+    y: int,
+    tail_x: int,
+}
+
+/// An empty slot table.
+pub fn strip_slots_new() -> StripSlots {
+    StripSlots {
+        col0: List[int](),
+        col1: List[int](),
+        pre: List[int](),
+        n: 0,
+        y: 0,
+        tail_x: 0,
+    }
+}
+
+// Grow a slot table's storage to `n` and reset its live part
+// (`strip_render_row1`'s clearing loop, `tabs.c:1069-1078`).
+fn slots_reset(mut s: StripSlots, n: int, y: int, x: int) {
+    while s.col0.len < n {
+        (mut s.col0).push(0)
+        (mut s.col1).push(0)
+        (mut s.pre).push(0)
+    }
+    s.n = n
+    s.y = y
+    s.tail_x = x
+    var i = 0
+    while i < n {
+        s.col0[i] = 0
+        s.col1[i] = 0
+        i += 1
+    }
+}
+
+// ---- the scroll ownership (s57.15 §1) -----------------------------------
+
+/// `yew_tabs_scroll_owned` (`tabs.c:39-51`): the offset on this row is
+/// now the USER'S.
+pub fn tabs_scroll_owned(mut ed: Ed, row2: bool) {
+    if row2 {
+        ed.tab_member_scroll_user = true
+    } else {
+        ed.tab_scroll_user = true
+    }
+}
+
+/// `yew_tabs_follow_active` (`tabs.c:53-59`): both rows follow again.
+pub fn tabs_follow_active(mut ed: Ed) {
+    ed.tab_scroll_user = false
+    ed.tab_member_scroll_user = false
+}
+
+/// `yew_tabs_scroll_is_owned` (`tabs.c:61-66`).
+pub fn tabs_scroll_is_owned(ed: Ed, row2: bool) -> bool {
+    if row2 then ed.tab_member_scroll_user else ed.tab_scroll_user
+}
+
+// ---- the model -----------------------------------------------------------
+
+// `tab_destroy` (`tabs.c:68-89`): each leaf's window released, then the
+// tree's nodes freed. The buffer stays in the workspace's list.
+fn tab_destroy(mut ed: Ed, idx: int) {
+    let root = ed.tabs[idx].root
+    if pane_live(ed, root) {
+        let leaves = pane_collect_leaves(ed, root, PANE_MAX_LEAVES * 2)
+        for l in leaves {
+            ed_win_release(mut ed, ed.panes[l].win)
+        }
+        pane_free(mut ed, root)
+    }
+    ed.tabs[idx].root = -1
+    ed.tabs[idx].focus = -1
+}
+
+/// `yew_tab_count` (`tabs.c:125-128`).
+pub fn tab_count(ed: Ed) -> int {
+    ed.tabs.len
+}
+
+/// `yew_tab_display_path` (`tabs.c:144-149`): the logical spelling, else
+/// the canonical path; "" for an untitled tab.
+pub fn tab_display_path(t: Tab) -> str {
+    if !t.has_path {
+        return ""
+    }
+    if t.display_path.len != 0 then t.display_path else t.path
+}
+
+/// `yew_tab_index_of_id` (`tabs.c:151-163`): the index, or -1 — gone,
+/// rather than "whatever is there now". Id 0 is never a tab.
+pub fn tab_index_of_id(ed: Ed, id: int) -> int {
+    if id == 0 {
+        return -1
+    }
+    var i = 0
+    while i < ed.tabs.len {
+        if ed.tabs[i].tab_id == id {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `canonical_path` (`tabs.c:165-188`): the realpath, or the path as
+/// typed when it does not exist yet; "" for no path (C's NULL, which an
+/// empty path also gives).
 pub fn canonical_path(path: str) -> str {
+    if path.len == 0 {
+        return ""
+    }
     text.file_realpath(path) else path
 }
 
-/// `logical_path` (`tabs.c:185-215`): the canonical path under the
-/// workspace root, else the spelling the user typed.
+/// `logical_path` (`tabs.c:190-219`): the canonical path under the
+/// workspace root, else the spelling the user typed (an absolute one
+/// kept as typed: Darwin's /tmp alias), else the canonical path.
 pub fn logical_path(ed: Ed, path: str, canonical: str) -> str {
+    if canonical.len == 0 {
+        return ""
+    }
     let root = ed.ws_dir
     if root.len != 0 {
         if root == "/" && canonical.starts_with("/") && canonical.len > 1 {
@@ -57,12 +206,17 @@ pub fn logical_path(ed: Ed, path: str, canonical: str) -> str {
     canonical
 }
 
-/// `yew_tab_find_by_path` (`tabs.c:217-238`).
+/// `yew_tab_find_by_path` (`tabs.c:221-241`): the tab whose canonical
+/// path is the same FILE (`yew_file_same_identity`: the same spelling or
+/// the same device and inode), or -1.
 pub fn tab_find_by_path(ed: Ed, path: str) -> int {
     let want = canonical_path(path)
+    if want.len == 0 {
+        return -1
+    }
     var i = 0
     while i < ed.tabs.len {
-        if ed.tabs[i].has_path && ed.tabs[i].path == want {
+        if ed.tabs[i].has_path && text.file_same_identity(ed.tabs[i].path, want) {
             return i
         }
         i += 1
@@ -70,25 +224,56 @@ pub fn tab_find_by_path(ed: Ed, path: str) -> int {
     -1
 }
 
-/// `yew_tab_open` (`tabs.c:258-345`): a new tab on `path` with its own
-/// non-resident buffer and its own window; answers its index.
-pub fn tab_open(mut ed: Ed, path: str) -> int {
-    let existing = tab_find_by_path(ed, path)
-    if existing >= 0 {
-        tab_switch(mut ed, existing)
-        return existing
+/// `yew_tab_set_path` (`tabs.c:243-258`): renames what a tab shows (the
+/// save-as path), canonicalized here, at the one site that establishes a
+/// tab's name.
+pub fn tab_set_path(mut ed: Ed, idx: int, path: str) {
+    if idx < 0 || idx >= ed.tabs.len {
+        return
     }
     let canonical = canonical_path(path)
     let display = logical_path(ed, path, canonical)
+    ed.tabs[idx].path = canonical
+    ed.tabs[idx].display_path = display
+    ed.tabs[idx].has_path = canonical.len != 0
+}
+
+/// `yew_ws_file_buf` (`ed.c:378-417`): the workspace's ONE buffer for
+/// `path` (two buffers on one path are two claims on one save
+/// destination), else a new one — born NON-resident for a file (the read
+/// is the first switch's), born loaded and empty for an untitled tab
+/// ("" path), which has nowhere to be read from. Answers its index.
+pub fn ws_file_buf(mut ed: Ed, path: str) -> int {
+    if !ed.model_ready {
+        return -1
+    }
+    if path.len != 0 {
+        var i = 0
+        while i < ed.bufs.len {
+            if !ed.bufs[i].has_name &&
+                ed.bufs[i].has_path &&
+                text.file_same_identity(ed.bufs[i].path, path) {
+                return i
+            }
+            i += 1
+        }
+    }
+    if path.len == 0 {
+        let b = buffer_around(mut ed, take text.textbuf_new(), text.filemeta_new(), "", false)
+        (mut ed.bufs).push(b)
+        return ed.bufs.len - 1
+    }
     let id = ed.next_buf_id
     ed.next_buf_id += 1
     var ec = text.editctx_new(take text.textbuf_new())
     ec.meta = text.filemeta_new()
+    ec.change_hook = true
+    ec.change_buf_id = id
     (mut ed.bufs).push(Buffer {
         id: id,
         ec: ec,
         resident: false,
-        path: canonical,
+        path: path,
         has_path: true,
         name: "",
         has_name: false,
@@ -98,39 +283,258 @@ pub fn tab_open(mut ed: Ed, path: str) -> int {
         pairs: pairstate_new(),
         named: named_marks_new(),
     })
-    let bi = ed.bufs.len - 1
-    let wid = ed.next_win_id
-    ed.next_win_id += 1
-    var w = win_new(wid, bi)
-    vp_init(mut w)
-    apply_win_opts(ed.opts, mut w)
-    (mut ed.wins).push(w)
-    // `tabs.c:328-329`: the tab's tree is one leaf, focused.
-    let leaf = pane_new_leaf(mut ed, ed.wins.len - 1)
-    let tid = ed.next_tab_id
-    ed.next_tab_id += 1
-    (mut ed.tabs).push(Tab {
+    ed.bufs.len - 1
+}
+
+/// A tab on buffer id `buffer_id` whose tree is the one leaf `leaf`
+/// (`tabs.c:308-325`): ungrouped, ordinal 0.
+pub fn tab_value(tid: int, buffer_id: int, leaf: int, path: str, display: str) -> Tab {
+    Tab {
         tab_id: tid,
-        buffer_id: id,
+        buffer_id: buffer_id,
         root: leaf,
         focus: leaf,
-        path: canonical,
+        path: path,
         display_path: display,
-        has_path: true,
-    })
+        has_path: path.len != 0,
+        group_id: 0,
+        group_ordinal: 0,
+        missing_at_restore: false,
+    }
+}
+
+/// `yew_tab_open` (`tabs.c:260-339`): one tab per file — a path already
+/// open is switched to and its own buffer shown again (a scratch view in
+/// its focused pane gives way); else, under the cap, a new tab with a
+/// view cloned from the focused window pointed at the file's buffer, its
+/// tree one leaf. "" opens an untitled tab. Answers the index, -1 when
+/// refused (the message says why) — every caller checks it (DoD 6).
+pub fn tab_open(mut ed: Ed, path: str) -> int {
+    if path.len != 0 {
+        let existing = tab_find_by_path(ed, path)
+        if existing >= 0 {
+            let doc = ed_buf_index(ed, ed.tabs[existing].buffer_id)
+            tab_switch(mut ed, existing)
+            if doc < 0 || buf_hydrate(mut ed, doc) != 0 {
+                ed_msg(mut ed, MSG_ERROR, "could not open {path}")
+                return -1
+            }
+            ed_show_buffer(mut ed, doc)
+            if ed.win < 0 || ed.wins[ed.win].buf != doc {
+                ed_msg(mut ed, MSG_ERROR, "could not open {path}")
+                return -1
+            }
+            if ed.prompt == PROMPT_NONE && ed.bufs[doc].recovery_pending {
+                ed_prompt(mut ed, PROMPT_RECOVER)
+            }
+            return existing
+        }
+    }
+    if ed.tabs.len >= TAB_MAX {
+        ed_msg(mut ed, MSG_ERROR, "too many tabs (max {TAB_MAX})")
+        return -1
+    }
+    let win = ed_win_clone(mut ed, ed.win)
+    if win < 0 {
+        ed_msg(mut ed, MSG_ERROR, "no room for another view")
+        return -1
+    }
+    let tid = ed.next_tab_id
+    ed.next_tab_id += 1
+    let canonical = canonical_path(path)
+    let display = logical_path(ed, path, canonical)
+    let bi = ws_file_buf(mut ed, canonical)
+    if bi < 0 {
+        ed_win_release(mut ed, win)
+        ed_msg(mut ed, MSG_ERROR, "no room for another buffer")
+        return -1
+    }
+    ed_win_set_buffer(mut ed, win, bi)
+    apply_win_opts(ed.opts, mut ed.wins[win])
+    let leaf = pane_new_leaf(mut ed, win)
+    (mut ed.tabs).push(tab_value(tid, ed.bufs[bi].id, leaf, canonical, display))
+    // s57.15 §1: an OPEN changes the entry list under the offset; a tab
+    // opened for a group is never switched to, so the follow resumes here.
+    tabs_follow_active(mut ed)
     ed.tabs.len - 1
 }
 
-/// `yew_buf_hydrate` (`ed.c:426-484`) via `yew_tab_hydrate`
-/// (`tabs.c:560-623`): read the file, a missing path opening empty; the
-/// undo tree at its save point; the journal probe that arms recovery.
-/// Answers 0 or -1.
-pub fn tab_hydrate(mut ed: Ed, idx: int) -> int {
-    if idx < 0 || idx >= ed.tabs.len {
+/// `yew_tab_open_buffer` (`tabs.c:341-372`): a new untitled tab showing
+/// the existing buffer index `bi` (A-e's scratch, s57.31 §2), not
+/// switched to; -1 when refused.
+pub fn tab_open_buffer(mut ed: Ed, bi: int) -> int {
+    if ed.win < 0 || bi < 0 || bi >= ed.bufs.len {
         return -1
     }
-    let bi = ed_buf_index(ed, ed.tabs[idx].buffer_id)
-    if bi < 0 {
+    if ed.tabs.len >= TAB_MAX {
+        ed_msg(mut ed, MSG_ERROR, "too many tabs (max {TAB_MAX})")
+        return -1
+    }
+    let win = ed_win_clone(mut ed, ed.win)
+    if win < 0 {
+        ed_msg(mut ed, MSG_ERROR, "no room for another view")
+        return -1
+    }
+    let tid = ed.next_tab_id
+    ed.next_tab_id += 1
+    ed_win_set_buffer(mut ed, win, bi)
+    apply_win_opts(ed.opts, mut ed.wins[win])
+    let leaf = pane_new_leaf(mut ed, win)
+    (mut ed.tabs).push(tab_value(tid, ed.bufs[bi].id, leaf, "", ""))
+    tabs_follow_active(mut ed)
+    ed.tabs.len - 1
+}
+
+// `pick_survivor_id` (`tabs.c:374-391`): which tab is active once `idx`
+// is gone — decided by ID, BEFORE the compaction.
+fn pick_survivor_id(ed: Ed, idx: int) -> int {
+    let active = ed.tab_active
+    let n = ed.tabs.len
+    if active != idx {
+        return if active >= 0 && active < n then ed.tabs[active].tab_id else 0
+    }
+    if idx + 1 < n {
+        return ed.tabs[idx + 1].tab_id
+    }
+    if idx - 1 >= 0 {
+        return ed.tabs[idx - 1].tab_id
+    }
+    0
+}
+
+/// `yew_tab_close` (`tabs.c:393-424`): the survivor chosen by id before
+/// the compaction; the tab leaves its group while `idx` still names it;
+/// its tree and windows freed; the survivor resolved after, from the id.
+/// False only for an index that names no tab (the veto is the
+/// command's).
+pub fn tab_close(mut ed: Ed, idx: int) -> bool {
+    if idx < 0 || idx >= ed.tabs.len {
+        return false
+    }
+    let survivor = pick_survivor_id(ed, idx)
+    group_remove_member(mut ed, idx)
+    tab_destroy(mut ed, idx)
+    // The compaction, in place: everything above `idx` slides down one.
+    var i = idx
+    while i + 1 < ed.tabs.len {
+        ed.tabs[i] = copy ed.tabs[i + 1]
+        i += 1
+    }
+    let _ = (mut ed.tabs).pop()
+    ed.tab_active = tab_index_of_id(ed, survivor)
+    if ed.tab_active < 0 && ed.tabs.len > 0 {
+        ed.tab_active = 0
+    }
+    tab_switch(mut ed, ed.tab_active)
+    true
+}
+
+/// `yew_tab_switch` (`tabs.c:426-484`): the strip resumes following (the
+/// one funnel every active-entry change goes through, before the bail);
+/// the tab is hydrated FIRST, then its tree is the visible one — each
+/// window owns its cursors and viewport, so swapping the tree is the
+/// whole switch; a pending recovery asks.
+pub fn tab_switch(mut ed: Ed, idx: int) {
+    tabs_follow_active(mut ed)
+    if idx < 0 || idx >= ed.tabs.len {
+        if ed.tabs.len == 0 {
+            ed.tab_active = -1
+        }
+        return
+    }
+    ed.tab_active = idx
+    let _ = tab_hydrate(mut ed, idx)
+    ed.pane_root = ed.tabs[idx].root
+    ed.focus = ed.tabs[idx].focus
+    if pane_live(ed, ed.focus) && ed.panes[ed.focus].win >= 0 {
+        ed.win = ed.panes[ed.focus].win
+    }
+    if ed.prompt == PROMPT_NONE && ed.win >= 0 {
+        let bi = ed.wins[ed.win].buf
+        if bi >= 0 && ed.bufs[bi].recovery_pending {
+            ed_prompt(mut ed, PROMPT_RECOVER)
+        }
+    }
+    ed.layout_dirty = true
+    ed.full_damage = true
+}
+
+/// `yew_tab_shifted_index` (`tabs.c:486-493`): where index `i` lands when
+/// `from` moves to `to`.
+pub fn tab_shifted_index(i: int, from: int, to: int) -> int {
+    if i == from {
+        return to
+    }
+    if to > from {
+        return if i > from && i <= to then i - 1 else i
+    }
+    if i >= to && i < from then i + 1 else i
+}
+
+/// `yew_tab_reorder` (`tabs.c:495-518`): an INSERTION, so the tabs the
+/// moved one passes keep their relative order; the active tab is a
+/// position, remapped through the shift.
+pub fn tab_reorder(mut ed: Ed, from: int, to: int) {
+    let n = ed.tabs.len
+    if from < 0 || from >= n || to < 0 || to >= n || from == to {
+        return
+    }
+    let moved = copy ed.tabs[from]
+    if to > from {
+        var i = from
+        while i < to {
+            ed.tabs[i] = copy ed.tabs[i + 1]
+            i += 1
+        }
+    } else {
+        var i = from
+        while i > to {
+            ed.tabs[i] = copy ed.tabs[i - 1]
+            i -= 1
+        }
+    }
+    ed.tabs[to] = moved
+    if ed.tab_active >= 0 {
+        ed.tab_active = tab_shifted_index(ed.tab_active, from, to)
+    }
+}
+
+/// `yew_tab_modified` (`tabs.c:520-537`): ASKED of the focused window's
+/// buffer every time (`yew_buf_dirty`), never remembered — undoing back
+/// to the clean state clears the marker.
+pub fn tab_modified(ed: Ed, idx: int) -> bool {
+    if idx < 0 || idx >= ed.tabs.len {
+        return false
+    }
+    let w = tab_focus_win(ed, idx)
+    if w < 0 || w >= ed.wins.len {
+        return false
+    }
+    let bi = ed.wins[w].buf
+    bi >= 0 && bi < ed.bufs.len && buf_dirty(ed.bufs[bi])
+}
+
+/// `yew_tab_buffer` (`tabs.c:543-550`): the buffer index the tab's
+/// focused window shows, -1 for none.
+pub fn tab_buffer(ed: Ed, idx: int) -> int {
+    let w = tab_focus_win(ed, idx)
+    if w < 0 || w >= ed.wins.len then -1 else ed.wins[w].buf
+}
+
+/// `yew_tab_is_resident` (`tabs.c:552-560`): asked of the buffer — does
+/// it hold its text (ruling R-yw05-4 = A: the piece tree built) — never
+/// of a tab flag.
+pub fn tab_is_resident(ed: Ed, idx: int) -> bool {
+    let bi = tab_buffer(ed, idx)
+    bi >= 0 && ed.bufs[bi].resident
+}
+
+/// `yew_buf_hydrate` (`ed.c:426-484`): read a non-resident file buffer —
+/// a missing path opens empty — with the undo tree at its save point and
+/// the journal probe that arms recovery. Answers 0, or -1 when the read
+/// failed (or there is no path to read).
+pub fn buf_hydrate(mut ed: Ed, bi: int) -> int {
+    if bi < 0 || bi >= ed.bufs.len {
         return -1
     }
     if ed.bufs[bi].resident {
@@ -143,6 +547,7 @@ pub fn tab_hydrate(mut ed: Ed, idx: int) -> int {
     if status != text.LOAD_OK && status != text.LOAD_ENOENT {
         return -1
     }
+    let id = ed.bufs[bi].id
     var ec = text.editctx_new(take tb)
     ec.undo = text.undo_new(ec.tb)
     ec.has_undo = true
@@ -151,6 +556,8 @@ pub fn tab_hydrate(mut ed: Ed, idx: int) -> int {
     ec.has_marks = true
     ec.meta = meta
     ec.has_meta = true
+    ec.change_hook = true
+    ec.change_buf_id = id
     ed.bufs[bi].ec = ec
     ed.bufs[bi].resident = true
     ed.bufs[bi].tabwidth = ed.opts.tabwidth
@@ -160,98 +567,143 @@ pub fn tab_hydrate(mut ed: Ed, idx: int) -> int {
     0
 }
 
-/// `yew_tab_switch` (`tabs.c:428-479`): hydrate, then the tab's window is
-/// the focused one; a pending recovery asks.
-pub fn tab_switch(mut ed: Ed, idx: int) {
-    if idx < 0 || idx >= ed.tabs.len {
-        if ed.tabs.len == 0 {
-            ed.tab_active = -1
-        }
-        return
+/// `yew_tab_hydrate` (`tabs.c:562-626`): resident returns without
+/// touching the disk; else the read, then the view rebuilt against the
+/// text with its SCROLL POSITION kept (s25 §6 restores it into a deferred
+/// tab's window first), and every cursor of the tab's windows on that
+/// buffer normalized against the text it now has. Answers 0 or -1.
+pub fn tab_hydrate(mut ed: Ed, idx: int) -> int {
+    let bi = tab_buffer(ed, idx)
+    if bi < 0 || idx < 0 || idx >= ed.tabs.len {
+        return -1
     }
-    ed.tab_active = idx
-    let _ = tab_hydrate(mut ed, idx)
-    // `tabs.c:460-470`: swapping the visible tree is the whole switch; each
-    // window owns its cursors and viewport.
-    ed.pane_root = ed.tabs[idx].root
-    ed.focus = ed.tabs[idx].focus
-    if pane_live(ed, ed.focus) && ed.panes[ed.focus].win >= 0 {
-        ed.win = ed.panes[ed.focus].win
+    if ed.bufs[bi].resident {
+        return 0
     }
-    let bi = ed.wins[ed.win].buf
-    if ed.prompt == PROMPT_NONE && ed.bufs[bi].recovery_pending {
-        ed_prompt(mut ed, PROMPT_RECOVER)
+    if buf_hydrate(mut ed, bi) != 0 {
+        let what = if ed.tabs[idx].has_path then ed.tabs[idx].path else "untitled"
+        ed_msg(mut ed, MSG_ERROR, "could not read {what}")
+        return -1
     }
-    ed.layout_dirty = true
-    ed.full_damage = true
-}
-
-// `tab_destroy` (`tabs.c:65-87`): each leaf's window released, then the
-// tree's nodes freed. The buffer stays in its list (the workspace owns
-// buffers), unreachable from the tab.
-fn tab_destroy(mut ed: Ed, idx: int) {
+    let w = tab_focus_win(ed, idx)
+    if w >= 0 {
+        let top = ed.wins[w].vp.top
+        let top_sub = ed.wins[w].vp.top_sub
+        let left = ed.wins[w].vp.left
+        let wrap = ed.wins[w].vp.wrap
+        let number_style = ed.wins[w].number_style
+        vp_init(mut ed.wins[w])
+        ed.wins[w].number_style = number_style
+        ed.wins[w].vp.top = top
+        ed.wins[w].vp.top_sub = top_sub
+        ed.wins[w].vp.left = left
+        ed.wins[w].vp.wrap = wrap
+        vp_clamp(mut ed.wins[w], ed.bufs[bi].ec.tb)
+    }
     let root = ed.tabs[idx].root
     if pane_live(ed, root) {
         let leaves = pane_collect_leaves(ed, root, PANE_MAX_LEAVES * 2)
         for l in leaves {
-            ed_win_release(mut ed, ed.panes[l].win)
+            let lw = ed.panes[l].win
+            if lw >= 0 && ed.wins[lw].buf == bi {
+                text.cset_normalize(ed.bufs[bi].ec.tb, mut ed.wins[lw].cs)
+            }
         }
-        pane_free(mut ed, root)
     }
-    ed.tabs[idx].root = -1
-    ed.tabs[idx].focus = -1
+    0
 }
 
-/// `yew_tab_close` (`tabs.c:398-426`): the survivor is chosen by id
-/// before the compaction (its right neighbour, else its left); the closed
-/// tab's tree and windows are freed (`tab_destroy`).
-pub fn tab_close(mut ed: Ed, idx: int) -> bool {
-    if idx < 0 || idx >= ed.tabs.len {
-        return false
+// ---- the row-1 entries (s23 §3, s57.8 §1) ----------------------------------
+
+// `tab_label` (`tabs.c:664-679`): " N basename* " — N the tab's POSITION
+// ON ITS ROW (s57.10), the `*` asked for, never remembered; padding is
+// part of the hit span. Capped as C's 64-byte buffer leaves it.
+fn tab_label(ed: Ed, idx: int, num: int) -> List[byte] {
+    let mark = if tab_modified(ed, idx) then glyph(GLYPH_MODIFIED) else ""
+    strip_label_cap(bytes_of(" {num} {tab_basename(ed, ed.tabs[idx])}{mark} "))
+}
+
+// `tab_group_label` (`tabs.c:681-711`): " N label " with the label
+// clipped so the trailing pad always fits in the 64-byte entry.
+fn tab_group_label(number: int, label: str) -> List[byte] {
+    var out = bytes_of(" {number} ")
+    let lb = bytes_of(label)
+    var keep = lb.len
+    if keep > TAB_LABEL_MAX - out.len - 2 {
+        keep = TAB_LABEL_MAX - out.len - 2
     }
-    let n = ed.tabs.len
-    var survivor = 0
-    if ed.tab_active != idx {
-        survivor = if ed.tab_active >= 0 && ed.tab_active < n {
-            ed.tabs[ed.tab_active].tab_id
-        } else {
-            0
-        }
-    } else if idx + 1 < n {
-        survivor = ed.tabs[idx + 1].tab_id
-    } else if idx - 1 >= 0 {
-        survivor = ed.tabs[idx - 1].tab_id
-    }
-    tab_destroy(mut ed, idx)
-    var kept = List[Tab]()
     var i = 0
-    while i < n {
-        if i != idx {
-            (mut kept).push(copy ed.tabs[i])
+    while i < keep {
+        (mut out).push(lb[i])
+        i += 1
+    }
+    (mut out).push(32 as byte)
+    out
+}
+
+// `tab_is_orphan` (`tabs.c:713-731`): outside the workspace root (a
+// prefix test on two canonical spellings), or gone at restore (s25 §6).
+fn tab_is_orphan(ed: Ed, idx: int) -> bool {
+    if ed.tabs[idx].missing_at_restore {
+        return true
+    }
+    ed.tabs[idx].has_path && ed.ws_dir.len != 0 && !ed.tabs[idx].path.starts_with(ed.ws_dir)
+}
+
+/// `yew_tab_row1_entries` (`tabs.c:733-788`): THE row-1 entry list — a
+/// group is one entry where its FIRST member sits, payload = −gid, with
+/// its label; an ungrouped tab is itself, payload = its index. Members
+/// never appear individually on row 1.
+pub fn tab_row1_entries(ed: Ed) -> List[StripEntry] {
+    var out = List[StripEntry]()
+    var seen = List[int]()
+    var i = 0
+    while i < ed.tabs.len {
+        let gid = ed.tabs[i].group_id
+        if gid != 0 {
+            var dup = false
+            for s in seen {
+                if s == gid {
+                    dup = true
+                }
+            }
+            if !dup {
+                (mut seen).push(gid)
+                (mut out).push(StripEntry {
+                    label: tab_group_label(out.len + 1, group_label(ed, gid)),
+                    payload: -gid,
+                    dim: false,
+                    modified: false,
+                })
+            }
+        } else {
+            let label = tab_label(ed, i, out.len + 1)
+            (mut out).push(StripEntry {
+                label: label,
+                payload: i,
+                dim: tab_is_orphan(ed, i),
+                modified: tab_modified(ed, i),
+            })
         }
         i += 1
     }
-    ed.tabs = kept
-    ed.tab_active = -1
-    var j = 0
-    while j < ed.tabs.len {
-        if ed.tabs[j].tab_id == survivor {
-            ed.tab_active = j
-        }
-        j += 1
-    }
-    if ed.tab_active < 0 && ed.tabs.len > 0 {
-        ed.tab_active = 0
-    }
-    tab_switch(mut ed, ed.tab_active)
-    true
+    out
 }
 
-/// The tab index showing tab id `id`, or -1 (`yew_tab_index_of_id`).
-pub fn tab_index_of_id(ed: Ed, id: int) -> int {
+/// `yew_tab_row1_active` (`tabs.c:790-808`): the entry the active tab
+/// belongs to (its group's, inside one), -1 for none.
+pub fn tab_row1_active(ed: Ed, entries: List[StripEntry]) -> int {
+    if ed.tab_active < 0 {
+        return -1
+    }
+    let gid = active_group_id(ed)
     var i = 0
-    while i < ed.tabs.len {
-        if ed.tabs[i].tab_id == id {
+    while i < entries.len {
+        if gid != 0 {
+            if entries[i].payload == -gid {
+                return i
+            }
+        } else if entries[i].payload == ed.tab_active {
             return i
         }
         i += 1
@@ -259,56 +711,84 @@ pub fn tab_index_of_id(ed: Ed, id: int) -> int {
     -1
 }
 
-// A strip entry (`StripEntry`, `strip.h`).
-struct StripEntry {
-    label: List[byte],
-    payload: int,
-    dim: bool,
-    modified: bool,
+/// `yew_tab_strip_rows` (`tabs.c:810-842`): one row whenever row one has
+/// an entry (s57.8: even one tab owns a row, its tail carries the
+/// new-untitled action); two inside a group. (A dwell's preview row is
+/// Sprint 27's.)
+pub fn tab_strip_rows(ed: Ed) -> int {
+    var rows = if ed.tabs.len > 0 then 1 else 0
+    if active_group_id(ed) != 0 {
+        rows = 2
+    }
+    rows
 }
 
-// `tab_is_orphan` (`tabs.c:722-734`): outside the workspace root.
-fn tab_is_orphan(ed: Ed, idx: int) -> bool {
-    let p = ed.tabs[idx].path
-    ed.tabs[idx].has_path && ed.ws_dir.len != 0 && !p.starts_with(ed.ws_dir)
-}
+// ---- the slot tables (Sprint 27 §4, s57.14) ---------------------------------
 
-// `yew_tab_row1_entries` (`tabs.c:736-791`), groups aside (yw05).
-fn row1_entries(ed: Ed) -> List[StripEntry] {
-    var out = List[StripEntry]()
+/// `yew_strip_slot_at` (`tabs.c:902-915`): the row-1 slot under (x, y),
+/// -1 off row 1.
+pub fn strip_slot_at(ed: Ed, x: int, y: int) -> int {
+    if ed.strip_row1.n == 0 || y != ed.strip_row1.y {
+        return -1
+    }
     var i = 0
-    while i < ed.tabs.len {
-        let modified = tab_modified(ed, i)
-        let label = " {out.len + 1} {tab_basename(ed, ed.tabs[i])}{if modified then "*" else ""} "
-        (mut out).push(StripEntry {
-            label: bytes_of(label),
-            payload: i,
-            dim: tab_is_orphan(ed, i),
-            modified: modified,
-        })
+    while i < ed.strip_row1.n {
+        if x >= ed.strip_row1.col0[i] && x < ed.strip_row1.col1[i] {
+            return i
+        }
         i += 1
     }
-    out
+    -1
 }
 
-/// `yew_tab_strip_rows` (`tabs.c:812-842`): one row while there is a
-/// tab (row 2 is a group's, yw05).
-pub fn tab_strip_rows(ed: Ed) -> int {
-    if ed.tabs.len > 0 then 1 else 0
+/// `yew_strip_pre_payload` (`tabs.c:917-923`).
+pub fn strip_pre_payload(ed: Ed, slot: int) -> (bool, int) {
+    if slot < 0 || slot >= ed.strip_row1.n {
+        return (false, 0)
+    }
+    (true, ed.strip_row1.pre[slot])
 }
 
-/// `yew_strip_label_cells` (`strip.c:11-27`).
-pub fn strip_label_cells(label: List[byte]) -> int {
-    let (_, cells) = unicode.str_clip(label, 0, label.len, STRIP_LABEL_CELLS)
-    if cells < 0 then 0 else cells
+/// `yew_strip_slot_cells` (`tabs.c:925-938`): false for a slot the
+/// layout scrolled off.
+pub fn strip_slot_cells(ed: Ed, slot: int) -> (bool, int, int) {
+    if slot < 0 || slot >= ed.strip_row1.n || ed.strip_row1.col1[slot] <= ed.strip_row1.col0[slot] {
+        return (false, 0, 0)
+    }
+    (true, ed.strip_row1.col0[slot], ed.strip_row1.col1[slot])
 }
 
-fn strip_label_bytes(label: List[byte]) -> int {
-    let (bytes, _) = unicode.str_clip(label, 0, label.len, STRIP_LABEL_CELLS)
-    bytes
+/// `yew_strip_slot_count` (`tabs.c:940-943`).
+pub fn strip_slot_count(ed: Ed) -> int {
+    ed.strip_row1.n
 }
 
-// `tab_base_style` (`tabs.c:1085-1106`).
+/// `yew_strip_tail_x` (`tabs.c:945-948`).
+pub fn strip_tail_x(ed: Ed) -> int {
+    ed.strip_row1.tail_x
+}
+
+/// `yew_strip_member_slot_count` (`tabs.c:959-962`).
+pub fn strip_member_slot_count(ed: Ed) -> int {
+    ed.strip_row2.n
+}
+
+/// `yew_strip_member_slot_cells` (`tabs.c:964-974`).
+pub fn strip_member_slot_cells(ed: Ed, slot: int) -> (bool, int, int) {
+    if slot < 0 || slot >= ed.strip_row2.n || ed.strip_row2.col1[slot] <= ed.strip_row2.col0[slot] {
+        return (false, 0, 0)
+    }
+    (true, ed.strip_row2.col0[slot], ed.strip_row2.col1[slot])
+}
+
+/// `yew_strip_member_tail_x` (`tabs.c:976-980`).
+pub fn strip_member_tail_x(ed: Ed) -> int {
+    ed.strip_row2.tail_x
+}
+
+// ---- the renderer ----------------------------------------------------------
+
+// `tab_base_style` (`tabs.c:1081-1101`).
 fn tab_base_style(ed: Ed) -> ThemeEnt {
     let r = theme_rendition_of(ed.render)
     let (hf, fg) = theme_ui(ed.theme, "fg", r)
@@ -329,7 +809,8 @@ fn tab_base_style(ed: Ed) -> ThemeEnt {
     style
 }
 
-// `tab_role_style` (`tabs.c:1114-1127`): a role is an overlay.
+// `tab_role_style` (`tabs.c:1103-1121`): a role is an OVERLAY — a colour
+// only where it names one; presence owns the attributes.
 fn tab_role_style(ed: Ed, role: str, fallback_in: ThemeEnt) -> ThemeEnt {
     var fallback = fallback_in
     let (ok, themed) = theme_ui(ed.theme, role, theme_rendition_of(ed.render))
@@ -346,6 +827,7 @@ fn tab_role_style(ed: Ed, role: str, fallback_in: ThemeEnt) -> ThemeEnt {
     fallback
 }
 
+// `tab_blank` (`tabs.c:1123-1132`).
 fn tab_blank(style: ThemeEnt) -> term.Cell {
     var c = term.cell_blank()
     c.fg = copy style.fg
@@ -354,15 +836,42 @@ fn tab_blank(style: ThemeEnt) -> term.Cell {
     c
 }
 
-/// `yew_tab_strip_draw` (`tabs.c:1576-1606`) with `strip_render` over row
-/// 1 (`tabs.c:1148-1316`) and `yew_strip_layout` (`strip.c:39-134`).
-pub fn tab_strip_draw(mut ed: Ed, r: Rect) {
-    if r.w == 0 || r.h == 0 {
-        return
+// Record a drawn span's cells in the row's slot table (`strip_render`,
+// `tabs.c:1260-1268`).
+fn slot_record(mut s: StripSlots, idx: int, x0: int, x1: int) {
+    if idx >= 0 && idx < s.n {
+        s.col0[idx] = x0
+        s.col1[idx] = x1
+        if x1 > s.tail_x {
+            s.tail_x = x1
+        }
     }
-    let entries = row1_entries(ed)
+}
+
+// `strip_render` (`tabs.c:1134-1291`): THE renderer, both rows. The row
+// blanked in `tab.bar`; the layout told −1 for a user-owned offset (the
+// highlight still uses `active_entry`); each span drawn with the bytes
+// that fit and registered with the SAME cells (`REGION_TAB`, the
+// payload); `<` and `>N` chevrons registered with ±`scroll_mag` (1 row
+// 1, 2 row 2); the ` + ` in otherwise-empty tail space on row 1 only,
+// never under right overflow. `held_idx` is a drag's gap (Sprint 27;
+// -1 with no drag in flight). Answers the row's new offset.
+fn strip_render(
+    mut ed: Ed,
+    r: Rect,
+    entries: List[StripEntry],
+    active_entry: int,
+    scroll: int,
+    user_scroll: bool,
+    scroll_mag: int,
+    row2: bool,
+    draw_new: bool,
+    held_idx: int,
+) -> int {
+    if r.w == 0 || r.h == 0 {
+        return scroll
+    }
     let n = entries.len
-    let active = ed.tab_active
     let base = tab_base_style(ed)
     let surface = tab_role_style(ed, "tab.bar", copy base)
     let inactive = tab_role_style(ed, "tab.inactive", copy surface)
@@ -380,129 +889,80 @@ pub fn tab_strip_draw(mut ed: Ed, r: Rect) {
     add = tab_role_style(ed, "tab.add", add)
     term.grid_fill(mut ed.grid, r.y, r.x, r.x + r.w, tab_blank(copy surface))
     if n <= 0 {
-        return
+        return scroll
     }
+    // Reserve a cell for `<` when scrolled, so the indicator never
+    // overlaps the first entry it points away from.
     var avail = r.w
-    if ed.tab_scroll > 0 && avail > 1 {
+    if scroll > 0 && avail > 1 {
         avail -= 1
     }
-    // `yew_strip_layout`: keep the active entry visible, moving as little
-    // as possible; place what fits; an entry too wide for the strip is
-    // placed clipped.
-    var first = ed.tab_scroll
-    if first < 0 {
-        first = 0
-    }
-    if first >= n {
-        first = n - 1
-    }
-    if active >= 0 && active < n {
-        if active < first {
-            first = active
-        } else {
-            loop {
-                var used = 0
-                var fits = false
-                var i = first
-                while i < n {
-                    let w = strip_label_cells(entries[i].label)
-                    if used + w > avail {
-                        break
-                    }
-                    used += w
-                    if i == active {
-                        fits = true
-                        break
-                    }
-                    i += 1
-                }
-                if fits || first >= active {
-                    break
-                }
-                first += 1
-            }
-        }
-    }
-    var span_idx = List[int]()
-    var span_c0 = List[int]()
-    var span_c1 = List[int]()
-    var at = 0
-    var k = first
-    while k < n {
-        let w = strip_label_cells(entries[k].label)
-        if at + w > avail {
-            break
-        }
-        (mut span_idx).push(k)
-        (mut span_c0).push(at)
-        (mut span_c1).push(at + w)
-        at += w
-        k += 1
-    }
-    if span_idx.len == 0 && first < n {
-        (mut span_idx).push(first)
-        (mut span_c0).push(0)
-        (mut span_c1).push(avail)
-    }
-    ed.tab_scroll = first
-    let more_left = first > 0
-    let more_right = first + span_idx.len < n
-    var tail_x = r.x + (if more_left then 1 else 0)
+    let lay = strip_layout(entries, avail, if user_scroll then -1 else active_entry, scroll)
+    let shift = if lay.more_left then 1 else 0
+    var tail_x = r.x + shift
     var s = 0
-    while s < span_idx.len {
-        let idx = span_idx[s]
-        let x = r.x + span_c0[s] + (if more_left then 1 else 0)
+    while s < lay.spans.len {
+        let idx = lay.spans[s].idx
+        let x = r.x + lay.spans[s].col0 + shift
+        let w = lay.spans[s].col1 - lay.spans[s].col0
         var style = copy inactive
-        if idx == active {
+        if idx == active_entry {
             style = copy act
         } else if entries[idx].dim {
             style = copy orphan
         } else if entries[idx].modified {
             style = copy modified
         }
-        let lb = strip_label_bytes(entries[idx].label)
-        let _ = term.grid_puts(
-            mut ed.grid,
-            r.y,
-            x,
-            entries[idx].label,
-            0,
-            lb,
-            copy style.fg,
-            copy style.bg,
-            style.attrs,
-        )
-        // Registered with the SAME cells the layout produced and the draw
-        // used (`tabs.c:1228-1243`, the Sprint 22 law).
-        let span_rect = rect(x, r.y, span_c1[s] - span_c0[s], 1)
-        region_add(mut ed.regions, REGION_TAB, span_rect, entries[idx].payload)
-        tail_x = x + span_c1[s] - span_c0[s]
+        if idx != held_idx {
+            let lb = strip_label_bytes(entries[idx].label)
+            let _ = term.grid_puts(
+                mut ed.grid,
+                r.y,
+                x,
+                entries[idx].label,
+                0,
+                lb,
+                copy style.fg,
+                copy style.bg,
+                style.attrs,
+            )
+            region_add(mut ed.regions, REGION_TAB, rect(x, r.y, w, 1), entries[idx].payload)
+        }
+        tail_x = x + w
+        if row2 {
+            slot_record(mut ed.strip_row2, idx, x, x + w)
+        } else {
+            slot_record(mut ed.strip_row1, idx, x, x + w)
+        }
         s += 1
     }
-    if more_left {
-        let lt = bytes_of("<")
+    if lay.more_left {
+        let lt = bytes_of(glyph(GLYPH_MORE_LEFT))
         let _ = term.grid_puts(
             mut ed.grid,
             r.y,
             r.x,
             lt,
             0,
-            1,
+            lt.len,
             copy orphan.fg,
             copy surface.bg,
             term.ATTR_DIM,
         )
-        region_add(mut ed.regions, REGION_TAB_SCROLL, rect(r.x, r.y, 1, 1), -1)
+        region_add(mut ed.regions, REGION_TAB_SCROLL, rect(r.x, r.y, 1, 1), -scroll_mag)
+        ed.strip_any_chevron = true
     }
-    if more_right {
-        let past = n - (if span_idx.len > 0 then span_idx[span_idx.len - 1] + 1 else 0)
-        let more = bytes_of(">{past}")
+    if lay.more_right {
+        let last = if lay.spans.len > 0 then lay.spans[lay.spans.len - 1].idx + 1 else 0
+        let past = n - last
+        let more = bytes_of("{glyph(GLYPH_MORE_RIGHT)}{past}")
         let w = more.len
         if w < r.w {
+            let x = r.x + r.w - w
             let _ = term.grid_puts(
                 mut ed.grid,
                 r.y,
-                r.x + r.w - w,
+                x,
                 more,
                 0,
                 w,
@@ -510,9 +970,10 @@ pub fn tab_strip_draw(mut ed: Ed, r: Rect) {
                 copy surface.bg,
                 term.ATTR_DIM,
             )
-            region_add(mut ed.regions, REGION_TAB_SCROLL, rect(r.x + r.w - w, r.y, w, 1), 1)
+            region_add(mut ed.regions, REGION_TAB_SCROLL, rect(x, r.y, w, 1), scroll_mag)
+            ed.strip_any_chevron = true
         }
-    } else if tail_x + 3 <= r.x + r.w {
+    } else if draw_new && tail_x + 3 <= r.x + r.w {
         let plus = bytes_of(" + ")
         let _ = term.grid_puts(
             mut ed.grid,
@@ -527,24 +988,480 @@ pub fn tab_strip_draw(mut ed: Ed, r: Rect) {
         )
         region_add(mut ed.regions, REGION_TAB_NEW, rect(tail_x, r.y, 3, 1), 0)
     }
+    lay.scroll
 }
 
-/// The tab strip's marks for the redraw check (`tab_marks_record`,
-/// `ed.c:2594-2618`): what each tab shows as modified.
-pub fn tab_marks(ed: Ed) -> str {
-    var out = ""
+// `strip_render_row1` (`tabs.c:1053-1079`): the pre-drag list recorded
+// and the slot table cleared before the render fills the cells in (a
+// slot scrolled out of view must not keep last frame's cells). With no
+// drag in flight the pre-drag list IS the drawn one.
+fn strip_render_row1(mut ed: Ed, r: Rect, entries: List[StripEntry], active_entry: int) {
+    let n = entries.len
+    slots_reset(mut ed.strip_row1, n, r.y, r.x)
     var i = 0
-    while i < ed.tabs.len {
-        out = out + (if tab_modified(ed, i) then "1" else "0")
+    while i < n {
+        ed.strip_row1.pre[i] = entries[i].payload
         i += 1
     }
-    out
+    let user = tabs_scroll_is_owned(ed, false)
+    let scroll = ed.tab_scroll
+    ed.tab_scroll = strip_render(mut ed, r, entries, active_entry, scroll, user, 1, false, true, -1)
 }
 
-/// `ed.tab.close` (`yew_tab_cmd_close`, `tabs.c:2028-2054`): A-e's tab
-/// returns its line (s57.31 §2); the last tab stays; an unmodified tab
-/// closes. A modified tab's save-or-discard question is Sprint 23's
-/// (`tab_prompt_show`, yw05) and refuses by name until then.
+/// `yew_tab_member_strip_draw` (`tabs.c:1293-1420`): row 2 — the members
+/// of `gid`, numbered 1..n, payload = the GLOBAL tab index (so a click is
+/// the ordinary `REGION_TAB` case), its own offset and its own slot
+/// table, through the same renderer (no `+`).
+pub fn tab_member_strip_draw(mut ed: Ed, r: Rect, gid: int) {
+    if gid == 0 {
+        return
+    }
+    let order = group_members(ed, gid)
+    var entries = List[StripEntry]()
+    var active_entry = -1
+    var i = 0
+    while i < order.len {
+        let t = order[i]
+        let mark = if tab_modified(ed, t) then glyph(GLYPH_MODIFIED) else ""
+        (mut entries).push(StripEntry {
+            label: strip_label_cap(bytes_of(" {i + 1} {tab_basename(ed, ed.tabs[t])}{mark} ")),
+            payload: t,
+            dim: tab_is_orphan(ed, t),
+            modified: tab_modified(ed, t),
+        })
+        if t == ed.tab_active {
+            active_entry = i
+        }
+        i += 1
+    }
+    slots_reset(mut ed.strip_row2, order.len, r.y, r.x)
+    var k = 0
+    while k < order.len {
+        ed.strip_row2.pre[k] = order[k]
+        k += 1
+    }
+    let user = tabs_scroll_is_owned(ed, true)
+    let scroll = ed.tab_member_scroll
+    ed.tab_member_scroll = strip_render(
+        mut ed,
+        r,
+        entries,
+        active_entry,
+        scroll,
+        user,
+        2,
+        true,
+        false,
+        -1,
+    )
+}
+
+// `strip_draw_rows` (`tabs.c:1532-1560`): row 1, then row 2 when the
+// strip has two rows and a group is active.
+fn strip_draw_rows(mut ed: Ed, r: Rect) {
+    if r.w == 0 || r.h == 0 {
+        return
+    }
+    let entries = tab_row1_entries(ed)
+    let active = tab_row1_active(ed, entries)
+    strip_render_row1(mut ed, rect(r.x, r.y, r.w, 1), entries, active)
+    let gid = active_group_id(ed)
+    if r.h >= 2 && gid != 0 {
+        tab_member_strip_draw(mut ed, rect(r.x, r.y + 1, r.w, 1), gid)
+    }
+}
+
+/// `yew_tab_strip_draw` (`tabs.c:1562-1588`): the chevron flag reset and
+/// row 2's slot table cleared at frame BEGIN (a frame that draws no row 2
+/// must not leave the last one's positions answering), then the rows.
+pub fn tab_strip_draw(mut ed: Ed, r: Rect) {
+    ed.strip_any_chevron = false
+    ed.strip_row2.n = 0
+    ed.strip_row2.tail_x = 0
+    strip_draw_rows(mut ed, r)
+    mouse_note_chevrons(mut ed, ed.strip_any_chevron)
+}
+
+// ---- the 1003 owner, the strip's half (`mouse.c:484-543`) -------------------
+//
+// Any-motion reporting (DEC 1003) is a FUNCTION of its wants — an open
+// context menu (Sprint 27, yw06: never open before it) and a drawn strip
+// chevron (s57.15 §2's hover reveal) — recomputed in one place; neither
+// customer arms or disarms the mode itself. The router these live in is
+// `mouse.c`'s (yw06); these three are the strip's.
+
+/// `yew_mouse_enabled` (`mouse.c:3039-3053`): `YEW_MOUSE` read to the same
+/// answer `term.input_enable` used.
+pub fn mouse_enabled() -> bool {
+    let (value, present) = term.env_getv("YEW_MOUSE")
+    !term.mouse_off_value(value, present)
+}
+
+// `motion_wanted` (`mouse.c:509-512`).
+fn motion_wanted(ed: Ed) -> bool {
+    mouse_enabled() && ed.motion_want_strip
+}
+
+/// `yew_mouse_note_chevrons` (`mouse.c:532-538`): the strip's want, and
+/// the mode recomputed when it changed.
+pub fn mouse_note_chevrons(mut ed: Ed, any: bool) {
+    if ed.motion_want_strip == any {
+        return
+    }
+    ed.motion_want_strip = any
+    if ed.tty_ready {
+        term.tty_mouse_motion(mut ed.tty, motion_wanted(ed))
+    }
+}
+
+/// `yew_mouse_motion_reassert` (`mouse.c:526-530`): after the base modes
+/// are written again (a resume, the probe's re-enable), the wants put the
+/// mode back through the tty's uncached path.
+pub fn mouse_motion_reassert(mut ed: Ed) {
+    if ed.tty_ready {
+        term.tty_mouse_motion_reassert(mut ed.tty, motion_wanted(ed))
+    }
+}
+
+// `strip_scroll` (`mouse.c:294-319`): one row's offset moved by `delta`,
+// clamped to the row's list, and owned by the user; false when it did not
+// move.
+fn strip_scroll(mut ed: Ed, row2: bool, delta: int) -> bool {
+    let cur = if row2 then ed.tab_member_scroll else ed.tab_scroll
+    var limit = ed.tabs.len
+    if row2 {
+        limit = group_member_count(ed, active_group_id(ed))
+    }
+    var to = cur + delta
+    if to < 0 {
+        to = 0
+    }
+    if to >= limit {
+        to = if limit > 0 then limit - 1 else 0
+    }
+    tabs_scroll_owned(mut ed, row2)
+    if cur == to {
+        return false
+    }
+    if row2 {
+        ed.tab_member_scroll = to
+    } else {
+        ed.tab_scroll = to
+    }
+    ed.full_damage = true
+    true
+}
+
+/// `yew_tab_strip_click` (`tabs.c:1590-1646`): a click on a chevron
+/// scrolls the row its payload's MAGNITUDE names (±1 row 1, ±2 row 2), in
+/// its sign's direction, the offset then the user's; on a tab span a
+/// negative payload ENTERS that group (an explicit entry resumes where
+/// the user left off), a tab index switches. Anything else is ignored.
+pub fn tab_strip_click(mut ed: Ed, x: int, y: int) -> bool {
+    let hit = region_hit(mut ed.regions, x, y)
+    if hit.kind == REGION_TAB_SCROLL {
+        let row2 = hit.payload == 2 || hit.payload == -2
+        let cur = if row2 then ed.tab_member_scroll else ed.tab_scroll
+        var limit = ed.tabs.len
+        if row2 {
+            limit = group_member_count(ed, active_group_id(ed))
+        }
+        var to = cur + (if hit.payload < 0 then -1 else 1)
+        if to < 0 {
+            to = 0
+        }
+        if to >= limit {
+            to = if limit > 0 then limit - 1 else 0
+        }
+        if row2 {
+            ed.tab_member_scroll = to
+        } else {
+            ed.tab_scroll = to
+        }
+        tabs_scroll_owned(mut ed, row2)
+        ed.full_damage = true
+        return true
+    }
+    if hit.kind != REGION_TAB {
+        return false
+    }
+    if hit.payload < 0 {
+        group_note_position(ed)
+        group_enter(ed, -hit.payload)
+        return true
+    }
+    tab_switch(mut ed, hit.payload)
+    true
+}
+
+// ---- the commands (s23 §5) ---------------------------------------------------
+
+/// `ed.tab.new` (`yew_tab_cmd_new`, `tabs.c:1652-1666`): an untitled tab,
+/// switched to; the cap's refusal is the status.
+pub fn tab_cmd_new(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let idx = tab_open(mut ed, "")
+    if idx < 0 {
+        return CMD_ERR_STATE
+    }
+    tab_switch(mut ed, idx)
+    CMD_OK
+}
+
+/// `ed.tab.open` (`yew_tab_cmd_open`, `tabs.c:1668-1680`).
+pub fn tab_cmd_open(mut ed: Ed, cx: CmdCtx) -> int {
+    if !cx.has_sarg {
+        return CMD_ERR_ARG
+    }
+    let idx = tab_open(mut ed, cx.sarg)
+    if idx < 0 {
+        return CMD_ERR_STATE
+    }
+    tab_switch(mut ed, idx)
+    CMD_OK
+}
+
+// `tab_step` (`tabs.c:1682-1700`): cyclic.
+fn tab_step(mut ed: Ed, delta: int) -> int {
+    let n = ed.tabs.len
+    if n <= 1 {
+        return CMD_OK
+    }
+    var at = ed.tab_active + delta
+    while at < 0 {
+        at += n
+    }
+    tab_switch(mut ed, at % n)
+    CMD_OK
+}
+
+/// `ed.tab.next` (`tabs.c:1702-1705`).
+pub fn tab_cmd_next(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    tab_step(mut ed, 1)
+}
+
+/// `ed.tab.prev` (`tabs.c:1707-1710`).
+pub fn tab_cmd_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    tab_step(mut ed, -1)
+}
+
+// ---- the jump window (s24 §7, s57.10) -----------------------------------------
+
+/// `yew_tab_jump_armed` (`tabs.c:1748-1751`): the test seam.
+pub fn tab_jump_armed(ed: Ed) -> bool {
+    ed.tab_jump_on
+}
+
+/// `yew_tab_jump_clear` (`tabs.c:1753-1763`).
+pub fn tab_jump_clear(mut ed: Ed) {
+    if ed.tab_jump_timer != 0 {
+        let _ = timer_cancel(mut ed.timers, ed.tab_jump_timer)
+        ed.tab_jump_timer = 0
+    }
+    ed.tab_jump_on = false
+    ed.tab_jump_value = 0
+    ed.tab_jump_deadline_ms = 0
+    ed.tab_jump_mode = JUMP_ROW1
+}
+
+// `jump_to_row1` (`tabs.c:1765-1789`): row-1 entry `pos` (1-based) —
+// switched to, or ENTERED for a group; the position noted first.
+fn jump_to_row1(mut ed: Ed, pos: int) -> bool {
+    let entries = tab_row1_entries(ed)
+    if pos < 1 || pos > entries.len {
+        return false
+    }
+    let payload = entries[pos - 1].payload
+    group_note_position(ed)
+    if payload < 0 {
+        group_enter(ed, -payload)
+    } else {
+        tab_switch(mut ed, payload)
+    }
+    true
+}
+
+// `jump_to_member` (`tabs.c:1791-1801`): member `pos` of `gid`, as row 2
+// shows it.
+fn jump_to_member(mut ed: Ed, gid: int, pos: int) -> bool {
+    let members = group_members(ed, gid)
+    if pos < 1 || pos > members.len {
+        return false
+    }
+    tab_switch(mut ed, members[pos - 1])
+    true
+}
+
+/// `jump_expire` (`tabs.c:1803-1818`): the window's timer fired — the
+/// hint's promise is withdrawn on an idle editor too.
+pub fn tab_jump_expire(mut ed: Ed) {
+    if !ed.tab_jump_on {
+        return
+    }
+    ed.tab_jump_timer = 0
+    tab_jump_clear(mut ed)
+    ed_msg_clear(mut ed)
+    ed.footer_dirty = true
+}
+
+// `jump_window_allowed` (`tabs.c:1820-1840`): Insert and FUSS read bare
+// digits, so they get single-digit jumps only.
+fn jump_window_allowed(ed: Ed) -> bool {
+    ed.mode != MODE_I && ed.mode != MODE_F
+}
+
+// `jump_arm` (`tabs.c:1842-1856`).
+fn jump_arm(mut ed: Ed, mode: int, value: int) {
+    tab_jump_clear(mut ed)
+    if !jump_window_allowed(ed) {
+        return
+    }
+    ed.tab_jump_on = true
+    ed.tab_jump_mode = mode
+    ed.tab_jump_value = value
+    ed.tab_jump_deadline_ms = ed.now_ms + JUMP_WINDOW_MS
+    ed.tab_jump_timer = timer_add(mut ed.timers, ed.tab_jump_deadline_ms, TIMER_TAB_JUMP, 0)
+    let what = if mode == JUMP_MEMBER then "member" else "tab"
+    ed_msg(mut ed, MSG_INFO, "{what} {value} — a digit extends to {value}_")
+}
+
+// `jump_mode_for_alt` (`tabs.c:1858-1862`): the row the active tab is on.
+fn jump_mode_for_alt(ed: Ed) -> int {
+    if active_group_id(ed) != 0 then JUMP_MEMBER else JUMP_ROW1
+}
+
+/// `yew_tab_jump_key` (`tabs.c:1864-1941`): inside the window a digit
+/// extends the jump in its MODE (`ctrl+1` `2` is row-1 entry 12); a held
+/// modifier continues only a window of its own kind; anything else
+/// clears and dispatches normally. True when the key was CONSUMED — an
+/// out-of-range digit is swallowed, never typed into the document.
+pub fn tab_jump_key(mut ed: Ed, key: term.Key) -> bool {
+    if !ed.tab_jump_on {
+        return false
+    }
+    if key.ev == term.KEY_RELEASE {
+        return false
+    }
+    if ed.now_ms >= ed.tab_jump_deadline_ms {
+        tab_jump_clear(mut ed)
+        return false
+    }
+    if key.code < 48 || key.code > 57 {
+        tab_jump_clear(mut ed)
+        return false
+    }
+    if key.mods & term.MOD_CTRL != 0 && ed.tab_jump_mode != JUMP_ROW1 {
+        tab_jump_clear(mut ed)
+        return false
+    }
+    if key.mods & term.MOD_ALT != 0 && ed.tab_jump_mode != jump_mode_for_alt(ed) {
+        tab_jump_clear(mut ed)
+        return false
+    }
+    let target = ed.tab_jump_value * 10 + (key.code - 48)
+    var ok = false
+    let mode = ed.tab_jump_mode
+    if mode == JUMP_MEMBER {
+        let gid = active_group_id(ed)
+        ok = gid != 0 && jump_to_member(mut ed, gid, target)
+        if !ok {
+            ed_msg(mut ed, MSG_ERROR, "no member {target}")
+        }
+    } else {
+        ok = jump_to_row1(mut ed, target)
+        if !ok {
+            ed_msg(mut ed, MSG_ERROR, "no tab {target}")
+        }
+    }
+    if ok {
+        jump_arm(mut ed, mode, target)
+    } else {
+        tab_jump_clear(mut ed)
+    }
+    true
+}
+
+// `goto_want` (`tabs.c:1943-1953`): the argument, a count overriding it,
+// 0 meaning 10 (the digit row reads 1..9 then 0).
+fn goto_want(cx: CmdCtx) -> int {
+    var want = cx.iarg
+    if cx.count_given && cx.count != 0 {
+        want = cx.count
+    }
+    if want == 0 then 10 else want
+}
+
+// `goto_row1` (`tabs.c:1955-1967`): jump now, then arm.
+fn goto_row1(mut ed: Ed, want: int) -> int {
+    if !jump_to_row1(mut ed, want) {
+        ed_msg(mut ed, MSG_ERROR, "no tab {want}")
+        return CMD_ERR_ARG
+    }
+    jump_arm(mut ed, JUMP_ROW1, want)
+    CMD_OK
+}
+
+/// `ed.tab.goto` (`yew_tab_cmd_goto`, `tabs.c:1969-1987`): the row the
+/// active tab is on — row 1 outside a group, the members inside one.
+pub fn tab_cmd_goto(mut ed: Ed, cx: CmdCtx) -> int {
+    let want = goto_want(cx)
+    let gid = active_group_id(ed)
+    if gid == 0 {
+        return goto_row1(mut ed, want)
+    }
+    if !jump_to_member(mut ed, gid, want) {
+        ed_msg(mut ed, MSG_ERROR, "no member {want}")
+        return CMD_ERR_ARG
+    }
+    jump_arm(mut ed, JUMP_MEMBER, want)
+    CMD_OK
+}
+
+/// `ed.tab.goto_bar` (`yew_tab_cmd_goto_bar`, `tabs.c:1989-1994`): row 1
+/// from anywhere.
+pub fn tab_cmd_goto_bar(mut ed: Ed, cx: CmdCtx) -> int {
+    goto_row1(mut ed, goto_want(cx))
+}
+
+/// `ed.tab.move` (`yew_tab_cmd_move`, `tabs.c:1996-2015`): the active tab
+/// to position N (1-based).
+pub fn tab_cmd_move(mut ed: Ed, cx: CmdCtx) -> int {
+    if ed.tab_active < 0 {
+        return CMD_ERR_STATE
+    }
+    var want = cx.iarg
+    if cx.count_given && cx.count != 0 {
+        want = cx.count
+    }
+    let to = want - 1
+    if to < 0 || to >= ed.tabs.len {
+        ed_msg(mut ed, MSG_ERROR, "no position {want}")
+        return CMD_ERR_ARG
+    }
+    tab_reorder(mut ed, ed.tab_active, to)
+    ed.full_damage = true
+    CMD_OK
+}
+
+// ---- the dirty-close prompt (s23 §6) --------------------------------------------
+
+// `tab_prompt_show` (`tabs.c:2017-2033`): the question resolves the ID
+// it holds; a tab gone meanwhile dissolves it.
+fn tab_prompt_show(mut ed: Ed) {
+    let idx = tab_index_of_id(ed, ed.tab_prompt_id)
+    if idx < 0 {
+        ed.tab_prompt_active = false
+        return
+    }
+    let what = if ed.tabs[idx].has_path then ed.tabs[idx].path else "untitled"
+    ed_msg(mut ed, MSG_INFO, "save changes to {what}?  [w]rite  [d]iscard  [esc] cancel")
+}
+
+/// `ed.tab.close` (`yew_tab_cmd_close`, `tabs.c:2035-2061`): A-e's tab
+/// returns its line (s57.31 §2); the last tab stays; a clean tab closes
+/// silently; a modified one asks, holding the tab's ID.
 pub fn tab_cmd_close(mut ed: Ed, cx: CmdCtx) -> int {
     let _ = cx.win
     let idx = ed.tab_active
@@ -562,10 +1479,113 @@ pub fn tab_cmd_close(mut ed: Ed, cx: CmdCtx) -> int {
         let _ = tab_close(mut ed, idx)
         return CMD_OK
     }
-    ed_msg(
-        mut ed,
-        MSG_ERROR,
-        "not yet ported: closing a modified tab: sagitta Sprint 23 (tabs) (yw05)",
-    )
-    CMD_ERR_DEFERRED
+    ed.tab_prompt_id = ed.tabs[idx].tab_id
+    ed.tab_prompt_active = true
+    tab_prompt_show(mut ed)
+    CMD_OK
+}
+
+/// `ed.tab.close_others` (`yew_tab_cmd_close_others`, `tabs.c:2063-
+/// 2113`): IDS FIRST, then close; a modified other tab refuses the whole
+/// gesture rather than closing half of them.
+pub fn tab_cmd_close_others(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if ed.tab_active < 0 {
+        return CMD_ERR_STATE
+    }
+    if ed.tabs.len <= 1 {
+        ed_msg(mut ed, MSG_ERROR, "no other tabs")
+        return CMD_ERR_STATE
+    }
+    let keep = ed.tabs[ed.tab_active].tab_id
+    var doomed = List[int]()
+    for t in ed.tabs {
+        if t.tab_id != keep {
+            (mut doomed).push(t.tab_id)
+        }
+    }
+    for id in doomed {
+        let idx = tab_index_of_id(ed, id)
+        if idx >= 0 && tab_modified(ed, idx) {
+            ed_msg(mut ed, MSG_ERROR, "unsaved changes in another tab; save or force first")
+            return CMD_ERR_STATE
+        }
+    }
+    for id in doomed {
+        let idx = tab_index_of_id(ed, id)
+        if idx >= 0 {
+            let _ = tab_close(mut ed, idx)
+        }
+    }
+    ed.layout_dirty = true
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.tab.copy_path` (`yew_tab_cmd_copy_path`, `tabs.c:2115-2144`): the
+/// CANONICAL path into register `+` (the system clipboard, out through
+/// OSC 52).
+pub fn tab_cmd_copy_path(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if ed.tab_active < 0 || ed.tab_active >= ed.tabs.len || !ed.tabs[ed.tab_active].has_path {
+        ed_msg(mut ed, MSG_ERROR, "this tab has no path")
+        return CMD_ERR_STATE
+    }
+    let path = ed.tabs[ed.tab_active].path
+    var v = text.regval_new()
+    v.bytes = bytes_of(path)
+    v.kind = text.REG_CHARWISE
+    text.reg_yank(mut ed.regs, '+' as int, v)
+    ed_msg(mut ed, MSG_INFO, "copied {path}")
+    CMD_OK
+}
+
+/// `yew_tab_prompt_key` (`tabs.c:2146-2197`): the answer to the
+/// dirty-close question, resolved by ID — `w` writes through the ONE save
+/// path and closes only on success (an I/O error aborts the close and the
+/// tab keeps its text, invariant 1); `d` discards; Esc cancels; any other
+/// key is swallowed with the question restated. True when consumed.
+pub fn tab_prompt_key(mut ed: Ed, answer: int) -> bool {
+    if !ed.tab_prompt_active {
+        return false
+    }
+    let idx = tab_index_of_id(ed, ed.tab_prompt_id)
+    if idx < 0 {
+        ed.tab_prompt_active = false
+        ed_msg_clear(mut ed)
+        return true
+    }
+    if answer == 119 {
+        let id = ed.tabs[idx].tab_id
+        tab_switch(mut ed, idx)
+        let st = ed_file_save(mut ed, false)
+        if st != CMD_OK {
+            ed.tab_prompt_active = false
+            return true
+        }
+        let now = tab_index_of_id(ed, id)
+        if now >= 0 {
+            let _ = tab_close(mut ed, now)
+        }
+    } else if answer == 100 {
+        let _ = tab_close(mut ed, idx)
+    } else if answer != 27 {
+        tab_prompt_show(mut ed)
+        return true
+    }
+    ed.tab_prompt_active = false
+    ed_msg_clear(mut ed)
+    true
+}
+
+/// The tab strip's marks for the redraw check (`tab_marks_record`,
+/// `ed.c:2609-2618`): what each tab shows as modified.
+pub fn tab_marks(ed: Ed) -> str {
+    var out = ""
+    var i = 0
+    while i < ed.tabs.len {
+        out = out + (if tab_modified(ed, i) then "1" else "0")
+        i += 1
+    }
+    out
 }
