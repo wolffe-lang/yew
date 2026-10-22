@@ -28,7 +28,9 @@ Campaign 05 is **22 of 23** on both tiers: `startup_multiple_files` is the
 one red, R-yw05-5 (its tabs are C's; its snapshot is the `:buffers`
 picker, Sprint 26, yw06's; `sweep-L2-c05-tabs-cases-*-startup_multiple_files.log`).
 
-The 66 native SKIP lines are 33 cases on two lines each, every one naming
+The 66 native lines with SKIP are 20 skipped cases, each printed twice
+(two identical lines in the log), and 26 files' summary
+lines that count their SKIPs (most "0 SKIP"); every skipped case names
 its owner: the workspace walk and state (yw06: four `groupfromdir`
 cases, the 100k storm's restore half), the recorder and Fletch's idle hook
 (yw09), the option table rows (s36, yw09), the syntax engine (yw10), the
