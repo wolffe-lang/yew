@@ -28,15 +28,22 @@ number from the same run, and a 2x gate holds from the first paint.
 
 ## Status
 
-Campaign 00 of sagitta's fifteen (yw00): the repo, the harness, `util`
-(strmap, intern, buf, sort) and `unicode` (UTF-8 with the lossless
-invalid-byte policy, UAX #29 grapheme clusters, UAX #11 and emoji
-widths) with a wolf generator over `ucd/16.0.0/` producing tables
-identical to sagitta's, and sagitta's unit tests ported one for one.
-`yew --version` prints what C yew prints; every other path hard-errors
-naming its sagitta sprint and the port lane that lands it. The map of
-every sagitta directory and sprint to a port lane, and of every wolf
-gap the port has met, is [`docs/MAP.md`](docs/MAP.md).
+Campaigns 00 to 04 of sagitta's fifteen and campaign 05's first half
+(yw00 to yw05), at wolf 0.2.34: `util` and `unicode` (tables generated
+from `ucd/16.0.0/`, identical to sagitta's); the terminal (raw mode, the
+input decoder, the cell grid and damage renderer, the restore on every
+exit path); the text engine (piece tree, byte-exact load, the atomic and
+synced save, the crash journal, undo); the modal core (modes, keymaps,
+dispatch, selection, multi-cursor); the `:` prompt with its completion
+engine, the regex engine, search and replace, and shell jobs (`:!`, the
+stream, the region filter, `:r !`, the persistent session); and the
+workspace's first half: the pane tree, tabs with the strip and its
+overflow, and tab groups. Each campaign's PTY goldens are gated by name
+against C yew's (campaign 05's `startup_multiple_files` waits on the
+fuzzy finder, yw06); every path not yet ported hard-errors naming its
+sagitta sprint and the port lane that lands it. The map of every sagitta
+directory and sprint to a port lane, and of every wolf gap the port has
+met, is [`docs/MAP.md`](docs/MAP.md); `CHANGELOG.md` has each lane.
 
 ## Build and test
 
@@ -50,7 +57,7 @@ tools/goldens --yew target/release/yew
 ```
 
 Builds and tests run on linux x86-64 and macOS arm64; on linux aarch64
-wolf 0.2.32 builds no tier (wolf-lang#614) and CI asserts the refusal
+wolf builds no tier at the pin (wolf-lang#614) and CI asserts the refusal
 by name, as pelt does. The oracle builds everywhere.
 
 ## The rules in brief
