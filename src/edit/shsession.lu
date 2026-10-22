@@ -1,37 +1,1083 @@
-//! edit.shsession — the persistent shell session (Sprint 57.27), as far as
-//! wolf 0.2.33 lets it run: not at all.
+//! edit.shsession — the persistent shell session (Sprint 57.27).
 //!
-//! Ports the queries of sagitta `src/edit/shsession.c` (1,187 lines) and
-//! `shsession.h` (126) at 9ace98c2 that the rest of the editor asks. The
-//! session is one long-lived `$SHELL -s` per editor, a FRAMED job whose
-//! output pipe the loop reads while it paints (`shsession.h:4-19`); at
-//! 0.2.33 there is no wait over the tty and N job pipes (G2,
-//! wolf-lang#795), so the session STOPs by name (ruling R-yw04-1) and
-//! every query answers what C answers with no session state
-//! (`shsession.h:93-99`): the workspace root and the process environment.
+//! Ports sagitta `src/edit/shsession.c` (1,187 lines) and `shsession.h`
+//! (126) at 9ace98c2: one long-lived `$SHELL -s` per editor that every
+//! plain `:!cmd` runs inside, so `cd`, `export` and functions persist
+//! (`shell.session = persistent`, the default; `fresh` is Sprint 19's
+//! `$SHELL -c`). The session is a FRAMED job (`edit.job`'s
+//! `FRAMED_SESSION` kind) whose stdin carries one line per command and
+//! whose stdout the loop reads while it paints (`os_signal_wait_fds`, G2);
+//! each command is a PROXY job with its own `*job:N*` buffer and `*jobs*`
+//! row. THE FRAME, the probe, the nonce, fd 9, `yew --yew-env0`'s record
+//! and the named limits are C's (`shsession.h:14-73`), byte for byte.
+//!
+//! **The shape.** C's link is an owner object the job layer destroys; a
+//! detached link (`l->s == NULL`) ignores every byte. Here the session
+//! (`ed.shsession`) holds ONE live link and the id of the shell job it
+//! belongs to: a byte from any other job's pipe is a detached link's,
+//! ignored. The link's transmit side is written at once, blocking, where
+//! C queues it for `POLLOUT`: a frame is written only to an idle shell
+//! (refused while busy) blocked in its read of stdin, which takes the
+//! whole line before it runs any of it, so the write cannot meet a shell
+//! blocked writing output.
+
+use std.signal
+use util
+use std.env as std_env
+use std.fs
+
+/// A second cancel inside this window escalates to SIGKILL
+/// (`YEW_SHSESSION_ESCALATE_MS`).
+pub const SHSESSION_ESCALATE_MS: int = 2000
+
+/// The largest env record accepted (`YEW_SHSESSION_ENV_MAX`).
+pub const SHSESSION_ENV_MAX: int = 8388608
+
+// `SH_MARK`, `SH_HEAD_MAX` (`shsession.c:28-32`).
+const SS_MARK: int = 30
+
+const SS_HEAD_MAX: int = 32
+
+// `RxState` (`shsession.c:34-41`).
+const RX_OUT: int = 0
+
+const RX_STATUS: int = 1
+
+const RX_HEAD: int = 2
+
+const RX_BODY: int = 3
+
+const RX_TAIL: int = 4
+
+const RX_SKIP: int = 5
+
+/// `ShLink` (`shsession.c:65-90`): the live shell's transport.
+pub struct ShLink {
+    job_id: int,
+    nonce: str,
+    word: str,
+    pending: str,
+    pending_env: str,
+    has_pending: bool,
+    self_exe: str,
+    has_self: bool,
+    seq: int,
+    open: bool,
+    st: int,
+    hold: List[byte],
+    mark: List[byte],
+    end: List[byte],
+    num: List[byte],
+    status: int,
+    have_status: bool,
+    envb: List[byte],
+    env_want: int,
+}
+
+fn ss_link_new() -> ShLink {
+    ShLink {
+        job_id: 0,
+        nonce: "",
+        word: "",
+        pending: "",
+        pending_env: "",
+        has_pending: false,
+        self_exe: "",
+        has_self: false,
+        seq: 0,
+        open: false,
+        st: RX_OUT,
+        hold: List[byte](),
+        mark: List[byte](),
+        end: List[byte](),
+        num: List[byte](),
+        status: 0,
+        have_status: false,
+        envb: List[byte](),
+        env_want: 0,
+    }
+}
+
+/// `YewShSession` (`shsession.c:45-63`).
+pub struct ShSession {
+    link: ShLink,
+    has_link: bool,
+    job_id: int,
+    dead: List[int],
+    cwd: str,
+    has_cwd: bool,
+    env: List[str],
+    has_env: bool,
+    proxy_id: int,
+    cancel_ms: int,
+    end_why: str,
+    has_end_why: bool,
+    warned: bool,
+    salt: int,
+}
+
+/// No session yet (`session_get`'s calloc).
+pub fn shsession_new() -> ShSession {
+    ShSession {
+        link: ss_link_new(),
+        has_link: false,
+        job_id: 0,
+        dead: List[int](),
+        cwd: "",
+        has_cwd: false,
+        env: List[str](),
+        has_env: false,
+        proxy_id: 0,
+        cancel_ms: 0,
+        end_why: "",
+        has_end_why: false,
+        warned: false,
+        salt: 0,
+    }
+}
+
+fn ss_bytes(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn ss_put(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn ss_clear(mut b: List[byte]) {
+    while b.len > 0 {
+        let _ = (mut b).pop()
+    }
+}
+
+// ------------------------------------------------------------------
+// Session state
+// ------------------------------------------------------------------
 
 /// `shell.session` is `persistent` (`session_persistent`,
-/// `shsession.c:117-125`; C's default `YEW_SHELL_SESSION_DEFAULT`,
-/// `option.c:117-119`): the literal option store until yw09.
+/// `shsession.c:117-125`): the literal option store until yw09.
 pub fn shsession_persistent(ed: Ed) -> bool {
     let v = ed.opts.store["shell.session"] else "persistent"
     v != "fresh"
 }
 
-/// `yew_shsession_busy` (`shsession.c:172-176`): no session ever runs.
-pub fn shsession_busy(ed: Ed) -> bool {
-    let _ = ed.win
+// `shell_supported` (`shsession.c:127-141`).
+fn ss_shell_supported() -> bool {
+    let sh = job_shell()
+    let slash = sh.rfind("/") else -1
+    let base = if slash >= 0 then sh[slash + 1..] else sh
+    for o in ["fish", "nu", "xonsh", "elvish", "pwsh"] {
+        if base == o {
+            return false
+        }
+    }
+    true
+}
+
+/// `yew_shsession_wanted` (`shsession.c:143-159`): persistent and a
+/// POSIX-family `$SHELL`; an unsupported shell is announced once.
+pub fn shsession_wanted(mut ed: Ed) -> bool {
+    if !shsession_persistent(ed) {
+        return false
+    }
+    if ss_shell_supported() {
+        return true
+    }
+    if !ed.shsession.warned {
+        ed.shsession.warned = true
+        ed_msg(mut ed, MSG_WARN, "shell session needs a POSIX-family $SHELL; running each :! fresh")
+    }
     false
 }
 
-/// `yew_shsession_cwd` (`shsession.c:178-186`): with no session state,
-/// the workspace root.
+// `session_proxy` (`shsession.c:161-170`): the running command's job slot,
+// or -1 (and the id forgotten).
+fn ss_proxy(mut ed: Ed) -> int {
+    let id = ed.shsession.proxy_id
+    let i = if id != 0 then job_find(ed, id) else -1
+    if i < 0 || ed.jobs.v[i].state != JOB_RUNNING || ed.jobs.v[i].reaped {
+        ed.shsession.proxy_id = 0
+        return -1
+    }
+    i
+}
+
+fn ss_proxy_peek(ed: Ed) -> int {
+    let id = ed.shsession.proxy_id
+    let i = if id != 0 then job_find(ed, id) else -1
+    if i < 0 || ed.jobs.v[i].state != JOB_RUNNING || ed.jobs.v[i].reaped {
+        return -1
+    }
+    i
+}
+
+/// `yew_shsession_busy` (`shsession.c:172-176`): a command runs inside.
+pub fn shsession_busy(ed: Ed) -> bool {
+    ss_proxy_peek(ed) >= 0
+}
+
+/// `yew_shsession_cwd` (`shsession.c:178-186`): the directory the session
+/// last reported; with no state, the workspace root.
 pub fn shsession_cwd(ed: Ed) -> str {
+    if ed.shsession.has_cwd && shsession_persistent(ed) {
+        return ed.shsession.cwd
+    }
     shell_ws_root(ed)
 }
 
-/// `yew_shsession_run` (`shsession.c`): the session's frame is a job
-/// whose pipes are read while the loop runs — the refusal (R-yw04-1).
-pub fn shsession_run_refusal() -> str {
-    job_stop_g2("the persistent shell session")
+/// `yew_shsession_env` (`shsession.c:188-194`): the exports it last
+/// reported, `(false, …)` for "the standard job environment".
+pub fn shsession_env(ed: Ed) -> (bool, List[str]) {
+    if !ed.shsession.has_env || !shsession_persistent(ed) {
+        return (false, List[str]())
+    }
+    (true, copy ed.shsession.env)
+}
+
+/// `yew_shsession_job` (`shsession.c:196-200`): the shell's own job id.
+pub fn shsession_job(ed: Ed) -> int {
+    ed.shsession.job_id
+}
+
+// environ's SHLVL row (`parent_shlvl`, `shsession.c:202-212`).
+fn ss_parent_shlvl() -> (bool, str) {
+    for r in std_env.vars() {
+        if r.starts_with("SHLVL=") {
+            return (true, r)
+        }
+    }
+    (false, "")
+}
+
+// `session_adopt` (`shsession.c:214-263`): cwd, then NAME=value rows; the
+// session's SHLVL is replaced by yew's. A record that is not
+// NUL-terminated rows leaves the state untouched. A row that is not
+// UTF-8 cannot be a wolf environment row (G40's kin) and is dropped.
+fn ss_adopt(mut ed: Ed, rec: List[byte]) -> bool {
+    if rec.len == 0 || rec[rec.len - 1] as int != 0 {
+        return false
+    }
+    let (has_lvl, shlvl) = ss_parent_shlvl()
+    var rows = List[str]()
+    var at = 0
+    var first = true
+    while at < rec.len {
+        var e = at
+        while e < rec.len && rec[e] as int != 0 {
+            e += 1
+        }
+        var piece = List[byte]()
+        var k = at
+        while k < e {
+            (mut piece).push(rec[k])
+            k += 1
+        }
+        at = e + 1
+        let row = str_from_utf8(piece) else |_| {
+            first = false
+            continue
+        }
+        if first {
+            first = false
+            if row.len != 0 && row.starts_with("/") {
+                ed.shsession.cwd = row
+                ed.shsession.has_cwd = true
+            }
+            continue
+        }
+        let eq = row.find("=") else -1
+        if eq <= 0 || row.starts_with("_=") {
+            continue
+        }
+        if row.starts_with("SHLVL=") {
+            if has_lvl {
+                (mut rows).push(shlvl)
+            }
+            continue
+        }
+        (mut rows).push(row)
+    }
+    ed.shsession.env = rows
+    ed.shsession.has_env = true
+    true
+}
+
+// ------------------------------------------------------------------
+// The link: transmit side
+// ------------------------------------------------------------------
+
+// `link_arm` (`shsession.c:271-286`).
+fn ss_arm(mut l: ShLink) {
+    ss_clear(mut l.mark)
+    (mut l.mark).push(SS_MARK as byte)
+    ss_put(mut l.mark, "{l.nonce}-{l.seq} ")
+    ss_clear(mut l.end)
+    (mut l.end).push(SS_MARK as byte)
+    ss_put(mut l.end, "{l.nonce}-{l.seq}.")
+    (mut l.end).push(SS_MARK as byte)
+    l.open = true
+    l.st = RX_OUT
+    ss_clear(mut l.hold)
+    l.have_status = false
+    ss_clear(mut l.num)
+}
+
+// `link_put_tail` (`shsession.c:288-318`): the status marker, the env
+// record and the end marker for frame `seq`.
+fn ss_put_tail(mut out: List[byte], l: ShLink, status_expr: str, between: str) {
+    let tag = "'{l.nonce}-{l.seq}'"
+    ss_put(mut out, l.word)
+    ss_put(mut out, "printf '\\036%s %d\\036' ")
+    ss_put(mut out, tag)
+    ss_put(mut out, " ")
+    ss_put(mut out, status_expr)
+    ss_put(mut out, " >&9; ")
+    ss_put(mut out, between)
+    if l.has_self {
+        let q = shell_quote(ss_bytes(l.self_exe))
+        for b in q {
+            (mut out).push(b)
+        }
+        ss_put(mut out, " --yew-env0 </dev/null >&9; ")
+    }
+    ss_put(mut out, l.word)
+    ss_put(mut out, "printf '\\036%s.\\036' ")
+    ss_put(mut out, tag)
+    ss_put(mut out, " >&9\n")
+}
+
+// Write `bytes` to the live shell's stdin (C's `link_tx_view` /
+// `link_tx_consume` under `POLLOUT`, written at once: see the header).
+fn ss_tx(mut ed: Ed, bytes: List[byte]) {
+    let i = job_find(ed, ed.shsession.job_id)
+    if i < 0 || ed.jobs.v[i].in_fd < 0 {
+        return
+    }
+    fs_write_chunk(ed.jobs.v[i].in_fd, bytes) else |_| {
+        ed.jobs.v[i].framed_failed = true
+        ed.jobs.v[i].in_fd = jb_close_fd(ed.jobs.v[i].in_fd)
+    }
+}
+
+// `link_send` (`shsession.c:332-355`): one command's line. The command
+// runs inside a function whose INT trap RETURNS (a cancelled `sleep 9;
+// make install` would otherwise install), defined again on every line;
+// `$#` is 0, as under `$SHELL -c`.
+fn ss_send(mut ed: Ed, cmdline: str, rows: str) {
+    ed.shsession.link.seq += 1
+    ss_arm(mut ed.shsession.link)
+    let l = copy ed.shsession.link
+    var out = List[byte]()
+    if rows.len != 0 {
+        ss_put(mut out, l.word)
+        ss_put(mut out, "export")
+        ss_put(mut out, rows)
+        ss_put(mut out, "; ")
+    }
+    ss_put(mut out, "__yew_run() {{ trap 'return 130' INT; ")
+    ss_put(mut out, l.word)
+    ss_put(mut out, "eval \"$__yew_c\"; }}; __yew_c=")
+    for b in shell_quote(ss_bytes(cmdline)) {
+        (mut out).push(b)
+    }
+    ss_put(mut out, "; __yew_run </dev/null 9>&-; ")
+    let between = "{l.word}trap : INT; {l.word}unset __yew_c; "
+    ss_put_tail(mut out, l, "\"$?\"", between)
+    ss_tx(mut ed, out)
+}
+
+// `link_prologue` (`shsession.c:357-378`): written once, first thing.
+// Frame 0 probes which prefix makes `eval` exit-safe and function-proof
+// (0: `command`, 1: `builtin`, 2: neither); its output is discarded.
+fn ss_prologue(mut ed: Ed) {
+    var out = List[byte]()
+    ss_put(mut out, "exec 2>&1\n")
+    ss_put(mut out, "trap : INT\n")
+    ss_put(mut out, "set +m\n")
+    ss_put(mut out, "exec 9>&1\n")
+    ed.shsession.link.seq = 0
+    ss_arm(mut ed.shsession.link)
+    ss_put(
+        mut out,
+        "if command eval : 2>/dev/null; then __yew_w=0; elif builtin eval : 2>/dev/null; then __yew_w=1; else __yew_w=2; fi </dev/null 9>&-; ",
+    )
+    let l = copy ed.shsession.link
+    ss_put_tail(mut out, l, "\"$__yew_w\"", "unset __yew_w; ")
+    ss_tx(mut ed, out)
+}
+
+// ------------------------------------------------------------------
+// The link: receive side
+// ------------------------------------------------------------------
+
+// `link_output` (`shsession.c:399-410`): output belongs to the running
+// command; between frames and in the probe frame, to nobody.
+fn ss_output(mut ed: Ed, bytes: List[byte]) {
+    if bytes.len == 0 ||
+        !ed.shsession.has_link ||
+        ed.shsession.link.seq == 0 ||
+        !ed.shsession.link.open {
+        return
+    }
+    let p = ss_proxy(mut ed)
+    if p >= 0 {
+        job_proxy_output(mut ed, ed.jobs.v[p].id, bytes)
+    }
+}
+
+// `frame_wait` (`shsession.c:412-428`): ksh93's `256 + N` is a signal
+// death; after a cancel, `128 + N` is one too.
+fn ss_frame_wait(ed: Ed, status0: int) -> JobWait {
+    var status = status0
+    if status > 255 {
+        status = 128 + (status - 256)
+    }
+    if ed.shsession.cancel_ms != 0 && status > 128 && status < 128 + 64 {
+        return JobWait { state: JOB_SIGNALED, exit_code: 0, termsig: status - 128, exec_errno: 0 }
+    }
+    JobWait { state: JOB_EXITED, exit_code: status, termsig: 0, exec_errno: 0 }
+}
+
+// `link_frame_done` (`shsession.c:430-475`).
+fn ss_frame_done(mut ed: Ed, env_ok: bool) {
+    ed.shsession.link.open = false
+    ed.shsession.link.st = RX_OUT
+    ss_clear(mut ed.shsession.link.hold)
+    if env_ok {
+        let rec = copy ed.shsession.link.envb
+        if !ss_adopt(mut ed, rec) {
+            util.log_warn("shell session: malformed env record")
+        }
+    }
+    ss_clear(mut ed.shsession.link.envb)
+    if ed.shsession.link.seq == 0 {
+        let st = ed.shsession.link.status
+        ed.shsession.link.word = if st == 0 then "command " else if st == 1 then "builtin " else ""
+        if ed.shsession.link.has_pending {
+            let cmd = ed.shsession.link.pending
+            let rows = ed.shsession.link.pending_env
+            ed.shsession.link.has_pending = false
+            ed.shsession.link.pending = ""
+            ed.shsession.link.pending_env = ""
+            ss_send(mut ed, cmd, rows)
+        }
+        return
+    }
+    let p = ss_proxy(mut ed)
+    let w = ss_frame_wait(ed, ed.shsession.link.status)
+    if p >= 0 {
+        job_proxy_end(mut ed, ed.jobs.v[p].id, true, w)
+    }
+    ed.shsession.proxy_id = 0
+    ed.shsession.cancel_ms = 0
+}
+
+// `prefix_match` (`shsession.c:477-489`): -1 no, 0 a proper prefix, 1
+// all of `pat`, over `b[at, n)`.
+fn ss_prefix_match(b: List[byte], at: int, n: int, pat: List[byte]) -> int {
+    if pat.len == 0 {
+        return -1
+    }
+    let have = n - at
+    let k = if have < pat.len then have else pat.len
+    var i = 0
+    while i < k {
+        if b[at + i] != pat[i] {
+            return -1
+        }
+        i += 1
+    }
+    if have >= pat.len then 1 else 0
+}
+
+// `find_marker` (`shsession.c:491-513`): `pat`'s offset in `b[at, n)`, or
+// a partial match's at the tail (`partial`), or `n`.
+fn ss_find_marker(b: List[byte], at0: int, n: int, pat: List[byte]) -> (int, bool) {
+    var at = at0
+    while at < n {
+        if b[at] as int != SS_MARK {
+            at += 1
+            continue
+        }
+        let m = ss_prefix_match(b, at, n, pat)
+        if m == 1 {
+            return (at, false)
+        }
+        if m == 0 {
+            return (at, true)
+        }
+        at += 1
+    }
+    (n, false)
+}
+
+// `head_parse` (`shsession.c:515-531`): "YEW0 <digits>".
+fn ss_head_parse(s: List[byte]) -> (bool, int) {
+    if s.len < 6 {
+        return (false, 0)
+    }
+    let pfx = "YEW0 "
+    var i = 0
+    while i < 5 {
+        if s[i] != pfx.bytes()[i] {
+            return (false, 0)
+        }
+        i += 1
+    }
+    var v = 0
+    while i < s.len {
+        let c = s[i] as int
+        if c < 48 || c > 57 || v > 99999999999 {
+            return (false, 0)
+        }
+        v = v * 10 + c - 48
+        i += 1
+    }
+    (true, v)
+}
+
+fn ss_slice(b: List[byte], lo: int, hi: int) -> List[byte] {
+    var out = List[byte]()
+    var i = lo
+    while i < hi {
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+// `link_scan` (`shsession.c:533-660`): one pass over `b`; answers how
+// many bytes were consumed (a partial marker at the end is left).
+fn ss_scan(mut ed: Ed, b: List[byte]) -> int {
+    let n = b.len
+    var i = 0
+    while i < n {
+        if !ed.shsession.has_link || !ed.shsession.link.open {
+            // Between frames: a background job's bytes, nobody's.
+            return n
+        }
+        let st = ed.shsession.link.st
+        if st == RX_OUT {
+            let mark = copy ed.shsession.link.mark
+            let (at, partial) = ss_find_marker(b, i, n, mark)
+            ss_output(mut ed, ss_slice(b, i, at))
+            i = at
+            if partial {
+                return i
+            }
+            if i < n {
+                i += mark.len
+                ed.shsession.link.st = RX_STATUS
+                ss_clear(mut ed.shsession.link.num)
+            }
+        } else if st == RX_STATUS {
+            let c = b[i] as int
+            i += 1
+            if c == SS_MARK {
+                let num = copy ed.shsession.link.num
+                var v = 0
+                var ok = num.len != 0
+                for d in num {
+                    let x = d as int
+                    if x < 48 || x > 57 {
+                        ok = false
+                    } else {
+                        v = v * 10 + x - 48
+                    }
+                    if v > 65535 {
+                        ok = false
+                    }
+                }
+                if !ok {
+                    ss_abandon(mut ed, true, "shell session lost its frame")
+                    return n
+                }
+                ed.shsession.link.status = v
+                ed.shsession.link.have_status = true
+                ed.shsession.link.st = RX_HEAD
+                ss_clear(mut ed.shsession.link.num)
+            } else if ed.shsession.link.num.len < SS_HEAD_MAX {
+                (mut ed.shsession.link.num).push(c as byte)
+            } else {
+                ss_abandon(mut ed, true, "shell session lost its frame")
+                return n
+            }
+        } else if st == RX_HEAD {
+            let c = b[i] as int
+            if c == 58 {
+                i += 1
+                let (ok, want) = ss_head_parse(ed.shsession.link.num)
+                if !ok || want > SHSESSION_ENV_MAX {
+                    ed.shsession.link.st = RX_SKIP
+                } else {
+                    ed.shsession.link.env_want = want
+                    ss_clear(mut ed.shsession.link.envb)
+                    ed.shsession.link.st = if want == 0 then RX_TAIL else RX_BODY
+                }
+            } else if c == SS_MARK ||
+                c < 32 ||
+                c > 126 ||
+                ed.shsession.link.num.len >= SS_HEAD_MAX {
+                // Not a record (no helper, or it failed): the byte may
+                // open the end marker, so it is not consumed.
+                ed.shsession.link.st = RX_SKIP
+            } else {
+                (mut ed.shsession.link.num).push(c as byte)
+                i += 1
+            }
+        } else if st == RX_BODY {
+            let left = ed.shsession.link.env_want - ed.shsession.link.envb.len
+            let n_take = if n - i < left then n - i else left
+            var k = 0
+            while k < n_take {
+                (mut ed.shsession.link.envb).push(b[i + k])
+                k += 1
+            }
+            i += n_take
+            if ed.shsession.link.envb.len == ed.shsession.link.env_want {
+                ed.shsession.link.st = RX_TAIL
+            }
+        } else if st == RX_TAIL {
+            let end = copy ed.shsession.link.end
+            let m = ss_prefix_match(b, i, n, end)
+            if m == 0 {
+                return i
+            }
+            if m == 1 {
+                i += end.len
+                ss_frame_done(mut ed, true)
+            } else {
+                ss_clear(mut ed.shsession.link.envb)
+                ed.shsession.link.st = RX_SKIP
+            }
+        } else {
+            let end = copy ed.shsession.link.end
+            let (at, partial) = ss_find_marker(b, i, n, end)
+            i = at
+            if partial || i >= n {
+                return i
+            }
+            i += end.len
+            ss_frame_done(mut ed, false)
+        }
+    }
+    i
+}
+
+/// `link_feed` (`shsession.c:662-689`): the shell job `job_id`'s stdout;
+/// a split marker waits in the hold for the next read. A job that is not
+/// the live link's is a detached link's: ignored.
+pub fn shsession_link_feed(mut ed: Ed, job_id: int, bytes: List[byte]) -> bool {
+    if !ed.shsession.has_link || ed.shsession.link.job_id != job_id || bytes.len == 0 {
+        return true
+    }
+    var work = copy ed.shsession.link.hold
+    for b in bytes {
+        (mut work).push(b)
+    }
+    ss_clear(mut ed.shsession.link.hold)
+    let used = ss_scan(mut ed, work)
+    if used < work.len && ed.shsession.has_link && ed.shsession.link.job_id == job_id {
+        var k = used
+        while k < work.len {
+            (mut ed.shsession.link.hold).push(work[k])
+            k += 1
+        }
+    }
+    true
+}
+
+/// `link_finish` (`shsession.c:691-700`): a held partial marker was
+/// output after all.
+pub fn shsession_link_finish(mut ed: Ed, job_id: int) -> bool {
+    if ed.shsession.has_link && ed.shsession.link.job_id == job_id {
+        if ed.shsession.link.st == RX_OUT && ed.shsession.link.hold.len != 0 {
+            let h = copy ed.shsession.link.hold
+            ss_output(mut ed, h)
+        }
+        ss_clear(mut ed.shsession.link.hold)
+    }
+    true
+}
+
+/// `link_destroy` (`shsession.c:702-714`): the job layer is done with the
+/// shell job `job_id`'s link.
+pub fn shsession_link_destroy(mut ed: Ed, job_id: int) {
+    if ed.shsession.has_link && ed.shsession.link.job_id == job_id {
+        ed.shsession.has_link = false
+        ed.shsession.link = ss_link_new()
+    }
+}
+
+// ------------------------------------------------------------------
+// Lifecycle
+// ------------------------------------------------------------------
+
+// `make_nonce` (`shsession.c:724-762`): 16 bytes of /dev/urandom in hex;
+// without it, splitmix64 over the clock, the pid and a counter.
+fn ss_make_nonce(mut ed: Ed) -> str {
+    var raw = List[byte]()
+    var f = fs.open("/dev/urandom") else |_| { fs.stdin() }
+    if f.fd != 0 {
+        raw = fs.read_chunk(mut f, 16) else List[byte]()
+        fs.close(take f) else |_| {}
+    }
+    if raw.len < 16 {
+        raw = List[byte]()
+        ed.shsession.salt += 1
+        var x = time_now_ms() * 2654435761 + os_pid() * 40503 + ed.shsession.salt
+        var i = 0
+        while i < 16 {
+            x = (x * 1103515245 + 12345) % 2147483648
+            (mut raw).push((x / 65536 % 256) as byte)
+            i += 1
+        }
+    }
+    let hex = "0123456789abcdef"
+    var out = ""
+    for b in raw {
+        let v = b as int
+        out += hex[v / 16..v / 16 + 1]
+        out += hex[v % 16..v % 16 + 1]
+    }
+    out
+}
+
+// `session_detach` (`shsession.c:764-781`): detach the live shell, kill
+// its group, keep its job for reaping.
+fn ss_detach(mut ed: Ed, kill_it: bool) {
+    let i = if ed.shsession.job_id != 0 then job_find(ed, ed.shsession.job_id) else -1
+    if ed.shsession.has_link {
+        ed.shsession.has_link = false
+        ed.shsession.link = ss_link_new()
+    }
+    if i >= 0 {
+        if kill_it && ed.jobs.v[i].pgid > 0 && job_pending(ed.jobs.v[i]) {
+            os_signal_send_group(ed.jobs.v[i].pgid, signal.kill()) else |_| {}
+        }
+        if ed.shsession.dead.len < JOB_MAX {
+            (mut ed.shsession.dead).push(ed.shsession.job_id)
+        }
+    }
+    ed.shsession.job_id = 0
+}
+
+// `session_end_proxy` (`shsession.c:783-792`).
+fn ss_end_proxy(mut ed: Ed, w: JobWait) {
+    let p = ss_proxy(mut ed)
+    if p >= 0 {
+        job_proxy_end(mut ed, ed.jobs.v[p].id, true, w)
+    }
+    ed.shsession.proxy_id = 0
+    ed.shsession.cancel_ms = 0
+}
+
+// `session_abandon` (`shsession.c:794-807`): kill the shell now; its
+// running command is CANCELLED. Safe inside a feed: nothing releases.
+fn ss_abandon(mut ed: Ed, has_why: bool, why: str) {
+    ss_end_proxy(mut ed, JobWait { state: JOB_CANCELLED, exit_code: 0, termsig: 0, exec_errno: 0 })
+    ss_detach(mut ed, true)
+    ed.shsession.end_why = why
+    ed.shsession.has_end_why = has_why
+}
+
+/// `proxy_signal` (`shsession.c:809-833`): a cancel is SIGINT to the
+/// session's group (the prologue's `trap : INT` keeps the shell); a
+/// second inside `SHSESSION_ESCALATE_MS`, or a kill, ends the session.
+pub fn shsession_proxy_signal(mut ed: Ed, id: int, meaning: int) -> bool {
+    let now = now_ms()
+    if id != ed.shsession.proxy_id || ed.shsession.job_id == 0 {
+        return false
+    }
+    let si = job_find(ed, ed.shsession.job_id)
+    if si < 0 || ed.jobs.v[si].pgid <= 0 || ed.jobs.v[si].state != JOB_RUNNING {
+        return false
+    }
+    if meaning == signal.kill() ||
+        ed.shsession.cancel_ms != 0 && now - ed.shsession.cancel_ms < SHSESSION_ESCALATE_MS {
+        ss_abandon(mut ed, true, "shell session ended")
+        return true
+    }
+    os_signal_send_group(ed.jobs.v[si].pgid, signal.interrupt()) else |_| { return false }
+    ed.shsession.cancel_ms = now
+    true
+}
+
+// `dir_usable` (`shsession.c:837-843`).
+fn ss_dir_usable(path: str) -> bool {
+    if path.len == 0 || !path.starts_with("/") {
+        return false
+    }
+    let info = fs.stat(path) else |_| { return false }
+    info.kind == 1
+}
+
+// `session_start` (`shsession.c:845-904`).
+fn ss_start(mut ed: Ed) -> (bool, str) {
+    if ed.shsession.has_cwd && !ss_dir_usable(ed.shsession.cwd) {
+        ed.shsession.has_cwd = false
+        ed.shsession.cwd = ""
+    }
+    let cwd = if ed.shsession.has_cwd then ed.shsession.cwd else shell_ws_root(ed)
+    var l = ss_link_new()
+    l.nonce = ss_make_nonce(mut ed)
+    let (has_self, exe) = job_self_exe()
+    l.has_self = has_self
+    l.self_exe = exe
+    if !has_self {
+        util.log_warn("shell session: cannot find yew for --yew-env0; cd and export will not carry")
+    }
+    var spec = job_spec_new()
+    (mut spec.argv).push(job_shell())
+    (mut spec.argv).push("-s")
+    spec.cwd = cwd
+    spec.has_cwd = true
+    spec.sink = SINK_FRAMED
+    spec.display = "shell session"
+    spec.has_display = true
+    spec.internal = true
+    if ed.shsession.has_env {
+        spec.env_base = copy ed.shsession.env
+        spec.has_env_base = true
+    }
+    (mut spec.env_set).push("PWD={cwd}")
+    spec.framed = FRAMED_SESSION
+    let (id, err) = job_spawn(mut ed, spec)
+    if id == 0 {
+        return (false, err)
+    }
+    l.job_id = id
+    ed.shsession.link = l
+    ed.shsession.has_link = true
+    ed.shsession.job_id = id
+    ss_prologue(mut ed)
+    (true, "")
+}
+
+// `frame_rows` (`shsession.c:906-936`): YEW_FILE, YEW_LINE, YEW_COL —
+// where the caret is NOW — as ` 'NAME=value'` words for the `export`.
+fn ss_frame_rows(mut ed: Ed) -> str {
+    var out = List[byte]()
+    for row in job_env(mut ed, false) {
+        for name in ["YEW_FILE=", "YEW_LINE=", "YEW_COL="] {
+            if row.starts_with(name) {
+                (mut out).push(32 as byte)
+                for b in shell_quote(ss_bytes(row)) {
+                    (mut out).push(b)
+                }
+            }
+        }
+    }
+    str_from_utf8(out) else ""
+}
+
+/// `yew_shsession_run` (`shsession.c:938-986`): run `cmdline` inside the
+/// session, starting one if there is none. Answers the command's proxy
+/// job id (its buffer is the caller's to attach), or 0 and why; refused
+/// while busy.
+pub fn shsession_run(mut ed: Ed, cmdline: str) -> (int, str) {
+    shsession_settle(mut ed)
+    if ss_proxy(mut ed) >= 0 {
+        return (0, "shell session is busy")
+    }
+    if !ed.shsession.has_link {
+        if ed.shsession.job_id != 0 {
+            ss_detach(mut ed, true)
+        }
+        let (ok, err) = ss_start(mut ed)
+        if !ok {
+            return (0, err)
+        }
+    }
+    var spec = job_spec_new()
+    spec.sink = SINK_BUFFER
+    spec.display = cmdline
+    spec.has_display = true
+    spec.cmdline = cmdline
+    spec.has_cmdline = true
+    spec.proxy = PROXY_SESSION
+    let (id, err) = job_spawn(mut ed, spec)
+    if id == 0 {
+        return (0, err)
+    }
+    ed.shsession.proxy_id = id
+    ed.shsession.cancel_ms = 0
+    let rows = ss_frame_rows(mut ed)
+    if ed.shsession.link.seq == 0 && ed.shsession.link.open {
+        // Still probing: the command goes the moment the probe ends.
+        ed.shsession.link.pending = cmdline
+        ed.shsession.link.pending_env = rows
+        ed.shsession.link.has_pending = true
+    } else {
+        ss_send(mut ed, cmdline, rows)
+    }
+    (id, "")
+}
+
+// `shell_wait` (`shsession.c:988-1004`): the shell's own verdict, for a
+// command it never finished.
+fn ss_shell_wait(ed: Ed, si: int) -> JobWait {
+    if si < 0 {
+        return JobWait { state: JOB_CANCELLED, exit_code: 0, termsig: 0, exec_errno: 0 }
+    }
+    let s = copy ed.jobs.v[si]
+    JobWait {
+        state: if s.state == JOB_RUNNING then JOB_CANCELLED else s.state,
+        exit_code: s.exit_code,
+        termsig: s.termsig,
+        exec_errno: s.exec_errno,
+    }
+}
+
+// `shell_output_pending` (`shsession.c:1006-1018`): the shell is gone but
+// its pipe may still hold what it wrote first.
+fn ss_output_pending(mut ed: Ed, si: int) -> bool {
+    if si < 0 || ed.jobs.v[si].out_fd < 0 {
+        return false
+    }
+    var fds = List[int]()
+    (mut fds).push(ed.jobs.v[si].out_fd)
+    loop {
+        let (which, m) = os_signal_wait_fds(fds, signal.child(), 0) else |_| { return false }
+        if which < 0 && m != 0 {
+            ed.jobs.child_seen = true
+            continue
+        }
+        return which == 0
+    }
+    false
+}
+
+/// `yew_shsession_settle` (`shsession.c:1020-1074`): after the job settle,
+/// a session whose shell is gone finishes its running command, says so
+/// once, and releases its job; abandoned shells are released once reaped.
+pub fn shsession_settle(mut ed: Ed) {
+    var k = 0
+    while k < ed.shsession.dead.len {
+        let i = job_find(ed, ed.shsession.dead[k])
+        if i >= 0 && !ed.jobs.v[i].reaped && ed.jobs.v[i].state == JOB_RUNNING {
+            k += 1
+            continue
+        }
+        if i >= 0 {
+            // Released with its pipes: a background child still holding
+            // one gets EPIPE, not a reader that never comes.
+            if ed.jobs.v[i].state == JOB_RUNNING {
+                ed.jobs.v[i].state = JOB_CANCELLED
+            }
+            job_release(mut ed, i)
+        }
+        let last = ed.shsession.dead.len - 1
+        ed.shsession.dead[k] = ed.shsession.dead[last]
+        let _ = (mut ed.shsession.dead).pop()
+        if ed.shsession.has_end_why {
+            ed_msg(mut ed, MSG_WARN, "{ed.shsession.end_why}; the next :! starts a new one")
+            ed.shsession.has_end_why = false
+            ed.shsession.end_why = ""
+        }
+    }
+    if ed.shsession.job_id == 0 {
+        return
+    }
+    let si = job_find(ed, ed.shsession.job_id)
+    if si >= 0 &&
+        (
+            !ed.jobs.v[si].reaped && ed.jobs.v[si].state == JOB_RUNNING ||
+                ss_output_pending(mut ed, si)
+        ) {
+        return
+    }
+    // The shell is gone (`exit`, `exec`, a death) and everything it wrote
+    // has been read: its running command ends with what is known.
+    var w = ss_shell_wait(ed, si)
+    if ed.shsession.has_link &&
+        ed.shsession.link.have_status &&
+        ed.shsession.link.seq != 0 &&
+        ed.shsession.link.open {
+        w = ss_frame_wait(ed, ed.shsession.link.status)
+    }
+    ss_end_proxy(mut ed, w)
+    ss_detach(mut ed, false)
+    // Finish the command first so its line does not cover this one.
+    let _ = job_settle(mut ed)
+    if w.state == JOB_EXECFAIL {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            "cannot start shell session: {job_shell()}: {exec_errno_text(w.exec_errno)}",
+        )
+    } else {
+        ed_msg(mut ed, MSG_INFO, "shell session ended; the next :! starts a new one")
+    }
+    shsession_settle(mut ed)
+}
+
+/// `yew_shsession_end` (`shsession.c:1076-1081`): end it now without a
+/// message; its last state is kept.
+pub fn shsession_end(mut ed: Ed) {
+    ss_abandon(mut ed, false, "")
+}
+
+/// `yew_shsession_reset` (`shsession.c:1083-1095`): `ed.shell.reset` —
+/// end it and forget its directory and exports.
+pub fn shsession_reset(mut ed: Ed) {
+    ss_abandon(mut ed, false, "")
+    ed.shsession.cwd = ""
+    ed.shsession.has_cwd = false
+    ed.shsession.env = List[str]()
+    ed.shsession.has_env = false
+}
+
+/// `yew_shsession_free` (`shsession.c:1097-1111`): editor teardown,
+/// before the job table's.
+pub fn shsession_free(mut ed: Ed) {
+    ss_detach(mut ed, true)
+}
+
+// ------------------------------------------------------------------
+// yew --yew-env0
+// ------------------------------------------------------------------
+
+// `env0_cwd` (`shsession.c:1132-1155`): the logical $PWD when it names
+// this directory, else the physical one.
+fn ss_env0_cwd() -> str {
+    let pwd = env_get("PWD") else ""
+    let here = os_cwd() else ""
+    if pwd.len != 0 && pwd.starts_with("/") {
+        let a = fs_realpath(pwd) else ""
+        let d = fs_realpath(".") else ""
+        if a.len != 0 && a == d {
+            return pwd
+        }
+    }
+    here
+}
+
+/// `yew_shsession_env0_main` (`shsession.c:1157-1187`): the frame's env
+/// record on stdout — `YEW0 <len>:`, the directory and every exported
+/// NAME=value, each NUL-terminated (`_`, this very command's path,
+/// skipped). Exit status.
+pub fn shsession_env0_main() -> int {
+    var rec = List[byte]()
+    ss_put(mut rec, ss_env0_cwd())
+    (mut rec).push(0 as byte)
+    for r in std_env.vars() {
+        if r.starts_with("_=") {
+            continue
+        }
+        ss_put(mut rec, r)
+        (mut rec).push(0 as byte)
+    }
+    var out = ss_bytes("YEW0 {rec.len}:")
+    for b in rec {
+        (mut out).push(b)
+    }
+    fs_write_chunk(1, out) else |_| { return 1 }
+    0
 }
