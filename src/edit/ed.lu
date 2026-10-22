@@ -74,12 +74,15 @@ pub struct Buffer {
     named: NamedMarks,
 }
 
-/// A tab (`Tab`, `ui/tabs.h`): the buffer it shows, its own window (C's
-/// one-leaf pane tree), its canonical path and the path it displays.
+/// A tab (`Tab`, `ui/tabs.h:36-62`): the buffer it was opened on, its own
+/// pane tree (`root`) and the focused leaf within it (`focus`), both
+/// indices into `Ed.panes` (`edit.layout`), its canonical path and the
+/// path it displays.
 pub struct Tab {
     tab_id: int,
     buffer_id: int,
-    win: int,
+    root: int,
+    focus: int,
     path: str,
     display_path: str,
     has_path: bool,
@@ -231,6 +234,21 @@ pub struct Ed {
     comp: CompState,
     regions: Regions,
     cmdedit: CmdEdit,
+    // yw05-panes: the pane-node pool (`edit.layout`) with its free list,
+    // the ACTIVE tab's tree (C's `ed->pane_root`, `ed->focus`), the
+    // per-frame leaf and split tables the region payloads index
+    // (`ed.h:193-196`), the border drag, and the released window slots a
+    // split reuses.
+    panes: List[Pane],
+    pane_free_head: int,
+    pane_root: int,
+    focus: int,
+    leaf_tab: List[int],
+    split_tab: List[int],
+    nleaf_tab: int,
+    nsplit_tab: int,
+    drag: PaneDrag,
+    win_free: List[int],
 }
 
 // The keymap pool's layout: mode keymaps (the panic floor, H's motions),
@@ -395,6 +413,16 @@ pub fn ed_new() -> Ed {
         comp: compstate_new(),
         regions: regions_new(),
         cmdedit: cmdedit_new(),
+        panes: List[Pane](),
+        pane_free_head: -1,
+        pane_root: -1,
+        focus: -1,
+        leaf_tab: List[int](),
+        split_tab: List[int](),
+        nleaf_tab: 0,
+        nsplit_tab: 0,
+        drag: panedrag_none(),
+        win_free: List[int](),
     }
     ed.chord_timeout_ms = dispatch_timeout_from_env()
     keys_highlight_install(mut ed, MODE_L)
@@ -489,12 +517,18 @@ pub fn ed_open_scratch(mut ed: Ed) {
     apply_win_opts(ed.opts, mut w)
     (mut ed.wins).push(w)
     ed.win = ed.wins.len - 1
+    // `ed.c:667-668`: the bootstrap window is the root leaf of the first
+    // tab's tree, and the focus.
+    let leaf = pane_new_leaf(mut ed, ed.win)
+    ed.pane_root = leaf
+    ed.focus = leaf
     let tid = ed.next_tab_id
     ed.next_tab_id += 1
     (mut ed.tabs).push(Tab {
         tab_id: tid,
         buffer_id: bid,
-        win: ed.win,
+        root: leaf,
+        focus: leaf,
         path: "",
         display_path: "",
         has_path: false,
@@ -607,6 +641,114 @@ pub fn ed_show_buffer(mut ed: Ed, bi: int) {
     ed.footer_dirty = true
     ed.drawn_cursor_line_valid = false
     ed.drawn_top_valid = false
+}
+
+/// `yew_ed_win_clone` (`ed.c:1106-1150`): a new view of the SAME buffer —
+/// the primary cursor and the scroll position copied, so a split opens
+/// showing what was already there; the jump list and the overlay fresh (a
+/// view that has been nowhere has no history, s21 §5). As C's, the copied
+/// number style is reset by `vp_init`. A released window's slot is reused
+/// before the list grows. Answers the window index, -1 for none.
+pub fn ed_win_clone(mut ed: Ed, src: int) -> int {
+    if src < 0 || src >= ed.wins.len {
+        return -1
+    }
+    let id = ed.next_win_id
+    ed.next_win_id += 1
+    var w = win_new(id, ed.wins[src].buf)
+    w.rect = copy ed.wins[src].rect
+    w.number_style = ed.wins[src].number_style
+    w.gutter_width = ed.wins[src].gutter_width
+    let n = ed.wins[src].cs.curs.len
+    let p = ed.wins[src].cs.primary
+    if n > 0 && p >= 0 && p < n {
+        w.cs = text.cset_init(copy ed.wins[src].cs.curs[p])
+    }
+    vp_init(mut w)
+    w.vp.top = ed.wins[src].vp.top
+    w.vp.top_sub = ed.wins[src].vp.top_sub
+    if ed.win_free.len > 0 {
+        let slot = (mut ed.win_free).pop() else -1
+        if slot >= 0 && slot < ed.wins.len {
+            ed.wins[slot] = w
+            return slot
+        }
+    }
+    (mut ed.wins).push(w)
+    ed.wins.len - 1
+}
+
+/// `yew_ed_win_release` (`ed.c:1186-1215`): the view is gone. C frees it;
+/// the port detaches the slot (id 0, no buffer: no lookup by id finds it)
+/// and keeps it for the next clone, so indices of the live windows never
+/// move.
+pub fn ed_win_release(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len || ed.wins[wi].id == 0 {
+        return
+    }
+    ed.wins[wi] = win_detached()
+    (mut ed.win_free).push(wi)
+}
+
+/// `yew_ed_win_set_buffer` (`ed.c:1159-1184`): window `wi` shows buffer
+/// index `bi` with a fresh view; the cursor is NOT carried over (its
+/// offset means nothing in another file).
+pub fn ed_win_set_buffer(mut ed: Ed, wi: int, bi: int) {
+    if wi < 0 || wi >= ed.wins.len || bi < 0 || ed.wins[wi].buf == bi {
+        return
+    }
+    ed.wins[wi].cs = text.cset_init(text.cursor_at(0 as text.ByteOff))
+    ed.wins[wi].buf = bi
+    vp_init(mut ed.wins[wi])
+}
+
+/// Whether some leaf of the tree at `root` shows window `wi`
+/// (`tabs_has_window`'s inner loop, `tabs.c:90-108`).
+pub fn tree_has_window(ed: Ed, root: int, wi: int) -> bool {
+    let leaves = pane_collect_leaves(ed, root, PANE_MAX_LEAVES * 2)
+    for l in leaves {
+        if ed.panes[l].win == wi {
+            return true
+        }
+    }
+    false
+}
+
+/// Whether some leaf of the tree at `root` shows buffer index `bi`
+/// (`cmdedit_pane_shows`, `cmdedit.c:273-288`).
+pub fn tree_shows_buffer(ed: Ed, root: int, bi: int) -> bool {
+    let leaves = pane_collect_leaves(ed, root, PANE_MAX_LEAVES * 2)
+    for l in leaves {
+        let w = ed.panes[l].win
+        if w >= 0 && w < ed.wins.len && ed.wins[w].buf == bi {
+            return true
+        }
+    }
+    false
+}
+
+/// The index of the tab whose tree shows window `wi`, or -1.
+pub fn tab_of_win(ed: Ed, wi: int) -> int {
+    var t = 0
+    while t < ed.tabs.len {
+        if tree_has_window(ed, ed.tabs[t].root, wi) {
+            return t
+        }
+        t += 1
+    }
+    -1
+}
+
+/// The window tab `idx`'s focused leaf shows (C's `t->focus->win`), or -1.
+pub fn tab_focus_win(ed: Ed, idx: int) -> int {
+    if idx < 0 || idx >= ed.tabs.len {
+        return -1
+    }
+    let f = ed.tabs[idx].focus
+    if !pane_live(ed, f) {
+        return -1
+    }
+    ed.panes[f].win
 }
 
 /// The tab's display basename (`tab_basename`, `tabs.c:642-660`).
