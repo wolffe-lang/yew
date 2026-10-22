@@ -255,6 +255,10 @@ pub struct Grid {
     cur_shape: int,
     cursor_generation: int,
     blank: Cell,
+    // A fill template's cluster bytes, read in place for its check (C
+    // reads the cell's own `utf8[]`, `grid.c:520-535`): reused, so a fill
+    // allocates nothing (yw05-hot, deliverable 6).
+    fill: List[byte],
 }
 
 fn damage_reset(mut g: Grid) {
@@ -345,11 +349,14 @@ fn cell_make(
         c.lo = lo
         c.hi = hi
     } else {
-        let text = str_from_utf8(s[at..at + n]) else {
+        // Interned by its bytes (`yew_intern(gi, bytes, n)`, `grid.c:93`):
+        // a cluster seen before costs no `str` (yw05-hot, deliverable 6).
+        let id = util.intern_bytes(mut gi, s, at, at + n)
+        if id == 0 {
             util.bug("term.grid", "cluster to intern is not UTF-8")
             return c
         }
-        c.lo = util.intern(mut gi, text)
+        c.lo = id
         c.flags = CELL_INTERNED
     }
     c
@@ -484,19 +491,71 @@ fn append_zero_width(mut g: Grid, row: int, col: int, s: List[byte], at: int, n:
     base_col + joined_width
 }
 
-fn put_ascii_expansion(
+// One printable ASCII byte `b` at `(row, col)`: `grid_put`'s path for a
+// one-byte, one-cell cluster (`grid.c:385-452`), the cell made from the
+// byte itself.
+fn put_ascii_cell(
     mut g: Grid,
     row: int,
-    col_in: int,
-    bytes: List[byte],
+    col: int,
+    b: int,
     fg: Color,
     bg: Color,
     attrs: int,
 ) -> int {
+    if row >= g.rows || col > g.cols {
+        return if col > g.cols then g.cols else col
+    }
+    if col == g.cols {
+        return col
+    }
+    let (lo, hi) = break_pair(mut g, row, col, col, col + 1)
+    var c = cell_blank()
+    c.fg = color_normalize(fg)
+    c.bg = color_normalize(bg)
+    c.attrs = attrs & CELL_ATTR_MASK
+    c.w = 1
+    c.lo = b
+    g.back[row * g.cols + col] = c
+    damage_add(mut g, row, lo, hi)
+    col + 1
+}
+
+// Byte `i` of a lowering (`control_expansion`'s `out[]`): `<XX>` of byte
+// `v` (kind 1) or `^X` of codepoint `v` (kind 2).
+fn lowered_byte(kind: int, v: int, i: int) -> int {
+    let hex = "0123456789ABCDEF"
+    if kind == 1 {
+        return match i {
+            0 => 60,
+            1 => hex.bytes()[v >> 4] as int,
+            2 => hex.bytes()[v & 15] as int,
+            _ => 62,
+        }
+    }
+    if i == 0 {
+        return 94
+    }
+    if v == 127 then 63 else v + 64
+}
+
+// `put_ascii_expansion` (`grid.c:231-240`): the lowering's bytes, a cell
+// each.
+fn put_ascii_expansion(
+    mut g: Grid,
+    row: int,
+    col_in: int,
+    kind: int,
+    v: int,
+    fg: Color,
+    bg: Color,
+    attrs: int,
+) -> int {
+    let n = if kind == 1 then 4 else 2
     var col = col_in
     var i = 0
-    while i < bytes.len && col < g.cols {
-        col = grid_put(mut g, row, col, bytes, i, i + 1, fg, bg, attrs)
+    while i < n && col < g.cols {
+        col = put_ascii_cell(mut g, row, col, lowered_byte(kind, v, i), copy fg, copy bg, attrs)
         i += 1
     }
     col
@@ -547,27 +606,21 @@ fn put_printable_ascii_run(
 }
 
 // A control, C1 or invalid byte lowered to printable cells
-// (`control_expansion`, `grid.c:272-297`): `<XX>` or `^X`. Answers
-// (lowered, the bytes, invalid).
-fn control_expansion(s: List[byte], at: int, n: int) -> (bool, List[byte], bool) {
+// (`control_expansion`, `grid.c:272-297`): `<XX>` or `^X`. C writes the
+// bytes into the caller's `u8 out[4]`; the port answers what they are made
+// of — (kind: 0 none, 1 `<XX>`, 2 `^X`; the byte or codepoint; invalid) —
+// so the common path, every printable cluster a frame puts, allocates
+// nothing (deliverable 6) and `lowered_byte` spells the bytes.
+fn control_expansion(s: List[byte], at: int, n: int) -> (int, int, bool) {
     let (cp, _) = unicode.utf8_decode(s, at, at + n)
     let invalid = unicode.utf8_is_escape(cp)
-    var out = List[byte]()
     if invalid || cp >= 128 && cp <= 159 {
-        let b = if invalid then unicode.utf8_escape_byte(cp) else cp
-        let hex = "0123456789ABCDEF"
-        (mut out).push(60 as byte)
-        (mut out).push(hex.bytes()[b >> 4])
-        (mut out).push(hex.bytes()[b & 15])
-        (mut out).push(62 as byte)
-        return (true, out, invalid)
+        return (1, if invalid then unicode.utf8_escape_byte(cp) else cp, invalid)
     }
     if cp <= 31 || cp == 127 {
-        (mut out).push(94 as byte)
-        (mut out).push((if cp == 127 then 63 else cp + 64) as byte)
-        return (true, out, false)
+        return (2, cp, false)
     }
-    (false, out, false)
+    (0, 0, false)
 }
 
 /// A grid of `rows` × `cols` blank cells with an unknown physical screen
@@ -588,6 +641,7 @@ pub fn grid_new(rows: int, cols: int) -> Grid {
         cur_shape: CURSOR_BLOCK,
         cursor_generation: 0,
         blank: cell_blank(),
+        fill: List[byte](),
     }
     let _ = grid_resize(mut g, rows, cols)
     g
@@ -685,13 +739,13 @@ pub fn grid_put(
         return col
     }
     let width = unicode.cluster_width(s, at, end)
-    let (lowered, expanded, invalid) = control_expansion(s, at, n)
-    if lowered {
+    let (lowered, lv, invalid) = control_expansion(s, at, n)
+    if lowered != 0 {
         var attrs = attrs_in
         if invalid {
             attrs = attrs | ATTR_INVALID_BYTE
         }
-        return put_ascii_expansion(mut g, row, col, expanded, fg, bg, attrs)
+        return put_ascii_expansion(mut g, row, col, lowered, lv, fg, bg, attrs)
     }
     if width == 0 {
         return append_zero_width(mut g, row, col, s, at, n)
@@ -820,16 +874,31 @@ pub fn grid_fill(mut g: Grid, row: int, c0: int, c1_in: int, template: Cell) {
         c.bg = color_normalize(c.bg)
         c.attrs = c.attrs & CELL_ATTR_MASK
         c.flags = c.flags & CELL_INTERNED
-        var data = List[byte]()
-        cell_bytes_into(mut data, g, c)
-        if cell_interned(c) && data.len == 0 {
+        // The template's cluster into the grid's `fill` bytes (C reads
+        // `c.utf8` or the interned string in place, `grid.c:520-535`).
+        while g.fill.len != 0 {
+            let _ = (mut g.fill).pop() else 0 as byte
+        }
+        if cell_interned(c) {
+            let interned = util.intern_str(g.gi, c.lo) else ""
+            for b in interned.bytes() {
+                (mut g.fill).push(b)
+            }
+        } else {
+            var k = 0
+            while k < 8 && cell_byte(c, k) != 0 {
+                (mut g.fill).push(cell_byte(c, k) as byte)
+                k += 1
+            }
+        }
+        if cell_interned(c) && g.fill.len == 0 {
             util.bug("term.grid", "grid fill contains invalid grapheme intern id {c.lo}")
             return
         }
-        if data.len != 0 &&
+        if g.fill.len != 0 &&
             (
-                unicode.gb_next_bytes(data, data.len, 0) != data.len ||
-                    unicode.cluster_width(data, 0, data.len) != 1
+                unicode.gb_next_bytes(g.fill, g.fill.len, 0) != g.fill.len ||
+                    unicode.cluster_width(g.fill, 0, g.fill.len) != 1
             ) {
             util.bug("term.grid", "grid fill requires one printable width-1 grapheme")
             return
