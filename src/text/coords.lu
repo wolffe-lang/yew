@@ -389,20 +389,35 @@ fn builder_none() -> Builder {
     }
 }
 
-// s255 (wolf-lang#821, `[mem.region.outer-write]`): a builder is made
-// over the index's spare pair, moved out of the index (a `List` field is
-// move-only) after a `reset` in place so its buffers stay the buffer's own
-// and grow once; when the scan is done the caller moves the pairs back
-// crosswise (`index_swap_in`'s shape, inlined: a helper taking the
-// builder would make `tb` keep another parameter's value and lose its
-// ambient-clean verdict). Nothing is allocated in the caller's region:
-// a builder over fresh lists was a turn's temporary only where the
-// caller sits in a per-turn region (the editor's render), and the text
-// engine's own callers — its tests, a script, the key dispatch — have
-// none (`text_coords_test`'s 200 appends caught that version at 16 MiB).
-// The old spare pair's placeholder (`List[T]()` stored while the pair
-// was out) was the one store the verdict refused; the move checker's
-// exit rule wants the fields back by the return, which the swap does.
+// s255 (wolf-lang#821, `[mem.region.outer-write]`): the index owns its
+// builder (`GraphemeIndex.spare`), emptied in place before a scan so its
+// buffers stay the buffer's own and grow once, and `index_swap` moves the
+// two pairs crosswise when the scan is done. Nothing is allocated in the
+// caller's region: a builder over fresh lists was a turn's temporary only
+// where the caller sits in a per-turn region (the editor's render), and
+// the text engine's own callers — its tests, a script, the key dispatch —
+// have none (`text_coords_test`'s 200 appends caught that version at
+// 16 MiB). The lists never leave `tb` (a `List` field is move-only, and a
+// moved field empties every read of `tb` until it is back), so the scan
+// that builds takes `mut tb` and consumes into `mut tb.graphemes.spare`;
+// the old spare pair's placeholder (`List[T]()` stored while the pair was
+// out) was the one store the ambient-clean verdict refused.
+fn builder_spare_begin(mut tb: TextBuf, next_motion: int) {
+    (mut tb.graphemes.spare.data).reset()
+    (mut tb.graphemes.spare.motion).reset()
+    tb.graphemes.spare.active = true
+    tb.graphemes.spare.next_motion = next_motion
+}
+
+fn index_swap(mut tb: TextBuf) {
+    let built_data = tb.graphemes.spare.data
+    let built_motion = tb.graphemes.spare.motion
+    tb.graphemes.spare.data = tb.graphemes.data
+    tb.graphemes.spare.motion = tb.graphemes.motion
+    tb.graphemes.data = built_data
+    tb.graphemes.motion = built_motion
+    tb.graphemes.spare.active = false
+}
 
 fn scan_init() -> ScanState {
     ScanState {
@@ -524,6 +539,27 @@ fn index_scan(tb: TextBuf, s: Src, start: int, end: int, mut st: ScanState, mut 
     index_finalize_cluster(mut b, st)
 }
 
+// The same scan into the index's own builder (`GraphemeIndex.spare`).
+fn index_scan_part_spare(mut tb: TextBuf, s: Src, start: int, end: int, mut st: ScanState) {
+    var r = reader_new()
+    reader_init(mut r, tb, s, start, end)
+    loop {
+        let cp = reader_cp(mut r, tb)
+        if !cp.ok {
+            break
+        }
+        index_consume_cp(mut tb.graphemes.spare, mut st, cp.cp, cp.start, cp.end)
+    }
+    if r.off != end {
+        util.bug("text.coords", "grapheme index scan ended early")
+    }
+}
+
+fn index_scan_spare(mut tb: TextBuf, s: Src, start: int, end: int, mut st: ScanState) {
+    index_scan_part_spare(mut tb, s, start, end, mut st)
+    index_finalize_cluster(mut tb.graphemes.spare, st)
+}
+
 // LF or printable ASCII only (`bytes_are_simple_ascii`, `coords.c:406-435`).
 fn bytes_are_simple_ascii(bytes: List[byte], lo: int, hi: int) -> bool {
     var i = lo
@@ -637,21 +673,11 @@ fn pending_clear(mut tb: TextBuf) {
 // `coords_index_rebuild`, `coords.c:553-570`.
 fn coords_index_rebuild(mut tb: TextBuf) {
     var st = scan_init()
-    (mut tb.graphemes.spare_data).reset()
-    (mut tb.graphemes.spare_motion).reset()
-    var b = Builder {
-        active: true,
-        data: tb.graphemes.spare_data,
-        motion: tb.graphemes.spare_motion,
-        next_motion: MOTION_CHECKPOINT_STRIDE,
-    }
+    builder_spare_begin(mut tb, MOTION_CHECKPOINT_STRIDE)
     let len = textbuf_len(tb)
-    index_scan(tb, src_live(tb), 0, len, mut st, mut b)
+    index_scan_spare(mut tb, src_live(tb), 0, len, mut st)
     let simple = range_is_simple_ascii(tb, 0, len)
-    tb.graphemes.spare_data = tb.graphemes.data
-    tb.graphemes.spare_motion = tb.graphemes.motion
-    tb.graphemes.data = b.data
-    tb.graphemes.motion = b.motion
+    index_swap(mut tb)
     tb.graphemes.gen = tb.gen
     tb.graphemes.simple_ascii = simple
     tb.graphemes.simple_ascii_direct = false
@@ -810,21 +836,14 @@ fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
         util.bug("text.coords", "grapheme index edit span underflow")
     }
     let scan_end = old_affected.hi - deleted_len + inserted_len
-    (mut tb.graphemes.spare_data).reset()
-    (mut tb.graphemes.spare_motion).reset()
-    var b = Builder {
-        active: true,
-        data: tb.graphemes.spare_data,
-        motion: tb.graphemes.spare_motion,
-        next_motion: next_motion_threshold(scan_start),
-    }
+    builder_spare_begin(mut tb, next_motion_threshold(scan_start))
     var i = 0
     while i < tb.graphemes.data.len {
         let c = copy tb.graphemes.data[i]
         if c.off >= rebuild_lo {
             break
         }
-        index_push(mut b.data, c.off, c.gcol)
+        index_push(mut tb.graphemes.spare.data, c.off, c.gcol)
         i += 1
     }
     i = 0
@@ -833,7 +852,7 @@ fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
         if m.off > scan_start {
             break
         }
-        motion_index_push(mut b.motion, m)
+        motion_index_push(mut tb.graphemes.spare.motion, m)
         i += 1
     }
     var scan_cursor = scan_start
@@ -854,7 +873,7 @@ fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
         if candidate_end < scan_cursor || candidate_end > scan_end {
             continue
         }
-        index_scan_part(tb, source, scan_cursor, candidate_end, mut st, mut b)
+        index_scan_part_spare(mut tb, source, scan_cursor, candidate_end, mut st)
         scan_cursor = candidate_end
         if !scan_state_matches(st, m) {
             continue
@@ -868,8 +887,8 @@ fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
         break
     }
     if !converged {
-        index_scan_part(tb, source, scan_cursor, scan_end, mut st, mut b)
-        index_finalize_cluster(mut b, st)
+        index_scan_part_spare(mut tb, source, scan_cursor, scan_end, mut st)
+        index_finalize_cluster(mut tb.graphemes.spare, st)
     }
     i = 0
     while i < tb.graphemes.data.len {
@@ -878,13 +897,13 @@ fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
         if converged && c.off >= conv_off && c.off < old_affected.hi {
             c.off = shifted_offset(c.off, deleted_len, inserted_len)
             c.gcol = shifted_gcol(c.gcol, conv_old_gcol, conv_new_gcol)
-            index_push(mut b.data, c.off, c.gcol)
+            index_push(mut tb.graphemes.spare.data, c.off, c.gcol)
             continue
         }
         if c.off < old_affected.hi {
             continue
         }
-        index_push(mut b.data, shifted_offset(c.off, deleted_len, inserted_len), c.gcol)
+        index_push(mut tb.graphemes.spare.data, shifted_offset(c.off, deleted_len, inserted_len), c.gcol)
     }
     i = 0
     while i < tb.graphemes.motion.len {
@@ -898,7 +917,7 @@ fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
                 m.cluster_start = shifted_cluster_start(m.cluster_start, old_range, inserted_len)
             }
             m.gcol = shifted_gcol(m.gcol, conv_old_gcol, conv_new_gcol)
-            motion_index_push(mut b.motion, m)
+            motion_index_push(mut tb.graphemes.spare.motion, m)
             continue
         }
         if m.off <= old_affected.hi {
@@ -906,12 +925,9 @@ fn coords_index_apply_edit(mut tb: TextBuf, edit: PendingEdit) {
         }
         m.off = shifted_offset(m.off, deleted_len, inserted_len)
         m.cluster_start = shifted_cluster_start(m.cluster_start, old_range, inserted_len)
-        motion_index_push(mut b.motion, m)
+        motion_index_push(mut tb.graphemes.spare.motion, m)
     }
-    tb.graphemes.spare_data = tb.graphemes.data
-    tb.graphemes.spare_motion = tb.graphemes.motion
-    tb.graphemes.data = b.data
-    tb.graphemes.motion = b.motion
+    index_swap(mut tb)
     tb.graphemes.gen = edit.new_gen
     tb.graphemes.initialized = true
 }
