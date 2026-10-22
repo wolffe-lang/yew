@@ -558,3 +558,84 @@ the strip's 832 B a frame (port work over the merged strip); the edit's
 own and the grapheme index's per-key bytes (text work); the terminal
 read's 64 B a turn (`fs.read_chunk` answers a fresh list: no read into a
 caller's buffer).
+
+
+### 4.7 The `unsafe` census
+
+**Delta: +2** (invariant 8's module vars, each with its safety stated in
+its file): `edit.glyphs`' `glyph_ascii_state` (C's vocabulary decided once
+from the locale at the first read, `glyphs.c:55-80`, the second
+process-wide option beside `unicode.width`'s `ambiguous_wide`) and
+`text.file`'s `file_load_calls` (C's `static u64 file_load_calls`,
+`file.c:313-331`, the counter s24 DoD 4 reads through
+`text.file_load_count`). The census is now `unicode.width`'s
+`ambiguous_wide`, `edit.glyphs`' `glyph_ascii_state`, `edit.gutter`'s
+`invalid_sign_warned`, `text.file`'s `temp_counter` and `file_load_calls`,
+and `text.undo`'s `text_hash_calls`. Every registry yw05 added — the pane
+pool, the tabs and their strip slot tables, the groups, the picker, the
+job table and the shell session, the region table in full — is a field of
+the `Ed` value.
+
+## 5. Rulings asked, issues, and what to correct
+
+**Rulings taken at launch** (above) were each implemented: R-yw04-5 A (the
+narrow tab replaced by the full model), R-yw04-6 B retired unasked by
+`os_fork` (yew#29), R-yw04-7 A, R-yw05-1 A (s57.13-s57.15 and s57.22 in
+yw06's draft), R-yw05-2 A (§4.1), R-yw05-3 A (§4.5), R-yw05-4 A (§4.4).
+
+**Asked here, with the recommendation implemented:**
+
+- **R-yw05-5 — `startup_multiple_files`.** The case's tabs are C's cell for
+  cell, but its snapshot is the `:buffers` picker (`ed.find.buffer`,
+  Sprint 26 §6). (A) it moves to yw06 with the finder, recorded in CI's
+  `startup_` step under that owner (recommended, implemented; yw06's draft
+  lists it); (B) pull `ed.find.buffer` forward into yw05 (refused: the
+  picker is s26's whole surface, `picker.c`/`pickers.c`, 1,991 C lines).
+
+**Issues to file** (none filed; by repo):
+
+- *wolf-lang*: G44 — the checked machine has no `f32`, and 0.2.34 casts no
+  float width to the other on either tier (witness
+  `notes/yw05-evidence/panes/f32-bits/`, `src/util/f32_test.lu`).
+- *wolf-lang* (G37's datum): on macOS the files source has no row for the
+  current user (Directory Services), so `std.os.users` cannot answer
+  `~user` there at all (run 39713224005; `edit_shctx_test` SKIPs by name).
+- *yew*: CI's port job has no oracle tree, so the fake clipboard tool's
+  halves of `prompt_keys_test`, `sel_actions_test` and `clipboard_test`
+  SKIP there by name and run only in the container gate; the port job
+  could build sagitta's `tests/unit/fakeclip.c` (one file, libc only) at
+  the pin (run 39790588648 found it).
+- *yew*: `notepad_burst_keys` rendered two frames for one burst once on
+  the release tier at a host load average of 33 on 16 cpus (the tabs
+  fork's gate fg1; six reruns at 14.6 and the lane gate's 20 green) —
+  a watch item for the macOS oracle, where the pair is gated again.
+- *sagitta* (the maintainer's, reported not filed):
+  `test_grouppicker.c`'s "ticks survive navigation" case presses Down and
+  never walks a directory, so a picker that drops its ticks on every
+  re-list passes C's whole file (the port adds a case that walks:
+  `notes/yw05-evidence/groups/plants/grouppicker-walk-uncaught.txt`).
+
+**Issues to close** on the merge: **yew#28** (the burst pair is gated on
+macOS again: green in runs 39790588648 and 39804774313's macOS oracle,
+red under the plant in 39811359963), **yew#29** (R-yw04-6: the writer
+forks), **yew#35** (the nightly's macOS port red on `edit_shctx_test`,
+the G37 SKIP, `db64def`). Unchanged and still the next pin's: yew#17,
+yew#20, yew#22, yew#23, yew#24, yew#27.
+The hot fork's issues (§4.5's "what remains") are the orchestrator's to
+file; this lane files nothing for them.
+
+**Corrections** (recorded in `docs/MAP.md` §8): the track index's
+campaign-05 row is s22-s27, not s23-s28; the draft's "30" campaign-05
+goldens are 23; MAP §2 had `strip` under yw06 and `pane_cmds` under yw06
+(both yw05's) and `ctxmenu` under yw05 (yw06's, R-yw05-1); §7's yw06
+paragraph, re-derived by yw06's draft (M-YW5's Sprint 42 field checks are
+campaign 08's and field evidence; the startup and FUSS sprints; the
+pin's state path already Fletch's; `trust*` yw09's; all 48 `chrome_*`
+cases Sprint 27 §7's). **Slips** (the lane's): a plant ran on the jobs
+fork's kasumi tree while that tree's own gate `g1` was in its check-test
+lanes, and a second check-test was launched on the same tree before `g1`
+had ended (its `g1.rc` was a stale file from a failed first launch); the
+harness refused stopping the second container, so both ran to the end and
+the lane gate L1 on the merged head is the clean record; and one quick
+probe (the f32 test) ran in the panes fork's dev tree while that tree's
+gate was live, touching only files the gate did not read.
