@@ -17,9 +17,13 @@
 //! (yw10): the case runs its damage-batch half and is counted SKIP for
 //! the rest. The two fault-shim cases (`200_insert…`, `1000_failure…`)
 //! run their child's whole body in process — the multicursor law — and
-//! the shim's "one `fsync-file pass`" is KNOWN-RED by name: the port's
-//! journal barrier syncs nothing at wolf 0.2.33 (G3, wolf-lang#796), so
-//! there is no fsync to count. The two bug-guard cases re-run this binary
+//! then, as C does, once more as this binary's child under sagitta's fault
+//! shim (`LD_PRELOAD`, the oracle's `faultshim.so`), counting exactly one
+//! `fsync-file pass` and no `fdatasync-file pass` in the shim's log: the
+//! journal barrier's one sync per transaction (G3, wolf-lang#796, since the
+//! 0.2.34 pin; R-yw03-5's KNOWN-RED retired by yw05). The shim half SKIPs
+//! by name where the shim is not built or this binary cannot re-run
+//! itself. The two bug-guard cases re-run this binary
 //! as their child (`--role`), as C's `yew_test_spawn_child` does; under
 //! `wolf test` (the checked machine) `os_exe()` is `wolf`, so they SKIP
 //! there loudly and run in `tools/check-test --native`.
@@ -482,23 +486,70 @@ fn journaled_done(mut ed: edit.Ed, root: str) {
     fs_remove_dir_all(root) else |_| {}
 }
 
-fn known_red_g3(what: str) -> int {
-    say(
-        "multicursor_test: KNOWN-RED {what}: the shim's one `fsync-file pass` per transaction (G3, wolf-lang#796: no fsync at wolf 0.2.33; the journal barrier is no_sync_g3)",
-    )
-    1
+// The shim half of the two sync cases (`mc_shim_child_prep`,
+// `test_multicursor.c:746-757`, and the parent's count, :854-858): this
+// binary again as `--role ROLE` with the oracle's fault shim preloaded,
+// its log at `<root>/intercept.log`, faults off until the child turns them
+// on around the one invoke. Answers 1 when it SKIPs by name, else 0.
+fn shim_sync_count(case_name: str, role: str) -> int {
+    let shim_rel = "target/oracle/sagitta/build/tests/torture/faultshim.so"
+    if !fs_is_file(shim_rel) {
+        return skip(
+            "{case_name}'s fault-shim half: the oracle's faultshim.so is not built (tools/oracle)",
+        )
+    }
+    if !self_reexecutes() {
+        return skip(
+            "{case_name}'s fault-shim half: os_exe() does not re-run this test here (the checked machine)",
+        )
+    }
+    let cwd = os_cwd() else "."
+    let root = scratch_root("mc-shim-{role}")
+    let log = "{root}/intercept.log"
+    env_set("YEW_MC_SHIM_ROOT", root) else |_| {}
+    env_set("YEW_FAULT_LOG", log) else |_| {}
+    env_set("YEW_FAULT_ENABLE", "0") else |_| {}
+    env_set("LD_PRELOAD", "{cwd}/{shim_rel}") else |_| {}
+    let (status, err) = spawn_role(role)
+    env_unset("LD_PRELOAD") else |_| {}
+    env_unset("YEW_FAULT_ENABLE") else |_| {}
+    env_unset("YEW_FAULT_LOG") else |_| {}
+    env_unset("YEW_MC_SHIM_ROOT") else |_| {}
+    assert(status == 0, "{case_name}: the shim child exits 0, at {status}: {err}")
+    let lines = fs_read_text(log) else ""
+    var fsyncs = 0
+    var fdatasyncs = 0
+    for line in lines.split("\n") {
+        if line.contains("fsync-file pass") && !line.contains("fdatasync-file pass") {
+            fsyncs += 1
+        }
+        if line.contains("fdatasync-file pass") {
+            fdatasyncs += 1
+        }
+    }
+    assert(fsyncs == 1, "{case_name}: one `fsync-file pass`, at {fsyncs}:\n{lines}")
+    assert(fdatasyncs == 0, "{case_name}: no `fdatasync-file pass`, at {fdatasyncs}")
+    say("multicursor_test: {case_name}: the shim counts 1 fsync-file pass, 0 fdatasync-file pass")
+    fs_remove_dir_all(root) else |_| {}
+    0
 }
 
-// `test_multicursor_200_insert_is_one_undo_and_one_journal_sync`.
-fn t_multicursor_200_insert_is_one_undo_and_one_journal_sync() -> int {
-    let root = scratch_root("mc-sync")
+// `mc_sync_child` (`test_multicursor.c:646-744`): the 200 inserts with the
+// shim's faults on around the one invoke.
+fn sync_200_body(root: str, shim: bool) {
     var (ed, initial) = journaled_ed(root, 200, false)
     let b = buf_of(ed)
     let insert = edit.cmd_lookup(ed.reg, "ed.edit.insert.text")
     var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
     cx.sarg = "X"
     cx.has_sarg = true
+    if shim {
+        env_set("YEW_FAULT_ENABLE", "1") else |_| {}
+    }
     assert(edit.ed_cmd_invoke(mut ed, insert, mut cx) == edit.CMD_OK, "200 inserts")
+    if shim {
+        env_set("YEW_FAULT_ENABLE", "0") else |_| {}
+    }
     assert(text.textbuf_len(ed.bufs[b].ec.tb) == 600, "600 bytes")
     assert(ed.bufs[b].ec.undo.nodes.len == 2, "one node")
     assert(ed.bufs[b].ec.undo.nodes[1].reason == text.TXN_MULTI, "a MULTI node")
@@ -509,21 +560,32 @@ fn t_multicursor_200_insert_is_one_undo_and_one_journal_sync() -> int {
     assert(undo_step(mut ed), "undo")
     assert_text(ed.bufs[b].ec.tb, initial, "one undo restores the text")
     journaled_done(mut ed, root)
-    known_red_g3("multicursor_200_insert_is_one_undo_and_one_journal_sync")
 }
 
-// `test_multicursor_1000_failure_at_700_rolls_back_and_syncs_once`.
-fn t_multicursor_1000_failure_at_700_rolls_back_and_syncs_once() -> int {
-    let root = scratch_root("mc-audit")
+// `test_multicursor_200_insert_is_one_undo_and_one_journal_sync`.
+fn t_multicursor_200_insert_is_one_undo_and_one_journal_sync() -> int {
+    let root = scratch_root("mc-sync")
+    sync_200_body(root, false)
+    shim_sync_count("multicursor_200_insert_is_one_undo_and_one_journal_sync", "shim-sync-200")
+}
+
+// `mc_audit_1000_child` (`test_multicursor.c:758-823`).
+fn audit_1000_body(root: str, shim: bool) {
     var (ed, initial) = journaled_ed(root, 1000, true)
     let w = ed.win
     let b = buf_of(ed)
     let id = probe(mut ed, "ed.edit.mc.toggle")
     ed.reg.probe_calls = 0
+    if shim {
+        env_set("YEW_FAULT_ENABLE", "1") else |_| {}
+    }
     assert(
         invoke(mut ed, id, 1) == edit.CMD_ERR_STATE,
         "cursor 700 fails (CMD_ERR_IO: visited out of order)",
     )
+    if shim {
+        env_set("YEW_FAULT_ENABLE", "0") else |_| {}
+    }
     assert(ed.reg.probe_calls == 701, "701 calls, at {ed.reg.probe_calls}")
     assert_text(ed.bufs[b].ec.tb, initial, "rolled back")
     assert(ed.bufs[b].ec.undo.nodes.len == 1, "no node")
@@ -535,7 +597,13 @@ fn t_multicursor_1000_failure_at_700_rolls_back_and_syncs_once() -> int {
         i += 1
     }
     journaled_done(mut ed, root)
-    known_red_g3("multicursor_1000_failure_at_700_rolls_back_and_syncs_once")
+}
+
+// `test_multicursor_1000_failure_at_700_rolls_back_and_syncs_once`.
+fn t_multicursor_1000_failure_at_700_rolls_back_and_syncs_once() -> int {
+    let root = scratch_root("mc-audit")
+    audit_1000_body(root, false)
+    shim_sync_count("multicursor_1000_failure_at_700_rolls_back_and_syncs_once", "shim-audit-1000")
 }
 
 // `test_multicursor_selection_union_semantics`.
@@ -921,6 +989,16 @@ fn t_multicursor_normalize_preserves_sticky_motion() {
 // The children the two bug-guard cases run (`yew_test_spawn_child`).
 fn child_role(role: str) {
     env_set("YEW_LOG", "/dev/null") else |_| {}
+    if role == "shim-sync-200" || role == "shim-audit-1000" {
+        let root = env_get("YEW_MC_SHIM_ROOT") else ""
+        assert(root.len != 0, "the shim child's root")
+        if role == "shim-sync-200" {
+            sync_200_body(root, true)
+        } else {
+            audit_1000_body(root, true)
+        }
+        os_exit(0)
+    }
     var set = text.cset_init(tc(1, 1, 1))
     assert(text.cset_add(mut set, tc(2, 2, 2)), "add")
     if role == "bug" {
@@ -1040,7 +1118,6 @@ fn main() {
         return
     }
     var skips = 0
-    var known_red = 0
     t_multicursor_lifecycle_and_point_dedupe()
     t_multicursor_latest_cap_and_active_tracking()
     t_multicursor_reseed_uses_fresh_identity_space()
@@ -1053,8 +1130,8 @@ fn main() {
     t_multicursor_adjacent_edit_ranges_both_run()
     t_multicursor_overlapping_edit_skips_later_and_reports_merge()
     t_multicursor_backward_overlap_uses_original_edit_ranges()
-    known_red += t_multicursor_200_insert_is_one_undo_and_one_journal_sync()
-    known_red += t_multicursor_1000_failure_at_700_rolls_back_and_syncs_once()
+    skips += t_multicursor_200_insert_is_one_undo_and_one_journal_sync()
+    skips += t_multicursor_1000_failure_at_700_rolls_back_and_syncs_once()
     t_multicursor_selection_union_semantics()
     t_multicursor_touch_and_adjacency()
     t_multicursor_deleted_cursor_collapses_and_merges()
@@ -1072,7 +1149,5 @@ fn main() {
     skips += t_multicursor_edit_guard_requires_multi_transaction()
     skips += t_multicursor_boundary_guards_name_their_constraints()
     t_multicursor_vertical_goals_are_per_cursor_over_tabs()
-    print(
-        "multicursor_test: 31 cases run, {skips} SKIP by name, {known_red} KNOWN-RED by name (G3)",
-    )
+    print("multicursor_test: 31 cases run, {skips} SKIP by name")
 }
