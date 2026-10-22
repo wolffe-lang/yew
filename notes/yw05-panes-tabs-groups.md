@@ -395,3 +395,44 @@ Goldens: **s22's 11 by name on both tiers** at `6b9797b` (gate g2) and at
 layout fuzz is `tools/fuzz-panes` over C's own generator: the four-seed
 campaign × 10,000 operations on both tiers and 200,000 at seed 1, every
 report hash equal to C's driver (`gate-g3/g3.log`).
+
+### 4.3 Tabs and the strip (deliverables 3 and 5, s23 and s57.8) — the tabs fork
+
+`edit.tabs` in full (`204eb7b` and on: a `Tab` owns its pane tree, a
+stable `tab_id` surviving compaction, `group_id`/`group_ordinal`; open,
+close, switch, move; the dirty-close question; the digit jump and its
+500 ms window; the 512 cap; the commands through the registry, ids
+700-708), `edit.strip` (`strip.c`, s23 §3's engine — MAP §2 had it under
+yw06, corrected — reused by row 2), the strip's mouse half merged into the
+panes fork's router (a press on a tab arms with the identity captured, a
+chevron scrolls on the press, ` + ` invokes `ed.tab.new` on a release in
+the same rect, `mouse.c:1410-1427`, `2385-2449`), and every startup file its
+own tab, the last read and shown (`ed.c:2885-2917`). The narrow `A-e` tab of
+R-yw04-5 gave way to the full open and close; `s57_31_edit_in_buffer_*`
+stayed green.
+
+Tests: `test_tabs` 34 (32 run, 2 SKIP for the groups fork) +1 port (s23
+DoD 7: a read-only `w` aborts the close, the tab survives), `test_strip` 14
+(13 run, 1 SKIP for the groups fork); `edit_modes_test`'s tab-jump case,
+SKIP-named for this lane since yw03, runs whole. Per case on the checked
+machine: strip 14 of 14, tabs 34 of 35 (the 512-tab cap on the step
+budget). The tab oracle (`tools/fuzz-tabs` over C's generator, s23 DoD 2):
+10,000 sessions at seed 1 and at a random seed on both tiers, every report
+line equal to C's driver (seed 1 `7f6650298b07dd0e`). s23 DoD 4 (the `*`
+derived from the undo tree, never cached), DoD 6 (every `tab_open` caller
+checked), DoD 8 (`ed.tab.goto 0` is tab 10) and s57.8's renditions
+(truecolor, 16, mono, ASCII and dumb whole screens equal to C's; 256 by the
+strip row) are recorded in `notes/yw05-evidence/tabs/README.md`. Five
+local plants seen red (`plants/`).
+
+Goldens at the fork's gate `fg1` (`gate-fg1/`): **s23's 6 and
+`s57_8_click_new_tab` green on both tiers**, s22's 11, campaign 03 62/62
+native (release 61/62 once: `notepad_burst_keys` "rendered 2 frames,
+expected 1" at a host load average of 33 on 16 cpus, six reruns green at
+14.6 — the lane gate's 20/20 below), campaign 04 84/104 (the 20 job rows,
+not on that base). **STOP: `startup_multiple_files`** — every file is its
+own tab in C's order (rows 1-2 are C's cell for cell), but the case
+snapshots after `:buffers` Enter, `ed.find.buffer` (`src/ui/pickers.c`,
+Sprint 26 §6: yw06's finder); the port refuses it by name
+(`startup_multiple_files-fulldiff.txt`). No golden edited; CI records it in
+the `startup_` step under that owner.
