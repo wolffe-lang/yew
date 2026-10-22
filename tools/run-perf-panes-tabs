@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# run-perf-panes-tabs — the 2× gates of campaign 05's first half (yw05
+# contract deliverable 7): sagitta's own `perf_latency_s56`, run over C yew,
+# the port, then C again (the rig's drift), each row's port/C ratio printed.
+#
+#   panes-one   `typing.keys` (10,000 keys of Insert typing) over
+#               `tests/perf/fixtures/syn/c_kitchen.c`, as `make
+#               perf-latency-s56-smoke` runs it: the reference row.
+#   panes-two   the same session after `ctrl+w s` (two panes on the one
+#               buffer: every key repaints both, `ed.c:2705-2711`), its
+#               last two keys dropped for the harness's 10,000 cap. GATED.
+#   many        C's own `latency.navigate.many_buffers.p99`
+#               (`make perf-latency-s56-many`): fifty startup files (copies
+#               of c_kitchen.c), twenty hydrated by `t n` before the clock
+#               starts (`perf_latency.c:985-1007`), then `navigate.keys`
+#               (10,000 cursor keys). GATED.
+#   tabswitch   the many-buffers editor, then 10,000 keys of tab switches:
+#               `alt+1` … `alt+9` (`ed.tab.goto`, `init.fl:309-317`) and
+#               `t n` (`ed.tab.next`) in turn, keypress → paint of each
+#               switch. GATED.
+#
+# A row's session file keeps the shipped basename (the harness keys its
+# metric on it), written under target/perf-panes-tabs/. The gate is each
+# GATED row's p99 ratio (ruling #89 R3's 2×); p50 and max are recorded
+# beside it.
+#
+#   tools/run-perf-panes-tabs [--yew BIN] [--c-yew BIN] [--cpus 0-3] [--rows LIST]
+#
+# The harness SIGKILLs a child that does not quit (`live_pty.c:489-501`):
+# run this inside the container (sprints/RULES.md §5). It needs the oracle
+# tree's `perf_latency_s56` (tools/oracle builds it).
+# Exit 0 when every gated p99 ratio is within 2.0, 1 above, 2 on a fault.
+set -u
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$YEW_ROOT"
+yew=$YEW_ROOT/target/release/yew
+tree=$YEW_ROOT/target/oracle/sagitta
+c_yew=$tree/build/yew
+cpus=
+rows="panes-one panes-two many tabswitch"
+while [ $# -gt 0 ]; do
+  case $1 in
+    --yew) yew=$2; shift 2 ;;
+    --c-yew) c_yew=$2; shift 2 ;;
+    --cpus) cpus=$2; shift 2 ;;
+    --rows) rows=$2; shift 2 ;;
+    *) echo "run-perf-panes-tabs: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+case $yew in /*) ;; *) yew=$YEW_ROOT/$yew ;; esac
+h=$tree/build/perf_latency_s56
+fix=$tree/tests/perf/fixtures/syn/c_kitchen.c
+for f in "$h" "$yew" "$c_yew" "$fix"; do
+  [ -e "$f" ] || { echo "run-perf-panes-tabs: missing $f" >&2; exit 2; }
+done
+out=$YEW_ROOT/target/perf-panes-tabs
+rm -rf "$out"
+mkdir -p "$out/panes-one" "$out/panes-two" "$out/many" "$out/tabswitch" "$out/many-dir" "$out/home/config"
+export HOME=$out/home XDG_CONFIG_HOME=$out/home/config
+cp "$tree/tests/perf/sessions/typing.keys" "$out/panes-one/typing.keys"
+# The harness takes at most 10,000 keys (`perf_latency.c:21-22`): the split's
+# two keys replace the session's last two.
+{ printf 'ctrl+w\ns\n'; head -n 9998 "$tree/tests/perf/sessions/typing.keys"; } >"$out/panes-two/typing.keys"
+cp "$tree/tests/perf/sessions/navigate.keys" "$out/many/navigate.keys"
+# The harness takes exactly 10,000 keys (`perf_latency.c:21-22`).
+i=0
+while [ $i -lt 910 ]; do
+  for k in 1 2 3 4 5 6 7 8 9; do printf 'alt+%s\n' $k; done
+  printf 't\nn\n'
+  i=$((i + 1))
+done | head -n 10000 >"$out/tabswitch/navigate.keys"
+n=0
+while [ $n -lt 50 ]; do cp "$fix" "$out/many-dir/buf-$(printf '%02d' $n).c"; n=$((n + 1)); done
+pin=
+[ -n "$cpus" ] && pin="taskset -c $cpus"
+metric() {
+  case $1 in panes-*) echo latency.typing.small ;; *) echo latency.navigate.many_buffers ;; esac
+}
+run() {
+  local tag=$1 bin=$2 row=$3 state=$out/state-$1-$3 sess=$out/$3
+  rm -rf "$state"; mkdir -p "$state"
+  case $row in
+    panes-*) args="--session $sess/typing.keys --fixture small --path $fix" ;;
+    *) args="--session $sess/navigate.keys --fixture many-buffers --path $out/many-dir/buf-00.c --many-dir $out/many-dir" ;;
+  esac
+  (cd "$tree" && YEW_RUNTIME_DIR="$tree/runtime" YEW_PERF_ADVISORY=1 $pin "$h" --yew "$bin" \
+    $args --state "$state") >"$out/$tag-$row.txt" 2>&1
+  echo "== $tag $row ($(sha256sum "$bin" | cut -c1-12))"
+  grep "^$(metric $row)\." "$out/$tag-$row.txt" || { cat "$out/$tag-$row.txt"; return 1; }
+}
+for row in $rows; do
+  run c1 "$c_yew" $row || exit 2
+  run port "$yew" $row || exit 2
+  run c2 "$c_yew" $row || exit 2
+done
+val() { awk -v k="$2" '$1 == k { print $2; exit }' "$out/$1.txt"; }
+status=0
+for row in $rows; do
+  m=$(metric $row)
+  for q in p99 p50 max; do
+    c1=$(val c1-$row $m.$q); w=$(val port-$row $m.$q); c2=$(val c2-$row $m.$q)
+    [ -n "$c1" ] && [ -n "$w" ] && [ -n "$c2" ] || { echo "run-perf-panes-tabs: $row $q: a run printed no value" >&2; exit 2; }
+    r=$(awk -v w="$w" -v a="$c1" -v b="$c2" 'BEGIN { c = (a + b) / 2; printf "%.2f", w / c }')
+    d=$(awk -v a="$c1" -v b="$c2" 'BEGIN { m = (a < b) ? a : b; printf "%.2f", (a > b ? a : b) / m }')
+    gated=
+    [ "$q" = p99 ] && [ "$row" != panes-one ] && gated=" GATED"
+    echo "$row: $q C=$c1,$c2 port=$w ratio=$r drift=$d$gated"
+    if [ -n "$gated" ] && awk -v r="$r" 'BEGIN { exit !(r > 2.0) }'; then status=1; fi
+  done
+done
+exit $status
