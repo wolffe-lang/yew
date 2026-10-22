@@ -1,0 +1,272 @@
+//! fuzz-panes — Sprint 22's pane fuzz (s22 DoD 10): the port of sagitta
+//! `tests/fuzz/fuzz_panes.c` (261 lines) over the generator of
+//! `tests/fuzz/fuzzlib.c` (`yew_fuzz_main`) at 9ace98c2, which
+//! `tools/fuzzgen` ports C's bit for bit, so a seed's `hash=` is C's for
+//! the same seed and iterations — the witness that the port ran the same
+//! sessions.
+//!
+//! The check is C's `run_session` (`fuzz_panes.c:121-254`): a fresh editor
+//! on a scratch buffer, the input's own LCG seeded from its bytes, 60 to
+//! 119 operations — split a random leaf (focus to the new one), close one
+//! (focus repaired to the parent's first leaf), resize the nearest
+//! ancestor split by -4..4 cells, move focus in a direction, or resize the
+//! screen (20..219 by 6..65, collapse included) — and after EVERY one the
+//! tree's invariants (parents match, a leaf holds a window and a split
+//! none, children inside their parent and disjoint), focus a live leaf, a
+//! second layout byte-identical to the first (invariant 5), and `leaf_at`
+//! of a random cell inside the rect it names. The region registry is never
+//! queried between a frame's begin and its first add (DoD 10's counter):
+//! the driver draws nothing, so it asserts the editor's empty-query count
+//! stays 0. A trap anywhere is the crash C reports.
+//!
+//!   fuzz-panes [--iters=N] [--seed=N]
+//!
+//! Defaults are C's (`--iters=200000 --seed=1`). One region a session: its
+//! editor dies with it (G33).
+
+use edit
+use fuzzgen
+
+const EPOCH: int = 4096
+
+struct Rng {
+    s: wrapping[u64],
+}
+
+// `rng_next` (`fuzz_panes.c:27-31`): the input's LCG.
+fn rng_next(mut r: Rng) -> int {
+    r.s = r.s * 6364136223846793005 + 1442695040888963407
+    (r.s >> 33) as int
+}
+
+// `rng_below` (`fuzz_panes.c:33-36`).
+fn rng_below(mut r: Rng, n: int) -> int {
+    if n == 0 {
+        return 0
+    }
+    rng_next(mut r) % n
+}
+
+// `rect_inside` (`fuzz_panes.c:38-45`): collapsed subtrees are skipped.
+fn rect_inside(inner: edit.Rect, outer: edit.Rect) -> bool {
+    if inner.w == 0 || inner.h == 0 {
+        return true
+    }
+    inner.x >= outer.x &&
+        inner.y >= outer.y &&
+        inner.x + inner.w <= outer.x + outer.w &&
+        inner.y + inner.h <= outer.y + outer.h
+}
+
+// `check_tree` (`fuzz_panes.c:47-89`): "" when it holds, else why.
+fn check_tree(ed: edit.Ed, p: int, parent: int) -> str {
+    if p < 0 {
+        return ""
+    }
+    if ed.panes[p].parent != parent {
+        return "parent pointer does not match"
+    }
+    if ed.panes[p].is_leaf {
+        if ed.panes[p].win < 0 {
+            return "leaf without a window"
+        }
+        return ""
+    }
+    let a = ed.panes[p].a
+    let b = ed.panes[p].b
+    if a < 0 || b < 0 {
+        return "split node missing a child"
+    }
+    if ed.panes[p].win >= 0 {
+        return "split node still holds a window"
+    }
+    let pr = copy ed.panes[p].rect
+    let ar = copy ed.panes[a].rect
+    let br = copy ed.panes[b].rect
+    if !rect_inside(ar, pr) || !rect_inside(br, pr) {
+        return "child rect escapes its parent"
+    }
+    if ar.w != 0 && br.w != 0 {
+        if ed.panes[p].dir == edit.SPLIT_H && ar.x + ar.w >= br.x {
+            return "horizontal children overlap"
+        }
+        if ed.panes[p].dir == edit.SPLIT_V && ar.y + ar.h >= br.y {
+            return "vertical children overlap"
+        }
+    }
+    let why = check_tree(ed, a, p)
+    if why.len != 0 {
+        return why
+    }
+    check_tree(ed, b, p)
+}
+
+// `focus_is_live` (`fuzz_panes.c:104-119`).
+fn focus_is_live(ed: edit.Ed) -> bool {
+    let leaves = edit.pane_collect_leaves(ed, ed.pane_root, edit.PANE_MAX_LEAVES * 2)
+    for l in leaves {
+        if l == ed.focus {
+            return true
+        }
+    }
+    false
+}
+
+fn same_rect(a: edit.Rect, b: edit.Rect) -> bool {
+    a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+}
+
+// `run_session` (`fuzz_panes.c:121-254`): "" when every operation held.
+fn run_session(data: List[byte]) -> str {
+    var rng = Rng { s: 11400714819323198485 }
+    for b in data {
+        rng.s = rng.s * 31 + b as int as wrapping[u64]
+    }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    var aw = 120
+    var ah = 40
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, aw, ah))
+    let ops = 60 + data.len % 60
+    var op = 0
+    while op < ops {
+        let leaves = edit.pane_collect_leaves(ed, ed.pane_root, edit.PANE_MAX_LEAVES * 2)
+        if leaves.len == 0 {
+            return "tree lost every leaf"
+        }
+        let pick = leaves[rng_below(mut rng, leaves.len)]
+        let what = rng_below(mut rng, 6)
+        if what == 0 || what == 1 {
+            let dir = if rng_below(mut rng, 2) != 0 then edit.SPLIT_V else edit.SPLIT_H
+            let nu = edit.pane_split(mut ed, pick, dir)
+            if nu >= 0 {
+                ed.focus = nu
+            }
+        } else if what == 2 {
+            let parent = ed.panes[pick].parent
+            if parent >= 0 {
+                if ed.focus == pick {
+                    ed.focus = -1
+                }
+                let _ = edit.pane_close(mut ed, pick)
+                if ed.focus < 0 {
+                    ed.focus = edit.pane_first_leaf(ed, parent)
+                }
+            }
+        } else if what == 3 {
+            var split = edit.pane_ancestor_split(ed, pick, edit.SPLIT_H)
+            if split < 0 {
+                split = edit.pane_ancestor_split(ed, pick, edit.SPLIT_V)
+            }
+            if split >= 0 {
+                let _ = edit.pane_resize(mut ed, split, rng_below(mut rng, 9) - 4)
+            }
+        } else if what == 4 {
+            let to = edit.pane_dir(ed, ed.pane_root, ed.focus, rng_below(mut rng, 4))
+            if to >= 0 {
+                ed.focus = to
+            }
+        } else {
+            aw = 20 + rng_below(mut rng, 200)
+            ah = 6 + rng_below(mut rng, 60)
+        }
+        edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, aw, ah))
+        let why = check_tree(ed, ed.pane_root, -1)
+        if why.len != 0 {
+            return why
+        }
+        if !focus_is_live(ed) {
+            return "focus is not a live leaf after op {op}"
+        }
+        let before = edit.pane_collect_leaves(ed, ed.pane_root, edit.PANE_MAX_LEAVES * 2)
+        var snap = List[edit.Rect]()
+        for l in before {
+            (mut snap).push(copy ed.panes[l].rect)
+        }
+        edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, aw, ah))
+        var i = 0
+        while i < before.len {
+            if !same_rect(snap[i], ed.panes[before[i]].rect) {
+                return "layout is not idempotent at op {op}"
+            }
+            i += 1
+        }
+        let x = rng_below(mut rng, aw)
+        let y = rng_below(mut rng, ah)
+        let leaf = edit.pane_leaf_at(ed, ed.pane_root, x, y)
+        if leaf >= 0 {
+            let r = copy ed.panes[leaf].rect
+            if x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h {
+                return "leaf_at returned a pane that does not contain the cell"
+            }
+        }
+        if edit.region_empty_queries(ed.regions) != 0 {
+            return "the region registry was queried before a frame's first add"
+        }
+        op += 1
+    }
+    ""
+}
+
+fn main() -> int {
+    let (ok, seed, iters) = fuzzgen.parse_args(env_args())
+    if !ok {
+        eprint("usage: fuzz-panes [--seed=N] [--iters=N]")
+        return 2
+    }
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let (cok, corpus) = fuzzgen.corpus_for("fuzz_panes")
+    if !cok {
+        return 2
+    }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > EPOCH then EPOCH else iters - done
+        region epoch {
+            var r = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut r, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut r, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, o) = fuzzgen.mutate(mut r, input, corpus)
+                    input = next
+                    op = o
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut r, input)
+                var bad = false
+                region session {
+                    let why = run_session(input)
+                    if why.len != 0 {
+                        eprint(
+                            "fuzz_panes: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                        )
+                        eprint("fuzz_panes: input={fuzzgen.hex_of(input)}")
+                        bad = true
+                    }
+                }
+                if bad {
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = r.state
+            hash = r.hash
+        }
+        done += n
+    }
+    if failed {
+        return 1
+    }
+    print("fuzz_panes: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok")
+    0
+}

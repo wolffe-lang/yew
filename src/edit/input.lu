@@ -36,6 +36,12 @@ fn ed_handle_key_inner(mut ed: Ed, key: term.Key, now: int) {
         search_preview_cancel(mut ed)
     }
     ed.now_ms = now
+    // Esc mid-gesture cancels it and restores the state the gesture
+    // started from, before any mode acts on Escape (`ed.c:2321-2330`).
+    if key.code == term.KEY_ESCAPE && mouse_gesture_active(ed) {
+        mouse_cancel(mut ed)
+        return
+    }
     if key.code == term.KEY_ESCAPE && (ed.chord.n != 0 || ed.chord.count_given) {
         dispatch_key(mut ed, key, now)
         return
@@ -186,14 +192,195 @@ pub fn mouse_claimed_by_menu(mut ed: Ed, key: term.Key) -> bool {
     true
 }
 
-/// `yew_mouse_event` (`mouse.c:2868-2903`), as narrow as ruling R-yw04-2
-/// = A: the command line's menu claims its own rows (Sprint 18.5 §8); the
-/// router's gestures — selection, drag, the document's wheel, borders,
-/// tabs — are Sprint 27's (yw06) and yw05's, and until they land an event
-/// outside the menu goes nowhere, as it did before this lane.
+/// No gesture (`YEW_MP_IDLE`, `mouse.h`).
+pub const MP_IDLE: int = 0
+
+/// A press is down and has not moved off its cell (`YEW_MP_ARMED`).
+pub const MP_ARMED: int = 1
+
+/// A pane border is being dragged (`YEW_MP_DRAG_BORDER`).
+pub const MP_DRAG_BORDER: int = 2
+
+/// The router's gesture state (`MouseState`, `mouse.h`), the fields
+/// Sprint 22's two gestures use: the phase and the press, its region
+/// CAPTURED at press time.
+pub struct MouseState {
+    phase: int,
+    press_x: int,
+    press_y: int,
+    press_kind: int,
+    press_payload: int,
+    drag_tab_id: int,
+    drag_gid: int,
+}
+
+/// At rest (`yew_mouse_init`, `mouse.c:56-89`).
+pub fn mousestate_new() -> MouseState {
+    MouseState {
+        phase: MP_IDLE,
+        press_x: 0,
+        press_y: 0,
+        press_kind: REGION_NONE,
+        press_payload: 0,
+        drag_tab_id: 0,
+        drag_gid: 0,
+    }
+}
+
+// `press_tab` (`mouse.c:1282-1294`): a press on a strip entry ARMS and does
+// nothing visible; the identity is captured now (a negative payload is a
+// group, s24) and the switch happens at release.
+fn press_tab(mut ed: Ed, payload: int) {
+    if payload < 0 {
+        ed.mouse.drag_gid = 0 - payload
+        ed.mouse.drag_tab_id = 0
+    } else {
+        ed.mouse.drag_gid = 0
+        ed.mouse.drag_tab_id = if payload < ed.tabs.len then ed.tabs[payload].tab_id else 0
+    }
+}
+
+// `click_tab` (`mouse.c:2385-2402`): resolved from the identity captured
+// at press, never from the cells under the release. A group entry's
+// enter is Sprint 24's (`yew_group_enter`): it refuses by name until then.
+fn click_tab(mut ed: Ed) {
+    if ed.mouse.drag_gid != 0 {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            "not yet ported: entering a tab group: sagitta Sprint 24 (groups) (yw05)",
+        )
+        return
+    }
+    if ed.mouse.drag_tab_id != 0 {
+        let idx = tab_index_of_id(ed, ed.mouse.drag_tab_id)
+        if idx >= 0 {
+            tab_switch(mut ed, idx)
+        }
+    }
+}
+
+/// `yew_mouse_gesture_active` (`mouse.c:91-94`).
+pub fn mouse_gesture_active(ed: Ed) -> bool {
+    ed.mouse.phase != MP_IDLE
+}
+
+/// `yew_mouse_cancel` (`mouse.c:2544-2580`), Sprint 22's half: a border
+/// drag in flight restores its entry ratio; the gesture ends. (The
+/// multi-click counter, the hover chevron and the strip drags it also
+/// resets are Sprint 27's, yw06.)
+pub fn mouse_cancel(mut ed: Ed) {
+    if ed.mouse.phase == MP_IDLE {
+        return
+    }
+    if ed.mouse.phase == MP_DRAG_BORDER {
+        pane_drag_cancel(mut ed)
+    }
+    ed.mouse = mousestate_new()
+}
+
+// `mouse_press` (`mouse.c:1349-1470`) for the left button: the menu's
+// claim first, then the region under the press, captured. A PANE press
+// focuses and lands the cursor (`press_pane` → `yew_pane_click`); a
+// BORDER press starts its drag (`press_border`). Every other region's
+// press is Sprint 23's, 24's or 27's to route.
+fn mouse_press(mut ed: Ed, key: term.Key) {
+    let hit = region_hit(mut ed.regions, key.col, key.row)
+    if key.button != term.MB_LEFT {
+        return
+    }
+    if mouse_claimed_by_menu(mut ed, key) {
+        return
+    }
+    ed.mouse.phase = MP_ARMED
+    ed.mouse.press_x = key.col
+    ed.mouse.press_y = key.row
+    ed.mouse.press_kind = hit.kind
+    ed.mouse.press_payload = hit.payload
+    if hit.kind == REGION_PANE {
+        if pane_leaf_by_index(ed, hit.payload) >= 0 {
+            let _ = pane_click(mut ed, key.col, key.row)
+        }
+    } else if hit.kind == REGION_PANE_BORDER {
+        let split = pane_split_by_index(ed, hit.payload)
+        if split >= 0 {
+            pane_drag_begin(mut ed, split, ed.mouse.press_x, ed.mouse.press_y)
+            ed.mouse.phase = MP_DRAG_BORDER
+        }
+    } else if hit.kind == REGION_TAB {
+        press_tab(mut ed, hit.payload)
+    }
+}
+
+// `mouse_motion` (`mouse.c:2308-2370`): unheld motion is the hover (yw06);
+// a held motion drags the border. Leaving the pressed cell from an ARMED
+// press begins Sprint 27's drag-select or strip drag (yw06): until then
+// the press stays armed.
+fn mouse_motion(mut ed: Ed, key: term.Key) {
+    if key.button == term.MB_NONE || ed.mouse.phase == MP_IDLE {
+        return
+    }
+    if ed.mouse.phase == MP_DRAG_BORDER {
+        pane_drag_motion(mut ed, key.col, key.row)
+    }
+}
+
+// `mouse_release` (`mouse.c:2404-2540`): a border drag ends (its ratio was
+// converted once per accepted motion, s22's pitfall); the gesture resets.
+fn mouse_release(mut ed: Ed, key: term.Key) {
+    if key.button != term.MB_LEFT {
+        return
+    }
+    if mouse_claimed_by_menu(mut ed, key) {
+        ed.mouse = mousestate_new()
+        return
+    }
+    if ed.mouse.phase == MP_IDLE {
+        return
+    }
+    if ed.mouse.phase == MP_DRAG_BORDER {
+        pane_drag_end(mut ed)
+    } else if ed.mouse.phase == MP_ARMED && ed.mouse.press_kind == REGION_TAB {
+        click_tab(mut ed)
+    } else if ed.mouse.phase == MP_ARMED && ed.mouse.press_kind == REGION_TAB_NEW {
+        // Release in the same region invokes `ed.tab.new` (`mouse.c:2440-
+        // 2449`), Sprint 57.8's command: through the registry, which
+        // refuses it by name until the tabs land.
+        let up = region_hit(mut ed.regions, key.col, key.row)
+        if up.kind == REGION_TAB_NEW {
+            let id = cmd_lookup(ed.reg, "ed.tab.new")
+            if id > 0 {
+                var cx = cmdctx_new(ed.win, SRC_MOUSE)
+                let _ = ed_cmd_invoke(mut ed, id, mut cx)
+            }
+        }
+    }
+    ed.mouse = mousestate_new()
+}
+
+/// `yew_mouse_event` (`mouse.c:2868-2903`): a wheel never enters the phase
+/// machine (it has no release); a press, a held motion and a release run
+/// it. The command line's menu claims its own rows (Sprint 18.5 §8,
+/// R-yw04-2); Sprint 22 adds click-to-focus and the border drag through
+/// the region registry; the router's other gestures — selection, the
+/// document's wheel, tabs, menus — are Sprint 23's, 24's and 27's.
 pub fn ed_mouse_event(mut ed: Ed, key: term.Key) {
     if key.kind != term.EV_MOUSE {
         return
     }
-    let _ = mouse_claimed_by_menu(mut ed, key)
+    let b = key.button
+    if b == term.MB_WHEEL_UP ||
+        b == term.MB_WHEEL_DOWN ||
+        b == term.MB_WHEEL_LEFT ||
+        b == term.MB_WHEEL_RIGHT {
+        let _ = mouse_claimed_by_menu(mut ed, key)
+        return
+    }
+    if key.ev == term.KEY_PRESS {
+        mouse_press(mut ed, key)
+    } else if key.ev == term.KEY_REPEAT {
+        mouse_motion(mut ed, key)
+    } else if key.ev == term.KEY_RELEASE {
+        mouse_release(mut ed, key)
+    }
 }
