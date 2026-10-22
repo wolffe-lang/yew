@@ -6,18 +6,16 @@
 //! cache (§5), the in-memory trees and the lazy descent (§4), the request
 //! queue (§2, §6) and `ed.shell.complete_forget`.
 //!
-//! What runs at wolf 0.2.33: everything but the job. A lookup resolves the
-//! command word, checks every §1 rule, answers from memory or from the
-//! disk cache — the cache C yew writes (`$XDG_CACHE_HOME/yew/completions/
-//! help/<key>.fl`, Fletch data read by the literal reader, R-yw04-4, the
-//! key C's FNV-1a over the same identity), so a tool C yew has learned
-//! completes in the port — and otherwise QUEUES the request. The idle
-//! path that spawns `<resolved> [subs] --help` is a job whose two pipes
-//! are read while the loop runs (G2): it takes C's own spawn-failure path
-//! (`comphelp.c:2627-2635`: the negative answer remembered for the
-//! session, not on disk, the request dropped) and logs the refusal by
-//! name (ruling R-yw04-1). The cache writer, the graft and the prune are
-//! C's, ready for the pin whose job layer delivers an answer.
+//! A lookup resolves the command word, checks every §1 rule, answers
+//! from memory or from the disk cache — the cache C yew writes
+//! (`$XDG_CACHE_HOME/yew/completions/help/<key>.fl`, Fletch data read by
+//! the literal reader, R-yw04-4, the key C's FNV-1a over the same
+//! identity), so a tool C yew has learned completes in the port — and
+//! otherwise QUEUES the request. The idle path spawns `<resolved> [subs]
+//! --help` as an internal, evictable callback job (the job layer's
+//! `CB_COMPHELP` owner, its two pipes read while the loop paints, wolf
+//! 0.2.34's `os_signal_wait_fds`); its end parses, caches, grafts and
+//! re-filters the waiting menu (`comphelp.c:2454-2493`).
 //!
 //! The port's shape: C's state is module statics (`help`,
 //! `comphelp.c:1404-1420`); here it is the value `CompHelp`, owned by the
@@ -1816,8 +1814,8 @@ fn ch_cache_prune(dir: str) {
 }
 
 /// `cache_write` (`comphelp.c:1923-1992`): the atomic write the state
-/// files use. Reached only from a finished help job (R-yw04-1 at 0.2.33).
-fn ch_cache_write(mut h: CompHelp, reg: CompSpecs, r: ChReq, has_spec: bool, spec: int) {
+/// files use, from a finished help job (`comphelp_job_complete`).
+fn ch_cache_write(mut h: CompHelp, r: ChReq, has_spec: bool, spec: CompSpec) {
     let (has_dir, dir) = comphelp_cache_dir()
     if !has_dir {
         return
@@ -1852,7 +1850,7 @@ fn ch_cache_write(mut h: CompHelp, reg: CompSpecs, r: ChReq, has_spec: bool, spe
     fdw_str(mut out, if has_spec then "  empty: false,\n" else "  empty: true,\n")
     if has_spec {
         fdw_str(mut out, "  node: ")
-        compspec_write_node(reg.pool[spec], 0, 1, true, mut out)
+        compspec_write_node(spec, 0, 1, true, mut out)
     }
     fdw_str(mut out, "}}\n\n")
     let err = text.file_write_atomic("{dir}/{r.key}.fl", out, 384)
@@ -2361,12 +2359,60 @@ fn ch_still_allowed(mut ed: Ed, r: ChReq) -> bool {
         comphelp_kind_allowed(policy, comphelp_exe_kind(r.real))
 }
 
+/// `help_complete` (`comphelp.c:2454-2493`): the help job ended — its
+/// stdout parsed, else its stderr (Go's flag package and BSD tools print
+/// usage there; the exit status says nothing), the answer cached on disk
+/// and in memory, the request dropped, and an open menu that asked for
+/// this key re-filtered (the line itself is never touched).
+pub fn comphelp_job_complete(mut ed: Ed, j: Job) {
+    let at = ch_req_find(ed.help, j.cb_key)
+    if at < 0 || !ed.help.q[at].inflight {
+        return
+    }
+    let r = copy ed.help.q[at]
+    var words = List[str]()
+    (mut words).push(ch_base_of(r.exec))
+    var i = 0
+    while i < r.subs.len && i < COMPHELP_DEPTH_MAX {
+        (mut words).push(r.subs[i])
+        i += 1
+    }
+    let origin = "help:{r.real}"
+    var (has, spec) = comphelp_parse(origin, words, j.collect)
+    if !has {
+        let (has2, spec2) = comphelp_parse(origin, words, j.collect_err)
+        has = has2
+        spec = spec2
+    }
+    ch_cache_write(mut ed.help, r, has, spec)
+    ch_store_answer(mut ed, r, has, take spec)
+    let at2 = ch_req_find(ed.help, j.cb_key)
+    if at2 >= 0 {
+        ch_req_drop_at(mut ed.help, at2)
+    }
+    cmdline_compgen_arrived(mut ed, j.cb_key)
+}
+
+/// `help_destroy` (`comphelp.c:2495-2508`): evicted for the user's own
+/// job, or torn down — no answer, nothing cached; a later lookup may ask
+/// again.
+pub fn comphelp_job_destroy(mut ed: Ed, key: str, completed: bool) {
+    if completed {
+        return
+    }
+    let at = ch_req_find(ed.help, key)
+    if at >= 0 && ed.help.q[at].inflight {
+        ch_req_drop_at(mut ed.help, at)
+    }
+}
+
 /// `yew_comphelp_idle` (`comphelp.c:2552-2638`): spawn the next queued
-/// request. At wolf 0.2.33 the help job's two pipes cannot be read while
-/// the loop runs (G2), so the spawn takes C's failure path (`:2627-2635`):
-/// the negative answer remembered for the session — not on disk, it was
-/// not the tool's answer — and the request dropped; the refusal is
-/// logged by name (R-yw04-1). Answers how many jobs it started (0).
+/// request as an internal, evictable callback job (`CB_COMPHELP`) — the
+/// RESOLVED path, never the bare name, then only subcommand names the
+/// parent's help listed, then `--help`, from `/` (a tool's help has no
+/// business with the workspace). A spawn that fails remembers the
+/// negative answer for the session (not on disk: it was not the tool's
+/// answer) and drops the request. Answers how many jobs it started.
 pub fn comphelp_idle(mut ed: Ed, others: int) -> int {
     if !comphelp_idle_ready(ed.help, others) {
         return 0
@@ -2388,23 +2434,56 @@ pub fn comphelp_idle(mut ed: Ed, others: int) -> int {
         ch_req_drop_at(mut ed.help, at)
         return 0
     }
-    var argv = r.exec
-    for s in r.subs {
-        argv += " {s}"
+    var argv = List[str]()
+    (mut argv).push(r.exec)
+    var k = 0
+    while k < r.subs.len && k < COMPHELP_DEPTH_MAX {
+        (mut argv).push(r.subs[k])
+        k += 1
     }
-    argv += " --help"
-    ed.help.last_argv = if argv.len > 1000 then argv[0..cs_floor_boundary(argv, 1000)] else argv
+    (mut argv).push("--help")
+    var line = ""
+    for a in argv {
+        line += if line.len == 0 then a else " {a}"
+    }
+    ed.help.last_argv = if line.len > 1000 then line[0..cs_floor_boundary(line, 1000)] else line
+    var spec = job_spec_new()
+    spec.argv = argv
+    spec.cwd = "/"
+    spec.has_cwd = true
+    spec.sink = SINK_CALLBACK
+    spec.internal = true
+    spec.evictable = true
+    spec.timeout_ms = if ed.help.timeout_ms > 0 then ed.help.timeout_ms else COMPHELP_TIMEOUT_MS
+    spec.collect_max = COMPHELP_COLLECT_MAX
+    for row in [
+        "NO_COLOR=1",
+        "TERM=dumb",
+        "COLUMNS=200",
+        "PAGER=cat",
+        "MANPAGER=cat",
+        "GIT_PAGER=cat",
+    ] {
+        (mut spec.env_set).push(row)
+    }
+    let (has, base) = shsession_env(ed)
+    spec.env_base = base
+    spec.has_env_base = has
+    spec.display = ch_base_of(r.exec)
+    spec.has_display = true
+    spec.callback = CB_COMPHELP
+    spec.cb_key = r.key
     ed.help.spawns += 1
-    util.log_info("completion help {ch_base_of(r.exec)}: {job_stop_g2("the --help job")}")
-    ch_store_answer(mut ed, r, false, take compspec_new(""))
-    ch_req_drop_at(mut ed.help, at)
-    // The refusal stands for the job's whole life, so its end is the
-    // job's arrival: the menu that waited re-ranks, as C's done callback
-    // makes it (`comphelp.c:2492`). C's spawn-failure path itself leaves
-    // the `…` up until the next keystroke; at 0.2.33 every spawn takes
-    // it, and a menu that never refilled would be every operand's.
-    cmdline_compgen_arrived(mut ed, r.key)
-    0
+    let (id, err) = job_spawn(mut ed, spec)
+    if id == 0 {
+        util.log_info("completion help {ch_base_of(r.exec)}: {err}")
+        ch_store_answer(mut ed, r, false, take compspec_new(""))
+        ch_req_drop_at(mut ed.help, at)
+        return 0
+    }
+    ed.help.q[at].inflight = true
+    ed.help.q[at].job_id = id
+    1
 }
 
 // ==================================================================

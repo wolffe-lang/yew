@@ -6,21 +6,17 @@
 //! as a black box (`fish -N --private -c QUERY -- LINE CMD`); its source
 //! is never read.
 //!
-//! What runs at wolf 0.2.33: the line (each word escaped for fish), the
-//! query stem, detection (`$YEW_TEST_FISH`, then `fish` on the absolute
-//! `$PATH` elements), the key, the cache and the queue, the lookup and
-//! the parse of `complete -C` output. The idle path that spawns fish is a
-//! job whose pipe is read while the loop runs (G2): it takes C's own
-//! spawn-failure path (`compfish.c:766-778`) — the oracle disabled for
-//! the session with one log line naming the refusal (R-yw04-1), every
-//! request dropped — so the ladder falls through to the `--help` rung, as
-//! C's does when fish cannot start.
+//! The line (each word escaped for fish), the query stem, detection
+//! (`$YEW_TEST_FISH`, then `fish` on the absolute `$PATH` elements), the
+//! key, the cache and the queue, the lookup and the parse of `complete
+//! -C` output; the idle path spawns fish as an internal, evictable
+//! callback job (the job layer's `CB_COMPFISH` owner, its pipe read while
+//! the loop paints, wolf 0.2.34's `os_signal_wait_fds`).
 //!
 //! The port's shape: C's state is module statics (`fish`,
 //! `compfish.c:165-175`); here the value `CompFish`, owned by the editor
 //! (`Ed.fish`). The prompt's refilter on an arrival
-//! (`yew_cmdline_compgen_arrived`) is the completion engine's; at 0.2.33
-//! nothing arrives.
+//! (`yew_cmdline_compgen_arrived`) is the completion engine's.
 
 use util
 
@@ -661,11 +657,54 @@ pub fn compfish_idle_ready(f: CompFish, others: int) -> bool {
     false
 }
 
-/// `yew_compfish_idle` (`compfish.c:717-783`). At wolf 0.2.33 fish's pipe
-/// cannot be read while the loop runs (G2), so the spawn takes C's
-/// failure path (`:766-778`): the oracle disabled for the session with
-/// one log line naming the refusal, every request dropped. Answers the
-/// jobs started (0).
+/// `fish_complete` (`compfish.c:639-677`): fish's answer — an exec
+/// failure, or a non-zero exit with no output, disables the oracle for
+/// the session (every request dropped; the waiting menu falls through to
+/// the help rung); else the rows (the gate closed when none) cached, the
+/// request dropped, and the waiting menu re-filtered.
+pub fn compfish_job_complete(mut ed: Ed, j: Job) {
+    let at = cf_req_find(ed.fish, j.cb_key)
+    if at < 0 || !ed.fish.q[at].inflight {
+        return
+    }
+    if j.state == JOB_EXECFAIL || j.state == JOB_EXITED && j.exit_code != 0 && j.collect.len == 0 {
+        cf_disable_once(mut ed.fish, "{job_state_name(j.state)} (exit {j.exit_code})")
+        ed.fish.q = List[CfReq]()
+        cmdline_compgen_arrived(mut ed, j.cb_key)
+        return
+    }
+    var rows = List[FishRow]()
+    if j.state == JOB_EXITED || j.collect_capped {
+        rows = compfish_parse(j.collect)
+    }
+    let gate = rows.len != 0
+    compfish_store(mut ed.fish, j.cb_key, now_ms(), gate, take rows)
+    let at2 = cf_req_find(ed.fish, j.cb_key)
+    if at2 >= 0 {
+        cf_req_drop_at(mut ed.fish, at2)
+    }
+    cmdline_compgen_arrived(mut ed, j.cb_key)
+}
+
+/// `fish_destroy` (`compfish.c:679-691`): evicted for the user's own job,
+/// or torn down — no answer.
+pub fn compfish_job_destroy(mut ed: Ed, key: str, completed: bool) {
+    if completed {
+        return
+    }
+    let at = cf_req_find(ed.fish, key)
+    if at >= 0 && ed.fish.q[at].inflight {
+        cf_req_drop_at(mut ed.fish, at)
+    }
+}
+
+/// `yew_compfish_idle` (`compfish.c:717-783`): spawn fish on the next
+/// queued request as an internal, evictable callback job (`CB_COMPFISH`):
+/// `fish -N --private -c QUERY -- LINE CMD`, the user's line `$argv[1]`
+/// and never part of the script. A spawn that fails disables the oracle
+/// for the session, drops every request and lets the waiting menu fall
+/// through to the help rung. Answers the jobs started. A line that is not
+/// UTF-8 cannot be an argument here (G40's kin): that request is dropped.
 pub fn compfish_idle(mut ed: Ed, others: int) -> int {
     if !compfish_idle_ready(ed.fish, others) {
         return 0
@@ -682,17 +721,45 @@ pub fn compfish_idle(mut ed: Ed, others: int) -> int {
     if at < 0 {
         return 0
     }
-    let (has, _) = compfish_path(mut ed.fish)
+    let (has, path) = compfish_path(mut ed.fish)
     if !cf_option_auto(ed) || !has {
         cf_req_drop_at(mut ed.fish, at)
         return 0
     }
-    let key = ed.fish.q[at].key
+    let r = copy ed.fish.q[at]
+    let line = str_from_utf8(r.line) else |_| {
+        cf_req_drop_at(mut ed.fish, at)
+        return 0
+    }
+    var spec = job_spec_new()
+    for a in [path, "-N", "--private", "-c", compfish_query(), "--", line, r.cmd] {
+        (mut spec.argv).push(a)
+    }
+    spec.cwd = r.cwd
+    spec.has_cwd = r.cwd.len != 0
+    spec.sink = SINK_CALLBACK
+    spec.internal = true
+    spec.evictable = true
+    spec.timeout_ms = COMPFISH_TIMEOUT_MS
+    spec.collect_max = COMPFISH_COLLECT_MAX
+    (mut spec.env_set).push("NO_COLOR=1")
+    (mut spec.env_set).push("TERM=dumb")
+    let (hb, base) = shsession_env(ed)
+    spec.env_base = base
+    spec.has_env_base = hb
+    spec.display = "fish"
+    spec.has_display = true
+    spec.callback = CB_COMPFISH
+    spec.cb_key = r.key
     ed.fish.spawns += 1
-    cf_disable_once(mut ed.fish, job_stop_g2("the fish completion job"))
-    ed.fish.q = List[CfReq]()
-    // The menu that waited falls through to the help rung now
-    // (`compfish.c:776-777`).
-    cmdline_compgen_arrived(mut ed, key)
-    0
+    let (id, err) = job_spawn(mut ed, spec)
+    if id == 0 {
+        cf_disable_once(mut ed.fish, err)
+        ed.fish.q = List[CfReq]()
+        cmdline_compgen_arrived(mut ed, r.key)
+        return 0
+    }
+    ed.fish.q[at].inflight = true
+    ed.fish.q[at].job_id = id
+    1
 }

@@ -5,13 +5,12 @@
 //! synchronous: they read a file and never run anything — `make_targets`
 //! PARSES the Makefile, because `make -p` would evaluate `$(shell ...)`
 //! (`compgen.h:4-26`). A spec generator is a subprocess run through the
-//! job layer, ASYNCHRONOUSLY, its answer cached per key; at wolf 0.2.33
-//! the job layer cannot read a child's pipe while the loop runs (G2,
-//! wolf-lang#795), so `compgen_rows`' spawn takes C's spawn-failure path
-//! (§5.6, `compgen.c:785-795`): the empty answer cached for `cache_ms`
-//! and the reason in the log — never the footer — naming the STOP
-//! (ruling R-yw04-1). The cache, the key and the output parser are
-//! C's, ready for the pin that has `os_signal_wait_fds`.
+//! job layer, ASYNCHRONOUSLY — an internal, evictable callback job (the
+//! job layer's `CB_COMPGEN` owner, its pipes read while the loop paints,
+//! wolf 0.2.34's `os_signal_wait_fds`) — its answer cached per key; a
+//! spawn that fails takes C's path (§5.6, `compgen.c:785-795`): the empty
+//! answer cached for `cache_ms` and the reason in the log, never the
+//! footer.
 //!
 //! The port's shape: C's cache and flights are module state (`gen`,
 //! `compgen.c:480-490`); here they are the value `CompGen`, owned by the
@@ -709,26 +708,80 @@ pub fn compgen_key_string(key: GenKey) -> str {
     s
 }
 
-/// `spawn_for` (`compgen.c:745-806`). C spawns the generator as an
-/// internal, evictable, callback job; at 0.2.33 the job layer cannot read
-/// its pipe while the loop runs (G2), so the spawn fails as C's does when
-/// `yew_job_spawn` answers 0: the empty answer cached for `cache_ms`, the
-/// reason in the log (§5.6), the footer silent. `others` is the help and
-/// fish flights that share the four slots (Sprints 57.25/57.26).
-fn cg_spawn_for(mut g: CompGen, key: GenKey, ks: str, now: int, others: int) {
-    if g.flights.len + others >= COMPGEN_MAX_INFLIGHT {
+/// `spawn_for` (`compgen.c:745-806`): the generator as an internal,
+/// evictable, callback job (`CB_COMPGEN`, its key the flight's), the
+/// shell session's exports its base; a spawn that fails caches the empty
+/// answer and says why in the log, never the footer (§5.6). `others` is
+/// the help and fish flights that share the four slots (57.25/57.26).
+fn cg_spawn_for(mut ed: Ed, key: GenKey, ks: str, now: int, others: int) {
+    if ed.gen.flights.len + others >= COMPGEN_MAX_INFLIGHT {
         return
     }
-    g.spawns += 1
-    let err = job_stop_g2("the completion generator job")
-    util.log_info("completion generator {key.name}: {err}")
-    cg_entry_store(mut g, ks, now, key.cache_ms, take List[CgRow]())
+    var spec = job_spec_new()
+    spec.argv = copy key.argv
+    spec.cwd = key.cwd
+    spec.has_cwd = key.has_cwd
+    spec.sink = SINK_CALLBACK
+    spec.internal = true
+    spec.evictable = true
+    spec.timeout_ms = if ed.gen.timeout_ms > 0 then ed.gen.timeout_ms else COMPGEN_TIMEOUT_MS
+    spec.collect_max = COMPGEN_COLLECT_MAX
+    for row in ["NO_COLOR=1", "PAGER=cat", "GIT_PAGER=cat", "TERM=dumb"] {
+        (mut spec.env_set).push(row)
+    }
+    let (has, base) = shsession_env(ed)
+    spec.env_base = base
+    spec.has_env_base = has
+    let name = if key.name.len == 0 then "?" else key.name
+    spec.display = name
+    spec.has_display = true
+    spec.callback = CB_COMPGEN
+    spec.cb_key = ks
+    spec.cb_name = name
+    spec.cb_ms = key.cache_ms
+    spec.cb_flag = key.ps_columns
+    ed.gen.spawns += 1
+    let (id, err) = job_spawn(mut ed, spec)
+    if id == 0 {
+        util.log_info("completion generator {name}: {err}")
+        cg_entry_store(mut ed.gen, ks, now, key.cache_ms, take List[CgRow]())
+        return
+    }
+    (mut ed.gen.flights).push(CgFlight { key: ks, job_id: id })
+}
+
+/// `gen_complete` (`compgen.c:695-713`): the finished job's rows cached
+/// (an exit failure is logged and caches nothing but the empty answer),
+/// the flight dropped, and an open menu that asked for this key
+/// re-filtered — the prompt's TEXT is never touched.
+pub fn compgen_job_complete(mut ed: Ed, j: Job) {
+    let ok = j.state == JOB_EXITED && j.exit_code == 0
+    var rows = List[CgRow]()
+    if ok || j.collect_capped {
+        rows = cg_parse_output(j.collect, j.cb_flag)
+    }
+    if !ok && !j.collect_capped {
+        util.log_info(
+            "completion generator {j.cb_name}: {job_state_name(j.state)} (exit {j.exit_code})",
+        )
+    }
+    cg_entry_store(mut ed.gen, j.cb_key, now_ms(), j.cb_ms, take rows)
+    cg_flight_drop(mut ed.gen, j.cb_key)
+    cmdline_compgen_arrived(mut ed, j.cb_key)
+}
+
+/// `gen_destroy` (`compgen.c:715-721`): evicted for a user's job, or torn
+/// down with the editor, no answer arrived, so none is cached.
+pub fn compgen_job_destroy(mut ed: Ed, key: str, completed: bool) {
+    if !completed {
+        cg_flight_drop(mut ed.gen, key)
+    }
 }
 
 /// `yew_compgen_rows` (`compgen.c:808-837`): the rows for `key` now
 /// (possibly stale, possibly empty) and whether a job is in flight.
 /// Never blocks. `(answered, pending)`.
-pub fn compgen_rows(mut g: CompGen, key: GenKey, now: int, others: int, mut out: List[GenItem]) -> (
+pub fn compgen_rows(mut ed: Ed, key: GenKey, now: int, others: int, mut out: List[GenItem]) -> (
     bool,
     bool,
 ) {
@@ -736,19 +789,19 @@ pub fn compgen_rows(mut g: CompGen, key: GenKey, now: int, others: int, mut out:
         return (false, false)
     }
     let ks = compgen_key_string(key)
-    var e = cg_entry_find(g, ks)
-    if e < 0 || now - g.entries[e].stamp >= g.entries[e].cache_ms {
-        if cg_flight_find(g, ks) < 0 {
-            cg_spawn_for(mut g, key, ks, now, others)
+    var e = cg_entry_find(ed.gen, ks)
+    if e < 0 || now - ed.gen.entries[e].stamp >= ed.gen.entries[e].cache_ms {
+        if cg_flight_find(ed.gen, ks) < 0 {
+            cg_spawn_for(mut ed, key, ks, now, others)
         }
-        e = cg_entry_find(g, ks)
+        e = cg_entry_find(ed.gen, ks)
     }
     if e >= 0 {
-        for r in g.entries[e].rows {
+        for r in ed.gen.entries[e].rows {
             cg_push(mut out, r.text, r.desc, r.has_desc)
         }
     }
-    (true, cg_flight_find(g, ks) >= 0)
+    (true, cg_flight_find(ed.gen, ks) >= 0)
 }
 
 /// The parser `gen_complete` runs over a finished job's output
