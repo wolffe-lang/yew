@@ -4,10 +4,12 @@
 //! Ports sagitta `src/edit/shell_cmds.c` (383 lines) and `shell_cmds.h`
 //! (23) at 9ace98c2: every command routes through the registry like any
 //! other, so `:!` is scriptable and recordable (`shell_cmds.c:1-3`). The
-//! job table is empty at wolf 0.2.33 — no job can start (R-yw04-1) — so
-//! the job commands answer what C answers over an empty table, and
-//! `ed.job.list`, whose `*jobs*` table is a workspace scratch buffer
-//! (yw06), refuses by name.
+//! range form of `:!` resolves its region as C's `range_span` does but for
+//! `ed.run`'s explicit byte span, which rides `CmdRange.tok` in C and has
+//! no field here yet (yew#32).
+
+use std.signal
+use text
 
 /// The command text an invocation carries (`shell_arg`,
 /// `shell_cmds.c:21-30`): `(has, text)`.
@@ -48,6 +50,34 @@ fn shc_term_run(mut ed: Ed, cmdline: str) -> int {
     CMD_OK
 }
 
+/// `range_span` (`shell_cmds.c:32-79`): the invocation's range as a byte
+/// span of its window's buffer; `(false, …)` for no region.
+fn shc_range_span(ed: Ed, cx: CmdCtx) -> (bool, int, int) {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len {
+        return (false, 0, 0)
+    }
+    let b = ed.wins[w].buf
+    let tb = ed.bufs[b].ec.tb
+    if cx.range.kind == RANGE_BUFFER {
+        return (true, 0, text.textbuf_len(tb))
+    }
+    if cx.range.kind == RANGE_LINES {
+        let lo = text.textbuf_line_span(tb, cx.range.lo as text.LineNo)
+        let hi = text.textbuf_line_span(tb, cx.range.hi as text.LineNo)
+        return (true, lo.lo, hi.hi)
+    }
+    if cx.range.kind == RANGE_SELECTION {
+        if ed.wins[w].cs.curs.len == 0 {
+            return (false, 0, 0)
+        }
+        let c = copy ed.wins[w].cs.curs[ed.wins[w].cs.primary]
+        let sp = sel_span(tb, ed.wins[w].h.kind, c)
+        return (sp.hi > sp.lo, sp.lo, sp.hi)
+    }
+    (false, 0, 0)
+}
+
 /// `yew_shell_cmd_run` (`shell_cmds.c:119-176`): `:!cmd`, `:!!cmd` (the
 /// second bang read HERE, not in the parser: the body still reaches this
 /// command verbatim), `:RANGE!cmd` the filter.
@@ -69,115 +99,171 @@ pub fn shc_run(mut ed: Ed, cx: CmdCtx) -> int {
         return shc_term_run(mut ed, cmdline[1..])
     }
     if cx.range.given {
-        ed_msg(mut ed, MSG_ERROR, shell_filter_refusal())
-        return CMD_ERR_DEFERRED
+        let (ok, lo, hi) = shc_range_span(ed, cx)
+        if ok {
+            let r = shell_filter(mut ed, cx.win, lo, hi, cmdline)
+            return if r == FILT_OK then CMD_OK else CMD_ERR_STATE
+        }
     }
-    ed_msg(mut ed, MSG_ERROR, shell_run_refusal())
-    CMD_ERR_DEFERRED
+    let (id, err) = shell_run(mut ed, cmdline, true)
+    if id == 0 {
+        ed_msg(mut ed, MSG_ERROR, err)
+        return CMD_ERR_STATE
+    }
+    CMD_OK
 }
 
-/// `yew_shell_cmd_run_bg` (`shell_cmds.c:178-193`).
+/// `yew_shell_cmd_run_bg` (`shell_cmds.c:178-193`): `:!` without stealing
+/// focus.
 pub fn shc_run_bg(mut ed: Ed, cx: CmdCtx) -> int {
-    let (has, _) = shc_arg(cx)
+    let (has, cmdline) = shc_arg(cx)
     if !has {
         ed_msg(mut ed, MSG_ERROR, ":!bg needs a command")
         return CMD_ERR_ARG
     }
-    ed_msg(mut ed, MSG_ERROR, shell_run_refusal())
-    CMD_ERR_DEFERRED
+    let (id, err) = shell_run(mut ed, cmdline, false)
+    if id == 0 {
+        ed_msg(mut ed, MSG_ERROR, err)
+        return CMD_ERR_STATE
+    }
+    CMD_OK
 }
 
 /// `yew_shell_cmd_read` (`shell_cmds.c:195-209`).
 pub fn shc_read(mut ed: Ed, cx: CmdCtx) -> int {
-    let (has, _) = shc_arg(cx)
+    let (has, cmdline) = shc_arg(cx)
     if !has {
         ed_msg(mut ed, MSG_ERROR, ":r ! needs a command")
         return CMD_ERR_ARG
     }
-    ed_msg(mut ed, MSG_ERROR, shell_read_refusal())
-    CMD_ERR_DEFERRED
+    let (id, err) = shell_read(mut ed, cmdline)
+    if id == 0 {
+        ed_msg(mut ed, MSG_ERROR, err)
+        return CMD_ERR_STATE
+    }
+    CMD_OK
 }
 
 /// `yew_shell_cmd_filter` (`shell_cmds.c:211-227`).
 pub fn shc_filter(mut ed: Ed, cx: CmdCtx) -> int {
-    let (has, _) = shc_arg(cx)
+    let (has, cmdline) = shc_arg(cx)
     if !has {
         ed_msg(mut ed, MSG_ERROR, "filter needs a command")
         return CMD_ERR_ARG
     }
-    if !cx.range.given {
+    let (ok, lo, hi) = shc_range_span(ed, cx)
+    if !ok {
         ed_msg(mut ed, MSG_ERROR, "filter needs a range or selection")
         return CMD_ERR_ARG
     }
-    ed_msg(mut ed, MSG_ERROR, shell_filter_refusal())
-    CMD_ERR_DEFERRED
+    let r = shell_filter(mut ed, cx.win, lo, hi, cmdline)
+    if r == FILT_OK then CMD_OK else CMD_ERR_STATE
 }
 
-/// `yew_job_cmd_list` (`shell_cmds.c:229-234`): the `*jobs*` table is a
-/// workspace scratch buffer, yw06's.
+/// `yew_job_cmd_list` (`shell_cmds.c:229-234`): the `*jobs*` table.
 pub fn shc_job_list(mut ed: Ed, cx: CmdCtx) -> int {
     let _ = cx.win
-    ed_msg(
-        mut ed,
-        MSG_ERROR,
-        "not yet ported: the *jobs* table (a workspace scratch buffer): sagitta Sprint 25 (workspace state) (yw06); no job can run at wolf 0.2.33 (R-yw04-1)",
-    )
-    CMD_ERR_DEFERRED
+    let _ = jobs_table_open(mut ed)
+    CMD_OK
 }
 
-/// `target_job` (`shell_cmds.c:238-243`): an explicit count, else the
-/// `*jobs*` row under the cursor — none: there is no table.
-fn shc_target_job(cx: CmdCtx) -> int {
-    if cx.count_given && cx.count != 0 then cx.count else 0
+/// `target_job` (`shell_cmds.c:238-243`): an explicit count wins, else
+/// the `*jobs*` row under the cursor.
+fn shc_target_job(ed: Ed, cx: CmdCtx) -> int {
+    if cx.count_given && cx.count != 0 {
+        return cx.count
+    }
+    jobs_table_row_id(ed)
 }
 
-/// `job_signal_cmd` (`shell_cmds.c:245-261`): over an empty table every
-/// addressed job "is not running".
-fn shc_job_signal(mut ed: Ed, cx: CmdCtx) -> int {
-    let id = shc_target_job(cx)
+/// `job_signal_cmd` (`shell_cmds.c:245-261`).
+fn shc_job_signal(mut ed: Ed, cx: CmdCtx, meaning: int, verb: str) -> int {
+    let id = shc_target_job(ed, cx)
     if id == 0 {
         ed_msg(mut ed, MSG_ERROR, "no job selected")
         return CMD_ERR_ARG
     }
-    ed_msg(mut ed, MSG_WARN, "job {id} is not running")
-    CMD_ERR_STATE
+    if !job_signal(mut ed, id, meaning) {
+        ed_msg(mut ed, MSG_WARN, "job {id} is not running")
+        return CMD_ERR_STATE
+    }
+    ed_msg(mut ed, MSG_INFO, "{verb} job {id}")
+    jobs_table_refresh(mut ed)
+    CMD_OK
 }
 
 /// `yew_job_cmd_kill` (`shell_cmds.c:263-266`).
 pub fn shc_job_kill(mut ed: Ed, cx: CmdCtx) -> int {
-    shc_job_signal(mut ed, cx)
+    shc_job_signal(mut ed, cx, signal.terminate(), "terminated")
 }
 
 /// `yew_job_cmd_kill_force` (`shell_cmds.c:268-271`).
 pub fn shc_job_kill_force(mut ed: Ed, cx: CmdCtx) -> int {
-    shc_job_signal(mut ed, cx)
+    shc_job_signal(mut ed, cx, signal.kill(), "killed")
 }
 
 /// `yew_job_cmd_jump` (`shell_cmds.c:273-285`).
 pub fn shc_job_jump(mut ed: Ed, cx: CmdCtx) -> int {
-    let id = shc_target_job(cx)
-    ed_msg(mut ed, MSG_WARN, "job {id} has no output buffer")
-    CMD_ERR_STATE
+    let id = shc_target_job(ed, cx)
+    let i = job_find(ed, id)
+    if i < 0 || ed.jobs.v[i].buf < 0 {
+        ed_msg(mut ed, MSG_WARN, "job {id} has no output buffer")
+        return CMD_ERR_STATE
+    }
+    ed_show_buffer(mut ed, ed.jobs.v[i].buf)
+    CMD_OK
 }
 
-/// `yew_job_cmd_clear_finished` (`shell_cmds.c:287-313`).
+/// `yew_job_cmd_clear_finished` (`shell_cmds.c:287-313`): every finished
+/// job released, its output buffer dropped with it.
 pub fn shc_job_clear_finished(mut ed: Ed, cx: CmdCtx) -> int {
     let _ = cx.win
-    ed_msg(mut ed, MSG_INFO, "cleared 0 finished jobs")
+    var i = 0
+    var removed = 0
+    while i < ed.jobs.v.len {
+        if ed.jobs.v[i].state == JOB_RUNNING {
+            i += 1
+            continue
+        }
+        let bi = ed.jobs.v[i].buf
+        if bi >= 0 {
+            ws_scratch_drop(mut ed, bi)
+            ed.jobs.v[i].buf = -1
+        }
+        job_release(mut ed, i)
+        removed += 1
+    }
+    let s = if removed == 1 then "" else "s"
+    ed_msg(mut ed, MSG_INFO, "cleared {removed} finished job{s}")
+    jobs_table_refresh(mut ed)
     CMD_OK
 }
 
 /// `yew_job_cmd_rerun` (`shell_cmds.c:315-340`).
 pub fn shc_job_rerun(mut ed: Ed, cx: CmdCtx) -> int {
-    let _ = cx.win
-    ed_msg(mut ed, MSG_ERROR, "no job selected")
-    CMD_ERR_ARG
+    let id = shc_target_job(ed, cx)
+    let i = job_find(ed, id)
+    if i < 0 {
+        ed_msg(mut ed, MSG_ERROR, "no job selected")
+        return CMD_ERR_ARG
+    }
+    let label = ed.jobs.v[i].label
+    let cmdline = if label.len > 511 then label[0..cs_floor_boundary(label, 511)] else label
+    let (nid, err) = shell_run(mut ed, cmdline, false)
+    if nid == 0 {
+        ed_msg(mut ed, MSG_ERROR, err)
+        return CMD_ERR_STATE
+    }
+    jobs_table_refresh(mut ed)
+    CMD_OK
 }
 
-/// `yew_shell_cmd_reset` (`shell_cmds.c:342-348`): no session ever ran,
-/// so there is nothing to end; C's message.
+/// `yew_shell_cmd_reset` (`shell_cmds.c:342-348`): `ed.shell.reset`
+/// (`:shreset`) — the next `:!` starts a new session in the workspace
+/// root with the standard job environment.
 pub fn shc_reset(mut ed: Ed, cx: CmdCtx) -> int {
     let _ = cx.win
+    shsession_reset(mut ed)
     ed_msg(mut ed, MSG_INFO, "shell session reset; the next :! starts in the workspace root")
     CMD_OK
 }

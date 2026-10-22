@@ -1,17 +1,19 @@
 //! member: false
 //!
 //! The port of sagitta `tests/unit/test_compgen.c` (797 lines), one test
-//! per C test in registry order. The three built-in cases run; the nine
-//! that drive a subprocess generator through the job layer (its pipes
-//! read while the loop runs, its timeout, its eviction, its arrival into
-//! an open prompt) SKIP loudly by name — ruling R-yw04-1: at wolf 0.2.33
-//! there is no wait over N descriptors (G2, wolf-lang#795). Two port-only
-//! cases stand beside them: the spawn refuses BY NAME the way C's spawn
-//! failure is reported (§5.6), and the output parser `gen_complete` runs
-//! keeps C's rules (the rows `test_compgen_lines_become_rows` asserts).
+//! per C test in registry order: the three built-ins, then the nine that
+//! drive a subprocess generator through the job layer — its pipe read
+//! while the loop runs (wolf 0.2.34's `os_signal_wait_fds`), its timeout
+//! kill, its cache, its caps, its eviction for a user's job, and its
+//! arrival into an open prompt. A test pumps the way the loop does
+//! (`pump`, C's `test_compgen.c:51-64`). Children: it runs inside the
+//! container (RULES §5). Two port-only cases keep the output parser's
+//! rules and the key's identity.
 
 use edit
 use std.fs
+use std.signal
+use term
 
 fn bytes_of(s: str) -> List[byte] {
     var v = List[byte]()
@@ -35,7 +37,7 @@ fn env_copy(name: str) -> (str, bool) {
 
 fn fix_init(tag: str) -> Fix {
     let (old, had) = env_copy("HOME")
-    let root = "/tmp/yew-compgen-{os_pid()}-{tag}"
+    let root = "/tmp/yew-compspec-{os_pid()}-{tag}"
     fs.remove_dir_all(root) else |_| {}
     fs.create_dir_all("{root}/home/.ssh") else |_| { assert(false, "mkdir") }
     env_set("HOME", "{root}/home") else |_| {}
@@ -145,9 +147,465 @@ fn t_compgen_signals_with_and_without_sig() {
     assert(!edit.compgen_builtin("nope", "", "", false, mut more), "not a built-in")
 }
 
+// ------------------------------------------------------------------
+// Subprocess generators (§5 async contract)
+// ------------------------------------------------------------------
+
+fn put(path: str, text: str, mode: int) {
+    fs.write_text(path, text) else |_| { assert(false, "write {path}") }
+    fs.set_mode(path, mode) else |_| { assert(false, "chmod {path}") }
+}
+
+// `script` (`test_compgen.c:38-49`): `name` in the fixture's bin dir.
+fn script(f: Fix, name: str, body: str) -> str {
+    fs.create_dir_all("{f.root}/bin") else |_| {}
+    let path = "{f.root}/bin/{name}"
+    put(path, body, 448)
+    path
+}
+
+// `pump` (`test_compgen.c:51-64`).
+fn pump(mut ed: edit.Ed, ms: int) {
+    let fds = edit.job_wait_fds(ed)
+    if fds.len != 0 {
+        let _ = os_signal_wait_fds(fds, signal.child(), ms) else |_| { (-1, 0) }
+    } else if ms > 0 {
+        time_sleep_ms(ms)
+    }
+    edit.job_pump(mut ed)
+    edit.job_reap(mut ed)
+    edit.job_tick(mut ed, time_now_ms())
+    let _ = edit.job_settle(mut ed)
+}
+
+// `pump_idle` (`test_compgen.c:66-74`): until no generator is in flight.
+fn pump_idle(mut ed: edit.Ed) {
+    let start = time_now_ms()
+    while edit.compgen_inflight(ed.gen) != 0 && time_now_ms() - start < 10000 {
+        pump(mut ed, 10)
+    }
+    assert(edit.compgen_inflight(ed.gen) == 0, "no generator in flight")
+}
+
+// `GenFix` (`test_compgen.c:76-96`): the spec fixture and an editor whose
+// workspace is its root.
+fn gen_ed(f: Fix) -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    ed.ws_dir = f.root
+    edit.compgen_set_timeout_ms(mut ed.gen, 0)
+    ed
+}
+
+fn gen_drop(f: Fix, mut ed: edit.Ed) {
+    edit.jobs_free(mut ed)
+    fix_drop(f)
+}
+
+// `key_for` (`test_compgen.c:98-109`).
+fn key_for(name: str, argv: List[str], cwd: str) -> edit.GenKey {
+    edit.GenKey {
+        name: name,
+        argv: copy argv,
+        cwd: cwd,
+        has_cwd: true,
+        cache_ms: edit.COMPGEN_DEFAULT_CACHE_MS,
+        ps_columns: false,
+    }
+}
+
+fn one(a: str) -> List[str] {
+    var v = List[str]()
+    (mut v).push(a)
+    v
+}
+
+fn two(a: str, b: str) -> List[str] {
+    var v = one(a)
+    (mut v).push(b)
+    v
+}
+
+fn ask(mut ed: edit.Ed, key: edit.GenKey, now: int, mut rows: List[edit.GenItem]) -> bool {
+    rows = List[edit.GenItem]()
+    let (ok, pending) = edit.compgen_rows(mut ed, key, now, 0, mut rows)
+    assert(ok, "answered")
+    pending
+}
+
+// Output rules (`test_compgen.c:286-363`): `candidate<TAB>description`,
+// trailing blanks trimmed, control bytes drawn as `·`, blank lines
+// skipped, order kept; the job's environment; cache fresh then stale.
+fn t_compgen_lines_become_rows() {
+    let f = fix_init("lines")
+    var ed = gen_ed(f)
+    let prog = script(
+        f,
+        "lines",
+        "#!/bin/sh\nprintf 'zeta\\tlast letter  \\n\\n'\nprintf 'alpha  \\n'\nprintf 'b\\033[2Jx\\tde\\001sc\\n'\nprintf '   \\n'\nprintf 'NO_COLOR=%s TERM=%s PAGER=%s\\n' \"$NO_COLOR\" \"$TERM\" \"$PAGER\"\nprintf 'cwd=%s\\n' \"$(pwd)\"\n",
+    )
+    let k = key_for("lines", one(prog), f.root)
+    var rows = List[edit.GenItem]()
+    assert(ask(mut ed, k, time_now_ms(), mut rows), "first ask: in flight")
+    assert(rows.len == 0, "nothing cached")
+    assert(edit.compgen_inflight(ed.gen) == 1, "one job")
+    let ks = edit.compgen_key_string(k)
+    assert(edit.compgen_awaiting(ed.gen, ks), "awaiting")
+    pump_idle(mut ed)
+    assert(!edit.compgen_awaiting(ed.gen, ks), "arrived")
+    assert(edit.job_running_count(ed) == 0, "never a user-visible job")
+    assert(!ask(mut ed, k, time_now_ms(), mut rows), "answered, nothing pending")
+    assert(rows.len == 5, "five rows, got {rows.len}")
+    assert(rows[0].text == "zeta" && rows[0].detail == "last letter", "zeta")
+    assert(rows[1].text == "alpha" && !rows[1].has_detail, "alpha: no detail")
+    assert(
+        rows[2].text == "b\u{B7}[2Jx" && rows[2].detail == "de\u{B7}sc",
+        "control bytes: {rows[2].text}",
+    )
+    assert(
+        rows[3].text == "NO_COLOR=1 TERM=dumb PAGER=cat",
+        "the job's environment: {rows[3].text}",
+    )
+    assert(rows[4].text.contains("yew-compspec-"), "the cwd: {rows[4].text}")
+    let spawns = edit.compgen_spawns(ed.gen)
+    let _ = ask(mut ed, k, time_now_ms(), mut rows)
+    assert(
+        edit.compgen_spawns(ed.gen) == spawns && rows.len == 5,
+        "fresh: the cache, nothing spawned",
+    )
+    assert(ask(mut ed, k, time_now_ms() + 60000, mut rows), "stale: refreshed")
+    assert(rows.len == 5, "stale: served")
+    assert(edit.compgen_spawns(ed.gen) == spawns + 1, "one more spawn")
+    pump_idle(mut ed)
+    gen_drop(f, mut ed)
+}
+
+// `test_compgen.c:367-409`: a generator that does not answer in time is
+// KILLED, its empty answer cached, and not respawned.
+fn t_compgen_timeout_kills_and_caches_empty() {
+    let f = fix_init("timeout")
+    var ed = gen_ed(f)
+    edit.compgen_set_timeout_ms(mut ed.gen, 200)
+    let prog = script(f, "sleeper", "#!/bin/sh\nexec sleep 5\n")
+    let k = key_for("sleeper", one(prog), f.root)
+    var rows = List[edit.GenItem]()
+    assert(ask(mut ed, k, time_now_ms(), mut rows), "in flight")
+    assert(ed.jobs.v.len == 1, "one job")
+    let pid = ed.jobs.v[0].pid
+    let slot = ed.jobs.v[0].child
+    assert(pid > 0, "a process")
+    let start = time_now_ms()
+    pump_idle(mut ed)
+    assert(time_now_ms() - start < 4000, "killed, not waited for")
+    assert(ed.jobs.v.len == 0, "released")
+    // C's `kill(pid, 0) == ESRCH`: the handle is reaped, and /proc (where
+    // the host has one) no longer lists the pid.
+    let gone = os_wait_status(slot) else -999
+    assert(gone == -999, "the child was reaped")
+    if fs.exists("/proc/self") {
+        assert(!fs.exists("/proc/{pid}"), "no such process")
+    }
+    let spawns = edit.compgen_spawns(ed.gen)
+    assert(!ask(mut ed, k, time_now_ms(), mut rows), "cached: nothing pending")
+    assert(rows.len == 0, "the empty answer")
+    assert(edit.compgen_spawns(ed.gen) == spawns, "not respawned")
+    gen_drop(f, mut ed)
+}
+
+fn log_text() -> str {
+    fs.read_text(env_get("YEW_LOG") else "") else ""
+}
+
+// `test_compgen.c:413-460`: a non-zero exit and a program that cannot
+// run: the empty answer, cached, logged — never a footer message.
+fn t_compgen_failure_caches_an_empty_answer() {
+    let f = fix_init("fails")
+    var ed = gen_ed(f)
+    let prog = script(f, "fails", "#!/bin/sh\necho partial\nexit 3\n")
+    let k = key_for("fails", one(prog), f.root)
+    var rows = List[edit.GenItem]()
+    let _ = ask(mut ed, k, time_now_ms(), mut rows)
+    pump_idle(mut ed)
+    let spawns = edit.compgen_spawns(ed.gen)
+    let _ = ask(mut ed, k, time_now_ms(), mut rows)
+    assert(rows.len == 0, "no rows from a failure")
+    assert(edit.compgen_spawns(ed.gen) == spawns, "cached")
+    assert(log_text().contains("completion generator fails"), "logged: {log_text()}")
+    assert(!ed.msg.active, "never a footer message")
+    let k2 = key_for("missing", one("{f.root}/no-such-program"), f.root)
+    let _ = ask(mut ed, k2, time_now_ms(), mut rows)
+    pump_idle(mut ed)
+    let spawns2 = edit.compgen_spawns(ed.gen)
+    assert(!ask(mut ed, k2, time_now_ms(), mut rows), "nothing pending")
+    assert(rows.len == 0, "no rows")
+    assert(edit.compgen_spawns(ed.gen) == spawns2, "cached")
+    gen_drop(f, mut ed)
+}
+
+// `test_compgen.c:463-491`: at most 5000 lines are taken.
+fn t_compgen_output_is_capped() {
+    let f = fix_init("big")
+    var ed = gen_ed(f)
+    let prog = script(
+        f,
+        "big",
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 6000 ]; do echo row$i; i=$((i+1)); done\n",
+    )
+    let k = key_for("big", one(prog), f.root)
+    var rows = List[edit.GenItem]()
+    let _ = ask(mut ed, k, time_now_ms(), mut rows)
+    pump_idle(mut ed)
+    let _ = ask(mut ed, k, time_now_ms(), mut rows)
+    assert(rows.len == edit.COMPGEN_MAX_LINES, "capped: {rows.len}")
+    assert(rows[0].text == "row0" && rows[4999].text == "row4999", "the first 5000")
+    gen_drop(f, mut ed)
+}
+
+// DoD 4 (`test_compgen.c:497-542`): 50 keystrokes against one key, then
+// six: at most one job per key and four in all.
+fn t_compgen_fifty_keystrokes_stay_within_the_caps() {
+    let f = fix_init("fifty")
+    var ed = gen_ed(f)
+    let prog = script(f, "slow", "#!/bin/sh\nsleep 0.3\necho \"$1\"\n")
+    var keys = List[edit.GenKey]()
+    var i = 0
+    while i < 6 {
+        (mut keys).push(key_for("slow", two(prog, "key{i}"), f.root))
+        i += 1
+    }
+    var rows = List[edit.GenItem]()
+    i = 0
+    while i < 50 {
+        let _ = ask(mut ed, keys[0], time_now_ms(), mut rows)
+        assert(edit.compgen_inflight(ed.gen) <= 1, "one flight per key")
+        assert(ed.jobs.v.len <= 1, "one job")
+        assert(edit.job_running_count(ed) == 0, "never a user job")
+        i += 1
+    }
+    assert(edit.compgen_spawns(ed.gen) == 1, "spawned once")
+    i = 0
+    while i < 50 {
+        let _ = ask(mut ed, keys[i % 6], time_now_ms(), mut rows)
+        assert(edit.compgen_inflight(ed.gen) <= edit.COMPGEN_MAX_INFLIGHT, "four flights")
+        assert(ed.jobs.v.len <= edit.COMPGEN_MAX_INFLIGHT, "four jobs")
+        if i % 7 == 0 {
+            pump(mut ed, 0)
+        }
+        i += 1
+    }
+    pump_idle(mut ed)
+    gen_drop(f, mut ed)
+}
+
+fn sleeper_job(mut ed: edit.Ed) -> int {
+    var spec = edit.job_spec_new()
+    spec.argv = two("/bin/sleep", "5")
+    spec.sink = edit.SINK_DISCARD
+    let (id, err) = edit.job_spawn(mut ed, mut spec)
+    assert(id != 0, "a user job starts: {err}")
+    id
+}
+
+// §5.2's reason (`test_compgen.c:549-612`): the table full of the user's
+// jobs plus four generators, the user's next command still starts — it
+// takes a generator's slot.
+fn t_compgen_never_costs_the_user_a_job_slot() {
+    let f = fix_init("slot")
+    var ed = gen_ed(f)
+    let prog = script(f, "slowgen", "#!/bin/sh\nsleep 5\n")
+    var rows = List[edit.GenItem]()
+    var i = 0
+    while i < 4 {
+        let _ = ask(mut ed, key_for("slowgen", two(prog, "k{i}"), f.root), time_now_ms(), mut rows)
+        i += 1
+    }
+    assert(edit.compgen_inflight(ed.gen) == 4, "four generators")
+    let user_jobs = edit.JOB_MAX - 4
+    i = 0
+    while i < user_jobs {
+        let _ = sleeper_job(mut ed)
+        i += 1
+    }
+    assert(ed.jobs.v.len == edit.JOB_MAX, "the table is full")
+    let _ = ask(mut ed, key_for("slowgen", two(prog, "k9"), f.root), time_now_ms(), mut rows)
+    assert(ed.jobs.v.len == edit.JOB_MAX, "a fifth key evicts nothing")
+    let _ = sleeper_job(mut ed)
+    assert(ed.jobs.v.len == edit.JOB_MAX, "still full")
+    assert(edit.compgen_inflight(ed.gen) == 3, "a generator gave its slot")
+    assert(edit.job_running_count(ed) == user_jobs + 1, "the user's jobs")
+    gen_drop(f, mut ed)
+}
+
+// ------------------------------------------------------------------
+// Arrival races (§5.4): through the real prompt
+// ------------------------------------------------------------------
+
+// `PromptFix` (`test_compgen.c:618-647`): the spec fixture with a state
+// home, the runtime, a user spec `fixcmd` whose generator is `gen_body`.
+struct PromptFix {
+    f: Fix,
+    ed: edit.Ed,
+    old_state: str,
+    had_state: bool,
+    old_rt: str,
+    had_rt: bool,
+    old_cfg: str,
+    had_cfg: bool,
+}
+
+fn gen_spec(prog: str) -> str {
+    "# test 1\n{{ completion: 1, command: \"fixcmd\",\n  generators: {{ g: {{ argv: [\"{prog}\"] }} }},\n  subcommands: [ {{ name: \"stat-one\" }}, {{ name: \"stat-two\" }} ],\n  args: [ {{ kind: \"generator\", generator: \"g\" }} ] }}\n"
+}
+
+fn prompt_fix_init(tag: str, gen_body: str) -> PromptFix {
+    let f = fix_init(tag)
+    let (os, hs) = env_copy("XDG_STATE_HOME")
+    let (orr, hr) = env_copy("YEW_RUNTIME_DIR")
+    let (oc, hc) = env_copy("XDG_CONFIG_HOME")
+    fs.create_dir_all("{f.root}/state") else |_| {}
+    fs.create_dir_all("{f.root}/config/yew/completions") else |_| {}
+    env_set("XDG_STATE_HOME", "{f.root}/state") else |_| {}
+    env_set("XDG_CONFIG_HOME", "{f.root}/config") else |_| {}
+    if !hr || orr.len == 0 {
+        let cwd = os_cwd() else ""
+        env_set("YEW_RUNTIME_DIR", "{cwd}/runtime") else |_| {}
+    }
+    // `yew_test_load_runtime` (`test_compgen.c:633`): the runtime's
+    // bindings, so the prompt's Backspace is the runtime's.
+    let rt = fs_read_bytes("runtime/init.fl") else List[byte]()
+    assert(rt.len != 0, "runtime/init.fl is readable from the repository root")
+    var ed = edit.ed_new_test(rt, "")
+    ed.ws_dir = f.root
+    let prog = script(f, "fixgen", gen_body)
+    fs.write_text("{f.root}/config/yew/completions/fixcmd.fl", gen_spec(prog)) else |_| {
+        assert(false, "spec")
+    }
+    PromptFix {
+        f: f,
+        ed: ed,
+        old_state: os,
+        had_state: hs,
+        old_rt: orr,
+        had_rt: hr,
+        old_cfg: oc,
+        had_cfg: hc,
+    }
+}
+
+fn env_back(name: str, v: str, had: bool) {
+    if had {
+        env_set(name, v) else |_| {}
+    } else {
+        env_unset(name) else |_| {}
+    }
+}
+
+fn prompt_fix_drop(mut p: PromptFix) {
+    edit.jobs_free(mut p.ed)
+    env_back("XDG_STATE_HOME", p.old_state, p.had_state)
+    env_back("YEW_RUNTIME_DIR", p.old_rt, p.had_rt)
+    env_back("XDG_CONFIG_HOME", p.old_cfg, p.had_cfg)
+    fix_drop(p.f)
+}
+
+fn prompt_text(ed: edit.Ed) -> str {
+    str_from_utf8(edit.cmdline_text(ed)) else "?"
+}
+
+fn press_tab(mut ed: edit.Ed) {
+    let cx = edit.cmdctx_new(ed.win, 0)
+    let _ = edit.cmdline_complete_next_cmd(mut ed, cx)
+}
+
+fn menu_has(ed: edit.Ed, t: str) -> bool {
+    for it in ed.cmdline.menu.items {
+        if (str_from_utf8(it.text) else "") == t {
+            return true
+        }
+    }
+    false
+}
+
+// `test_compgen.c:659-697`: the answer arrives with the prompt open and
+// the same context: the menu refills, the marker goes, the TEXT is
+// untouched.
+fn t_compgen_arrival_refilters_but_never_edits() {
+    var p = prompt_fix_init("refilter", "#!/bin/sh\nsleep 0.2\necho only-branch\n")
+    edit.cmdline_open(mut p.ed, edit.PROMPT_CMD, "")
+    edit.cmdline_paste(mut p.ed, bytes_of("!fixcmd "))
+    assert(edit.compgen_inflight(p.ed.gen) == 0, "an empty word completes nothing live")
+    press_tab(mut p.ed)
+    assert(p.ed.cmdline.filter.gen_pending, "the filter is pending")
+    assert(p.ed.cmdline.menu.pending, "the menu's marker")
+    assert(p.ed.cmdline.menu.items.len == 2, "the static rows: {p.ed.cmdline.menu.items.len}")
+    let before = prompt_text(p.ed)
+    assert(before == "!fixcmd ", "Tab inserted nothing: `{before}`")
+    pump_idle(mut p.ed)
+    assert(prompt_text(p.ed) == before, "the text is untouched")
+    assert(!p.ed.cmdline.menu.pending, "the marker went")
+    assert(p.ed.cmdline.menu.items.len == 3, "refilled: {p.ed.cmdline.menu.items.len}")
+    edit.cmdline_paste(mut p.ed, bytes_of("only"))
+    assert(prompt_text(p.ed) == "!fixcmd only", "the sole survivor was never inserted")
+    edit.cmdline_close(mut p.ed, false)
+    prompt_fix_drop(mut p)
+}
+
+// `test_compgen.c:701-717`: the prompt closes before the answer: nothing
+// repaints, the answer only lands in the cache.
+fn t_compgen_arrival_after_prompt_close() {
+    var p = prompt_fix_init("closed", "#!/bin/sh\nsleep 0.2\necho late\n")
+    edit.cmdline_open(mut p.ed, edit.PROMPT_CMD, "")
+    edit.cmdline_paste(mut p.ed, bytes_of("!fixcmd "))
+    press_tab(mut p.ed)
+    assert(edit.compgen_inflight(p.ed.gen) == 1, "in flight")
+    edit.cmdline_close(mut p.ed, false)
+    assert(!p.ed.cmdline.active, "closed")
+    pump_idle(mut p.ed)
+    assert(!p.ed.cmdline.active, "still closed")
+    assert(p.ed.cmdline.menu.items.len == 0, "no menu")
+    prompt_fix_drop(mut p)
+}
+
+fn key(code: int) -> term.Key {
+    var k = term.key_new()
+    k.code = code
+    k.kind = term.EV_KEY
+    k.ev = term.KEY_PRESS
+    k
+}
+
+// `test_compgen.c:720-777`: the context moved on before the answer: it is
+// cached, not shown; going back serves it without a new job.
+fn t_compgen_arrival_for_a_stale_context_is_only_cached() {
+    var p = prompt_fix_init("stale", "#!/bin/sh\nsleep 0.2\necho gen-row\n")
+    edit.cmdline_open(mut p.ed, edit.PROMPT_CMD, "")
+    edit.cmdline_paste(mut p.ed, bytes_of("!fixcmd "))
+    press_tab(mut p.ed)
+    assert(p.ed.cmdline.filter.has_gen_key, "a generator key")
+    edit.cmdline_paste(mut p.ed, bytes_of("stat-one "))
+    assert(p.ed.cmdline.menu.items.len == 0, "a different node: {p.ed.cmdline.menu.items.len}")
+    pump_idle(mut p.ed)
+    assert(p.ed.cmdline.menu.items.len == 0, "not shown")
+    assert(!menu_has(p.ed, "gen-row"), "never the generator's row")
+    assert(prompt_text(p.ed) == "!fixcmd stat-one ", "the text")
+    let spawns = edit.compgen_spawns(p.ed.gen)
+    var i = 0
+    while i < 9 {
+        edit.ed_handle_key(mut p.ed, key(term.KEY_BACKSPACE), 1)
+        i += 1
+    }
+    assert(prompt_text(p.ed) == "!fixcmd ", "back: `{prompt_text(p.ed)}`")
+    press_tab(mut p.ed)
+    assert(edit.compgen_spawns(p.ed.gen) == spawns, "served from the cache")
+    assert(!p.ed.cmdline.menu.pending, "nothing pending")
+    assert(menu_has(p.ed, "gen-row"), "the cached row")
+    edit.cmdline_close(mut p.ed, false)
+    prompt_fix_drop(mut p)
+}
+
 // Port-only: the rows `gen_complete` parses out of a finished job
 // (`compgen.c:622-693`), on the bytes `test_compgen_lines_become_rows`'
-// script prints (its environment and cwd lines are the job's, R-yw04-1).
+// script prints; the job-run case above asserts the environment rows.
 fn t_port_compgen_parse_rules() {
     var data = List[byte]()
     for b in "zeta\tlast letter  \n\nalpha  \nb".bytes() {
@@ -172,69 +630,45 @@ fn t_port_compgen_parse_rules() {
     assert(ps[1].text == "7" && ps[1].detail == "bash", "ps")
 }
 
-// Port-only: a spec generator's spawn refuses by name (R-yw04-1), cached
-// as C caches a spawn failure (§5.6): empty, fresh for cache_ms, logged.
-fn t_port_compgen_spawn_refuses_by_name() {
-    var g = edit.compgen_new()
-    var argv = List[str]()
-    (mut argv).push("/bin/echo")
+// Port-only: the key's identity (`compgen.c:723-743`).
+fn t_port_compgen_key_string() {
     let key = edit.GenKey {
         name: "test:echo",
-        argv: argv,
+        argv: one("/bin/echo"),
         cwd: "/tmp",
         has_cwd: true,
         cache_ms: 2000,
         ps_columns: false,
     }
-    var rows = List[edit.GenItem]()
-    let (ok, pending) = edit.compgen_rows(mut g, key, 1000, 0, mut rows)
-    assert(ok, "answered")
-    assert(!pending, "nothing in flight: the spawn refused")
-    assert(rows.len == 0, "the empty answer")
-    assert(edit.compgen_spawns(g) == 1, "one spawn attempted")
-    let (ok2, _) = edit.compgen_rows(mut g, key, 1500, 0, mut rows)
-    assert(ok2 && edit.compgen_spawns(g) == 1, "the cached empty answer, no respawn")
-    let (_, _) = edit.compgen_rows(mut g, key, 4000, 0, mut rows)
-    assert(edit.compgen_spawns(g) == 2, "stale: asked again")
-    let log = fs.read_text(env_get("YEW_LOG") else "") else ""
-    assert(
-        log.contains(
-            "completion generator test:echo: not yet ported: the completion generator job: needs os_signal_wait_fds (G2, wolf-lang#795)",
-        ),
-        "the refusal is in the log: {log}",
-    )
     assert(
         edit.compgen_key_string(key) == "test:echo\u{1F}/bin/echo\u{1E}/tmp",
         "the key's identity",
     )
 }
 
-fn skip(name: str) -> int {
-    let why = "a subprocess generator reads its pipe while the loop runs: needs os_signal_wait_fds (G2, wolf-lang#795), R-yw04-1"
-    print("compgen_test: SKIP {name}: {why}")
-    eprint("compgen_test: SKIP {name}: {why}")
-    1
-}
-
 fn main() {
+    // The session's `--yew-env0` runs this binary (`unit_main.c:14-19`).
+    if edit.shsession_env0_requested() {
+        os_exit(edit.shsession_env0_main())
+    }
     fs.create_dir_all("target/tests") else |_| {}
     let log = "target/tests/edit-compgen-test.log"
     fs.remove(log) else |_| {}
     env_set("YEW_LOG", log) else |_| {}
-    var skips = 0
+    signal.listen(signal.child()) else |_| {}
     t_compgen_hosts_reads_the_fixture_home_only()
     t_compgen_make_targets_never_executes_the_makefile()
     t_compgen_signals_with_and_without_sig()
-    skips += skip("compgen_lines_become_rows")
-    skips += skip("compgen_timeout_kills_and_caches_empty")
-    skips += skip("compgen_failure_caches_an_empty_answer")
-    skips += skip("compgen_output_is_capped")
-    skips += skip("compgen_fifty_keystrokes_stay_within_the_caps")
-    skips += skip("compgen_never_costs_the_user_a_job_slot")
-    skips += skip("compgen_arrival_refilters_but_never_edits")
-    skips += skip("compgen_arrival_after_prompt_close")
-    skips += skip("compgen_arrival_for_a_stale_context_is_only_cached")
+    t_compgen_lines_become_rows()
+    t_compgen_timeout_kills_and_caches_empty()
+    t_compgen_failure_caches_an_empty_answer()
+    t_compgen_output_is_capped()
+    t_compgen_fifty_keystrokes_stay_within_the_caps()
+    t_compgen_never_costs_the_user_a_job_slot()
+    t_compgen_arrival_refilters_but_never_edits()
+    t_compgen_arrival_after_prompt_close()
+    t_compgen_arrival_for_a_stale_context_is_only_cached()
     t_port_compgen_parse_rules()
-    t_port_compgen_spawn_refuses_by_name()
-    print("compgen_test: {12 - skips} C cases pass, {skips} SKIP; 2 port cases pass")
+    t_port_compgen_key_string()
+    print("compgen_test: 12 C cases pass, 0 SKIP; 2 port cases pass")
 }

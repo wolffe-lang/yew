@@ -211,3 +211,187 @@ issue filed or closed; no trailer.
 | the budgets | `budgets.txt` has no pane or tab-switch row; `startup.first_paint.workspace50` and `mem.workspace50` are s25's deferred tabs (yw06) | the 2× gates here are the port/C ratio from the same run |
 | the oracle | C yew at `9ace98c2`, gcc: 3,047 unit tests, 0 failures in the lane's container once `YEW_LOG` is unset (one failure under it, the variable's, `notes/yw05-evidence/lane/pin-baseline.txt`) | none |
 | the yew trunk | `5889a8b` (yw04's merge) | none |
+
+## 3. Prediction — the hits and misses
+
+**The lane's own** (the twelve written before the first change):
+
+1. *The pin commit changes no source* — **HIT**: at `e6d3f04` both tiers
+   built with warnings denied, campaign 01 18/18, 03 62/62 and 04 83/104
+   on both tiers, `check-test` 89 files on both lanes, the same 21 red as
+   yw04's final gate (`notes/yw05-evidence/lane/pin-baseline.txt`).
+2. *The deliverable's count is 23, not 30* — **HIT** (§2).
+3. *G2 retires the whole interim; the burst pair passes on macOS* —
+   **HIT**: `1ebff08` waits on the tty, the jobs' descriptors and the
+   signal set in one `os_signal_wait_fds` with the timer heap's deadline;
+   the `VTIME` tick, the drain and the fine wait went with their mode
+   switches (`term.tty`), and so did `edit.loop`'s deadline-first turn.
+   The burst pair 20/20 and 20/20 in the container
+   (`notes/yw05-evidence/wait/sweeps/a137225-burst-f1-release.txt`), and
+   gated by name on macOS again in the wait fork's dispatch (run
+   39713224005: "campaign 03: 60 goldens green by name" on the macOS
+   oracle, the pair among them) — yew#28 closes on the PR run's macOS leg.
+4. *G34 retires the LF-as-Enter interim* — **HIT**: `rawios` sets
+   `RAW_CR | RAW_OUTPUT` (C's `cfmakeraw` set), `term.input_set_lf_enter`
+   and `tty_icrnl_stuck` are gone (`21532a2`); no golden changed. The
+   goldens cannot see the bit (the modern profile sends Enter as CSI u):
+   the RAW_CR plant is green on campaign 03 and RED on the live torture
+   lane, whose driver types a raw CR (`notes/yw05-evidence/wait/
+   plant-raw-cr.txt`), so the live lane is the bit's gate.
+5. *G1 does not retire the guard* — **HIT, and one better**:
+   `os_term_restore_at_exit` restores on a trap, `os_exit`,
+   `os_exit_signal` and a return, and on no outside signal
+   (`notes/yw05-evidence/wait/witness/restore-at-exit/run.txt`), so yw01's
+   guard sibling stays for an outside `SIGSEGV`/`SIGBUS`/`SIGKILL`. The
+   miss in the right direction: `ABORT` is listenable, so the editor now
+   listens for it and restores before that death in process, as C's
+   handler table does (`ccfddaa`, `tty.c:381-384`), and `restore_abrt` is
+   GATED on macOS again; three of the four cases stay advisory there
+   (`restore_bus`, `notepad_restore_segv`, `notepad_restore_kill`,
+   R-yw01-1), not four.
+6. *G3 turns every sync red green* — **HIT**: `save_fault_shim_contract`,
+   the replica's determinism order (the port's shim log is C's order with
+   one more `close`, the compiled tiers syncing a duplicate of the handle),
+   `tools/torture-live`'s determinism lane and `test_multicursor`'s sync
+   count (R-yw03-5) green; every acceptance and CI's KNOWN-RED branches
+   deleted (`9981fe5`, `ff2e34c`, `660667d`, `ebb43d3`, `452128f`;
+   `notes/yw05-evidence/sync/`).
+7. *G4: `fs_realpath` replaces the component walk, every answer unchanged*
+   — **HIT** (`f249cbb`; `text_file_test` 17 cases +1 port).
+8. *G30's fork half: the writer forks as C's, `s57_29` green, R-yw04-6
+   retires; the filter's write side served by a forked writer* — **HIT**
+   both halves: the clipboard writer and reader fork (`c2535bf`), campaign
+   04 84/104 at the sync fork's head; the filter's stdin is fed by a forked
+   writer child (`job_fork_writer`) and its three goldens are green with
+   the job half. yew#29 closes.
+9. *The job half: 19 of 20 green; `s19_jobs_table` green only if its table
+   needs no workspace state* — **HIT, all 20**: the `*jobs*` table needs
+   none; campaign 04 **104/104** on both tiers at the jobs fork's head
+   merged with the lane (`notes/yw05-evidence/jobs/`). yw04's SKIP-by-name
+   job cases run (§4.1).
+10. *Deliverable 6 cuts the `:` keystroke's ~210 KB by 10× or more, short
+    of C's* — (§4.5).
+11. *The ratio is a C `float`; wolf's `f32` reproduces it exactly* —
+    **MISS, then the prediction's own fallback**: natively `f32` rounds as
+    C does (the panes fork's layout fuzz equal to C's driver), but the
+    checked machine refuses `f32` ("f64 is the supported float") and every
+    editor case lays out a tree, so an `f32` ratio took every editor test
+    off the checked machine (`edit_layout_test` 0 of 46 checked per case,
+    `edit_jumplist_test` 0 of 18). The ratio is C's float BITS in an `int`,
+    rounded exactly by `util.f32` in integers (`ef7ad62`): 45 of 46 and
+    18 of 18 back on the checked machine, `f32_test` against C's twelve
+    boundary rows and 2M points of wolf's own `f32` (`notes/yw05-evidence/
+    panes/f32-bits/`). A new gap (§5, G44).
+12. *Merging is the risk; no golden of campaigns 03 and 04 changes at any
+    merge* — (§4.6).
+
+**The contract's** — (§4.6, after the gates).
+
+## 4. The sections, and what yw05 measured
+
+### 4.1 The bump (deliverable 1) — the pin, then the wait, sync and jobs forks
+
+**The pin** (`e6d3f04`, prediction recorded first at `0f37145`):
+`wolf-toolchain.toml` names wolf `v0.2.34` (`9da7bdcf`), lupin `v0.1.55`
+(`e642f26`) and the bundled std `e036bec` by archive digest (read twice,
+the table above); at the pin, before any gap was adopted, every gate was
+yw04's (`notes/yw05-evidence/lane/pin-baseline.txt`, prediction 1).
+
+**The wait fork** (`notes/yw05-evidence/wait/`, merged `5f74372`): G2 —
+`term.tty_wait(t, extra, deadline)` is ONE `os_signal_wait_fds` over the
+terminal, the job descriptors and the signal set, with the timer heap's
+deadline (`1ebff08`); the `VTIME` tick, the drain mode, the fine wait and
+`edit.loop`'s deadline-first turn are gone, and with them every termios
+switch in the wait (yew#28's cause). yw04's port-only cases for the
+interim (`t_port_loop_deadline_turn_precedes_late_bytes`,
+`t_port_tty_wait_kind`) retire with it, each replaced: the job
+descriptors' look (`t_port_tty_ready_extra`) and C's four raw-flag cases
+over the widened mode int (`85b9a61`). G34 — `rawios` sets `RAW_CR |
+RAW_OUTPUT` (C's `cfmakeraw`), R-yw03-4's LF-as-Enter interim
+(`term.input_set_lf_enter`, `tty_icrnl_stuck`) retires (`21532a2`); under
+a pty the port's mode reads a typed CR as 13 and writes a LF alone
+(`witness/raw-bits/`). G1 — `os_term_restore_at_exit` is registered
+(`3f35e72`), and `ABORT` is listened for and restored before, as C's
+handler table (`ccfddaa`); the runtime's restore covers no outside signal
+(`witness/restore-at-exit/`), so yw01's guard sibling stays for an outside
+`SIGSEGV`/`SIGBUS`/`SIGKILL`. CI (`9f1259f`): the burst pair and
+`restore_abrt` gated on macOS again; `restore_bus`,
+`notepad_restore_segv` and `notepad_restore_kill` stay announced macOS
+advisories under R-yw01-1, renamed for why (an outside signal runs no code
+of the process). The fork's gate at `a137225`: 18/18, 62/62, 83/104 on
+both tiers, the burst pair 20/20 twice, `check-test` 89 files both lanes;
+its every-leg dispatch (run 39713224005) gated campaign 03's 60 on the
+macOS oracle with the burst pair among them.
+
+**The sync fork** (`notes/yw05-evidence/sync/`, merged `765557e`): G3 —
+`fs_sync`/`fs_sync_dir` at C's sites in the save and the journal
+(`452128f`), and every acceptance deleted: `save_paths_test`'s KNOWN-RED
+(`9981fe5`), `multicursor_test`'s sync count (R-yw03-5, `ff2e34c`),
+`tools/torture-live`'s determinism acceptance (`660667d`) and CI's
+KNOWN-RED branches of the kill9, replica and live-editor steps
+(`ebb43d3`); each was seen red with the acceptance gone and the save still
+unsynced (`red-acceptance-gone/`, `redmc/`) and green with the syncs
+(`g3-syncs/`, `final/`): the replica GREEN three ways, the live lane GREEN
+with no acceptance, 500 external SIGKILLs old=500 new=0. G4 —
+`text.file_realpath` is `fs_realpath` (`f249cbb`). G30's fork half — the
+clipboard writer and reader fork as C's (`c2535bf`, the deadline and the
+demotion kept), the loop pumps the writer after the wait (`9aa062e`), the
+paste reads the clipboard and R-yw03-6's refusal retires (`1523360`):
+`clipboard_test` 15 cases whole, `prompt_keys_test` 56 and
+`sel_actions_test` 30 with no SKIP natively; on the checked machine the
+`os_fork` halves SKIP by name (`unsupported` there, ruling #95 R4 C).
+`s57_29_prompt_select_and_copy` green: campaign 04 84/104 at the fork's
+head; R-yw04-6 retires unasked (yew#29).
+
+**The jobs fork** (`notes/yw05-evidence/jobs/`, merged `d53daae`): yw04's
+job half over the wait — `job.c`'s table with its owners as kinds, the
+stream, the footers and the badge, `shell.c`'s three modes with the
+filter's restricted loop and the `*jobs*` table, `:r !`, the persistent
+session (s57.27), the generator, `--help` and fish jobs; the filter's
+write side through a forked writer child (G30, R-yw04-3) — and the unit
+suites yw04 ported to the STOP, each now run: see the jobs evidence README
+for the commits. **Campaign 04: 104/104 on both tiers** (the 21 rows
+red at yw04's end all green; CI gates the 104 by name, `b77f12c`). Every
+turned-green suite was seen red under one planted break (`red-*.txt`).
+
+### 4.2 The pane tree (deliverable 2, s22) — the panes fork
+
+**The tree's shape, and why** (`e38c6de`, then `edit.layout`'s header): C's
+`Pane` is a `malloc`ed node with parent/child pointers mutated in place;
+the port keeps the tree as a NODE POOL in the `Ed` (`Ed.panes`, every link
+an index, a free list through `next_free`: yw02's piece-tree shape), so a
+split/close storm grows nothing past its high-water mark (G33) and a
+leaf mutated in place into a split keeps every index at it valid, as C's
+pointers. Each `Tab` owns its tree by root and focus indices (`tabs.h:36-
+41`); the active tab's are mirrored in `Ed.pane_root`/`Ed.focus`, and
+`Ed.win` is the focused leaf's window. A layout node, a tab and a region
+are values threaded through the `Ed`, never module state (E1010). C's tree
+walk takes a function pointer; the port answers the nodes in the walk's
+order and the caller loops (G19/G20).
+
+What landed: `edit.region` in full (`96730bc`: every kind, `remove_rect`,
+`frozen`, the 256 cap warning once a frame, cleared at frame start, the TAB
+payload's sign convention), `edit.glyphs` (`660ffeb`: the chrome
+vocabulary, ASCII decided once from the locale), `edit.pane_cmds`
+(`1b42dd1`: every `ed.pane.*` command, the tab splits, the border drag
+and click-to-focus through the registry), the draw half of s22 §7
+(`912d1ca`: the tree, its borders and crossings, dim-inactive, the
+regions; partial damage with more than one pane redraws the tree, as
+`ed.c:2705-2711`), the mouse route's Sprint-22 half (`94ccbc1`:
+click-to-focus, the border drag with Esc and focus-out restoring the entry
+ratio, the strip's press and release), every other view of a buffer
+following its edits and undo replay (`0e400bd`, `test_jumplist`'s
+peer-window half running), an inactive diff peer clamping (`7df0578`), and
+**the ratio as C's float bits** (`ef7ad62`, §3 prediction 11, G44).
+
+Tests: `test_layout` 45 (+1 port: the ratio rounds in C's float),
+`test_region` 7, `test_glyphs` 8, `test_draw` 3 of 4 (the git diff rows
+SKIP by name: yw13). Per case on the checked machine at `ef7ad62`:
+`edit_layout_test` 45 of 46 (one on the step budget), `edit_region_test` 7
+of 7, `edit_glyphs_test` 8 of 8, `edit_draw_test` 3 of 4,
+`edit_jumplist_test` 18 of 18 (`notes/yw05-evidence/panes/f32-bits/`).
+Goldens: **s22's 11 by name on both tiers** at `6b9797b` (gate g2) and at
+`ef7ad62` (gate g3), campaign 03 62/62 and 04 unchanged. Fuzz: s22 DoD 10's
+layout fuzz is `tools/fuzz-panes` over C's own generator: the four-seed
+campaign × 10,000 operations on both tiers and 200,000 at seed 1, every
+report hash equal to C's driver (`gate-g3/g3.log`).
