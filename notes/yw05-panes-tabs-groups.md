@@ -291,7 +291,7 @@ issue filed or closed; no trailer.
 
 ### 4.1 The bump (deliverable 1) — the pin, then the wait, sync and jobs forks
 
-**The pin** (`e6d3f04`, prediction recorded first at `0f37145`):
+**The pin** (`e6d3f04`, prediction recorded first at `0f94e7f`):
 `wolf-toolchain.toml` names wolf `v0.2.34` (`9da7bdcf`), lupin `v0.1.55`
 (`e642f26`) and the bundled std `e036bec` by archive digest (read twice,
 the table above); at the pin, before any gap was adopted, every gate was
@@ -486,3 +486,58 @@ Goldens at the fork's gate g2 (`3842fd5`, merged with the lane at
 `s24_group_two_row_bar`, `s24_picker_chrome`), s22 11/11, the tab cases
 7/8 (`startup_multiple_files`, §4.3), campaign 03 62/62, campaign 04
 104/104; `check-test` 100 files both lanes (68 SKIP lines natively).
+
+### 4.5 Allocation-free hot paths (deliverable 6, R-yw05-3 = R-yw03-7 A) — the hot fork
+
+At wolf 0.2.34 a function allocates in its caller's region and the loop's
+is the session's, so every per-frame temporary stays to the session's end
+(G33; a per-turn region is E1010 while the turn mutates the editor —
+wolf-lang#839, s255, 0.2.35). The deliverable writes the hot paths into
+storage the editor already owns, byte-identical: `edit.drawbufs`
+(`Ed.dbuf`, `fab5abe`) holds what a frame draws into; the document rows,
+the overlay signature and border glyphs (`7eb3096`), the gutter's numbers
+(`abab3f8`, C's `number[32]`), the statusline and message row
+(`fab5abe`; the job badge written in place, the one conflict of the
+merge), the prompt row, its message and ghost and the menu's labels and
+footer (`effc0f2`), the drawn tab marks (`544d07b`, C's byte buffer) and
+the strip's chevrons and ` + ` control (`27646e6`) go through it; beneath
+them a held cluster reader (`f5c06cf`, C's stack reader), `intern_bytes`
+(`92211eb`), the grid's control lowering and fill check in place
+(`f95e972`), the renderer's digits and attribute tables (`dbed336`), the
+piece iterator's stack (`de28a46`), the viewport's follow through the held
+reader (`63c5a7c`) and the bang body parsed in a copy region (`ba95252`).
+
+Measured with the PTY driver (yw03's and yw04's, 24x80, N = 2,000 keys a
+phase, C, the baseline `7249ff8` and the head from ONE run, both tiers,
+the port's output byte-identical before and after on every row by sha;
+`notes/yw05-evidence/hot/README.md`, `runs/ptymem-final2.txt`), B/key
+release (native):
+
+| phase | C | before | after |
+|---|---:|---:|---:|
+| `:` prompt, menu key | ~300 | 208,460 | **20,967** (22,080) |
+| `:` prompt, typing | ~300 | 237,279 | 26,452 (27,148) |
+| I mode, README | 64 | 37,202 | 2,054 (2,417) |
+| I mode, 10k-line file | 31 | 17,285 | 901 (1,294) |
+| line moves, 10k-line file | 4 | 74,381 | **473** (1,202) |
+| line moves, README | 39 | 120,943 | 518 (1,264) |
+| two panes: line moves | 0 | 123,500 | 936 (1,100) |
+| two panes: typing | 88 | 137,413 | 2,779 (3,172) |
+| two panes: prompt menu | 254 | 231,799 | 21,010 (21,926) |
+
+In process (the region's ledger, exact): a full repaint 181,328 → 832 B;
+the document rows 177,200 → 0; the gutter 7,040 → 0; the statusline 2,352
+→ 0; the prompt row, the cursor overlay, the frame's encoding and an idle
+frame → 0; the strip 921 → 841. `edit_drawbufs_test` holds the zero
+ledger as a unit gate (its zero-ledger asserts SKIP by name on the checked
+machine, whose ledger charges a reused buffer's pushes). A plant (one
+`List[byte]()` put back into `draw_span`) moved line moves 1,794 →
+43,827 B/key and turned the unit gate red. **What remains**, named: the
+prompt menu's ~15 KB a key is the completion rows copied out of the
+filter's copy region — refilling the existing rows inside the region is
+E1010 at this pin (witness `notes/yw05-evidence/hot/witness/
+rebuild-copyin/`; s255's outer write and `List.reset`/`reserve`, 0.2.35);
+the strip's 832 B a frame (port work over the merged strip); the edit's
+own and the grapheme index's per-key bytes (text work); the terminal
+read's 64 B a turn (`fs.read_chunk` answers a fresh list: no read into a
+caller's buffer).
