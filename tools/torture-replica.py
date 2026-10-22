@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""torture-replica — the lanes of sagitta's `tests/torture/kill9.c` that
-its driver cannot reach against the wolf child at wolf 0.2.33.
+"""torture-replica — the late lanes of sagitta's `tests/torture/kill9.c`,
+run line for line against any child and any checker.
 
 sagitta's driver runs its lanes in one order and stops at the first red
-(`kill9.c:1159-1203`). Against the port's torture child it is green through
-the atomic sweeps, the hard-link sweep, the fallbacks, the in-place sweep
-and the rotation, then red at `inplace_write_failure_check` — the EIO the
-fault shim arms after a directory fsync (`faultshim.c:456-462`), which the
-port cannot make (G3, wolf-lang#796) — so the EINTR, ENOSPC, determinism
-and external-SIGKILL lanes after it never run. This tool runs THOSE four,
+(`kill9.c:1159-1203`). At wolf 0.2.33 the port's save synced nothing (G3,
+wolf-lang#796), so against the port's child the driver went red at
+`inplace_write_failure_check` — the EIO the fault shim arms after a
+directory fsync (`faultshim.c:456-462`) — and never reached the EINTR,
+ENOSPC, determinism and external-SIGKILL lanes; this tool was written to run
+THOSE four. Since the 0.2.34 pin the save syncs and the driver reaches every
+lane itself; the replica stays as the cross-check the driver cannot make:
 line for line from `kill9.c` (`injected_eintr` 907-926, `injected_enospc`
 928-967, `determinism_check` 831-860 with `atomic_log_order` 321-391,
 `external_kills` 1046-1104, `random_next` 1036-1044, the fixtures 19-23,
-`start_save` 163-232, `run_check` 234-251), against any child and any
-checker, with sagitta's own fault shim. It is the PORT'S replica, not
-sagitta's driver, and says so in every line it prints.
+`start_save` 163-232, `run_check` 234-251), with sagitta's own fault shim,
+the port's child checked by C and C's child checked by the port. It is the
+PORT'S replica, not sagitta's driver, and says so in every line it prints.
 
     tools/torture-replica.py --child BIN --checker BIN --shim SO
                              [--iters 500] [--lanes eintr,enospc,determinism,sigkill]

@@ -9,14 +9,11 @@
 //! scratch editor, `--clean` (session-lived histories), clipboard sync
 //! off, `shell.suggest_history = yew`.
 //!
-//! What wolf 0.2.33 cannot do here, each named on both streams:
-//!  - the subprocess clipboard WRITER (G30, R-yw02-3: no non-blocking
-//!    pipe write, no fork) — the cases that wait for the fake tool to
-//!    write its file (`pk_clip_holds`) run every other row and SKIP that
-//!    one; the `+` register half runs;
-//!  - the subprocess clipboard READER (G30, R-yw03-6 = B) — a C-v that
-//!    reaches it is REFUSED with C's deferred status and the session is
-//!    kept: those rows assert the refusal and SKIP C's pasted text.
+//! The subprocess clipboard runs whole since the 0.2.34 pin (G30's fork
+//! half, `text.clipboard`'s forked writer and reader, yw05): the fake
+//! tool writes its file (`clip_holds`) and the C-v rows paste what it
+//! reads. On the checked machine `os_fork` answers `unsupported` (ruling
+//! #95 R4 C), so those halves SKIP by name there, on both streams.
 //! The `/` and `?` halves run: the search fork's prompt (`edit.searchui`,
 //! sagitta Sprint 21) is merged.
 
@@ -43,12 +40,20 @@ fn skip(what: str, why: str) {
     say("prompt_keys_test: SKIP {what}: {why}")
 }
 
-fn writer_gap() -> str {
-    "the subprocess clipboard writer is G30's gap at wolf 0.2.33 (no non-blocking pipe write, no fork; R-yw02-2/R-yw02-3), so the fake tool never runs"
+fn no_fork() -> str {
+    "os_fork answers unsupported here (the checked machine, ruling #95 R4 C), so the fake tool never runs"
 }
 
-fn reader_gap() -> str {
-    "the subprocess clipboard reader is G30's gap at wolf 0.2.33 (R-yw03-6 = B): the paste is refused with C's deferred status and the session kept, asserted"
+// Does `os_fork` make a child here?
+fn fork_available() -> bool {
+    let (pid, h) = os_fork() else {
+        return false
+    }
+    if pid == 0 {
+        os_exit(0)
+    }
+    let _ = os_wait_status(h) else -1
+    true
 }
 
 fn runtime() -> List[byte] {
@@ -233,6 +238,57 @@ fn clip_done(mut ed: edit.Ed, c: Clip) {
         env_set("YEW_CLIPBOARD", c.saved) else |_| {}
     } else {
         env_unset("YEW_CLIPBOARD") else |_| {}
+    }
+}
+
+// `pk_fake_clipboard` (`test_prompt_keys.c:585-607`): a read-only fake
+// clipboard (`/bin/true` writes), the previous value restored after.
+fn fake_clipboard(bytes: str) -> Clip {
+    let saved = env_get("YEW_CLIPBOARD") else "\u{0}"
+    let cwd = std_env.cwd() else "."
+    let path = "{cwd}/target/tests/yew-pkclip-{std_env.pid()}"
+    fs.write_text(path, bytes) else |_| {
+        assert(false, "clipboard fixture")
+    }
+    env_set("YEW_CLIPBOARD", "cmd:/bin/true|{fake_path()} {path} read") else |_| {}
+    Clip { path: path, saved: saved, had: saved != "\u{0}" }
+}
+
+// `pk_clip_holds` (`test_prompt_keys.c:729-768`): render, pump the writer
+// until idle (the loop's one-millisecond wait on its descriptor), then
+// wait, bounded, on the fake tool's file content.
+fn clip_holds(mut ed: edit.Ed, c: Clip, want: str) {
+    var terminal = List[byte]()
+    text.clip_after_render(mut ed.regs.clip, mut ed.render, mut terminal, time_now_ms())
+    var i = 0
+    while i < 5000 && text.clip_busy(ed.regs.clip) {
+        let fd = text.clip_write_fd(ed.regs.clip)
+        if fd >= 0 {
+            let _ = os_signal_wait_fds([fd], 32768, 1) else (0, 0)
+        }
+        text.clip_pump(mut ed.regs.clip, mut ed.render, time_now_ms())
+        i += 1
+    }
+    assert(!text.clip_busy(ed.regs.clip), "the writer goes idle")
+    var got = ""
+    i = 0
+    while i < 2000 {
+        got = fs_read_text(c.path) else ""
+        if got == want {
+            break
+        }
+        time_sleep_ms(1)
+        i += 1
+    }
+    assert(got == want, "the clipboard file holds '{got}', want '{want}'")
+}
+
+// The clipboard file half of a row, or its SKIP where no tool can start.
+fn file_half(mut ed: edit.Ed, c: Clip, want: str, what: str) {
+    if fork_available() {
+        clip_holds(mut ed, c, want)
+    } else {
+        skip(what, no_fork())
     }
 }
 
@@ -543,28 +599,19 @@ fn prompt_keys_alt_r_inserts_a_register() {
     assert(!ed.cmdline.hsearch, "left")
 }
 
-// The C-v rows: the reader refuses (R-yw03-6 = B), the session kept.
-fn paste_refused(mut ed: edit.Ed, what: str) {
-    try_key(mut ed, ch("v"), term.MOD_CTRL)
-    assert(ed.last_cmd == edit.cmd_lookup(ed.reg, "ed.clip.paste"), "{what}: C-v is the paste")
-    assert(
-        ed.last_status == edit.CMD_ERR_DEFERRED,
-        "{what}: refused with C's deferred status ({ed.last_status})",
-    )
-    // The refusal's message is cleared at once by the prompt's edit hook,
-    // as C's is for any failed paste into the prompt (`clear_error` in
-    // `yew_cmdline_edited`, `cmdline.c:1102-1110`); the log keeps it.
-    assert(ed.cmdline.active && ed.mode == edit.MODE_E, "{what}: the prompt and the session kept")
-    skip(what, reader_gap())
-}
-
 fn prompt_keys_ctrl_v_pastes_the_system_clipboard() {
+    if !fork_available() {
+        skip("prompt_keys_ctrl_v_pastes_the_system_clipboard", no_fork())
+        return
+    }
+    let c = fake_clipboard("git log\n--oneline")
     var ed = init()
-    let c = clip_open("git log\n--oneline")
     text.clip_reset(mut ed.regs.clip)
     prompt(mut ed, none(), "!")
-    paste_refused(mut ed, "prompt_keys_ctrl_v_pastes_the_system_clipboard")
-    expect(ed, "!")
+    run(mut ed, ch("v"), term.MOD_CTRL, "ed.clip.paste")
+    expect(ed, "!git log --oneline")
+    assert(caret(ed) == 18, "caret 18, at {caret(ed)}")
+    assert(ed.mode == edit.MODE_E, "E")
     clip_done(mut ed, c)
 }
 
@@ -853,7 +900,7 @@ fn prompt_keys_ctrl_c_copies_or_cancels() {
     assert(caret(ed) == 8, "caret 8")
     expect(ed, "e alpha beta")
     plus_holds(mut ed, "beta")
-    skip("prompt_keys_ctrl_c_copies_or_cancels's clipboard file", writer_gap())
+    file_half(mut ed, c, "beta", "prompt_keys_ctrl_c_copies_or_cancels's clipboard file")
     run(mut ed, ch("c"), term.MOD_CTRL, "ed.cmdline.copy_or_cancel")
     assert(!ed.cmdline.active, "C-g without a selection")
     assert(ed.mode == edit.MODE_L, "L")
@@ -879,7 +926,7 @@ fn prompt_keys_ctrl_x_cuts_or_does_nothing() {
     assert(ed.cmdline.active, "open")
     assert(ed.mode == edit.MODE_E, "E")
     plus_holds(mut ed, "beta")
-    skip("prompt_keys_ctrl_x_cuts_or_does_nothing's clipboard file", writer_gap())
+    file_half(mut ed, c, "beta", "prompt_keys_ctrl_x_cuts_or_does_nothing's clipboard file")
     clip_done(mut ed, c)
 }
 
@@ -889,9 +936,19 @@ fn prompt_keys_ctrl_v_replaces_the_selection() {
     text.clip_reset(mut ed.regs.clip)
     prompt(mut ed, none(), "!echo hi")
     shift(mut ed, term.KEY_LEFT, term.MOD_ALT, "ed.sel.extend.word_prev")
-    paste_refused(mut ed, "prompt_keys_ctrl_v_replaces_the_selection")
-    expect(ed, "!echo hi")
+    if fork_available() {
+        run(mut ed, ch("v"), term.MOD_CTRL, "ed.clip.paste")
+        expect(ed, "!echo git log")
+        nosel(ed)
+        assert(caret(ed) == 13, "caret 13, at {caret(ed)}")
+        run(mut ed, ch("z"), term.MOD_CTRL, "ed.edit.undo")
+        expect(ed, "!echo hi")
+    } else {
+        skip("prompt_keys_ctrl_v_replaces_the_selection's paste half", no_fork())
+    }
     clip_done(mut ed, c)
+    // An EMPTY clipboard refuses the paste, and the selection it would
+    // have replaced is still there: the delete rolls back with it.
     var ed2 = init()
     let c2 = clip_open("")
     text.clip_reset(mut ed2.regs.clip)
@@ -969,7 +1026,7 @@ fn prompt_keys_clipboard_and_yank_stack_stay_apart() {
     expect(ed, "e one four")
     assert(yank_snap(ed) == before, "the yank stack byte-identical")
     plus_holds(mut ed, "two ")
-    skip("prompt_keys_clipboard_and_yank_stack_stay_apart's clipboard file", writer_gap())
+    file_half(mut ed, c, "two ", "prompt_keys_clipboard_and_yank_stack_stay_apart's clipboard file")
     text.clip_reset(mut ed.regs.clip)
     ed.regs.clipboard_sync = text.CLIP_SYNC_ALL
     shift(mut ed, term.KEY_LEFT, term.MOD_ALT, "ed.sel.extend.word_prev")
@@ -1005,7 +1062,7 @@ fn prompt_keys_insert_mode_ctrl_c_and_ctrl_x() {
     assert(ed.mode == edit.MODE_H, "H")
     run(mut ed, ch("c"), term.MOD_CTRL, "ed.clip.copy")
     plus_holds(mut ed, "lo")
-    skip("prompt_keys_insert_mode_ctrl_c_and_ctrl_x's clipboard file", writer_gap())
+    file_half(mut ed, c, "lo", "prompt_keys_insert_mode_ctrl_c_and_ctrl_x's clipboard file")
     clip_done(mut ed, c)
 }
 

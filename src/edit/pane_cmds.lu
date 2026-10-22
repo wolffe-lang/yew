@@ -1,0 +1,464 @@
+//! edit.pane_cmds — the pane commands, the border drag and click-to-focus.
+//!
+//! Ports sagitta `src/edit/pane_cmds.c` (555 lines) and `pane_cmds.h` (79)
+//! at 9ace98c2, under `s22-layout-panes.md` §4-§6 (and `s57_22-drag-to-
+//! spawn-pane.md` §5's `ed.tab.split_*`, which share the split's code; the
+//! drag gesture that also calls it is yw06's, R-yw05-1). Every command
+//! dispatches through the registry (DoD 8): an implementation id and the
+//! ONE `match` in `edit.impl`, as yw03's shape has it.
+//!
+//! Focus is a LEAF index validated after every tree mutation, and every
+//! mutation ends in `pane_refocus`, which also moves the TAB's copy of
+//! focus (`pane_cmds.c:49-65`: a split mutates the focused leaf in place
+//! into the split node, so a tab left pointing at it would land a later
+//! switch on a non-leaf). The per-frame leaf and split tables are what the
+//! region payloads index: a stale payload can name nothing once the table
+//! is reset with the nodes (`pane_free`, `pane_close`).
+//!
+//! What C calls here that later campaigns own, and so has no counterpart
+//! yet: `yew_shadow_dismiss` (shadow text, yw11), `yew_fl_hook_window`
+//! (Fletch's window-focus event, yw09), `yew_state_mark_dirty` (the
+//! workspace state, yw06) and `yew_fuss_windows_changed` (FUSS, yw13) —
+//! each is a notification to a subsystem that does not exist in the port,
+//! so there is nothing to tell.
+
+use text
+
+// `pane_refocus` (`pane_cmds.c:19-74`): focus lands on `want` when it is
+// a leaf, else on the current focus, else on the tree's first leaf; the
+// tab's copy follows.
+fn pane_refocus_to(mut ed: Ed, want: int) {
+    if !pane_live(ed, ed.pane_root) {
+        return
+    }
+    var target = if pane_live(ed, want) && ed.panes[want].is_leaf then want else ed.focus
+    if !pane_live(ed, target) || !ed.panes[target].is_leaf {
+        target = pane_first_leaf(ed, ed.pane_root)
+    }
+    ed.focus = target
+    if pane_live(ed, ed.focus) && ed.panes[ed.focus].win >= 0 {
+        ed.win = ed.panes[ed.focus].win
+    }
+    let t = ed.tab_active
+    if t >= 0 && t < ed.tabs.len && pane_live(ed, ed.focus) && ed.panes[ed.focus].is_leaf {
+        ed.tabs[t].focus = ed.focus
+    }
+    ed.layout_dirty = true
+    ed.full_damage = true
+}
+
+/// `yew_pane_refocus` (`pane_cmds.c:76-79`).
+pub fn pane_refocus(mut ed: Ed, want: int) {
+    pane_refocus_to(mut ed, want)
+}
+
+// The refusal's message (`pane_cmds.c:89-100`): which of the two reasons,
+// because "no room" and "too many panes" call for different responses.
+fn split_refusal(mut ed: Ed) {
+    if pane_leaf_count(ed, ed.pane_root) >= PANE_MAX_LEAVES {
+        ed_msg(mut ed, MSG_ERROR, "too many panes (max {PANE_MAX_LEAVES})")
+    } else {
+        ed_msg(mut ed, MSG_ERROR, "no room to split")
+    }
+}
+
+// `pane_split` (`pane_cmds.c:81-106`): the new pane takes focus.
+fn pane_split_focused(mut ed: Ed, dir: int) -> int {
+    if !pane_live(ed, ed.focus) {
+        return CMD_ERR_STATE
+    }
+    let nu = pane_split(mut ed, ed.focus, dir)
+    if nu < 0 {
+        split_refusal(mut ed)
+        return CMD_ERR_STATE
+    }
+    pane_refocus_to(mut ed, nu)
+    CMD_OK
+}
+
+/// `ed.pane.split_h` (`yew_pane_cmd_split_h`, `pane_cmds.c:108-111`).
+pub fn pane_cmd_split_h(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    pane_split_focused(mut ed, SPLIT_H)
+}
+
+/// `ed.pane.split_v` (`yew_pane_cmd_split_v`, `pane_cmds.c:113-116`).
+pub fn pane_cmd_split_v(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    pane_split_focused(mut ed, SPLIT_V)
+}
+
+/// `yew_pane_open_tab_in_split` (`pane_cmds.c:118-194`): tab `tab_id`'s
+/// buffer (the one it was opened on, never what its focused pane happens
+/// to show) in a new pane split from `leaf` (the focus when -1) on a
+/// chosen side; it takes focus. Answers the status and the new leaf.
+pub fn pane_open_tab_in_split(mut ed: Ed, tab_id: int, leaf_in: int, dir: int, new_first: bool) -> (
+    int,
+    int,
+) {
+    var leaf = leaf_in
+    if leaf < 0 {
+        leaf = ed.focus
+    }
+    if !pane_live(ed, leaf) || !ed.panes[leaf].is_leaf {
+        return (CMD_ERR_STATE, -1)
+    }
+    let idx = tab_index_of_id(ed, tab_id)
+    if idx < 0 {
+        return (CMD_ERR_STATE, -1)
+    }
+    let bi = ed_buf_index(ed, ed.tabs[idx].buffer_id)
+    if bi < 0 {
+        return (CMD_ERR_STATE, -1)
+    }
+    if tab_hydrate(mut ed, idx) != 0 {
+        let what = if ed.tabs[idx].has_path then ed.tabs[idx].path else "untitled"
+        ed_msg(mut ed, MSG_ERROR, "could not read {what}")
+        return (CMD_ERR_IO, -1)
+    }
+    let nu = pane_split_side(mut ed, leaf, dir, new_first)
+    if nu < 0 {
+        split_refusal(mut ed)
+        return (CMD_ERR_STATE, -1)
+    }
+    ed_win_set_buffer(mut ed, ed.panes[nu].win, bi)
+    pane_refocus_to(mut ed, nu)
+    (CMD_OK, nu)
+}
+
+// `tab_split` (`pane_cmds.c:196-216`): the ACTIVE tab's buffer.
+fn tab_split(mut ed: Ed, dir: int, new_first: bool) -> int {
+    let t = ed.tab_active
+    if t < 0 || t >= ed.tabs.len {
+        return CMD_ERR_STATE
+    }
+    let (status, _) = pane_open_tab_in_split(mut ed, ed.tabs[t].tab_id, ed.focus, dir, new_first)
+    status
+}
+
+/// `ed.tab.split_left` (`pane_cmds.c:218-221`).
+pub fn pane_cmd_tab_split_left(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    tab_split(mut ed, SPLIT_H, true)
+}
+
+/// `ed.tab.split_right` (`pane_cmds.c:223-226`).
+pub fn pane_cmd_tab_split_right(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    tab_split(mut ed, SPLIT_H, false)
+}
+
+/// `ed.tab.split_down` (`pane_cmds.c:228-231`).
+pub fn pane_cmd_tab_split_down(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    tab_split(mut ed, SPLIT_V, false)
+}
+
+/// `ed.pane.close` (`yew_pane_cmd_close`, `pane_cmds.c:233-299`): the
+/// pane showing the invoking window (else the focus), in whichever tab
+/// owns it; the root leaf refuses — closing a tab's last pane is the
+/// tab's close. Focus moves to the parent's first leaf in tree order (the
+/// sibling's node is gone).
+pub fn pane_cmd_close(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = if cx.win >= 0 then cx.win else ed.win
+    var leaf = -1
+    var tab = -1
+    var i = 0
+    while i < ed.tabs.len && leaf < 0 {
+        let leaves = pane_collect_leaves(ed, ed.tabs[i].root, PANE_MAX_LEAVES)
+        for l in leaves {
+            if leaf < 0 && ed.panes[l].win == w {
+                leaf = l
+                tab = i
+            }
+        }
+        i += 1
+    }
+    if leaf < 0 && pane_live(ed, ed.focus) && ed.panes[ed.focus].win == w {
+        leaf = ed.focus
+    }
+    if leaf < 0 {
+        return CMD_ERR_STATE
+    }
+    let parent = ed.panes[leaf].parent
+    if parent < 0 {
+        ed_msg(mut ed, MSG_ERROR, "cannot close the only pane; close its tab instead")
+        return CMD_ERR_STATE
+    }
+    let sibling = if ed.panes[parent].a == leaf then ed.panes[parent].b else ed.panes[parent].a
+    if !pane_close(mut ed, leaf) {
+        return CMD_ERR_STATE
+    }
+    if tab >= 0 && (ed.tabs[tab].focus == leaf || ed.tabs[tab].focus == sibling) {
+        ed.tabs[tab].focus = pane_first_leaf(ed, parent)
+    }
+    if tab < 0 || tab == ed.tab_active {
+        ed.focus = if tab < 0 then -1 else ed.tabs[tab].focus
+        let want = if pane_live(ed, ed.focus) then ed.focus else pane_first_leaf(ed, parent)
+        pane_refocus_to(mut ed, want)
+    } else {
+        ed.layout_dirty = true
+        ed.full_damage = true
+    }
+    CMD_OK
+}
+
+// `pane_focus` (`pane_cmds.c:301-312`): a no-op at the edge; it never
+// wraps.
+fn pane_focus(mut ed: Ed, dir: int) -> int {
+    if !pane_live(ed, ed.focus) {
+        return CMD_ERR_STATE
+    }
+    let to = pane_dir(ed, ed.pane_root, ed.focus, dir)
+    if to < 0 {
+        return CMD_OK
+    }
+    pane_refocus_to(mut ed, to)
+    CMD_OK
+}
+
+/// `ed.pane.focus_left` (`pane_cmds.c:314-317`).
+pub fn pane_cmd_focus_left(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    pane_focus(mut ed, DIR_LEFT)
+}
+
+/// `ed.pane.focus_right` (`pane_cmds.c:319-322`).
+pub fn pane_cmd_focus_right(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    pane_focus(mut ed, DIR_RIGHT)
+}
+
+/// `ed.pane.focus_up` (`pane_cmds.c:324-327`).
+pub fn pane_cmd_focus_up(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    pane_focus(mut ed, DIR_UP)
+}
+
+/// `ed.pane.focus_down` (`pane_cmds.c:329-332`).
+pub fn pane_cmd_focus_down(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    pane_focus(mut ed, DIR_DOWN)
+}
+
+/// `ed.pane.focus_next` and `ed.win.next` (`pane_cmds.c:334-340`): the
+/// tree-order cycle, for terminals that eat arrows.
+pub fn pane_cmd_focus_next(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let to = pane_next(ed, ed.pane_root, ed.focus)
+    pane_refocus_to(mut ed, to)
+    CMD_OK
+}
+
+/// `ed.pane.focus_prev` and `ed.win.prev` (`pane_cmds.c:342-348`).
+pub fn pane_cmd_focus_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let to = pane_prev(ed, ed.pane_root, ed.focus)
+    pane_refocus_to(mut ed, to)
+    CMD_OK
+}
+
+// `pane_resize` (`pane_cmds.c:350-397`): the nearest ancestor split on
+// the horizontal axis, else the vertical, moved by two cells (or the
+// count), the sign by which side of it the focused leaf is on.
+fn pane_resize_focused(mut ed: Ed, cx: CmdCtx, sign: int) -> int {
+    if !pane_live(ed, ed.focus) {
+        return CMD_ERR_STATE
+    }
+    var split = pane_ancestor_split(ed, ed.focus, SPLIT_H)
+    if split < 0 {
+        split = pane_ancestor_split(ed, ed.focus, SPLIT_V)
+    }
+    if split < 0 {
+        ed_msg(mut ed, MSG_ERROR, "only one pane")
+        return CMD_ERR_STATE
+    }
+    var cells = 2 * sign
+    if cx.count_given && cx.count != 0 {
+        cells = cx.count * sign
+    }
+    var at = ed.focus
+    while ed.panes[at].parent >= 0 && ed.panes[at].parent != split {
+        at = ed.panes[at].parent
+    }
+    let first_child = ed.panes[at].parent == split && ed.panes[split].a == at
+    if !first_child {
+        cells = 0 - cells
+    }
+    if !pane_resize(mut ed, split, cells) {
+        ed_msg(mut ed, MSG_ERROR, "no room to resize")
+        return CMD_ERR_STATE
+    }
+    ed.layout_dirty = true
+    ed.full_damage = true
+    CMD_OK
+}
+
+/// `ed.pane.grow` (`pane_cmds.c:399-402`).
+pub fn pane_cmd_grow(mut ed: Ed, cx: CmdCtx) -> int {
+    pane_resize_focused(mut ed, cx, 1)
+}
+
+/// `ed.pane.shrink` (`pane_cmds.c:404-407`).
+pub fn pane_cmd_shrink(mut ed: Ed, cx: CmdCtx) -> int {
+    pane_resize_focused(mut ed, cx, -1)
+}
+
+/// `yew_pane_drag_begin` (`pane_cmds.c:413-421`): the entry ratio kept for
+/// Esc, the boundary's cell for the motion's delta.
+pub fn pane_drag_begin(mut ed: Ed, split: int, x: int, y: int) {
+    if !pane_live(ed, split) || ed.panes[split].is_leaf {
+        return
+    }
+    ed.drag.split = split
+    ed.drag.entry_ratio = ed.panes[split].ratio
+    ed.drag.origin = if ed.panes[split].dir == SPLIT_H then x else y
+    ed.drag.active = true
+}
+
+/// `yew_pane_drag_motion` (`pane_cmds.c:423-443`): motion accumulates
+/// CELLS; a resize the clamp refuses leaves the origin where it was.
+pub fn pane_drag_motion(mut ed: Ed, x: int, y: int) {
+    if !ed.drag.active || !pane_live(ed, ed.drag.split) {
+        return
+    }
+    let now = if ed.panes[ed.drag.split].dir == SPLIT_H then x else y
+    let delta = now - ed.drag.origin
+    if delta == 0 {
+        return
+    }
+    if pane_resize(mut ed, ed.drag.split, delta) {
+        ed.drag.origin = now
+    }
+    ed.layout_dirty = true
+    ed.full_damage = true
+}
+
+/// `yew_pane_drag_end` (`pane_cmds.c:445-455`).
+pub fn pane_drag_end(mut ed: Ed) {
+    ed.drag.active = false
+    ed.drag.split = -1
+}
+
+/// `yew_pane_drag_cancel` (`pane_cmds.c:457-469`): Esc restores the ratio
+/// the drag started from.
+pub fn pane_drag_cancel(mut ed: Ed) {
+    if !ed.drag.active {
+        return
+    }
+    if pane_live(ed, ed.drag.split) {
+        ed.panes[ed.drag.split].ratio = ed.drag.entry_ratio
+    }
+    ed.drag.active = false
+    ed.drag.split = -1
+    ed.layout_dirty = true
+    ed.full_damage = true
+}
+
+/// `yew_pane_click` (`pane_cmds.c:471-511`): through the region registry —
+/// a press on a border starts its drag; on a pane, it takes focus and the
+/// cursor lands on the clicked GRAPHEME (the cell-to-column conversion is
+/// `unicode`'s, so a double-width glyph earlier on the line cannot desync
+/// it).
+pub fn pane_click(mut ed: Ed, x: int, y: int) -> bool {
+    let hit = region_hit(mut ed.regions, x, y)
+    if hit.kind == REGION_PANE_BORDER {
+        let split = pane_split_by_index(ed, hit.payload)
+        if split >= 0 {
+            pane_drag_begin(mut ed, split, x, y)
+            return true
+        }
+        return false
+    }
+    if hit.kind != REGION_PANE {
+        return false
+    }
+    let leaf = pane_leaf_by_index(ed, hit.payload)
+    if leaf < 0 {
+        return false
+    }
+    pane_refocus_to(mut ed, leaf)
+    let w = ed.panes[leaf].win
+    if w >= 0 && w < ed.wins.len && ed.wins[w].buf >= 0 {
+        win_click_to_cursor(mut ed, w, x, y)
+    }
+    true
+}
+
+/// `yew_pane_table_add_leaf` (`pane_cmds.c:525-532`): the leaf's index in
+/// this frame's table, -1 past the cap. The table's storage is kept and
+/// overwritten in place (G33).
+pub fn pane_table_add_leaf(mut ed: Ed, leaf: int) -> int {
+    if leaf < 0 || ed.nleaf_tab >= PANE_MAX_LEAVES {
+        return -1
+    }
+    if ed.nleaf_tab < ed.leaf_tab.len {
+        ed.leaf_tab[ed.nleaf_tab] = leaf
+    } else {
+        (mut ed.leaf_tab).push(leaf)
+    }
+    ed.nleaf_tab += 1
+    ed.nleaf_tab - 1
+}
+
+/// `yew_pane_table_add_split` (`pane_cmds.c:534-541`).
+pub fn pane_table_add_split(mut ed: Ed, split: int) -> int {
+    if split < 0 || ed.nsplit_tab >= PANE_MAX_LEAVES {
+        return -1
+    }
+    if ed.nsplit_tab < ed.split_tab.len {
+        ed.split_tab[ed.nsplit_tab] = split
+    } else {
+        (mut ed.split_tab).push(split)
+    }
+    ed.nsplit_tab += 1
+    ed.nsplit_tab - 1
+}
+
+/// `yew_pane_leaf_by_index` (`pane_cmds.c:543-548`): -1 for a payload
+/// this frame's table does not hold.
+pub fn pane_leaf_by_index(ed: Ed, index: int) -> int {
+    if index < 0 || index >= ed.nleaf_tab {
+        return -1
+    }
+    ed.leaf_tab[index]
+}
+
+/// `yew_pane_split_by_index` (`pane_cmds.c:550-555`).
+pub fn pane_split_by_index(ed: Ed, index: int) -> int {
+    if index < 0 || index >= ed.nsplit_tab {
+        return -1
+    }
+    ed.split_tab[index]
+}
+
+/// `yew_win_click_to_cursor` (`win.c:41-77`): a clicked CELL to a cursor
+/// position, the whole conversion through `unicode` (the cell column, then
+/// the byte offset), so a double-width glyph earlier on the line cannot
+/// shift the click. The shadow rows C skips (`shadow_source_grid_y`) are
+/// yw11's and never drawn before it.
+pub fn win_click_to_cursor(mut ed: Ed, wi: int, grid_x: int, grid_y: int) {
+    let bi = ed.wins[wi].buf
+    if bi < 0 || bi >= ed.bufs.len {
+        return
+    }
+    let r = copy ed.wins[wi].rect
+    if grid_y < r.y || grid_y >= r.y + r.h {
+        return
+    }
+    let (ok, line, _) = vp_line_of_row(mut ed.wins[wi], ed.bufs[bi].ec.tb, grid_y - r.y)
+    if !ok {
+        return
+    }
+    let span = text.textbuf_line_span(ed.bufs[bi].ec.tb, line as text.LineNo)
+    let col = vp_ccol_of_gridx(ed.wins[wi], grid_x)
+    if ed.wins[wi].cs.curs.len == 0 {
+        return
+    }
+    let tw = if ed.bufs[bi].tabwidth == 0 then VP_TABWIDTH else ed.bufs[bi].tabwidth
+    let pos = text.ccol_to_off(ed.bufs[bi].ec.tb, span, col as text.CCol, tw) as int
+    let p = ed.wins[wi].cs.primary
+    ed.wins[wi].cs.curs[p].pos = pos
+    ed.wins[wi].cs.curs[p].anchor = pos
+    ed.wins[wi].cs.curs[p].goal_col = 0
+}

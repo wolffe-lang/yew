@@ -4,13 +4,14 @@
 //! Ports sagitta `src/edit/loop.c` (757 lines) and `loop.h` (40) at
 //! 9ace98c2, under `s14-modes-L-I.md` §4. C's loop is one `poll(2)` over
 //! the tty, a signal self-pipe and every job/clipboard/HTTP descriptor
-//! with the earliest deadline as its timeout; at wolf 0.2.33 the wait is
-//! `term.tty_wait` (ruling #93 R2's interim: `os_signal_wait_fd` parked,
-//! `VTIME` ticks when a deadline is a tick or more away — 100 ms
-//! granularity — and, since yw04, a fine wait polled each millisecond when
-//! it is closer; the swap point for `os_signal_wait_fds`, wolf-lang#795,
-//! G2). Campaign 03 has no job, HTTP or subprocess clipboard descriptor
-//! (yw04, yw12, G30).
+//! with the earliest deadline as its timeout (`loop.c:557-571`); since the
+//! 0.2.34 pin the port's is one `os_signal_wait_fds` (G2, wolf-lang#795,
+//! ruling #93 R2 A) through `term.tty_wait`: the terminal, the jobs'
+//! descriptors (`job_wait_fds`) and the signal set, with `loop_deadline` as
+//! the deadline, so a 25 ms ESC or a 16 ms idle timer fires on time and a
+//! deadline's turn comes before bytes that arrive after it, as C's `poll`
+//! orders them. yw04's interim — the `VTIME` tick, the fine wait and the
+//! deadline-first turn (`3375b51`, `57f47dd`, `620817e`) — is retired.
 //!
 //! C's timer is a callback and a context pointer (`TimerFn`,
 //! `loop.h:20`); the port's is a KIND and a payload (no function value
@@ -273,48 +274,39 @@ fn feed_bytes(mut ed: Ed, bytes: List[byte]) {
     loop_seed_probe(mut ed)
 }
 
-// `loop_read_input` (`loop.c:377-424`), first half: the bytes the wait
-// said are there — the fine wait's own, else a read (at 0.2.33 in the
-// `VTIME` tick, one that may block up to 100 ms; `hangup` at the end of
-// input). Answers (ok, eof, bytes).
-fn loop_read_first(mut ed: Ed) -> (bool, bool, List[byte]) {
-    let first = term.tty_read(mut ed.tty) else |e| match e {
+// `loop_read_input` (`loop.c:377-424`), first half: the read the wait
+// said is there (`hangup` at the end of input). Answers (ok, eof, bytes).
+fn loop_read_first(ed: Ed) -> (bool, bool, List[byte]) {
+    let first = term.tty_read(ed.tty) else |e| match e {
         hangup => { return (true, true, List[byte]()) },
         io => { return (false, false, List[byte]()) },
     }
     (true, false, first)
 }
 
-// `loop_read_input`'s second half: `first`, then everything else already
-// queued (the drain), up to the burst cap, so a burst of typeahead is ONE
-// dispatch pass and ONE frame. Answers whether the cap was reached.
-fn loop_read_rest(mut ed: Ed, first: List[byte]) -> bool {
+// `loop_read_input`'s second half: `first`, then every chunk a
+// zero-deadline look says is already queued (C's `poll(fd, 0)` between
+// reads, `loop.c:403-409`), up to the burst cap, so a burst of typeahead
+// is ONE dispatch pass and ONE frame. No mode is switched (yew#28).
+// Answers (ok, eof, whether the cap was reached).
+fn loop_read_rest(mut ed: Ed, first: List[byte]) -> (bool, bool, bool) {
     var drained = first.len
     feed_bytes(mut ed, first)
-    term.tty_drain_begin(mut ed.tty)
     while drained < INPUT_BURST_MAX {
-        let more = term.tty_read(mut ed.tty) else |_| List[byte]()
-        if more.len == 0 {
-            break
+        let more_ready = term.tty_ready(mut ed.tty) else |_| {
+            return (false, false, false)
+        }
+        if !more_ready {
+            return (true, false, false)
+        }
+        let more = term.tty_read(ed.tty) else |e| match e {
+            hangup => { return (true, true, false) },
+            io => { return (false, false, false) },
         }
         drained += more.len
         feed_bytes(mut ed, more)
     }
-    term.tty_drain_end(mut ed.tty)
-    drained >= INPUT_BURST_MAX
-}
-
-/// Whether bytes a `VTIME` read returned at `t` arrived after the wait's
-/// deadline (`deadline_ms` from `waited`): C's `poll(2)` with that deadline
-/// as its timeout would have returned at the deadline with nothing to read
-/// and run that turn first (`loop.c:568-640`) — a lone ESC expiring to
-/// Escape, a chord timing out, a timer firing — and read these bytes on the
-/// next turn. At 0.2.33 the wait cannot time out below the tick (G2,
-/// wolf-lang#795), so the loop orders the two itself; bytes already queued
-/// when the wait began return at once (`t == waited`) and are fed in the
-/// same turn, as C's `poll` answers them.
-pub fn loop_deadline_passed_first(waited: int, deadline_ms: int, t: int) -> bool {
-    deadline_ms > 0 && t > waited && t - waited >= deadline_ms
+    (true, false, true)
 }
 
 /// `yew_loop_dispatch_event` (`loop.c:426-473`): one decoded event.
@@ -331,6 +323,11 @@ pub fn loop_dispatch_event(mut ed: Ed, key: term.Key, now: int) {
         ed_handle_paste(mut ed, List[byte](), false, true)
     } else if key.kind == term.EV_MOUSE {
         ed_mouse_event(mut ed, key)
+    } else if key.kind == term.EV_FOCUS && key.code == term.KEY_FOCUS_OUT {
+        // Focus-out cancels any gesture: a drag whose release lands in
+        // another window never reports it (`loop.c:454-463`). FOCUS_IN's
+        // git refresh is FUSS's (yw13).
+        mouse_cancel(mut ed)
     }
     // s57.31 §2: a click can close A-e's buffer; the prompt comes back at
     // this boundary as after a key (`loop.c:472-474`).
@@ -371,6 +368,10 @@ fn handle_signal(mut ed: Ed, m: int) {
 // editor quits.
 fn loop_turn(mut ed: Ed, mut key: term.Key, now: int, raw_input: bool) -> bool {
     ed.now_ms = now
+    // Clipboard writes are deliberately outside the input path: pumped
+    // after the wait so the writer's status and its deadline both make
+    // progress (`loop.c:606-608`).
+    text.clip_pump(mut ed.regs.clip, mut ed.render, now)
     term.probe_tick(mut ed.tty, now)
     loop_seed_probe(mut ed)
     var had_input = false
@@ -409,49 +410,85 @@ fn loop_turn(mut ed: Ed, mut key: term.Key, now: int, raw_input: bool) -> bool {
     ed.quit
 }
 
-/// `yew_loop_run` (`loop.c:509-757`): wait, read, drain signals, decode
-/// and dispatch every event, fire deadlines, lay out, render once.
+// Every meaning a look held this turn (C's `yew_tty_drain_signals`,
+// `loop.c:600-611`).
+fn handle_held_signals(mut ed: Ed) {
+    loop {
+        let m = term.tty_take_meaning(mut ed.tty)
+        if m == 0 {
+            break
+        }
+        handle_signal(mut ed, m)
+    }
+}
+
+/// `yew_loop_run` (`loop.c:509-757`): one wait over the terminal, the
+/// jobs' descriptors and the signal set with the earliest deadline
+/// (`loop.c:557-571`); then the read and its drain, the meanings, every
+/// ready job descriptor once, every decoded event, the deadlines, layout
+/// and one render. C's `poll` reports every ready descriptor at once; the
+/// prelude's wait answers a meaning first and then the lowest ready
+/// descriptor, so after a meaning one look asks whether the terminal is
+/// ready too, and the job descriptors are each looked at once.
 pub fn loop_run(mut ed: Ed) -> int {
     var key = term.key_new()
     loop {
         var now = now_ms()
         loop_seed_probe(mut ed)
         let d = loop_deadline(ed, now)
-        let m = term.tty_wait(mut ed.tty, d) else |_| {
+        let extra = job_wait_fds(ed)
+        let (woke, m) = term.tty_wait(mut ed.tty, extra, d) else |_| {
             return util.EXIT_IO
         }
-        let waited = now
-        var raw = false
         now = now_ms()
         ed.now_ms = now
+        var tty_ready = woke == 0
         if m != 0 {
-            handle_signal(mut ed, m)
-        } else {
-            let (ok, eof, first) = loop_read_first(mut ed)
+            tty_ready = term.tty_ready(mut ed.tty) else |_| {
+                return util.EXIT_IO
+            }
+        }
+        var raw = false
+        if tty_ready {
+            let (ok, eof, first) = loop_read_first(ed)
             if !ok {
                 return util.EXIT_IO
             }
-            raw = first.len > 0
+            var at_eof = eof
             if first.len > 0 {
-                let t = now_ms()
-                if loop_deadline_passed_first(waited, d, t) {
-                    if loop_turn(mut ed, mut key, waited + d, false) {
-                        return ed.exit_code
-                    }
-                }
-                now = t
-                ed.now_ms = now
                 // Raw input preempts cooperative search before decoding
                 // (`loop.c:389-394`).
                 search_preview_preempt(mut ed)
                 raw = true
-                let _ = loop_read_rest(mut ed, first)
+                let (ok2, eof2, _) = loop_read_rest(mut ed, first)
+                if !ok2 {
+                    return util.EXIT_IO
+                }
+                at_eof = at_eof || eof2
             }
-            if eof {
+            if at_eof {
                 term.input_eof(mut ed.input)
                 ed.quit = true
             }
         }
+        if m != 0 {
+            handle_signal(mut ed, m)
+        }
+        handle_held_signals(mut ed)
+        // Jobs are pumped after input is drained (`loop.c:613-622`), each
+        // ready descriptor once.
+        var from = 0
+        loop {
+            let k = term.tty_ready_extra(mut ed.tty, extra, from) else |_| {
+                return util.EXIT_IO
+            }
+            if k < 0 {
+                break
+            }
+            job_fd_ready(ed, k)
+            from = k + 1
+        }
+        handle_held_signals(mut ed)
         if loop_turn(mut ed, mut key, now, raw) {
             return ed.exit_code
         }
