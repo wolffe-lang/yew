@@ -1,20 +1,636 @@
-//! edit.shell — E mode's shell surface (Sprint 19, 57.18 §4, 57.31 §3).
+//! edit.shell — E mode's shell surface (Sprint 19, 57.18 §4, 57.27,
+//! 57.31 §3): the three consumption modes over the job layer, the
+//! terminal handover, and the `*jobs*` table.
 //!
 //! Ports sagitta `src/edit/shell.c` (1,200 lines) and `shell.h` (78) at
-//! 9ace98c2 as far as wolf 0.2.33 lets it run. What runs: mode (d), the
-//! terminal handover — `:!!cmd` and the argv route (`yew_shell_term_run`,
-//! `yew_shell_term_argv`, `shell.c:650-747`) — a synchronous child the
-//! editor waits for while it paints nothing, so it needs no wait over N
-//! descriptors (`edit.job_run_sync`). What STOPs by name (ruling
-//! R-yw04-1): mode (a), the stream into a job buffer (`yew_shell_run`),
-//! mode (c), read at the cursor (`yew_shell_read`), and mode (b), the
-//! region filter (`yew_shell_filter`) — each reads a child's pipe while
-//! the loop runs (G2, wolf-lang#795); the filter's interleaved write is
-//! ALSO wolf-lang#818's (G30, ruling R-yw04-3: a 1 MiB output before the
-//! child reads its stdin deadlocks a blocking write). `:!yew FILE`
-//! (`yew_shell_try_self_open`, `shell.c:531-647`) opens the file as a
-//! tab of its own — several tabs are yw05's — and is not recognised: the
-//! line reaches the stream's refusal like any other `:!`.
+//! 9ace98c2: mode (a), the stream into a job buffer (`yew_shell_run`,
+//! `shell.c:749-797`, through the persistent session when it is wanted);
+//! mode (c), read at the cursor (`yew_shell_read`, `:834-866`); mode (b),
+//! the synchronous region filter (`yew_shell_filter`, `:872-1080`, its
+//! restricted loop over the terminal, the job's pipes and the signals,
+//! typeahead kept and replayed); mode (d), the terminal handover
+//! (`yew_shell_term_run`, `yew_shell_term_argv`, `:650-747`); the job
+//! seam (`yew_job_buffer_append`, `yew_job_finish`, `:139-290`) and the
+//! `*jobs*` table (`:1082-1200`). `:!yew FILE` (`yew_shell_try_self_open`,
+//! `:531-647`) opens the file as a tab of its own: the tabs fork's (yw05),
+//! not recognised here — the line reaches the stream like any other `:!`.
+
+use std.signal
+use term
+use text
+
+/// The `*jobs*` table's buffer name (`YEW_JOBS_TABLE_NAME`, `shell.c:28`).
+pub const JOBS_TABLE_NAME: str = "*jobs*"
+
+/// The filter's poll tick (`YEW_FILTER_TICK_MS`, `shell.c:32`): how long
+/// the restricted loop sleeps before it looks for the child's exit.
+pub const FILTER_TICK_MS: int = 20
+
+/// `YewFilterResult` (`shell.h:17-23`).
+pub const FILT_OK: int = 0
+
+/// The filter exited non-zero; the buffer is unchanged.
+pub const FILT_NONZERO: int = 1
+
+/// The filter met its deadline.
+pub const FILT_TIMEOUT: int = 2
+
+/// The filter was cancelled (Escape, C-c, or a signal death).
+pub const FILT_CANCELLED: int = 3
+
+/// The filter never ran.
+pub const FILT_SPAWN: int = 4
+
+/// `yew_signame` (`shell.c:36-57`): our own table, not `strsignal`'s
+/// locale text (invariant 5); `n` is the host's signal number.
+pub fn signame(n: int) -> str {
+    let table = [
+        signal.reload(),
+        signal.interrupt(),
+        signal.quit(),
+        signal.illegal(),
+        signal.abort(),
+        signal.arithmetic(),
+        signal.kill(),
+        signal.segment_fault(),
+        signal.broken_pipe(),
+        signal.alarm(),
+        signal.terminate(),
+        signal.user(),
+    ]
+    let names = [
+        "SIGHUP",
+        "SIGINT",
+        "SIGQUIT",
+        "SIGILL",
+        "SIGABRT",
+        "SIGFPE",
+        "SIGKILL",
+        "SIGSEGV",
+        "SIGPIPE",
+        "SIGALRM",
+        "SIGTERM",
+        "SIGUSR1",
+    ]
+    var i = 0
+    while i < table.len {
+        let num = signal.number(table[i]) else -1
+        if num == n {
+            return names[i]
+        }
+        i += 1
+    }
+    // SIGUSR2 has no meaning of its own in std.signal: the host's number
+    // beside SIGUSR1's (linux 10/12, macOS 30/31).
+    let usr1 = signal.number(signal.user()) else 0
+    let usr2 = if usr1 == 10 then 12 else 31
+    if n == usr2 {
+        return "SIGUSR2"
+    }
+    "SIG?"
+}
+
+/// `strerror` for the two exec failures a spawn reports.
+pub fn exec_errno_text(e: int) -> str {
+    if e == 13 then "Permission denied" else "No such file or directory"
+}
+
+/// `elapsed_override` (`shell.c:66-87`): `YEW_JOB_ELAPSED_MS` pins the one
+/// nondeterministic thing a job prints, so goldens stay exact (invariant
+/// 5); unset, real timings show.
+fn sh_elapsed_override() -> int {
+    let v = env_get("YEW_JOB_ELAPSED_MS") else ""
+    if v.len == 0 {
+        return -1
+    }
+    var n = 0
+    for b in v.bytes() {
+        let c = b as int
+        if c < 48 || c > 57 {
+            return -1
+        }
+        n = n * 10 + c - 48
+    }
+    n
+}
+
+/// `fmt_elapsed` (`shell.c:89-96`): `%.2fs` of milliseconds. A
+/// millisecond count has an exact third decimal, so printf's rounding of
+/// it is half-to-even at the hundredth, done here in integers.
+pub fn fmt_elapsed(ms0: int) -> str {
+    let fixed = sh_elapsed_override()
+    var ms = if fixed >= 0 then fixed else ms0
+    if ms < 0 {
+        ms = 0
+    }
+    var cents = ms / 10
+    let rem = ms % 10
+    if rem > 5 || rem == 5 && cents % 2 == 1 {
+        cents += 1
+    }
+    let whole = cents / 100
+    let frac = cents % 100
+    let pad = if frac < 10 then "0" else ""
+    "{whole}.{pad}{frac}s"
+}
+
+// `%.1fs` of milliseconds (the filter's timeout line).
+fn sh_fmt_tenths(ms: int) -> str {
+    var tenths = ms / 100
+    let rem = ms % 100
+    if rem > 50 || rem == 50 && tenths % 2 == 1 {
+        tenths += 1
+    }
+    "{tenths / 10}.{tenths % 10}s"
+}
+
+// ------------------------------------------------------------------
+// Shared helpers
+// ------------------------------------------------------------------
+
+// `buf_append_raw`'s seam (`shell.c:98-131`): an edit of buffer index
+// `bi` through the edit chokepoint, so marks and the visible cursor
+// track, outside any undo transaction (a job buffer is `BUF_NOUNDO`).
+fn sh_raw_insert(mut ed: Ed, bi: int, at: int, bytes: List[byte]) {
+    if bi < 0 || bi >= ed.bufs.len || bytes.len == 0 {
+        return
+    }
+    let had_undo = ed.bufs[bi].ec.has_undo
+    ed.bufs[bi].ec.has_undo = false
+    if ed.win >= 0 && ed.wins[ed.win].buf == bi {
+        let w = ed.win
+        edit_take(mut ed, w)
+        let _ = text.edit_insert_part(mut ed.bufs[bi].ec, at as text.ByteOff, bytes, 0, bytes.len)
+        edit_give(mut ed, w)
+    } else {
+        let _ = text.edit_insert_part(mut ed.bufs[bi].ec, at as text.ByteOff, bytes, 0, bytes.len)
+    }
+    ed.bufs[bi].ec.has_undo = had_undo
+}
+
+fn sh_raw_delete(mut ed: Ed, bi: int, lo: int, hi: int) {
+    if bi < 0 || bi >= ed.bufs.len || hi <= lo {
+        return
+    }
+    let had_undo = ed.bufs[bi].ec.has_undo
+    ed.bufs[bi].ec.has_undo = false
+    if ed.win >= 0 && ed.wins[ed.win].buf == bi {
+        let w = ed.win
+        edit_take(mut ed, w)
+        let _ = text.edit_delete(mut ed.bufs[bi].ec, text.span(lo, hi))
+        edit_give(mut ed, w)
+    } else {
+        let _ = text.edit_delete(mut ed.bufs[bi].ec, text.span(lo, hi))
+    }
+    ed.bufs[bi].ec.has_undo = had_undo
+}
+
+fn sh_append_raw(mut ed: Ed, bi: int, bytes: List[byte]) {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident {
+        return
+    }
+    sh_raw_insert(mut ed, bi, text.textbuf_len(ed.bufs[bi].ec.tb), bytes)
+}
+
+fn sh_append_str(mut ed: Ed, bi: int, s: str) {
+    var b = List[byte]()
+    for x in s.bytes() {
+        (mut b).push(x)
+    }
+    sh_append_raw(mut ed, bi, b)
+}
+
+/// `yew_ws_scratch_new` (`ed.c:342-368`): a resident, empty, named
+/// scratch buffer with its undo tree at the save point (`BUF_NOUNDO`
+/// governs whether edits record into it). Answers its index.
+pub fn ws_scratch_new(mut ed: Ed, name: str, flags: int) -> int {
+    var ec = text.editctx_new(take text.textbuf_new())
+    ec.undo = text.undo_new(ec.tb)
+    ec.has_undo = true
+    text.undo_mark_saved(mut ec.undo, ec.tb)
+    ec.marks = text.marks_new()
+    ec.has_marks = true
+    let id = ed.next_buf_id
+    ed.next_buf_id += 1
+    (mut ed.bufs).push(Buffer {
+        id: id,
+        ec: ec,
+        resident: true,
+        path: "",
+        has_path: false,
+        name: name,
+        has_name: true,
+        flags: flags | BUF_SCRATCH,
+        tabwidth: ed.opts.tabwidth,
+        recovery_pending: false,
+        pairs: pairstate_new(),
+        named: named_marks_new(),
+    })
+    ed.bufs.len - 1
+}
+
+// ------------------------------------------------------------------
+// Mode (a): streaming into a job buffer (§4)
+// ------------------------------------------------------------------
+
+/// `yew_job_buffer_append` (`shell.c:139-169`): job slot `i`'s bytes at
+/// the end of its buffer; follow-tail moves the cursor only when it was
+/// already at the end with nothing selected.
+pub fn job_buffer_append(mut ed: Ed, i: int, bytes: List[byte], is_err: bool) {
+    let _ = is_err
+    let bi = ed.jobs.v[i].buf
+    if bi < 0 || bi >= ed.bufs.len || bytes.len == 0 || !ed.bufs[bi].resident {
+        return
+    }
+    let w = if ed.win >= 0 && ed.wins[ed.win].buf == bi then ed.win else -1
+    var at_end = false
+    if w >= 0 && ed.wins[w].cs.curs.len != 0 {
+        let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+        at_end = pos >= text.textbuf_len(ed.bufs[bi].ec.tb) &&
+            ed.wins[w].cs.active == text.MC_ACTIVE_NONE
+    }
+    sh_append_raw(mut ed, bi, bytes)
+    if at_end && ed.jobs.v[i].follow_tail && w >= 0 {
+        let p = ed.wins[w].cs.primary
+        let end = text.textbuf_len(ed.bufs[bi].ec.tb)
+        ed.wins[w].cs.curs[p].pos = end
+        ed.wins[w].cs.curs[p].anchor = end
+        ed.cursor_follow_pending = true
+    }
+    if w >= 0 {
+        ed_damage_document(mut ed)
+    }
+}
+
+/// `job_footer` (`shell.c:171-198`).
+pub fn job_footer(j: Job) -> str {
+    let elapsed = fmt_elapsed(j.end_ms - j.start_ms)
+    match j.state {
+        3 => "[cannot run {j.label}: {exec_errno_text(j.exec_errno)}]",
+        2 => "[killed by {signame(j.termsig)} after {elapsed}]",
+        4 => "[timed out after {elapsed}]",
+        5 => "[cancelled after {elapsed}]",
+        _ => "[exit {j.exit_code} in {elapsed}]",
+    }
+}
+
+// `job_insert_collected` (`shell.c:201-240`): mode (c)'s output in one
+// transaction at the mark, a newline added when it landed at a line
+// start without one.
+fn sh_insert_collected(mut ed: Ed, i: int) {
+    if ed.win < 0 {
+        return
+    }
+    let w = ed.win
+    let b = ed.wins[w].buf
+    let j = copy ed.jobs.v[i]
+    if j.state != JOB_EXITED || j.exit_code != 0 {
+        ed_msg(mut ed, MSG_WARN, "{j.label} {job_footer(j)}")
+        return
+    }
+    if j.collect.len == 0 {
+        ed_msg(mut ed, MSG_INFO, "{j.label} — no output")
+        return
+    }
+    let mid = copy ed.jobs.v[i].mark
+    let at = copy text.mark_pos(ed.bufs[b].ec.marks, mid) as int
+    ed_undo_begin(mut ed, w, text.TXN_EXTERNAL)
+    let _ = ed_edit_insert(mut ed, w, at, j.collect, 0, j.collect.len)
+    let ln = text.textbuf_line_of(ed.bufs[b].ec.tb, at as text.ByteOff)
+    let start = copy text.textbuf_line_start(ed.bufs[b].ec.tb, ln) as int
+    let needs_nl = j.collect[j.collect.len - 1] as int != 10 && (at == 0 || at == start)
+    if needs_nl {
+        var nl = List[byte]()
+        (mut nl).push(10 as byte)
+        let _ = ed_edit_insert(mut ed, w, at + j.collect.len, nl, 0, 1)
+    }
+    ed_undo_end(mut ed, w)
+    ed_finish_edit(mut ed, w)
+    text.mark_del(mut ed.bufs[b].ec.marks, mid)
+    ed.jobs.v[i].has_mark = false
+    ed_damage_document(mut ed)
+    ed_msg(mut ed, MSG_INFO, "{j.label} — {j.collect.len} bytes read")
+}
+
+/// `yew_job_finish` (`shell.c:242-290`): what a finished job means for
+/// its buffer and the message line. The filter drives its own job and
+/// owns the outcome.
+pub fn job_finish(mut ed: Ed, i: int) {
+    if ed.jobs.v[i].synchronous {
+        return
+    }
+    if ed.jobs.v[i].sink == SINK_COLLECT && ed.jobs.v[i].has_mark {
+        sh_insert_collected(mut ed, i)
+        return
+    }
+    let bi = ed.jobs.v[i].buf
+    if bi < 0 {
+        return
+    }
+    let j = copy ed.jobs.v[i]
+    let foot = job_footer(j)
+    if j.bytes_out + j.bytes_err == 0 {
+        // "Command produced no output": no full-screen empty buffer after
+        // every `:!make`.
+        if ed.win >= 0 && ed.wins[ed.win].buf == bi {
+            let origin = ed_buf_index(ed, j.origin_buf_id)
+            ed_show_buffer(mut ed, if origin >= 0 then origin else 0)
+        }
+        ed_msg(mut ed, MSG_INFO, ":!{j.label} — no output (exit {j.exit_code})")
+        ws_scratch_drop(mut ed, bi)
+        ed.jobs.v[i].buf = -1
+        return
+    }
+    let len = text.textbuf_len(ed.bufs[bi].ec.tb)
+    if len != 0 && text.textbuf_byte_at(ed.bufs[bi].ec.tb, len - 1) != 10 {
+        sh_append_str(mut ed, bi, "\n")
+    }
+    sh_append_str(mut ed, bi, foot)
+    sh_append_str(mut ed, bi, "\n")
+    let sev = if j.state == JOB_EXITED && j.exit_code == 0 then MSG_INFO else MSG_WARN
+    ed_msg(mut ed, sev, ":!{j.label} {foot}")
+    ed_damage_document(mut ed)
+}
+
+/// `yew_shell_run` (`shell.c:749-797`): mode (a). With the session
+/// wanted the command runs inside it (57.27), alongside it when it is
+/// busy, else Sprint 19's `$SHELL -c` exactly. Answers the job id, or 0
+/// and why.
+pub fn shell_run(mut ed: Ed, cmdline: str, focus: bool) -> (int, str) {
+    var spec = job_spec_new()
+    spec.cmdline = cmdline
+    spec.has_cmdline = true
+    spec.sink = SINK_BUFFER
+    var alongside = false
+    var id = 0
+    var err = ""
+    if !shsession_wanted(mut ed) {
+        let (i0, e0) = job_spawn(mut ed, spec)
+        id = i0
+        err = e0
+    } else if shsession_busy(ed) {
+        spec.cwd = shsession_cwd(ed)
+        spec.has_cwd = true
+        let (has, base) = shsession_env(ed)
+        spec.env_base = base
+        spec.has_env_base = has
+        let (i0, e0) = job_spawn(mut ed, spec)
+        id = i0
+        err = e0
+        alongside = true
+    } else {
+        let (i0, e0) = shsession_run(mut ed, cmdline)
+        id = i0
+        err = e0
+    }
+    if id == 0 {
+        return (0, err)
+    }
+    let i = job_find(ed, id)
+    ed.jobs.v[i].origin_buf_id = if ed.win >= 0 then ed.bufs[ed.wins[ed.win].buf].id else 0
+    let bi = ws_scratch_new(mut ed, "*job:{id} {cmdline}*", BUF_NOUNDO)
+    ed.jobs.v[i].buf = bi
+    if focus {
+        ed_show_buffer(mut ed, bi)
+    }
+    if alongside {
+        ed_msg(mut ed, MSG_INFO, "session busy: ran outside it (a cd here will not persist)")
+    }
+    (id, "")
+}
+
+/// `yew_shell_dismiss_output` (`shell.c:799-830`): hide a focused public
+/// job buffer without releasing it — back to the buffer that launched it.
+pub fn shell_dismiss_output(mut ed: Ed) -> bool {
+    if ed.win < 0 {
+        return false
+    }
+    let focused = ed.wins[ed.win].buf
+    var target = -2
+    for j in ed.jobs.v {
+        if j.internal || j.sink != SINK_BUFFER || j.buf != focused {
+            continue
+        }
+        target = ed_buf_index(ed, j.origin_buf_id)
+        break
+    }
+    if target == -2 {
+        return false
+    }
+    if target < 0 && ed.tab_active >= 0 && ed.tab_active < ed.tabs.len {
+        target = ed_buf_index(ed, ed.tabs[ed.tab_active].buffer_id)
+    }
+    if target < 0 {
+        target = 0
+    }
+    if target == focused || !ed.bufs[target].resident {
+        return false
+    }
+    ed_show_buffer(mut ed, target)
+    true
+}
+
+// ------------------------------------------------------------------
+// Mode (c): read output at the cursor (§6)
+// ------------------------------------------------------------------
+
+/// `yew_shell_read` (`shell.c:836-866`): collect a command's output and
+/// insert it at the cursor when it ends; the point is a RIGHT-bias mark,
+/// so text typed there stays before the arriving output.
+pub fn shell_read(mut ed: Ed, cmdline: str) -> (int, str) {
+    if ed.win < 0 || ed.wins[ed.win].cs.curs.len == 0 {
+        return (0, "")
+    }
+    let w = ed.win
+    let b = ed.wins[w].buf
+    var spec = job_spec_new()
+    spec.cmdline = cmdline
+    spec.has_cmdline = true
+    spec.sink = SINK_COLLECT
+    spec.cwd = shsession_cwd(ed)
+    spec.has_cwd = true
+    let (has, base) = shsession_env(ed)
+    spec.env_base = base
+    spec.has_env_base = has
+    let (id, err) = job_spawn(mut ed, spec)
+    if id == 0 {
+        return (0, err)
+    }
+    let i = job_find(ed, id)
+    let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    ed.jobs.v[i].mark = text.mark_add(mut ed.bufs[b].ec.marks, pos as text.ByteOff, text.BIAS_RIGHT)
+    ed.jobs.v[i].has_mark = true
+    (id, "")
+}
+
+// ------------------------------------------------------------------
+// Mode (b): the synchronous region filter (§5)
+// ------------------------------------------------------------------
+
+// `filter_drive` (`shell.c:872-990`): the filter's restricted loop. NOT
+// a nested event loop: terminal input is buffered as typeahead and
+// replayed afterwards, never dispatched; Escape or C-c cancels. It ends
+// only when the child is reaped AND its output reached EOF (a reap alone
+// truncated large output in C); the deadline forces the end.
+fn sh_filter_drive(mut ed: Ed, id: int, mut typeahead: List[byte]) -> int {
+    var cancel = term.input_new(term.tty_caps(ed.tty))
+    var cancelled = false
+    var key = term.key_new()
+    loop {
+        let i = job_find(ed, id)
+        if i < 0 || !job_pending(ed.jobs.v[i]) {
+            break
+        }
+        let now = now_ms()
+        var deadline = job_deadline(ed, now)
+        if deadline < 0 || deadline > FILTER_TICK_MS {
+            deadline = FILTER_TICK_MS
+        }
+        var fds = List[int]()
+        if ed.tty_ready {
+            (mut fds).push(0)
+        }
+        for fd in job_wait_fds(ed) {
+            (mut fds).push(fd)
+        }
+        var tty_in = false
+        var meaning = 0
+        if fds.len != 0 {
+            let set = if ed.tty_ready then term.tty_signal_set() else signal.child()
+            let (which, m) = os_signal_wait_fds(fds, set, deadline) else |_| { return FILT_SPAWN }
+            meaning = m
+            tty_in = ed.tty_ready && which == 0
+        } else {
+            time_sleep_ms(5)
+        }
+        let now2 = now_ms()
+        job_pump(mut ed)
+        if meaning == signal.child() {
+            ed.jobs.child_seen = true
+        } else if meaning != 0 {
+            // A resize is honoured and the filter keeps running.
+            handle_signal(mut ed, meaning)
+        }
+        if tty_in {
+            let got = fs_read_chunk(0, 1024) else List[byte]()
+            if got.len > 0 && !cancelled {
+                for b in got {
+                    (mut typeahead).push(b)
+                }
+                term.input_feed(mut cancel, got, 0, got.len)
+            }
+        }
+        if !cancelled {
+            while term.input_next(mut cancel, now2, mut key) {
+                if key.kind != term.EV_KEY || key.ev == term.KEY_RELEASE {
+                    continue
+                }
+                if key.code != term.KEY_ESCAPE &&
+                    !(key.code == 99 && key.mods & term.MOD_CTRL != 0) {
+                    continue
+                }
+                let _ = job_signal(mut ed, id, signal.terminate())
+                let k = job_find(ed, id)
+                ed.jobs.v[k].state = JOB_CANCELLED
+                cancelled = true
+                break
+            }
+        }
+        // Reap before the tick: a child that exits as the deadline lands
+        // is EXITED, not a timeout it beat.
+        job_reap(mut ed)
+        job_tick(mut ed, now2)
+    }
+    if cancelled {
+        while typeahead.len > 0 {
+            let _ = (mut typeahead).pop()
+        }
+    }
+    let i = job_find(ed, id)
+    if i < 0 {
+        return FILT_SPAWN
+    }
+    match ed.jobs.v[i].state {
+        4 => FILT_TIMEOUT,
+        5 => FILT_CANCELLED,
+        3 => FILT_SPAWN,
+        2 => FILT_CANCELLED,
+        _ => if ed.jobs.v[i].exit_code == 0 then FILT_OK else FILT_NONZERO,
+    }
+}
+
+/// `yew_shell_filter` (`shell.c:992-1080`): pipe `[lo, hi)` of window
+/// `w`'s buffer through `cmdline` and replace it — exactly one undo
+/// transaction; every failure leaves the buffer byte-identical.
+pub fn shell_filter(mut ed: Ed, w: int, lo: int, hi: int, cmdline: str) -> int {
+    if w < 0 || w >= ed.wins.len {
+        return FILT_SPAWN
+    }
+    let b = ed.wins[w].buf
+    var spec = job_spec_new()
+    spec.cmdline = cmdline
+    spec.has_cmdline = true
+    spec.sink = SINK_COLLECT
+    spec.cwd = shsession_cwd(ed)
+    spec.has_cwd = true
+    let (has, base) = shsession_env(ed)
+    spec.env_base = base
+    spec.has_env_base = has
+    spec.in_bytes = text.textbuf_copy_range(ed.bufs[b].ec.tb, lo, hi)
+    spec.has_in = true
+    spec.timeout_ms = FILTER_TIMEOUT_MS
+    let (id, err) = job_spawn(mut ed, spec)
+    if id == 0 {
+        ed_msg(mut ed, MSG_ERROR, err)
+        return FILT_SPAWN
+    }
+    var i = job_find(ed, id)
+    ed.jobs.v[i].synchronous = true
+    var typeahead = List[byte]()
+    let result = sh_filter_drive(mut ed, id, mut typeahead)
+    i = job_find(ed, id)
+    let j = copy ed.jobs.v[i]
+    if result == FILT_SPAWN && j.state == JOB_EXECFAIL {
+        ed_msg(mut ed, MSG_ERROR, "cannot run {cmdline}: {exec_errno_text(j.exec_errno)}")
+    }
+    let before_lines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+    if result == FILT_OK {
+        let own = !ed.bufs[b].ec.has_undo || ed.bufs[b].ec.undo.depth == 0
+        if own {
+            ed_undo_begin(mut ed, w, text.TXN_FILTER)
+        }
+        let _ = ed_edit_delete(mut ed, w, lo, hi)
+        if j.collect.len != 0 {
+            let _ = ed_edit_insert(mut ed, w, lo, j.collect, 0, j.collect.len)
+        }
+        if own {
+            ed_undo_end(mut ed, w)
+        }
+        ed_finish_edit(mut ed, w)
+        let after_lines = text.textbuf_line_count(ed.bufs[b].ec.tb)
+        if j.collect.len == 0 {
+            ed_msg(mut ed, MSG_WARN, "filter produced no output; region deleted (undo restores)")
+        } else {
+            ed_msg(mut ed, MSG_INFO, "filter: {before_lines} → {after_lines} lines")
+        }
+        ed_damage_document(mut ed)
+    } else if result == FILT_NONZERO {
+        ed_msg(mut ed, MSG_WARN, "filter: exit {j.exit_code}; buffer unchanged")
+    } else if result == FILT_TIMEOUT {
+        ed_msg(mut ed, MSG_WARN, "filter timed out after {sh_fmt_tenths(FILTER_TIMEOUT_MS)}")
+    } else if result == FILT_CANCELLED {
+        ed_msg(mut ed, MSG_WARN, "filter cancelled; buffer unchanged")
+    }
+    // Typed-ahead bytes were never dispatched: replay them now.
+    if typeahead.len != 0 && ed.probe_seeded {
+        term.input_feed(mut ed.input, typeahead, 0, typeahead.len)
+    }
+    result
+}
+
+// ------------------------------------------------------------------
+// Mode (d): the terminal handover (57.18 §4, 57.31 §3)
+// ------------------------------------------------------------------
 
 /// `yew_shell_term_run` (`shell.c:687-725`): `:!!cmd` — the child is
 /// handed the real terminal and waited for. `(ok, wait, error)`.
@@ -47,19 +663,127 @@ pub fn shell_term_argv(mut ed: Ed, argv: List[str]) -> (bool, JobWait, str) {
     job_run_sync(mut ed, argv, "")
 }
 
-/// Mode (a), the stream into a job buffer (`yew_shell_run`,
-/// `shell.c:749-797`): the refusal (R-yw04-1).
-pub fn shell_run_refusal() -> str {
-    job_stop_g2("streaming a command's output into a job buffer")
+// ------------------------------------------------------------------
+// The *jobs* table (§8)
+// ------------------------------------------------------------------
+
+fn sh_pad_left(s: str, w: int) -> str {
+    var out = ""
+    var n = s.len
+    while n < w {
+        out += " "
+        n += 1
+    }
+    out + s
 }
 
-/// Mode (c), read at the cursor (`yew_shell_read`, `shell.c:834-866`).
-pub fn shell_read_refusal() -> str {
-    job_stop_g2("reading a command's output at the cursor")
+fn sh_pad_right(s: str, w: int) -> str {
+    var out = s
+    var n = s.len
+    while n < w {
+        out += " "
+        n += 1
+    }
+    out
 }
 
-/// Mode (b), the region filter (`yew_shell_filter`, `shell.c:993-1080`):
-/// R-yw04-1, and its write side R-yw04-3.
-pub fn shell_filter_refusal() -> str {
-    "not yet ported: the region filter: needs os_signal_wait_fds (G2, wolf-lang#795) and a non-blocking pipe write (G30, wolf-lang#818), sagitta Sprint 19 (yw04, R-yw04-1, R-yw04-3)"
+// `jobs_table_render` (`shell.c:1086-1129`): newest first, internal jobs
+// hidden, replaced wholesale through the edit chokepoint.
+fn sh_jobs_table_render(mut ed: Ed, bi: int) {
+    var out = " id  state     code  elapsed    bytes  command\n"
+    var i = ed.jobs.v.len
+    while i > 0 {
+        i -= 1
+        let j = copy ed.jobs.v[i]
+        if j.internal {
+            continue
+        }
+        let end = if j.state == JOB_RUNNING then now_ms() else j.end_ms
+        let elapsed = fmt_elapsed(end - j.start_ms)
+        let code = if j.state == JOB_RUNNING {
+            "-"
+        } else if j.state == JOB_SIGNALED {
+            signame(j.termsig)
+        } else {
+            "{j.exit_code}"
+        }
+        let id = sh_pad_left("{j.id}", 3)
+        let st = sh_pad_right(job_state_name(j.state), 9)
+        let cd = sh_pad_left(code, 4)
+        let el = sh_pad_left(elapsed, 7)
+        let by = sh_pad_left("{j.bytes_out + j.bytes_err}", 7)
+        out += "{id}  {st} {cd}  {el}  {by}  {j.label}\n"
+    }
+    let old = text.textbuf_len(ed.bufs[bi].ec.tb)
+    if old != 0 {
+        sh_raw_delete(mut ed, bi, 0, old)
+    }
+    var bytes = List[byte]()
+    for x in out.bytes() {
+        (mut bytes).push(x)
+    }
+    sh_raw_insert(mut ed, bi, 0, bytes)
+}
+
+/// `yew_jobs_table_refresh` (`shell.c:1131-1145`): re-rendered whenever a
+/// job changes state, once a loop turn.
+pub fn jobs_table_refresh(mut ed: Ed) {
+    let bi = ws_scratch_find(ed, JOBS_TABLE_NAME)
+    if bi < 0 {
+        return
+    }
+    sh_jobs_table_render(mut ed, bi)
+    if ed.win >= 0 && ed.wins[ed.win].buf == bi {
+        let w = ed.win
+        vp_clamp(mut ed.wins[w], ed.bufs[bi].ec.tb)
+        ed_damage_document(mut ed)
+    }
+}
+
+/// `yew_jobs_table_open` (`shell.c:1147-1160`): the table, made on first
+/// use and shown in the focused window. Answers its buffer index.
+pub fn jobs_table_open(mut ed: Ed) -> int {
+    var bi = ws_scratch_find(ed, JOBS_TABLE_NAME)
+    if bi < 0 {
+        bi = ws_scratch_new(mut ed, JOBS_TABLE_NAME, BUF_NOUNDO)
+    }
+    sh_jobs_table_render(mut ed, bi)
+    ed_show_buffer(mut ed, bi)
+    bi
+}
+
+/// `yew_jobs_table_row_id` (`shell.c:1162-1200`): the job id on the
+/// `*jobs*` row under the cursor, or 0 (the header row addresses none).
+pub fn jobs_table_row_id(ed: Ed) -> int {
+    if ed.win < 0 {
+        return 0
+    }
+    let w = ed.win
+    let bi = ed.wins[w].buf
+    if !ed.bufs[bi].has_name || ed.bufs[bi].name != JOBS_TABLE_NAME || ed.wins[w].cs.curs.len == 0 {
+        return 0
+    }
+    let pos = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    let line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff)
+    let ln = copy line as int
+    if ln == 0 {
+        return 0
+    }
+    let span = text.textbuf_line_span(ed.bufs[bi].ec.tb, ln as text.LineNo)
+    var at = span.lo
+    while at < span.hi && text.textbuf_byte_at(ed.bufs[bi].ec.tb, at) == 32 {
+        at += 1
+    }
+    var id = 0
+    var digits = 0
+    while at < span.hi {
+        let c = text.textbuf_byte_at(ed.bufs[bi].ec.tb, at)
+        if c < 48 || c > 57 {
+            break
+        }
+        id = id * 10 + c - 48
+        digits += 1
+        at += 1
+    }
+    if digits == 0 then 0 else id
 }
