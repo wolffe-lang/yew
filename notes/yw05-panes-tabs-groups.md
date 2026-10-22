@@ -280,7 +280,7 @@ issue filed or closed; no trailer.
     "10× or more": 208,460 → 20,967 B a key, 9.9× on release and 9.5× on
     native (the two-pane prompt row 11.0×/10.6×); **"short of C's" HIT**
     (21 KB against C's 0.3 KB: the completion rows' copy-out, E1010 at
-    this pin). Every other row fell 18× to 230× (§4.5).
+    this pin); the prompt's typing row 9.0×, the I-mode and line-move rows 18× to 233× (§4.5).
 11. *The ratio is a C `float`; wolf's `f32` reproduces it exactly* —
     **MISS, then the prediction's own fallback**: natively `f32` rounds as
     C does (the panes fork's layout fuzz equal to C's driver), but the
