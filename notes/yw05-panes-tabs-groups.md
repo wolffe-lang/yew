@@ -436,3 +436,53 @@ snapshots after `:buffers` Enter, `ed.find.buffer` (`src/ui/pickers.c`,
 Sprint 26 §6: yw06's finder); the port refuses it by name
 (`startup_multiple_files-fulldiff.txt`). No golden edited; CI records it in
 the `startup_` step under that owner.
+
+### 4.4 Groups (deliverable 4, s24) — the groups fork
+
+**The group model's shape, and why** (`edit.groups`, `bdd1b53`):
+facsimile's model as sagitta's C states it — a `TabGroup` holds an id, a
+label, a directory and a resume point as a PATH, and NO member list:
+membership is `Tab.group_id` plus a compacted `Tab.group_ordinal`, every
+count and member list computed on the ask, so no second record can
+disagree with the tabs. An emptied group auto-dissolves (the only source
+of s24 DoD 10); `set_ordinal` builds the final order first (the
+rightward off-by-one) and `reorder_block` computes its destination as tab
+IDs first. C's `Groups`, the picker's file static and groupnav's DoD 6
+hook are fields of the `Ed` (E1010). Residency (R-yw05-4 = A) is the
+buffer slot's own: `Buffer.resident` is set where the piece tree is built
+and cleared where `buf_defer` releases it; `Tab` has no residency field,
+and `text.file_load_count` (C's `file_load_calls`, one `unsafe` module
+var, census +1) counts the reads: a forty-file group opens with exactly
+one (`groups_opening_a_forty_file_group_reads_one_file`, on native and on
+its own checked machine).
+
+What landed: groupnav's continuous line (`60196fe`: inside a group by
+ordinal, off either end into row 1 and wrapping, enter-at-edge never
+reading the resume point, the explicit enter resuming by path), the
+New/Edit picker (`4ce6473`: ticks a set of canonical paths in insertion
+order surviving every walk), `ed.group.from_dir` with a directory
+(`6b9f557`), the fourteen handlers (ids 800-813), the picker owning the
+keyboard after the prompt and drawn after the cursor (`0a03f61`).
+Refusing by name: `yew_group_from_dir`'s WALK (`ws/walk.c`,
+`ws/gitignore.c`: Sprint 26, yw06), the F-mode selected directory (Sprint
+53, yw13), the storm's state restore (Sprint 25, yw06).
+
+Tests: `test_groups` 23 (1 SKIP: the storm's restore half, yw06),
+`test_groupnav` 35, `test_grouppicker` 19 +1 port (a real walk keeps the
+ticks: C's own case presses Down and never walks, so a picker that dropped
+ticks on every re-list passes C's file — seen with a plant), and
+`test_groupfromdir` 1 run + 4 SKIP (the walk, yw06) + 3 port cases; the
+three SKIPs the tabs fork left (two in `test_tabs`, one in `test_strip`)
+run. Per case on the checked machine: 97 of 101 rows checked-pass, the four
+others the step budget (the membership storms, the picker key storm, the
+tab cap). The membership fuzz (`tools/fuzz-groups` over C's generator,
+s24's 5,000-op storm: no empty group survives): four seeds × 250
+sessions, every hash equal to C's driver; the tab oracle again beside it.
+Six local plants seen red (`notes/yw05-evidence/groups/plants/`).
+
+Goldens at the fork's gate g2 (`3842fd5`, merged with the lane at
+`d53daae` and with tabs): **s24's 4 green on both tiers**
+(`s24_click_enters_a_group`, `s24_digit_jump_is_immediate`,
+`s24_group_two_row_bar`, `s24_picker_chrome`), s22 11/11, the tab cases
+7/8 (`startup_multiple_files`, §4.3), campaign 03 62/62, campaign 04
+104/104; `check-test` 100 files both lanes (68 SKIP lines natively).
