@@ -366,6 +366,21 @@ maintainer.
   `Opts` (`edit.option_cmdline`), every other name refusing naming yw09,
   retired by yw09 as R-yw03-2's reader is (implemented, recommended);
   (B) refuse `:set` until yw09.
+- **R-yw05-1 — s57.13–s57.15 and s57.22** (taken at launch: A). Their
+  prerequisites are Sprint 27's router; the four move to yw06 after s27
+  (17 PTY cases, `test_ctxmenu`, `test_ctxrows`; yw06's draft).
+- **R-yw05-2 — the 0.2.34 bump's size** (taken: A). The bump and yw04's
+  job half inside yw05: campaign 04 104/104.
+- **R-yw05-3 — R-yw03-7's turn temporaries** (taken: A, as the draft
+  recommended): deliverable 6, yw05's allocation-free hot paths.
+- **R-yw05-4 — deferred-tab residency** (taken: A). Residency is the
+  buffer slot's own (`Buffer.resident`, set where the piece tree is
+  built); s24 DoD 4's one read counted by `text.file_load_count`.
+- **R-yw05-5 — `startup_multiple_files`.** Every file is its own tab in C's
+  order (rows 1–2 of the snapshot are C's), but the case snapshots after
+  `:buffers` Enter, `ed.find.buffer` (Sprint 26 §6). (A) it moves to yw06
+  with the finder, recorded under that owner (implemented, recommended);
+  (B) pull the buffer picker forward into yw05. **Recommend A.**
 - **R5 — the module-name collisions** (`unicode`, `term`, `search`
   against std): (A) the port keeps sagitta's names and aliases std
   where both are needed (recommended, done); (B) prefix the port's
