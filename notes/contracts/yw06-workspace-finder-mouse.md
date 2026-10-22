@@ -100,7 +100,11 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
    with one summary message, §7's corrupt rows (renamed aside with the
    UTC stamp, five kept, never deleted, never a prompt, exit 0).
    Per-workspace history (§8, `history.scope`, merged at load) retires
-   `edit.cmdline_hist`'s global interim (its header); yw04's jump-list
+   `edit.cmdline_hist`'s global interim (its header) and with it
+   `tools/torture-live`'s one KNOWN-RED by name (kill9's shared state
+   home: the second determinism run lacks the first's history append,
+   `05391c7`; still printed at yw05's lane gate L2): the branch and its
+   acceptance are deleted, the shared run seen red first; yw04's jump-list
    serializer, which "nobody calls" (`edit.jumplist`'s header), is
    called. The five `ed.ws.*` commands `cmd_owner` routes here
    (`save_state`, `restore_state`, `info`, `forget`, `migrate`) and the
