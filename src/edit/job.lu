@@ -460,6 +460,13 @@ pub const FRAMED_NONE: int = 0
 /// The persistent shell session's link (`shsession.c`'s `link_ops`).
 pub const FRAMED_SESSION: int = 1
 
+/// No stream owner.
+pub const STREAM_NONE: int = 0
+
+/// The unit tests' stream witness (`test_job.c`'s `job_stream_test_*`);
+/// the curl transport is yw12's.
+pub const STREAM_TEST: int = 1
+
 /// No callback owner.
 pub const CB_NONE: int = 0
 
@@ -512,6 +519,7 @@ pub struct JobSpec {
     has_env_base: bool,
     inherit_tty: bool,
     framed: int,
+    stream: int,
     callback: int,
     cb_key: str,
     cb_name: str,
@@ -545,6 +553,7 @@ pub fn job_spec_new() -> JobSpec {
         has_env_base: false,
         inherit_tty: false,
         framed: FRAMED_NONE,
+        stream: STREAM_NONE,
         callback: CB_NONE,
         cb_key: "",
         cb_name: "",
@@ -577,6 +586,8 @@ pub struct Job {
     collect_max: int,
     framed_err: List[byte],
     framed: int,
+    stream_err: List[byte],
+    stream: int,
     callback: int,
     cb_key: str,
     cb_name: str,
@@ -597,6 +608,8 @@ pub struct Job {
     collect_capped: bool,
     framed_failed: bool,
     framed_destroyed: bool,
+    stream_failed: bool,
+    stream_destroyed: bool,
     callback_called: bool,
     callback_destroyed: bool,
     reaped: bool,
@@ -630,6 +643,8 @@ fn jb_job_new() -> Job {
         collect_max: JOB_COLLECT_MAX,
         framed_err: List[byte](),
         framed: FRAMED_NONE,
+        stream_err: List[byte](),
+        stream: STREAM_NONE,
         callback: CB_NONE,
         cb_key: "",
         cb_name: "",
@@ -650,6 +665,8 @@ fn jb_job_new() -> Job {
         collect_capped: false,
         framed_failed: false,
         framed_destroyed: false,
+        stream_failed: false,
+        stream_destroyed: false,
         callback_called: false,
         callback_destroyed: false,
         reaped: false,
@@ -679,6 +696,20 @@ pub struct JobWitness {
     collect_capped: bool,
 }
 
+/// What the unit tests' stream owner saw (`JobStreamWitness`,
+/// `test_job.c:969-979`).
+pub struct StreamWitness {
+    key: str,
+    out: List[byte],
+    err: List[byte],
+    out_finish: int,
+    err_finish: int,
+    ticks: int,
+    destroys: int,
+    reject_stdout: bool,
+    deadline: int,
+}
+
 /// `JobTable` (`job.h:309-319`): the jobs, compacted on release; public
 /// ids count up from 1, internal ones down from `JOB_INTERNAL_ID_TOP` so
 /// background plumbing makes no visible gap.
@@ -691,6 +722,7 @@ pub struct JobTable {
     child_seen: bool,
     fds: List[int],
     witness: List[JobWitness],
+    stream_witness: List[StreamWitness],
 }
 
 /// `UINT32_MAX` (`job.c:243`): the first internal id.
@@ -707,6 +739,7 @@ pub fn jobs_new() -> JobTable {
         child_seen: false,
         fds: List[int](),
         witness: List[JobWitness](),
+        stream_witness: List[StreamWitness](),
     }
 }
 
@@ -715,6 +748,15 @@ fn jb_close_fd(fd: int) -> int {
         fs_close(fd) else |_| {}
     }
     -1
+}
+
+// `yew_memzero` over a lent buffer: every byte 0, the length kept.
+fn jb_zero(mut b: List[byte]) {
+    var i = 0
+    while i < b.len {
+        b[i] = 0 as byte
+        i += 1
+    }
 }
 
 fn jb_wipe(mut b: List[byte]) {
@@ -736,6 +778,7 @@ fn jb_dispose(mut ed: Ed, i: int) {
     ed.jobs.v[i].err_fd = jb_close_fd(ed.jobs.v[i].err_fd)
     jb_wipe(mut ed.jobs.v[i].in_bytes)
     jb_framed_destroy(mut ed, i)
+    jb_stream_destroy(mut ed, i)
     jb_callback_destroy(mut ed, i)
 }
 
@@ -1091,7 +1134,10 @@ fn jb_spawn_err(e: int) -> str {
 }
 
 /// `yew_job_spawn` (`job.c:1151-1337`): the new job's id, or 0 and why.
-pub fn job_spawn(mut ed: Ed, spec: JobSpec) -> (int, str) {
+/// `spec.in_bytes` is the caller's to lend and the spawn's to wipe: a
+/// successful spawn zeroes it once the bytes are written (or handed to the
+/// forked writer), as C wipes its borrowed `in_bytes` (`job.c:290-297`).
+pub fn job_spawn(mut ed: Ed, mut spec: JobSpec) -> (int, str) {
     if spec.inherit_tty {
         return (0, "inherited-tty job requires synchronous runner")
     }
@@ -1110,8 +1156,8 @@ pub fn job_spawn(mut ed: Ed, spec: JobSpec) -> (int, str) {
     if spec.sink == SINK_FRAMED && spec.framed == FRAMED_NONE {
         return (0, "framed job has no transport")
     }
-    if spec.sink == SINK_STREAM {
-        return (0, "not yet ported: a stream job's transport (curl): sagitta Sprint 48 (yw12)")
+    if spec.sink == SINK_STREAM && spec.stream == STREAM_NONE {
+        return (0, "stream job has no transport")
     }
     if spec.sink == SINK_CALLBACK && spec.callback == CB_NONE {
         return (0, "callback job has no completion owner")
@@ -1133,6 +1179,7 @@ pub fn job_spawn(mut ed: Ed, spec: JobSpec) -> (int, str) {
         // A fresh pipe takes PIPE_BUF bytes without its reader.
         fs_write_chunk(in_w, spec.in_bytes) else |_| {}
         in_w2 = jb_close_fd(in_w)
+        jb_zero(mut spec.in_bytes)
     } else if want_stdin {
         let (h, why) = job_fork_writer(in_r, in_w, spec.in_bytes)
         if h < 0 {
@@ -1142,6 +1189,7 @@ pub fn job_spawn(mut ed: Ed, spec: JobSpec) -> (int, str) {
         }
         writer = h
         in_w2 = jb_close_fd(in_w)
+        jb_zero(mut spec.in_bytes)
     }
     let (out_r, out_w) = os_pipe() else |_| {
         let _ = jb_close_fd(in_r)
@@ -1200,6 +1248,7 @@ pub fn job_spawn(mut ed: Ed, spec: JobSpec) -> (int, str) {
     j.internal = spec.internal
     j.evictable = spec.evictable
     j.framed = spec.framed
+    j.stream = spec.stream
     j.callback = spec.callback
     j.cb_key = spec.cb_key
     j.cb_name = spec.cb_name
@@ -1296,6 +1345,111 @@ fn jb_framed_destroy(mut ed: Ed, i: int) {
     ed.jobs.v[i].framed_destroyed = true
     match ed.jobs.v[i].framed {
         1 => shsession_link_destroy(mut ed, ed.jobs.v[i].id),
+        _ => {},
+    }
+}
+
+fn jb_sw_at(ed: Ed, key: str) -> int {
+    var i = 0
+    while i < ed.jobs.stream_witness.len {
+        if ed.jobs.stream_witness[i].key == key {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// A test stream owner (`job_stream_witness_init`): what the transport
+/// saw, by key; `deadline` -1 for none.
+pub fn job_stream_witness_new(mut ed: Ed, key: str, reject_stdout: bool, deadline: int) {
+    (mut ed.jobs.stream_witness).push(StreamWitness {
+        key: key,
+        out: List[byte](),
+        err: List[byte](),
+        out_finish: 0,
+        err_finish: 0,
+        ticks: 0,
+        destroys: 0,
+        reject_stdout: reject_stdout,
+        deadline: deadline,
+    })
+}
+
+fn jb_stream_feed(mut ed: Ed, i: int, bytes: List[byte], is_err: bool) -> bool {
+    match ed.jobs.v[i].stream {
+        1 => {
+            let w = jb_sw_at(ed, ed.jobs.v[i].cb_key)
+            if w < 0 {
+                return true
+            }
+            if is_err {
+                for b in bytes {
+                    (mut ed.jobs.stream_witness[w].err).push(b)
+                }
+                return true
+            }
+            for b in bytes {
+                (mut ed.jobs.stream_witness[w].out).push(b)
+            }
+            !ed.jobs.stream_witness[w].reject_stdout
+        },
+        _ => true,
+    }
+}
+
+fn jb_stream_finish(mut ed: Ed, i: int, is_err: bool) -> bool {
+    match ed.jobs.v[i].stream {
+        1 => {
+            let w = jb_sw_at(ed, ed.jobs.v[i].cb_key)
+            if w >= 0 {
+                if is_err {
+                    ed.jobs.stream_witness[w].err_finish += 1
+                } else {
+                    ed.jobs.stream_witness[w].out_finish += 1
+                }
+            }
+            true
+        },
+        _ => true,
+    }
+}
+
+fn jb_stream_deadline(ed: Ed, j: Job) -> int {
+    match j.stream {
+        1 => {
+            let w = jb_sw_at(ed, j.cb_key)
+            if w < 0 then -1 else ed.jobs.stream_witness[w].deadline
+        },
+        _ => -1,
+    }
+}
+
+fn jb_stream_tick(mut ed: Ed, i: int, now: int) {
+    let _ = now
+    match ed.jobs.v[i].stream {
+        1 => {
+            let w = jb_sw_at(ed, ed.jobs.v[i].cb_key)
+            if w >= 0 {
+                ed.jobs.stream_witness[w].ticks += 1
+            }
+        },
+        _ => {},
+    }
+}
+
+fn jb_stream_destroy(mut ed: Ed, i: int) {
+    if ed.jobs.v[i].stream_destroyed || ed.jobs.v[i].stream == STREAM_NONE {
+        return
+    }
+    ed.jobs.v[i].stream_destroyed = true
+    match ed.jobs.v[i].stream {
+        1 => {
+            let w = jb_sw_at(ed, ed.jobs.v[i].cb_key)
+            if w >= 0 {
+                ed.jobs.stream_witness[w].destroys += 1
+            }
+        },
         _ => {},
     }
 }
@@ -1481,6 +1635,27 @@ fn jb_deliver(mut ed: Ed, i: int, bytes: List[byte], is_err: bool) {
         job_buffer_append(mut ed, i, bytes, is_err)
         return
     }
+    if sink == SINK_STREAM {
+        if is_err {
+            if bytes.len > JOB_COLLECT_MAX - ed.jobs.v[i].stream_err.len {
+                if !ed.jobs.v[i].collect_capped {
+                    ed.jobs.v[i].collect_capped = true
+                    let _ = job_signal(mut ed, ed.jobs.v[i].id, signal.terminate())
+                }
+                return
+            }
+            for b in bytes {
+                (mut ed.jobs.v[i].stream_err).push(b)
+            }
+        }
+        if !jb_stream_feed(mut ed, i, bytes, is_err) {
+            ed.jobs.v[i].stream_failed = true
+            if ed.jobs.v[i].state == JOB_RUNNING {
+                let _ = job_signal(mut ed, ed.jobs.v[i].id, signal.terminate())
+            }
+        }
+        return
+    }
     if sink == SINK_FRAMED {
         if is_err {
             if bytes.len > JOB_COLLECT_MAX - ed.jobs.v[i].framed_err.len {
@@ -1591,6 +1766,9 @@ fn jb_read_once(mut ed: Ed, i: int, is_err: bool, want: int) -> int {
         },
         io => {
             eof = true
+            if sink == SINK_STREAM {
+                ed.jobs.v[i].stream_failed = true
+            }
             List[byte]()
         },
     }
@@ -1606,6 +1784,11 @@ fn jb_read_once(mut ed: Ed, i: int, is_err: bool, want: int) -> int {
         if eof && sink == SINK_FRAMED && !is_err {
             if !jb_framed_finish(mut ed, i) {
                 ed.jobs.v[i].framed_failed = true
+            }
+        }
+        if eof && sink == SINK_STREAM {
+            if !jb_stream_finish(mut ed, i, is_err) {
+                ed.jobs.v[i].stream_failed = true
             }
         }
     } else {
@@ -1776,6 +1959,7 @@ pub fn job_settle(mut ed: Ed) -> int {
             continue
         }
         jb_framed_destroy(mut ed, i)
+        jb_stream_destroy(mut ed, i)
         job_finish(mut ed, i)
         i += 1
     }
@@ -1787,7 +1971,16 @@ pub fn job_settle(mut ed: Ed) -> int {
 pub fn job_deadline(ed: Ed, now: int) -> int {
     var best = -1
     for j in ed.jobs.v {
-        if j.state != JOB_RUNNING && j.kill_at_ms == 0 {
+        if j.state == JOB_RUNNING && j.sink == SINK_STREAM {
+            let sat = jb_stream_deadline(ed, j)
+            if sat >= 0 && sat <= now {
+                return 0
+            }
+            if sat >= 0 && (best < 0 || sat - now < best) {
+                best = sat - now
+            }
+        }
+        if j.state != JOB_RUNNING {
             continue
         }
         var at = -1
@@ -1826,6 +2019,9 @@ pub fn job_tick(mut ed: Ed, now: int) {
         if ed.jobs.v[i].state != JOB_RUNNING {
             i += 1
             continue
+        }
+        if ed.jobs.v[i].sink == SINK_STREAM {
+            jb_stream_tick(mut ed, i, now)
         }
         if ed.jobs.v[i].timeout_ms > 0 && now - ed.jobs.v[i].start_ms >= ed.jobs.v[i].timeout_ms {
             ed.jobs.v[i].state = JOB_TIMEOUT
