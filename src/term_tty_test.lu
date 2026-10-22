@@ -13,6 +13,8 @@
 //! `//! member: false` entries beside `src/yew.lu`, named
 //! `src/<module>_<unit>_test.lu`, importing the module as a program does.
 
+use std.fs
+use std.process
 use term
 
 fn bytes_of(s: str) -> List[byte] {
@@ -32,15 +34,25 @@ fn getv_of(m: Map[str, str]) -> term.Env {
     term.env_of(m)
 }
 
+// C's four raw-flag cases (`test_tty_raw_{input,output,local,control}_
+// flags`, `test_tty.c:87-150`) over the one mode int (`[os.term.mode]`):
+// since the 0.2.34 pin (G34, #802) the input case's `ICRNL` and `ISTRIP`
+// and the output case's `OPOST` are reachable bits, asserted here (red at
+// the pin's parent: no bit 5-7 existed); `INLCR`, `IGNCR`, `BRKINT`,
+// `IGNBRK`, `PARMRK`, `INPCK` and `CS8` stay unreachable and left as found.
 fn t_tty_raw_flags() {
-    let raw = term.rawios()
-    assert(!raw.canonical, "raw: canonical off")
-    assert(!raw.echo, "raw: echo off")
-    assert(!raw.signals, "raw: signals off (Ctrl-C is a key, s03 §2)")
-    assert(!raw.flow, "raw: flow off")
-    assert(!raw.extended, "raw: extended off")
-    assert(raw.min == 1, "raw: VMIN 1 (poll sleeps when idle, tty.c:535)")
-    assert(raw.time == 0, "raw: VTIME 0")
+    let mode = term.rawios()
+    assert(mode & 1 == 0, "raw: canonical off")
+    assert(mode & 2 == 0, "raw: echo off")
+    assert(mode & 4 == 0, "raw: signals off (Ctrl-C is a key, s03 §2)")
+    assert(mode & 8 == 0, "raw: flow off (IXON)")
+    assert(mode & 16 == 0, "raw: extended off")
+    assert(mode & term.MODE_RAW_CR != 0, "raw: ICRNL cleared (Enter reads CR)")
+    assert(mode & term.MODE_RAW_OUTPUT != 0, "raw: OPOST cleared")
+    assert(mode & term.MODE_STRIP8 == 0, "raw: ISTRIP off")
+    assert(mode / 256 % 256 == 1, "raw: VMIN 1 (poll sleeps when idle, tty.c:535)")
+    assert(mode / 65536 % 256 == 0, "raw: VTIME 0")
+    assert(mode == 32 + 64 + 256, "raw: nothing else")
 }
 
 fn t_tty_restore_blob() {
@@ -253,22 +265,53 @@ fn t_tty_probe_ambiguous_prefix() {
     }
 }
 
-// Port-only (yw04): which wait a deadline gets at 0.2.33 (G2). None parks;
-// one a tick or more away ticks (`VTIME=1`); one under a tick away — an
-// ESC's 25 ms, the search count's 16 ms idle timer — waits finely, so it
-// fires on time instead of at the next tick (`s21_search_word_under_cursor`
-// measured ~211 ms against the harness's 60 ms settle on the tick alone).
-fn t_port_tty_wait_kind() {
-    assert(term.tty_wait_kind(-1) == term.WAIT_PARK, "no deadline parks")
-    assert(term.tty_wait_kind(0) == term.WAIT_FINE, "a due deadline never blocks a tick")
-    assert(term.tty_wait_kind(16) == term.WAIT_FINE, "16 ms waits finely")
-    assert(term.tty_wait_kind(25) == term.WAIT_FINE, "the ESC deadline waits finely")
-    assert(
-        term.tty_wait_kind(term.TTY_TICK_MS - 1) == term.WAIT_FINE,
-        "just under a tick waits finely",
-    )
-    assert(term.tty_wait_kind(term.TTY_TICK_MS) == term.WAIT_TICK, "a tick away ticks")
-    assert(term.tty_wait_kind(3000) == term.WAIT_TICK, "a message expiry ticks")
+// Port-only (yw05): the job descriptors' look (`term.tty_ready_extra`,
+// `os_signal_wait_fds` with a zero deadline, G2): none ready answers -1, a
+// written pipe its index in the list, `from` skips the ones before it, and
+// a pipe whose writer closed is ready too (the end of input), as `poll`'s
+// POLLHUP is. The loop serves each ready descriptor once a turn from
+// these answers. No meaning is held by a look that met none.
+fn t_port_tty_ready_extra() -> int {
+    var t = term.tty_new()
+    let a = process.pipe() else {
+        return say_skip("tty_ready_extra: no pipe")
+    }
+    let b = process.pipe() else {
+        return say_skip("tty_ready_extra: no pipe")
+    }
+    var fds = List[int]()
+    (mut fds).push(a.read.fd)
+    (mut fds).push(b.read.fd)
+    let none = term.tty_ready_extra(mut t, fds, 0) else -2
+    assert(none == -1, "no pipe ready: -1 (got {none})")
+    var bw = fs.File { fd: b.write.fd }
+    fs.write_chunk(mut bw, "x".bytes()) else |_| {}
+    let second = term.tty_ready_extra(mut t, fds, 0) else -2
+    assert(second == 1, "the second pipe ready: index 1 (got {second})")
+    let past = term.tty_ready_extra(mut t, fds, 2) else -2
+    assert(past == -1, "from past the list: -1 (got {past})")
+    var aw = fs.File { fd: a.write.fd }
+    fs.write_chunk(mut aw, "y".bytes()) else |_| {}
+    let lowest = term.tty_ready_extra(mut t, fds, 0) else -2
+    assert(lowest == 0, "both ready: the lowest, 0 (got {lowest})")
+    let after = term.tty_ready_extra(mut t, fds, 1) else -2
+    assert(after == 1, "from 1: the second (got {after})")
+    fs.close(take fs.File { fd: a.write.fd }) else |_| {}
+    var ar = fs.File { fd: a.read.fd }
+    let _ = fs.read_chunk(mut ar, 16) else |_| List[byte]()
+    let hup = term.tty_ready_extra(mut t, fds, 0) else -2
+    assert(hup == 0, "a closed writer is ready, the end of input (got {hup})")
+    assert(term.tty_take_meaning(mut t) == 0, "no meaning held")
+    fs.close(take fs.File { fd: a.read.fd }) else |_| {}
+    fs.close(take fs.File { fd: b.read.fd }) else |_| {}
+    fs.close(take fs.File { fd: b.write.fd }) else |_| {}
+    0
+}
+
+fn say_skip(what: str) -> int {
+    print("tty_test: SKIP {what}")
+    eprint("tty_test: SKIP {what}")
+    1
 }
 
 fn main() {
@@ -285,6 +328,10 @@ fn main() {
     t_tty_probe_chunking()
     t_tty_probe_pending_interleaved()
     t_tty_probe_ambiguous_prefix()
-    t_port_tty_wait_kind()
+    let skips = t_port_tty_ready_extra()
+    if skips != 0 {
+        print("tty_test: 13 cases pass (13 C), 1 port-only SKIP")
+        return
+    }
     print("tty_test: 14 cases pass (13 C, 1 port-only)")
 }
