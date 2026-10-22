@@ -5,6 +5,37 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw05 — panes, tabs and groups, and the 0.2.34 bump (2026-10-22)
+
+- The toolchain to wolf 0.2.34 / lupin 0.1.55 / wolf-std `e036bec`, every
+  gap yw01–yw04 met adopted: one `os_signal_wait_fds` over the terminal,
+  the jobs' descriptors and the signals (the `VTIME` interim, the drain,
+  the fine wait and the deadline-first turn gone; the burst pair gated on
+  macOS again); `RAW_CR | RAW_OUTPUT` in the raw mode (the LF-as-Enter
+  interim gone); `os_term_restore_at_exit` registered and `ABORT`
+  listened; `fs_sync`/`fs_sync_dir` at C's sites (every acceptance
+  deleted); `fs_realpath`; the clipboard writer and reader forked as C's.
+- yw04's job half over the wait: `job.c`'s table, the stream, the footers
+  and badge, the region filter both ways (its stdin through a forked
+  writer), `:r !`, the `*jobs*` table, the persistent session, the
+  generator, `--help` and fish jobs. Campaign 04: 104 of 104 gated by name.
+- Campaign 05's first half: the pane tree in cells (`edit.layout`, its
+  ratio C's float bits through `util.f32`, the checked machine having no
+  `f32`), the region registry in full, glyphs, `pane_cmds`, borders and
+  dim-inactive, click-to-focus and the border drag; tabs in full with the
+  strip engine, its overflow and s57.8's modern strip; tab groups
+  (facsimile's model: membership on the tab, deferred tabs, groupnav, the
+  New/Edit picker, from-dir as far as campaign 05 reaches); every startup
+  file its own tab. The s22, s23, s24 and s57.8 goldens gated by name;
+  `startup_multiple_files` recorded on the `:buffers` picker (s26, yw06).
+- Allocation-free hot paths (R-yw03-7 A): the document rows, gutter,
+  statusline, prompt row, overlay and strip controls drawn into storage
+  the editor owns (`edit.drawbufs`), byte-identical: a `:` key keeps
+  ~21 KB where it kept ~208 KB, a line move ~0.5 KB where it kept ~74-121 KB.
+- Fuzzers against C's own drivers (`tools/fuzz-{panes,tabs,groups}`), the
+  2× tools `tools/run-perf-panes-tabs` (two panes, fifty buffers, the tab
+  switch) and `tools/run-perf-jobstream`; yw06's contract drafted.
+
 ### yw04 — execute and search (2026-10-21)
 
 - Campaign 04 ported at wolf 0.2.33: the full `:` prompt replacing
