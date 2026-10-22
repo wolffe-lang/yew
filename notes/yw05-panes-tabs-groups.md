@@ -220,7 +220,12 @@ issue filed or closed; no trailer.
    built with warnings denied, campaign 01 18/18, 03 62/62 and 04 83/104
    on both tiers, `check-test` 89 files on both lanes, the same 21 red as
    yw04's final gate (`notes/yw05-evidence/lane/pin-baseline.txt`).
-2. *The deliverable's count is 23, not 30* — **HIT** (§2).
+2. *The deliverable's count is 23, not 30; 23 of 23 green by name on both
+   tiers* — **HIT on the count, MISS by one on the greens**: 22 of 23
+   (s22 11, s23 6, s24 4, `s57_8_click_new_tab`) on both tiers;
+   `startup_multiple_files` opens each file in its own tab as C does
+   (rows 1-2 of its snapshot are C's) but snapshots the `:buffers`
+   picker, Sprint 26's (R-yw05-5, §4.3).
 3. *G2 retires the whole interim; the burst pair passes on macOS* —
    **HIT**: `1ebff08` waits on the tty, the jobs' descriptors and the
    signal set in one `os_signal_wait_fds` with the timer heap's deadline;
@@ -270,7 +275,12 @@ issue filed or closed; no trailer.
    merged with the lane (`notes/yw05-evidence/jobs/`). yw04's SKIP-by-name
    job cases run (§4.1).
 10. *Deliverable 6 cuts the `:` keystroke's ~210 KB by 10× or more, short
-    of C's* — (§4.5).
+    of C's* — **in process HIT** (a full repaint 181,328 → 832 B, 10.6×
+    the key's share and more); **under the PTY driver a narrow MISS** on
+    "10× or more": 208,460 → 20,967 B a key, 9.9× on release and 9.5× on
+    native (the two-pane prompt row 11.0×/10.6×); **"short of C's" HIT**
+    (21 KB against C's 0.3 KB: the completion rows' copy-out, E1010 at
+    this pin). Every other row fell 18× to 230× (§4.5).
 11. *The ratio is a C `float`; wolf's `f32` reproduces it exactly* —
     **MISS, then the prediction's own fallback**: natively `f32` rounds as
     C does (the panes fork's layout fuzz equal to C's driver), but the
@@ -283,7 +293,14 @@ issue filed or closed; no trailer.
     boundary rows and 2M points of wolf's own `f32` (`notes/yw05-evidence/
     panes/f32-bits/`). A new gap (§5, G44).
 12. *Merging is the risk; no golden of campaigns 03 and 04 changes at any
-    merge* — (§4.6).
+    merge* — **HIT**: campaign 03 62/62 and 04 at its base's count after
+    every merge, on both tiers (the lane gate L1 after the bump's merges,
+    the tabs fork's fg1 and the groups fork's g2 after merging the lane,
+    the hot fork's gate after merging all of it, and L2 at the final head,
+    §4.6); the merges' conflicts were textual (`ed.lu`'s fields, `impl.lu`'s
+    id ranges, CI's step, `tools/oracle`'s target list) but one: the mouse
+    route, where the panes fork's router and the tabs fork's strip press
+    met and the router kept the phases (§4.3).
 
 **The contract's** — (§4.6, after the gates).
 
