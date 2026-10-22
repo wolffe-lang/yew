@@ -1,0 +1,473 @@
+//! fuzz-groups — Sprint 24's group fuzz: the port of sagitta
+//! `tests/fuzz/fuzz_groups.c` (459 lines) over the generator of
+//! `tests/fuzz/fuzzlib.c` (`yew_fuzz_main`) at 9ace98c2, which
+//! `tools/fuzzgen` ports C's bit for bit, so a seed's `hash=` is C's for
+//! the same seed and iterations — the witness that the port ran the same
+//! sessions.
+//!
+//! The check is C's `run_session` (`fuzz_groups.c:409-454`): a fresh
+//! editor on a scratch buffer and six seed tabs, the input's own LCG
+//! seeded from its bytes, then two storms. MEMBERSHIP (`run_membership`,
+//! `:179-277`, 400 steps): create a one-member group, join, leave, close,
+//! open, reorder within a group — after every one an oracle that keeps
+//! the member lists the model refuses to keep (by tab ID) must agree, and
+//! every live group must have members (DoD 10: no empty group survives
+//! any sequence); then one walk step either way (the walk is the only way
+//! out of a group, so a crash there strands the user) and the oracle
+//! again. THE PICKER (`run_picker`, `:324-407`, 400 keys over a fixture
+//! tree, the dialog reopened whenever Enter or Esc closed it): every
+//! confirmed path must be absolute, a regular file, and canonical — an
+//! INVENTED path (a truncated join, a ticked directory, a stale row) is
+//! the failure. A trap anywhere is the crash C reports.
+//!
+//!   fuzz-groups [--iters=N] [--seed=N]
+//!
+//! Defaults are C's (`--iters=200000 --seed=1`); C's own campaign counts
+//! SESSIONS (`GROUPS_FUZZ_SESSIONS=250` at four seeds, Makefile:180-195):
+//! `tools/run-fuzz-groups --campaign`. One region a session: its editor
+//! dies with it (G33).
+
+use edit
+use fuzzgen
+use term
+use text
+
+const EPOCH: int = 64
+
+const FZ_MAX_TABS: int = 48
+
+const FZ_MAX_GROUPS: int = 12
+
+struct Rng {
+    s: wrapping[u64],
+}
+
+// `rng_next` (`fuzz_groups.c:40-44`).
+fn rng_next(mut r: Rng) -> int {
+    r.s = r.s * 6364136223846793005 + 1442695040888963407
+    (r.s >> 33) as int
+}
+
+// `rng_below` (`fuzz_groups.c:46-49`).
+fn rng_below(mut r: Rng, n: int) -> int {
+    if n == 0 {
+        return 0
+    }
+    rng_next(mut r) % n
+}
+
+// The oracle (`fuzz_groups.c:56-63`): the member lists, by tab ID.
+struct Oracle {
+    gid: List[int],
+    members: List[List[int]],
+}
+
+fn oracle_find(o: Oracle, gid: int) -> int {
+    var i = 0
+    while i < o.gid.len {
+        if o.gid[i] == gid {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `oracle_drop` (`fuzz_groups.c:76-87`).
+fn oracle_drop(mut o: Oracle, at: int) {
+    var i = at
+    while i + 1 < o.gid.len {
+        o.gid[i] = o.gid[i + 1]
+        o.members[i] = copy o.members[i + 1]
+        i += 1
+    }
+    let _ = (mut o.gid).pop()
+    let _ = (mut o.members).pop()
+}
+
+// `oracle_remove` (`fuzz_groups.c:89-109`): out of whichever group holds
+// it, an emptied group dissolved as the model does.
+fn oracle_remove(mut o: Oracle, tid: int) {
+    var i = 0
+    while i < o.gid.len {
+        var j = 0
+        while j < o.members[i].len {
+            if o.members[i][j] == tid {
+                var k = j
+                while k + 1 < o.members[i].len {
+                    o.members[i][k] = o.members[i][k + 1]
+                    k += 1
+                }
+                let _ = (mut o.members[i]).pop()
+                if o.members[i].len == 0 {
+                    oracle_drop(mut o, i)
+                }
+                return
+            }
+            j += 1
+        }
+        i += 1
+    }
+}
+
+// `oracle_agrees` (`fuzz_groups.c:111-177`): "" when the model and the
+// oracle describe the same world, else why.
+fn oracle_agrees(ed: edit.Ed, o: Oracle) -> str {
+    if ed.groups.len != o.gid.len {
+        return "group count {ed.groups.len}, oracle {o.gid.len}"
+    }
+    var i = 0
+    while i < o.gid.len {
+        let m = edit.group_members(ed, o.gid[i])
+        if m.len == 0 {
+            return "group {o.gid[i]} is empty"
+        }
+        if m.len != o.members[i].len {
+            return "group {o.gid[i]} has {m.len} members, oracle {o.members[i].len}"
+        }
+        if edit.group_member_count(ed, o.gid[i]) != m.len {
+            return "count disagrees with members()"
+        }
+        var j = 0
+        while j < m.len {
+            if ed.tabs[m[j]].tab_id != o.members[i][j] {
+                return "group {o.gid[i]} member {j} mismatch"
+            }
+            if ed.tabs[m[j]].group_ordinal != j + 1 {
+                return "group {o.gid[i]} ordinal {ed.tabs[m[j]].group_ordinal} at slot {j}"
+            }
+            j += 1
+        }
+        i += 1
+    }
+    i = 0
+    while i < ed.tabs.len {
+        let g = ed.tabs[i].group_id
+        if g == 0 {
+            if ed.tabs[i].group_ordinal != 0 {
+                return "ungrouped tab has ordinal {ed.tabs[i].group_ordinal}"
+            }
+        } else if edit.group_find(ed, g) < 0 {
+            return "tab {i} orphaned on group {g}"
+        }
+        i += 1
+    }
+    ""
+}
+
+// `run_membership` (`fuzz_groups.c:179-277`).
+fn run_membership(mut rng: Rng, mut ed: edit.Ed, mut o: Oracle, iters: int) -> str {
+    var step = 0
+    while step < iters {
+        let ntabs = ed.tabs.len
+        let idx = if ntabs > 0 then rng_below(mut rng, ntabs) else 0
+        let what = rng_below(mut rng, 6)
+        if what == 0 {
+            if o.gid.len < FZ_MAX_GROUPS && ntabs > 0 {
+                let g = edit.group_create(mut ed, "/src", "")
+                let tid = ed.tabs[idx].tab_id
+                edit.group_add_member(mut ed, g, idx)
+                oracle_remove(mut o, tid)
+                (mut o.gid).push(g)
+                var m = List[int]()
+                (mut m).push(tid)
+                (mut o.members).push(m)
+            }
+        } else if what == 1 {
+            if o.gid.len > 0 && ntabs > 0 {
+                let gi0 = rng_below(mut rng, o.gid.len)
+                let gid = o.gid[gi0]
+                let tid = ed.tabs[idx].tab_id
+                if ed.tabs[idx].group_id != gid {
+                    edit.group_add_member(mut ed, gid, idx)
+                    oracle_remove(mut o, tid)
+                    let gi = oracle_find(o, gid)
+                    if gi >= 0 {
+                        (mut o.members[gi]).push(tid)
+                    }
+                }
+            }
+        } else if what == 2 {
+            if ntabs > 0 {
+                let tid = ed.tabs[idx].tab_id
+                edit.group_remove_member(mut ed, idx)
+                oracle_remove(mut o, tid)
+            }
+        } else if what == 3 {
+            if ntabs > 1 {
+                let tid = ed.tabs[idx].tab_id
+                let _ = edit.tab_close(mut ed, idx)
+                oracle_remove(mut o, tid)
+            }
+        } else if what == 4 {
+            if ntabs < FZ_MAX_TABS - 1 {
+                let _ = edit.tab_open(mut ed, "/tmp/yew-fz-{step}.txt")
+            }
+        } else if ntabs > 0 && ed.tabs[idx].group_id != 0 {
+            let gid = ed.tabs[idx].group_id
+            let gi = oracle_find(o, gid)
+            let n = if gi >= 0 then o.members[gi].len else 0
+            if n > 0 {
+                let pos = rng_below(mut rng, n) + 1
+                let tid = ed.tabs[idx].tab_id
+                edit.group_set_ordinal(mut ed, idx, pos)
+                var at = 0
+                var k = 0
+                while k < n {
+                    if o.members[gi][k] == tid {
+                        at = k
+                    }
+                    k += 1
+                }
+                k = at
+                while k < n - 1 {
+                    o.members[gi][k] = o.members[gi][k + 1]
+                    k += 1
+                }
+                k = n - 1
+                while k > pos - 1 {
+                    o.members[gi][k] = o.members[gi][k - 1]
+                    k -= 1
+                }
+                o.members[gi][pos - 1] = tid
+            }
+        }
+        var why = oracle_agrees(ed, o)
+        if why.len != 0 {
+            return why
+        }
+        edit.file_step(mut ed, if rng_below(mut rng, 2) == 0 then 1 else -1)
+        why = oracle_agrees(ed, o)
+        if why.len != 0 {
+            return why
+        }
+        step += 1
+    }
+    ""
+}
+
+// `tree_make`'s `mkdtemp` (`fuzz_groups.c:289-312`): "" on failure.
+fn fresh_dir() -> str {
+    var tries = 0
+    while tries < 100 {
+        var suffix = ""
+        for r in os_random(6) {
+            suffix = suffix + "{r % 10}"
+        }
+        let dir = "/tmp/yew-fzgp-{suffix}"
+        fs_create_dir_mode(dir, 448) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            denied => { return "" },
+            invalid => { return "" },
+            not_found => { return "" },
+            unsupported => { return "" },
+            io => { return "" },
+        }
+        return dir
+    }
+    ""
+}
+
+struct FzTree {
+    root: str,
+    sub: str,
+    files: List[str],
+}
+
+// `tree_make` (`fuzz_groups.c:289-312`).
+fn tree_make() -> (bool, FzTree) {
+    var t = FzTree { root: fresh_dir(), sub: "", files: List[str]() }
+    if t.root.len == 0 {
+        return (false, t)
+    }
+    t.sub = "{t.root}/sub"
+    fs_create_dir_mode(t.sub, 448) else |_| {
+        return (false, t)
+    }
+    (mut t.files).push("{t.root}/a.txt")
+    (mut t.files).push("{t.root}/b.txt")
+    (mut t.files).push("{t.sub}/c.txt")
+    (mut t.files).push("{t.sub}/d.txt")
+    var x = List[byte]()
+    (mut x).push(120 as byte)
+    (mut x).push(10 as byte)
+    var ok = true
+    for f in t.files {
+        fs_write_bytes(f, x) else |_| {
+            ok = false
+        }
+    }
+    (ok, t)
+}
+
+// `tree_remove` (`fuzz_groups.c:314-322`).
+fn tree_remove(t: FzTree) {
+    for f in t.files {
+        fs_remove(f) else |_| {}
+    }
+    if t.sub.len != 0 {
+        fs_remove_dir(t.sub) else |_| {}
+    }
+    if t.root.len != 0 {
+        fs_remove_dir(t.root) else |_| {}
+    }
+}
+
+// `run_picker` (`fuzz_groups.c:324-407`).
+fn run_picker(mut rng: Rng, mut ed: edit.Ed, t: FzTree, iters: int) -> str {
+    let codes = [
+        term.KEY_UP,
+        term.KEY_DOWN,
+        term.KEY_LEFT,
+        term.KEY_RIGHT,
+        term.KEY_TAB,
+        term.KEY_ENTER,
+        32,
+        113,
+        47,
+        term.KEY_BACKSPACE,
+        term.KEY_ESCAPE,
+    ]
+    if !edit.gp_show(mut ed, t.root) {
+        return "picker refused to open"
+    }
+    var step = 0
+    while step < iters {
+        if !edit.gp_active(ed) {
+            edit.gp_apply(mut ed)
+            if !edit.gp_show(mut ed, t.root) {
+                return "picker refused to reopen"
+            }
+        }
+        var k = term.key_new()
+        k.kind = term.EV_KEY
+        k.ev = term.KEY_PRESS
+        k.code = codes[rng_below(mut rng, codes.len)]
+        if k.code >= 32 && k.code < 127 {
+            (mut k.text).push(k.code as byte)
+        }
+        let _ = edit.gp_key(mut ed, k)
+        if edit.gp_result(ed) == edit.GP_CONFIRMED {
+            var i = 0
+            while i < edit.gp_count(ed) {
+                let p = edit.gp_path(ed, i)
+                if p.len == 0 || !p.starts_with("/") {
+                    let shown = if p.len == 0 then "(null)" else p
+                    return "picker produced a non-absolute path: {shown}"
+                }
+                let st = fs_stat(p) else {
+                    return "picker produced a non-file: {p}"
+                }
+                if st[0] != 0 {
+                    return "picker produced a non-file: {p}"
+                }
+                let canon = text.file_realpath(p) else ""
+                if canon != p {
+                    return "picker produced a non-canonical path: {p}"
+                }
+                i += 1
+            }
+        }
+        edit.gp_apply(mut ed)
+        step += 1
+    }
+    edit.gp_close(mut ed)
+    ""
+}
+
+// `run_session` (`fuzz_groups.c:409-454`): "" when every step held.
+fn run_session(data: List[byte]) -> str {
+    var rng = Rng { s: 11400714819323198485 }
+    for b in data {
+        rng.s = rng.s * 31 + b as int as wrapping[u64]
+    }
+    var o = Oracle { gid: List[int](), members: List[List[int]]() }
+    let (made, t) = tree_make()
+    if !made {
+        tree_remove(t)
+        return "cannot build the fixture tree"
+    }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    var i = 0
+    while i < 6 {
+        let _ = edit.tab_open(mut ed, "/tmp/yew-fzseed-{i}.txt")
+        i += 1
+    }
+    var why = run_membership(mut rng, mut ed, mut o, 400)
+    if why.len == 0 {
+        why = run_picker(mut rng, mut ed, t, 400)
+    }
+    edit.gp_close(mut ed)
+    tree_remove(t)
+    why
+}
+
+fn main() -> int {
+    let (ok, seed, iters) = fuzzgen.parse_args(env_args())
+    if !ok {
+        eprint("usage: fuzz-groups [--seed=N] [--iters=N]")
+        return 2
+    }
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let (cok, corpus) = fuzzgen.corpus_for("fuzz_groups")
+    if !cok {
+        return 2
+    }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > EPOCH then EPOCH else iters - done
+        region epoch {
+            var r = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut r, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut r, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, o) = fuzzgen.mutate(mut r, input, corpus)
+                    input = next
+                    op = o
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut r, input)
+                var bad = false
+                region session {
+                    let why = run_session(input)
+                    if why.len != 0 {
+                        eprint(
+                            "fuzz_groups: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                        )
+                        eprint("fuzz_groups: input={fuzzgen.hex_of(input)}")
+                        bad = true
+                    }
+                }
+                if bad {
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = r.state
+            hash = r.hash
+        }
+        done += n
+    }
+    if failed {
+        return 1
+    }
+    print(
+        "fuzz_groups: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok",
+    )
+    0
+}
