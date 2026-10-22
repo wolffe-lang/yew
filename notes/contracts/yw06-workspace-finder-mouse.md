@@ -168,7 +168,9 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
    that refuses by name. yw04's `ws.fuzzy` is the scorer. Unit:
    `test_walk` (20), `test_gitignore` (26), `test_picker` (13),
    `test_pickers` (10), `test_narrow` (11), `test_typejump` (11) —
-   **91**. PTY: `s26_*` (5). Fuzz: `fuzz_gitignore` (`fuzz_fuzzy` is
+   **91**. PTY: `s26_*` (5), and `startup_multiple_files` (yw05's
+   R-yw05-5 = A: its tabs are yw05's and green, its snapshot is
+   `:buffers` Enter, `ed.find.buffer`). Fuzz: `fuzz_gitignore` (`fuzz_fuzzy` is
    yw04's). Perf: `tests/perf/finder.c`'s gates (a walk slice ≤ 3 ms,
    the first key ≤ 5 ms in frame, each narrowing key ≤ 5 ms complete,
    open → first paint ≤ 16 ms, `finder.c:39-41`; in-process: the port's
@@ -247,8 +249,8 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
    today) — a pax lane's change, never this lane's.
 8. **The gates**: `tools/check-test` and `--native` green with the
    per-case checked run for every `[native]` fallback (G29); the **80**
-   reachable PTY goldens of deliverables 2–6 (`s25_*` 2, `s26_*` 5,
-   `startup_explicit_workspace`, the router's 68 — its 70 less the two
+   reachable PTY goldens of deliverables 2–6 and `startup_multiple_files`
+   (`s25_*` 2, `s26_*` 5, `startup_explicit_workspace`, the router's 68 — its 70 less the two
    FUSS menus — `s57_11_*` 1, `s57_12_*` 3) gated BY NAME in CI beside
    campaigns 03, 04 and yw05's — **M-YW5** as R-yw06-3 shapes it; the
    recorded step narrowed to what is red by design, by owner:
