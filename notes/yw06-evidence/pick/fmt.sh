@@ -13,6 +13,7 @@ for d in tools/*/; do
 done
 "$WOLF" fmt notes/yw06-evidence/pick/witness/bytes-view
 "$WOLF" fmt notes/yw06-evidence/pick/witness/checked-repeat
+"$WOLF" fmt notes/yw06-evidence/pick/witness/checked-bytes
 mkdir -p target
 git diff > target/fmt.patch
 echo "fmt: $(git diff --stat | tail -1)"

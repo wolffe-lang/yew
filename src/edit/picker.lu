@@ -173,10 +173,15 @@ pub fn picker_spec(kind: int, title: str, take items: List[PickItem]) -> PickerS
     }
 }
 
-// `PickerCustomSearch` (`picker.c:31-47`): a borrowed-part scan's cursor;
-// the part's text is held as the `str` the host answered.
+// `PickerCustomSearch` (`picker.c:31-47`): a borrowed-part scan's cursor.
+// The part's text, the `str` the host answered, is `PickerState`'s
+// `part_text` beside it: the scan reads it through a lent `List[byte]`
+// view, one per call, never an inline `.bytes()[i]` a byte — the checked
+// machine copies a field's text on every inline read (`notes/yw06-
+// evidence/pick/witness/checked-bytes/`), which made `test_picker.c`'s
+// 8 MiB case hours long there; the compiled tiers read in place either
+// way.
 struct PickCustom {
-    part_text: str,
     part_len: int,
     part_off: int,
     total: int,
@@ -195,7 +200,6 @@ struct PickCustom {
 
 fn pick_custom_new() -> PickCustom {
     PickCustom {
-        part_text: "",
         part_len: 0,
         part_off: 0,
         total: 0,
@@ -232,6 +236,7 @@ pub struct PickerState {
     top: TopK,
     custom_matched: int,
     custom: PickCustom,
+    part_text: str,
     total: int,
     scanning: bool,
     sel_payload: int,
@@ -276,6 +281,7 @@ pub fn picker_state_new() -> PickerState {
         top: topk_new(),
         custom_matched: 0,
         custom: pick_custom_new(),
+        part_text: "",
         total: 0,
         scanning: false,
         sel_payload: 0,
@@ -520,6 +526,7 @@ fn pk_normalize(c: int) -> int {
 fn pk_candidate_reset(mut ed: Ed) {
     let item = ed.picker.custom.item
     ed.picker.custom = pick_custom_new()
+    ed.picker.part_text = ""
     ed.picker.custom.item = item
 }
 
@@ -528,6 +535,7 @@ fn pk_custom_reset(mut ed: Ed) {
     ed.picker.top.n = 0
     ed.picker.custom_matched = 0
     ed.picker.custom = pick_custom_new()
+    ed.picker.part_text = ""
 }
 
 // `custom_part_reset` (`picker.c:289-300`).
@@ -536,6 +544,7 @@ fn pk_part_reset(mut ed: Ed) {
     let part = ed.picker.custom.part
     let best = ed.picker.custom.best_score
     ed.picker.custom = pick_custom_new()
+    ed.picker.part_text = ""
     ed.picker.custom.item = item
     ed.picker.custom.part = part
     ed.picker.custom.best_score = best
@@ -567,8 +576,9 @@ fn pk_custom_rank(mut ed: Ed, idx: int, score: int, empty_pattern: bool) {
 }
 
 // `custom_consume` (`picker.c:327-355`): one byte of the joined parts
-// against the pattern, the scorer's table in flight.
-fn pk_custom_consume(mut c: PickCustom, ch: int, pattern: List[byte]) {
+// against the pattern, the scorer's table in flight; `prev` is the part's
+// byte before this one (read only past the part's first byte).
+fn pk_custom_consume(mut c: PickCustom, ch: int, prev: int, pattern: List[byte]) {
     let plen = pattern.len
     if c.total < plen && pk_fold(ch) != pk_fold(pattern[c.total] as int) {
         c.prefix = false
@@ -588,8 +598,7 @@ fn pk_custom_consume(mut c: PickCustom, ch: int, pattern: List[byte]) {
             }
             if c.total == 0 {
                 c.score += 200
-            } else if c.part_off != 0 &&
-                pk_boundary(pk_normalize(c.part_text.bytes()[c.part_off - 1] as int)) {
+            } else if c.part_off != 0 && pk_boundary(pk_normalize(prev)) {
                 c.score += 150
             }
             c.pattern_at += 1
@@ -618,6 +627,28 @@ fn pk_custom_finish(mut c: PickCustom, plen: int) -> int {
 
 fn pk_now_us() -> int {
     os_clock_ns() / 1000
+}
+
+// `custom_step`'s byte loop (`picker.c:430-438`) over the part's lent
+// bytes: false when the budget ran out mid-part (the clock read every
+// 4,096 bytes), true when the part is consumed.
+fn pk_custom_scan(
+    mut c: PickCustom,
+    text: List[byte],
+    pattern: List[byte],
+    budget_us: int,
+    started_us: int,
+) -> bool {
+    while c.part_off < c.part_len {
+        let ch = pk_normalize(text[c.part_off] as int)
+        let prev = if c.part_off != 0 then text[c.part_off - 1] as int else 0
+        pk_custom_consume(mut c, ch, prev, pattern)
+        c.part_off += 1
+        if budget_us > 0 && c.total & 4095 == 0 && pk_now_us() - started_us >= budget_us {
+            return false
+        }
+    }
+    true
 }
 
 // `custom_step` (`picker.c:376-453`): resumable, the clock read every
@@ -657,7 +688,7 @@ fn pk_custom_step(mut ed: Ed, n: int, budget_us: int) -> bool {
                 }
                 continue
             }
-            ed.picker.custom.part_text = a.text
+            ed.picker.part_text = a.text
             ed.picker.custom.part_len = a.text.len
             ed.picker.custom.part_off = 0
             ed.picker.custom.part_loaded = true
@@ -665,20 +696,17 @@ fn pk_custom_step(mut ed: Ed, n: int, budget_us: int) -> bool {
                 ed.picker.custom.part == 0
         }
         if !ed.picker.custom.separator_done {
-            pk_custom_consume(mut ed.picker.custom, 32, ed.picker.text)
+            pk_custom_consume(mut ed.picker.custom, 32, 0, ed.picker.text)
             ed.picker.custom.separator_done = true
         }
-        while ed.picker.custom.part_off < ed.picker.custom.part_len {
-            let ch = pk_normalize(
-                ed.picker.custom.part_text.bytes()[ed.picker.custom.part_off] as int,
-            )
-            pk_custom_consume(mut ed.picker.custom, ch, ed.picker.text)
-            ed.picker.custom.part_off += 1
-            if budget_us > 0 &&
-                ed.picker.custom.total & 4095 == 0 &&
-                pk_now_us() - started_us >= budget_us {
-                return false
-            }
+        if !pk_custom_scan(
+            mut ed.picker.custom,
+            ed.picker.part_text.bytes(),
+            ed.picker.text,
+            budget_us,
+            started_us,
+        ) {
+            return false
         }
         ed.picker.custom.part += 1
         if ed.picker.search_parts_independent {
@@ -826,6 +854,7 @@ pub fn picker_open(mut ed: Ed, spec: PickerSpec) {
     ed.picker.top.n = 0
     ed.picker.custom_matched = 0
     ed.picker.custom = pick_custom_new()
+    ed.picker.part_text = ""
     ed.picker.total = 0
     ed.picker.scanning = false
     ed.picker.sel_payload = 0
