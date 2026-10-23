@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Integration-test the real harnesses with fixture executables, not an editor.
+C's own fixture contract: tests/unit/test_ws_key.c:29-85; yew#11.
+Both harnesses must protect all four caller homes; a planted missing call
+must be caught, and successive golden invocations must get fresh roots.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+FIELDS = ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME")
+PROBE = """#!{python}
+import json, os
+from pathlib import Path
+keys = ('HOME','XDG_STATE_HOME','XDG_CONFIG_HOME','XDG_CACHE_HOME')
+with open(os.environ['PROBE_LOG'], 'a') as f:
+    f.write(json.dumps({{k: os.environ.get(k) for k in keys}}) + '\\n')
+for k in keys:
+    p = Path(os.environ[k]); p.mkdir(parents=True, exist_ok=True)
+    (p / 'editor-wrote-here').touch()
+print('fixture: ok')
+""".format(python=sys.executable)
+
+
+def fixture(base, plant):
+    root = base / ("plant-" + plant if plant else "fixed")
+    tools = root / "tools"
+    tools.mkdir(parents=True)
+    for name in ("goldens", "oracle", "lib-test-env.sh"):
+        text = (ROOT / "tools" / name).read_text()
+        if name == plant:
+            assert text.count("\ntest_env_begin") == 1
+            text = text.replace("\ntest_env_begin", "\n: # planted missing test_env_begin")
+        (tools / name).write_text(text)
+    (root / "sagitta.pin").write_text("SAGITTA_REPO=unused\nSAGITTA_REV=fixture\n")
+    tree = root / "target/oracle/sagitta"
+    (tree / ".git").mkdir(parents=True)
+    build = tree / "build-fixture"
+    build.mkdir()
+    (tree / "build").symlink_to("build-fixture")
+    bins = root / "fake-bin"
+    bins.mkdir()
+    for p in (build / "yew", bins / "make"):
+        p.write_text(PROBE)
+        p.chmod(0o755)
+    git = bins / "git"
+    git.write_text("#!/bin/sh\nprintf 'fixture\\n'\n")
+    git.chmod(0o755)
+    caller = root / "caller"
+    env = os.environ.copy()
+    for key in FIELDS:
+        p = caller / key
+        p.mkdir(parents=True)
+        (p / "sentinel").write_text(key)
+        env[key] = str(p)
+    env["PATH"] = str(bins) + os.pathsep + env["PATH"]
+    return root, env
+
+
+def verify(root, env):
+    roots = []
+    for i, cmd in enumerate((
+        ["bash", "tools/oracle", "--cc", "fixture", "--unit", "--jobs", "1"],
+        ["bash", "tools/goldens", "--yew", "target/oracle/sagitta/build-fixture/yew", "--suite", "version"],
+        ["bash", "tools/goldens", "--yew", "target/oracle/sagitta/build-fixture/yew", "--suite", "version"],
+    )):
+        log = root / ("probe-%d.jsonl" % i)
+        env["PROBE_LOG"] = str(log)
+        result = subprocess.run(cmd, cwd=root, env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = [json.loads(line) for line in log.read_text().splitlines()]
+        assert len(rows) == 2, (cmd, rows)
+        assert rows[0] == rows[1], "one invocation must retain one environment"
+        for row in rows:
+            for key in FIELDS:
+                path = Path(row[key])
+                assert path.parent.parent == root / "target", (key, str(path))
+                assert path.parent.name.startswith("test-home."), str(path)
+                assert not path.exists(), "private roots must be cleaned on exit"
+        roots.append(rows[0]["HOME"])
+    assert len(set(roots)) == 3, "each invocation needs fresh state"
+    for key in FIELDS:
+        p = Path(env[key])
+        assert (p / "sentinel").read_text() == key
+        assert sorted(x.name for x in p.iterdir()) == ["sentinel"], str(p)
+
+
+# Scratch stays in this repo's target tree; never a maintainer state path.
+(ROOT / "target").mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="test-env-selftest-", dir=ROOT / "target") as tmp:
+    base = Path(tmp)
+    for harness in ("oracle", "goldens"):
+        root, env = fixture(base, harness)
+        try:
+            verify(root, env)
+        except AssertionError as error:
+            print("test-env:", harness, "missing-isolation plant caught:", error)
+        else:
+            raise AssertionError("missing-isolation plant passed: " + harness)
+    root, env = fixture(base, None)
+    verify(root, env)
+    print("test-env: GREEN; oracle build/unit and both golden invocations isolated; 0 SKIP")
