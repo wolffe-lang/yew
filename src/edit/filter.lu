@@ -1,0 +1,463 @@
+//! edit.filter — incremental filtering inside the keystroke budget.
+//!
+//! Ports sagitta `src/ui/filter.c` (398 lines) and `ui/filter.h` (138) at
+//! 9ace98c2, under `s26-fuzzy-finder.md` §7. The numbers it is designed
+//! against (`filter.h:7-11`): 100,000 candidates, ~200 ns a score, a full
+//! rescan four times over the 5 ms keypress gate, so:
+//!
+//! - NARROWING ON APPEND IS EXACT (`filter.h:13-19`): a pattern that has
+//!   the old one as a strict prefix rescores only the current set — a
+//!   subsequence match cannot appear by adding a character — compacting
+//!   it in place, resumable (`narrow_read` behind, `n_cand` writing at or
+//!   before it), sliced too: `src` over a checkout half under `src/` still
+//!   matches ~54,000 paths (`filter.h:73-86`);
+//! - BACKSPACE or a mid-line edit is a full rescan, sliced on the idle
+//!   timer, the count meaningful mid-scan (` scanning…`);
+//! - THE SET IS NEVER SORTED (`filter.h:21-25`): `filter_top` keeps a
+//!   bounded insertion into the visible window, the only place an order
+//!   exists; `ws.fz_rank` stays for tests and small lists;
+//! - NO PER-CANDIDATE ALLOCATION: the candidate and score lists are
+//!   reserved to `n` at reset and written in place after, and the window
+//!   is a `TopK` made once and rewritten (G33: a list replaced inside the
+//!   session-long `Ed` is held to the session's end; at 0.2.34 there is no
+//!   `List.reserve`/`reset`, so the lists grow once and are reused).
+//!
+//! The port's shapes. C's `FilterCand.len` is the label's `strlen`, taken
+//! once at reset so the loop never measures; a `str` knows its length, so
+//! the port reads `label.len` (no NUL ends a label). C's `g_scored` test
+//! hook (`filter.c:15-25`) is the state's own `scored` count — every test
+//! reads it after resetting it on the same state. C's `FzRanked out[]` is
+//! the caller's `TopK`; `filter_top` (the tests' form) copies one out as
+//! `ws.FzRanked` rows. C writes a candidate's positions as it is inserted
+//! into the window and shifts them with it; the port computes them once
+//! for the final occupants — the same rows, the same positions, since a
+//! candidate's positions depend on it and the pattern alone.
+
+use ws
+
+/// `YEW_FILTER_PAT_MAX` (`filter.h:37-42`): a pattern keeps 255 bytes.
+pub const FILTER_PAT_MAX: int = 256
+
+/// `YEW_FILTER_TOPK` (`filter.h:37-42`): the visible window.
+pub const FILTER_TOPK: int = 32
+
+const I32_MAX: int = 2147483647
+
+/// A picker row (`PickItem`, `picker.h:88-97`): the label ranked and
+/// drawn, the dim detail column (`has_detail` false is C's NULL), the
+/// payload — IDENTITY, never a row index (the s23 law) — and the flags.
+pub struct PickItem {
+    label: str,
+    detail: str,
+    has_detail: bool,
+    payload: int,
+    flags: int,
+}
+
+/// A row with no detail.
+pub fn pick_item(label: str, payload: int, flags: int) -> PickItem {
+    PickItem { label: label, detail: "", has_detail: false, payload: payload, flags: flags }
+}
+
+/// `FilterState` (`filter.h:53-90`).
+pub struct FilterState {
+    cand: List[int],
+    score: List[int],
+    n_cand: int,
+    pat: List[byte],
+    plen: int,
+    src_gen: int,
+    scan_at: int,
+    n_total: int,
+    scanning: bool,
+    narrow_read: int,
+    narrow_end: int,
+    narrowing: bool,
+    /// C's `g_scored` (`filter.c:15-25`): candidates scored.
+    scored: int,
+}
+
+/// The visible window (C's `FzRanked out[max]`): `n` rows, each its item
+/// index, its key and `npos[j]` positions at `pos[j * FZ_MAX_POS..]`.
+pub struct TopK {
+    idx: List[int],
+    score: List[int],
+    npos: List[int],
+    pos: List[int],
+    n: int,
+}
+
+/// A window of `FILTER_TOPK` rows, made once.
+pub fn topk_new() -> TopK {
+    var t = TopK {
+        idx: List[int](),
+        score: List[int](),
+        npos: List[int](),
+        pos: List[int](),
+        n: 0,
+    }
+    var i = 0
+    while i < FILTER_TOPK {
+        (mut t.idx).push(0)
+        (mut t.score).push(0)
+        (mut t.npos).push(0)
+        i += 1
+    }
+    i = 0
+    while i < FILTER_TOPK * ws.FZ_MAX_POS {
+        (mut t.pos).push(0)
+        i += 1
+    }
+    t
+}
+
+/// `yew_filter_init` (`filter.c:36-40`): an empty filter.
+pub fn filter_new() -> FilterState {
+    var f = FilterState {
+        cand: List[int](),
+        score: List[int](),
+        n_cand: 0,
+        pat: List[byte](),
+        plen: 0,
+        src_gen: 0,
+        scan_at: 0,
+        n_total: 0,
+        scanning: false,
+        narrow_read: 0,
+        narrow_end: 0,
+        narrowing: false,
+        scored: 0,
+    }
+    var i = 0
+    while i < FILTER_PAT_MAX {
+        (mut f.pat).push(0 as byte)
+        i += 1
+    }
+    f
+}
+
+// `reserve` (`filter.c:51-58`): grown once, never replaced.
+fn reserve(mut f: FilterState, n: int) {
+    while f.cand.len < n {
+        (mut f.cand).push(0)
+        (mut f.score).push(0)
+    }
+}
+
+/// `yew_filter_reset` (`filter.c:60-93`): `n` of `items`, the empty
+/// pattern matching all of them in source order; reserved here so no
+/// keystroke allocates.
+pub fn filter_reset(mut f: FilterState, items: List[PickItem], n: int, src_gen: int) {
+    reserve(mut f, n)
+    f.n_total = n
+    f.src_gen = src_gen
+    f.plen = 0
+    f.scan_at = 0
+    f.scanning = false
+    f.narrowing = false
+    f.narrow_read = 0
+    f.narrow_end = 0
+    f.n_cand = 0
+    var i = 0
+    while i < n && i < items.len {
+        f.cand[i] = i
+        f.score[i] = 1
+        i += 1
+    }
+    f.n_cand = i
+}
+
+// The basename of `text` for §2's rule: (offset, length), trailing
+// slashes ignored (`filter.c:111-122`).
+fn base_of(text: str) -> (int, int) {
+    var end = text.len
+    while end > 0 && text.bytes()[end - 1] as int == 47 {
+        end -= 1
+    }
+    var start = end
+    while start > 0 && text.bytes()[start - 1] as int != 47 {
+        start -= 1
+    }
+    (start, end - start)
+}
+
+// `score_one` (`filter.c:99-143`): §2's two-pass basename rule without
+// the sort — a basename hit at prefix strength or better outranks every
+// fuzzy path match, checked BEFORE the path is scored.
+fn score_one(mut f: FilterState, items: List[PickItem], idx: int, path_mode: bool) -> int {
+    f.scored += 1
+    let text = items[idx].label
+    var boff = 0
+    var blen = text.len
+    if path_mode {
+        let (o, l) = base_of(text)
+        boff = o
+        blen = l
+    }
+    let sb = ws.fz_score(f.pat, 0, f.plen, text.bytes(), boff, boff + blen)
+    if sb >= 5000 {
+        return if sb > I32_MAX - ws.FZ_BASENAME_TIER then I32_MAX else sb + ws.FZ_BASENAME_TIER
+    }
+    var sp = ws.FZ_NO_MATCH
+    if path_mode {
+        sp = ws.fz_score(f.pat, 0, f.plen, text.bytes(), 0, text.len)
+    }
+    if sb == ws.FZ_NO_MATCH && sp == ws.FZ_NO_MATCH {
+        return ws.FZ_NO_MATCH
+    }
+    if sb != ws.FZ_NO_MATCH && sb >= sp {
+        return sb
+    }
+    sp
+}
+
+fn now_us() -> int {
+    os_clock_ns() / 1000
+}
+
+// `narrow_step` (`filter.c:153-176`): the current set rescored in place,
+// the clock read every 256 candidates. True while more remains.
+fn narrow_step(mut f: FilterState, items: List[PickItem], path_mode: bool, budget_us: int) -> bool {
+    let started = if budget_us > 0 then now_us() else 0
+    var checked = 0
+    while f.narrow_read < f.narrow_end {
+        let idx = f.cand[f.narrow_read]
+        let s = score_one(mut f, items, idx, path_mode)
+        if s != ws.FZ_NO_MATCH {
+            f.cand[f.n_cand] = idx
+            f.score[f.n_cand] = s
+            f.n_cand += 1
+        }
+        f.narrow_read += 1
+        checked += 1
+        if budget_us > 0 && checked & 255 == 0 && now_us() - started >= budget_us {
+            return true
+        }
+    }
+    f.narrowing = false
+    false
+}
+
+// `extends` (`filter.c:179-186`): `pat` has the current pattern as a
+// STRICT prefix.
+fn extends(f: FilterState, pat: List[byte], plen: int) -> bool {
+    if plen <= f.plen {
+        return false
+    }
+    var i = 0
+    while i < f.plen {
+        if f.pat[i] as int != pat[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_filter_apply` (`filter.c:188-239`): `pat[0..plen]` over `n` of
+/// `items`. True when the result is COMPLETE; false while a sliced pass
+/// runs on (`filter_step`, ` scanning…`). `budget_us` 0 runs to
+/// completion. A changed item count resets first: nothing the old set
+/// knew is still true.
+pub fn filter_apply(
+    mut f: FilterState,
+    items: List[PickItem],
+    n: int,
+    path_mode: bool,
+    pat: List[byte],
+    plen_in: int,
+    budget_us: int,
+) -> bool {
+    var plen = if plen_in > pat.len then pat.len else plen_in
+    if plen > FILTER_PAT_MAX - 1 {
+        plen = FILTER_PAT_MAX - 1
+    }
+    var can_narrow = false
+    if n != f.n_total {
+        let gen = f.src_gen
+        filter_reset(mut f, items, n, gen)
+        can_narrow = plen == 0
+    } else {
+        can_narrow = !f.scanning && !f.narrowing && extends(f, pat, plen)
+    }
+    var i = 0
+    while i < plen {
+        f.pat[i] = pat[i]
+        i += 1
+    }
+    f.plen = plen
+    if can_narrow {
+        // THE fast path, and exact.
+        f.narrow_read = 0
+        f.narrow_end = f.n_cand
+        f.n_cand = 0
+        f.narrowing = true
+        f.scanning = false
+        f.scan_at = f.n_total
+        return !narrow_step(mut f, items, path_mode, budget_us)
+    }
+    // Backspace or a mid-line edit: a full rescan, sliced on a budget.
+    f.n_cand = 0
+    f.scan_at = 0
+    f.scanning = true
+    f.narrowing = false
+    !filter_step(mut f, items, path_mode, budget_us)
+}
+
+/// `yew_filter_step` (`filter.c:241-283`): continues a sliced pass — a
+/// narrow resumes here too — the clock read every 256 candidates. False
+/// when it is finished.
+pub fn filter_step(mut f: FilterState, items: List[PickItem], path_mode: bool, budget_us: int) -> bool {
+    if f.narrowing {
+        return narrow_step(mut f, items, path_mode, budget_us)
+    }
+    if !f.scanning {
+        return false
+    }
+    let started = if budget_us > 0 then now_us() else 0
+    var checked = 0
+    while f.scan_at < f.n_total {
+        let idx = f.scan_at
+        let s = score_one(mut f, items, idx, path_mode)
+        f.scan_at += 1
+        if s != ws.FZ_NO_MATCH {
+            f.cand[f.n_cand] = idx
+            f.score[f.n_cand] = s
+            f.n_cand += 1
+        }
+        checked += 1
+        if budget_us > 0 && checked & 255 == 0 && now_us() - started >= budget_us {
+            return true
+        }
+    }
+    f.scanning = false
+    false
+}
+
+/// `yew_filter_matched` (`filter.c:285-288`): matches so far, meaningful
+/// mid-scan.
+pub fn filter_matched(f: FilterState) -> int {
+    f.n_cand
+}
+
+// `strcmp(a, b) < 0` over two labels.
+fn label_less(a: str, b: str) -> bool {
+    var i = 0
+    while i < a.len && i < b.len {
+        let x = a.bytes()[i] as int
+        let y = b.bytes()[i] as int
+        if x != y {
+            return x < y
+        }
+        i += 1
+    }
+    a.len < b.len
+}
+
+/// `yew_filter_top` (`filter.c:296-398`) into a held window: at most
+/// `max` rows (and the window's own size), answering how many — bounded
+/// insertion, one pass, no allocation. Ties break by shorter text, then
+/// bytes (`fz_rank`'s order); the EMPTY pattern keeps source order. The
+/// positions are the basename's when it scored at prefix strength or the
+/// list is not paths, else the whole path's (`filter.c:381-392`) —
+/// C's choice, kept even where the key itself was the basename's.
+pub fn filter_top_into(f: FilterState, items: List[PickItem], path_mode: bool, mut t: TopK, max_in: int) -> int {
+    let max = if max_in > t.idx.len then t.idx.len else max_in
+    if max <= 0 {
+        t.n = 0
+        return 0
+    }
+    var held = 0
+    var i = 0
+    while i < f.n_cand {
+        let s = f.score[i]
+        let ci = f.cand[i]
+        var at = held
+        while at > 0 {
+            let prev = t.idx[at - 1]
+            var better = false
+            if t.score[at - 1] != s {
+                better = s > t.score[at - 1]
+            } else if f.plen == 0 {
+                // THE EMPTY PATTERN PRESERVES SOURCE ORDER.
+                better = false
+            } else {
+                let pl = items[prev].label.len
+                let ml = items[ci].label.len
+                if pl != ml {
+                    better = ml < pl
+                } else {
+                    better = label_less(items[ci].label, items[prev].label)
+                }
+            }
+            if !better {
+                break
+            }
+            at -= 1
+        }
+        if at >= max {
+            i += 1
+            continue
+        }
+        var k = if held < max then held else max - 1
+        while k > at {
+            t.idx[k] = t.idx[k - 1]
+            t.score[k] = t.score[k - 1]
+            k -= 1
+        }
+        t.idx[at] = ci
+        t.score[at] = s
+        if held < max {
+            held += 1
+        }
+        i += 1
+    }
+    // Positions for what is DRAWN only.
+    var j = 0
+    while j < held {
+        let text = items[t.idx[j]].label
+        var boff = 0
+        var blen = text.len
+        if path_mode {
+            let (o, l) = base_of(text)
+            boff = o
+            blen = l
+        }
+        let base_at = j * ws.FZ_MAX_POS
+        let (sb, nb) = ws.fz_score_into(f.pat, 0, f.plen, text.bytes(), boff, boff + blen, mut t.pos, base_at)
+        if sb >= 5000 || !path_mode {
+            var q = 0
+            while q < nb {
+                t.pos[base_at + q] = (t.pos[base_at + q] + boff) & 65535
+                q += 1
+            }
+            t.npos[j] = nb
+        } else {
+            let (_, np) = ws.fz_score_into(f.pat, 0, f.plen, text.bytes(), 0, text.len, mut t.pos, base_at)
+            t.npos[j] = np
+        }
+        j += 1
+    }
+    t.n = held
+    held
+}
+
+/// `yew_filter_top` as C's tests call it: the window copied out as
+/// `ws.FzRanked` rows.
+pub fn filter_top(f: FilterState, items: List[PickItem], path_mode: bool, max: int) -> List[ws.FzRanked] {
+    var t = topk_new()
+    let n = filter_top_into(f, items, path_mode, mut t, max)
+    var out = List[ws.FzRanked]()
+    var j = 0
+    while j < n {
+        var m = ws.fzmatch_none()
+        var q = 0
+        while q < t.npos[j] {
+            (mut m.pos).push(t.pos[j * ws.FZ_MAX_POS + q])
+            q += 1
+        }
+        (mut out).push(ws.FzRanked { idx: t.idx[j], score: t.score[j], m: m })
+        j += 1
+    }
+    out
+}
