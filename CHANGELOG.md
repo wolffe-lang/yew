@@ -5,6 +5,39 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw06 — workspace, finder and mouse (2026-10-23)
+
+- yw05-tail first (PR #46); the pin kept at wolf 0.2.34 / lupin 0.1.55 /
+  wolf-std `e036bec` (0.2.35 tagged after the pin commit: yw07's bump).
+  The oracle tools run C yew with fresh scratch homes (yew#11,
+  `tools/lib-test-env.sh`, `tools/check-test-env`) and a perf harness that
+  does not compile is a hard step (yew#44).
+- Workspace identity and the session state (s25): the workspace key, `:`
+  history scoped by it, the frozen v1 schema over the hand codec
+  (`ws.state_lit` and `fl_emit`/`fl_parse`, bytes throughout, R-yw06-1),
+  restore, the commands, recovery and the debounced atomic save; the
+  corpus 22/4/20, the C↔port differential byte-identical both ways;
+  `fuzz_state` equal to C's driver at 100,000 cases × 4 seeds; G20's
+  closure twin routed around by two local sorts until 0.2.35.
+- The startup plan (s56.5 §1, §6): resume, files, `--workspace`, a
+  directory launch, restore before the files.
+- The finder (s26): the walk (an explicit stack, C's measured
+  `.gitignore` disk quirks, R-yw06-10), the matcher, the incremental
+  filter with its bounded top-k and sliced rescan, the one picker and
+  its file, buffer, undo-branch and command instances, type-to-jump;
+  `fuzz_gitignore` equal to C's; `perf_finder` within 1.35× C.
+- The mouse (s27, s57.13–s57.15, s57.22): one router at the pin's state,
+  the context menus and their rows, drag with its previews, the strip's
+  scroll and drag-to-spawn; `fuzz_mouse` equal to C's at 400,000 events.
+- `:!yew FILE` inside yew (s57.11); s57.12's goldens gated.
+- The gates: the 81 reachable campaign-05 goldens by name, M-YW5's
+  trials (`tools/run-trials`: twenty resume cycles, the restore after
+  SIGKILL, SIGSEGV and a closed terminal, the state differential both
+  ways), the checked machine one case at a time as a CI job
+  (`tools/check-test-cases`), the walk's listings against C's
+  (`tools/check-walk-listings`); the fuzzy fuzzer's staging fixed for
+  `ws`'s new imports; yw07's contract drafted.
+
 ### yw05 — panes, tabs and groups, and the 0.2.34 bump (2026-10-22)
 
 - The toolchain to wolf 0.2.34 / lupin 0.1.55 / wolf-std `e036bec`, every
