@@ -16,8 +16,10 @@
   L4  the wiring of .github/workflows/ci.yml: `legs` is the first job and
       runs this file before ci/legs.py; `port` and `oracle` need it and
       take their hosts from it, read with a default, with no host list of
-      their own; the outputs are declared; the trunk push, the pull
-      request, the nightly and the dispatch are there; cancel-in-progress
+      their own; `checked-cases` (yw06: the checked machine one case at a
+      time) needs it too and runs on one ubuntu host, the checked machine
+      being the same on every host; the outputs are declared; the trunk
+      push, the pull request, the nightly and the dispatch are there; cancel-in-progress
       is for pull requests only and every other run has a group of its own
       run id; a red nightly, and only a red nightly, runs
       ci/nightly-red.sh with issues: write.
@@ -106,7 +108,7 @@ say(night == BEFORE, "L3 the nightly runs exactly the legs every push ran before
 # --- L4 the wiring -----------------------------------------------------------------
 wf = open(WORKFLOW, encoding="utf-8").read()
 JOBS = re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", wf[wf.index("\njobs:\n"):], re.M)
-say(JOBS == ["legs", "port", "oracle", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
+say(JOBS == ["legs", "port", "checked-cases", "oracle", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
 blocks = {}
 for j in JOBS:
     m = re.search(r"^  %s:\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)" % re.escape(j), wf, re.M | re.S)
@@ -122,6 +124,10 @@ for j in ("port", "oracle"):
     say("    needs: legs\n" in b and ("        include: ${{ fromJSON(needs.legs.outputs.matrix_%s || '[]') }}\n" % j) in b
         and "    runs-on: ${{ matrix.os }}\n" in b and not re.search(r"^          - os: ", b, re.M),
         "L4 %s needs the legs and takes its hosts from them, with a default, and no host list of its own" % j)
+cc = blocks["checked-cases"]
+say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-latest$", cc, re.M) is not None
+    and "matrix" not in cc and "run: python3 -I tools/check-test-cases\n" in cc,
+    "L4 checked-cases needs the legs and runs tools/check-test-cases on one ubuntu host")
 say(re.search(r"^  push:\n    branches: \[trunk\]\n", wf, re.M) is not None and re.search(r"^  pull_request:\s*$", wf, re.M) is not None
     and re.search(r"^  schedule:\n(\s+#.*\n)*\s+- cron: ", wf, re.M) is not None and re.search(r"^  workflow_dispatch:\s*$", wf, re.M) is not None,
     "L4 the trunk push, the pull request, the nightly and the dispatch are there")
@@ -131,7 +137,7 @@ g = g.group(1).rstrip() if g else ""
 say(g.endswith("|| format('ci-{0}-{1}', github.event_name, github.run_id) }}") and "github.head_ref" in g,
     "L4 a pull request's runs share its branch's group; every other run has a group of its own run id")
 n = blocks["nightly-red"]
-say("    needs: [legs, port, oracle]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
+say("    needs: [legs, port, checked-cases, oracle]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
     and "      issues: write\n" in n and "        run: ci/nightly-red.sh\n" in n and "WORKFLOW: ${{ github.workflow }}" in n,
     "L4 a red nightly, and only a red nightly, runs ci/nightly-red.sh with issues: write")
 
