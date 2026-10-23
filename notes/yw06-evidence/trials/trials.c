@@ -24,6 +24,14 @@
  *                           a fatal path saves nothing (s25 §5), so what
  *                           comes back is the last save, whole
  *
+ *   trial_cross_differential  the arrangement built and saved by THIS
+ *                           binary (the runner's --yew) and resumed by the
+ *                           OTHER (YEW_TRIAL_OTHER: C for the port, the
+ *                           port for C) — the other's grid the first's,
+ *                           exactly, and the two saved state.fl documents
+ *                           byte-identical but for `saved_at` (s25's
+ *                           C<->port differential, both ways)
+ *
  * Signals go only to the editor this runner spawned, inside the lane's
  * container (RULES §5). Build and run: run-trials.sh.
  */
@@ -110,6 +118,117 @@ static void case_trial_restore_hangup(PtyCtx *c)
     trial_kill(c, SIGHUP);
 }
 
+/* The one state.fl under XDG_STATE_HOME (the case's state dir). */
+static bool trial_state_read(PtyCtx *c, Bytebuf *out)
+{
+    char dir[PATH_MAX];
+    char path[PATH_MAX + 64];
+    DIR *d;
+    struct dirent *e;
+    FILE *f;
+    u8 chunk[4096];
+    size_t got;
+    bool found = false;
+
+    out->len = 0U;
+    (void)snprintf(dir, sizeof(dir), "%s/yew/workspaces", c->state_dir);
+    d = opendir(dir);
+    if (d == NULL)
+        return false;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        (void)snprintf(path, sizeof(path), "%s/%s/state.fl", dir, e->d_name);
+        found = true;
+        break;
+    }
+    (void)closedir(d);
+    if (!found)
+        return false;
+    f = fopen(path, "rb");
+    if (f == NULL)
+        return false;
+    while ((got = fread(chunk, 1U, sizeof(chunk), f)) > 0U)
+        bytebuf_append(out, chunk, got);
+    (void)fclose(f);
+    return out->len != 0U;
+}
+
+/* `saved_at` is the one field a save stamps (compare_live.py's rule). */
+static void trial_normalize(Bytebuf *b)
+{
+    Bytebuf o;
+    size_t i = 0U;
+
+    bytebuf_init(&o);
+    while (i < b->len) {
+        size_t e = i;
+
+        while (e < b->len && b->data[e] != '\n')
+            e++;
+        if (e < b->len)
+            e++;
+        if (!(e - i > 13U && memcmp(b->data + i, "    saved_at:", 13U) == 0))
+            bytebuf_append(&o, b->data + i, e - i);
+        i = e;
+    }
+    b->len = 0U;
+    bytebuf_append(b, o.data, o.len);
+    bytebuf_free(&o);
+}
+
+static void case_trial_cross_differential(PtyCtx *c)
+{
+    const char *other = getenv("YEW_TRIAL_OTHER");
+    Bytebuf first;
+    Bytebuf second;
+
+    if (other == NULL || other[0] == '\0') {
+        ptc_check(c, false, "YEW_TRIAL_OTHER names no second editor");
+        return;
+    }
+    bytebuf_init(&first);
+    bytebuf_init(&second);
+    s25_fixture_make();
+    s25_spawn_bare(c);
+    s25_build_session(c);
+    if (c->failed)
+        goto done;
+    ptc_mark_resume(c);
+    force_quit(c);
+    ptc_cleanup(c);
+    if (!trial_state_read(c, &first)) {
+        ptc_check(c, false, "the first editor left no state.fl");
+        goto done;
+    }
+    ptc_resume(c, other, NULL);
+    ptc_settle(c, 0);
+    ptc_wait_kitty_push(c, 21U);
+    ptc_check_resume_exact(c);
+    ptc_snapshot(c, "s25_resume_exact");
+    force_quit(c);
+    ptc_cleanup(c);
+    if (!trial_state_read(c, &second)) {
+        ptc_check(c, false, "the second editor left no state.fl");
+        goto done;
+    }
+    trial_normalize(&first);
+    trial_normalize(&second);
+    if (first.len != second.len ||
+        memcmp(first.data, second.data, first.len) != 0) {
+        ptc_check(c, false, "the two editors' state.fl differ beyond saved_at");
+        (void)fwrite(first.data, 1U, first.len, stderr);
+        (void)fwrite(second.data, 1U, second.len, stderr);
+    } else {
+        (void)fprintf(stderr, "trial: state.fl byte-identical but saved_at (%zu bytes)\n",
+                      (size_t)first.len);
+    }
+done:
+    bytebuf_free(&first);
+    bytebuf_free(&second);
+    s25_fixture_remove();
+}
+
 /* registry.c #undefs its C() macro at its end, so the rows are spelled
  * out: {name, profile, rows, cols, fn, xfail_id}. */
 const PtyCase yew_pty_cases[] = {
@@ -117,5 +236,6 @@ const PtyCase yew_pty_cases[] = {
     {"trial_restore_sigkill", "modern", 24U, 80U, case_trial_restore_sigkill, NULL},
     {"trial_restore_sigsegv", "modern", 24U, 80U, case_trial_restore_sigsegv, NULL},
     {"trial_restore_hangup", "modern", 24U, 80U, case_trial_restore_hangup, NULL},
+    {"trial_cross_differential", "modern", 24U, 80U, case_trial_cross_differential, NULL},
     {NULL, NULL, 0U, 0U, NULL, NULL}
 };

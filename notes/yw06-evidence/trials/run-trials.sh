@@ -16,8 +16,12 @@ ld_line=$(make -n -B CC=gcc BUILD=build-gcc build-gcc/pty_runner | grep -E -- '-
 cp "$root/notes/yw06-evidence/trials/trials.c" build-gcc/trials.c
 eval "$(echo "$cc_line" | sed 's#-o build-gcc/tests/pty/registry.o#-o build-gcc/trials.o#; s#tests/pty/registry.c#build-gcc/trials.c#; s# -MMD -MP##')" -Itests/pty
 eval "$(echo "$ld_line" | sed 's#build-gcc/tests/pty/registry.o#build-gcc/trials.o#; s#-o build-gcc/pty_runner#-o build-gcc/trials_runner#')"
-for bin in "$tree/build-gcc/yew" "$port"; do
-    echo "== trials over $bin ($(sha256sum "$bin" | cut -c1-12))"
+c_yew=$tree/build-gcc/yew
+for bin in "$c_yew" "$port"; do
+    other=$port
+    [ "$bin" = "$port" ] && other=$c_yew
+    export YEW_TRIAL_OTHER=$other
+    echo "== trials over $bin ($(sha256sum "$bin" | cut -c1-12)), the other $other"
     ulimit -c 0
     set +e
     YEW_PTY_BUDGET_MS=1350000 YEW_PTY_CASE_BUDGET_MS=300000 \
