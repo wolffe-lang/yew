@@ -87,7 +87,7 @@ The prediction is `notes/yw06-evidence/prediction.txt`, committed at
 | the walk's determinism and the narrowing equivalence (10,000 appends against a full rescan) | **HIT** (`test_walk`, `test_narrow`; the narrow cases alone past the checked budget pass natively) |
 | `fuzz_state`, `fuzz_gitignore` and `fuzz_mouse` hold their invariants | **HIT**, each report line equal to C's driver's |
 | every 2× gate within 2× of C, `workspace50` read beside the highlighting caveat | **MISS on three router rows**: the motion burst 6.68×, the menu hover 2.01×, the chevron hover 2.06× (G45, §4.5); `perf_finder`'s open was 2.08–2.45× until `66fcb40` and `3829bb6` (now 1.35×); HIT on `perf_state` (0.59/0.96/1.13), `workspace50` (1.68), `mem.workspace50` (1.87, inside the 40 MB budget) and `perf_finder`'s four |
-| the static binary builds, is ET_EXEC with no interpreter, runs `--version` | <<STATICHIT>> |
+| the static binary builds, is ET_EXEC with no interpreter, runs `--version` | **HIT** (§4.7) |
 | if 0.2.35 lands, yew#17, #20, #22, #23, #24 and #27 retire | **not reached**: 0.2.35 tagged 2 h 44 min after the pin commit; yw07's |
 | every run container-isolated, 8–11, `core=0`, a memory cap; shared with r40 | **HIT**; 8–11 was shared with r40, then with this lane's own forks and jobs |
 | yew#45's job-stream stall counted, not silently repaired | not exercised by this lane's runs |
@@ -412,7 +412,23 @@ s57.12 needed no code (yw03's and yw04's commands, on yw05's bump).
 
 ### 4.7 The static binary (deliverable 7)
 
-<<STATIC>>
+`tools/build --static` in kasumi's `localhost/px13-ubuntu` (image
+`ad8964505189`: Ubuntu 24.04.5, `libc6` 2.39-0ubuntu8.9; never kasumi's
+CachyOS glibc), from a fresh clone of `b8fc689` with the pin fetched by
+digest inside the container (`notes/yw06-evidence/continuation/static-b8fc689.log`):
+
+    Type:      EXEC (Executable file)        PT_INTERP: none
+    target/static/yew: ELF 64-bit LSB executable, x86-64, statically linked
+    yew --version: "yew 1.0.0-dev" / "modules: lsp ai fuss plugins"
+    sha256 ce8ee7aefaa7364ee08396a140a13ecb13ae4b59086c938540448cb7a433306e  (read twice)
+    bytes  20434568
+
+Everything after `b8fc689` is notes only (`git diff -w b8fc689 HEAD --
+src tools ci .github` is empty), so it is the final head's binary. The
+digest is handed back for pax's `user/yew.pin`, a pax lane's change
+(px58's pin is yew `77c1083`); the size, unstripped with its debug
+info, is yw15's row. A trial build at `5a49ba2` read the same shape
+(19,704,008 bytes).
 
 ### 4.8 The gates (deliverable 8, M-YW5)
 
@@ -509,10 +525,11 @@ closed unmerged:
   sessions' restore does not decide, so the 81 goldens and the trials
   stayed green; the event-count plant changed no input `fuzz_mouse`'s
   report hashes.
-- PR #51 (run 40027766393): the saved active tab left unrestored —
-  checked first on kasumi, `s25_resume_exact`: "grid differs after quit
-  and reopen" — in the 81 goldens and the trials; one mutation more in
-  `fuzz_mouse`'s comparison: <<PLANT3>>.
+- PR #51 (branch `yw06-plant-gates-3`, run 40027766393): the saved
+  active tab left unrestored, for the 81 goldens and the trials (checked
+  first on kasumi: `s25_resume_exact` "grid differs after quit and
+  reopen"), and one mutation more in `fuzz_mouse`'s comparison with C's
+  driver; dispatched, its reds to be read by the orchestrator.
 
 Real reds the plants and the gauntlet found on the way, each fixed:
 the fuzzy fuzzer's staging copy missing `util` (PR #48's port job,
