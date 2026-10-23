@@ -1,0 +1,428 @@
+//! ws.state_lit — pure frozen schema bridges; no editor or filesystem.
+//! sagitta 9ace98c2 src/ws/state_lit.c:64-303, state_parse.c:153-249,
+//! state_emit.c:206-394. Live identities and dirty/timer effects stay in edit.
+
+use util
+
+/// Schema version accepted by this reader.
+pub const STATE_VERSION: int = 1
+
+/// Per-tab/window/file limits, independent of syntax caps.
+pub const STATE_MAX_TABS: int = 512
+
+/// Maximum retained file records applied by the editor.
+pub const STATE_MAX_FILES: int = 256
+
+/// Maximum jump/change entries applied per ring.
+pub const STATE_MAX_JUMPS: int = 100
+
+/// Maximum cursors applied per window.
+pub const STATE_MAX_CURSORS: int = 1024
+
+/// Maximum pane-tree depth (root depth zero), independent of parse depth.
+pub const STATE_MAX_PANE_DEPTH: int = 8
+
+/// The port's text.CCOL_EOL representation (C UINT64_MAX).
+pub const STATE_GOAL_EOL: int = 9223372036854775807
+
+/// Group record retained by live group id.
+pub const STATE_REC_GROUP: int = 0
+
+/// Tab record retained by live tab id.
+pub const STATE_REC_TAB: int = 1
+
+/// Pane record retained by tab id and generated token.
+pub const STATE_REC_PANE: int = 2
+
+/// Window record retained by live window id.
+pub const STATE_REC_WIN: int = 3
+
+/// Cursor record retained by window id and cursor stamp.
+pub const STATE_REC_CURSOR: int = 4
+
+/// View record retained by window id, entity zero.
+pub const STATE_REC_VIEW: int = 5
+
+/// Jump ring retained by window id, entity zero.
+pub const STATE_REC_JUMPS: int = 6
+
+/// Jump entry retained by window id and generated token.
+pub const STATE_REC_JUMP_ENTRY: int = 7
+
+/// File record retained by live buffer id.
+pub const STATE_REC_FILE: int = 8
+
+/// Mark record retained by buffer id and name byte.
+pub const STATE_REC_MARK: int = 9
+
+/// Change ring retained by buffer id, entity zero.
+pub const STATE_REC_CHANGES: int = 10
+
+/// Change entry retained by buffer id and generated token.
+pub const STATE_REC_CHANGE_ENTRY: int = 11
+
+/// Undo reference retained by buffer id, entity zero.
+pub const STATE_REC_UNDO: int = 12
+
+/// One sorted mutable boolean override of an immutable retained option.
+pub struct StateBoolOption {
+    key: List[byte],
+    value: bool,
+}
+
+/// Sparse association of unknown literal fields with a live entity.
+pub struct StateRecord {
+    kind: int,
+    owner: int,
+    entity: int,
+    node: int,
+}
+
+/// Owns the retained document. Editor entities store only live ids/tokens.
+pub struct StateLiterals {
+    doc: FlDoc,
+    workspace: int,
+    options: int,
+    bool_options: List[StateBoolOption],
+    records: List[StateRecord],
+    next_token: int,
+}
+
+/// An empty retained store, suitable for a stateless editor.
+pub fn state_literals() -> StateLiterals {
+    StateLiterals {
+        doc: fl_doc(),
+        workspace: -1,
+        options: -1,
+        bool_options: List[StateBoolOption](),
+        records: List[StateRecord](),
+        next_token: 1,
+    }
+}
+
+/// Checks only root-map and integer version 1. Syntax has already been checked.
+pub fn state_validate_v1(doc: FlDoc) -> bool {
+    if doc.root < 0 || doc.root >= doc.nodes.len || doc.nodes[doc.root].kind != FL_MAP {
+        return false
+    }
+    let version = fl_get(doc, doc.root, "version".bytes()) else -1
+    fl_int_or(doc, version, 0) == STATE_VERSION
+}
+
+/// Owns a validated document; invalid marks wrong root/version. Caller clears
+/// tokens on live entities before replacing its previous retained store.
+pub fn state_literals_from(take doc: FlDoc) -> StateLiterals ! {invalid} {
+    if !state_validate_v1(doc) { return invalid }
+    let workspace = fl_get(doc, doc.root, "workspace".bytes()) else -1
+    let options = fl_get(doc, doc.root, "options".bytes()) else -1
+    StateLiterals {
+        doc: doc,
+        workspace: workspace,
+        options: options,
+        bool_options: List[StateBoolOption](),
+        records: List[StateRecord](),
+        next_token: 1,
+    }
+}
+
+fn state_key_cmp(a: List[byte], b: List[byte]) -> int {
+    var i = 0
+    while i < a.len && i < b.len {
+        if a[i] < b[i] { return -1 }
+        if a[i] > b[i] { return 1 }
+        i += 1
+    }
+    if a.len < b.len then -1 else if a.len > b.len then 1 else 0
+}
+
+fn state_bool_at(s: StateLiterals, key: List[byte]) -> int {
+    var lo = 0
+    var hi = s.bool_options.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if state_key_cmp(s.bool_options[mid].key, key) < 0 { lo = mid + 1 } else { hi = mid }
+    }
+    lo
+}
+
+/// Effective bool: mutable override first, then retained bool, then default.
+pub fn state_option_bool(s: StateLiterals, key: List[byte], dflt: bool) -> bool {
+    let at = state_bool_at(s, key)
+    if at < s.bool_options.len && state_key_cmp(s.bool_options[at].key, key) == 0 {
+        return s.bool_options[at].value
+    }
+    let node = fl_get(s.doc, s.options, key) else -1
+    fl_bool_or(s.doc, node, dflt)
+}
+
+/// Retained nonempty string span; none when absent, wrong typed or overridden.
+pub fn state_option_string_span(s: StateLiterals, key: List[byte]) -> FlSpan ! {none} {
+    let at = state_bool_at(s, key)
+    if at < s.bool_options.len && state_key_cmp(s.bool_options[at].key, key) == 0 { return none }
+    let node = fl_get(s.doc, s.options, key)?
+    let span = fl_string_span(s.doc, node)?
+    if span.len == 0 { return none }
+    span
+}
+
+/// Returns true only on effective change. Empty/oversize keys return false.
+/// Caller invokes mark_dirty only when true; this module owns no timer.
+pub fn state_option_bool_set(mut s: StateLiterals, key: List[byte], value: bool) -> bool {
+    if key.len == 0 || key.len > FL_MAX_STRING { return false }
+    let at = state_bool_at(s, key)
+    if at < s.bool_options.len && state_key_cmp(s.bool_options[at].key, key) == 0 {
+        if s.bool_options[at].value == value { return false }
+        s.bool_options[at].value = value
+        return true
+    }
+    let retained = fl_get(s.doc, s.options, key) else -1
+    if retained >= 0 &&
+        s.doc.nodes[retained].kind == FL_BOOL &&
+        fl_bool_or(s.doc, retained, !value) == value {
+        return false
+    }
+    var owned = List[byte]()
+    for b in key { (mut owned).push(b) }
+    (mut s.bool_options).push(StateBoolOption { key: owned, value: value })
+    var i = s.bool_options.len - 1
+    while i > at {
+        let prior = copy s.bool_options[i - 1]
+        s.bool_options[i - 1] = copy s.bool_options[i]
+        s.bool_options[i] = prior
+        i -= 1
+    }
+    true
+}
+
+/// Emits options at the current map level: retained order first, overrides in
+/// place, new booleans appended in sorted byte-key order. Unknown values survive.
+pub fn state_emit_options(mut e: FlEmit, s: StateLiterals) {
+    fl_map_open(mut e, true, "options".bytes())
+    if s.options >= 0 && s.doc.nodes[s.options].kind == FL_MAP {
+        var i = 0
+        while i < s.doc.nodes[s.options].items.len {
+            let span = copy s.doc.nodes[s.options].keys[i]
+            var found = -1
+            var k = 0
+            while k < s.bool_options.len {
+                if fl_span_equal(s.doc.bytes, span, s.bool_options[k].key, FlSpan { at: 0, len: s.bool_options[k].key.len }) { found = k; break }
+                k += 1
+            }
+            if found >= 0 {
+                fl_bool(mut e, true, s.bool_options[found].key, s.bool_options[found].value)
+            } else {
+                fl_emit_retained_entry(mut e, s.doc, s.options, i)
+            }
+            i += 1
+        }
+    }
+    var i = 0
+    while i < s.bool_options.len {
+        let retained = fl_get(s.doc, s.options, s.bool_options[i].key) else -1
+        if retained < 0 { fl_bool(mut e, true, s.bool_options[i].key, s.bool_options[i].value) }
+        i += 1
+    }
+    fl_map_close(mut e)
+}
+
+/// Emits one retained map pair without converting or truncating its byte key.
+pub fn fl_emit_retained_entry(mut e: FlEmit, doc: FlDoc, map: int, index: int) {
+    fl_emit_lit_span(
+        mut e,
+        true,
+        doc.bytes,
+        doc.nodes[map].keys[index],
+        doc,
+        doc.nodes[map].items[index],
+    )
+}
+
+fn state_known_keys(kind: int) -> str {
+    match kind {
+        0 => "id|label|dir_path|last_active_member",
+        1 => "id|path|group|group_ordinal|deferred|focus|panes|wins",
+        2 => "win|split|ratio_permille|a|b",
+        3 => "cursors|primary|view|jumps",
+        4 => "pos|anchor|goal",
+        5 => "top|top_sub|left|wrap",
+        6 => "cur|entries",
+        7 => "path|line|col|stamp",
+        8 => "path|marks|changes|undo",
+        9 => "name|pos|line|col|bias",
+        10 => "cur|entries",
+        11 => "path|line|col|stamp",
+        12 => "file|version",
+        _ => "",
+    }
+}
+
+/// Tests frozen known spellings (including the legacy mark line/col/bias keys).
+pub fn state_record_key_known(kind: int, key: List[byte]) -> bool {
+    for word in state_known_keys(kind).split("|") {
+        if word.len > 0 && fl_span_equal(key, FlSpan { at: 0, len: key.len }, word.bytes(), FlSpan { at: 0, len: word.len }) { return true }
+    }
+    false
+}
+
+fn state_known_span(kind: int, doc: FlDoc, span: FlSpan) -> bool {
+    for word in state_known_keys(kind).split("|") {
+        if word.len > 0 && fl_span_equal(doc.bytes, span, word.bytes(), FlSpan { at: 0, len: word.len }) { return true }
+    }
+    false
+}
+
+fn state_has_unknown(s: StateLiterals, kind: int, node: int) -> bool {
+    if node < 0 || node >= s.doc.nodes.len || s.doc.nodes[node].kind != FL_MAP { return false }
+    for key in s.doc.nodes[node].keys {
+        if !state_known_span(kind, s.doc, key) { return true }
+    }
+    false
+}
+
+/// Records a live identity only if its literal has unknown fields.
+pub fn state_record_retain(mut s: StateLiterals, kind: int, owner: int, entity: int, node: int) {
+    if state_has_unknown(s, kind, node) {
+        (mut s.records).push(StateRecord { kind: kind, owner: owner, entity: entity, node: node })
+    }
+}
+
+/// Allocates a token only for records containing unknown fields; zero otherwise.
+pub fn state_record_retain_token(mut s: StateLiterals, kind: int, owner: int, node: int) -> int {
+    if !state_has_unknown(s, kind, node) { return 0 }
+    assert(s.next_token > 0 && s.next_token < 4294967295, "retained-record token overflow")
+    let token = s.next_token
+    s.next_token += 1
+    state_record_retain(mut s, kind, owner, token, node)
+    token
+}
+
+fn state_record_less(a: StateRecord, b: StateRecord) -> bool {
+    if a.kind != b.kind { return a.kind < b.kind }
+    if a.owner != b.owner { return a.owner < b.owner }
+    a.entity < b.entity
+}
+
+/// Stable identity order and last-wins deduplication, matching applied records.
+pub fn state_records_finish(mut s: StateLiterals) {
+    util.sort_stable(mut s.records, fn(a: StateRecord, b: StateRecord) state_record_less(a, b))
+    var at = 0
+    var n = 0
+    while at < s.records.len {
+        var last = at
+        while last + 1 < s.records.len && !state_record_less(s.records[last], s.records[last + 1]) {
+            last += 1
+        }
+        s.records[n] = copy s.records[last]
+        n += 1
+        at = last + 1
+    }
+    while s.records.len > n {
+        let _ = (mut s.records).pop() else StateRecord { kind: 0, owner: 0, entity: 0, node: 0 }
+    }
+}
+
+/// Finds a retained node after records_finish; none for an unknown identity.
+pub fn state_record_get(s: StateLiterals, kind: int, owner: int, entity: int) -> int ! {none} {
+    let key = StateRecord { kind: kind, owner: owner, entity: entity, node: 0 }
+    var lo = 0
+    var hi = s.records.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if state_record_less(s.records[mid], key) { lo = mid + 1 } else { hi = mid }
+    }
+    if lo < s.records.len && !state_record_less(key, s.records[lo]) { return s.records[lo].node }
+    none
+}
+
+/// Clears only record associations; caller clears live tokens first.
+pub fn state_records_reset(mut s: StateLiterals) {
+    while s.records.len > 0 {
+        let _ = (mut s.records).pop() else StateRecord { kind: 0, owner: 0, entity: 0, node: 0 }
+    }
+    s.next_token = 1
+}
+
+/// Appends the unknown fields of a retained entity after canonical live fields.
+pub fn state_emit_record_unknown(
+    mut e: FlEmit,
+    s: StateLiterals,
+    kind: int,
+    owner: int,
+    entity: int,
+) {
+    let node = state_record_get(s, kind, owner, entity) else { return }
+    var i = 0
+    while i < s.doc.nodes[node].items.len {
+        if !state_known_span(kind, s.doc, s.doc.nodes[node].keys[i]) {
+            fl_emit_retained_entry(mut e, s.doc, node, i)
+        }
+        i += 1
+    }
+}
+
+/// Appends unknown root/workspace keys. workspace=true selects workspace fields.
+pub fn state_emit_unknown(mut e: FlEmit, s: StateLiterals, workspace: bool) {
+    let node = if workspace then s.workspace else s.doc.root
+    if node < 0 || s.doc.nodes[node].kind != FL_MAP { return }
+    let known = if workspace {
+        "path|saved_at"
+    } else {
+        "version|writer|workspace|options|groups|tabs|active_tab|files"
+    }
+    var i = 0
+    while i < s.doc.nodes[node].items.len {
+        var found = false
+        for word in known.split("|") {
+            if fl_span_equal(s.doc.bytes, s.doc.nodes[node].keys[i], word.bytes(), FlSpan { at: 0, len: word.len }) { found = true; break }
+        }
+        if !found { fl_emit_retained_entry(mut e, s.doc, node, i) }
+        i += 1
+    }
+}
+
+/// File id/live id association; no relationship between the two number spaces.
+pub struct StateId {
+    file_id: int,
+    live_id: int,
+}
+
+/// Appends an association; file id zero (ungrouped) is ignored.
+pub fn state_idmap_put(mut ids: List[StateId], file_id: int, live_id: int) {
+    if file_id != 0 { (mut ids).push(StateId { file_id: file_id, live_id: live_id }) }
+}
+
+/// Returns mapped live id, or zero for absent/ungrouped; first duplicate wins.
+pub fn state_idmap_get(ids: List[StateId], file_id: int) -> int {
+    if file_id == 0 { return 0 }
+    for pair in ids { if pair.file_id == file_id { return pair.live_id } }
+    0
+}
+
+/// Clamps wire permille to 1..999 then performs C binary32 division by 1000.
+pub fn state_permille_to_ratio(permille: int) -> int {
+    let p = if permille < 1 then 1 else if permille > 999 then 999 else permille
+    util.f32_div_bits(p, 1000)
+}
+
+/// Rounds binary32 ratio bits through C's DOUBLE multiply/add, then clamps.
+/// The product mantissa*1000 fits 34 bits, so integer rounding is exact here.
+pub fn state_ratio_to_permille(bits: int) -> int {
+    if bits <= 0 || bits & 2147483648 != 0 { return 1 }
+    if bits >= 1065353216 { return 999 }
+    let exponent = bits >> 23 & 255
+    let shift = 150 - exponent
+    if shift >= 35 { return 1 }
+    let mantissa = bits & 8388607 | 8388608
+    let rounded = mantissa * 1000 + (1 << shift - 1) >> shift
+    if rounded < 1 then 1 else if rounded > 999 then 999 else rounded
+}
+
+/// Serializes the port's EOL sentinel as -1; ordinary goals remain cell columns.
+pub fn state_goal_to_i64(goal: int) -> int {
+    if goal < 0 || goal == STATE_GOAL_EOL then -1 else goal
+}
+
+/// Every negative wire goal denotes the port's EOL sentinel.
+pub fn state_goal_from_i64(goal: int) -> int {
+    if goal < 0 then STATE_GOAL_EOL else goal
+}
