@@ -1,0 +1,562 @@
+//! ws.walk — the workspace file walk.
+//!
+//! Ports sagitta `src/ws/walk.c` (561 lines) and `ws/walk.h` (123) at
+//! 9ace98c2, under `s26-fuzzy-finder.md` §3 and §4.1. BESPOKE
+//! (`walk.h:7-16`): an EXPLICIT STACK of directories, never recursion (a
+//! 400-deep tree is a stack hazard, G41); each directory's entries read
+//! WHOLE and sorted in byte order before descent (`walk.c:266-312`: the
+//! determinism step, readdir's order is the filesystem's); `.git` dropped
+//! before any ignore matching; dotfiles out unless `hidden`; the
+//! `(dev, ino)` set of every directory ENTERED kept unconditionally
+//! (`walk.c:52-139`) from the stat record's words 9-10 (v0.2.34
+//! `spec/11-os.md:3080-3105`), so `a/b -> ../a` terminates counted;
+//! `max_depth`, `max_entries` (flagged, never a silently short list; the
+//! finder says it once, `edit.pickers`); an ignored directory nothing
+//! could re-include PRUNED with one stat and no read (§4.1, DoD 5), else
+//! descended with its exclusion carried down (`WalkFrame.ignored`); the
+//! budget checked at every entry boundary (`walk.c:438-443`).
+//!
+//! The port's shapes. C's `WalkState *` is a `WalkState` value that OWNS
+//! its `FileList` (`out`, C's caller-held list) and its ignore sets (a
+//! `ws.Gi`, C's `gi_arena`); `walk_begin` answers (ok, state) where C
+//! answers NULL. C's test hooks are module statics (`walk.c:29-46`); here
+//! they are the state's own counters, `opendirs` and `statats`, which a
+//! test reads after the walk as C's reads after a reset (module state is
+//! E1010's, invariant 8). C's path buffer is `path`, a byte list grown
+//! and truncated in place. A directory read is `fs_read_dir_entries`
+//! (each entry its kind byte and its name's bytes; G39: one whole read,
+//! as C's own, so no slice falls inside a read). The stat is `fs_stat`
+//! when following links, else `fs_lstat` — C's `fstatat` with and without
+//! `AT_SYMLINK_NOFOLLOW` (`walk.c:455-456`). A name that is not UTF-8
+//! cannot be named to either (G40: fs paths are `str`): R-yw06-6 = A, it
+//! is sorted with the rest, skipped where C would stat it, and logged
+//! naming G40 — C lists it.
+
+use util
+
+/// `YEW_WALK_DEFAULT_DEPTH` (`walk.h:60-63`).
+pub const WALK_DEFAULT_DEPTH: int = 64
+
+/// `YEW_WALK_DEFAULT_ENTRIES` (`walk.h:60-63`).
+pub const WALK_DEFAULT_ENTRIES: int = 200000
+
+// `PATH_MAX` (`walk.c:177-180`).
+const WALK_PATH_MAX: int = 4096
+
+/// `WalkOpts` (`walk.h:42-58`): 0 depth and 0 entries are the defaults.
+pub struct WalkOpts {
+    follow_symlinks: bool,
+    hidden: bool,
+    use_gitignore: bool,
+    include_dirs: bool,
+    max_depth: int,
+    max_entries: int,
+}
+
+/// Every option off (`(WalkOpts){0}`, C's NULL options).
+pub fn walk_opts() -> WalkOpts {
+    WalkOpts {
+        follow_symlinks: false,
+        hidden: false,
+        use_gitignore: false,
+        include_dirs: false,
+        max_depth: 0,
+        max_entries: 0,
+    }
+}
+
+/// `FileList` (`walk.h:70-83`): workspace-RELATIVE paths, `is_dir`
+/// parallel to them, the counts, and `truncated` when `max_entries` was
+/// reached.
+pub struct FileList {
+    paths: List[str],
+    is_dir: List[bool],
+    n_dirs: int,
+    n_files: int,
+    n_ignored: int,
+    n_loops: int,
+    truncated: bool,
+}
+
+/// An empty list (`yew_filelist_init`).
+pub fn filelist_new() -> FileList {
+    FileList {
+        paths: List[str](),
+        is_dir: List[bool](),
+        n_dirs: 0,
+        n_files: 0,
+        n_ignored: 0,
+        n_loops: 0,
+        truncated: false,
+    }
+}
+
+// One directory descended into (`WalkFrame`, `walk.c:151-174`): its
+// entries still to visit, already sorted (each a kind byte and the
+// name's bytes), the path length to truncate back to, its depth, the
+// ignore set in scope HERE, and whether the directory was itself ignored
+// and descended for a negation.
+struct WalkFrame {
+    names: List[List[byte]],
+    at: int,
+    rel_len: int,
+    depth: int,
+    gi: int,
+    ignored: bool,
+}
+
+/// One walk (`struct WalkState`, `walk.c:176-195`) and its results.
+pub struct WalkState {
+    path: List[byte],
+    rel_base: int,
+    stack: List[WalkFrame],
+    seen_dev: List[int],
+    seen_ino: List[int],
+    seen_used: List[bool],
+    seen_len: int,
+    opts: WalkOpts,
+    gi: Gi,
+    done: bool,
+    out: FileList,
+    /// C's `g_opendirs` (`walk.c:29-35`): directory reads attempted.
+    opendirs: int,
+    /// C's `g_statats` (`walk.c:29-40`): stat calls made.
+    statats: int,
+}
+
+fn walk_empty(o: WalkOpts) -> WalkState {
+    WalkState {
+        path: List[byte](),
+        rel_base: 0,
+        stack: List[WalkFrame](),
+        seen_dev: List[int](),
+        seen_ino: List[int](),
+        seen_used: List[bool](),
+        seen_len: 0,
+        opts: o,
+        gi: gi_new(),
+        done: true,
+        out: filelist_new(),
+        opendirs: 0,
+        statats: 0,
+    }
+}
+
+// ---- the visited set ----------------------------------------------------
+
+// An `int` word as C's `u64` (words 9-10 are the host's unsigned words in
+// an int's 64 bits).
+fn as_u64(x: int) -> wrapping[u64] {
+    let lo = x & 4294967295
+    let hi = x >> 32 & 4294967295
+    hi as wrapping[u64] << 32 | lo as wrapping[u64]
+}
+
+// `seen_hash` (`walk.c:76-84`): mixed, not concatenated.
+fn seen_hash(dev: int, ino: int) -> wrapping[u64] {
+    let k: wrapping[u64] = 11400714819323198485
+    var h = as_u64(dev) * k
+    h = h ^ as_u64(ino) + k + (h << 6) + (h >> 2)
+    h
+}
+
+fn seen_init(mut w: WalkState) {
+    var i = 0
+    while i < 256 {
+        (mut w.seen_dev).push(0)
+        (mut w.seen_ino).push(0)
+        (mut w.seen_used).push(false)
+        i += 1
+    }
+    w.seen_len = 0
+}
+
+// The probe of `seen_add` (`walk.c:104-123`): true when present; inserts
+// it either way.
+fn seen_probe(mut w: WalkState, dev: int, ino: int) -> bool {
+    let cap = w.seen_used.len
+    let mask = cap - 1
+    var i = (seen_hash(dev, ino) & mask as wrapping[u64]) as int
+    while w.seen_used[i] {
+        if w.seen_dev[i] == dev && w.seen_ino[i] == ino {
+            return true
+        }
+        i = i + 1 & mask
+    }
+    w.seen_used[i] = true
+    w.seen_dev[i] = dev
+    w.seen_ino[i] = ino
+    w.seen_len += 1
+    false
+}
+
+// `seen_grow` (`walk.c:125-139`): twice the slots, every entry re-added.
+fn seen_grow(mut w: WalkState) {
+    let old_dev = copy w.seen_dev
+    let old_ino = copy w.seen_ino
+    let old_used = copy w.seen_used
+    let cap = old_used.len * 2
+    w.seen_dev = List[int]()
+    w.seen_ino = List[int]()
+    w.seen_used = List[bool]()
+    var i = 0
+    while i < cap {
+        (mut w.seen_dev).push(0)
+        (mut w.seen_ino).push(0)
+        (mut w.seen_used).push(false)
+        i += 1
+    }
+    w.seen_len = 0
+    i = 0
+    while i < old_used.len {
+        if old_used[i] {
+            let _ = seen_probe(mut w, old_dev[i], old_ino[i])
+        }
+        i += 1
+    }
+}
+
+// `seen_add` (`walk.c:104-123`): load held under 1/2.
+fn seen_add(mut w: WalkState, dev: int, ino: int) -> bool {
+    if (w.seen_len + 1) * 2 > w.seen_used.len {
+        seen_grow(mut w)
+    }
+    seen_probe(mut w, dev, ino)
+}
+
+// ---- reading a directory -----------------------------------------------
+
+// `name_cmp` (`walk.c:217-221`): `strcmp` of the names — byte order, never
+// a collation. An entry is its kind byte then its name.
+fn name_less(a: List[byte], b: List[byte]) -> bool {
+    var i = 1
+    while i < a.len && i < b.len {
+        if a[i] as int != b[i] as int {
+            return a[i] as int < b[i] as int
+        }
+        i += 1
+    }
+    a.len < b.len
+}
+
+// `yew_sort_stable` over the names: a bottom-up merge, a tie taking the
+// left run (util.sort_stable's order), local so no comparator crosses a
+// module boundary (G20).
+fn sort_names(xs: List[List[byte]]) -> List[List[byte]] {
+    let n = xs.len
+    var src = copy xs
+    var width = 1
+    while width < n {
+        var dst = List[List[byte]]()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if lo + 2 * width < n then lo + 2 * width else n
+            var i = lo
+            var j = mid
+            while i < mid && j < hi {
+                if name_less(src[j], src[i]) {
+                    (mut dst).push(copy src[j])
+                    j += 1
+                } else {
+                    (mut dst).push(copy src[i])
+                    i += 1
+                }
+            }
+            while i < mid {
+                (mut dst).push(copy src[i])
+                i += 1
+            }
+            while j < hi {
+                (mut dst).push(copy src[j])
+                j += 1
+            }
+            lo = hi
+        }
+        src = dst
+        width *= 2
+    }
+    src
+}
+
+fn is_dot_git(e: List[byte]) -> bool {
+    e.len == 5 &&
+        e[1] as int == 46 &&
+        e[2] as int == 103 &&
+        e[3] as int == 105 &&
+        e[4] as int == 116
+}
+
+// `read_sorted` (`walk.c:266-312`): the directory's names, `.git` and
+// (without `hidden`) dotfiles dropped, sorted. Not ok when it cannot be
+// read — distinct from an empty directory, which is ok with none.
+fn read_sorted(mut w: WalkState, abs: str) -> (bool, List[List[byte]]) {
+    w.opendirs += 1
+    let entries = fs_read_dir_entries(abs) else {
+        return (false, List[List[byte]]())
+    }
+    var keep = List[List[byte]]()
+    for e in entries {
+        if e.len < 2 {
+            continue
+        }
+        if is_dot_git(e) {
+            continue
+        }
+        if !w.opts.hidden && e[1] as int == 46 {
+            continue
+        }
+        (mut keep).push(copy e)
+    }
+    (true, sort_names(keep))
+}
+
+fn path_str(w: WalkState) -> str {
+    str_from_utf8(w.path) else ""
+}
+
+fn truncate_path(mut w: WalkState, to: int) {
+    while w.path.len > to {
+        let _ = (mut w.path).pop() else 0 as byte
+    }
+}
+
+// ---- the walk ------------------------------------------------------------
+
+/// `yew_walk_begin` (`walk.c:323-386`): a walk of `root` with options `o`
+/// (0 depth and 0 entries their defaults). Not ok when `root` is empty,
+/// past `PATH_MAX`, or cannot be read — an empty list, not an error the
+/// caller must handle beyond showing it. With `use_gitignore` the root's
+/// layers are loaded first: `ROOT/.git/info/.gitignore`, then
+/// `ROOT/.gitignore` over it (R-yw06-10: C's `yew_gi_load` of
+/// `.git/info`, `walk.c:378-381`; `exclude` is not read).
+pub fn walk_begin(root: str, o: WalkOpts) -> (bool, WalkState) {
+    var w = walk_empty(o)
+    if root.len == 0 || root.len + 2 >= WALK_PATH_MAX {
+        return (false, w)
+    }
+    if w.opts.max_depth == 0 {
+        w.opts.max_depth = WALK_DEFAULT_DEPTH
+    }
+    if w.opts.max_entries == 0 {
+        w.opts.max_entries = WALK_DEFAULT_ENTRIES
+    }
+    for x in root.bytes() {
+        (mut w.path).push(x)
+    }
+    // A trailing slash is stripped so the relative part never starts with
+    // one — "src/x.c", never "/src/x.c".
+    while w.path.len > 1 && w.path[w.path.len - 1] as int == 47 {
+        let _ = (mut w.path).pop() else 0 as byte
+    }
+    w.rel_base = w.path.len + 1
+    seen_init(mut w)
+    let top = path_str(w)
+    w.statats += 1
+    let st = fs_stat(top) else |_| List[int]()
+    if st.len >= 11 {
+        let _ = seen_add(mut w, st[9], st[10])
+    }
+    let (ok, names) = read_sorted(mut w, top)
+    if !ok {
+        return (false, walk_empty(o))
+    }
+    var root_gi = GI_NONE
+    if w.opts.use_gitignore {
+        let info = "{top}/.git/info"
+        if info.len < WALK_PATH_MAX {
+            root_gi = gi_load(mut w.gi, info, GI_NONE)
+        }
+        root_gi = gi_load(mut w.gi, top, root_gi)
+    }
+    (mut w.stack).push(WalkFrame {
+        names: names,
+        at: 0,
+        rel_len: w.path.len,
+        depth: 0,
+        gi: root_gi,
+        ignored: false,
+    })
+    w.done = false
+    (true, w)
+}
+
+// `record_path` (`walk.c:408-424`): past `max_entries` it flags the list
+// truncated and records nothing.
+fn record_path(mut w: WalkState, abs: str, is_dir: bool) {
+    if w.out.paths.len >= w.opts.max_entries {
+        w.out.truncated = true
+        return
+    }
+    (mut w.out.paths).push(abs[w.rel_base..abs.len])
+    (mut w.out.is_dir).push(is_dir)
+    if is_dir {
+        w.out.n_dirs += 1
+    } else {
+        w.out.n_files += 1
+    }
+}
+
+fn now_us() -> int {
+    os_clock_ns() / 1000
+}
+
+/// `yew_walk_step` (`walk.c:426-549`): about `budget_us` of work, true
+/// while there is more; a budget of 0 runs to completion (the tests and
+/// the finder). The budget is checked at every ENTRY boundary: the names
+/// are already read whole and held, so nothing is open across a yield.
+pub fn walk_step(mut w: WalkState, budget_us: int) -> bool {
+    let started = if budget_us > 0 then now_us() else 0
+    if w.done {
+        return false
+    }
+    while w.stack.len > 0 {
+        if budget_us > 0 && now_us() - started >= budget_us {
+            return true
+        }
+        let top = w.stack.len - 1
+        if w.stack[top].at >= w.stack[top].names.len {
+            truncate_path(mut w, w.stack[top].rel_len)
+            let _ = (mut w.stack).pop()
+            continue
+        }
+        let at = w.stack[top].at
+        w.stack[top].at += 1
+        let saved = w.path.len
+        let name_len = w.stack[top].names[at].len - 1
+        // A truncated path is a different path, never a shorter one
+        // (`path_push`, `walk.c:390-400`).
+        if saved + 1 + name_len + 1 > WALK_PATH_MAX {
+            continue
+        }
+        (mut w.path).push(47 as byte)
+        var k = 1
+        while k <= name_len {
+            (mut w.path).push(w.stack[top].names[at][k])
+            k += 1
+        }
+        let abs = str_from_utf8(w.path) else {
+            truncate_path(mut w, saved)
+            let dir = path_str(w)
+            util.log_warn("skipping a name that is not UTF-8 under {dir}: G40 (fs paths are str)")
+            continue
+        }
+        w.statats += 1
+        var st = List[int]()
+        if w.opts.follow_symlinks {
+            st = fs_stat(abs) else |_| List[int]()
+        } else {
+            st = fs_lstat(abs) else |_| List[int]()
+        }
+        if st.len < 11 {
+            truncate_path(mut w, saved)
+            continue
+        }
+        let rel = abs[w.rel_base..abs.len]
+        let gi = w.stack[top].gi
+        let in_ignored = w.stack[top].ignored
+        if st[0] == 1 {
+            var child_ignored = in_ignored
+            if w.opts.include_dirs {
+                record_path(mut w, abs, true)
+            }
+            if w.out.truncated {
+                w.done = true
+                return false
+            }
+            if w.stack[top].depth + 1 >= w.opts.max_depth {
+                truncate_path(mut w, saved)
+                continue
+            }
+            // §4.1: PRUNE before opening; `gi_prunable` is conservative,
+            // so when it says no the walk descends and filters per file.
+            if w.opts.use_gitignore && gi != GI_NONE && gi_match(w.gi, gi, rel, true) {
+                w.out.n_ignored += 1
+                if gi_prunable(w.gi, gi, rel) {
+                    truncate_path(mut w, saved)
+                    continue
+                }
+                child_ignored = true
+            }
+            // The loop guard, checked BEFORE opening.
+            if seen_add(mut w, st[9], st[10]) {
+                w.out.n_loops += 1
+                truncate_path(mut w, saved)
+                continue
+            }
+            let (ok, names) = read_sorted(mut w, abs)
+            if !ok {
+                truncate_path(mut w, saved)
+                continue
+            }
+            if !w.opts.include_dirs {
+                w.out.n_dirs += 1
+            }
+            // This directory's own .gitignore, layered over everything
+            // above it.
+            var child_gi = gi
+            if w.opts.use_gitignore {
+                child_gi = gi_load(mut w.gi, abs, gi)
+            }
+            let depth = w.stack[top].depth + 1
+            (mut w.stack).push(WalkFrame {
+                names: names,
+                at: 0,
+                rel_len: saved,
+                depth: depth,
+                gi: child_gi,
+                ignored: child_ignored,
+            })
+            continue
+        }
+        if st[0] == 0 {
+            var skip = false
+            if w.opts.use_gitignore && gi != GI_NONE {
+                // Inside an ignored directory the default flips: a file is
+                // out unless a rule explicitly RE-INCLUDES it.
+                if in_ignored {
+                    skip = gi_match(w.gi, gi, rel, false) || !gi_negated(w.gi, gi, rel)
+                } else {
+                    skip = gi_match(w.gi, gi, rel, false)
+                }
+            }
+            if skip {
+                w.out.n_ignored += 1
+            } else {
+                record_path(mut w, abs, false)
+            }
+        }
+        truncate_path(mut w, saved)
+        if w.out.truncated {
+            w.done = true
+            return false
+        }
+    }
+    w.done = true
+    false
+}
+
+/// `yew_walk_end` (`walk.c:551-561`): the frames dropped; the list stays
+/// the caller's in `w.out`.
+pub fn walk_end(mut w: WalkState) {
+    while w.stack.len > 0 {
+        let _ = (mut w.stack).pop()
+    }
+    w.done = true
+}
+
+/// A whole walk to completion, its scratch freed as one region and only
+/// the list copied out (`copy region`, G33): what the finder and
+/// `ed.group.from_dir` call (`pickers.c:261-273`, `groupfromdir.c:141-
+/// 149`). Not ok when `walk_begin` refused.
+pub fn walk_all(root: str, o: WalkOpts) -> (bool, FileList) {
+    copy region walk {
+        let (ok, st) = walk_begin(root, o)
+        var w = st
+        if ok {
+            while walk_step(mut w, 0) {}
+            walk_end(mut w)
+        }
+        (ok, w.out)
+    }
+}

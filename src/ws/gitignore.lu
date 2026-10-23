@@ -1,0 +1,622 @@
+//! ws.gitignore — the `.gitignore` matcher, bespoke and a SUBSET.
+//!
+//! Ports sagitta `src/ws/gitignore.c` (539 lines) and `ws/gitignore.h`
+//! (124) at 9ace98c2, under `s26-fuzzy-finder.md` §4 and §4.1. No git
+//! subprocess and no other matcher's source: the supported rows
+//! (`gitignore.h:15-27`) are blank lines and `#` comments with `\#` a
+//! literal, trailing whitespace stripped unless `\ `, a leading `/`
+//! anchoring, a trailing `/` directory-only, `*` within a segment, `?`
+//! one non-`/` byte, byte bracket sets with `!`/`^`, the double star in
+//! all three places, `!` negation with the last matching rule winning,
+//! nested sets deepest last. The pinned divergences (`gitignore.h:29-
+//! 56`) are kept, never fixed: a POSIX class closes its set at the first
+//! `]`, no index awareness, always case-sensitive, no global excludes.
+//!
+//! R-yw06-10 = A, disk loading as MEASURED pinned C: `gi_load` reads
+//! `DIR/.gitignore` (`gitignore.c:479-482`) — the walk hands it
+//! `.git/info`, so the root's outer layer is `.git/info/.gitignore`,
+//! never `exclude` — and a set loaded from disk gets the NULL base
+//! (`gitignore.c:505`), so a nested file's anchored rule anchors to the
+//! workspace root; the in-memory `gi_compile` keeps its `base`
+//! (`notes/yw06-evidence/finder-inputs/c-witness.log`).
+//!
+//! The port's shapes. C's `GiSet` chain of arena pointers is a `Gi`
+//! value: every compiled set, rule and pattern byte of one owner (a
+//! walk, a test), a set an INDEX into it (`GI_NONE` is C's NULL), its
+//! parent an index; patterns and bases are runs of one byte pool. A
+//! pattern is a C string in C (`arena_strndup` of the line's bytes), so
+//! a NUL inside a line ends its pattern there; a path is a C string, so
+//! a NUL in `rel` ends it too — both truncated once on entry, after
+//! which the matcher's reads past the end answer 0 as C's terminator
+//! does. Matching allocates nothing: the walk calls it on every entry of
+//! a 100,000-file tree from a value that lives for the session (G33).
+//!
+//! `glob_match` (`gitignore.c:113-177`) recurses once per `**/`: on a
+//! failed `glob_match(after, t)` it continues from `after` with a star
+//! saved at `(after, t)` that may cross `/`. That continuation runs, in
+//! lockstep, every step the recursive call runs (the same pattern and
+//! text positions; the two star states differ only until the next `*`,
+//! which overwrites both alike) and diverges only where the recursive
+//! call would answer false for want of a star — so the recursive call
+//! answering true implies the continuation answers true at the same
+//! step, and `call || continuation` is the continuation alone. The port
+//! runs the continuation and no recursion (G41: no recursion on
+//! input-sized depth); `tools/fuzz-gitignore --answers` hashes every
+//! answer the fuzz session asks and is equal to C's own matcher's hash
+//! (`notes/yw06-evidence/pick/gitignore/`).
+
+use util
+
+/// No set (C's `NULL` `GiSet *`).
+pub const GI_NONE: int = -1
+
+// `YEW_GI_MAX_PATTERN` (`gitignore.c:16-19`): the copy buffer, so a
+// pattern keeps at most 1,023 bytes.
+const GI_MAX_PATTERN: int = 1024
+
+// `YEW_GI_MAX_BYTES` (`gitignore.c:20-21`).
+const GI_MAX_BYTES: int = 1048576
+
+// `chain[64]` (`gitignore.c:225`, `:511`): matching consults at most the
+// 64 nearest sets.
+const GI_CHAIN_MAX: int = 64
+
+// `PATH_MAX` (`gitignore.c:470`).
+const GI_PATH_MAX: int = 4096
+
+// One compiled rule (`GiRule`, `gitignore.c:32-41`): the pattern (its
+// `!`, anchoring slash and trailing slash already flags) and its base
+// directory, each a run of the owner's pool.
+struct GiRule {
+    pat_at: int,
+    pat_len: int,
+    base_at: int,
+    base_len: int,
+    negate: bool,
+    dir_only: bool,
+    anchored: bool,
+}
+
+// One set (`GiSet`, `gitignore.c:43-49`): its rules, a run of the
+// owner's rule list, and its parent.
+struct GiSetRec {
+    first: int,
+    n: int,
+    parent: int,
+}
+
+/// Every compiled set of one owner (C's arena of `GiSet`s).
+pub struct Gi {
+    pool: List[byte],
+    rules: List[GiRule],
+    sets: List[GiSetRec],
+}
+
+/// An empty owner (`arena_init`).
+pub fn gi_new() -> Gi {
+    Gi { pool: List[byte](), rules: List[GiRule](), sets: List[GiSetRec]() }
+}
+
+/// How many sets `g` holds (a test's "a set was made").
+pub fn gi_set_count(g: Gi) -> int {
+    g.sets.len
+}
+
+// ---- matching one pattern against one name ----------------------------
+
+// A pattern byte, 0 past its end (C's NUL terminator).
+fn pc(g: Gi, r: GiRule, i: int) -> int {
+    if i < r.pat_len then g.pool[r.pat_at + i] as int else 0
+}
+
+// A path byte, 0 past `n` (C's NUL terminator).
+fn tc(rel: str, n: int, i: int) -> int {
+    if i < n then rel.bytes()[i] as int else 0
+}
+
+// The length C sees: up to the first NUL.
+fn cstr_len(rel: str) -> int {
+    var i = 0
+    while i < rel.len {
+        if rel.bytes()[i] as int == 0 {
+            return i
+        }
+        i += 1
+    }
+    rel.len
+}
+
+// `bracket_match` (`gitignore.c:62-104`): a set starting at pattern
+// offset `q` (just past its `[`) against byte `c`. Answers (ok, hit,
+// the offset past its `]`); not ok when unterminated — the `[` is then a
+// literal, as git does with one.
+fn bracket_match(g: Gi, r: GiRule, q: int, c: int) -> (bool, bool, int) {
+    let end = r.pat_len
+    var p = q
+    var negate = false
+    var hit = false
+    var first = true
+    if p < end && (pc(g, r, p) == 33 || pc(g, r, p) == 94) {
+        negate = true
+        p += 1
+    }
+    while p < end {
+        if pc(g, r, p) == 93 && !first {
+            return (true, if negate then !hit else hit, p + 1)
+        }
+        first = false
+        var lo = pc(g, r, p)
+        if lo == 92 && p + 1 < end {
+            p += 1
+            lo = pc(g, r, p)
+        }
+        // `a-z`, but a `-` just before the `]` is a literal.
+        if p + 2 < end && pc(g, r, p + 1) == 45 && pc(g, r, p + 2) != 93 {
+            let hi = pc(g, r, p + 2)
+            if c >= lo && c <= hi {
+                hit = true
+            }
+            p += 3
+            continue
+        }
+        if c == lo {
+            hit = true
+        }
+        p += 1
+    }
+    (false, false, p)
+}
+
+// `glob_match` (`gitignore.c:113-177`) of rule `r`'s pattern against
+// `rel[t0..n]`: `*` does not cross `/`, `?` is one non-`/` byte, `**`
+// crosses anything, `**/` also matches zero segments. Backtracking is
+// iterative, and the `**/` recursion is its continuation (the header).
+fn glob_match(g: Gi, r: GiRule, rel: str, n: int, t0: int) -> bool {
+    var p = 0
+    var t = t0
+    var star_p = -1
+    var star_t = -1
+    var star_crosses = false
+    loop {
+        let c = pc(g, r, p)
+        if c == 42 {
+            let dstar = pc(g, r, p + 1) == 42
+            p += if dstar then 2 else 1
+            // `**/` consumes the slash it is followed by, so `**/b`
+            // matches `b` as well as `x/b`.
+            if dstar && pc(g, r, p) == 47 {
+                p += 1
+            }
+            star_p = p
+            star_t = t
+            star_crosses = dstar
+            continue
+        }
+        let tb = tc(rel, n, t)
+        var miss = false
+        if c == 63 && tb != 0 && tb != 47 {
+            p += 1
+            t += 1
+            continue
+        }
+        if c == 91 && tb != 0 {
+            let (ok, hit, q) = bracket_match(g, r, p + 1, tb)
+            if ok {
+                if hit {
+                    p = q
+                    t += 1
+                    continue
+                }
+                miss = true
+            }
+            // Unterminated `[`: fall through to the literal compare.
+        }
+        if !miss {
+            if c != 0 && c == tb {
+                p += 1
+                t += 1
+                continue
+            }
+            if c == 0 && tb == 0 {
+                return true
+            }
+        }
+        if star_p < 0 {
+            return false
+        }
+        // A single `*` may not cross a separator.
+        let st = tc(rel, n, star_t)
+        if st == 0 || !star_crosses && st == 47 {
+            return false
+        }
+        star_t += 1
+        t = star_t
+        p = star_p
+    }
+    false
+}
+
+// ---- matching a rule against a path -----------------------------------
+
+// `below_base` (`gitignore.c:185-194`): where the part of `rel` below
+// the rule's own directory starts, -1 when `rel` is not under it.
+fn below_base(g: Gi, r: GiRule, rel: str, n: int) -> int {
+    if r.base_len == 0 {
+        return 0
+    }
+    if n < r.base_len {
+        return -1
+    }
+    var i = 0
+    while i < r.base_len {
+        if rel.bytes()[i] as int != g.pool[r.base_at + i] as int {
+            return -1
+        }
+        i += 1
+    }
+    if tc(rel, n, r.base_len) != 47 {
+        return -1
+    }
+    r.base_len + 1
+}
+
+// `rule_match` (`gitignore.c:196-221`): unanchored patterns match any
+// COMPONENT — `*.o` ignores `a/b/c.o` — by walking the suffixes.
+fn rule_match(g: Gi, r: GiRule, rel: str, n: int, is_dir: bool) -> bool {
+    var sub = below_base(g, r, rel, n)
+    if sub < 0 || sub >= n {
+        return false
+    }
+    if r.dir_only && !is_dir {
+        return false
+    }
+    if r.anchored {
+        return glob_match(g, r, rel, n, sub)
+    }
+    loop {
+        if glob_match(g, r, rel, n, sub) {
+            return true
+        }
+        var slash = -1
+        var i = sub
+        while i < n {
+            if rel.bytes()[i] as int == 47 {
+                slash = i
+                break
+            }
+            i += 1
+        }
+        if slash < 0 {
+            return false
+        }
+        sub = slash + 1
+    }
+    false
+}
+
+// The `k`-th set above `s` (0 is `s` itself).
+fn ancestor(g: Gi, s: int, k: int) -> int {
+    var at = s
+    var i = 0
+    while i < k && at >= 0 {
+        at = g.sets[at].parent
+        i += 1
+    }
+    at
+}
+
+// How many sets the chain from `s` holds, at most `GI_CHAIN_MAX`.
+fn chain_depth(g: Gi, s: int) -> int {
+    var d = 0
+    var at = s
+    while at >= 0 && d < GI_CHAIN_MAX {
+        d += 1
+        at = g.sets[at].parent
+    }
+    d
+}
+
+/// `yew_gi_match` (`gitignore.c:223-250`): is the workspace-RELATIVE
+/// `rel` ignored? The chain is consulted root-first, deepest last, and
+/// within a set the LAST matching rule wins, which is what makes `!`
+/// work; a trailing-slash rule matches directories only.
+pub fn gi_match(g: Gi, set: int, rel: str, is_dir: bool) -> bool {
+    let n = cstr_len(rel)
+    if set < 0 || n == 0 {
+        return false
+    }
+    var ignored = false
+    var depth = chain_depth(g, set)
+    while depth > 0 {
+        depth -= 1
+        let s = ancestor(g, set, depth)
+        var i = 0
+        while i < g.sets[s].n {
+            let ri = g.sets[s].first + i
+            if rule_match(g, g.rules[ri], rel, n, is_dir) {
+                ignored = !g.rules[ri].negate
+            }
+            i += 1
+        }
+    }
+    ignored
+}
+
+// `literal_prefix_len` (`gitignore.c:258-266`): the pattern up to its
+// first wildcard.
+fn literal_prefix_len(g: Gi, r: GiRule) -> int {
+    var i = 0
+    while i < r.pat_len {
+        let c = g.pool[r.pat_at + i] as int
+        if c == 42 || c == 63 || c == 91 {
+            break
+        }
+        i += 1
+    }
+    i
+}
+
+/// `yew_gi_prunable` (`gitignore.c:268-329`), §4.1: may the walk skip
+/// this IGNORED directory without opening it? CONSERVATIVE: any negation
+/// whose literal prefix could name something inside `rel` blocks it, an
+/// unanchored or wildcard-led negation blocks it everywhere. The whole
+/// chain is read here (C's loop has no 64 cap).
+pub fn gi_prunable(g: Gi, set: int, rel: str) -> bool {
+    let n = cstr_len(rel)
+    if set < 0 || n == 0 {
+        return false
+    }
+    if !gi_match(g, set, rel, true) {
+        return false
+    }
+    var s = set
+    while s >= 0 {
+        var i = 0
+        while i < g.sets[s].n {
+            let r = copy g.rules[g.sets[s].first + i]
+            i += 1
+            if !r.negate {
+                continue
+            }
+            let sub = below_base(g, r, rel, n)
+            // A negation written above this directory, whose own base
+            // does not contain it, cannot reach inside it.
+            if sub < 0 && r.base_len != 0 {
+                continue
+            }
+            let lit = literal_prefix_len(g, r)
+            if lit == 0 {
+                return false
+            }
+            if r.anchored {
+                let k = if lit < n then lit else n
+                if r.base_len == 0 && same_prefix(g, r, rel, k) {
+                    return false
+                }
+                if r.base_len != 0 {
+                    return false
+                }
+            } else {
+                // Unanchored negations match at any depth.
+                return false
+            }
+        }
+        s = g.sets[s].parent
+    }
+    true
+}
+
+// `strncmp(r->pat, rel, k) == 0` with `k` within both.
+fn same_prefix(g: Gi, r: GiRule, rel: str, k: int) -> bool {
+    var i = 0
+    while i < k {
+        if g.pool[r.pat_at + i] as int != rel.bytes()[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_gi_negated` (`gitignore.c:509-539`): did a `!` rule name this
+/// path? Asked apart from `gi_match` because inside an ignored directory
+/// the default reverses — everything is out unless re-included, and a
+/// file under `node_modules/` matches no rule at all.
+pub fn gi_negated(g: Gi, set: int, rel: str) -> bool {
+    let n = cstr_len(rel)
+    if set < 0 || n == 0 {
+        return false
+    }
+    var negated = false
+    var depth = chain_depth(g, set)
+    while depth > 0 {
+        depth -= 1
+        let s = ancestor(g, set, depth)
+        var i = 0
+        while i < g.sets[s].n {
+            let ri = g.sets[s].first + i
+            if rule_match(g, g.rules[ri], rel, n, false) {
+                negated = g.rules[ri].negate
+            }
+            i += 1
+        }
+    }
+    negated
+}
+
+// ---- compiling --------------------------------------------------------
+
+fn is_blank(c: int) -> bool {
+    c == 32 || c == 9
+}
+
+// `compile_line` (`gitignore.c:339-413`): one line of `text` (bytes
+// `at..at + len_in`) into one rule pushed on `g`; false when it
+// contributes nothing — blank, or a comment.
+fn compile_line(
+    mut g: Gi,
+    base_at: int,
+    base_len: int,
+    text: List[byte],
+    at: int,
+    len_in: int,
+) -> bool {
+    var len = len_in
+    var i = 0
+    while i < len && is_blank(text[at + i] as int) {
+        i += 1
+    }
+    if i >= len {
+        return false
+    }
+    // `\#` is a literal `#`; a bare `#` starts a comment.
+    if text[at + i] as int == 35 {
+        return false
+    }
+    var escaped_hash = false
+    if text[at + i] as int == 92 && i + 1 < len && text[at + i + 1] as int == 35 {
+        escaped_hash = true
+        i += 1
+    }
+    var negate = false
+    if !escaped_hash && text[at + i] as int == 33 {
+        negate = true
+        i += 1
+        if i >= len {
+            return false
+        }
+    }
+    // Trailing whitespace is stripped unless escaped, scanned from the
+    // end so `a\ ` keeps its space while `a   ` does not.
+    while len > i && is_blank(text[at + len - 1] as int) {
+        if len - 1 > i && text[at + len - 2] as int == 92 {
+            break
+        }
+        len -= 1
+    }
+    if len <= i {
+        return false
+    }
+    var dir_only = false
+    if text[at + len - 1] as int == 47 {
+        dir_only = true
+        len -= 1
+        if len <= i {
+            return false
+        }
+    }
+    var anchored = false
+    if text[at + i] as int == 47 {
+        anchored = true
+        i += 1
+        if i >= len {
+            return false
+        }
+    }
+    // A `/` anywhere but the end also anchors — git's rule.
+    var k = i
+    while k + 1 < len {
+        if text[at + k] as int == 47 {
+            anchored = true
+        }
+        k += 1
+    }
+    // `\ ` and `\#` lose their backslash; every other escape is kept for
+    // the matcher's bracket handling. The copy keeps at most
+    // GI_MAX_PATTERN - 1 bytes, and the C string it becomes ends at its
+    // first NUL.
+    let pat_at = g.pool.len
+    var copied = 0
+    var pat_len = -1
+    while i < len && copied + 1 < GI_MAX_PATTERN {
+        if text[at + i] as int == 92 &&
+            i + 1 < len &&
+            (text[at + i + 1] as int == 32 || text[at + i + 1] as int == 35) {
+            i += 1
+        }
+        let b = text[at + i]
+        if b as int == 0 && pat_len < 0 {
+            pat_len = copied
+        }
+        (mut g.pool).push(b)
+        copied += 1
+        i += 1
+    }
+    if copied == 0 {
+        return false
+    }
+    if pat_len < 0 {
+        pat_len = copied
+    }
+    (mut g.rules).push(GiRule {
+        pat_at: pat_at,
+        pat_len: pat_len,
+        base_at: base_at,
+        base_len: base_len,
+        negate: negate,
+        dir_only: dir_only,
+        anchored: anchored,
+    })
+    true
+}
+
+/// `yew_gi_compile` (`gitignore.c:415-466`): one in-memory ignore file,
+/// `base` its directory workspace-relative ("" at the root, C's NULL
+/// alike), chained under `parent`. An ignore file with no usable rule is
+/// not a set: `parent` comes back, so a deep tree costs no chain depth.
+pub fn gi_compile(mut g: Gi, base: str, text: List[byte], parent: int) -> int {
+    let base_at = g.pool.len
+    let base_len = cstr_len(base)
+    var i = 0
+    while i < base_len {
+        (mut g.pool).push(base.bytes()[i])
+        i += 1
+    }
+    let first = g.rules.len
+    var at = 0
+    while at < text.len {
+        var eol = at
+        while eol < text.len && text[eol] as int != 10 {
+            eol += 1
+        }
+        var line_len = eol - at
+        // A CRLF file is not a broken file.
+        if line_len > 0 && text[at + line_len - 1] as int == 13 {
+            line_len -= 1
+        }
+        if line_len > 0 {
+            let _ = compile_line(mut g, base_at, base_len, text, at, line_len)
+        }
+        at = eol + 1
+    }
+    let n = g.rules.len - first
+    if n == 0 {
+        return parent
+    }
+    (mut g.sets).push(GiSetRec { first: first, n: n, parent: parent })
+    g.sets.len - 1
+}
+
+/// `yew_gi_load` (`gitignore.c:468-507`): `dir/.gitignore` compiled
+/// under `parent` with the NULL base (R-yw06-10); `parent` when there is
+/// none, it cannot be read, or it is past 1 MiB (said once in the log).
+pub fn gi_load(mut g: Gi, dir: str, parent: int) -> int {
+    let path = "{dir}/.gitignore"
+    if path.len >= GI_PATH_MAX {
+        return parent
+    }
+    if !fs_is_file(path) {
+        return parent
+    }
+    let size = fs_size(path) else {
+        return parent
+    }
+    if size > GI_MAX_BYTES {
+        util.log_warn("{path} is too large to read as ignore rules")
+        return parent
+    }
+    let text = fs_read_bytes(path) else {
+        return parent
+    }
+    gi_compile(mut g, "", text, parent)
+}
