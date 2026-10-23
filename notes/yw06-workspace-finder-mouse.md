@@ -86,7 +86,7 @@ The prediction is `notes/yw06-evidence/prediction.txt`, committed at
 | the 81 reachable goldens green, the router's 68 as one set at the end | **HIT**: 81 of 81 by name on release at `443d271` (`notes/yw06-evidence/continuation/goldens81-release-443d271.log`); the router's 38 → 64 → 68 |
 | the walk's determinism and the narrowing equivalence (10,000 appends against a full rescan) | **HIT** (`test_walk`, `test_narrow`; the narrow cases alone past the checked budget pass natively) |
 | `fuzz_state`, `fuzz_gitignore` and `fuzz_mouse` hold their invariants | **HIT**, each report line equal to C's driver's |
-| every 2× gate within 2× of C, `workspace50` read beside the highlighting caveat | **MISS on three router rows**: the motion burst 6.68×, the menu hover 2.01×, the chevron hover 2.06× (G45, §4.5); `perf_finder`'s open was 2.08–2.45× until `66fcb40` and `7b44ac4` (now 1.35×); HIT on `perf_state` (0.59/0.96/1.13), `workspace50` (1.68), `mem.workspace50` (1.87, inside the 40 MB budget) and `perf_finder`'s four |
+| every 2× gate within 2× of C, `workspace50` read beside the highlighting caveat | **MISS on three router rows**: the motion burst 6.68×, the menu hover 2.01×, the chevron hover 2.06× (G45, §4.5); `perf_finder`'s open was 2.08–2.45× until `66fcb40` and `3829bb6` (now 1.35×); HIT on `perf_state` (0.59/0.96/1.13), `workspace50` (1.68), `mem.workspace50` (1.87, inside the 40 MB budget) and `perf_finder`'s four |
 | the static binary builds, is ET_EXEC with no interpreter, runs `--version` | <<STATICHIT>> |
 | if 0.2.35 lands, yew#17, #20, #22, #23, #24 and #27 retire | **not reached**: 0.2.35 tagged 2 h 44 min after the pin commit; yw07's |
 | every run container-isolated, 8–11, `core=0`, a memory cap; shared with r40 | **HIT**; 8–11 was shared with r40, then with this lane's own forks and jobs |
@@ -289,7 +289,7 @@ two runs):
 Both sides match 53,919 candidates. Open was 2.08–2.45× before two
 changes: a fresh filter's slots pushed with their values (`66fcb40`),
 and a full top-k window rejecting a row that cannot land in one
-comparison (`7b44ac4`, C's insertion order's answer; the top-k pass
+comparison (`3829bb6`, C's insertion order's answer; the top-k pass
 0.83 → 0.07 ms). Most of what remains is filling a fresh filter by
 `push` (no `List.reserve` at 0.2.34; s255's, 0.2.35's): with the
 storage held, as the picker holds it after its first open, open is
