@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# run-perf-finder — Sprint 26 DoD 6's finder gates, the port beside C.
+#
+#   tools/run-perf-finder [--cpus 8-11] [--build-only [--native]]
+#
+# Runs sagitta's own perf_finder (`build/perf_finder`, built into the
+# oracle tree from its Makefile if tools/oracle has not: `make
+# perf-finder`'s binary; its `--selftest-policy` first, as that target
+# runs it) and the port's twin (tools/perf-finder/main.lu, release tier,
+# staged beside the port's modules — D32), both under `taskset` on the
+# CPUs given (yw06 ran on kasumi 8-11: 0-3 were another lane's), C first,
+# the port, C again, and prints one ratio line: the port's worst-of-11
+# over C's (the two C runs averaged) for each gate and the informational
+# narrowing total, and the narrowed match counts side by side (the same
+# corpus and pattern must match the same number of paths); then, as
+# information, the port's reopen (the filter's storage held, as the
+# picker holds it after its first open) over C's open.
+#
+# --build-only is the hard compile gate (yew#44's shape): build both
+# harnesses, run neither (`--native` builds the port's on the default
+# tier). Exit: 2 a harness fault; 1 the port's own gate failed (C's
+# perf_policy: strict, or past 100x under YEW_PERF_ADVISORY) or the match
+# counts differ; 0 otherwise. C's verdict is printed, not gated here.
+set -eu
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export YEW_ROOT
+cd "$YEW_ROOT"
+. tools/lib-toolchain.sh
+
+cpus=8-11
+build_only=0
+tier=--release
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --cpus) cpus=$2; shift 2 ;;
+    --build-only) build_only=1; shift ;;
+    --native) tier=""; shift ;;
+    *) echo "run-perf-finder: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$build_only" = 0 ] && [ -z "$tier" ]; then
+    echo "run-perf-finder: --native is for --build-only: a measurement is the release tier's" >&2
+    exit 2
+fi
+oracle=$YEW_ROOT/target/oracle/sagitta
+[ -d "$oracle" ] || { echo "run-perf-finder: no oracle tree (tools/oracle)" >&2; exit 2; }
+build=$(readlink "$oracle/build" || echo build-gcc)
+cc=gcc
+case "$build" in build-clang) cc=clang ;; esac
+if [ ! -x "$oracle/$build/perf_finder" ]; then
+    make -C "$oracle" --no-print-directory CC="$cc" BUILD="$build" "$build/perf_finder" >/dev/null
+fi
+
+stage=$YEW_ROOT/target/perf-finder
+if [ "$build_only" = 1 ] || [ "${PERF_PREBUILT:-0}" != 1 ] || [ ! -x "$stage/perf-finder" ]; then
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    cp tools/perf-finder/main.lu "$stage/main.lu"
+    for d in src/*/; do
+        m=$(basename "$d")
+        cp -R "src/$m" "$stage/$m"
+        rm -f "$stage/$m"/*_test.lu
+    done
+    # shellcheck disable=SC2086
+    "$WOLF" build $tier --deny-warnings "$stage/main.lu" -o "$stage/perf-finder"
+fi
+if [ "$build_only" = 1 ]; then
+    echo "run-perf-finder: build-only: C and port harnesses built; no measurement"
+    exit 0
+fi
+
+"$oracle/$build/perf_finder" --selftest-policy || exit 2
+"$stage/perf-finder" --selftest-policy || exit 2
+runc() {
+    taskset -c "$cpus" "$oracle/$build/perf_finder"
+}
+c1=$(runc) || true
+prc=0
+port=$(YEW_LOG=/dev/null taskset -c "$cpus" "$stage/perf-finder") || prc=$?
+c2=$(runc) || true
+echo "$c1" | sed 's/^/C (first): /'
+echo "$port"
+echo "$c2" | sed 's/^/C (again): /'
+[ "$prc" -le 1 ] || { echo "run-perf-finder: the port's harness faulted (rc=$prc)" >&2; exit 2; }
+python3 -I - "$c1" "$c2" "$port" "$prc" <<'PY'
+import re, sys
+c1, c2, port, prc = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+def c_ms(text, key):
+    m = re.search(r'\b' + key + r'_ms=([0-9.]+)', text)
+    return float(m.group(1)) if m else None
+def p_ms(text, key):
+    m = re.search(r'\b' + key + r'_ns=([0-9]+)', text)
+    return int(m.group(1)) / 1e6 if m else None
+def matched(text):
+    m = re.search(r'matched=([0-9]+)', text)
+    return int(m.group(1)) if m else None
+rows = []
+for key in ('open', 'first_key', 'narrowing_frame', 'worst_slice', 'narrowing_total'):
+    a, b, p = c_ms(c1, key), c_ms(c2, key), p_ms(port, key)
+    if a is None or b is None or p is None:
+        print("run-perf-finder: %s missing (C %s/%s, port %s)" % (key, a, b, p))
+        sys.exit(2)
+    c = (a + b) / 2
+    rows.append("%s %.3f/%.3f ms = %.2f" % (key, p, c, p / c if c else float('inf')))
+pm, cm = matched(port), matched(c1)
+held = p_ms(port, 'open_held')
+copen = (c_ms(c1, 'open') + c_ms(c2, 'open')) / 2
+print("perf-finder: port/C worst-of-11: " + " | ".join(rows) +
+      " | matched port=%s C=%s" % (pm, cm))
+if held is not None:
+    print("perf-finder: informational: the port's open with its storage held "
+          "%.3f ms over C's open %.3f ms = %.2f" % (held, copen, held / copen if copen else float('inf')))
+if pm is None or pm != cm:
+    print("run-perf-finder: the narrowed match counts differ")
+    sys.exit(1)
+sys.exit(1 if prc == 1 else 0)
+PY

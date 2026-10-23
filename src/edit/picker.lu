@@ -1,0 +1,1335 @@
+//! edit.picker — THE list picker.
+//!
+//! Ports sagitta `src/ui/picker.c` (1,093 lines) and `ui/picker.h` (193)
+//! at 9ace98c2, under `s26-fuzzy-finder.md` §5 and §7. Every list is an
+//! instance of this widget (`picker.h:7-11`), and its three laws
+//! (`picker.h:13-33`) are its tests:
+//!
+//! 1. SELECTION IS HELD BY PAYLOAD, never by row index: one more
+//!    character reorders the list, and the held payload is found again
+//!    wherever the new order put it — gone, the selection falls to row 0,
+//!    visibly.
+//! 2. THE FILTER LINE IS yw04's `CmdLine` (DoD 9), a `PROMPT_INPUT`,
+//!    opened LAZILY on the first key or draw (`picker.c:589-600`: opened
+//!    inside `:find`, the invoking prompt's close took it down too).
+//! 3. AN OPEN PICKER SWALLOWS EVERY KEY it does not use. C's own key
+//!    route is the witness (`notes/yw06-evidence/pick/witness/
+//!    c-witness.log`, W3): `yew_cmdline_key` takes printable text only,
+//!    so Backspace, the motions and every editing chord are swallowed
+//!    with the line unchanged — the port routes exactly so.
+//!
+//! The geometry is C's (centred, 80 wide, 160 with a preview, 20 tall,
+//! refused under 24 columns or 6 rows with a message), the rows clipped
+//! through the width tables with the matched BYTES re-clipped to cells,
+//! the detail column right-aligned and dropped under 40, `*` for
+//! modified, `REGION_BLOCK` over the box and a `REGION_PICK_ROW` per drawn
+//! row whose payload is the item's PAYLOAD, the footer `shown/total` with
+//! ` scanning...` while a sliced pass runs (2 ms slices on the idle path,
+//! `picker_tick`), the preview a slot BESIDE the list from 100 cells.
+//!
+//! The port's shapes. C's module-static `PickerState pk` (`picker.c:97`)
+//! is `Ed.picker`, a value (E1010), with the pickers' own statics beside
+//! it (`pickers.c:35-36`, `:155-156`: the clock, the read counter, the
+//! file list). C's `PickerSpec` function pointers (`items`, `preview`,
+//! `accept`, `action`, `search_part`) are a HOST KIND matched in ONE
+//! place (`pk_host`, G19/G20: no function value across a module
+//! boundary): the probe host the unit tests drive (C's test callbacks,
+//! `test_picker.c:42-85`), the four instances (`edit.pickers`), and the
+//! hosts later lanes own, each refusing by name. The rows are the
+//! picker's own `List[PickItem]`, built once at open as C's item store
+//! is (`pickers.c:75-149`). The visible window is a `TopK` made once and
+//! rewritten (`edit.filter`), and the filter line's text is copied into a
+//! held byte list, so a keystroke allocates nothing of the picker's
+//! (G33; W5: C allocates nothing either).
+
+use term
+use text
+use unicode
+use ws
+
+/// `YEW_PICK_MODIFIED` (`picker.h:49-53`).
+pub const PICK_MODIFIED: int = 1
+
+/// `YEW_PICK_DEFERRED`.
+pub const PICK_DEFERRED: int = 2
+
+/// `YEW_PICK_ORPHAN`.
+pub const PICK_ORPHAN: int = 4
+
+/// `YEW_PICK_ACCEPT_HERE` (`picker.h:55-60`).
+pub const PICK_ACCEPT_HERE: int = 0
+
+/// `YEW_PICK_ACCEPT_VSPLIT`.
+pub const PICK_ACCEPT_VSPLIT: int = 1
+
+/// `YEW_PICK_ACCEPT_HSPLIT`.
+pub const PICK_ACCEPT_HSPLIT: int = 2
+
+// `picker.h:62-86`.
+const PICKER_MAX_W: int = 80
+
+const PICKER_PREVIEW_MAX_W: int = 160
+
+const PICKER_MAX_H: int = 20
+
+const PICKER_MIN_COLS: int = 24
+
+const PICKER_MIN_ROWS: int = 6
+
+const PICKER_DETAIL_MIN_W: int = 40
+
+/// `YEW_PICKER_SLICE_US`: a full rescan's share of a frame.
+pub const PICKER_SLICE_US: int = 2000
+
+const PICKER_PREVIEW_MIN_W: int = 100
+
+// The draw's line buffer (`char line[YEW_PICKER_PREVIEW_MAX_W + 64]`,
+// `picker.c:959`): what `snprintf` keeps.
+const PICKER_LINE_MAX: int = 224
+
+/// The host kinds (C's `PickerSpec` callbacks), matched in `pk_host`.
+/// The unit tests' host: accept and preview record what they were
+/// handed, the search part is the test's text (`test_picker.c:42-85`).
+pub const PICK_HOST_PROBE: int = 0
+
+/// `ed.find.file` (`pickers.c:155-319`).
+pub const PICK_HOST_FILE: int = 1
+
+/// `ed.find.buffer` (`pickers.c:321-421`).
+pub const PICK_HOST_BUFFER: int = 2
+
+/// `ed.find.command` (`pickers.c:423-543`).
+pub const PICK_HOST_COMMAND: int = 3
+
+/// `ed.undo.branches` (`pickers.c:545-646`).
+pub const PICK_HOST_UNDO: int = 4
+
+/// The LSP symbol and diagnostic pickers (`mod/lsp/pickers.c`): Sprint
+/// 47, yw11.
+pub const PICK_HOST_LSP: int = 5
+
+/// The plugin lifecycle picker (`mod/plug/plug.c`): Sprint 55, yw14.
+pub const PICK_HOST_PLUGIN: int = 6
+
+/// The macro browser (`ui/macrobrowse.c`): Sprint 38, yw09.
+pub const PICK_HOST_MACRO: int = 7
+
+/// FUSS's pickers (`mod/git/fussmode.c`): Sprint 52, yw13.
+pub const PICK_HOST_FUSS: int = 8
+
+// The host calls `pk_host` answers.
+const PK_ACCEPT: int = 0
+
+const PK_PREVIEW: int = 1
+
+const PK_PART: int = 2
+
+const PK_ACTION: int = 3
+
+/// One host call's answer: `ok` (accepted, a part exists, a key taken)
+/// and a part's text.
+pub struct PkAnswer {
+    ok: bool,
+    text: str,
+}
+
+fn pk_no() -> PkAnswer {
+    PkAnswer { ok: false, text: "" }
+}
+
+/// `PickerSpec` (`picker.h:104-133`) with its callbacks a host kind and
+/// its candidate source the rows themselves.
+pub struct PickerSpec {
+    kind: int,
+    title: str,
+    items: List[PickItem],
+    has_preview: bool,
+    has_accept: bool,
+    has_action: bool,
+    has_search_part: bool,
+    search_parts_independent: bool,
+    footer: str,
+    has_footer: bool,
+    path_mode: bool,
+    filter_requires_slash: bool,
+}
+
+/// A spec of `kind` titled `title` over `items` with an accept and no
+/// other optional callback.
+pub fn picker_spec(kind: int, title: str, take items: List[PickItem]) -> PickerSpec {
+    PickerSpec {
+        kind: kind,
+        title: title,
+        items: items,
+        has_preview: false,
+        has_accept: true,
+        has_action: false,
+        has_search_part: false,
+        search_parts_independent: false,
+        footer: "",
+        has_footer: false,
+        path_mode: false,
+        filter_requires_slash: false,
+    }
+}
+
+// `PickerCustomSearch` (`picker.c:31-47`): a borrowed-part scan's cursor;
+// the part's text is held as the `str` the host answered.
+struct PickCustom {
+    part_text: str,
+    part_len: int,
+    part_off: int,
+    total: int,
+    score: int,
+    best_score: int,
+    item: int,
+    part: int,
+    pattern_at: int,
+    run: int,
+    started: bool,
+    prefix: bool,
+    part_loaded: bool,
+    separator_done: bool,
+    invalid: bool,
+}
+
+fn pick_custom_new() -> PickCustom {
+    PickCustom {
+        part_text: "",
+        part_len: 0,
+        part_off: 0,
+        total: 0,
+        score: 0,
+        best_score: ws.FZ_NO_MATCH,
+        item: 0,
+        part: 0,
+        pattern_at: 0,
+        run: 0,
+        started: false,
+        prefix: true,
+        part_loaded: false,
+        separator_done: false,
+        invalid: false,
+    }
+}
+
+/// `PickerState` (`picker.c:49-95`) and the pickers' file statics.
+pub struct PickerState {
+    active: bool,
+    kind: int,
+    title: str,
+    items: List[PickItem],
+    has_preview: bool,
+    has_accept: bool,
+    has_action: bool,
+    has_search_part: bool,
+    search_parts_independent: bool,
+    footer: str,
+    has_footer: bool,
+    path_mode: bool,
+    filter_requires_slash: bool,
+    filter: FilterState,
+    top: TopK,
+    custom_matched: int,
+    custom: PickCustom,
+    total: int,
+    scanning: bool,
+    sel_payload: int,
+    has_sel: bool,
+    scroll: int,
+    filter_open: bool,
+    box: Rect,
+    text: List[byte],
+    line: List[byte],
+    /// The finder's walk (`g_files`, `pickers.c:155-156`).
+    files: ws.FileList,
+    files_ready: bool,
+    /// `g_now` (`pickers.c:35`): 0 reads the clock.
+    now: int,
+    /// `g_preview_reads` (`pickers.c:36`).
+    preview_reads: int,
+    /// The probe host's records (`test_picker.c:50-55`).
+    probe_accepted: int,
+    probe_how: int,
+    probe_preview_calls: int,
+    probe_preview_rect: Rect,
+    probe_text: str,
+}
+
+/// A closed picker (`(void)memset(&pk, 0, sizeof(pk))`).
+pub fn picker_state_new() -> PickerState {
+    PickerState {
+        active: false,
+        kind: PICK_HOST_PROBE,
+        title: "",
+        items: List[PickItem](),
+        has_preview: false,
+        has_accept: false,
+        has_action: false,
+        has_search_part: false,
+        search_parts_independent: false,
+        footer: "",
+        has_footer: false,
+        path_mode: false,
+        filter_requires_slash: false,
+        filter: filter_new(),
+        top: topk_new(),
+        custom_matched: 0,
+        custom: pick_custom_new(),
+        total: 0,
+        scanning: false,
+        sel_payload: 0,
+        has_sel: false,
+        scroll: 0,
+        filter_open: false,
+        box: rect(0, 0, 0, 0),
+        text: List[byte](),
+        line: List[byte](),
+        files: ws.filelist_new(),
+        files_ready: false,
+        now: 0,
+        preview_reads: 0,
+        probe_accepted: -1,
+        probe_how: 255,
+        probe_preview_calls: 0,
+        probe_preview_rect: rect(0, 0, 0, 0),
+        probe_text: "",
+    }
+}
+
+// ---- the one match on the host -------------------------------------------
+
+// The refusal of a host a later lane owns.
+fn pk_later_host(kind: int) -> str {
+    match kind {
+        5 => "not yet ported: the LSP pickers: sagitta Sprint 47 (yw11)", // PICK_HOST_LSP
+        6 => "not yet ported: the plugin picker: sagitta Sprint 55 (yw14)", // PICK_HOST_PLUGIN
+        7 => "not yet ported: the macro browser: sagitta Sprint 38 (yw09)", // PICK_HOST_MACRO
+        8 => "not yet ported: the FUSS pickers: sagitta Sprint 52 (yw13)", // PICK_HOST_FUSS
+        _ => "",
+    }
+}
+
+// THE host table (C's `PickerSpec` pointers, `picker.h:104-133`): `call`
+// is accept, preview, a search part or a picker-specific key. No ported
+// host has a key action (`action` is NULL for all four, `pickers.c:311-
+// 317`, `:414-418`, `:534-540`, `:637-644`), so the key itself is not
+// carried; the later lanes' hosts that take one add it with their kind.
+fn pk_host(mut ed: Ed, call: int, payload: int, how: int, r: Rect, part: int) -> PkAnswer {
+    match ed.picker.kind {
+        0 => pk_probe_host(mut ed, call, payload, how, r, part), // PICK_HOST_PROBE
+        1 => pickers_file_host(mut ed, call, payload, how, r), // PICK_HOST_FILE
+        2 => pickers_buffer_host(mut ed, call, payload, how), // PICK_HOST_BUFFER
+        3 => pickers_command_host(mut ed, call, payload, how, part), // PICK_HOST_COMMAND
+        4 => pickers_undo_host(mut ed, call, payload, how), // PICK_HOST_UNDO
+        _ => {
+            bug(pk_later_host(ed.picker.kind))
+            pk_no()
+        },
+    }
+}
+
+// The probe host (`pk_accept`, `pk_preview`, `pk_search_part`,
+// `test_picker.c:57-85`).
+fn pk_probe_host(mut ed: Ed, call: int, payload: int, how: int, r: Rect, part: int) -> PkAnswer {
+    if call == PK_ACCEPT {
+        ed.picker.probe_accepted = payload
+        ed.picker.probe_how = how
+        return PkAnswer { ok: true, text: "" }
+    }
+    if call == PK_PREVIEW {
+        ed.picker.probe_preview_calls += 1
+        ed.picker.probe_preview_rect = copy r
+        return pk_no()
+    }
+    if call == PK_PART {
+        if part != 0 {
+            return pk_no()
+        }
+        return PkAnswer { ok: true, text: ed.picker.probe_text }
+    }
+    pk_no()
+}
+
+// ---- counts and the selection --------------------------------------------
+
+/// `yew_picker_active` (`picker.c:99-103`).
+pub fn picker_active(ed: Ed) -> bool {
+    ed.picker.active
+}
+
+/// `yew_picker_shown` (`picker.c:105-115`): MATCHES, not drawn rows.
+pub fn picker_shown(ed: Ed) -> int {
+    if !ed.picker.active {
+        return 0
+    }
+    if ed.picker.has_search_part then ed.picker.custom_matched else filter_matched(ed.picker.filter)
+}
+
+/// `yew_picker_total` (`picker.c:117-121`).
+pub fn picker_total(ed: Ed) -> int {
+    if ed.picker.active then ed.picker.total else 0
+}
+
+// `sel_row` (`picker.c:128-150`): where the held payload sits; row 0
+// when it is gone.
+fn pk_sel_row(ed: Ed) -> int {
+    if !ed.picker.has_sel {
+        return 0
+    }
+    var i = 0
+    while i < ed.picker.top.n {
+        let idx = ed.picker.top.idx[i]
+        if idx < ed.picker.items.len && ed.picker.items[idx].payload == ed.picker.sel_payload {
+            return i
+        }
+        i += 1
+    }
+    0
+}
+
+// `sel_set_row` (`picker.c:152-168`).
+fn pk_sel_set_row(mut ed: Ed, row_in: int) {
+    if ed.picker.top.n == 0 {
+        ed.picker.has_sel = false
+        return
+    }
+    let row = if row_in >= ed.picker.top.n then ed.picker.top.n - 1 else row_in
+    let idx = ed.picker.top.idx[row]
+    if idx >= ed.picker.items.len {
+        return
+    }
+    ed.picker.sel_payload = ed.picker.items[idx].payload
+    ed.picker.has_sel = true
+}
+
+/// `yew_picker_selected` (`picker.c:170-194`): the payload UNDER THE
+/// CURSOR, not the one held — Enter never opens a row that is not shown.
+/// 0 when nothing is.
+pub fn picker_selected(ed: Ed) -> int {
+    if !ed.picker.active || ed.picker.top.n == 0 || !ed.picker.has_sel {
+        return 0
+    }
+    let row = pk_sel_row(ed)
+    if row >= ed.picker.top.n || ed.picker.top.idx[row] >= ed.picker.items.len {
+        return 0
+    }
+    ed.picker.items[ed.picker.top.idx[row]].payload
+}
+
+// ---- filtering -------------------------------------------------------------
+
+// `ensure_filter` (`picker.c:204-210`).
+fn pk_ensure_filter(mut ed: Ed) {
+    if !ed.picker.active || ed.cmdline.active {
+        return
+    }
+    cmdline_open(mut ed, PROMPT_INPUT, "")
+    ed.picker.filter_open = true
+}
+
+// `refresh_window` (`picker.c:213-221`).
+fn pk_refresh_window(mut ed: Ed) {
+    let _ = filter_top_into(
+        ed.picker.filter,
+        ed.picker.items,
+        ed.picker.path_mode,
+        mut ed.picker.top,
+        FILTER_TOPK,
+    )
+}
+
+// The filter line's text into `ed.picker.text`, in place.
+fn pk_read_line(mut ed: Ed) {
+    clear_bytes(mut ed.picker.text)
+    if !ed.cmdline.active || ed.cmdline.target_win < 0 {
+        return
+    }
+    let bi = ed.wins[ed.cmdline.target_win].buf
+    let n = text.textbuf_len(ed.bufs[bi].ec.tb)
+    var k = 0
+    while k < n {
+        (mut ed.picker.text).push(text.textbuf_byte_at(ed.bufs[bi].ec.tb, k) as byte)
+        k += 1
+    }
+}
+
+// Whether the filter line still holds `ed.picker.text` (C's compare
+// against a copy, `picker.c:854-863`: the same length is not the same
+// filter).
+fn pk_line_unchanged(ed: Ed) -> bool {
+    let bi = if ed.cmdline.active && ed.cmdline.target_win >= 0 {
+        ed.wins[ed.cmdline.target_win].buf
+    } else {
+        -1
+    }
+    let n = if bi < 0 then 0 else text.textbuf_len(ed.bufs[bi].ec.tb)
+    if n != ed.picker.text.len {
+        return false
+    }
+    var k = 0
+    while k < n {
+        if text.textbuf_byte_at(ed.bufs[bi].ec.tb, k) != ed.picker.text[k] as int {
+            return false
+        }
+        k += 1
+    }
+    true
+}
+
+// `custom_better` (`picker.c:223-243`).
+fn pk_custom_better(ed: Ed, idx: int, score: int, at: int, empty_pattern: bool) -> bool {
+    let prev = ed.picker.top.idx[at]
+    if score != ed.picker.top.score[at] {
+        return score > ed.picker.top.score[at]
+    }
+    if empty_pattern {
+        return false
+    }
+    let a = ed.picker.items[idx].label
+    let b = ed.picker.items[prev].label
+    if a.len != b.len {
+        return a.len < b.len
+    }
+    var i = 0
+    while i < a.len {
+        let x = a.bytes()[i] as int
+        let y = b.bytes()[i] as int
+        if x != y {
+            return x < y
+        }
+        i += 1
+    }
+    false
+}
+
+fn pk_fold(c: int) -> int {
+    if c >= 65 && c <= 90 then c + 32 else c
+}
+
+fn pk_boundary(c: int) -> bool {
+    c == 47 || c == 95 || c == 45 || c == 46
+}
+
+// `custom_normalize` (`picker.c:264-268`).
+fn pk_normalize(c: int) -> int {
+    if c == 10 || c == 13 || c == 9 then 32 else c
+}
+
+// `custom_candidate_reset` (`picker.c:270-278`).
+fn pk_candidate_reset(mut ed: Ed) {
+    let item = ed.picker.custom.item
+    ed.picker.custom = pick_custom_new()
+    ed.picker.custom.item = item
+}
+
+// `custom_reset` (`picker.c:280-287`).
+fn pk_custom_reset(mut ed: Ed) {
+    ed.picker.top.n = 0
+    ed.picker.custom_matched = 0
+    ed.picker.custom = pick_custom_new()
+}
+
+// `custom_part_reset` (`picker.c:289-300`).
+fn pk_part_reset(mut ed: Ed) {
+    let item = ed.picker.custom.item
+    let part = ed.picker.custom.part
+    let best = ed.picker.custom.best_score
+    ed.picker.custom = pick_custom_new()
+    ed.picker.custom.item = item
+    ed.picker.custom.part = part
+    ed.picker.custom.best_score = best
+}
+
+// `custom_rank` (`picker.c:302-325`): bounded insertion, no positions.
+fn pk_custom_rank(mut ed: Ed, idx: int, score: int, empty_pattern: bool) {
+    var at = ed.picker.top.n
+    ed.picker.custom_matched += 1
+    while at > 0 && pk_custom_better(ed, idx, score, at - 1, empty_pattern) {
+        at -= 1
+    }
+    if at >= FILTER_TOPK {
+        return
+    }
+    var k = if ed.picker.top.n < FILTER_TOPK then ed.picker.top.n else FILTER_TOPK - 1
+    while k > at {
+        ed.picker.top.idx[k] = ed.picker.top.idx[k - 1]
+        ed.picker.top.score[k] = ed.picker.top.score[k - 1]
+        ed.picker.top.npos[k] = ed.picker.top.npos[k - 1]
+        k -= 1
+    }
+    ed.picker.top.idx[at] = idx
+    ed.picker.top.score[at] = score
+    ed.picker.top.npos[at] = 0
+    if ed.picker.top.n < FILTER_TOPK {
+        ed.picker.top.n += 1
+    }
+}
+
+// `custom_consume` (`picker.c:327-355`): one byte of the joined parts
+// against the pattern, the scorer's table in flight.
+fn pk_custom_consume(mut c: PickCustom, ch: int, pattern: List[byte]) {
+    let plen = pattern.len
+    if c.total < plen && pk_fold(ch) != pk_fold(pattern[c.total] as int) {
+        c.prefix = false
+    }
+    if c.pattern_at < plen {
+        if pk_fold(ch) != pk_fold(pattern[c.pattern_at] as int) {
+            c.run = 0
+            if c.started {
+                c.score -= 1
+            }
+        } else {
+            c.started = true
+            c.score += 100
+            c.run += 1
+            if c.run >= 2 {
+                c.score += 50 * c.run
+            }
+            if c.total == 0 {
+                c.score += 200
+            } else if c.part_off != 0 &&
+                pk_boundary(pk_normalize(c.part_text.bytes()[c.part_off - 1] as int)) {
+                c.score += 150
+            }
+            c.pattern_at += 1
+        }
+    }
+    c.total += 1
+}
+
+// `custom_finish_score` (`picker.c:357-371`).
+fn pk_custom_finish(mut c: PickCustom, plen: int) -> int {
+    if c.invalid || c.pattern_at < plen {
+        return ws.FZ_NO_MATCH
+    }
+    if c.prefix && plen == c.total {
+        return 10000
+    }
+    if c.prefix && plen < c.total {
+        return 5000
+    }
+    c.score -= c.total
+    if c.score <= ws.FZ_NO_MATCH {
+        return ws.FZ_NO_MATCH + 1
+    }
+    if c.score > 2147483647 then 2147483647 else c.score
+}
+
+fn pk_now_us() -> int {
+    os_clock_ns() / 1000
+}
+
+// `custom_step` (`picker.c:376-453`): resumable, the clock read every
+// 4,096 bytes so one 8 MiB source cannot hold a frame. True when done.
+fn pk_custom_step(mut ed: Ed, n: int, budget_us: int) -> bool {
+    let started_us = if budget_us > 0 then pk_now_us() else 0
+    let plen = ed.picker.text.len
+    var completed = 0
+    while ed.picker.custom.item < n {
+        if plen == 0 {
+            pk_custom_rank(mut ed, ed.picker.custom.item, 1, true)
+            ed.picker.custom.item += 1
+            completed += 1
+            if budget_us > 0 && completed & 255 == 0 && pk_now_us() - started_us >= budget_us {
+                return false
+            }
+            continue
+        }
+        if !ed.picker.custom.part_loaded {
+            let payload = ed.picker.items[ed.picker.custom.item].payload
+            let a = pk_host(mut ed, PK_PART, payload, 0, rect(0, 0, 0, 0), ed.picker.custom.part)
+            if !a.ok {
+                let score = if ed.picker.search_parts_independent {
+                    ed.picker.custom.best_score
+                } else {
+                    pk_custom_finish(mut ed.picker.custom, plen)
+                }
+                let item = ed.picker.custom.item
+                if score != ws.FZ_NO_MATCH {
+                    pk_custom_rank(mut ed, item, score, false)
+                }
+                ed.picker.custom.item = item + 1
+                pk_candidate_reset(mut ed)
+                completed += 1
+                if budget_us > 0 && completed & 255 == 0 && pk_now_us() - started_us >= budget_us {
+                    return false
+                }
+                continue
+            }
+            ed.picker.custom.part_text = a.text
+            ed.picker.custom.part_len = a.text.len
+            ed.picker.custom.part_off = 0
+            ed.picker.custom.part_loaded = true
+            ed.picker.custom.separator_done = ed.picker.search_parts_independent ||
+                ed.picker.custom.part == 0
+        }
+        if !ed.picker.custom.separator_done {
+            pk_custom_consume(mut ed.picker.custom, 32, ed.picker.text)
+            ed.picker.custom.separator_done = true
+        }
+        while ed.picker.custom.part_off < ed.picker.custom.part_len {
+            let ch = pk_normalize(
+                ed.picker.custom.part_text.bytes()[ed.picker.custom.part_off] as int,
+            )
+            pk_custom_consume(mut ed.picker.custom, ch, ed.picker.text)
+            ed.picker.custom.part_off += 1
+            if budget_us > 0 &&
+                ed.picker.custom.total & 4095 == 0 &&
+                pk_now_us() - started_us >= budget_us {
+                return false
+            }
+        }
+        ed.picker.custom.part += 1
+        if ed.picker.search_parts_independent {
+            let score = pk_custom_finish(mut ed.picker.custom, plen)
+            if score > ed.picker.custom.best_score {
+                ed.picker.custom.best_score = score
+            }
+            pk_part_reset(mut ed)
+        } else {
+            ed.picker.custom.part_loaded = false
+        }
+        if budget_us > 0 && pk_now_us() - started_us >= budget_us {
+            return false
+        }
+    }
+    true
+}
+
+/// `yew_picker_refilter` (`picker.c:463-520`): re-rank against the
+/// filter line. Only OUR line is the pattern (`filter_open`); the
+/// selection is NOT recomputed — it is a payload (law 1).
+pub fn picker_refilter(mut ed: Ed) {
+    if !ed.picker.active {
+        return
+    }
+    let n = ed.picker.items.len
+    ed.picker.total = n
+    if n == 0 {
+        ed.picker.top.n = 0
+        ed.picker.custom_matched = 0
+        ed.picker.has_sel = false
+        ed.picker.scanning = false
+        return
+    }
+    if ed.picker.filter_open {
+        pk_read_line(mut ed)
+    } else {
+        clear_bytes(mut ed.picker.text)
+    }
+    if ed.picker.has_search_part {
+        pk_custom_reset(mut ed)
+        ed.picker.scanning = !pk_custom_step(mut ed, n, PICKER_SLICE_US)
+        if !ed.picker.has_sel {
+            pk_sel_set_row(mut ed, 0)
+        }
+        ed.picker.scroll = 0
+        return
+    }
+    let complete = filter_apply(
+        mut ed.picker.filter,
+        ed.picker.items,
+        n,
+        ed.picker.path_mode,
+        ed.picker.text,
+        ed.picker.text.len,
+        PICKER_SLICE_US,
+    )
+    ed.picker.scanning = !complete
+    pk_refresh_window(mut ed)
+    if !ed.picker.has_sel {
+        pk_sel_set_row(mut ed, 0)
+    }
+    ed.picker.scroll = 0
+}
+
+/// `yew_picker_tick` (`picker.c:528-556`): a sliced pass continues, on
+/// the idle path after input, so a keystroke wins the turn. True while
+/// more remains.
+pub fn picker_tick(mut ed: Ed) -> bool {
+    if !ed.picker.active || !ed.picker.scanning {
+        return false
+    }
+    let n = ed.picker.items.len
+    if ed.picker.has_search_part {
+        if n != ed.picker.total {
+            ed.picker.total = n
+            pk_custom_reset(mut ed)
+        }
+        ed.picker.scanning = !pk_custom_step(mut ed, n, PICKER_SLICE_US)
+        if !ed.picker.has_sel {
+            pk_sel_set_row(mut ed, 0)
+        }
+        ed.full_damage = true
+        return ed.picker.scanning
+    }
+    ed.picker.scanning = filter_step(
+        mut ed.picker.filter,
+        ed.picker.items,
+        ed.picker.path_mode,
+        PICKER_SLICE_US,
+    )
+    pk_refresh_window(mut ed)
+    if !ed.picker.has_sel {
+        pk_sel_set_row(mut ed, 0)
+    }
+    ed.full_damage = true
+    ed.picker.scanning
+}
+
+/// `yew_picker_scanning` (`picker.c:558-562`): ` scanning...` is up, and
+/// the loop must not sleep.
+pub fn picker_scanning(ed: Ed) -> bool {
+    ed.picker.active && ed.picker.scanning
+}
+
+// ---- opening and closing ---------------------------------------------------
+
+/// `yew_picker_open` (`picker.c:568-604`): a picker over `spec` (its rows
+/// copied in, as C's caller-owned spec is copied, `pk.spec = *s`),
+/// REFUSED with a message on a terminal under 24 columns or 6 rows; a
+/// host a later lane owns refuses by name. The filter line opens lazily.
+pub fn picker_open(mut ed: Ed, spec: PickerSpec) {
+    let later = pk_later_host(spec.kind)
+    if later.len != 0 {
+        ed_msg(mut ed, MSG_ERROR, later)
+        return
+    }
+    if ed.picker.active {
+        picker_close(mut ed, false)
+    }
+    if ed.grid.cols < PICKER_MIN_COLS || ed.grid.rows < PICKER_MIN_ROWS {
+        let what = if spec.title.len == 0 then "the picker" else spec.title
+        ed_msg(mut ed, MSG_ERROR, "terminal too small for {what}")
+        return
+    }
+    ed.picker.active = true
+    ed.picker.kind = spec.kind
+    ed.picker.title = copy spec.title
+    ed.picker.items = copy spec.items
+    ed.picker.has_preview = spec.has_preview
+    ed.picker.has_accept = spec.has_accept
+    ed.picker.has_action = spec.has_action
+    ed.picker.has_search_part = spec.has_search_part
+    ed.picker.search_parts_independent = spec.search_parts_independent
+    ed.picker.footer = copy spec.footer
+    ed.picker.has_footer = spec.has_footer
+    ed.picker.path_mode = spec.path_mode
+    ed.picker.filter_requires_slash = spec.filter_requires_slash
+    // `yew_filter_init` on a held filter: its storage is reused.
+    ed.picker.filter.n_total = -1
+    ed.picker.filter.n_cand = 0
+    ed.picker.filter.plen = 0
+    ed.picker.filter.scanning = false
+    ed.picker.filter.narrowing = false
+    ed.picker.top.n = 0
+    ed.picker.custom_matched = 0
+    ed.picker.custom = pick_custom_new()
+    ed.picker.total = 0
+    ed.picker.scanning = false
+    ed.picker.sel_payload = 0
+    ed.picker.has_sel = false
+    ed.picker.scroll = 0
+    ed.picker.filter_open = false
+    ed.picker.box = rect(0, 0, 0, 0)
+    clear_bytes(mut ed.picker.text)
+    picker_refilter(mut ed)
+    ed.full_damage = true
+    ed.layout_dirty = true
+}
+
+/// `yew_picker_close` (`picker.c:606-622`): the filter line with it.
+pub fn picker_close(mut ed: Ed, accepted: bool) {
+    if !ed.picker.active {
+        return
+    }
+    ed.picker.active = false
+    if ed.cmdline.active {
+        cmdline_close(mut ed, accepted)
+    }
+    ed.full_damage = true
+    ed.layout_dirty = true
+    ed.picker.top.n = 0
+    ed.picker.scanning = false
+    ed.picker.filter_open = false
+    ed.picker.filter.n_total = -1
+    ed.picker.filter.n_cand = 0
+    clear_bytes(mut ed.picker.text)
+}
+
+// ---- keys ------------------------------------------------------------------
+
+// `list_rows` (`picker.c:628-632`): the box less its title, filter line,
+// separator and footer.
+fn pk_list_rows(ed: Ed) -> int {
+    if ed.picker.box.h > 4 then ed.picker.box.h - 4 else 0
+}
+
+// `move_by` (`picker.c:634-646`): clamped, never wrapped.
+fn pk_move_by(mut ed: Ed, delta: int) {
+    if ed.picker.top.n == 0 {
+        return
+    }
+    var want = pk_sel_row(ed) + delta
+    if want < 0 {
+        want = 0
+    }
+    if want >= ed.picker.top.n {
+        want = ed.picker.top.n - 1
+    }
+    pk_sel_set_row(mut ed, want)
+}
+
+// `accept_selected` (`picker.c:648-695`): TRUE either way (law 3); a
+// split happens BEFORE the accept, and the picker closes FIRST.
+fn pk_accept_selected(mut ed: Ed, how: int) -> bool {
+    let payload = picker_selected(ed)
+    if ed.picker.top.n == 0 || !ed.picker.has_sel {
+        return true
+    }
+    if !ed.picker.has_accept {
+        picker_close(mut ed, true)
+        return true
+    }
+    if how == PICK_ACCEPT_VSPLIT || how == PICK_ACCEPT_HSPLIT {
+        let nu = pane_split(
+            mut ed,
+            ed.focus,
+            if how == PICK_ACCEPT_VSPLIT then SPLIT_V else SPLIT_H,
+        )
+        if nu < 0 {
+            ed_msg(mut ed, MSG_ERROR, "no room to split")
+            return true
+        }
+        ed.focus = nu
+        if ed.panes[nu].win >= 0 {
+            ed.win = ed.panes[nu].win
+        }
+    }
+    picker_close(mut ed, true)
+    let _ = pk_host(mut ed, PK_ACCEPT, payload, how, rect(0, 0, 0, 0), 0)
+    true
+}
+
+/// `yew_picker_select_payload` (`picker.c:697-710`): the mouse seam, by
+/// PAYLOAD (Sprint 27 §2).
+pub fn picker_select_payload(mut ed: Ed, payload: int) {
+    if !ed.picker.active {
+        return
+    }
+    ed.picker.sel_payload = payload
+    ed.picker.has_sel = true
+    ed.full_damage = true
+}
+
+/// `yew_picker_accept` (`picker.c:712-717`): what Enter does.
+pub fn picker_accept(mut ed: Ed) -> bool {
+    if !ed.picker.active {
+        return false
+    }
+    pk_accept_selected(mut ed, PICK_ACCEPT_HERE)
+}
+
+/// `yew_picker_accept_how` (`picker.c:719-728`): with the split-accepts'
+/// mode; anything else is HERE.
+pub fn picker_accept_how(mut ed: Ed, how_in: int) -> bool {
+    if !ed.picker.active {
+        return false
+    }
+    let how = if how_in == PICK_ACCEPT_VSPLIT || how_in == PICK_ACCEPT_HSPLIT {
+        how_in
+    } else {
+        PICK_ACCEPT_HERE
+    }
+    pk_accept_selected(mut ed, how)
+}
+
+/// `yew_picker_sel_cell` (`picker.c:730-749`): the selected row's cell
+/// (the +3 is the title, the filter line and the rule above the list);
+/// (false, 0, 0) when no picker is up or the list was not drawn.
+pub fn picker_sel_cell(ed: Ed) -> (bool, int, int) {
+    if !ed.picker.active || ed.picker.box.w == 0 || ed.picker.box.h == 0 {
+        return (false, 0, 0)
+    }
+    let cur = pk_sel_row(ed)
+    if cur < ed.picker.scroll {
+        return (false, 0, 0)
+    }
+    if cur - ed.picker.scroll + 3 >= ed.picker.box.h {
+        return (false, 0, 0)
+    }
+    (true, ed.picker.box.x + 1, ed.picker.box.y + 3 + (cur - ed.picker.scroll))
+}
+
+/// `yew_picker_scroll` (`picker.c:751-757`): the wheel moves the
+/// SELECTION — the list's scroll is derived from it.
+pub fn picker_scroll(mut ed: Ed, rows: int) {
+    if !ed.picker.active || rows == 0 {
+        return
+    }
+    pk_move_by(mut ed, rows)
+    ed.full_damage = true
+}
+
+/// `yew_picker_key` (`picker.c:759-870`): false only when no picker is
+/// open — an open one swallows everything (law 3). The picker's own keys
+/// first, then a host's (`action`), then the Ctrl chords, then the
+/// filter line, which takes printable text alone.
+pub fn picker_key(mut ed: Ed, key: term.Key) -> bool {
+    if !ed.picker.active {
+        return false
+    }
+    var page = pk_list_rows(ed)
+    if page == 0 {
+        page = 1
+    }
+    let c = key.code
+    if c == term.KEY_ESCAPE {
+        picker_close(mut ed, false)
+        return true
+    }
+    if c == term.KEY_ENTER {
+        return pk_accept_selected(mut ed, PICK_ACCEPT_HERE)
+    }
+    if c == term.KEY_UP || c == term.KEY_DOWN || c == term.KEY_PAGE_UP || c == term.KEY_PAGE_DOWN {
+        let d = if c == term.KEY_UP {
+            -1
+        } else if c == term.KEY_DOWN {
+            1
+        } else if c == term.KEY_PAGE_UP {
+            -page
+        } else {
+            page
+        }
+        pk_move_by(mut ed, d)
+        ed.full_damage = true
+        return true
+    }
+    if c == term.KEY_HOME {
+        pk_sel_set_row(mut ed, 0)
+        ed.full_damage = true
+        return true
+    }
+    if c == term.KEY_END {
+        pk_sel_set_row(mut ed, if ed.picker.top.n == 0 then 0 else ed.picker.top.n - 1)
+        ed.full_damage = true
+        return true
+    }
+    if (!ed.picker.filter_open || c == term.KEY_TAB) && ed.picker.has_action {
+        let a = pk_host(mut ed, PK_ACTION, picker_selected(ed), 0, rect(0, 0, 0, 0), 0)
+        if a.ok {
+            return true
+        }
+    }
+    if !ed.picker.filter_open && ed.picker.filter_requires_slash {
+        if key.text.len == 1 &&
+            key.text[0] as int == 47 &&
+            key.mods & (term.MOD_CTRL | term.MOD_ALT | term.MOD_SUPER) == 0 {
+            pk_ensure_filter(mut ed)
+            ed.full_damage = true
+        }
+        return true
+    }
+    if !ed.picker.filter_requires_slash || ed.picker.filter_open {
+        pk_ensure_filter(mut ed)
+    }
+    // Ctrl chords, for terminals that eat arrows (invariant 9).
+    if key.mods & term.MOD_CTRL != 0 && key.text.len == 0 {
+        if c == 110 || c == 78 {
+            pk_move_by(mut ed, 1)
+            ed.full_damage = true
+            return true
+        }
+        if c == 112 || c == 80 {
+            pk_move_by(mut ed, -1)
+            ed.full_damage = true
+            return true
+        }
+        if c == 118 || c == 86 {
+            return pk_accept_selected(mut ed, PICK_ACCEPT_VSPLIT)
+        }
+        if c == 115 || c == 83 {
+            return pk_accept_selected(mut ed, PICK_ACCEPT_HSPLIT)
+        }
+    }
+    // Everything else goes to the filter line; what it does not use is
+    // SWALLOWED here (law 3).
+    if ed.cmdline.active {
+        let _ = cmdline_key(mut ed, key)
+        let changed = !pk_line_unchanged(ed)
+        pk_read_line(mut ed)
+        if changed {
+            picker_refilter(mut ed)
+            ed.full_damage = true
+        }
+    }
+    true
+}
+
+// ---- drawing ---------------------------------------------------------------
+
+// A draw line into the held `ed.picker.line`, kept as C's `snprintf`
+// into `line[224]` keeps it (`picker.c:959`); nothing is allocated.
+fn pk_line_str(mut ed: Ed, s: str) {
+    var i = 0
+    while i < s.len && ed.picker.line.len < PICKER_LINE_MAX - 1 {
+        (mut ed.picker.line).push(s.bytes()[i])
+        i += 1
+    }
+}
+
+// `%u` into the held line.
+fn pk_line_int(mut ed: Ed, v: int) {
+    if v < 0 {
+        pk_line_str(mut ed, "-")
+        pk_line_int(mut ed, -v)
+        return
+    }
+    var d = 1
+    while d * 10 <= v {
+        d *= 10
+    }
+    while d > 0 {
+        if ed.picker.line.len >= PICKER_LINE_MAX - 1 {
+            return
+        }
+        (mut ed.picker.line).push((48 + v / d % 10) as byte)
+        d /= 10
+    }
+}
+
+// `draw_row` (`picker.c:876-942`): row `j` of the window.
+fn pk_draw_row(mut ed: Ed, y: int, x0: int, w: int, j: int, selected: bool) {
+    let item = ed.picker.top.idx[j]
+    let fg = term.color_default()
+    let bg = term.color_default()
+    let accent = term.color_rgb(120, 180, 255)
+    let dim = term.color_rgb(120, 120, 120)
+    var label_w = if w > 2 then w - 2 else 0
+    if label_w == 0 {
+        return
+    }
+    // The detail column is dropped under 40 cells.
+    if w >= PICKER_DETAIL_MIN_W && ed.picker.items[item].has_detail {
+        let d = ed.picker.items[item].detail
+        let (dfit, dcells) = unicode.str_clip(d.bytes(), 0, d.len, w / 3)
+        if dcells > 0 && dcells + 4 < w {
+            let dx = x0 + w - 1 - dcells
+            let _ = term.grid_puts(
+                mut ed.grid,
+                y,
+                dx,
+                d.bytes(),
+                0,
+                dfit,
+                copy dim,
+                copy bg,
+                term.ATTR_DIM,
+            )
+            label_w = dx - x0 - 2
+        }
+    }
+    let label = ed.picker.items[item].label
+    let (fit, _) = unicode.str_clip(label.bytes(), 0, label.len, label_w)
+    let at = x0 + 1
+    let _ = term.grid_puts(
+        mut ed.grid,
+        y,
+        at,
+        label.bytes(),
+        0,
+        fit,
+        copy fg,
+        copy bg,
+        if selected then term.ATTR_REVERSE else 0,
+    )
+    // Matched bytes in the accent, each re-clipped to its cell.
+    if !selected {
+        var q = 0
+        while q < ed.picker.top.npos[j] {
+            let pos = ed.picker.top.pos[j * ws.FZ_MAX_POS + q]
+            if pos >= fit {
+                break
+            }
+            let (_, pre_cells) = unicode.str_clip(label.bytes(), 0, pos, 1000)
+            if pre_cells < label_w {
+                let _ = term.grid_puts(
+                    mut ed.grid,
+                    y,
+                    at + pre_cells,
+                    label.bytes(),
+                    pos,
+                    pos + 1,
+                    copy accent,
+                    copy bg,
+                    term.ATTR_BOLD,
+                )
+            }
+            q += 1
+        }
+    }
+    if ed.picker.items[item].flags & PICK_MODIFIED != 0 && w > 2 {
+        let _ = term.grid_puts(
+            mut ed.grid,
+            y,
+            x0 + w - 1,
+            "*".bytes(),
+            0,
+            1,
+            copy accent,
+            copy bg,
+            0,
+        )
+    }
+}
+
+/// `yew_picker_draw` (`picker.c:944-1093`) over `area`: the centred box
+/// blanked and blocked, the title, the filter line (the s18 widget draws
+/// itself), the window with its regions by PAYLOAD, the footer, and the
+/// preview slot BESIDE the list.
+pub fn picker_draw(mut ed: Ed, area: Rect) {
+    if !ed.picker.active || area.w == 0 || area.h == 0 {
+        return
+    }
+    if !ed.picker.filter_requires_slash || ed.picker.filter_open {
+        pk_ensure_filter(mut ed)
+    }
+    let fg = term.color_default()
+    let bg = term.color_default()
+    let dim = term.color_rgb(120, 120, 120)
+    let max_w = if ed.picker.has_preview then PICKER_PREVIEW_MAX_W else PICKER_MAX_W
+    var w = if area.w < max_w then area.w else max_w
+    if area.w > 2 {
+        if w > area.w - 2 {
+            w = area.w - 2
+        }
+    } else {
+        w = area.w
+    }
+    var h = if area.h < PICKER_MAX_H then area.h else PICKER_MAX_H
+    if area.h > 2 {
+        if h > area.h - 2 {
+            h = area.h - 2
+        }
+    } else {
+        h = area.h
+    }
+    let x0 = area.x + (area.w - w) / 2
+    let y0 = area.y + (area.h - h) / 2
+    ed.picker.box = rect(x0, y0, w, h)
+    let rows = pk_list_rows(ed)
+    // C's zeroed `Cell`: width 0, so the fill writes styled blanks.
+    var blank = term.cell_blank()
+    blank.w = 0
+    var i = 0
+    while i < h {
+        term.grid_fill(mut ed.grid, y0 + i, x0, x0 + w, copy blank)
+        i += 1
+    }
+    // The dialog owns its rectangle: a click never falls through.
+    let b = copy ed.picker.box
+    region_add(mut ed.regions, REGION_BLOCK, b, 0)
+    let title = if ed.picker.title.len == 0 then "Pick" else ed.picker.title
+    clear_bytes(mut ed.picker.line)
+    pk_line_str(mut ed, " ")
+    pk_line_str(mut ed, title)
+    pk_line_str(mut ed, " ")
+    let _ = term.grid_puts(
+        mut ed.grid,
+        y0,
+        x0,
+        ed.picker.line,
+        0,
+        ed.picker.line.len,
+        copy fg,
+        copy bg,
+        term.ATTR_BOLD,
+    )
+    if ed.picker.filter_open && ed.cmdline.active {
+        cmdline_draw(mut ed, rect(x0, y0 + 1, w, 1))
+    } else {
+        let _ = term.grid_puts(
+            mut ed.grid,
+            y0 + 1,
+            x0,
+            " / filter".bytes(),
+            0,
+            9,
+            copy dim,
+            copy bg,
+            term.ATTR_DIM,
+        )
+    }
+    let cur = pk_sel_row(ed)
+    // Scroll to keep the selection visible, computed here, never stored
+    // as the truth.
+    if rows > 0 {
+        if cur < ed.picker.scroll {
+            ed.picker.scroll = cur
+        } else if cur >= ed.picker.scroll + rows {
+            ed.picker.scroll = cur - rows + 1
+        }
+    }
+    let row_width = if ed.picker.has_preview && w >= PICKER_PREVIEW_MIN_W then w / 2 else w
+    i = 0
+    while i < rows {
+        let idx = ed.picker.scroll + i
+        let y = y0 + 3 + i
+        if idx >= ed.picker.top.n {
+            break
+        }
+        let item = ed.picker.top.idx[idx]
+        if item >= ed.picker.items.len {
+            i += 1
+            continue
+        }
+        pk_draw_row(mut ed, y, x0, row_width, idx, idx == cur)
+        // The region payload is the item's PAYLOAD (law 1).
+        let payload = ed.picker.items[item].payload
+        region_add(mut ed.regions, REGION_PICK_ROW, rect(x0, y, row_width, 1), payload)
+        i += 1
+    }
+    clear_bytes(mut ed.picker.line)
+    pk_line_str(mut ed, " ")
+    pk_line_int(mut ed, picker_shown(ed))
+    pk_line_str(mut ed, "/")
+    pk_line_int(mut ed, ed.picker.total)
+    if ed.picker.scanning {
+        pk_line_str(mut ed, " scanning...")
+    }
+    pk_line_str(mut ed, "   ")
+    let foot = if ed.picker.has_footer {
+        ed.picker.footer
+    } else {
+        "up/down move . enter open . ^v split . esc"
+    }
+    pk_line_str(mut ed, foot)
+    let _ = term.grid_puts(
+        mut ed.grid,
+        y0 + h - 1,
+        x0,
+        ed.picker.line,
+        0,
+        ed.picker.line.len,
+        copy dim,
+        copy bg,
+        term.ATTR_DIM,
+    )
+    // The preview is a SLOT BESIDE the list, never over it, and only when
+    // the box gives both halves something readable.
+    if ed.picker.has_preview &&
+        ed.picker.has_sel &&
+        ed.picker.top.n > 0 &&
+        w >= PICKER_PREVIEW_MIN_W {
+        let split = w / 2
+        let _ = pk_host(
+            mut ed,
+            PK_PREVIEW,
+            picker_selected(ed),
+            0,
+            rect(x0 + split + 1, y0 + 3, w - split - 2, rows),
+            0,
+        )
+    }
+}

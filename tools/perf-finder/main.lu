@@ -1,0 +1,360 @@
+//! perf-finder — Sprint 26 DoD 6's finder latency gates: the port of
+//! sagitta `tests/perf/finder.c` (425 lines) at 9ace98c2, in process, over
+//! the port's `edit.filter_*` (`src/edit/filter.lu`). The same corpus
+//! (`corpus_make`, `finder.c:96-136`: 100 000 paths, random 5-12 letter
+//! stems from C's LCG, 12 directories, 5 extensions), the same 3 warm-ups
+//! and 11 trials, the worst of the trials (C's "p99 of eleven is the
+//! max", `:166-168`), each timed with `os_clock_ns` around what C times
+//! (C's `CLOCK_MONOTONIC`), and the picker's own slice budget
+//! (`edit.PICKER_SLICE_US`, C's `YEW_PICKER_SLICE_US`) handed to every
+//! call as the picker hands it:
+//!
+//!   open to paint   <= 16 ms  reset plus the first top-k (`:251-277`)
+//!   first keystroke <= 5 ms   in-frame; the rest is sliced (`:145-170`)
+//!   narrowing keys  <= 5 ms   `s` then `r`, `c`, every slice too
+//!                             (`:186-245`)
+//!   worst slice     <= 3 ms   a sliced rescan of `xq` (`:280-305`)
+//!
+//! and the informational `narrowing_total` (every slice of the narrow,
+//! not gated, `:238-242`). The open's top-k goes into a `TopK` made before
+//! the clock, as the picker holds one (C's `top[]` is on the stack). One
+//! line C has no twin of: the open again with the filter's storage
+//! already held (the picker's reopen) and the top-k's share, said apart
+//! because the port's fresh filter grows by `push` where C's reserves
+//! once (no `List` reserve, F-0011). The
+//! verdicts are C's `perf_policy.h` (strict; under `YEW_PERF_ADVISORY`
+//! only past the 100x sanity ceiling). `tools/run-perf-finder` runs C's
+//! own `perf_finder` beside it from the same run.
+//!
+//!   perf-finder                    measure; exit 1 on a failed gate
+//!   perf-finder --selftest-policy  C's policy self-test (`:332-351`)
+
+use edit
+
+const ITEMS: int = 100000
+
+const TRIALS: int = 11
+
+const WARMUPS: int = 3
+
+const SLICE_BUDGET_NS: int = 3000000
+
+const KEY_BUDGET_NS: int = 5000000
+
+const OPEN_BUDGET_NS: int = 16000000
+
+// `YEW_PERF_ADVISORY_SANITY_MULTIPLIER` (`perf_policy.h`).
+const SANITY: int = 100
+
+// `yew_perf_advisory`: set and not "0".
+fn advisory() -> bool {
+    let v = env_get("YEW_PERF_ADVISORY") else ""
+    v.len > 0 && v != "0"
+}
+
+// `yew_perf_sample_failed_i64`.
+fn sample_failed(value: int, budget: int, adv: bool) -> bool {
+    if value < 0 || budget < 0 {
+        return true
+    }
+    value > (if adv then budget * SANITY else budget)
+}
+
+// `yew_perf_sample_verdict_i64`.
+fn sample_verdict(value: int, budget: int, adv: bool) -> str {
+    if value < 0 || budget < 0 || sample_failed(value, budget, true) {
+        return " SANITY-FAIL"
+    }
+    if value > budget {
+        return if adv then " WARN" else " REGRESSION"
+    }
+    " ok"
+}
+
+// `finder_failed` (`finder.c:315-330`).
+fn finder_failed(open: int, first: int, narrowing: int, slice: int, adv: bool) -> bool {
+    sample_failed(open, OPEN_BUDGET_NS, adv) ||
+        sample_failed(first, KEY_BUDGET_NS, adv) ||
+        sample_failed(narrowing, KEY_BUDGET_NS, adv) ||
+        sample_failed(slice, SLICE_BUDGET_NS, adv)
+}
+
+// `selftest_policy` (`finder.c:332-351`).
+fn selftest_policy() -> int {
+    let o = OPEN_BUDGET_NS
+    let k = KEY_BUDGET_NS
+    let s = SLICE_BUDGET_NS
+    let m = SANITY
+    if finder_failed(o, k, k, s, false) ||
+        !finder_failed(o, k, k, s + 1, false) ||
+        finder_failed(o + 1, k + 1, k + 1, s + 1, true) ||
+        finder_failed(o * m, k * m, k * m, s * m, true) ||
+        !finder_failed(o, k, k * m + 1, s, true) ||
+        !finder_failed(-1, k, k, s, true) {
+        eprint("perf-finder: policy selftest failed")
+        return 1
+    }
+    print("perf-finder-policy: strict/advisory/sanity ok")
+    0
+}
+
+struct Lcg {
+    s: wrapping[u64],
+}
+
+fn lcg_next(mut r: Lcg) {
+    r.s = r.s * 6364136223846793005 + 1442695040888963407
+}
+
+// `corpus_make` (`finder.c:96-136`).
+fn corpus(n: int) -> List[edit.PickItem] {
+    let dirs = "src|src/ui|src/ws|src/edit|src/text|src/term|tests/unit|tests/pty|tests/fuzz|docs|vendor/lib|vendor/lib/deep/nested/path".
+        split("|")
+    let exts = "c|h|md|txt|json".split("|")
+    var r = Lcg { s: 11400714819323198485 }
+    var items = List[edit.PickItem]()
+    var i = 0
+    while i < n {
+        lcg_next(mut r)
+        let stem_len = 5 + ((r.s >> 33) % 8) as int
+        var stem = List[byte]()
+        var k = 0
+        while k < stem_len {
+            lcg_next(mut r)
+            (mut stem).push((97 + ((r.s >> 29) % 26) as int) as byte)
+            k += 1
+        }
+        let name = str_from_utf8(stem) else ""
+        let dir = dirs[((r.s >> 45) % 12) as int]
+        let ext = exts[((r.s >> 7) % 5) as int]
+        (mut items).push(edit.pick_item("{dir}/{name}.{ext}", i, 0))
+        i += 1
+    }
+    items
+}
+
+fn pat_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for x in s.bytes() {
+        (mut v).push(x)
+    }
+    v
+}
+
+// `sort_i64` (`finder.c:59-73`): insertion sort.
+fn sort_ints(mut v: List[int]) {
+    var i = 1
+    while i < v.len {
+        let key = v[i]
+        var k = i
+        while k > 0 && v[k - 1] > key {
+            v[k] = v[k - 1]
+            k -= 1
+        }
+        v[k] = key
+        i += 1
+    }
+}
+
+// `measure_first_key` (`finder.c:145-170`).
+fn measure_first_key(items: List[edit.PickItem]) -> int {
+    var samples = List[int]()
+    var t = 0
+    while t < TRIALS + WARMUPS {
+        var dt = 0
+        region trial {
+            var f = edit.filter_new()
+            edit.filter_reset(mut f, items, ITEMS, 0)
+            let pat = pat_of("s")
+            let start = os_clock_ns()
+            let _ = edit.filter_apply(mut f, items, ITEMS, true, pat, 1, edit.PICKER_SLICE_US)
+            let end = os_clock_ns()
+            dt = end - start
+        }
+        if t >= WARMUPS {
+            (mut samples).push(dt)
+        }
+        t += 1
+    }
+    sort_ints(mut samples)
+    samples[TRIALS - 1]
+}
+
+// `measure_narrowing` (`finder.c:186-245`): (worst in-frame, matched,
+// worst trial's total).
+fn measure_narrowing(items: List[edit.PickItem]) -> (int, int, int) {
+    let keys = pat_of("src")
+    var worst = 0
+    var total = 0
+    var matched = 0
+    var t = 0
+    while t < TRIALS + WARMUPS {
+        var trial_total = 0
+        region trial {
+            var f = edit.filter_new()
+            edit.filter_reset(mut f, items, ITEMS, 0)
+            var pat = List[byte]()
+            (mut pat).push(keys[0])
+            // The first key, unmeasured: it is the one allowed to slice.
+            let _ = edit.filter_apply(mut f, items, ITEMS, true, pat, 1, edit.PICKER_SLICE_US)
+            while edit.filter_step(mut f, items, true, edit.PICKER_SLICE_US) {}
+            var k = 1
+            while k < keys.len {
+                (mut pat).push(keys[k])
+                let start = os_clock_ns()
+                var more = !edit.filter_apply(
+                    mut f,
+                    items,
+                    ITEMS,
+                    true,
+                    pat,
+                    pat.len,
+                    edit.PICKER_SLICE_US,
+                )
+                let end = os_clock_ns()
+                if t >= WARMUPS && end - start > worst {
+                    worst = end - start
+                }
+                trial_total += end - start
+                while more {
+                    let s2 = os_clock_ns()
+                    more = edit.filter_step(mut f, items, true, edit.PICKER_SLICE_US)
+                    trial_total += os_clock_ns() - s2
+                    // Every slice is a frame's worth, so each must also
+                    // fit the slice budget.
+                    let s3 = os_clock_ns() - s2
+                    if t >= WARMUPS && s3 > worst {
+                        worst = s3
+                    }
+                }
+                k += 1
+            }
+            matched = edit.filter_matched(f)
+        }
+        if t >= WARMUPS && trial_total > total {
+            total = trial_total
+        }
+        t += 1
+    }
+    (worst, matched, total)
+}
+
+// `measure_open` (`finder.c:251-277`).
+fn measure_open(items: List[edit.PickItem]) -> int {
+    var samples = List[int]()
+    var t = 0
+    while t < TRIALS + WARMUPS {
+        var dt = 0
+        region trial {
+            var f = edit.filter_new()
+            var top = edit.topk_new()
+            let start = os_clock_ns()
+            edit.filter_reset(mut f, items, ITEMS, 0)
+            let _ = edit.filter_top_into(f, items, true, mut top, edit.FILTER_TOPK)
+            let end = os_clock_ns()
+            dt = end - start
+        }
+        if t >= WARMUPS {
+            (mut samples).push(dt)
+        }
+        t += 1
+    }
+    sort_ints(mut samples)
+    samples[TRIALS - 1]
+}
+
+// Not C's: the open again on a filter whose storage is already held —
+// the picker's every open after its first, the filter living in
+// `PickerState` (C's `reserve` is one allocation either way, the port's
+// fresh filter grows by `push`) — and the top-k's share of it alone.
+// Informational: (worst reopen, worst top-k).
+fn measure_open_held(items: List[edit.PickItem]) -> (int, int) {
+    var samples = List[int]()
+    var tops = List[int]()
+    var t = 0
+    while t < TRIALS + WARMUPS {
+        var dt = 0
+        var dtop = 0
+        region trial {
+            var f = edit.filter_new()
+            var top = edit.topk_new()
+            edit.filter_reset(mut f, items, ITEMS, 0)
+            let start = os_clock_ns()
+            edit.filter_reset(mut f, items, ITEMS, 0)
+            let mid = os_clock_ns()
+            let _ = edit.filter_top_into(f, items, true, mut top, edit.FILTER_TOPK)
+            let end = os_clock_ns()
+            dt = end - start
+            dtop = end - mid
+        }
+        if t >= WARMUPS {
+            (mut samples).push(dt)
+            (mut tops).push(dtop)
+        }
+        t += 1
+    }
+    sort_ints(mut samples)
+    sort_ints(mut tops)
+    (samples[TRIALS - 1], tops[TRIALS - 1])
+}
+
+// `measure_worst_slice` (`finder.c:280-305`).
+fn measure_worst_slice(items: List[edit.PickItem]) -> (int, int) {
+    var worst = 0
+    var slices = 0
+    region scan {
+        var f = edit.filter_new()
+        edit.filter_reset(mut f, items, ITEMS, 0)
+        // A pattern that is not an extension of anything forces the full
+        // sliced path.
+        let pat = pat_of("xq")
+        let _ = edit.filter_apply(mut f, items, ITEMS, true, pat, 2, edit.PICKER_SLICE_US)
+        while true {
+            let start = os_clock_ns()
+            let more = edit.filter_step(mut f, items, true, edit.PICKER_SLICE_US)
+            let end = os_clock_ns()
+            if end - start > worst {
+                worst = end - start
+            }
+            slices += 1
+            if !more || slices > 100000 {
+                break
+            }
+        }
+    }
+    (worst, slices)
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len == 1 && args[0] == "--selftest-policy" {
+        return selftest_policy()
+    }
+    if args.len != 0 {
+        eprint("usage: perf-finder [--selftest-policy]")
+        return 2
+    }
+    let adv = advisory()
+    print("perf-finder: mode {if adv then "ADVISORY" else "GATING"}")
+    let items = corpus(ITEMS)
+    let open = measure_open(items)
+    let first = measure_first_key(items)
+    let (narrowing, matched, total) = measure_narrowing(items)
+    let (slice, slices) = measure_worst_slice(items)
+    let (open_held, top) = measure_open_held(items)
+    print(
+        "perf-finder: port items={ITEMS} open_ns={open} (budget {OPEN_BUDGET_NS}){sample_verdict(open, OPEN_BUDGET_NS, adv)} first_key_ns={first} (budget {KEY_BUDGET_NS}){sample_verdict(first, KEY_BUDGET_NS, adv)}",
+    )
+    print(
+        "perf-finder: port narrowing_frame_ns={narrowing} (budget {KEY_BUDGET_NS}){sample_verdict(narrowing, KEY_BUDGET_NS, adv)} matched={matched} worst_slice_ns={slice} (budget {SLICE_BUDGET_NS}){sample_verdict(slice, SLICE_BUDGET_NS, adv)} slices={slices}",
+    )
+    print("perf-finder: port narrowing_total_ns={total} (informational, spread across idle slices)")
+    print(
+        "perf-finder: port open_held_ns={open_held} top_ns={top} (informational, the port's: the open with the filter's storage held, and its top-k)",
+    )
+    if finder_failed(open, first, narrowing, slice, adv) {
+        1
+    } else {
+        0
+    }
+}

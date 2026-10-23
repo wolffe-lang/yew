@@ -1,0 +1,538 @@
+//! edit.pickers — the picker's instances.
+//!
+//! Ports sagitta `src/ui/pickers.c` (655 lines) and `ui/pickers.h` (50) at
+//! 9ace98c2, under `s26-fuzzy-finder.md` §6 and §9: each instance is a
+//! `PickerSpec` and nothing else — no new widget, no second event loop, no
+//! private key handling (`pickers.h:4-9`).
+//!
+//! - `ed.find.file` (`pickers.c:155-319`): the workspace walked with its
+//!   ignore files, SYNCHRONOUSLY to completion as C's is ("walked to
+//!   completion here rather than sliced", `:266-273`; the C witness W1),
+//!   the one message when the walk's 200,000 cap truncated it, and the
+//!   picker over the first 4,096 paths (`YEW_PICKERS_MAX_ITEMS`, `:27`, C's
+//!   item table), the dirname the detail, the payload the path's index.
+//!   The preview CREATES NOTHING (DoD 11): one `fs_read_at` of at most 64
+//!   KiB at offset 0 (`pread`), never a `Buffer`, never the loader; a NUL
+//!   in the first 8 KiB is "binary file, N bytes"; at most 40 lines,
+//!   clipped through the width tables.
+//! - `ed.find.buffer` (`:321-421`): every tab, its display path the label,
+//!   its dirname (with the group's label in front for a member) the
+//!   detail, modified DERIVED from undo, deferred from residency, the
+//!   orphan mark from the restore; the payload the TAB ID, so a closed tab
+//!   cannot make Enter switch to whoever slid into its slot.
+//! - `ed.find.command` (`:423-543`), the palette: the registry alone, its
+//!   live non-internal rows in registry order, each searched over its name
+//!   and its help as independent parts; an argument-taking or deferred row
+//!   reopens `:` seeded with its name, any other runs.
+//! - `ed.undo.branches` (`:545-646`), closing s10 §11: the undo tree's
+//!   rows from `undo_list` and `undo_describe` with `now` PASSED IN
+//!   (`YEW_PICKERS_NOW` in the environment, the pty harness's, else the
+//!   wall clock), the depth as indentation, `> ` the current, ` *` the
+//!   saved, `+ins -del` the detail; accepting travels there.
+//!
+//! The port's shapes. C's item store and statics (`pickers.c:35-156`)
+//! are `Ed.picker`'s rows and fields; the hosts' callbacks are the arms of
+//! `edit.picker`'s one match. A preview's 64 KiB read is made inside a
+//! `copy region` and only the drawn bytes leave it — at 0.2.34 a read
+//! mints its list and there is no read into a held buffer, so C's static
+//! buffer (`pickers.c:168`) costs the port the few drawn bytes a frame
+//! (G33). The finder's walk list is held as C's `g_files` is, until the
+//! next `:find`; the old one is held to the session's end (G33).
+
+use term
+use text
+use unicode
+use ws
+
+// `pickers.c:26-33`.
+const PICKERS_MAX_ITEMS: int = 4096
+
+const PREVIEW_BYTES: int = 65536
+
+const PREVIEW_LINES: int = 40
+
+const PICKERS_PATH_MAX: int = 4096
+
+// The undo row's description (`char desc[192]`, `pickers.c:597`).
+const UNDO_DESC_MAX: int = 191
+
+// A group's label in the switcher (`char label[64]`, `pickers.c:385`).
+const GROUP_LABEL_MAX: int = 63
+
+/// `yew_pickers_set_now` (`pickers.c:38-41`): 0 reads the clock.
+pub fn pickers_set_now(mut ed: Ed, now: int) {
+    ed.picker.now = now
+}
+
+/// `yew_pickers_preview_reads` (`pickers.c:43-46`).
+pub fn pickers_preview_reads(ed: Ed) -> int {
+    ed.picker.preview_reads
+}
+
+/// `yew_pickers_preview_reset` (`pickers.c:48-51`).
+pub fn pickers_preview_reset(mut ed: Ed) {
+    ed.picker.preview_reads = 0
+}
+
+// `strtoll(s, NULL, 10)`: leading blanks, a sign, the digits there are.
+fn pk_strtoll(s: str) -> int {
+    var i = 0
+    while i < s.len &&
+        (s.bytes()[i] as int == 32 || s.bytes()[i] as int >= 9 && s.bytes()[i] as int <= 13) {
+        i += 1
+    }
+    var neg = false
+    if i < s.len && (s.bytes()[i] as int == 45 || s.bytes()[i] as int == 43) {
+        neg = s.bytes()[i] as int == 45
+        i += 1
+    }
+    var v = 0
+    while i < s.len && s.bytes()[i] as int >= 48 && s.bytes()[i] as int <= 57 {
+        v = v * 10 + (s.bytes()[i] as int - 48)
+        i += 1
+    }
+    if neg then -v else v
+}
+
+// `pickers_now` (`pickers.c:53-69`): the injected clock, then the pty
+// harness's `YEW_PICKERS_NOW`, then the wall clock in seconds.
+fn pickers_now(ed: Ed) -> int {
+    if ed.picker.now != 0 {
+        return ed.picker.now
+    }
+    let pinned = env_get("YEW_PICKERS_NOW") else ""
+    if pinned.len != 0 {
+        return pk_strtoll(pinned)
+    }
+    time_unix_ms() / 1000
+}
+
+// The directory part of `p` (up to its last `/`), or none.
+fn pk_dirname(p: str) -> (bool, str) {
+    var i = p.len
+    while i > 0 {
+        i -= 1
+        if p.bytes()[i] as int == 47 {
+            return (true, p[0..i])
+        }
+    }
+    (false, "")
+}
+
+// ---- the file finder -----------------------------------------------------
+
+/// What one preview draws, the read's own list left behind in its region.
+struct PreviewPlan {
+    ok: bool,
+    binary: bool,
+    got: int,
+    bytes: List[byte],
+    starts: List[int],
+    ends: List[int],
+}
+
+// The read and the clip of `yew_pickers_preview_file` (`pickers.c:189-
+// 226`) for a slot of `w` by `h`: one positional read of 64 KiB at 0, the
+// NUL heuristic over the first 8 KiB, at most 40 lines each clipped to
+// `w` cells — only the clipped bytes copied out.
+fn pk_preview_plan(fd: int, w: int, h: int) -> PreviewPlan {
+    copy region preview {
+        var plan = PreviewPlan {
+            ok: false,
+            binary: false,
+            got: 0,
+            bytes: List[byte](),
+            starts: List[int](),
+            ends: List[int](),
+        }
+        let buf = fs_read_at(fd, 0, PREVIEW_BYTES) else |_| List[byte]()
+        let got = buf.len
+        if got > 0 {
+            plan.ok = true
+            plan.got = got
+            var i = 0
+            while i < got && i < 8192 {
+                if buf[i] as int == 0 {
+                    plan.binary = true
+                    break
+                }
+                i += 1
+            }
+            if !plan.binary {
+                var at = 0
+                var row = 0
+                while at < got && row < h && row < PREVIEW_LINES {
+                    var eol = at
+                    while eol < got && buf[eol] as int != 10 {
+                        eol += 1
+                    }
+                    let (fit, _) = unicode.str_clip(buf, at, eol, w)
+                    (mut plan.starts).push(plan.bytes.len)
+                    var k = at
+                    while k < at + fit {
+                        (mut plan.bytes).push(buf[k])
+                        k += 1
+                    }
+                    (mut plan.ends).push(plan.bytes.len)
+                    row += 1
+                    at = eol + 1
+                }
+            }
+        }
+        plan
+    }
+}
+
+/// `yew_pickers_preview_file` (`pickers.c:166-227`): the finder's row
+/// `payload` previewed into `r` WITHOUT a `Buffer` or a `TextBuf` (DoD
+/// 11): one counted read, then "binary file, N bytes" or the first lines.
+pub fn pickers_preview_file(mut ed: Ed, payload: int, r: Rect) {
+    if payload < 0 || payload >= ed.picker.files.paths.len {
+        return
+    }
+    if r.w == 0 || r.h == 0 {
+        return
+    }
+    let path = "{ws_root(ed)}/{ed.picker.files.paths[payload]}"
+    if path.len >= PICKERS_PATH_MAX {
+        return
+    }
+    let fd = fs_open(path) else {
+        return
+    }
+    ed.picker.preview_reads += 1
+    let plan = pk_preview_plan(fd, r.w, r.h)
+    fs_close(fd) else |_| {}
+    if !plan.ok {
+        return
+    }
+    let dim = term.color_rgb(140, 140, 140)
+    let bg = term.color_default()
+    if plan.binary {
+        let line = "binary file, {plan.got} bytes"
+        let _ = term.grid_puts(
+            mut ed.grid,
+            r.y,
+            r.x,
+            line.bytes(),
+            0,
+            line.len,
+            copy dim,
+            copy bg,
+            term.ATTR_DIM,
+        )
+        return
+    }
+    var row = 0
+    while row < plan.starts.len {
+        let _ = term.grid_puts(
+            mut ed.grid,
+            r.y + row,
+            r.x,
+            plan.bytes,
+            plan.starts[row],
+            plan.ends[row],
+            copy dim,
+            copy bg,
+            term.ATTR_DIM,
+        )
+        row += 1
+    }
+}
+
+// `find_file_accept` (`pickers.c:229-241`): the path opened as a tab.
+fn pk_find_file_accept(mut ed: Ed, payload: int) -> bool {
+    if payload < 0 || payload >= ed.picker.files.paths.len {
+        return false
+    }
+    let path = "{ws_root(ed)}/{ed.picker.files.paths[payload]}"
+    if path.len >= PICKERS_PATH_MAX {
+        return false
+    }
+    tab_open(mut ed, path) >= 0
+}
+
+/// The file host's calls (`pickers.c:166-241`).
+pub fn pickers_file_host(mut ed: Ed, call: int, payload: int, how: int, r: Rect) -> PkAnswer {
+    let _ = how
+    if call == PK_ACCEPT {
+        return PkAnswer { ok: pk_find_file_accept(mut ed, payload), text: "" }
+    }
+    if call == PK_PREVIEW {
+        pickers_preview_file(mut ed, payload, r)
+    }
+    pk_no()
+}
+
+/// `ed.find.file` (`yew_find_cmd_file`, `pickers.c:243-319`).
+pub fn find_cmd_file(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    var o = ws.walk_opts()
+    o.use_gitignore = true
+    let root = ws_root(ed)
+    let (ok, files) = ws.walk_all(root, o)
+    ed.picker.files = files
+    ed.picker.files_ready = true
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "cannot read {root}")
+        return CMD_ERR_IO
+    }
+    if ed.picker.files.truncated {
+        ed_msg(
+            mut ed,
+            MSG_WARN,
+            "showing the first {ed.picker.files.paths.len} files; narrow the workspace",
+        )
+    }
+    var items = List[PickItem]()
+    var i = 0
+    while i < ed.picker.files.paths.len && items.len < PICKERS_MAX_ITEMS {
+        let rel = ed.picker.files.paths[i]
+        let (has_dir, dir) = pk_dirname(rel)
+        (mut items).push(PickItem {
+            label: rel,
+            detail: dir,
+            has_detail: has_dir,
+            payload: i,
+            flags: 0,
+        })
+        i += 1
+    }
+    var spec = picker_spec(PICK_HOST_FILE, "Find file", take items)
+    spec.has_preview = true
+    spec.path_mode = true
+    picker_open(mut ed, spec)
+    CMD_OK
+}
+
+// ---- the buffer switcher -------------------------------------------------
+
+// `find_buffer_accept` (`pickers.c:325-345`): resolved from the TAB ID;
+// the switch hydrates a deferred tab.
+fn pk_find_buffer_accept(mut ed: Ed, payload: int) -> bool {
+    let idx = tab_index_of_id(ed, payload)
+    if idx < 0 {
+        return false
+    }
+    tab_switch(mut ed, idx)
+    true
+}
+
+/// The buffer host's calls (`pickers.c:325-345`).
+pub fn pickers_buffer_host(mut ed: Ed, call: int, payload: int, how: int) -> PkAnswer {
+    let _ = how
+    if call == PK_ACCEPT {
+        return PkAnswer { ok: pk_find_buffer_accept(mut ed, payload), text: "" }
+    }
+    pk_no()
+}
+
+// `label` cut as `yew_group_label(..., label, 64)` cuts it, at a
+// character boundary.
+fn pk_cut(s: str, max: int) -> str {
+    if s.len <= max {
+        return s
+    }
+    var n = max
+    while n > 0 && s.bytes()[n] as int & 192 == 128 {
+        n -= 1
+    }
+    s[0..n]
+}
+
+/// `ed.find.buffer` (`yew_find_cmd_buffer`, `pickers.c:347-421`).
+pub fn find_cmd_buffer(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    var items = List[PickItem]()
+    var i = 0
+    while i < ed.tabs.len && items.len < PICKERS_MAX_ITEMS {
+        let display = tab_display_path(ed.tabs[i])
+        let label = if display.len == 0 then "untitled" else display
+        let (has_dir, dir) = pk_dirname(display)
+        var detail = dir
+        if has_dir && ed.tabs[i].group_id != 0 {
+            detail = "{pk_cut(group_label(ed, ed.tabs[i].group_id), GROUP_LABEL_MAX)}  {dir}"
+        }
+        var flags = 0
+        if tab_modified(ed, i) {
+            flags = flags | PICK_MODIFIED
+        }
+        if !tab_is_resident(ed, i) {
+            flags = flags | PICK_DEFERRED
+        }
+        if ed.tabs[i].missing_at_restore {
+            flags = flags | PICK_ORPHAN
+        }
+        (mut items).push(PickItem {
+            label: label,
+            detail: detail,
+            has_detail: has_dir,
+            payload: ed.tabs[i].tab_id,
+            flags: flags,
+        })
+        i += 1
+    }
+    var spec = picker_spec(PICK_HOST_BUFFER, "Switch buffer", take items)
+    spec.path_mode = true
+    picker_open(mut ed, spec)
+    CMD_OK
+}
+
+// ---- the command palette -------------------------------------------------
+
+// `find_command_accept` (`pickers.c:443-492`): an argument-taking or
+// deferred row reopens `:` seeded with its name (its argspec, completion
+// and pinned refusal live there); any other runs as a key would run it.
+fn pk_find_command_accept(mut ed: Ed, payload: int) -> bool {
+    if payload <= 0 {
+        return false
+    }
+    let id = payload
+    if !cmd_active(ed.reg, id) || ed.reg.entries[id - 1].flags & CMD_INTERNAL != 0 {
+        ed_msg(mut ed, MSG_ERROR, "command is no longer available")
+        return false
+    }
+    let name = ed.reg.entries[id - 1].name
+    let arity = ed.reg.entries[id - 1].arity
+    if arity != ARITY_NONE || ed.reg.entries[id - 1].flags & CMD_DEFERRED != 0 {
+        let short = if name.starts_with("ed.") then name[3..name.len] else name
+        let seed = if arity == ARITY_NONE then short else "{short} "
+        if seed.len >= 256 {
+            ed_msg(mut ed, MSG_ERROR, "command name is too long")
+            return false
+        }
+        cmdline_open(mut ed, PROMPT_CMD, seed)
+        return true
+    }
+    var cx = cmdctx_new(ed.win, SRC_KEY)
+    cx.count = 1
+    let status = ed_cmd_invoke(mut ed, id, mut cx)
+    if status != CMD_OK && !ed.msg.active {
+        ed_msg(mut ed, MSG_ERROR, "command failed: {name}")
+    }
+    status == CMD_OK
+}
+
+/// The palette host's calls (`pickers.c:427-492`): part 0 the name, part
+/// 1 the help.
+pub fn pickers_command_host(mut ed: Ed, call: int, payload: int, how: int, part: int) -> PkAnswer {
+    let _ = how
+    if call == PK_ACCEPT {
+        return PkAnswer { ok: pk_find_command_accept(mut ed, payload), text: "" }
+    }
+    if call == PK_PART {
+        if payload <= 0 || part > 1 || !cmd_active(ed.reg, payload) {
+            return pk_no()
+        }
+        let t = if part == 0 {
+            ed.reg.entries[payload - 1].name
+        } else {
+            ed.reg.entries[payload - 1].help
+        }
+        return PkAnswer { ok: true, text: t }
+    }
+    pk_no()
+}
+
+/// `ed.find.command` (`yew_find_cmd_command`, `pickers.c:494-543`).
+pub fn find_cmd_command(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    var items = List[PickItem]()
+    let n = cmd_count(ed.reg)
+    var i = 0
+    while i < n && items.len < PICKERS_MAX_ITEMS {
+        let id = i + 1
+        i += 1
+        if !cmd_active(ed.reg, id) || ed.reg.entries[id - 1].flags & CMD_INTERNAL != 0 {
+            continue
+        }
+        let deferred = ed.reg.entries[id - 1].flags & CMD_DEFERRED != 0
+        (mut items).push(PickItem {
+            label: ed.reg.entries[id - 1].name,
+            detail: ed.reg.entries[id - 1].help,
+            has_detail: true,
+            payload: id,
+            flags: if deferred then PICK_DEFERRED else 0,
+        })
+    }
+    var spec = picker_spec(PICK_HOST_COMMAND, "Command palette", take items)
+    spec.has_search_part = true
+    spec.search_parts_independent = true
+    spec.path_mode = false
+    picker_open(mut ed, spec)
+    CMD_OK
+}
+
+// ---- the undo branch picker ----------------------------------------------
+
+// `undo_branch_accept` (`pickers.c:549-568`): the document travels to
+// the row's state.
+fn pk_undo_branch_accept(mut ed: Ed, payload: int) -> bool {
+    let doc = ed_doc(ed)
+    let w = ed.win
+    if doc < 0 || w < 0 {
+        return false
+    }
+    let b = ed.wins[w].buf
+    edit_take(mut ed, w)
+    let ok = text.undo_to(mut ed.bufs[b].ec, payload)
+    edit_give(mut ed, w)
+    ed_finish_edit(mut ed, w)
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "cannot reach that undo state")
+    }
+    ok
+}
+
+/// The undo host's calls (`pickers.c:549-568`).
+pub fn pickers_undo_host(mut ed: Ed, call: int, payload: int, how: int) -> PkAnswer {
+    let _ = how
+    if call == PK_ACCEPT {
+        return PkAnswer { ok: pk_undo_branch_accept(mut ed, payload), text: "" }
+    }
+    pk_no()
+}
+
+/// `ed.undo.branches` (`yew_undo_cmd_branches`, `pickers.c:570-646`).
+pub fn undo_cmd_branches(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let now = pickers_now(ed)
+    let doc = ed_doc(ed)
+    if doc < 0 {
+        ed_msg(mut ed, MSG_ERROR, "no undo history here")
+        return CMD_ERR_STATE
+    }
+    let info = text.undo_list(ed.bufs[doc].ec.undo)
+    var items = List[PickItem]()
+    var i = 0
+    while i < info.len && items.len < PICKERS_MAX_ITEMS {
+        var desc = text.undo_describe(ed.bufs[doc].ec.undo, info[i].id, now)
+        if desc.len > UNDO_DESC_MAX {
+            desc = desc[0..UNDO_DESC_MAX]
+        }
+        let indent = if info[i].depth < 16 then info[i].depth else 16
+        var label = ""
+        var k = 0
+        while k < indent {
+            label = label + "  "
+            k += 1
+        }
+        let cur = if info[i].is_current then "> " else ""
+        let saved = if info[i].is_saved then " *" else ""
+        label = "{label}{cur}{desc}{saved}"
+        let trimmed = if info[i].is_trimmed then " (trimmed)" else ""
+        let detail = "+{info[i].bytes_ins} -{info[i].bytes_del}{trimmed}"
+        (mut items).push(PickItem {
+            label: label,
+            detail: detail,
+            has_detail: true,
+            payload: info[i].id,
+            flags: if info[i].on_current_path then 0 else PICK_DEFERRED,
+        })
+        i += 1
+    }
+    // NOT path_mode: an undo description is prose.
+    let spec = picker_spec(PICK_HOST_UNDO, "Undo branches", take items)
+    picker_open(mut ed, spec)
+    CMD_OK
+}

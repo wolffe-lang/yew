@@ -1,0 +1,292 @@
+//! perf-mouse — Sprint 27 DoD 13's motion-burst gate and its two
+//! descendants: the port of sagitta `tests/perf/mouse.c` (451 lines) at
+//! 9ace98c2, in process, the same fixture C builds (a scratch buffer and
+//! eight tabs at `/tmp/yew-perfmouse-N.txt` on a 24x80 grid, tab 0
+//! active, `now_ms = 1000`, `main`, `:342-451`) and the same three
+//! measurements, each timed with `os_clock_ns` (C's `CLOCK_MONOTONIC`):
+//!
+//!   burst           a live tab drag over the strip, 1,000 held motions,
+//!                   11 trials, the median <= 5 ms and NO render
+//!                   (`measure_burst`, `:123-147`)
+//!   menu_hover      1,000 unheld motions sweeping an open 20-row menu,
+//!                   the loop emulated (render when damage was marked):
+//!                   at most one frame per row, 20 (`:164-216`)
+//!   chevron_hover   1,000 unheld motions parked on the `>N` chevron, the
+//!                   clock driven ten reveal steps: at most 10 frames
+//!                   (`:231-276`)
+//!
+//! C's third burst claim — no allocation in the router — is read from
+//! its SOURCE (`router_allocates`, `:279-312`: no `malloc(` and kin in
+//! `src/ui/mouse.c`); the port reads it from the REGION LEDGER instead:
+//! the editor lives in one region, and `region_bytes` around each trial's
+//! 1,000 router calls is the router's allocation on this tier
+//! (`router_bytes=`, the worst trial; the native and release tiers charge
+//! a push into a list with room nothing, docs/MAP.md G12). Verdicts are
+//! strict; `tools/run-perf-mouse` runs C's own `build/perf_mouse` beside
+//! it from the same run and prints the port/C ratios.
+
+use edit
+use term
+
+const PERF_MOUSE_EVENTS: int = 1000
+
+const PERF_MOUSE_TRIALS: int = 11
+
+const PERF_MOUSE_BUDGET_NS: int = 5000000
+
+const PERF_MOUSE_MENU_ROWS: int = 20
+
+const PERF_MOUSE_HOVER_STEPS: int = 10
+
+// `sort_i64` (`:89-103`): insertion sort, eleven samples.
+fn sort_ints(mut v: List[int]) {
+    var i = 1
+    while i < v.len {
+        let key = v[i]
+        var k = i
+        while k > 0 && v[k - 1] > key {
+            v[k] = v[k - 1]
+            k -= 1
+        }
+        v[k] = key
+        i += 1
+    }
+}
+
+// `motion_at` (`:105-116`).
+fn motion_at(x: int, y: int) -> term.Key {
+    var k = term.key_new()
+    k.kind = term.EV_MOUSE
+    k.button = term.MB_LEFT
+    k.ev = term.KEY_REPEAT
+    k.col = x
+    k.row = y
+    k
+}
+
+fn fixture() -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    ed.grid = term.grid_new(24, 80)
+    ed.grid_ready = true
+    var i = 0
+    while i < 8 {
+        let _ = edit.tab_open(mut ed, "/tmp/yew-perfmouse-{i}.txt")
+        i += 1
+    }
+    edit.tab_switch(mut ed, 0)
+    edit.ed_layout(mut ed)
+    ed.now_ms = 1000
+    ed
+}
+
+// `measure_burst`'s set-up (`:123-136`): a frame, then a press on the
+// first tab.
+fn burst_begin(mut ed: edit.Ed) {
+    edit.region_frame_begin(mut ed.regions)
+    let tr = copy ed.tab_strip_rect
+    edit.tab_strip_draw(mut ed, tr)
+    var press = motion_at(2, 0)
+    press.ev = term.KEY_PRESS
+    edit.mouse_event(mut ed, press)
+}
+
+// `measure_burst`'s timed loop (`:137-147`): 1,000 held motions across
+// the strip — the most expensive motion path there is. C's `Key` is a
+// stack value; the port's carries a `text` list, so ONE key is made
+// before the clock starts and re-aimed per report — a `term.key_new` per
+// report would charge the harness's 48 bytes to the router's ledger.
+fn burst_run(mut ed: edit.Ed, mut m: term.Key) -> int {
+    let start = os_clock_ns()
+    var i = 0
+    while i < PERF_MOUSE_EVENTS {
+        m.col = 1 + i % 70
+        m.row = 0
+        edit.mouse_event(mut ed, m)
+        i += 1
+    }
+    os_clock_ns() - start
+}
+
+fn emulate_loop(mut ed: edit.Ed) {
+    if ed.overlay_dirty || ed.full_damage || ed.footer_dirty {
+        edit.ed_render(mut ed)
+    }
+}
+
+// `measure_menu_hover` (`:164-216`): the burst with a menu up. Answers
+// (ok, renders, elapsed ns).
+fn measure_menu_hover(mut ed: edit.Ed) -> (bool, int, int) {
+    edit.ctx_begin(mut ed.ctx, edit.CTX_KIND_DOC)
+    var i = 0
+    while i < PERF_MOUSE_MENU_ROWS {
+        let label = if i < 10 then "Row 0{i}" else "Row {i}"
+        edit.ctx_item(mut ed.ctx, label, "C-x", edit.CTXA_PALETTE, true, 0)
+        i += 1
+    }
+    if !edit.ctx_show(mut ed.ctx, 0, 0, edit.rect(0, 0, ed.grid.cols, ed.grid.rows - 1)) {
+        eprint("perf_mouse: the menu would not open")
+        return (false, 0, 0)
+    }
+    edit.region_frame_begin(mut ed.regions)
+    edit.mouse_menu_draw(mut ed)
+    let b = edit.ctx_box(ed.ctx)
+    ed.full_damage = false
+    ed.overlay_dirty = false
+    ed.footer_dirty = false
+    // NO BUTTON HELD: base 35. One key, re-aimed (as the burst's).
+    var m = motion_at(0, 0)
+    m.button = term.MB_NONE
+    let before = ed.render.frames
+    let start = os_clock_ns()
+    i = 0
+    while i < PERF_MOUSE_EVENTS {
+        // ONE SWEEP down the box, fifty reports a row, with a jitter.
+        m.col = b.x + 1 + i % 3
+        m.row = b.y + 1 + i * PERF_MOUSE_MENU_ROWS / PERF_MOUSE_EVENTS
+        edit.mouse_event(mut ed, m)
+        emulate_loop(mut ed)
+        i += 1
+    }
+    let elapsed = os_clock_ns() - start
+    edit.ctx_close(mut ed.ctx)
+    (true, ed.render.frames - before, elapsed)
+}
+
+// `measure_chevron_hover` (`:231-276`): parked on the chevron, the clock
+// driven. Answers (ok, renders, elapsed ns).
+fn measure_chevron_hover(mut ed: edit.Ed) -> (bool, int, int) {
+    edit.region_frame_begin(mut ed.regions)
+    let tr = copy ed.tab_strip_rect
+    edit.tab_strip_draw(mut ed, tr)
+    var chev = 0
+    var found = false
+    var x = 0
+    while x < ed.grid.cols && !found {
+        let hit = edit.region_find(ed.regions, x, ed.tab_strip_rect.y)
+        if hit.kind == edit.REGION_TAB_SCROLL && hit.payload > 0 {
+            chev = x
+            found = true
+        }
+        x += 1
+    }
+    if !found {
+        eprint("perf_mouse: the strip drew no chevron")
+        return (false, 0, 0)
+    }
+    ed.full_damage = false
+    ed.overlay_dirty = false
+    ed.footer_dirty = false
+    var m = motion_at(chev, ed.tab_strip_rect.y)
+    m.button = term.MB_NONE
+    let before = ed.render.frames
+    let start = os_clock_ns()
+    var i = 0
+    while i < PERF_MOUSE_EVENTS {
+        edit.mouse_event(mut ed, m)
+        if (i + 1) % (PERF_MOUSE_EVENTS / PERF_MOUSE_HOVER_STEPS) == 0 {
+            ed.now_ms += edit.HOVER_SCROLL_MS
+            let now = ed.now_ms
+            edit.mouse_tick(mut ed, now)
+        }
+        emulate_loop(mut ed)
+        i += 1
+    }
+    (true, ed.render.frames - before, os_clock_ns() - start)
+}
+
+fn verdict(ok: bool) -> str {
+    if ok then " ok" else " FAIL"
+}
+
+fn main() -> int {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    print("perf-mouse: mode strict")
+    var status = 0
+    // The samples are made outside the editor's region and only written
+    // inside it, so the trials allocate nothing of their own (E1010).
+    var samples = List[int]()
+    var z = 0
+    while z < PERF_MOUSE_TRIALS {
+        (mut samples).push(0)
+        z += 1
+    }
+    var worst_renders = 0
+    var worst_bytes = 0
+    var first_bytes = 0
+    var hover_ok = false
+    var hover_renders = 0
+    var hover_ns = 0
+    var chev_ok = false
+    var chev_renders = 0
+    var chev_ns = 0
+    region probe {
+        var ed = fixture()
+        var t = 0
+        while t < PERF_MOUSE_TRIALS {
+            burst_begin(mut ed)
+            let frames0 = ed.render.frames
+            var key = motion_at(0, 0)
+            let b0 = region_bytes(probe)
+            let dt = burst_run(mut ed, mut key)
+            let grew = region_bytes(probe) - b0
+            let renders = ed.render.frames - frames0
+            edit.mouse_cancel(mut ed)
+            if t == 0 {
+                first_bytes = grew
+            }
+            if grew > worst_bytes {
+                worst_bytes = grew
+            }
+            if renders > worst_renders {
+                worst_renders = renders
+            }
+            samples[t] = dt
+            t += 1
+        }
+        // The hover gates render through the editor's own Render: no
+        // tty, so a frame is counted and written nowhere (C points
+        // `tty.wfd` at /dev/null).
+        ed.render = term.render_new(term.caps_new(), term.env_of(Map[str, str]()))
+        ed.render_ready = true
+        let (hok, hr, hns) = measure_menu_hover(mut ed)
+        hover_ok = hok
+        hover_renders = hr
+        hover_ns = hns
+        let (cok, cr, cns) = measure_chevron_hover(mut ed)
+        chev_ok = cok
+        chev_renders = cr
+        chev_ns = cns
+        ed.render_ready = false
+    }
+    if !hover_ok || !chev_ok {
+        return 1
+    }
+    sort_ints(mut samples)
+    let median = samples[PERF_MOUSE_TRIALS / 2]
+    let hover_pass = hover_renders <= PERF_MOUSE_MENU_ROWS
+    print(
+        "perf-mouse: menu_hover burst={PERF_MOUSE_EVENTS} renders={hover_renders} (budget {PERF_MOUSE_MENU_ROWS}) hover_ns={hover_ns}{verdict(hover_pass)}",
+    )
+    if !hover_pass {
+        status = 1
+    }
+    let chev_pass = chev_renders <= PERF_MOUSE_HOVER_STEPS
+    print(
+        "perf-mouse: chevron_hover burst={PERF_MOUSE_EVENTS} renders={chev_renders} (budget {PERF_MOUSE_HOVER_STEPS}) chevron_ns={chev_ns}{verdict(chev_pass)}",
+    )
+    if !chev_pass {
+        status = 1
+    }
+    let time_pass = median > 0 && median <= PERF_MOUSE_BUDGET_NS
+    print(
+        "perf-mouse: burst={PERF_MOUSE_EVENTS} events_ns={median} (budget {PERF_MOUSE_BUDGET_NS}){verdict(time_pass)} renders={worst_renders} (budget 0){verdict(worst_renders == 0)}",
+    )
+    print(
+        "perf-mouse: router_bytes={worst_bytes} (first trial {first_bytes}){verdict(worst_bytes == 0)}",
+    )
+    if !time_pass || worst_renders != 0 || worst_bytes != 0 {
+        status = 1
+    }
+    status
+}

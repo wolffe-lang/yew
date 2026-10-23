@@ -1,0 +1,1772 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_drag.c` (2,678 lines) at
+//! 9ace98c2, one test per C test in registry order
+//! (`tests/unit/registry.c:2627-2666`): Sprint 27 §4's tab and group
+//! drag — NOTHING IN THE TAB ARRAY CHANGES UNTIL THE DROP; the dwell reads
+//! the PRE-DRAG slot table, never the previewed region table — and the
+//! Sprint 57.14 pictures over it: row 1 as the group exit (§1), the float
+//! and the gap (§2), the dwell's two-flash cue (§3), the group hover band,
+//! row 2's member preview, and 57.15's user-owned offset under a drag.
+//!
+//! C's fixture (`dg_fixture`, `:40-67`) is `yew_ed_init` +
+//! `yew_ed_open_scratch` + a 24x80 grid + `extra` tabs opened as
+//! `/tmp/yew-drag-<i>.txt` + `yew_ed_layout` with `now_ms = 1000`; the
+//! port's is `edit.ed_new` + `edit.ed_open_scratch` + `term.grid_new(24,
+//! 80)` + `edit.tab_open` + `edit.ed_layout`. C's `f->ids[i]` (the tab id
+//! of the i-th opened tab) is `ed.tabs[i + 1].tab_id` read before the
+//! gesture; `ed.tabs.scroll` is `ed.tab_scroll`; `yew_region_hit` is
+//! `edit.region_find` (the same lookup, without the empty-query count
+//! the hit path keeps for the registry's own diagnostics). C's two
+//! `_Static_assert`s on `YEW_DRAG_DWELL_MS == 500` and `YEW_DRAG_FLASH_MS
+//! == 125` (`:403-406`) are run-time asserts in the 500/499 case.
+//!
+//! The per-case selector `YEW_DRAG_CASE=N` (the registry index within
+//! this file, 0-based) runs one case, for the checked machine's step
+//! budget (G29).
+
+use edit
+use term
+
+// `dg_fixture` + `dg_open` (`test_drag.c:40-67`).
+fn fixture(extra: int) -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    ed.grid = term.grid_new(24, 80)
+    ed.grid_ready = true
+    var i = 0
+    while i < extra {
+        let idx = edit.tab_open(mut ed, "/tmp/yew-drag-{i}.txt")
+        assert(idx >= 0, "open yew-drag-{i}")
+        i += 1
+    }
+    edit.ed_layout(mut ed)
+    ed.now_ms = 1000
+    ed
+}
+
+// `dg_paint` (`:74-80`): one frame of the strip — the regions AND the
+// pre-drag slot table are both products of the render.
+fn paint(mut ed: edit.Ed) {
+    if ed.layout_dirty {
+        edit.ed_layout(mut ed)
+    }
+    edit.region_frame_begin(mut ed.regions)
+    let r = copy ed.tab_strip_rect
+    edit.tab_strip_draw(mut ed, r)
+}
+
+// `dg_ev` (`:82-93`): a left-button report.
+fn ev(kind: int, x: int, y: int) -> term.Key {
+    var k = term.key_new()
+    k.kind = term.EV_MOUSE
+    k.button = term.MB_LEFT
+    k.ev = kind
+    k.col = x
+    k.row = y
+    k
+}
+
+fn press(mut ed: edit.Ed, x: int, y: int) {
+    edit.mouse_event(mut ed, ev(term.KEY_PRESS, x, y))
+}
+
+fn motion(mut ed: edit.Ed, x: int, y: int) {
+    edit.mouse_event(mut ed, ev(term.KEY_REPEAT, x, y))
+}
+
+fn release(mut ed: edit.Ed, x: int, y: int) {
+    edit.mouse_event(mut ed, ev(term.KEY_RELEASE, x, y))
+}
+
+fn tick(mut ed: edit.Ed, now: int) {
+    edit.mouse_tick(mut ed, now)
+}
+
+fn hit(ed: edit.Ed, x: int, y: int) -> edit.Region {
+    edit.region_find(ed.regions, x, y)
+}
+
+// `dg_slot_x` (`:96-107`): the first cell row-1 slot `slot` occupies.
+fn slot_x(ed: edit.Ed, slot: int) -> int {
+    var x = 0
+    while x < 80 {
+        if edit.strip_slot_at(ed, x, 0) == slot {
+            return x
+        }
+        x += 1
+    }
+    assert(false, "slot {slot} is on screen")
+    0
+}
+
+// `TabSnap` / `dg_snap` / `dg_snap_eq` (`:110-138`): the order and the
+// membership, as ids and ordinals.
+struct TabSnap {
+    id: List[int],
+    gid: List[int],
+    ordinal: List[int],
+}
+
+fn snap(ed: edit.Ed) -> TabSnap {
+    var id = List[int]()
+    var gid = List[int]()
+    var ordinal = List[int]()
+    var i = 0
+    while i < edit.tab_count(ed) {
+        (mut id).push(ed.tabs[i].tab_id)
+        (mut gid).push(ed.tabs[i].group_id)
+        (mut ordinal).push(ed.tabs[i].group_ordinal)
+        i += 1
+    }
+    TabSnap { id: id, gid: gid, ordinal: ordinal }
+}
+
+fn snap_eq(a: TabSnap, b: TabSnap) -> bool {
+    if a.id.len != b.id.len {
+        return false
+    }
+    var i = 0
+    while i < a.id.len {
+        if a.id[i] != b.id[i] || a.gid[i] != b.gid[i] || a.ordinal[i] != b.ordinal[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `dg_make_group` (`:374-382`).
+fn make_group(mut ed: edit.Ed, a: int, b: int) -> int {
+    let g = edit.group_create(mut ed, "/src", "grp")
+    assert(g != 0, "the group is made")
+    edit.group_add_member(mut ed, g, a)
+    edit.group_add_member(mut ed, g, b)
+    g
+}
+
+// `dg_slot_of_payload` (`:385-396`): the row-1 slot whose PRE-DRAG
+// payload is `want`.
+fn slot_of_payload(ed: edit.Ed, want: int) -> int {
+    var i = 0
+    while i < edit.strip_slot_count(ed) {
+        let (ok, got) = edit.strip_pre_payload(ed, i)
+        if ok && got == want {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// The usual group fixture: `extra` tabs, members `a` and `b`, tab
+// `active` switched to, laid out and painted.
+fn group_fixture(extra: int, a: int, b: int, active: int) -> (edit.Ed, int) {
+    var ed = fixture(extra)
+    let g = make_group(mut ed, a, b)
+    edit.tab_switch(mut ed, active)
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    (ed, g)
+}
+
+// `dg_row2_x` (`:897-910`): the middle of the row-2 member entry whose
+// payload is `want` (its first cell, as C's loop finds it).
+fn row2_x(ed: edit.Ed, want: int) -> int {
+    var x = 0
+    while x < 80 {
+        let h = hit(ed, x, 1)
+        if h.kind == edit.REGION_TAB && h.payload == want {
+            return x
+        }
+        x += 1
+    }
+    assert(false, "row 2 draws {want}")
+    0
+}
+
+// `dg_row_text` (`:1090-1102`): grid row `y` from column `x0`, single-byte
+// cells only.
+fn row_text_from(ed: edit.Ed, y: int, x0: int) -> List[byte] {
+    var out = List[byte]()
+    var x = x0
+    while x < ed.grid.cols {
+        let c = term.grid_back(ed.grid, y, x)
+        let b = if term.cell_interned(c) then 32 else term.cell_byte(c, 0)
+        (mut out).push(if b >= 32 && b < 127 then b as byte else 32 as byte)
+        x += 1
+    }
+    out
+}
+
+fn row_text(ed: edit.Ed, y: int) -> str {
+    str_from_utf8(row_text_from(ed, y, 0)) else ""
+}
+
+// `dg_entry_reversed` (`:1257-1269`): does the group's row-1 entry render
+// reversed right now — found through the REGION the render registered.
+fn entry_reversed(ed: edit.Ed, gid: int) -> bool {
+    var x = 0
+    while x < ed.grid.cols {
+        let h = hit(ed, x, 0)
+        if h.kind == edit.REGION_TAB && h.payload == -gid {
+            return term.grid_back(ed.grid, 0, x).attrs & term.ATTR_REVERSE != 0
+        }
+        x += 1
+    }
+    assert(false, "group {gid} is on row 1")
+    false
+}
+
+// `dg_active_entry` (`:1272-1279`).
+fn active_entry(ed: edit.Ed) -> int {
+    let entries = edit.tab_row1_entries(ed)
+    edit.tab_row1_active(ed, entries)
+}
+
+// `dg_grouped_fixture` / `dg_held_index` (`:1571-1588`): `1 untitled`,
+// group `ch4/`, group `ch5/` and the tab being dragged — or four plain
+// tabs, the same geometry with nothing to dwell on.
+fn grouped_fixture(grouped: bool) -> edit.Ed {
+    if !grouped {
+        return fixture(3)
+    }
+    var ed = fixture(5)
+    let _ = make_group(mut ed, 1, 2)
+    let _ = make_group(mut ed, 3, 4)
+    edit.tab_switch(mut ed, 0)
+    edit.ed_layout(mut ed)
+    ed
+}
+
+fn held_index(grouped: bool) -> int {
+    if grouped then 5 else 3
+}
+
+// `dg_entry_key` (`:1593-1598`): a group's id, or a tab's id lifted clear
+// of it — tab INDICES move when a drop commits.
+fn entry_key(ed: edit.Ed, payload: int) -> int {
+    if payload < 0 {
+        return -payload
+    }
+    65536 + ed.tabs[payload].tab_id
+}
+
+// `dg_row1_keys` (`:1602-1620`): row 1's entries as DRAWN, left to right.
+fn row1_keys(ed: edit.Ed) -> List[int] {
+    var out = List[int]()
+    var x = 0
+    while x < ed.grid.cols {
+        let h = hit(ed, x, 0)
+        if h.kind == edit.REGION_TAB {
+            let key = entry_key(ed, h.payload)
+            if out.len == 0 || out[out.len - 1] != key {
+                (mut out).push(key)
+            }
+        }
+        x += 1
+    }
+    out
+}
+
+// `dg_grab_dx` (`:1624-1633`).
+fn grab_dx(ed: edit.Ed) -> int {
+    let (ok, _, _, _, grab) = edit.mouse_drag_float(ed)
+    assert(ok, "a float")
+    grab
+}
+
+// `dg_entry_x` (`:1636-1647`): the leftmost cell of the row-1 entry with
+// this payload, or -1.
+fn entry_x(ed: edit.Ed, payload: int) -> int {
+    var x = 0
+    while x < 80 {
+        let h = hit(ed, x, 0)
+        if h.kind == edit.REGION_TAB && h.payload == payload {
+            return x
+        }
+        x += 1
+    }
+    -1
+}
+
+// `dg_slot_span` (`:1650-1667`): the half-open range slot `slot` occupies.
+fn slot_span(ed: edit.Ed, slot: int) -> (int, int) {
+    var c0 = 0
+    var c1 = 0
+    var seen = false
+    var x = 0
+    while x < 80 {
+        if edit.strip_slot_at(ed, x, 0) == slot {
+            if !seen {
+                c0 = x
+                seen = true
+            }
+            c1 = x + 1
+        }
+        x += 1
+    }
+    assert(seen, "slot {slot} is on screen")
+    (c0, c1)
+}
+
+// `dg_carry_to` / `dg_carry_to_row2` (`:1799-1814`).
+fn carry_to(mut ed: edit.Ed, col: int) {
+    motion(mut ed, col, 0)
+    paint(mut ed)
+}
+
+fn carry_to_row2(mut ed: edit.Ed, col: int) {
+    motion(mut ed, col, 1)
+    paint(mut ed)
+}
+
+// `dg_col_for_trail` (`:1822-1831`): the pointer column that puts the
+// carried entry's trailing edge on `want` (pressed at slot 0's left edge,
+// so the grip is 0).
+fn col_for_trail(ed: edit.Ed, want: int) -> int {
+    let (c0, c1) = slot_span(ed, 0)
+    assert(want - (c1 - c0) >= 0, "a column for {want}")
+    want - (c1 - c0)
+}
+
+// `dg_row2_entry_x` (`:2026-2037`).
+fn row2_entry_x(ed: edit.Ed, payload: int) -> int {
+    var x = 0
+    while x < 80 {
+        let h = hit(ed, x, 1)
+        if h.kind == edit.REGION_TAB && h.payload == payload {
+            return x
+        }
+        x += 1
+    }
+    -1
+}
+
+// `dg_row2_gap_slot` (`:2045-2059`): the row-2 position whose cells carry
+// no region — where the drop is aimed.
+fn row2_gap_slot(ed: edit.Ed) -> int {
+    var i = 0
+    while i < edit.strip_member_slot_count(ed) {
+        let (ok, a0, _) = edit.strip_member_slot_cells(ed, i)
+        if ok && hit(ed, a0, 1).kind == edit.REGION_NONE {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `dg_row2_fixture` (`:2063-2075`): scratch, three loose tabs, a two-member
+// group, one more loose tab, the ACTIVE tab inside the group.
+fn row2_fixture() -> (edit.Ed, int) {
+    let (ed, g) = group_fixture(5, 3, 4, 3)
+    assert(ed.tab_strip_rect.h == 2, "two strip rows")
+    assert(edit.strip_member_slot_count(ed) == 2, "two members")
+    (ed, g)
+}
+
+// `dg_chevron_x` (`:2392-2403`): the `>N` chevron, or -1.
+fn chevron_x(ed: edit.Ed, cols: int) -> int {
+    var x = 0
+    while x < cols {
+        let h = hit(ed, x, 0)
+        if h.kind == edit.REGION_TAB_SCROLL && h.payload > 0 {
+            return x
+        }
+        x += 1
+    }
+    -1
+}
+
+// ---- DoD 8: the array is frozen for the drag's lifetime ---------------------
+
+// `test_drag_never_mutates_the_tab_array_before_release` (`:144-187`).
+fn t_never_mutates_the_tab_array_before_release() {
+    var ed = fixture(5)
+    paint(mut ed)
+    let before = snap(ed)
+    let x = slot_x(ed, 0)
+    press(mut ed, x, 0)
+    assert(ed.mouse.phase == edit.MP_ARMED, "armed")
+    // Fifty motion events, sweeping the whole bar, each one checked.
+    var step = 0
+    while step < 50 {
+        motion(mut ed, 1 + step % 60, 0)
+        assert(snap_eq(before, snap(ed)), "step {step}: the array is frozen")
+        paint(mut ed)
+        step += 1
+    }
+    assert(ed.mouse.phase == edit.MP_DRAG_TAB, "a tab drag")
+    // And the preview is a PICTURE: it reports a target, while the array
+    // still does not know about it.
+    let (ok, _, to) = edit.mouse_drag_preview(ed)
+    assert(ok, "a preview")
+    assert(to >= 0, "a target")
+    assert(snap_eq(before, snap(ed)), "still frozen")
+}
+
+// `test_drag_cancel_restores_nothing_because_nothing_moved` (`:194-216`).
+fn t_cancel_restores_nothing_because_nothing_moved() {
+    var ed = fixture(5)
+    paint(mut ed)
+    let before = snap(ed)
+    let px = slot_x(ed, 0)
+    let mx = slot_x(ed, 3)
+    press(mut ed, px, 0)
+    motion(mut ed, mx, 0)
+    assert(ed.mouse.phase == edit.MP_DRAG_TAB, "a tab drag")
+    edit.mouse_cancel(mut ed)
+    assert(snap_eq(before, snap(ed)), "byte-identical")
+    assert(!edit.mouse_gesture_active(ed), "no gesture")
+}
+
+// ---- the drop ---------------------------------------------------------------
+
+// `test_drag_drop_reorders_by_insertion` (`:222-247`).
+fn t_drop_reorders_by_insertion() {
+    var ed = fixture(5)
+    let ids0 = ed.tabs[1].tab_id
+    let ids1 = ed.tabs[2].tab_id
+    let ids2 = ed.tabs[3].tab_id
+    paint(mut ed)
+    let moved = ed.tabs[0].tab_id
+    let px = slot_x(ed, 0)
+    press(mut ed, px, 0)
+    let mx = slot_x(ed, 3)
+    motion(mut ed, mx, 0)
+    let ux = slot_x(ed, 3)
+    release(mut ed, ux, 0)
+    // Insertion, not swap: the three it passed keep their order.
+    assert(edit.tab_index_of_id(ed, moved) == 3, "landed at 3")
+    assert(ed.tabs[0].tab_id == ids0, "first kept")
+    assert(ed.tabs[1].tab_id == ids1, "second kept")
+    assert(ed.tabs[2].tab_id == ids2, "third kept")
+}
+
+// `test_drag_drop_where_it_started_changes_nothing` (`:255-279`).
+fn t_drop_where_it_started_changes_nothing() {
+    var ed = fixture(5)
+    paint(mut ed)
+    let before = snap(ed)
+    let x = slot_x(ed, 2)
+    press(mut ed, x, 0)
+    motion(mut ed, x + 1, 0)
+    paint(mut ed)
+    release(mut ed, x, 0)
+    assert(snap_eq(before, snap(ed)), "unchanged")
+}
+
+// `test_drag_a_changed_tab_count_cancels` (`:287-316`).
+fn t_a_changed_tab_count_cancels() {
+    var ed = fixture(5)
+    paint(mut ed)
+    let moved = ed.tabs[0].tab_id
+    let px = slot_x(ed, 0)
+    let mx = slot_x(ed, 3)
+    press(mut ed, px, 0)
+    motion(mut ed, mx, 0)
+    let at_press = edit.tab_index_of_id(ed, moved)
+    // Something else closes a tab under the drag.
+    assert(edit.tab_close(mut ed, 5), "closed")
+    paint(mut ed)
+    let m2 = slot_x(ed, 2)
+    motion(mut ed, m2, 0)
+    assert(ed.mouse.phase == edit.MP_IDLE, "cancelled")
+    // And the held tab did not move.
+    assert(edit.tab_index_of_id(ed, moved) == at_press, "not moved")
+}
+
+// `test_drag_a_close_or_open_under_a_drag_cancels_at_once` (`:326-368`):
+// fuzz_mouse seed 20260925's finding — the drag cancels AT THE MUTATION.
+fn t_a_close_or_open_under_a_drag_cancels_at_once() {
+    var round = 0
+    while round < 2 {
+        var ed = fixture(5)
+        paint(mut ed)
+        let held = ed.tabs[0].tab_id
+        let px = slot_x(ed, 0)
+        let mx = slot_x(ed, 3)
+        press(mut ed, px, 0)
+        motion(mut ed, mx, 0)
+        assert(ed.mouse.phase == edit.MP_DRAG_TAB, "round {round}: a tab drag")
+        if round == 0 {
+            assert(edit.tab_close(mut ed, 5), "closed")
+        } else {
+            assert(edit.tab_open(mut ed, "/tmp/yew-drag-late.txt") >= 0, "opened")
+        }
+        assert(ed.mouse.phase == edit.MP_IDLE, "round {round}: cancelled at once")
+        var hover = ev(term.KEY_REPEAT, 40, 11)
+        hover.button = term.MB_NONE
+        edit.mouse_event(mut ed, hover)
+        assert(ed.mouse.phase == edit.MP_IDLE, "round {round}: still idle")
+        paint(mut ed)
+        assert(edit.strip_float_rect(ed).w == 0, "round {round}: no float")
+        let ux = slot_x(ed, 3)
+        release(mut ed, ux, 0)
+        // The release found nothing to drop.
+        assert(edit.tab_index_of_id(ed, held) == 0, "round {round}: nothing dropped")
+        round += 1
+    }
+}
+
+// ---- the dwell --------------------------------------------------------------
+
+// `test_drag_dwell_opens_a_group_at_500ms_and_not_at_499` (`:408-440`).
+fn t_dwell_opens_a_group_at_500ms_and_not_at_499() {
+    // C's `_Static_assert`s (`:403-406`): the name carries the number.
+    assert(edit.DRAG_DWELL_MS == 500, "the dwell boundary row is named for 500 ms")
+    assert(edit.DRAG_FLASH_MS == 125, "the cue is a derived quarter of the dwell")
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    assert(ed.mouse.dwell_gid == g, "counting")
+    // 499 ms: still counting.
+    let t499 = ed.now_ms + edit.DRAG_DWELL_MS - 1
+    tick(mut ed, t499)
+    assert(edit.mouse_preview_group(ed) == 0, "not at 499")
+    // 500 ms: open.
+    let t500 = ed.now_ms + edit.DRAG_DWELL_MS
+    tick(mut ed, t500)
+    assert(edit.mouse_preview_group(ed) == g, "open at 500")
+}
+
+// `test_drag_passing_over_three_groups_opens_none` (`:442-489`).
+fn t_passing_over_three_groups_opens_none() {
+    var ed = fixture(7)
+    var gids = List[int]()
+    (mut gids).push(make_group(mut ed, 2, 3))
+    (mut gids).push(make_group(mut ed, 4, 5))
+    (mut gids).push(make_group(mut ed, 6, 7))
+    edit.tab_switch(mut ed, 0)
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    let px = slot_x(ed, 0)
+    press(mut ed, px, 0)
+    let t = ed.now_ms
+    // Three groups crossed in 300 ms: 100 ms each, none long enough.
+    var i = 0
+    while i < 3 {
+        let slot = slot_of_payload(ed, -gids[i])
+        assert(slot >= 0, "group {i} is on row 1")
+        ed.now_ms = t + 100 * i
+        let x = slot_x(ed, slot)
+        motion(mut ed, x, 0)
+        let now = ed.now_ms
+        tick(mut ed, now)
+        assert(edit.mouse_preview_group(ed) == 0, "group {i}: not opened")
+        paint(mut ed)
+        i += 1
+    }
+    tick(mut ed, t + 300)
+    assert(edit.mouse_preview_group(ed) == 0, "none opened")
+}
+
+// `test_drag_dwell_reads_the_pre_drag_list_not_the_region` (`:501-553`).
+fn t_dwell_reads_the_pre_drag_list_not_the_region() {
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    let x = slot_x(ed, gslot)
+    let px = slot_x(ed, 0)
+    press(mut ed, px, 0)
+    motion(mut ed, x, 0)
+    // Repaint WITH the preview: the held entry now occupies the slot.
+    paint(mut ed)
+    let gx = slot_x(ed, gslot)
+    // Since 57.14 §2 the held entry is a GAP that registers nothing; the
+    // pre-drag list still says a group is there.
+    assert(hit(ed, gx, 0).kind == edit.REGION_NONE, "the gap answers nothing")
+    let (ok, pre) = edit.strip_pre_payload(ed, gslot)
+    assert(ok && pre == -g, "the pre-drag list names the group")
+    motion(mut ed, gx, 0)
+    // And the dwell armed on the GROUP.
+    assert(ed.mouse.dwell_gid == g, "the dwell reads the pre-drag list")
+    let t = ed.now_ms + edit.DRAG_DWELL_MS
+    tick(mut ed, t)
+    assert(edit.mouse_preview_group(ed) == g, "open")
+}
+
+// `test_drag_never_dwells_into_its_own_group` (`:558-589`).
+fn t_never_dwells_into_its_own_group() {
+    var (ed, g) = group_fixture(5, 4, 5, 4)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    // Hold a MEMBER of the group, from row 2, and hover the group's own
+    // row-1 entry.
+    assert(hit(ed, 1, 1).kind == edit.REGION_TAB, "a member on row 2")
+    press(mut ed, 1, 1)
+    let gx = slot_x(ed, gslot)
+    motion(mut ed, gx, 0)
+    assert(ed.mouse.dwell_gid == 0, "no dwell into its own group")
+    let t = ed.now_ms + 1000
+    tick(mut ed, t)
+    assert(edit.mouse_preview_group(ed) == 0, "nothing opens")
+}
+
+// ---- joining a group --------------------------------------------------------
+
+// `test_drag_join_matches_the_keyboard_sequence` (`:602-665`): FULL
+// membership and ordinal snapshots, the mouse path against Sprint 24's
+// commands.
+fn t_join_matches_the_keyboard_sequence() {
+    var (m, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(m, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    let px = slot_x(m, 0)
+    let gx = slot_x(m, gslot)
+    press(mut m, px, 0)
+    motion(mut m, gx, 0)
+    let t = m.now_ms + edit.DRAG_DWELL_MS
+    tick(mut m, t)
+    assert(edit.mouse_preview_group(m) == g, "open")
+    paint(mut m)
+    // Row 2's blank tail: append to the group.
+    release(mut m, 78, 1)
+    let via_mouse = snap(m)
+
+    var k = fixture(5)
+    let gk = make_group(mut k, 4, 5)
+    edit.tab_switch(mut k, 0)
+    let pos = edit.group_member_count(k, gk) + 1
+    edit.group_add_member(mut k, gk, 0)
+    edit.group_set_ordinal(mut k, 0, pos)
+    let members = edit.group_members(k, gk)
+    var lowest = -1
+    var i = 0
+    while i < members.len {
+        if lowest < 0 || members[i] < lowest {
+            lowest = members[i]
+        }
+        i += 1
+    }
+    edit.group_reorder_block(mut k, gk, lowest)
+    let via_keys = snap(k)
+    assert(via_mouse.id.len == via_keys.id.len, "the same count")
+    assert(snap_eq(via_mouse, via_keys), "the same state")
+}
+
+// `test_drag_drop_on_the_blank_tail_leaves_a_sole_group` (`:671-713`).
+fn t_drop_on_the_blank_tail_leaves_a_sole_group() {
+    var ed = fixture(2)
+    // Every tab in one group, so row 1 has exactly one entry.
+    let g = edit.group_create(mut ed, "/src", "grp")
+    edit.group_add_member(mut ed, g, 0)
+    edit.group_add_member(mut ed, g, 1)
+    edit.group_add_member(mut ed, g, 2)
+    edit.tab_switch(mut ed, 0)
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    assert(edit.strip_slot_count(ed) == 1, "one row-1 entry")
+    let held = ed.tabs[1].tab_id
+    // Press a member on row 2, drag right onto row 1's blank tail.
+    let row2 = hit(ed, 12, 1)
+    assert(row2.kind == edit.REGION_TAB, "a member")
+    assert(row2.payload == 1, "tab 1")
+    press(mut ed, 12, 1)
+    motion(mut ed, 70, 0)
+    assert(ed.mouse.phase == edit.MP_DRAG_TAB, "a tab drag")
+    paint(mut ed)
+    release(mut ed, 70, 0)
+    let idx = edit.tab_index_of_id(ed, held)
+    assert(idx >= 0, "still open")
+    assert(ed.tabs[idx].group_id == 0, "out of the group")
+    // The group survives with its other two members.
+    assert(edit.group_member_count(ed, g) == 2, "two left")
+}
+
+// ---- auto-scroll ------------------------------------------------------------
+
+// `test_drag_autoscroll_is_throttled_to_one_entry_per_window` (`:727-785`).
+fn t_autoscroll_is_throttled_to_one_entry_per_window() {
+    var ed = fixture(7)
+    // A narrow strip, so the `>N` chevron exists to hold over.
+    assert(term.grid_resize(mut ed.grid, 24, 24), "resized")
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    let px = slot_x(ed, 0)
+    press(mut ed, px, 0)
+    // Find the chevron and park the pointer on it.
+    var chev = 0
+    var found = false
+    var x = 0
+    while x < 24 && !found {
+        if hit(ed, x, 0).kind == edit.REGION_TAB_SCROLL {
+            chev = x
+            found = true
+        }
+        x += 1
+    }
+    assert(found, "a chevron")
+    let scroll_before = ed.tab_scroll
+    let t0 = ed.now_ms
+    var i = 0
+    while i < 1000 {
+        motion(mut ed, chev, 0)
+        i += 1
+    }
+    // A thousand reports at one instant: no scroll at all.
+    assert(ed.tab_scroll == scroll_before, "no scroll per report")
+    // The clock is what moves it, one entry per window (absolute times).
+    tick(mut ed, t0 + edit.DRAG_SCROLL_MS)
+    assert(ed.tab_scroll == scroll_before + 1, "one window, one entry")
+    tick(mut ed, t0 + edit.DRAG_SCROLL_MS + 1)
+    assert(ed.tab_scroll == scroll_before + 1, "not twice in a window")
+    tick(mut ed, t0 + 2 * edit.DRAG_SCROLL_MS)
+    assert(ed.tab_scroll == scroll_before + 2, "the next window")
+}
+
+// `test_drag_reports_a_deadline_at_every_flash_edge` (`:792-842`).
+fn t_reports_a_deadline_at_every_flash_edge() {
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    // Idle: nothing to wake up for.
+    assert(edit.mouse_deadline(ed, ed.now_ms) == -1, "idle")
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    let now = ed.now_ms
+    let f = edit.DRAG_FLASH_MS
+    let d = edit.DRAG_DWELL_MS
+    // EVERY phase edge: the three quarter boundaries, then the open.
+    assert(edit.mouse_deadline(ed, now) == f, "first quarter")
+    assert(edit.mouse_deadline(ed, now + f) == f, "second quarter")
+    assert(edit.mouse_deadline(ed, now + 2 * f) == f, "third quarter")
+    // Past the third quarter the next thing is the open: one sleep.
+    assert(edit.mouse_deadline(ed, now + 3 * f) == d - 3 * f, "the settle")
+    assert(edit.mouse_deadline(ed, now + d - 1) == 1, "one to go")
+    assert(edit.mouse_deadline(ed, now + d) == 0, "due")
+    // Once it has fired there is nothing left to wait for.
+    tick(mut ed, now + d)
+    assert(edit.mouse_deadline(ed, ed.now_ms) == -1, "fired")
+}
+
+// ---- dragging a group -------------------------------------------------------
+
+// `test_drag_a_group_moves_the_whole_block` (`:848-890`).
+fn t_a_group_moves_the_whole_block() {
+    var (ed, g) = group_fixture(5, 0, 1, 3)
+    let member_a = ed.tabs[0].tab_id
+    let member_b = ed.tabs[1].tab_id
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot == 0, "the group leads row 1")
+    let gx = slot_x(ed, gslot)
+    press(mut ed, gx, 0)
+    assert(ed.mouse.drag_gid == g, "the gid captured")
+    let mx = slot_x(ed, 2)
+    motion(mut ed, mx, 0)
+    assert(ed.mouse.phase == edit.MP_DRAG_GROUP, "a group drag")
+    paint(mut ed)
+    let ux = slot_x(ed, 2)
+    release(mut ed, ux, 0)
+    // Both members travelled, and they are still contiguous.
+    let a = edit.tab_index_of_id(ed, member_a)
+    let b = edit.tab_index_of_id(ed, member_b)
+    assert(a >= 0 && b >= 0, "both open")
+    assert(b == a + 1, "contiguous")
+    assert(a > 0, "moved")
+}
+
+// ---- Sprint 57.14 §1: row 1 is the group exit --------------------------------
+
+// `test_drag_row1_slot_extracts_a_member_from_its_group` (`:920-956`).
+fn t_row1_slot_extracts_a_member_from_its_group() {
+    var (ed, g) = group_fixture(5, 4, 5, 4)
+    let held = ed.tabs[4].tab_id
+    let target = slot_of_payload(ed, 1)
+    assert(target >= 0, "tab 1 is on row 1")
+    let px = row2_x(ed, 4)
+    let tx = slot_x(ed, target)
+    press(mut ed, px, 1)
+    motion(mut ed, tx, 0)
+    assert(ed.mouse.phase == edit.MP_DRAG_TAB, "a tab drag")
+    paint(mut ed)
+    release(mut ed, tx, 0)
+    let idx = edit.tab_index_of_id(ed, held)
+    assert(idx == 1, "landed on slot 1's tab")
+    assert(ed.tabs[idx].group_id == 0, "out of the group")
+    // The group survives, with the member that stayed.
+    assert(edit.group_member_count(ed, g) == 1, "one left")
+}
+
+// `test_drag_extracting_a_sole_member_onto_a_slot_to_its_right`
+// (`:966-1014`): THE DISSOLVE — the drop resolves to a tab INDEX first.
+fn t_extracting_a_sole_member_onto_a_slot_to_its_right() {
+    var ed = fixture(3)
+    let g = edit.group_create(mut ed, "/src", "grp")
+    assert(g != 0, "the group is made")
+    edit.group_add_member(mut ed, g, 1)
+    edit.tab_switch(mut ed, 1)
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    // Four row-1 entries: tab 0, the group, tabs 2 and 3.
+    assert(edit.strip_slot_count(ed) == 4, "four entries")
+    let held = ed.tabs[1].tab_id
+    let passed_a = ed.tabs[2].tab_id
+    let passed_b = ed.tabs[3].tab_id
+    let target = slot_of_payload(ed, 3)
+    assert(target == 3, "tab 3 at slot 3")
+    let px = row2_x(ed, 1)
+    let tx = slot_x(ed, target)
+    press(mut ed, px, 1)
+    motion(mut ed, tx, 0)
+    paint(mut ed)
+    release(mut ed, tx, 0)
+    // The group is gone, and the tab landed on the slot it was aimed at.
+    assert(edit.group_member_count(ed, g) == 0, "no members")
+    assert(edit.group_find(ed, g) == -1, "dissolved")
+    assert(edit.tab_index_of_id(ed, passed_a) == 1, "passed a")
+    assert(edit.tab_index_of_id(ed, passed_b) == 2, "passed b")
+    assert(edit.tab_index_of_id(ed, held) == 3, "held at 3")
+    assert(ed.tabs[3].group_id == 0, "ungrouped")
+    // And row 1 is one entry SHORTER: four again with the held tab.
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    assert(edit.strip_slot_count(ed) == 4, "four entries after")
+}
+
+// `test_drag_row1_exit_works_when_the_strip_overflows` (`:1023-1083`):
+// THE LOCKOUT — every visible slot is an exit, with no tail on screen.
+fn t_row1_exit_works_when_the_strip_overflows() {
+    var ed = fixture(7)
+    let g = make_group(mut ed, 1, 2)
+    edit.tab_switch(mut ed, 1)
+    assert(term.grid_resize(mut ed.grid, 24, 24), "resized")
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    var tail = false
+    var chevron = false
+    var x = 0
+    while x < 24 {
+        let h = hit(ed, x, 0)
+        if h.kind == edit.REGION_TAB_NEW {
+            tail = true
+        }
+        if h.kind == edit.REGION_TAB_SCROLL {
+            chevron = true
+        }
+        x += 1
+    }
+    // The premise: overflow, and therefore no tail to aim at.
+    assert(chevron, "overflow")
+    assert(!tail, "no tail")
+    let held = ed.tabs[1].tab_id
+    var target = -1
+    x = 0
+    while x < 24 && target < 0 {
+        let slot = edit.strip_slot_at(ed, x, 0)
+        let (ok, pre) = edit.strip_pre_payload(ed, slot)
+        if slot >= 0 && ok && pre >= 0 {
+            target = slot
+        }
+        x += 1
+    }
+    assert(target >= 0, "a tab slot")
+    let px = row2_x(ed, 1)
+    let tx = slot_x(ed, target)
+    press(mut ed, px, 1)
+    motion(mut ed, tx, 0)
+    paint(mut ed)
+    release(mut ed, tx, 0)
+    let idx = edit.tab_index_of_id(ed, held)
+    assert(idx >= 0, "still open")
+    assert(ed.tabs[idx].group_id == 0, "out of the group")
+    assert(edit.group_member_count(ed, g) == 1, "one left")
+}
+
+// ---- Sprint 57.14 §2: the float and the gap ---------------------------------
+
+// `test_drag_float_is_drawn_and_registers_no_region` (`:1112-1175`).
+fn t_float_is_drawn_and_registers_no_region() {
+    var ed = fixture(5)
+    paint(mut ed)
+    // Nothing in flight: no float.
+    assert(edit.strip_float_rect(ed).w == 0, "no float at rest")
+    // Grabbed one cell into the entry, carried far from every entry.
+    let px = slot_x(ed, 1) + 1
+    press(mut ed, px, 0)
+    motion(mut ed, 60, 3)
+    assert(ed.mouse.phase == edit.MP_DRAG_TAB, "a tab drag")
+    paint(mut ed)
+    let fl = edit.strip_float_rect(ed)
+    assert(fl.w > 0, "a float")
+    assert(fl.y == 3, "on the pointer's row")
+    // It follows the pointer's grip, not the pointer's left edge.
+    assert(fl.x == 59, "the grip: {fl.x}")
+    let row = row_text(ed, fl.y)
+    assert(row.contains("yew-drag-0.txt"), "the held tab's name: {row}")
+    // And the registry knows nothing about any of it.
+    var x = fl.x
+    while x < fl.x + fl.w {
+        assert(hit(ed, x, fl.y).kind == edit.REGION_NONE, "cell {x}: unregistered")
+        x += 1
+    }
+    // The float has no number.
+    let tail = str_from_utf8(row_text_from(ed, fl.y, fl.x)) else ""
+    assert(!tail.contains(" 2 yew-drag-0.txt"), "no number: {tail}")
+    // Inside one cell repaints nothing; crossing into the next repaints.
+    ed.full_damage = false
+    motion(mut ed, 60, 3)
+    assert(!ed.full_damage, "the same cell")
+    motion(mut ed, 61, 3)
+    assert(ed.full_damage, "the next cell")
+    // The release takes it off the screen, though it changes nothing.
+    ed.full_damage = false
+    release(mut ed, 61, 3)
+    assert(ed.full_damage, "the release repaints")
+    paint(mut ed)
+    assert(edit.strip_float_rect(ed).w == 0, "no float after")
+}
+
+// `test_drag_held_entry_leaves_a_gap_in_the_strip` (`:1186-1244`).
+fn t_held_entry_leaves_a_gap_in_the_strip() {
+    var ed = fixture(5)
+    paint(mut ed)
+    let before = row_text(ed, 0)
+    assert(before.contains("yew-drag-0.txt"), "drawn at rest: {before}")
+    let px = slot_x(ed, 1)
+    let mx = slot_x(ed, 3)
+    press(mut ed, px, 0)
+    motion(mut ed, mx, 0)
+    paint(mut ed)
+    var held_region = false
+    var x = 0
+    while x < 80 {
+        let h = hit(ed, x, 0)
+        if h.kind == edit.REGION_TAB && h.payload == 1 {
+            held_region = true
+        }
+        x += 1
+    }
+    // No entry, and no target for it.
+    assert(!held_region, "the held entry registers nothing")
+    var at = -1
+    var i = 0
+    while i < edit.strip_slot_count(ed) {
+        let (ok, pre) = edit.strip_pre_payload(ed, i)
+        if ok && pre == 1 {
+            at = i
+        }
+        i += 1
+    }
+    // The pre-drag table still names the held tab at its ORIGINAL slot.
+    assert(at == 1, "the pre-drag slot")
+    // Drawn once: the strip row no longer carries it, only the float.
+    let fl = edit.strip_float_rect(ed)
+    assert(fl.y == 0, "the float on row 0")
+    var strip_only = row_text_from(ed, 0, 0)
+    var c = fl.x
+    while c < fl.x + fl.w && c < 80 && c < strip_only.len {
+        strip_only[c] = 46 as byte
+        c += 1
+    }
+    let s = str_from_utf8(strip_only) else ""
+    assert(!s.contains("yew-drag-0.txt"), "drawn exactly once: {s}")
+}
+
+// ---- Sprint 57.14 §3: the dwell's two-flash cue -----------------------------
+
+// One phase of `test_drag_dwell_flashes_twice_before_opening`'s table:
+// the cue at `t0 + at`, painted twice at the same instant.
+fn flash_phase(mut ed: edit.Ed, g: int, t0: int, at: int, lit: bool, unlit: bool) {
+    ed.now_ms = t0 + at
+    let want = if lit then g else 0
+    assert(edit.mouse_dwell_flash(ed) == want, "{at} ms: the cue")
+    let look = if lit then !unlit else unlit
+    paint(mut ed)
+    assert(entry_reversed(ed, g) == look, "{at} ms: drawn")
+    // The same instant, painted again: byte-identical.
+    paint(mut ed)
+    assert(entry_reversed(ed, g) == look, "{at} ms: drawn again")
+}
+
+// `test_drag_dwell_flashes_twice_before_opening` (`:1289-1353`): the cue
+// is a function of the clock, not of a paint counter.
+fn t_dwell_flashes_twice_before_opening() {
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    // What the entry looks like with no dwell on it.
+    let unlit = entry_reversed(ed, g)
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    assert(ed.mouse.dwell_gid == g, "counting")
+    let t0 = ed.now_ms
+    let f = edit.DRAG_FLASH_MS
+    flash_phase(mut ed, g, t0, 0, true, unlit)
+    flash_phase(mut ed, g, t0, 1, true, unlit)
+    flash_phase(mut ed, g, t0, f - 1, true, unlit)
+    flash_phase(mut ed, g, t0, f, false, unlit)
+    flash_phase(mut ed, g, t0, 2 * f, true, unlit)
+    flash_phase(mut ed, g, t0, 3 * f, false, unlit)
+    flash_phase(mut ed, g, t0, 4 * f, false, unlit)
+    flash_phase(mut ed, g, t0, edit.DRAG_DWELL_MS - 1, false, unlit)
+    // Once the strip is open the cue is done.
+    ed.now_ms = t0 + edit.DRAG_DWELL_MS
+    let now = ed.now_ms
+    tick(mut ed, now)
+    assert(edit.mouse_preview_group(ed) == g, "open")
+    assert(edit.mouse_dwell_flash(ed) == 0, "the cue is done")
+}
+
+// `test_drag_dwell_flash_marks_damage_only_at_an_edge` (`:1362-1397`).
+fn t_dwell_flash_marks_damage_only_at_an_edge() {
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    let t0 = ed.now_ms
+    // One tick per millisecond across the dwell: three quarter edges.
+    var edges = 0
+    var i = 0
+    while i < edit.DRAG_DWELL_MS {
+        ed.full_damage = false
+        tick(mut ed, t0 + i)
+        if ed.full_damage {
+            edges += 1
+        }
+        i += 1
+    }
+    assert(edges == 3, "three edges: {edges}")
+}
+
+// `test_drag_float_survives_a_user_scrolled_strip` (`:2419-2499`):
+// 57.14 §2 meets 57.15 §1.
+fn t_float_survives_a_user_scrolled_strip() {
+    var ed = fixture(7)
+    // Tab 0 stays active and far to the left.
+    edit.tab_switch(mut ed, 0)
+    assert(term.grid_resize(mut ed.grid, 24, 44), "resized")
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    let chev = chevron_x(ed, 44)
+    assert(chev >= 0, "a chevron")
+    // Two clicks on the chevron: the offset is now the user's.
+    var i = 0
+    while i < 2 {
+        assert(edit.tab_strip_click(mut ed, chev, 0), "click {i}")
+        paint(mut ed)
+        i += 1
+    }
+    let scrolled = ed.tab_scroll
+    assert(scrolled > 0, "scrolled")
+    assert(edit.tabs_scroll_is_owned(ed, false), "user-owned")
+    // Two visible slots to drag between, both of them tabs.
+    var held_slot = -1
+    var to_slot = -1
+    var x = 0
+    while x < 44 {
+        let slot = edit.strip_slot_at(ed, x, 0)
+        let (ok, pre) = edit.strip_pre_payload(ed, slot)
+        if slot >= 0 && ok && pre >= 0 {
+            if held_slot < 0 {
+                held_slot = slot
+            } else if slot != held_slot {
+                to_slot = slot
+            }
+        }
+        x += 1
+    }
+    assert(held_slot >= 0, "a held slot")
+    assert(to_slot >= 0, "a target slot")
+    let (hok, held_payload) = edit.strip_pre_payload(ed, held_slot)
+    assert(hok, "its payload")
+    let px = slot_x(ed, held_slot)
+    let tx = slot_x(ed, to_slot)
+    press(mut ed, px, 0)
+    motion(mut ed, tx, 0)
+    assert(ed.mouse.phase == edit.MP_DRAG_TAB, "a tab drag")
+    paint(mut ed)
+    // The render did not walk the offset back toward tab 0.
+    assert(ed.tab_scroll == scrolled, "the offset held")
+    assert(edit.tabs_scroll_is_owned(ed, false), "still the user's")
+    // The float is at the pointer and claims nothing.
+    let fl = edit.strip_float_rect(ed)
+    assert(fl.w > 0, "a float")
+    x = fl.x
+    while x < fl.x + fl.w {
+        assert(hit(ed, x, fl.y).kind == edit.REGION_NONE, "cell {x}: unregistered")
+        x += 1
+    }
+    // And the gap: the held entry has no region on the scrolled row.
+    var held_region = false
+    x = 0
+    while x < 44 {
+        let h = hit(ed, x, 0)
+        if h.kind == edit.REGION_TAB && h.payload == held_payload {
+            held_region = true
+        }
+        x += 1
+    }
+    assert(!held_region, "a gap")
+    // A second paint of the same state is the same offset (invariant 5).
+    paint(mut ed)
+    assert(ed.tab_scroll == scrolled, "the same offset")
+}
+
+// `test_drag_autoscroll_keeps_the_strip_where_the_drop_landed`
+// (`:2514-2559`).
+fn t_autoscroll_keeps_the_strip_where_the_drop_landed() {
+    var ed = fixture(7)
+    edit.tab_switch(mut ed, 0)
+    assert(term.grid_resize(mut ed.grid, 24, 24), "resized")
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    assert(!edit.tabs_scroll_is_owned(ed, false), "following")
+    let chev = chevron_x(ed, 24)
+    assert(chev >= 0, "a chevron")
+    let px = slot_x(ed, 0)
+    press(mut ed, px, 0)
+    motion(mut ed, chev, 0)
+    let t0 = ed.now_ms
+    tick(mut ed, t0 + edit.DRAG_SCROLL_MS)
+    tick(mut ed, t0 + 2 * edit.DRAG_SCROLL_MS)
+    let scrolled = ed.tab_scroll
+    assert(scrolled >= 2, "scrolled twice: {scrolled}")
+    assert(edit.tabs_scroll_is_owned(ed, false), "the user's")
+    // The render that follows the autoscroll does not undo it.
+    paint(mut ed)
+    assert(ed.tab_scroll == scrolled, "kept by the render")
+    release(mut ed, chev, 0)
+    paint(mut ed)
+    assert(ed.tab_scroll == scrolled, "kept by the drop")
+    assert(edit.tabs_scroll_is_owned(ed, false), "still the user's")
+    // And the follow resumes the moment the active entry moves.
+    edit.tab_switch(mut ed, 0)
+    assert(!edit.tabs_scroll_is_owned(ed, false), "following again")
+    paint(mut ed)
+    assert(ed.tab_scroll == 0, "home")
+}
+
+// `test_drag_a_press_ends_the_hover_reveal` (`:2574-2619`).
+fn t_a_press_ends_the_hover_reveal() {
+    var ed = fixture(7)
+    edit.tab_switch(mut ed, 0)
+    assert(term.grid_resize(mut ed.grid, 24, 24), "resized")
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    let chev = chevron_x(ed, 24)
+    assert(chev >= 0, "a chevron")
+    let t0 = ed.now_ms
+    var hover = ev(term.KEY_REPEAT, chev, 0)
+    hover.button = term.MB_NONE
+    edit.mouse_event(mut ed, hover)
+    assert(ed.mouse.hover_chevron, "hovering a chevron")
+    // One reveal step, to prove the clock is live before the press.
+    tick(mut ed, t0 + edit.HOVER_SCROLL_MS)
+    assert(ed.tab_scroll == 1, "one reveal step")
+    paint(mut ed)
+    let after_hover = ed.tab_scroll
+    let px = slot_x(ed, after_hover)
+    press(mut ed, px, 0)
+    assert(!ed.mouse.hover_chevron, "the press ends the hover")
+    // Two whole windows with the button down: nothing moves.
+    assert(edit.mouse_deadline(ed, t0 + edit.HOVER_SCROLL_MS) == -1, "no wake")
+    tick(mut ed, t0 + 2 * edit.HOVER_SCROLL_MS)
+    tick(mut ed, t0 + 3 * edit.HOVER_SCROLL_MS)
+    assert(ed.tab_scroll == after_hover, "the strip held")
+}
+
+// `test_drag_float_does_not_disturb_the_chevron_answer` (`:2629-2678`):
+// 57.15 §2's 1003 owner reads a product of the render.
+fn t_float_does_not_disturb_the_chevron_answer() {
+    var ed = fixture(7)
+    edit.tab_switch(mut ed, 0)
+    assert(term.grid_resize(mut ed.grid, 24, 24), "resized")
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    assert(edit.mouse_chevron_drawn(ed), "a chevron drawn")
+    let chev = chevron_x(ed, 24)
+    assert(chev >= 0, "the `>N` chevron")
+    let px = slot_x(ed, 0)
+    press(mut ed, px, 0)
+    motion(mut ed, chev, 0)
+    paint(mut ed)
+    assert(edit.strip_float_rect(ed).w > 0, "a float")
+    assert(edit.mouse_chevron_drawn(ed), "the float leaves the answer")
+    release(mut ed, chev, 0)
+    paint(mut ed)
+    assert(edit.strip_float_rect(ed).w == 0, "no float")
+    assert(edit.mouse_chevron_drawn(ed), "after the drop too")
+    // And the answer comes back DOWN when the strip stops needing it.
+    edit.tab_switch(mut ed, 0)
+    assert(term.grid_resize(mut ed.grid, 24, 200), "widened")
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    assert(ed.tab_scroll == 0, "home")
+    assert(!edit.mouse_chevron_drawn(ed), "no chevron")
+}
+
+// ---- the preview belongs to the pointer -------------------------------------
+
+// `test_drag_dwell_preview_retracts_when_the_pointer_leaves`
+// (`:1415-1460`): DOGFOOD BUG — the preview stuck to the first group.
+fn t_dwell_preview_retracts_when_the_pointer_leaves() {
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    let plain = slot_of_payload(ed, 2)
+    assert(gslot >= 0, "the group is on row 1")
+    assert(plain >= 0, "tab 2 is on row 1")
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    let t = ed.now_ms + edit.DRAG_DWELL_MS
+    tick(mut ed, t)
+    assert(edit.mouse_preview_group(ed) == g, "open")
+    paint(mut ed)
+    assert(edit.tab_strip_rows(ed) == 2, "two rows")
+    // Off the group, onto an ordinary row-1 slot: row 2 goes with it.
+    ed.layout_dirty = false
+    ed.full_damage = false
+    let plx = slot_x(ed, plain)
+    motion(mut ed, plx, 0)
+    assert(ed.mouse.dwell_gid == 0, "no dwell")
+    assert(edit.mouse_preview_group(ed) == 0, "no preview")
+    // A strip-row count change is the layout's, not a repaint's.
+    assert(ed.layout_dirty, "the layout's")
+    assert(ed.full_damage, "repainted")
+    paint(mut ed)
+    assert(edit.tab_strip_rows(ed) == 1, "one row")
+}
+
+// `test_drag_dwell_reopens_a_group_the_pointer_returns_to` (`:1471-1523`).
+fn t_dwell_reopens_a_group_the_pointer_returns_to() {
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    let plain = slot_of_payload(ed, 2)
+    assert(gslot >= 0, "the group is on row 1")
+    assert(plain >= 0, "tab 2 is on row 1")
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    let t = ed.now_ms
+    tick(mut ed, t + edit.DRAG_DWELL_MS)
+    assert(edit.mouse_preview_group(ed) == g, "open")
+    paint(mut ed)
+    let ax = slot_x(ed, plain)
+    ed.now_ms = t + edit.DRAG_DWELL_MS
+    motion(mut ed, ax, 0)
+    paint(mut ed)
+    // Back onto the same group: the cue runs from the top.
+    let bx = slot_x(ed, gslot)
+    ed.now_ms = t + 2 * edit.DRAG_DWELL_MS
+    motion(mut ed, bx, 0)
+    assert(ed.mouse.dwell_gid == g, "counting again")
+    assert(edit.mouse_preview_group(ed) == 0, "not yet open")
+    assert(edit.mouse_dwell_flash(ed) == g, "the cue is lit")
+    assert(edit.mouse_deadline(ed, ed.now_ms) == edit.DRAG_FLASH_MS, "a deadline")
+    let t2 = ed.now_ms + edit.DRAG_DWELL_MS
+    tick(mut ed, t2)
+    assert(edit.mouse_preview_group(ed) == g, "open again")
+}
+
+// `test_drag_dwell_preview_survives_the_pointer_on_row_2` (`:1530-1560`).
+fn t_dwell_preview_survives_the_pointer_on_row_2() {
+    var (ed, g) = group_fixture(5, 4, 5, 0)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    let t = ed.now_ms + edit.DRAG_DWELL_MS
+    tick(mut ed, t)
+    assert(edit.mouse_preview_group(ed) == g, "open")
+    paint(mut ed)
+    motion(mut ed, 2, 1)
+    assert(edit.mouse_preview_group(ed) == g, "row 2 keeps it")
+}
+
+// ---- the neighbours get out of the way --------------------------------------
+
+// `test_drag_neighbours_slide_out_of_the_carried_tabs_way` (`:1683-1775`).
+fn t_neighbours_slide_out_of_the_carried_tabs_way() {
+    var ed = fixture(5)
+    let ga = make_group(mut ed, 1, 2)
+    let gb = make_group(mut ed, 3, 4)
+    edit.tab_switch(mut ed, 0)
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    // untitled, group a, group b, the tab being dragged.
+    assert(edit.strip_slot_count(ed) == 4, "four entries")
+    let held = ed.tabs[5].tab_id
+    let xa0 = entry_x(ed, -ga)
+    let xb0 = entry_x(ed, -gb)
+    assert(xa0 > 0 && xb0 > xa0, "the groups in order")
+    // Grabbed near its RIGHT edge.
+    let (c0, c1) = slot_span(ed, 3)
+    assert(c1 - c0 == 18, "an 18-cell entry: {c1 - c0}")
+    let press_x = c1 - 2
+    press(mut ed, press_x, 0)
+    // The pointer is still inside the tab's own slot, and the carried
+    // entry is already over the second group past its midpoint.
+    assert(edit.strip_slot_at(ed, press_x - 14, 0) == 3, "still its own slot")
+    motion(mut ed, press_x - 14, 0)
+    paint(mut ed)
+    assert(ed.mouse.drag_to_valid, "a target")
+    assert(ed.mouse.drag_to_slot == 2, "slot 2: {ed.mouse.drag_to_slot}")
+    // The second group slid RIGHT; the first has not moved.
+    assert(entry_x(ed, -gb) > xb0, "group b slid")
+    assert(entry_x(ed, -ga) == xa0, "group a stayed")
+    // Keep sliding left until the carried entry's left edge is on the
+    // first group.
+    let (a0, _) = slot_span(ed, 1)
+    let drop_x = a0 + grab_dx(ed)
+    motion(mut ed, drop_x, 0)
+    paint(mut ed)
+    assert(ed.mouse.drag_to_slot == 1, "slot 1")
+    assert(entry_x(ed, -ga) > xa0, "group a slid")
+    assert(entry_x(ed, -gb) > entry_x(ed, -ga), "in order")
+    // And releasing there lands exactly the strip that was drawn.
+    release(mut ed, drop_x, 0)
+    assert(edit.tab_index_of_id(ed, held) == 1, "landed at 1")
+    paint(mut ed)
+    let keys = row1_keys(ed)
+    assert(keys.len == 4, "four entries drawn")
+    assert(keys[1] == 65536 + held, "the held tab second")
+    assert(keys[2] == ga, "group a third")
+    assert(keys[3] == gb, "group b fourth")
+}
+
+// ---- a group entry's hover band ---------------------------------------------
+
+// `test_drag_a_group_entry_holds_still_inside_its_hover_band`
+// (`:1833-1876`): DOGFOOD BUG — a group moved out from under the pointer
+// trying to rest on it.
+fn t_a_group_entry_holds_still_inside_its_hover_band() {
+    var (ed, g) = group_fixture(5, 1, 2, 0)
+    // untitled, the group, and the three loose tabs after it.
+    assert(slot_of_payload(ed, -g) == 1, "the group at slot 1")
+    let (c0, _) = slot_span(ed, 0)
+    let (a0, a1) = slot_span(ed, 1)
+    let w = a1 - a0
+    // A band needs room to exist.
+    assert(w >= 8, "wide enough: {w}")
+    press(mut ed, c0, 0)
+    // PAST THE GROUP'S MIDPOINT and inside its middle half.
+    let x1 = col_for_trail(ed, a0 + w / 2 + 1)
+    carry_to(mut ed, x1)
+    assert(ed.mouse.drag_to_valid, "a target")
+    assert(ed.mouse.drag_to_slot == 0, "held still: {ed.mouse.drag_to_slot}")
+    // The outer quarter is an ordinary swap trigger.
+    let x2 = col_for_trail(ed, a1 - w / 4 + 1)
+    carry_to(mut ed, x2)
+    assert(ed.mouse.drag_to_slot == 1, "swapped: {ed.mouse.drag_to_slot}")
+}
+
+// `test_drag_a_group_entry_holds_still_coming_from_the_right`
+// (`:1934-1970`).
+fn t_a_group_entry_holds_still_coming_from_the_right() {
+    var (ed, g) = group_fixture(5, 2, 3, 0)
+    assert(slot_of_payload(ed, -g) == 2, "the group at slot 2")
+    let (c0, _) = slot_span(ed, 3)
+    let (a0, a1) = slot_span(ed, 2)
+    let w = a1 - a0
+    assert(w >= 8, "wide enough: {w}")
+    // Pressed at its LEFT edge, so the pointer is the leading edge.
+    press(mut ed, c0, 0)
+    // Inside the middle half, coming left: nothing shifts.
+    carry_to(mut ed, a0 + w / 2 - 1)
+    assert(ed.mouse.drag_to_valid, "a target")
+    assert(ed.mouse.drag_to_slot == 3, "held still: {ed.mouse.drag_to_slot}")
+    // Past the band's left edge, into the outer quarter: it swaps.
+    carry_to(mut ed, a0 + w / 4 - 1)
+    assert(ed.mouse.drag_to_slot == 2, "swapped: {ed.mouse.drag_to_slot}")
+}
+
+// `test_drag_resting_in_a_group_band_still_opens_it` (`:1891-1927`): the
+// band and the dwell are the same gesture.
+fn t_resting_in_a_group_band_still_opens_it() {
+    var (ed, g) = group_fixture(5, 1, 2, 0)
+    assert(slot_of_payload(ed, -g) == 1, "the group at slot 1")
+    let (c0, _) = slot_span(ed, 0)
+    let (a0, a1) = slot_span(ed, 1)
+    let w = a1 - a0
+    assert(w >= 8, "wide enough: {w}")
+    press(mut ed, c0, 0)
+    // The far edge of the band.
+    let x = col_for_trail(ed, a1 - w / 4)
+    carry_to(mut ed, x)
+    assert(ed.mouse.drag_to_slot == 0, "nothing shifted")
+    assert(ed.mouse.dwell_gid == g, "and it is counting")
+    let t = ed.now_ms + edit.DRAG_DWELL_MS
+    tick(mut ed, t)
+    assert(edit.mouse_preview_group(ed) == g, "open")
+}
+
+// `test_drag_a_plain_neighbour_still_swaps_at_half_its_width`
+// (`:1977-2008`).
+fn t_a_plain_neighbour_still_swaps_at_half_its_width() {
+    var ed = fixture(5)
+    edit.tab_switch(mut ed, 0)
+    edit.ed_layout(mut ed)
+    paint(mut ed)
+    let (c0, _) = slot_span(ed, 0)
+    let (a0, a1) = slot_span(ed, 1)
+    let w = a1 - a0
+    assert(w >= 8, "wide enough: {w}")
+    press(mut ed, c0, 0)
+    // One cell short of the midpoint: still where it was.
+    let x1 = col_for_trail(ed, a0 + w / 2)
+    carry_to(mut ed, x1)
+    assert(ed.mouse.drag_to_valid, "a target")
+    assert(ed.mouse.drag_to_slot == 0, "not yet")
+    // One cell past it: swapped.
+    let x2 = col_for_trail(ed, a0 + w / 2 + 1)
+    carry_to(mut ed, x2)
+    assert(ed.mouse.drag_to_slot == 1, "swapped")
+}
+
+// ---- row 2 previews the drop too --------------------------------------------
+
+// `test_drag_row2_opens_a_gap_where_the_member_will_land` (`:2077-2114`).
+fn t_row2_opens_a_gap_where_the_member_will_land() {
+    var (ed, _) = row2_fixture()
+    let at_rest_3 = row2_entry_x(ed, 3)
+    let at_rest_4 = row2_entry_x(ed, 4)
+    assert(at_rest_3 >= 0 && at_rest_4 > at_rest_3, "two members")
+    let (ok, a0, _) = edit.strip_member_slot_cells(ed, 0)
+    assert(ok, "member slot 0")
+    // A loose row-1 tab, grabbed at its left edge.
+    let (c0, _) = slot_span(ed, 0)
+    press(mut ed, c0, 0)
+    // Onto row 2, aimed at the FIRST member: both slide right.
+    carry_to_row2(mut ed, a0)
+    assert(row2_gap_slot(ed) == 0, "the gap first")
+    assert(row2_entry_x(ed, 3) > at_rest_3, "3 slid")
+    assert(row2_entry_x(ed, 4) > at_rest_4, "4 slid")
+    // Aimed past them all: they close back up and the gap is last.
+    let tx = edit.strip_member_tail_x(ed) + 1
+    carry_to_row2(mut ed, tx)
+    assert(row2_gap_slot(ed) == 2, "the gap last")
+    assert(row2_entry_x(ed, 3) == at_rest_3, "3 home")
+    assert(row2_entry_x(ed, 4) == at_rest_4, "4 home")
+}
+
+// `test_drag_moving_between_rows_hands_the_preview_over` (`:2123-2157`).
+fn t_moving_between_rows_hands_the_preview_over() {
+    var (ed, _) = row2_fixture()
+    let at_rest_3 = row2_entry_x(ed, 3)
+    let (ok, a0, _) = edit.strip_member_slot_cells(ed, 0)
+    assert(ok, "member slot 0")
+    let (c0, _) = slot_span(ed, 0)
+    press(mut ed, c0, 0)
+    // Row 1 owns it: row 2 is untouched.
+    let x1 = slot_x(ed, 2)
+    carry_to(mut ed, x1)
+    assert(row2_gap_slot(ed) == -1, "no gap on row 2")
+    assert(row2_entry_x(ed, 3) == at_rest_3, "3 at rest")
+    // Row 2 takes it.
+    carry_to_row2(mut ed, a0)
+    assert(row2_gap_slot(ed) == 0, "row 2's gap")
+    assert(row2_entry_x(ed, 3) > at_rest_3, "3 slid")
+    // And gives it back on the way up.
+    let x2 = slot_x(ed, 2)
+    carry_to(mut ed, x2)
+    assert(row2_gap_slot(ed) == -1, "given back")
+    assert(row2_entry_x(ed, 3) == at_rest_3, "3 home")
+}
+
+// `test_drag_row2_previewed_gap_is_the_ordinal_the_drop_commits`
+// (`:2166-2220`): swept cell by cell, each column on its own fixture.
+fn t_row2_previewed_gap_is_the_ordinal_the_drop_commits() {
+    let (probe, _) = row2_fixture()
+    let (press_x, _) = slot_span(probe, 0)
+    let tail_x = edit.strip_member_tail_x(probe) + 3
+    var seen = 0
+    var x = 0
+    while x < tail_x {
+        var (ed, g) = row2_fixture()
+        let held = ed.tabs[0].tab_id
+        press(mut ed, press_x, 0)
+        carry_to_row2(mut ed, x)
+        let gap = row2_gap_slot(ed)
+        assert(gap >= 0, "column {x}: a gap")
+        seen = seen | 1 << gap
+        release(mut ed, x, 1)
+        let idx = edit.tab_index_of_id(ed, held)
+        assert(idx >= 0, "column {x}: open")
+        assert(ed.tabs[idx].group_id == g, "column {x}: joined")
+        // THE AGREEMENT: the gap the frame showed, 1-based.
+        assert(
+            ed.tabs[idx].group_ordinal == gap + 1,
+            "column {x}: ordinal {ed.tabs[idx].group_ordinal} for gap {gap}",
+        )
+        x += 1
+    }
+    // Every one of the three positions was actually reached.
+    assert(seen == 7, "all three reached: {seen}")
+}
+
+// `dg_sweep_preview_matches_drop` (`:2232-2313`): the strip the user is
+// looking at and the list the release commits are the same answer, swept
+// right to left, each pointer position on its own fixture.
+fn sweep_preview_matches_drop(grouped: bool) {
+    var probe = grouped_fixture(grouped)
+    paint(mut probe)
+    assert(edit.strip_slot_count(probe) == 4, "four entries")
+    let (_, pc1) = slot_span(probe, 3)
+    let press_x = pc1 - 2
+    let tail_x = edit.strip_tail_x(probe)
+    var prev_to = -1
+    var x = tail_x
+    while x > 0 {
+        x -= 1
+        // The press cell itself is a click, with no drag to agree with.
+        if x != press_x {
+            var ed = grouped_fixture(grouped)
+            paint(mut ed)
+            let held_key = 65536 + ed.tabs[held_index(grouped)].tab_id
+            press(mut ed, press_x, 0)
+            motion(mut ed, x, 0)
+            paint(mut ed)
+            assert(ed.mouse.drag_to_valid, "column {x}: a target")
+            assert(!ed.mouse.drag_to_tail, "column {x}: not the tail")
+            let to = ed.mouse.drag_to_slot
+            // MONOTONE: carrying further left only moves the landing left.
+            if prev_to >= 0 {
+                assert(to <= prev_to, "column {x}: monotone ({to} after {prev_to})")
+            }
+            prev_to = to
+            let during = row1_keys(ed)
+            release(mut ed, x, 0)
+            paint(mut ed)
+            let after = row1_keys(ed)
+            // The gap was one entry wide, and it was the held one.
+            assert(after.len == during.len + 1, "column {x}: one more entry")
+            assert(after[to] == held_key, "column {x}: the held entry at {to}")
+            // Everything else kept the order the drag had drawn.
+            var i = 0
+            var j = 0
+            while i < after.len {
+                if i != to {
+                    assert(after[i] == during[j], "column {x}: entry {i} kept")
+                    j += 1
+                }
+                i += 1
+            }
+        }
+    }
+    // The sweep reached the far left.
+    assert(prev_to == 0, "the head of the strip")
+}
+
+// `test_drag_every_previewed_gap_is_where_the_drop_lands` (`:2315-2318`).
+fn t_every_previewed_gap_is_where_the_drop_lands() {
+    sweep_preview_matches_drop(false)
+}
+
+// `test_drag_the_dogfood_strip_reorders_at_every_step` (`:2326-2329`).
+fn t_the_dogfood_strip_reorders_at_every_step() {
+    sweep_preview_matches_drop(true)
+}
+
+// `test_drag_dwell_flash_is_visible_on_the_active_group_entry`
+// (`:2341-2390`): §3 toggles REVERSE, so an active entry still announces.
+fn t_dwell_flash_is_visible_on_the_active_group_entry() {
+    var (ed, g) = group_fixture(5, 4, 5, 4)
+    let gslot = slot_of_payload(ed, -g)
+    assert(gslot >= 0, "the group is on row 1")
+    // The premise: this entry is the row-1 ACTIVE one.
+    assert(active_entry(ed) == gslot, "the active entry")
+    let base = entry_reversed(ed, g)
+    // An UNGROUPED tab carried onto it.
+    let px = slot_x(ed, 0)
+    let gx = slot_x(ed, gslot)
+    press(mut ed, px, 0)
+    motion(mut ed, gx, 0)
+    assert(ed.mouse.dwell_gid == g, "counting")
+    let t0 = ed.now_ms
+    ed.now_ms = t0
+    assert(edit.mouse_dwell_flash(ed) == g, "lit")
+    paint(mut ed)
+    let lit = entry_reversed(ed, g)
+    ed.now_ms = t0 + edit.DRAG_FLASH_MS
+    assert(edit.mouse_dwell_flash(ed) == 0, "dark")
+    paint(mut ed)
+    let dark = entry_reversed(ed, g)
+    assert(lit == !base, "the lit quarter differs")
+    assert(dark == base, "the dark quarter is the active look")
+}
+
+fn want(chosen: int, n: int) -> bool {
+    chosen < 0 || chosen == n
+}
+
+fn main() {
+    let chosen = (env_get("YEW_DRAG_CASE") else "-1").to_int() else -1
+    if want(chosen, 0) {
+        t_never_mutates_the_tab_array_before_release()
+        print("drag_never_mutates_the_tab_array_before_release: PASS")
+    }
+    if want(chosen, 1) {
+        t_cancel_restores_nothing_because_nothing_moved()
+        print("drag_cancel_restores_nothing_because_nothing_moved: PASS")
+    }
+    if want(chosen, 2) {
+        t_drop_reorders_by_insertion()
+        print("drag_drop_reorders_by_insertion: PASS")
+    }
+    if want(chosen, 3) {
+        t_drop_where_it_started_changes_nothing()
+        print("drag_drop_where_it_started_changes_nothing: PASS")
+    }
+    if want(chosen, 4) {
+        t_a_changed_tab_count_cancels()
+        print("drag_a_changed_tab_count_cancels: PASS")
+    }
+    if want(chosen, 5) {
+        t_a_close_or_open_under_a_drag_cancels_at_once()
+        print("drag_a_close_or_open_under_a_drag_cancels_at_once: PASS")
+    }
+    if want(chosen, 6) {
+        t_dwell_opens_a_group_at_500ms_and_not_at_499()
+        print("drag_dwell_opens_a_group_at_500ms_and_not_at_499: PASS")
+    }
+    if want(chosen, 7) {
+        t_passing_over_three_groups_opens_none()
+        print("drag_passing_over_three_groups_opens_none: PASS")
+    }
+    if want(chosen, 8) {
+        t_dwell_reads_the_pre_drag_list_not_the_region()
+        print("drag_dwell_reads_the_pre_drag_list_not_the_region: PASS")
+    }
+    if want(chosen, 9) {
+        t_never_dwells_into_its_own_group()
+        print("drag_never_dwells_into_its_own_group: PASS")
+    }
+    if want(chosen, 10) {
+        t_join_matches_the_keyboard_sequence()
+        print("drag_join_matches_the_keyboard_sequence: PASS")
+    }
+    if want(chosen, 11) {
+        t_drop_on_the_blank_tail_leaves_a_sole_group()
+        print("drag_drop_on_the_blank_tail_leaves_a_sole_group: PASS")
+    }
+    if want(chosen, 12) {
+        t_autoscroll_is_throttled_to_one_entry_per_window()
+        print("drag_autoscroll_is_throttled_to_one_entry_per_window: PASS")
+    }
+    if want(chosen, 13) {
+        t_reports_a_deadline_at_every_flash_edge()
+        print("drag_reports_a_deadline_at_every_flash_edge: PASS")
+    }
+    if want(chosen, 14) {
+        t_a_group_moves_the_whole_block()
+        print("drag_a_group_moves_the_whole_block: PASS")
+    }
+    if want(chosen, 15) {
+        t_row1_slot_extracts_a_member_from_its_group()
+        print("drag_row1_slot_extracts_a_member_from_its_group: PASS")
+    }
+    if want(chosen, 16) {
+        t_extracting_a_sole_member_onto_a_slot_to_its_right()
+        print("drag_extracting_a_sole_member_onto_a_slot_to_its_right: PASS")
+    }
+    if want(chosen, 17) {
+        t_row1_exit_works_when_the_strip_overflows()
+        print("drag_row1_exit_works_when_the_strip_overflows: PASS")
+    }
+    if want(chosen, 18) {
+        t_float_is_drawn_and_registers_no_region()
+        print("drag_float_is_drawn_and_registers_no_region: PASS")
+    }
+    if want(chosen, 19) {
+        t_held_entry_leaves_a_gap_in_the_strip()
+        print("drag_held_entry_leaves_a_gap_in_the_strip: PASS")
+    }
+    if want(chosen, 20) {
+        t_dwell_flashes_twice_before_opening()
+        print("drag_dwell_flashes_twice_before_opening: PASS")
+    }
+    if want(chosen, 21) {
+        t_dwell_flash_marks_damage_only_at_an_edge()
+        print("drag_dwell_flash_marks_damage_only_at_an_edge: PASS")
+    }
+    if want(chosen, 22) {
+        t_float_survives_a_user_scrolled_strip()
+        print("drag_float_survives_a_user_scrolled_strip: PASS")
+    }
+    if want(chosen, 23) {
+        t_autoscroll_keeps_the_strip_where_the_drop_landed()
+        print("drag_autoscroll_keeps_the_strip_where_the_drop_landed: PASS")
+    }
+    if want(chosen, 24) {
+        t_a_press_ends_the_hover_reveal()
+        print("drag_a_press_ends_the_hover_reveal: PASS")
+    }
+    if want(chosen, 25) {
+        t_float_does_not_disturb_the_chevron_answer()
+        print("drag_float_does_not_disturb_the_chevron_answer: PASS")
+    }
+    if want(chosen, 26) {
+        t_dwell_preview_retracts_when_the_pointer_leaves()
+        print("drag_dwell_preview_retracts_when_the_pointer_leaves: PASS")
+    }
+    if want(chosen, 27) {
+        t_dwell_reopens_a_group_the_pointer_returns_to()
+        print("drag_dwell_reopens_a_group_the_pointer_returns_to: PASS")
+    }
+    if want(chosen, 28) {
+        t_dwell_preview_survives_the_pointer_on_row_2()
+        print("drag_dwell_preview_survives_the_pointer_on_row_2: PASS")
+    }
+    if want(chosen, 29) {
+        t_neighbours_slide_out_of_the_carried_tabs_way()
+        print("drag_neighbours_slide_out_of_the_carried_tabs_way: PASS")
+    }
+    if want(chosen, 30) {
+        t_a_group_entry_holds_still_inside_its_hover_band()
+        print("drag_a_group_entry_holds_still_inside_its_hover_band: PASS")
+    }
+    if want(chosen, 31) {
+        t_a_group_entry_holds_still_coming_from_the_right()
+        print("drag_a_group_entry_holds_still_coming_from_the_right: PASS")
+    }
+    if want(chosen, 32) {
+        t_resting_in_a_group_band_still_opens_it()
+        print("drag_resting_in_a_group_band_still_opens_it: PASS")
+    }
+    if want(chosen, 33) {
+        t_a_plain_neighbour_still_swaps_at_half_its_width()
+        print("drag_a_plain_neighbour_still_swaps_at_half_its_width: PASS")
+    }
+    if want(chosen, 34) {
+        t_row2_opens_a_gap_where_the_member_will_land()
+        print("drag_row2_opens_a_gap_where_the_member_will_land: PASS")
+    }
+    if want(chosen, 35) {
+        t_moving_between_rows_hands_the_preview_over()
+        print("drag_moving_between_rows_hands_the_preview_over: PASS")
+    }
+    if want(chosen, 36) {
+        t_row2_previewed_gap_is_the_ordinal_the_drop_commits()
+        print("drag_row2_previewed_gap_is_the_ordinal_the_drop_commits: PASS")
+    }
+    if want(chosen, 37) {
+        t_every_previewed_gap_is_where_the_drop_lands()
+        print("drag_every_previewed_gap_is_where_the_drop_lands: PASS")
+    }
+    if want(chosen, 38) {
+        t_the_dogfood_strip_reorders_at_every_step()
+        print("drag_the_dogfood_strip_reorders_at_every_step: PASS")
+    }
+    if want(chosen, 39) {
+        t_dwell_flash_is_visible_on_the_active_group_entry()
+        print("drag_dwell_flash_is_visible_on_the_active_group_entry: PASS")
+    }
+    print("drag_test: done")
+}
