@@ -155,8 +155,11 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
    `spec/11-os.md:3080-3105`), `.git` skipped first, `max_depth`,
    `max_entries` with its one message, budget slices on the idle timer.
    `ws.gitignore`: s26 §4's table, every supported row and every pinned
-   divergence, nested sets, `.git/info/exclude`, the conservative prune
-   and a directory-read counter (DoD 5: a pruned 5,000-file
+   divergence and nested sets. Disk loading follows measured pinned C,
+   including its `.git/info/.gitignore` lookup instead of `exclude` and
+   NULL-base nested rules (R-yw06-10); in-memory base-scoped compilation
+   remains distinct. Gate both fixture-tree listings against C. Preserve
+   the conservative prune and a directory-read counter (DoD 5: a pruned 5,000-file
    `node_modules/` costs one stat and no read). `edit.picker`: the
    filter line IS yw04's `CmdLine` (DoD 9), selection held by payload
    across refilters, the keymap layer, the centred box and the
@@ -406,6 +409,17 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
   retrofit the earlier text and viewport engines to u64. Prove both the
   no-edit load/save round trip and the same coordinate-moving edit against
   C, including distinct wide cursors, identity retention and removal.
+- **R-yw06-10 — disk-ignore loading (Decided A after the C witness,
+  2026-10-23).** Match the pinned implementation, not the stronger prose:
+  `src/ws/walk.c:378-381` calls the loader on `.git/info`, and
+  `src/ws/gitignore.c:479-482` appends `/.gitignore`; `exclude` is not read.
+  `src/ws/gitignore.c:505` gives disk-loaded rules a NULL base, so a nested
+  anchored rule does not get the in-memory API's base scoping. The C-only
+  witnesses in `notes/yw06-evidence/finder-inputs/` confirm both findings;
+  require the port's identical listings on those same fixture trees when
+  the finder lands. Report the C findings, never silently fix them in the
+  port or change a golden. If further measurement contradicts the static
+  reading, measured pinned C is the oracle.
 - **Decided**: R-yw05-1 = A (2026-10-22). s57.9's C is yw03's `block.c`
   and yw05's `groupfromdir.c` and `groupnav.c` (its unit cases are
   `test_block`'s, `test_groupfromdir`'s and `test_groupnav`'s), its
