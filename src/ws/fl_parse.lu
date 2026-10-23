@@ -1,0 +1,276 @@
+//! ws.fl_parse — total bounded byte parser, with an explicit container stack.
+//! sagitta 9ace98c2 src/ws/fl_parse.c:20-525. Duplicate keys follow shipping
+//! src/fl/gc.c:651-698: last value wins without changing insertion order.
+
+struct FlReader {
+    at: int,
+    end: int,
+    line: int,
+    col: int,
+    nodes: int,
+    failed: bool,
+    err: FlParseErr,
+}
+
+struct FlFrame {
+    node: int,
+    after: bool,
+}
+
+fn fl_fail(mut r: FlReader, msg: str) {
+    if !r.failed {
+        r.failed = true
+        r.err = FlParseErr { off: r.at, line: r.line, col: r.col, msg: msg }
+    }
+}
+
+fn fl_peek(src: List[byte], r: FlReader) -> int {
+    if r.at < r.end then src[r.at] as int else -1
+}
+
+fn fl_advance(src: List[byte], mut r: FlReader) -> int {
+    let c = src[r.at] as int
+    r.at += 1
+    if c == 10 { r.line += 1; r.col = 1 } else { r.col += 1 }
+    c
+}
+
+fn fl_skip(src: List[byte], mut r: FlReader) {
+    while r.at < r.end {
+        let c = fl_peek(src, r)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            let _ = fl_advance(src, mut r)
+        } else if c == 35 {
+            while r.at < r.end && fl_peek(src, r) != 10 {
+                let _ = fl_advance(src, mut r)
+            }
+        } else {
+            return
+        }
+    }
+}
+
+fn fl_count(mut r: FlReader) {
+    r.nodes += 1
+    if r.nodes > FL_MAX_NODES { fl_fail(mut r, "node cap exceeded") }
+}
+
+fn fl_hex(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    -1
+}
+
+fn fl_read_string(src: List[byte], mut r: FlReader, mut doc: FlDoc) -> FlSpan {
+    let start = doc.bytes.len
+    let _ = fl_advance(src, mut r)
+    while !r.failed {
+        if r.at >= r.end { fl_fail(mut r, "unterminated string"); break }
+        var c = fl_advance(src, mut r)
+        if c == 34 { break }
+        if c == 92 {
+            if r.at >= r.end { fl_fail(mut r, "unterminated escape"); break }
+            c = fl_advance(src, mut r)
+            if c == 110 {
+                c = 10
+            } else if c == 116 {
+                c = 9
+            } else if c == 114 {
+                c = 13
+            } else if c == 48 {
+                c = 0
+            } else if c == 120 {
+                if r.at + 1 >= r.end { fl_fail(mut r, "truncated \\xNN escape"); break }
+                let hi = fl_hex(fl_advance(src, mut r))
+                let lo = fl_hex(fl_advance(src, mut r))
+                if hi < 0 || lo < 0 { fl_fail(mut r, "bad \\xNN escape"); break }
+                c = hi * 16 + lo
+            } else if c != 34 && c != 92 {
+                fl_fail(mut r, "unknown escape")
+                break
+            }
+        }
+        if doc.bytes.len - start >= FL_MAX_STRING {
+            fl_fail(mut r, "string exceeds the 4096-byte cap")
+            break
+        }
+        (mut doc.bytes).push(c as byte)
+    }
+    FlSpan { at: start, len: doc.bytes.len - start }
+}
+
+fn fl_read_key(src: List[byte], mut r: FlReader, mut doc: FlDoc) -> FlSpan {
+    if fl_peek(src, r) == 34 {
+        fl_count(mut r)
+        return fl_read_string(src, mut r, mut doc)
+    }
+    let start = doc.bytes.len
+    while r.at < r.end {
+        let c = fl_peek(src, r)
+        if c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 95 || c == 46 {
+            (mut doc.bytes).push(fl_advance(src, mut r) as byte)
+        } else {
+            break
+        }
+    }
+    if doc.bytes.len == start { fl_fail(mut r, "expected a key") }
+    FlSpan { at: start, len: doc.bytes.len - start }
+}
+
+fn fl_word(src: List[byte], r: FlReader, word: str) -> bool {
+    if word.len > r.end - r.at { return false }
+    var i = 0
+    while i < word.len {
+        if src[r.at + i] != word.bytes()[i] { return false }
+        i += 1
+    }
+    true
+}
+
+// Negative accumulation handles INT64_MIN without an overflowing positive
+// magnitude; every multiply/subtract is checked BEFORE evaluating it.
+fn fl_read_int(src: List[byte], mut r: FlReader) -> int {
+    let neg = fl_peek(src, r) == 45
+    if neg { let _ = fl_advance(src, mut r) }
+    var value: int = 0
+    var any = false
+    var over = false
+    let limit: int = if neg then -9223372036854775807 - 1 else -9223372036854775807
+    while r.at < r.end {
+        let c = fl_peek(src, r)
+        if c < 48 || c > 57 { break }
+        let _ = fl_advance(src, mut r)
+        any = true
+        let digit = c - 48
+        if value < limit / 10 || value == limit / 10 && digit > 0 - limit % 10 {
+            over = true
+        } else if !over {
+            value = value * 10 - digit
+        }
+    }
+    if !any { fl_fail(mut r, "expected digits") }
+    if over { fl_fail(mut r, "integer out of range") }
+    if neg then value else 0 - value
+}
+
+fn fl_atom(src: List[byte], mut r: FlReader, mut doc: FlDoc) -> int {
+    fl_skip(src, mut r)
+    if r.at >= r.end { fl_fail(mut r, "expected a value"); return -1 }
+    fl_count(mut r)
+    if r.failed { return -1 }
+    var kind = FL_NIL
+    var number: int = 0
+    var text = FlSpan { at: 0, len: 0 }
+    let c = fl_peek(src, r)
+    if c == 123 || c == 91 {
+        kind = if c == 123 then FL_MAP else FL_LIST
+        let _ = fl_advance(src, mut r)
+    } else if c == 34 {
+        kind = FL_STR
+        text = fl_read_string(src, mut r, mut doc)
+    } else if c == 45 || c >= 48 && c <= 57 {
+        kind = FL_INT
+        number = fl_read_int(src, mut r)
+    } else if fl_word(src, r, "true") {
+        kind = FL_BOOL
+        number = 1
+        r.at += 4
+        r.col += 4
+    } else if fl_word(src, r, "false") {
+        kind = FL_BOOL
+        r.at += 5
+        r.col += 5
+    } else if fl_word(src, r, "nil") {
+        r.at += 3
+        r.col += 3
+    } else {
+        fl_fail(mut r, "unexpected byte")
+    }
+    if r.failed { return -1 }
+    fl_node(mut doc, kind, number, text)
+}
+
+fn fl_attach(mut doc: FlDoc, parent: int, key: FlSpan, child: int) {
+    if doc.nodes[parent].kind == FL_MAP {
+        var i = 0
+        while i < doc.nodes[parent].keys.len {
+            if fl_span_equal(doc.bytes, doc.nodes[parent].keys[i], doc.bytes, key) {
+                doc.nodes[parent].items[i] = child
+                return
+            }
+            i += 1
+        }
+        (mut doc.nodes[parent].keys).push(key)
+    }
+    (mut doc.nodes[parent].items).push(child)
+}
+
+/// Parses one literal, not a program. Offsets are absolute; line/column start
+/// at 1 at `at`. Syntax errors never trap or return a partial successful tree.
+pub fn fl_parse(src: List[byte], at: int, end: int) -> FlParseResult {
+    var doc = fl_doc()
+    var r = FlReader {
+        at: at,
+        end: end,
+        line: 1,
+        col: 1,
+        nodes: 0,
+        failed: false,
+        err: FlParseErr { off: at, line: 1, col: 1, msg: "" },
+    }
+    if at < 0 || end < at || end > src.len {
+        fl_fail(mut r, "invalid input bounds")
+    } else if end - at > FL_MAX_BYTES {
+        fl_fail(mut r, "document exceeds 8 MiB")
+    }
+    var stack = List[FlFrame]()
+    if !r.failed {
+        doc.root = fl_atom(src, mut r, mut doc)
+        if !r.failed && doc.nodes[doc.root].kind >= FL_LIST {
+            (mut stack).push(FlFrame { node: doc.root, after: false })
+        }
+    }
+    while !r.failed && stack.len > 0 {
+        let top = stack.len - 1
+        let parent = stack[top].node
+        let map = doc.nodes[parent].kind == FL_MAP
+        let closer = if map then 125 else 93
+        fl_skip(src, mut r)
+        if r.at >= r.end { fl_fail(mut r, "unterminated container"); break }
+        if fl_peek(src, r) == closer {
+            let _ = fl_advance(src, mut r)
+            let _ = (mut stack).pop() else FlFrame { node: 0, after: false }
+            continue
+        }
+        if stack[top].after {
+            if fl_peek(src, r) != 44 { fl_fail(mut r, "expected ',' or a closer"); break }
+            let _ = fl_advance(src, mut r)
+            stack[top].after = false
+            continue
+        }
+        var key = FlSpan { at: 0, len: 0 }
+        if map {
+            key = fl_read_key(src, mut r, mut doc)
+            if r.failed { break }
+            fl_skip(src, mut r)
+            if r.at >= r.end || fl_advance(src, mut r) != 58 {
+                fl_fail(mut r, "expected ':' after a key")
+                break
+            }
+        }
+        let child = fl_atom(src, mut r, mut doc)
+        if r.failed { break }
+        fl_attach(mut doc, parent, key, child)
+        stack[top].after = true
+        if doc.nodes[child].kind >= FL_LIST {
+            if stack.len >= FL_MAX_DEPTH { fl_fail(mut r, "nesting deeper than 32"); break }
+            (mut stack).push(FlFrame { node: child, after: false })
+        }
+    }
+    if !r.failed {
+        fl_skip(src, mut r)
+        if r.at < r.end { fl_fail(mut r, "trailing bytes after the document") }
+    }
+    FlParseResult { ok: !r.failed, doc: doc, err: r.err }
+}
