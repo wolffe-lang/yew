@@ -1,0 +1,217 @@
+//! member: false
+//! Port of sagitta tests/fuzz/fuzz_state.c:60-423 at9ace98c2: one raw
+//! session plus24 structure mutations, parser caps AND real Ed survival.
+//! Seeds are the frozen corpus (<=64KiB, max32, at least20 required).
+//! The bounded outer raw generator is seeded; target mutation RNG is C's.
+
+use edit
+use util
+use ws
+
+fn next(mut seed: wrapping[u64]) -> int {
+    seed = seed * 6364136223846793005 + 1442695040888963407
+    (seed >> 33) as int
+}
+
+fn below(mut seed: wrapping[u64], n: int) -> int { if n == 0 then 0 else next(mut seed) % n }
+
+fn append(mut out: List[byte], src: List[byte], lo: int, hi: int) {
+    var i = lo
+    while i < hi { (mut out).push(src[i]); i += 1 }
+}
+
+fn seeds_load() -> List[List[byte]] {
+    var seeds = List[List[byte]]()
+    let root = "tests/unit/fixtures/wsstate/v1"
+    for dir in [root, "{root}/noncanonical", "{root}/invalid"] {
+        var names = fs_read_dir(dir) else { assert(false, "missing corpus {dir}"); return seeds }
+        util.sort_stable(mut names, fn(a: str, b: str) a < b)
+        for name in names {
+            if seeds.len >= 32 { break }
+            if !name.ends_with(".fl") { continue }
+            let path = "{dir}/{name}"
+            let stat = fs_stat(path) else { assert(false); continue }
+            if stat[1] == 0 || stat[1] > 65536 { continue }
+            let bytes = fs_read_bytes(path) else { assert(false); continue }
+            (mut seeds).push(bytes)
+        }
+    }
+    assert(seeds.len >= 20, "fuzz_state requires at least20 frozen seeds")
+    seeds
+}
+
+fn mutate(mut rng: wrapping[u64], seed: List[byte], seeds: List[List[byte]]) -> List[byte] {
+    let kind = below(mut rng, 9), n = seed.len
+    var out = List[byte]()
+    if n == 0 { return out }
+    match kind {
+        0 => {
+            out = copy seed
+            let at = below(mut rng, n)
+            out[at] = below(mut rng, 256) as byte
+        },
+        1 => { let at = below(mut rng, n); append(mut out, seed, 0, at) },
+        2 => {
+            let at = below(mut rng, n)
+            append(mut out, seed, 0, at)
+            let skip = 1 + below(mut rng, 32)
+            if at + skip < n { append(mut out, seed, at + skip, n) }
+        },
+        3 => {
+            let at = below(mut rng, n)
+            append(mut out, seed, 0, at)
+            let want = 1 + below(mut rng, 64)
+            let run = if at + want > n then n - at else want
+            append(mut out, seed, at, at + run)
+            append(mut out, seed, at, at + run)
+            append(mut out, seed, at, n)
+        },
+        4 => {
+            let drop = if below(mut rng, 2) != 0 then 125 else 93
+            for b in seed { if b as int != drop { (mut out).push(b) } }
+        },
+        5 => {
+            let at = below(mut rng, n)
+            append(mut out, seed, 0, at)
+            let j = below(mut rng, seeds.len)
+            append(mut out, seeds[j], 0, seeds[j].len)
+            append(mut out, seed, at, n)
+        },
+        6 => {
+            let depth = 1 + below(mut rng, 64)
+            for _ in 0..depth { append(mut out, "{{ a: ".bytes(), 0, 5) }
+            append(mut out, seed, 0, n)
+        },
+        7 => {
+            let len = 4000 + below(mut rng, 400)
+            append(mut out, "{{ version: 1, path: \"".bytes(), 0, 21)
+            for i in 0..len { (mut out).push((97 + i % 26) as byte) }
+            append(mut out, "\", }}\n".bytes(), 0, 5)
+        },
+        _ => {
+            out = copy seed
+            let hits = 1 + below(mut rng, 8)
+            for _ in 0..hits { let at = below(mut rng, n); out[at] = 0 as byte }
+        },
+    }
+    out
+}
+
+fn caps(doc: ws.FlDoc) {
+    assert(doc.nodes.len <= ws.FL_MAX_NODES)
+    var nodes = List[int](), depths = List[int]()
+    (mut nodes).push(doc.root)
+    (mut depths).push(0)
+    while nodes.len > 0 {
+        let n = (mut nodes).pop() else -1
+        let depth = (mut depths).pop() else -1
+        assert(n >= 0 && depth <= ws.FL_MAX_DEPTH)
+        if doc.nodes[n].kind == ws.FL_STR { assert(doc.nodes[n].text.len <= ws.FL_MAX_STRING) }
+        for key in doc.nodes[n].keys { assert(key.len <= ws.FL_MAX_STRING) }
+        for child in doc.nodes[n].items { (mut nodes).push(child); (mut depths).push(depth + 1) }
+    }
+}
+
+fn fresh() -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    ed
+}
+
+fn verify_fixture(seeds: List[List[byte]], fixture: edit.Ed) {
+    for bytes in seeds {
+        region equivalence {
+            var rebuilt = fresh()
+            var cloned = copy fixture
+            let a = edit.state_apply(mut rebuilt, bytes)
+            let b = edit.state_apply(mut cloned, bytes)
+            assert(a == b)
+            assert(rebuilt.tabs.len == cloned.tabs.len && rebuilt.tab_active == cloned.tab_active)
+            assert(rebuilt.timers.len == cloned.timers.len && rebuilt.state.timer == cloned.state.timer)
+            assert(rebuilt.state.dirty == cloned.state.dirty && rebuilt.state.writes == cloned.state.writes)
+            assert(rebuilt.quit == cloned.quit && rebuilt.exit_code == cloned.exit_code)
+            let left = edit.state_emit_at(rebuilt, 0)
+            let right = edit.state_emit_at(cloned, 0)
+            assert(edit.comp_bytes_eq(left, right), "fresh/copy Ed emit equivalence")
+            edit.state_dispose(mut rebuilt)
+            edit.state_dispose(mut cloned)
+        }
+    }
+    assert(fixture.tabs.len == 1 && fixture.bufs.len == 1 && fixture.groups.len == 0)
+    assert(fixture.wins[fixture.win].cs.curs[0].pos == 0 && !fixture.state.ready)
+    assert(!fixture.tty.opened && !fixture.tty.guard_on && !fixture.tty_ready)
+    assert(fixture.jobs.v.len == 0 && fixture.jobs.fds.len == 0 && fixture.journals.paths.len == 0)
+    assert(!fixture.bufs[0].ec.has_jrnl && fixture.regs.clip.write_fd < 0 && fixture.regs.clip.pid_fd < 0 && fixture.regs.clip.exec_fd < 0 && fixture.regs.clip.reap.len == 0)
+    region independence {
+        let before = edit.state_emit_at(fixture, 0)
+        var changed = copy fixture
+        changed.tabs[0].display_path = "clone-only"
+        changed.wins[changed.win].cs.curs[0].pos = 77
+        changed.bufs[0].named.pending[0] = 99
+        changed.bufs[0].named.pending_set[0] = true
+        let _ = edit.group_create(mut changed, "/clone", "clone")
+        let _ = edit.timer_add(mut changed.timers, 7, edit.TIMER_TEST_MARK, 0)
+        let fresh_clone = copy fixture
+        assert(fixture.wins[fixture.win].cs.curs[0].pos == 0 && !fixture.bufs[0].named.pending_set[0])
+        assert(fixture.groups.len == 0 && fixture.timers.len == 0 && fresh_clone.timers.len == 0)
+        let after = edit.state_emit_at(fresh_clone, 0)
+        assert(edit.comp_bytes_eq(before, after), "nested clone mutation cannot affect template/fresh clone")
+    }
+    print("fuzz_state fixture rebuild/copy equivalence: {seeds.len} seeds, nested independence, no live handles PASS")
+}
+
+fn run_one(bytes: List[byte], fixture: edit.Ed, clone_fixture: bool) -> int {
+    let parsed = ws.fl_parse(bytes, 0, bytes.len)
+    if parsed.ok { caps(parsed.doc) } else { assert(bytes.len == 0 || parsed.err.line > 0) }
+    var ed = if clone_fixture then copy fixture else fresh()
+    let result = edit.state_apply(mut ed, bytes)
+    assert(result >= edit.WS_FRESH && result <= edit.WS_RECOVERED)
+    assert(ed.tabs.len >= 1 && !ed.quit && ed.win >= 0 && edit.pane_live(ed, ed.pane_root))
+    edit.state_dispose(mut ed)
+    if parsed.ok then 1 else 0
+}
+
+fn session(data: List[byte], seeds: List[List[byte]], fixture: edit.Ed, clone_fixture: bool) -> int {
+    var rng: wrapping[u64] = 0x9E3779B97F4A7C15
+    for b in data { rng = rng * 31 + b as int as wrapping[u64] }
+    var accepted = 0
+    region raw { accepted += run_one(data, fixture, clone_fixture) }
+    for _ in 0..24 {
+        region mutated {
+            let j = below(mut rng, seeds.len)
+            let bytes = mutate(mut rng, seeds[j], seeds)
+            assert(bytes.len <= ws.FL_MAX_BYTES)
+            accepted += run_one(bytes, fixture, clone_fixture)
+        }
+    }
+    accepted
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len != 2 { return 2 }
+    let initial = args[0].to_int() else { return 2 }
+    let count = args[1].to_int() else { return 2 }
+    let seeds = seeds_load()
+    let fixture = fresh()
+    let clone_fixture = (env_get("YEW_FUZZ_COPY_FIXTURE") else "") == "1"
+    if clone_fixture { verify_fixture(seeds, fixture) }
+    print("fuzz_state cloned_fixture={clone_fixture}")
+    var outer: wrapping[u64] = initial as wrapping[u64]
+    var accepted: int = 0
+    print("fuzz_state seed={initial} sessions={count} mutations_per_session=24 seeds={seeds.len}")
+    for i in 0..count {
+        region one_session {
+            var raw = List[byte]()
+            let n = below(mut outer, 257)
+            for _ in 0..n { (mut raw).push(below(mut outer, 256) as byte) }
+            accepted += session(raw, seeds, fixture, clone_fixture)
+        }
+        if i % 100 == 99 {
+            print("fuzz_state seed={initial} sessions={i+1} documents={(i+1)*25} parsed={accepted}")
+        }
+    }
+    print("fuzz_state seed={initial} completed={count} documents={count*25} parsed={accepted} PASS")
+    0
+}
