@@ -416,7 +416,85 @@ s57.12 needed no code (yw03's and yw04's commands, on yw05's bump).
 
 ### 4.8 The gates (deliverable 8, M-YW5)
 
-<<GATES>>
+**The unit lanes.** `tools/check-test` (the checked machine, whole
+files, falling back to native where it refuses) and `tools/check-test
+--native` <<UNITLANES>>. The checked machine one case at a time is
+`tools/check-test-cases` (new): its table (`tools/check-test-cases.txt`)
+holds every test file that reads a `YEW_*_CASE` or `YEW_*_FIXTURE`
+selector — 21 files, 421 cases — and a full run fails if a selector file
+is missing from it; a counted file's case past the last must print no
+case line, so a stale count is red; a case that is not `exit(0)` is red
+unless an `allow` row names it as past the budget, and an allowed case
+that now exits 0 is red too. Eleven cases are allowed, each alone past
+the 20M-step budget and passing natively (`18-maximal-512-tabs.fl`;
+`shell_self` 0 and 3; `mouse_click` 4; `drag` 36–38; `narrow` 0, 4, 5;
+`picker` 9). It runs as CI's `checked-cases` job (27 minutes in run
+40011667289, the plant's 420 cases); its first run caught a real red
+(`shell_self` case 0 past the budget, `2f5d907`).
+
+**M-YW5** (R-yw06-3 = A):
+- the **81** reachable goldens green by name against the wolf binary,
+  release and native, at `c49b738`
+  (`notes/yw06-evidence/continuation/goldens81-{release-443d271,native-c49b738}.log`,
+  and `gauntlet-oracle-c49b738.log`), held to the C registry by name,
+  count and order (`tools/check-yw06-cases`), CI's `goldens, campaign
+  05's workspace, finder and mouse` step; the recorded step narrowed to
+  the eleven red by design, by owner: `s57_9_block_days_structure`,
+  `_left_eof` (yw10, `wolf.fl`'s colours), `s57_13_fuss_file_menu`,
+  `_dir_menu`, `startup_directory_workspace` and the six `fuss_drawer_*`
+  (yw13);
+- the automated twins of s42 §10's boxes, as a CI step
+  (`tools/run-trials`, `tools/trials/trials.c` over sagitta's own PTY
+  harness and its s25 helpers): **Workspace resume in anger** —
+  `trial_resume_cycles20`, twenty quit/reopen cycles of
+  `s25_resume_exact`'s arrangement, every reopened grid byte-identical to
+  the first; **Zero data loss** and **Terminal restore in the field** —
+  `trial_restore_sigkill`, `_sigsegv` and `_hangup`, the debounced save
+  allowed to land and the editor killed by the signal or its terminal
+  closed, the reopened grid the arrangement exactly; and
+  `trial_cross_differential` both ways. Each runs over C yew and over
+  the port, each binary the other's partner once. Green at `c5f8bbe`
+  and `c49b738`;
+- the budgets beside C (§4.2, §4.4, §4.5) and `test_invariant9` (13 of
+  13, native and checked);
+- the field gate itself stays the maintainer's, after yw10 (box 8,
+  highlighting) and yw09 (his own `init.fl`).
+
+**The 2× rows on kasumi** (8–11, shared; C, the port, C again in one
+run): `perf_state` emit 0.59, parse 0.96, restore 1.13;
+`startup.first_paint.workspace50` 1.68; `mem.workspace50` 1.87 (both
+inside 40 MB); `perf_finder` open 1.35, its three in-frame gates 1.00;
+the router's burst 6.68, menu hover 2.01, chevron hover 2.06 (over 2×,
+G45, yw15's); <<MANYBUFFERS>>.
+
+**The other gates CI now holds** (all in the oracle job unless named):
+`fuzz_state` (2,000 × 4 seeds), `fuzz_gitignore` (200,000) and
+`fuzz_mouse` (4 sessions × 4 seeds) each against C's own driver, the
+report lines equal byte for byte; the `perf_state`, `perf_mouse` and
+`perf_finder` harnesses' builds as hard steps; the save's two
+fault-shim rows in a container; the walk's listings against C's (the
+port job, `tools/check-walk-listings`); and the port job's timeout
+raised to 240 minutes (yw05-tail's run took 166 of 180, and yw06 adds 28
+test files to both unit lanes).
+
+**Seen red.** Every new gate was planted in a PR's own run and the PR
+closed unmerged:
+- PR #47 (run 39919880434): the harness homes (job 120302334000) and
+  the perf compile gate (job 120302334031, E0402, exit 2).
+- PR #48 (run 39979049134): the self-open plant in `wolf test` (port
+  job 120501254928); the global `:` history in torture-live's
+  determinism lane, the dropped dictionary in `fuzz_state`'s
+  comparison, the `perf_state` compile plant (exit 2) and the plain
+  state write in the shim rows (oracle job 120501254955, and macOS
+  120501255132).
+- PR #50 (runs 40011439752 and 40011667289): <<PLANT2>>.
+
+Real reds the plants and the gauntlet found on the way, each fixed:
+the fuzzy fuzzer's staging copy missing `util` (PR #48's port job,
+`e79e2c6`); `ci/legs-test.py`'s L4 wiring refusing the new
+`checked-cases` job (PR #50's first run, legs job; `edad410`);
+`shell_self` case 0 past the checked budget (the byte walk,
+`2f5d907`); `tools/perf-mouse` unformatted (`c36559c`).
 
 ### 4.9 The `unsafe` census
 
