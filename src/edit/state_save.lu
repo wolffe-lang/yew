@@ -16,6 +16,18 @@ pub const STATE_SAVE_DEBOUNCE_MS: int = 2000
 /// Original bytes of a G40 path that the filesystem's str API cannot name.
 pub struct StatePath { buffer_id: int, bytes: List[byte] }
 
+/// Sparse raw i64 wire bits for values whose C u64 interpretation is beyond
+/// the port's signed coordinate domain. Live coordinates remain safe; a later
+/// clamp/edit changes the normalized value and therefore retires the override.
+pub struct StateWire {
+    kind: int,
+    owner: int,
+    entity: int,
+    field: str,
+    raw: int,
+    normalized: int,
+}
+
 /// Single-session workspace state, stateless until explicitly opened.
 pub struct WsState {
     key: ws.WsKey,
@@ -29,6 +41,7 @@ pub struct WsState {
     literals: ws.StateLiterals,
     missing_count: int,
     byte_paths: List[StatePath],
+    wire: List[StateWire],
 }
 
 /// Empty state does not read or write anything.
@@ -45,6 +58,7 @@ pub fn state_new() -> WsState {
         literals: ws.state_literals(),
         missing_count: 0,
         byte_paths: List[StatePath](),
+        wire: List[StateWire](),
     }
 }
 
@@ -96,7 +110,11 @@ fn state_lock_claim(mut s: WsState) {
         return
     }
     let readback = state_lock_read(path)
-    if readback != mine { s.owner_pid = readback; return }
+    if readback != mine {
+        s.owner_pid = readback
+        util.log_info("workspace state is owned by pid {readback}; this session will not save it")
+        return
+    }
     s.writer = true
 }
 
@@ -114,6 +132,7 @@ pub fn state_save(mut ed: Ed) -> bool {
     if !ed.state.ready || !ed.state.writer { return false }
     let path = ws.ws_state_path(ed.state.key)
     if path.len == 0 { return false }
+    state_wire_prune(mut ed)
     var ok = false
     region save {
         let bytes = state_emit(ed)
@@ -216,4 +235,126 @@ pub fn state_option_bool(ed: Ed, key: str, dflt: bool) -> bool {
 pub fn state_option_str(ed: Ed, key: str, dflt: str) -> str {
     let span = ws.state_option_string_span(ed.state.literals, key.bytes()) else { return dflt }
     str_from_utf8(ed.state.literals.doc.bytes[span.at..span.at + span.len]) else dflt
+}
+
+/// Retain a C u64 field's original signed wire bits only when it is negative.
+pub fn state_wire_retain(
+    mut ed: Ed,
+    kind: int,
+    owner: int,
+    entity: int,
+    field: str,
+    raw: int,
+    normalized: int,
+) {
+    if raw >= 0 { return }
+    (mut ed.state.wire).push(StateWire {
+        kind: kind,
+        owner: owner,
+        entity: entity,
+        field: field,
+        raw: raw,
+        normalized: normalized,
+    })
+}
+
+/// Re-emit a retained wide value only while its live normalized field is unchanged.
+pub fn state_wire_value(
+    ed: Ed,
+    kind: int,
+    owner: int,
+    entity: int,
+    field: str,
+    current: int,
+) -> int {
+    for w in ed.state.wire {
+        if w.kind == kind &&
+            w.owner == owner &&
+            w.entity == entity &&
+            w.field == field &&
+            w.normalized == current {
+            return w.raw
+        }
+    }
+    current
+}
+
+// Retire raw metadata at a real clamp/edit boundary, not at a frame boundary.
+// -1 entity and empty field select the owner's whole class.
+fn state_wire_clear(mut ed: Ed, kind: int, owner: int, entity: int, field: str) {
+    var i = 0, kept = 0
+    while i < ed.state.wire.len {
+        let row = copy ed.state.wire[i]
+        if row.kind != kind ||
+            row.owner != owner ||
+            entity >= 0 && row.entity != entity ||
+            field.len != 0 && row.field != field {
+            ed.state.wire[kept] = row
+            kept += 1
+        }
+        i += 1
+    }
+    while ed.state.wire.len > kept { let _ = (mut ed.state.wire).pop() }
+}
+
+fn state_wire_current(ed: Ed, row: StateWire) -> int ! {none} {
+    if row.kind == ws.STATE_REC_MARK {
+        let bi = ed_buf_index(ed, row.owner)
+        let index = row.entity - 97
+        if bi < 0 || index < 0 || index >= 26 { return none }
+        if ed.bufs[bi].named.pending_set[index] { return ed.bufs[bi].named.pending[index] }
+        return ed_mark_get(ed, bi, row.entity)?
+    }
+    var wi = 0
+    while wi < ed.wins.len && ed.wins[wi].id != row.owner { wi += 1 }
+    if row.kind == ws.STATE_REC_VIEW {
+        if wi == ed.wins.len { return none }
+        return if row.field == "top" then ed.wins[wi].vp.top else ed.wins[wi].vp.left
+    }
+    if row.kind == ws.STATE_REC_CURSOR {
+        if wi == ed.wins.len { return none }
+        var i = 0
+        while i < ed.wins[wi].cs.stamps.len {
+            if ed.wins[wi].cs.stamps[i] == row.entity {
+                return if row.field == "pos" {
+                    ed.wins[wi].cs.curs[i].pos
+                } else {
+                    ed.wins[wi].cs.curs[i].anchor
+                }
+            }
+            i += 1
+        }
+        return none
+    }
+    if row.kind == ws.STATE_REC_JUMP_ENTRY {
+        if wi == ed.wins.len { return none }
+        for je in ed.wins[wi].jumps.e {
+            if je.state_token == row.entity {
+                return if row.field == "line" then je.line_hint else je.stamp_ms
+            }
+        }
+    } else if row.kind == ws.STATE_REC_CHANGE_ENTRY {
+        let bi = ed_buf_index(ed, row.owner)
+        if bi < 0 { return none }
+        for je in ed.bufs[bi].ec.changes.ring.e {
+            if je.state_token == row.entity {
+                return if row.field == "line" then je.line_hint else je.stamp_ms
+            }
+        }
+    }
+    none
+}
+
+// Sparse, allocation-free retirement after commands and before saving.
+fn state_wire_prune(mut ed: Ed) {
+    var i = 0, kept = 0
+    while i < ed.state.wire.len {
+        let current = state_wire_current(ed, ed.state.wire[i]) else { i += 1; continue }
+        if current == ed.state.wire[i].normalized {
+            ed.state.wire[kept] = copy ed.state.wire[i]
+            kept += 1
+        }
+        i += 1
+    }
+    while ed.state.wire.len > kept { let _ = (mut ed.state.wire).pop() }
 }

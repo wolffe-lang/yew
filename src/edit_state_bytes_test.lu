@@ -1,0 +1,176 @@
+//! member: false
+//! R-yw06-6 G40 integration and R-yw06-9 sparse wire lifecycle.
+//! Live schema counterparts of state_parse.c:319-450,763-824,841-929.
+
+use edit
+use term
+use text
+use util
+use ws
+
+struct Fix { root: str, work: str, saved: str, had: bool }
+
+fn fixture() -> Fix {
+    let saved = env_get("XDG_STATE_HOME") else ""
+    let had = saved.len != 0
+    assert(util.mkdirs("target/ws-byte-fixtures", 448))
+    var root = ""
+    loop {
+        var suffix = ""
+        for r in os_random(8) { suffix = "{suffix}{r % 10}" }
+        root = "target/ws-byte-fixtures/{suffix}"
+        fs_create_dir_mode(root, 448) else |e| match e {
+            exists => { continue },
+            _ => { assert(false, "mkdir fixture: {e}") },
+        }
+        break
+    }
+    root = fs_realpath(root) else {
+        assert(false)
+        return Fix { root: "", work: "", saved: "", had: false }
+    }
+    let work = "{root}/work"
+    assert(util.mkdirs(work, 448))
+    env_set("XDG_STATE_HOME", "{root}/state") else { assert(false) }
+    Fix { root: root, work: work, saved: saved, had: had }
+}
+
+fn remove_tree(path: str) {
+    let entries = fs_read_dir(path) else { return }
+    for name in entries {
+        let p = "{path}/{name}"
+        fs_remove(p) else |_| {
+            remove_tree(p)
+            fs_remove_dir(p) else { assert(false, "remove dir {p}") }
+        }
+    }
+}
+
+fn finish(f: Fix) {
+    if f.had {
+        env_set("XDG_STATE_HOME", f.saved) else { assert(false) }
+    } else {
+        env_unset("XDG_STATE_HOME") else { assert(false) }
+    }
+    remove_tree(f.root)
+    fs_remove_dir(f.root) else { assert(false) }
+}
+
+fn fresh(f: Fix) -> edit.Ed {
+    var ed = edit.ed_new()
+    ed.ws_dir = f.work
+    edit.ed_open_scratch(mut ed)
+    ed.grid = term.grid_new(24, 80)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    ed
+}
+
+fn file(f: Fix, name: str, body: str) -> str {
+    let path = "{f.work}/{name}"
+    assert(text.file_write_atomic(path, body.bytes(), 384) == text.SAVE_OK)
+    path
+}
+
+fn t_invalid_paths_remain_distinct_orphans() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    let bad_a = [255 as byte], bad_b = [255 as byte, 0 as byte]
+    var e = ws.fl_emit()
+    ws.fl_map_open(mut e, false, "".bytes())
+    ws.fl_int(mut e, true, "version".bytes(), 1)
+    ws.fl_list_open(mut e, true, "tabs".bytes())
+    for i in 0..3 {
+        ws.fl_map_open(mut e, false, "".bytes())
+        ws.fl_int(mut e, true, "id".bytes(), i + 10)
+        ws.fl_str(mut e, true, "path".bytes(), if i == 1 then copy bad_b else copy bad_a)
+        ws.fl_map_close(mut e)
+    }
+    ws.fl_list_close(mut e)
+    ws.fl_int(mut e, true, "active_tab".bytes(), 10)
+    ws.fl_map_close(mut e)
+    let bytes = ws.fl_emit_finish(take e)
+    assert(text.file_write_atomic(ws.ws_state_path(ed.state.key), bytes, 384) == text.SAVE_OK)
+    text.file_load_count_reset()
+    assert(edit.ws_restore(mut ed) == edit.WS_RESTORED)
+    assert(ed.tabs.len == 3 && ed.state.byte_paths.len == 2)
+    assert(
+        ed.tabs[1].buffer_id != ed.tabs[2].buffer_id &&
+            ed.tabs[1].missing_at_restore &&
+            ed.tabs[2].missing_at_restore,
+    )
+    assert(ed.tabs[1].path == "" && ed.tabs[2].path == "")
+    assert(text.file_load_count() == 0, "invalid paths never reach filesystem loader")
+    assert(
+        ed.msg.text == "3 files in this workspace are no longer on disk" &&
+            ed.prompt == edit.PROMPT_NONE,
+    )
+    let emitted = edit.state_emit_at(ed, 0)
+    let parsed = ws.fl_parse(emitted, 0, emitted.len)
+    assert(parsed.ok)
+    let tabs = ws.fl_get(parsed.doc, parsed.doc.root, "tabs".bytes()) else -1
+    for i in 1..3 {
+        let tab = ws.fl_at(parsed.doc, tabs, i) else -1
+        let p = ws.fl_get(parsed.doc, tab, "path".bytes()) else -1
+        let raw = ws.fl_string_bytes(parsed.doc, p) else { assert(false); return }
+        assert(edit.comp_bytes_eq(raw, if i == 1 then copy bad_a else copy bad_b))
+    }
+    assert(edit.state_save(mut ed))
+}
+
+fn t_wide_cursor_identity_and_clamp() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    let bytes = fs_read_bytes("notes/yw06-evidence/state/negative-multi-wire.fl") else {
+        assert(false)
+        return
+    }
+    assert(edit.state_apply(mut ed, bytes) == edit.WS_RESTORED)
+    let wi = edit.tab_focus_win(ed, 2), id = ed.wins[wi].id
+    assert(
+        ed.wins[wi].cs.curs.len == 3,
+        "unsigned-distinct max/-2/-1 do not merge before hydration",
+    )
+    let first = edit.state_emit_at(ed, 0), again = edit.state_emit_at(ed, 0)
+    assert(edit.comp_bytes_eq(first, again))
+    edit.tab_reorder(mut ed, 2, 1)
+    let moved = edit.tab_index_of_id(ed, 3)
+    assert(moved == 1 && edit.tab_focus_win(ed, moved) == wi)
+    edit.tab_switch(mut ed, moved)
+    assert(ed.wins[wi].cs.curs.len == 1 && ed.wins[wi].cs.curs[0].pos == 0)
+    for row in ed.state.wire { assert(!(row.kind == ws.STATE_REC_CURSOR && row.owner == id)) }
+    let out = edit.state_emit_at(ed, 0)
+    let rendered = str_from_utf8(out) else ""
+    assert(
+        rendered.contains("future_max") &&
+            !rendered.contains("future_prev") &&
+            !rendered.contains("future_last"),
+    )
+    // Mutation followed by the ordinary command boundary permanently retires
+    // left's raw override; restoring its saturated value must not resurrect it.
+    ed.wins[wi].vp.left = 7
+    let noop = edit.cmd_lookup(ed.reg, "ed.nop")
+    var cx = edit.cmdctx_new(wi, edit.SRC_TEST)
+    assert(edit.cmd_invoke(mut ed, noop, mut cx) == edit.CMD_OK)
+    for row in ed.state.wire {
+        assert(!(row.kind == ws.STATE_REC_VIEW && row.owner == id && row.field == "left"))
+    }
+    ed.wins[wi].vp.left = 9223372036854775807
+    let changed = edit.state_emit_at(ed, 0)
+    assert(!(str_from_utf8(changed) else "").contains("left: -5"))
+    assert(edit.tab_close(mut ed, moved))
+    let newtab = edit.tab_open(mut ed, "{f.work}/brand-new")
+    assert(newtab >= 0)
+    let newwin = edit.tab_focus_win(ed, newtab)
+    assert(ed.wins[newwin].id != id && ed.wins[newwin].cs.curs[0].pos == 0)
+}
+
+fn main() {
+    t_invalid_paths_remain_distinct_orphans()
+    print("state_bytes_invalid_paths_distinct_dedup_preserved: PASS")
+    t_wide_cursor_identity_and_clamp()
+    print("state_bytes_wide_cursor_identity_clamp_mutation: PASS")
+}

@@ -81,6 +81,30 @@ fn sp_ring_entry(mut ed: Ed, node: int, kind: int, owner: int) -> text.JumpEntry
     je.line_hint = sp_nonnegative(sp_int(ed, node, "line", 0))
     je.stamp_ms = sp_nonnegative(sp_int(ed, node, "stamp", 0))
     je.state_token = sp_token(mut ed, kind, owner, node)
+    // Wide scalar preservation needs an identity even without unknown keys.
+    if (sp_int(ed, node, "line", 0) < 0 || sp_int(ed, node, "stamp", 0) < 0) &&
+        je.state_token == 0 {
+        je.state_token = ed.state.literals.next_token
+        ed.state.literals.next_token += 1
+    }
+    state_wire_retain(
+        mut ed,
+        kind,
+        owner,
+        je.state_token,
+        "line",
+        sp_int(ed, node, "line", 0),
+        je.line_hint,
+    )
+    state_wire_retain(
+        mut ed,
+        kind,
+        owner,
+        je.state_token,
+        "stamp",
+        sp_int(ed, node, "stamp", 0),
+        je.stamp_ms,
+    )
     je
 }
 
@@ -104,43 +128,180 @@ fn sp_ring(mut ed: Ed, node: int, kind: int, entry_kind: int, owner: int) -> tex
     ring
 }
 
+// A rank embedding preserves every unsigned ordering/equality/span relation
+// while reusing the already ported cset merge/stamp law. Only the rare wide
+// path pays for this table; ordinary state uses cset_add directly. The ranks
+// are never live document offsets and are replaced before returning.
+fn sp_u64_less(a: int, b: int) -> bool {
+    if (a < 0) != (b < 0) { return b < 0 }
+    a < b
+}
+
+fn sp_rank(values: List[int], value: int) -> int {
+    var lo = 0, hi = values.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if sp_u64_less(values[mid], value) { lo = mid + 1 } else { hi = mid }
+    }
+    lo
+}
+
+fn sp_wide_cursors(mut ed: Ed, wi: int, curs: int) -> bool {
+    let n = if sp_len(ed, curs) > ws.STATE_MAX_CURSORS {
+        ws.STATE_MAX_CURSORS
+    } else {
+        sp_len(ed, curs)
+    }
+    var wide = false
+    var i = 0
+    while i < n {
+        let node = sp_at(ed, curs, i)
+        if sp_int(ed, node, "pos", 0) < 0 || sp_int(ed, node, "anchor", 0) < 0 {
+            wide = true
+            break
+        }
+        i += 1
+    }
+    if !wide { return false }
+    var values = List[int]()
+    i = 0
+    while i < n {
+        let node = sp_at(ed, curs, i)
+        for key in "pos anchor".words() {
+            let raw = sp_int(ed, node, key, 0)
+            let at = sp_rank(values, raw)
+            if at == values.len || values[at] != raw {
+                (mut values).push(raw)
+                var j = values.len - 1
+                while j > at { values[j] = values[j - 1]; j -= 1 }
+                values[at] = raw
+            }
+        }
+        i += 1
+    }
+    let first = sp_at(ed, curs, 0)
+    var cs = text.cset_init(text.Cursor {
+        pos: sp_rank(values, sp_int(ed, first, "pos", 0)),
+        anchor: sp_rank(values, sp_int(ed, first, "anchor", 0)),
+        goal_col: ws.state_goal_from_i64(sp_int(ed, first, "goal", -1)),
+    })
+    let id = ed.wins[wi].id
+    sp_retain(mut ed, ws.STATE_REC_CURSOR, id, cs.stamps[0], first)
+    i = 1
+    while i < n {
+        let node = sp_at(ed, curs, i)
+        let stamp = cs.next_stamp
+        let cur = text.Cursor {
+            pos: sp_rank(values, sp_int(ed, node, "pos", 0)),
+            anchor: sp_rank(values, sp_int(ed, node, "anchor", 0)),
+            goal_col: ws.state_goal_from_i64(sp_int(ed, node, "goal", -1)),
+        }
+        if text.cset_add(mut cs, cur) {
+            for live in cs.stamps {
+                if live == stamp { sp_retain(mut ed, ws.STATE_REC_CURSOR, id, stamp, node); break }
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < cs.curs.len {
+        let pos = values[cs.curs[i].pos], anchor = values[cs.curs[i].anchor]
+        cs.curs[i].pos = sp_nonnegative(pos)
+        cs.curs[i].anchor = sp_nonnegative(anchor)
+        state_wire_retain(mut ed, ws.STATE_REC_CURSOR, id, cs.stamps[i], "pos", pos, cs.curs[i].pos)
+        state_wire_retain(
+            mut ed,
+            ws.STATE_REC_CURSOR,
+            id,
+            cs.stamps[i],
+            "anchor",
+            anchor,
+            cs.curs[i].anchor,
+        )
+        i += 1
+    }
+    ed.wins[wi].cs = cs
+    true
+}
+
 fn sp_win(mut ed: Ed, wi: int, rec: int) {
     let id = ed.wins[wi].id
     sp_retain(mut ed, ws.STATE_REC_WIN, 0, id, rec)
     let curs = sp_get(ed, rec, "cursors")
-    var i = 0
-    while i < sp_len(ed, curs) && i < ws.STATE_MAX_CURSORS {
-        let node = sp_at(ed, curs, i)
-        let cur = text.Cursor {
-            pos: sp_nonnegative(sp_int(ed, node, "pos", 0)),
-            anchor: sp_nonnegative(sp_int(ed, node, "anchor", 0)),
-            goal_col: ws.state_goal_from_i64(sp_int(ed, node, "goal", -1)),
-        }
-        var stamp = 0
-        if i == 0 {
-            ed.wins[wi].cs.curs[ed.wins[wi].cs.primary] = cur
-            stamp = ed.wins[wi].cs.stamps[ed.wins[wi].cs.primary]
-        } else {
-            let added = ed.wins[wi].cs.next_stamp
-            if text.cset_add(mut ed.wins[wi].cs, cur) {
-                for s in ed.wins[wi].cs.stamps { if s == added { stamp = added; break } }
+    if !sp_wide_cursors(mut ed, wi, curs) {
+        var i = 0
+        while i < sp_len(ed, curs) && i < ws.STATE_MAX_CURSORS {
+            let node = sp_at(ed, curs, i)
+            let cur = text.Cursor {
+                pos: sp_nonnegative(sp_int(ed, node, "pos", 0)),
+                anchor: sp_nonnegative(sp_int(ed, node, "anchor", 0)),
+                goal_col: ws.state_goal_from_i64(sp_int(ed, node, "goal", -1)),
             }
+            var stamp = 0
+            if i == 0 {
+                ed.wins[wi].cs.curs[ed.wins[wi].cs.primary] = cur
+                stamp = ed.wins[wi].cs.stamps[ed.wins[wi].cs.primary]
+            } else {
+                let added = ed.wins[wi].cs.next_stamp
+                if text.cset_add(mut ed.wins[wi].cs, cur) {
+                    for s in ed.wins[wi].cs.stamps { if s == added { stamp = added; break } }
+                }
+            }
+            if stamp != 0 {
+                sp_retain(mut ed, ws.STATE_REC_CURSOR, id, stamp, node)
+                state_wire_retain(
+                    mut ed,
+                    ws.STATE_REC_CURSOR,
+                    id,
+                    stamp,
+                    "pos",
+                    sp_int(ed, node, "pos", 0),
+                    sp_nonnegative(sp_int(ed, node, "pos", 0)),
+                )
+                state_wire_retain(
+                    mut ed,
+                    ws.STATE_REC_CURSOR,
+                    id,
+                    stamp,
+                    "anchor",
+                    sp_int(ed, node, "anchor", 0),
+                    sp_nonnegative(sp_int(ed, node, "anchor", 0)),
+                )
+            }
+            i += 1
         }
-        if stamp != 0 { sp_retain(mut ed, ws.STATE_REC_CURSOR, id, stamp, node) }
-        i += 1
     }
     let primary = sp_int(ed, rec, "primary", 0)
     if primary >= 0 && primary < ed.wins[wi].cs.curs.len { ed.wins[wi].cs.primary = primary }
     let bi = ed.wins[wi].buf
     if bi >= 0 && ed.bufs[bi].resident {
         text.cset_normalize(ed.bufs[bi].ec.tb, mut ed.wins[wi].cs)
+        state_wire_clear(mut ed, ws.STATE_REC_CURSOR, id, -1, "")
     }
     let view = sp_get(ed, rec, "view")
     if view >= 0 {
         sp_retain(mut ed, ws.STATE_REC_VIEW, id, 0, view)
         ed.wins[wi].vp.top = sp_nonnegative(sp_int(ed, view, "top", 0))
-        ed.wins[wi].vp.top_sub = sp_nonnegative(sp_int(ed, view, "top_sub", 0))
+        ed.wins[wi].vp.top_sub = sp_int(ed, view, "top_sub", 0) & 4294967295
         ed.wins[wi].vp.left = sp_nonnegative(sp_int(ed, view, "left", 0))
+        state_wire_retain(
+            mut ed,
+            ws.STATE_REC_VIEW,
+            id,
+            0,
+            "top",
+            sp_int(ed, view, "top", 0),
+            ed.wins[wi].vp.top,
+        )
+        state_wire_retain(
+            mut ed,
+            ws.STATE_REC_VIEW,
+            id,
+            0,
+            "left",
+            sp_int(ed, view, "left", 0),
+            ed.wins[wi].vp.left,
+        )
         ed.wins[wi].vp.wrap = ws.fl_bool_or(ed.state.literals.doc, sp_get(ed, view, "wrap"), false)
     }
     let jumps = sp_get(ed, rec, "jumps")
@@ -344,6 +505,15 @@ fn sp_files(mut ed: Ed, root: int) {
                 let c = name.bytes()[0] as int
                 ed.bufs[bi].named.pending[c - 97] = sp_nonnegative(sp_int(ed, mk, "pos", 0))
                 ed.bufs[bi].named.pending_set[c - 97] = true
+                state_wire_retain(
+                    mut ed,
+                    ws.STATE_REC_MARK,
+                    id,
+                    c,
+                    "pos",
+                    sp_int(ed, mk, "pos", 0),
+                    ed.bufs[bi].named.pending[c - 97],
+                )
                 sp_retain(mut ed, ws.STATE_REC_MARK, id, c, mk)
             }
             m += 1
@@ -372,7 +542,10 @@ pub fn state_set_aside(ed: Ed) -> str ! {none} {
     let name = "state.fl.corrupt-{stamp}"
     let path = "{ed.state.key.dir}/{name}"
     if path.len >= 4096 { return none }
-    if text.file_move_aside(ws.ws_state_path(ed.state.key), path) != text.SAVE_OK { return none }
+    if text.file_move_aside(ws.ws_state_path(ed.state.key), path) != text.SAVE_OK {
+        util.log_warn("cannot set aside {ws.ws_state_path(ed.state.key)}")
+        return none
+    }
     let entries = fs_read_dir(ed.state.key.dir) else { return name }
     var names = List[str]()
     for entry in entries {
@@ -417,6 +590,7 @@ pub fn state_apply(mut ed: Ed, bytes: List[byte]) -> int {
         return sp_recover(mut ed, "root/version is not workspace v1")
     }
     state_retained_clear(mut ed)
+    ed.state.wire = List[StateWire]()
     var literals = ws.state_literals_from(take parsed.doc) else {
         return sp_recover(mut ed, "invalid version")
     }
@@ -477,6 +651,10 @@ pub fn ws_restore(mut ed: Ed) -> int {
         let bi = ed.wins[i].buf
         if ed.wins[i].id != 0 && bi >= 0 && ed.bufs[bi].resident {
             vp_clamp(mut ed.wins[i], ed.bufs[bi].ec.tb)
+            state_wire_clear(mut ed, ws.STATE_REC_VIEW, ed.wins[i].id, 0, "top")
+            if ed.wins[i].vp.wrap {
+                state_wire_clear(mut ed, ws.STATE_REC_VIEW, ed.wins[i].id, 0, "left")
+            }
         }
         i += 1
     }
