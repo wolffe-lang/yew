@@ -25,12 +25,13 @@
  *                           comes back is the last save, whole
  *
  *   trial_cross_differential  the arrangement built and saved by THIS
- *                           binary (the runner's --yew) and resumed by the
- *                           OTHER (YEW_TRIAL_OTHER: C for the port, the
- *                           port for C) — the other's grid the first's,
- *                           exactly, and the two saved state.fl documents
- *                           byte-identical but for `saved_at` (s25's
- *                           C<->port differential, both ways)
+ *                           binary (the runner's --yew), resumed by the
+ *                           OTHER (YEW_TRIAL_OTHER) and by this one from
+ *                           the same saved document: both grids the
+ *                           first's, both second saves byte-identical but
+ *                           for `saved_at`; run-trials.sh then compares the
+ *                           two directions' first saves (s25's C<->port
+ *                           differential, both ways)
  *
  * Signals go only to the editor this runner spawned, inside the lane's
  * container (RULES §5). Build and run: run-trials.sh.
@@ -154,7 +155,9 @@ static bool trial_state_read(PtyCtx *c, Bytebuf *out)
     return out->len != 0U;
 }
 
-/* `saved_at` is the one field a save stamps (compare_live.py's rule). */
+/* `saved_at` is the one field a save stamps (compare_live.py's rule);
+ * the workspace's own `path` (four spaces in, `state_emit.c`'s layout) is
+ * the run's case directory, which two runs of the runner never share. */
 static void trial_normalize(Bytebuf *b)
 {
     Bytebuf o;
@@ -168,7 +171,8 @@ static void trial_normalize(Bytebuf *b)
             e++;
         if (e < b->len)
             e++;
-        if (!(e - i > 13U && memcmp(b->data + i, "    saved_at:", 13U) == 0))
+        if (!(e - i > 13U && memcmp(b->data + i, "    saved_at:", 13U) == 0) &&
+            !(e - i > 9U && memcmp(b->data + i, "    path:", 9U) == 0))
             bytebuf_append(&o, b->data + i, e - i);
         i = e;
     }
@@ -177,18 +181,99 @@ static void trial_normalize(Bytebuf *b)
     bytebuf_free(&o);
 }
 
+/* Writes `b` to $YEW_TRIAL_OUT/<name> when that directory is named. */
+static void trial_keep(const char *name, const Bytebuf *b)
+{
+    const char *dir = getenv("YEW_TRIAL_OUT");
+    char path[PATH_MAX];
+    FILE *f;
+
+    if (dir == NULL || dir[0] == '\0')
+        return;
+    (void)snprintf(path, sizeof(path), "%s/%s", dir, name);
+    f = fopen(path, "wb");
+    if (f == NULL)
+        return;
+    (void)fwrite(b->data, 1U, b->len, f);
+    (void)fclose(f);
+}
+
+/* Puts `doc` back as the workspace's state.fl (the one under the
+ * case's XDG_STATE_HOME). */
+static bool trial_state_write(PtyCtx *c, const Bytebuf *doc)
+{
+    char dir[PATH_MAX];
+    char path[2U * PATH_MAX + 320U];
+    DIR *d;
+    struct dirent *e;
+    FILE *f;
+    bool found = false;
+
+    (void)snprintf(dir, sizeof(dir), "%s/yew/workspaces", c->state_dir);
+    d = opendir(dir);
+    if (d == NULL)
+        return false;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        (void)snprintf(path, sizeof(path), "%s/%s/state.fl", dir, e->d_name);
+        found = true;
+        break;
+    }
+    (void)closedir(d);
+    if (!found)
+        return false;
+    f = fopen(path, "wb");
+    if (f == NULL)
+        return false;
+    (void)fwrite(doc->data, 1U, doc->len, f);
+    return fclose(f) == 0;
+}
+
+/* One resume by `bin` of the saved state, checked against the first
+ * process's grid, then quit; its own save read back into `out`. */
+static bool trial_resume_by(PtyCtx *c, const char *bin, Bytebuf *out)
+{
+    c->resumed = false;
+    ptc_resume(c, bin, NULL);
+    ptc_settle(c, 0);
+    ptc_wait_kitty_push(c, 21U);
+    ptc_check_resume_exact(c);
+    if (c->failed)
+        return false;
+    force_quit(c);
+    ptc_cleanup(c);
+    return trial_state_read(c, out);
+}
+
+/*
+ * The arrangement built and saved by THIS binary (S1); the OTHER resumes
+ * S1 and saves (S2 other); S1 put back; THIS one resumes it and saves
+ * (S2 this). Each resume's grid is the first process's, exactly, and the
+ * two second saves are byte-identical but for `saved_at`: the two
+ * editors read S1 alike and write the same document from it. (A second
+ * save differs from the first by design — restored tabs not yet visited
+ * save `deferred: true` — so S1 is never compared with an S2.)
+ * run-trials.sh compares the two S1 documents of the two directions.
+ */
 static void case_trial_cross_differential(PtyCtx *c)
 {
     const char *other = getenv("YEW_TRIAL_OTHER");
+    const char *tag = getenv("YEW_TRIAL_TAG");
     Bytebuf first;
-    Bytebuf second;
+    Bytebuf by_other;
+    Bytebuf by_this;
+    char name[64];
 
     if (other == NULL || other[0] == '\0') {
         ptc_check(c, false, "YEW_TRIAL_OTHER names no second editor");
         return;
     }
+    if (tag == NULL || tag[0] == '\0')
+        tag = "this";
     bytebuf_init(&first);
-    bytebuf_init(&second);
+    bytebuf_init(&by_other);
+    bytebuf_init(&by_this);
     s25_fixture_make();
     s25_spawn_bare(c);
     s25_build_session(c);
@@ -201,31 +286,47 @@ static void case_trial_cross_differential(PtyCtx *c)
         ptc_check(c, false, "the first editor left no state.fl");
         goto done;
     }
-    ptc_resume(c, other, NULL);
+    if (!trial_resume_by(c, other, &by_other)) {
+        ptc_check(c, false, "the other editor's resume or save failed");
+        goto done;
+    }
+    if (!trial_state_write(c, &first)) {
+        ptc_check(c, false, "could not put S1 back");
+        goto done;
+    }
+    if (!trial_resume_by(c, ptc_yew_bin(c), &by_this)) {
+        ptc_check(c, false, "this editor's resume or save failed");
+        goto done;
+    }
+    /* The case's snapshot, against C's golden, on one more resume. */
+    c->resumed = false;
+    ptc_resume(c, ptc_yew_bin(c), NULL);
     ptc_settle(c, 0);
     ptc_wait_kitty_push(c, 21U);
     ptc_check_resume_exact(c);
     ptc_snapshot(c, "s25_resume_exact");
     force_quit(c);
-    ptc_cleanup(c);
-    if (!trial_state_read(c, &second)) {
-        ptc_check(c, false, "the second editor left no state.fl");
-        goto done;
-    }
     trial_normalize(&first);
-    trial_normalize(&second);
-    if (first.len != second.len ||
-        memcmp(first.data, second.data, first.len) != 0) {
-        ptc_check(c, false, "the two editors' state.fl differ beyond saved_at");
-        (void)fwrite(first.data, 1U, first.len, stderr);
-        (void)fwrite(second.data, 1U, second.len, stderr);
+    trial_normalize(&by_other);
+    trial_normalize(&by_this);
+    (void)snprintf(name, sizeof(name), "%s-S1.fl", tag);
+    trial_keep(name, &first);
+    (void)snprintf(name, sizeof(name), "%s-S2-by-other.fl", tag);
+    trial_keep(name, &by_other);
+    (void)snprintf(name, sizeof(name), "%s-S2-by-this.fl", tag);
+    trial_keep(name, &by_this);
+    if (by_other.len != by_this.len ||
+        memcmp(by_other.data, by_this.data, by_this.len) != 0) {
+        ptc_check(c, false, "the two editors' second saves differ beyond saved_at");
     } else {
-        (void)fprintf(stderr, "trial: state.fl byte-identical but saved_at (%zu bytes)\n",
-                      (size_t)first.len);
+        (void)fprintf(stderr,
+                      "trial: both editors resumed S1 to the first grid and saved %zu identical bytes\n",
+                      (size_t)by_this.len);
     }
 done:
     bytebuf_free(&first);
-    bytebuf_free(&second);
+    bytebuf_free(&by_other);
+    bytebuf_free(&by_this);
     s25_fixture_remove();
 }
 
