@@ -8,6 +8,7 @@
 set -euo pipefail
 iters=${1:-200000}
 seed=${2:-1}
+root=$PWD
 oracle=target/oracle/sagitta
 out=target/pick-witness
 mkdir -p "$out"
@@ -23,7 +24,7 @@ mapfile -t objects < <(find "$oracle/build-gcc/src" -name '*.o' ! -path '*/main.
 gcc -std=c11 -O2 -Wall -Wextra -Werror -I"$oracle/src" -I"$oracle/tests/fuzz" -I"$oracle/build-gcc" \
     notes/yw06-evidence/pick/gitignore/gi_answers.c "$oracle/build-gcc/tests/fuzz/fuzzlib.o" \
     "${objects[@]}" -lm -o "$out/gi-answers"
-c_lines=$(cd "$oracle" && ../../$out/gi-answers --iters="$iters" --seed="$seed")
+c_lines=$(cd "$oracle" && "$root/$out/gi-answers" --iters="$iters" --seed="$seed")
 port_lines=$(FUZZ_PREBUILT=1 tools/run-fuzz-gitignore --iters="$iters" --seed="$seed" --answers)
 printf 'C:    %s\n' "$c_lines" | sed '2,$s/^/      /'
 printf 'port: %s\n' "$port_lines" | sed '2,$s/^/      /'
