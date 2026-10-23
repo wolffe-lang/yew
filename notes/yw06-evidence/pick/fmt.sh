@@ -12,6 +12,7 @@ for d in tools/*/; do
     [ -f "$d/main.lu" ] && "$WOLF" fmt "$d" && "$WOLF" fmt "$d"
 done
 "$WOLF" fmt notes/yw06-evidence/pick/witness/bytes-view
+"$WOLF" fmt notes/yw06-evidence/pick/witness/checked-repeat
 mkdir -p target
 git diff > target/fmt.patch
 echo "fmt: $(git diff --stat | tail -1)"
