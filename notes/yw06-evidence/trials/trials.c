@@ -18,8 +18,8 @@
  *                           first quit (ptc_check_resume_exact)
  *   trial_restore_sigkill   the debounced save (2,000 ms, state.h:76)
  *   trial_restore_sigsegv   allowed to land, then the editor killed by the
- *   trial_restore_hangup    signal / its terminal closed (the master fd
- *                           shut: the kernel's SIGHUP to the session);
+ *   trial_restore_hangup    signal / its terminal closed (SIGHUP, the
+ *                           kernel's signal to the controlling process);
  *                           the reopened grid is the arrangement exactly —
  *                           a fatal path saves nothing (s25 §5), so what
  *                           comes back is the last save, whole
@@ -66,6 +66,12 @@ static void case_trial_resume_cycles20(PtyCtx *c)
 static void trial_kill(PtyCtx *c, int how)
 {
     s25_fixture_make();
+    /* Before the spawn, or the harness ignores it (harness.c:1488-1494):
+     * a death leaves the alternate screen, and the port's guard sibling
+     * (#93 R1 B) also restores after a SIGKILL, which C cannot, writing
+     * tty.c:157's note to the primary screen. */
+    ptc_allow_primary(c);
+    ptc_allow_restore(c);
     s25_spawn_bare(c);
     s25_build_session(c);
     if (c->failed) {
@@ -74,14 +80,10 @@ static void trial_kill(PtyCtx *c, int how)
     }
     ptc_settle(c, TRIAL_DEBOUNCE_QUIET_MS);
     ptc_mark_resume(c);
-    ptc_allow_primary(c);
-    ptc_allow_restore(c);
-    if (how == SIGHUP) {
-        /* The terminal closed: the master end shut under the editor. */
-        (void)close(c->pty.master);
-        c->pty.master = -1;
-        c->eof = true;
-    } else if (kill(c->pty.pid, how) != 0) {
+    /* SIGHUP is the terminal closing: the signal the kernel sends the
+     * session's controlling process when the master end goes away (the
+     * harness keeps its master open, so it is sent by hand). */
+    if (kill(c->pty.pid, how) != 0) {
         ptc_check(c, false, "could not signal the live editor");
         s25_fixture_remove();
         return;
