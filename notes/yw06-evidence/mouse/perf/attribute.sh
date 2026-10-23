@@ -8,7 +8,7 @@
 set -u
 export YEW_ROOT=$PWD
 . tools/lib-toolchain.sh
-tools/run-perf-mouse --build-only || exit 2
+[ -x target/perf-mouse/perf-mouse ] || tools/run-perf-mouse --build-only || exit 2
 P=target/perf-mouse/perf-mouse
 for i in 1 2 3; do
     YEW_LOG=/dev/null taskset -c 8-11 "$P" --attribute
@@ -21,5 +21,7 @@ else
     tail -5 target/mouse-perf.out
 fi
 rm -f target/mouse-perf.data target/mouse-perf.out
+# The router's frames: every edit function with a stack frame past 4 KiB.
+objdump -d --no-show-raw-insn "$P" | awk '/^[0-9a-f]+ <_Wedit\./ {f=$2} /sub +\$0x[0-9a-f]+,%rsp/ {split($0,a,"$"); split(a[2],b,","); v=strtonum(b[1]); if (v >= 4096 && f != "") {print v, f; f=""}}' | sort -rn | head -25
 PERF_PREBUILT=1 tools/run-perf-mouse --cpus 8-11
 echo "attribute: gate rc=$?"
