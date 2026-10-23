@@ -383,6 +383,37 @@ maintainer.
   `:buffers` Enter, `ed.find.buffer` (Sprint 26 §6). (A) it moves to yw06
   with the finder, recorded under that owner (implemented, recommended);
   (B) pull the buffer picker forward into yw05. **Recommend A.**
+- **R-yw06-1 to R-yw06-10** (taken at launch and on the C witnesses: A
+  in each; the contract, `notes/contracts/yw06-workspace-finder-mouse.md`):
+  the hand codec as the interim state path, retired by yw09's swap; one
+  router at the pin's state, its goldens and units gated as a set; M-YW5
+  as the 81 goldens and the automated twins of s42 §10's boxes; the map
+  corrected, nothing of FUSS or shadow ported early; `trust*` yw09's;
+  non-UTF-8 paths as bytes, skipped by the walk, restored as orphans;
+  all 81 reachable cases; the jump state as literal jumps; the
+  coordinates' raw wire values; the disk-ignore quirks C measures.
+- **R-yw06-11 — the FUSS kinds in `test_ctxrows`' every-row walk.**
+  `ctxrows_every_row_resolves_to_a_registry_command` walks every kind's
+  rows; the three FUSS builders refuse by name until yw13. (A) the walk
+  SKIPs the three FUSS kinds by name, the other 54 rows checked and the
+  FUSS actions held by the table case (implemented, recommended); (B)
+  build C's rows over "unknown" FUSS answers; (C) a sixth FUSS red.
+- **R-yw06-12 — type-to-jump's deadline** (`typejump.h:36`, 500 ms). (A)
+  C's shape, a timestamp the next key compares against: no production
+  host calls `yew_typejump_key` at the pin, only FUSS clears its jump (the
+  C witness W4) (implemented, recommended); (B) a timer-heap entry, as the
+  contract worded it.
+- **R-yw06-13 — the walk's first yield** (`walk.c:438-443`). (A) every
+  budgeted step takes one entry before it may yield (implemented,
+  recommended: under (B) `test_walk` case 4's 1 µs step made no progress
+  on the checked machine, trap "never loops"; the listing is the same
+  either way, and nothing at the pin walks with a budget in production);
+  (B) C's check before the first entry, exactly.
+- **R-yw06-14 — `test_picker` case 9's 8 MiB text** (`test_picker.c:
+  402-468`). (A) built a byte at a time, so the checked machine's step
+  budget ends the case in ~5 s, native unchanged (implemented,
+  recommended); (B) the builtin `repeat`, where G46 runs the case 16+
+  minutes at 2–4 GB.
 - **R5 — the module-name collisions** (`unicode`, `term`, `search`
   against std): (A) the port keeps sagitta's names and aliases std
   where both are needed (recommended, done); (B) prefix the port's
