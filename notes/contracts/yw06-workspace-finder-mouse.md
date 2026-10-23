@@ -104,9 +104,12 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
    `tools/torture-live`'s one KNOWN-RED by name (kill9's shared state
    home: the second determinism run lacks the first's history append,
    `05391c7`; still printed at yw05's lane gate L2): the branch and its
-   acceptance are deleted, the shared run seen red first; yw04's jump-list
-   serializer, which "nobody calls" (`edit.jumplist`'s header), is
-   called. The five `ed.ws.*` commands `cmd_owner` routes here
+   acceptance are deleted, the shared run seen red first. Jump state follows
+   the pin's literal emission/restoration path (`src/ws/state_emit.c:485-520`),
+   not `yew_jumplist_serialize`'s separate `jumplist 1` tab-separated blob
+   (`src/edit/jumplist.c:344-385`), which remains uncalled as in shipping C
+   (R-yw06-8 = A, Decided). Share resolved-position logic where it is the
+   same code; never put the unrelated blob into the frozen literal schema. The five `ed.ws.*` commands `cmd_owner` routes here
    (`save_state`, `restore_state`, `info`, `forget`, `migrate`) and the
    start with no file (`edit.driver`'s "starting with no file" refusal)
    restoring. Unit: `test_ws_key` (11), `test_ws_save` (27),
@@ -252,9 +255,10 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
    handed back for pax's `user/yew.pin` (px58's, at yew `77c1083`
    today) — a pax lane's change, never this lane's.
 8. **The gates**: `tools/check-test` and `--native` green with the
-   per-case checked run for every `[native]` fallback (G29); the **80**
+   per-case checked run for every `[native]` fallback (G29); the **81**
    reachable PTY goldens of deliverables 2–6 and `startup_multiple_files`
-   (`s25_*` 2, `s26_*` 5, `startup_explicit_workspace`, the router's 68 — its 70 less the two
+   (`s25_*` 2, `s26_*` 5, `startup_explicit_workspace` 1,
+   `startup_multiple_files` 1, the router's 68 — its 70 less the two
    FUSS menus — `s57_11_*` 1, `s57_12_*` 3) gated BY NAME in CI beside
    campaigns 03, 04 and yw05's — **M-YW5** as R-yw06-3 shapes it; the
    recorded step narrowed to what is red by design, by owner:
@@ -332,7 +336,7 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
   our own tree** (`:488`: `ed.syn.status`, yw10), Workspace resume in
   anger (`:495`, ≥ 20 cycles: this lane), Modal completeness (`:498`).
   None needs LSP; FUSS only through `yew DIR`'s drawer. (A) M-YW5 at
-  yw06 is the automated half: deliverable 8's 80 goldens green by name,
+  yw06 is the automated half: deliverable 8's 81 goldens green by name,
   plus the automated twins of boxes 3–7, 9 and 10 on the wolf binary —
   a scripted 20-cycle quit/reopen loop over `s25_resume_exact`'s
   arrangement compared grid for grid, the three restore trials
@@ -382,6 +386,16 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
   tab with such a path is restored as an orphan (s25 §6's missing-file
   row: kept, dimmed, counted in the one message), never dropped
   (recommended: no golden reaches it); (B) a STOP by name at the first.
+- **R-yw06-7 — reachable PTY count (Decided A, 2026-10-23).** The
+  enumerated prefixed cases total 79 after excluding the two FUSS menus;
+  both startup cases are separate, so gate all **81**, not the draft's 80.
+  No case or golden is removed to keep the old total.
+- **R-yw06-8 — jump-state mechanism (Decided A, 2026-10-23).** Port
+  `src/ws/state_emit.c:485-520`'s literal entries and their restoration.
+  Keep `src/edit/jumplist.c:344-385`'s separate text serializer uncalled,
+  as the pin does; share position resolution where it is the same code.
+  The earlier instruction to call that serializer was a mechanism error,
+  not permission to change the frozen schema. No golden changes.
 - **Decided**: R-yw05-1 = A (2026-10-22). s57.9's C is yw03's `block.c`
   and yw05's `groupfromdir.c` and `groupnav.c` (its unit cases are
   `test_block`'s, `test_groupfromdir`'s and `test_groupnav`'s), its
@@ -472,7 +486,7 @@ byte-identical, 4 noncanonical re-emitted canonical, 20 invalid each
 reaching a result) and the C↔port differential on `s25_resume_exact`'s
 `state.fl` is byte-identical both ways; the permille fixpoint holds for
 all 999 values through `util.f32`; a 40-tab restore performs one file
-read; the 80 reachable goldens go green, the router's 68 as one set at
+read; the 81 reachable goldens go green, the router's 68 as one set at
 the end (R-yw06-2); the walk's determinism and the narrowing
 equivalence (10,000 appends against a full rescan) hold; `fuzz_state`,
 `fuzz_gitignore` and `fuzz_mouse` hold their invariants; every 2× gate
@@ -484,7 +498,7 @@ interpreter and runs `--version`; if a 0.2.35 lands, yew#17, #20, #22,
 ## Done-when
 
 Every deliverable with its tests; `tools/check-test` and `--native`
-green and the per-case checked run recorded; the 80 goldens of this
+green and the per-case checked run recorded; the 81 goldens of this
 contract green by name against the wolf binary as far as the rulings
 let them (M-YW5 as R-yw06-3 rules it), the rest named by gap or owner;
 the 2× gates recorded on kasumi under `taskset -c 0-3`; the static
