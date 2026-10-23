@@ -1,0 +1,733 @@
+//! edit.ctxmenu — the context menu: geometry, drawing, hit-testing and
+//! key navigation, and nothing else.
+//!
+//! Ports sagitta `src/ui/ctxmenu.c` (671 lines) and `ui/ctxmenu.h` (183)
+//! at 9ace98c2, under `s27-mouse-and-feel.md` §5 and
+//! `s57_13-mouse-overhaul-context-menus.md` §2 (the bordered box, the
+//! priorities and shedding, the hover by geometry, Home/End, the caller's
+//! style). The module is EDITOR-IGNORANT as C's is (`ctxmenu.h:7-17`):
+//! the caller decides which rows exist, whether each is enabled, what
+//! each one does (an opaque `action`, `edit.ctxrows`' table) and what it
+//! looks like (`CtxStyle`); nothing here reads an `Ed`.
+//!
+//! C's file static (`ctxmenu.c:46-61`) is a `CtxMenu` VALUE the editor
+//! owns (`Ed.ctx`, E1010); every `yew_ctx_*` takes it. THE PITFALL THE
+//! SHAPE ENFORCES (`ctxmenu.h:19-32`): the menu CAPTURES ITS TARGET AT
+//! OPEN TIME — the tab id and its canonical path, the gid, the pane cell —
+//! and never re-resolves it; a row that reached for a region payload
+//! would act on whatever slid into those cells, and the region table is
+//! frozen while a row runs (`edit.region`'s `region_hit` refuses).
+//!
+//! THE BOX (`ctxmenu.h:34-39`): a one-cell border, no title, `h = rows +
+//! 2`, `w = widest + 2·pad + 2`; a keyboard menu's corner one cell
+//! below-right of the anchor, a pointer menu's ON the click cell — the
+//! opening release lands on a border, never a row. SHEDDING
+//! (`ctxmenu.h:41-47`): priority 0 never sheds, 3 sheds first, a whole
+//! level at a time; a separator inherits the priority above it and never
+//! leads, trails or doubles; the menu refuses only when the priority-0
+//! rows alone do not fit.
+//!
+//! Storage: the row list is overwritten in place from index 0 at every
+//! begin (C's `memset`), so a menu opened again reuses the list's storage
+//! (a `List` replaced inside the session-long `Ed` is held to the
+//! session's end, G33). C's label and accelerator are 48- and 12-byte
+//! buffers (`ctxmenu.c:20-21`): the port cuts at 47 and 11 bytes as
+//! `snprintf` does, backing off to a code point (a `str` is UTF-8; no
+//! label at the pin is near either limit).
+
+use term
+use unicode
+
+/// `YEW_CTX_MAX_ROWS` (`ctxmenu.h:60`): beyond this a menu is a list and
+/// wants a picker.
+pub const CTX_MAX_ROWS: int = 32
+
+/// `YEW_CTX_MIN_WIDTH` (`ctxmenu.h:64`): the box is never made narrower
+/// than this by its OWN contents; a narrower allowed rectangle still
+/// clamps it.
+pub const CTX_MIN_WIDTH: int = 18
+
+/// `YEW_CTX_PRIORITY_MAX` (`ctxmenu.h:66`): shed first.
+pub const CTX_PRIORITY_MAX: int = 3
+
+// `ctxmenu.c:19-35`.
+const CTX_LABEL_MAX: int = 48
+
+const CTX_ACCEL_MAX: int = 12
+
+// One cell of padding each side of the content, inside the border.
+const CTX_PAD: int = 1
+
+// Border + padding, per side.
+const CTX_EDGE: int = 2
+
+// The gap between a label and its accelerator.
+const CTX_GAP: int = 2
+
+// Two borders, two pads and two label cells.
+const CTX_FLOOR_WIDTH: int = 6
+
+// Two borders and one row.
+const CTX_FLOOR_HEIGHT: int = 3
+
+// Long enough that nothing a caller can build ever hits it.
+const CTX_UNCLIPPED: int = 1000
+
+/// One row (`CtxRow`, `ctxmenu.c:37-44`).
+pub struct CtxRow {
+    label: str,
+    accel: str,
+    action: int,
+    enabled: bool,
+    separator: bool,
+    priority: int,
+}
+
+/// The menu's look, resolved by the CALLER from the theme's `menu.*`
+/// roles (`CtxStyle`, `ctxmenu.h:77-91`): `surface` the box and its
+/// border, `row` an enabled row, `hover` the highlighted row, `disabled`
+/// a greyed row, `accel` the accelerator column, `sep` a rule.
+pub struct CtxStyle {
+    surface: ThemeEnt,
+    row: ThemeEnt,
+    hover: ThemeEnt,
+    disabled: ThemeEnt,
+    accel: ThemeEnt,
+    sep: ThemeEnt,
+}
+
+/// The widget's state (C's file static `ctx`, `ctxmenu.c:46-61`):
+/// `rows[0..n)` are the menu's.
+pub struct CtxMenu {
+    rows: List[CtxRow],
+    n: int,
+    kind: int,
+    active: bool,
+    accels_hidden: bool,
+    cursor: int,
+    chosen: int,
+    shed: int,
+    box: Rect,
+    target_id: int,
+    target_path: str,
+    has_target_path: bool,
+    target_rect: Rect,
+}
+
+/// No menu (C's zeroed static).
+pub fn ctxmenu_new() -> CtxMenu {
+    CtxMenu {
+        rows: List[CtxRow](),
+        n: 0,
+        kind: 0,
+        active: false,
+        accels_hidden: false,
+        cursor: -1,
+        chosen: 0,
+        shed: 0,
+        box: rect(0, 0, 0, 0),
+        target_id: 0,
+        target_path: "",
+        has_target_path: false,
+        target_rect: rect(0, 0, 0, 0),
+    }
+}
+
+// C's `memset(&ctx, 0, sizeof(ctx))`, the row storage kept (G33).
+fn ctx_reset(mut c: CtxMenu, kind: int) {
+    c.n = 0
+    c.kind = kind
+    c.active = false
+    c.accels_hidden = false
+    c.cursor = -1
+    c.chosen = 0
+    c.shed = 0
+    c.box = rect(0, 0, 0, 0)
+    c.target_id = 0
+    c.target_path = ""
+    c.has_target_path = false
+    c.target_rect = rect(0, 0, 0, 0)
+}
+
+// `snprintf` into a `cap`-byte buffer: at most `cap - 1` bytes, cut back
+// to a code point.
+fn ctx_cut(s: str, cap: int) -> str {
+    if s.len < cap {
+        return s
+    }
+    var k = cap - 1
+    while k > 0 {
+        let head = s.get(0..k) else ""
+        if head.len == k {
+            return head
+        }
+        k -= 1
+    }
+    ""
+}
+
+fn ctx_put_row(mut c: CtxMenu, row: CtxRow) {
+    if c.n < c.rows.len {
+        c.rows[c.n] = row
+    } else {
+        (mut c.rows).push(row)
+    }
+    c.n += 1
+}
+
+// ---- building ---------------------------------------------------------------
+
+/// `yew_ctx_begin` (`ctxmenu.c:67-79`): whatever was open is discarded —
+/// two menus can never both be up.
+pub fn ctx_begin(mut c: CtxMenu, kind: int) {
+    ctx_reset(mut c, kind)
+}
+
+/// `yew_ctx_item` (`ctxmenu.c:81-97`): past `CTX_MAX_ROWS` a row is
+/// dropped; `priority` is clamped to `CTX_PRIORITY_MAX`. An empty
+/// `accel` is C's NULL.
+pub fn ctx_item(mut c: CtxMenu, label: str, accel: str, action: int, enabled: bool, priority: int) {
+    if c.n >= CTX_MAX_ROWS {
+        return
+    }
+    let row = CtxRow {
+        label: ctx_cut(label, CTX_LABEL_MAX),
+        accel: ctx_cut(accel, CTX_ACCEL_MAX),
+        action: action,
+        enabled: enabled,
+        separator: false,
+        priority: if priority > CTX_PRIORITY_MAX then CTX_PRIORITY_MAX else priority,
+    }
+    ctx_put_row(mut c, row)
+}
+
+/// `yew_ctx_sep` (`ctxmenu.c:99-115`): a separator INHERITS the priority
+/// of the row above it, so it leaves the menu with the section it closes.
+pub fn ctx_sep(mut c: CtxMenu) {
+    if c.n >= CTX_MAX_ROWS {
+        return
+    }
+    let above = if c.n >= 1 then c.rows[c.n - 1].priority else 0
+    let row = CtxRow { label: "", accel: "", action: 0, enabled: false, separator: true, priority: above }
+    ctx_put_row(mut c, row)
+}
+
+/// `yew_ctx_target` (`ctxmenu.c:117-131`): the TARGET, captured now — a
+/// tab id or a gid, and a path COPIED (the tab that owns the original can
+/// close while the menu is up). `has_path` false is C's NULL.
+pub fn ctx_target(mut c: CtxMenu, id: int, path: str, has_path: bool) {
+    c.target_id = id
+    c.target_path = if has_path then path else ""
+    c.has_target_path = has_path
+}
+
+/// `yew_ctx_target_rect` (`ctxmenu.c:133-136`): the pane cell a document
+/// menu was opened on.
+pub fn ctx_target_rect(mut c: CtxMenu, r: Rect) {
+    c.target_rect = r
+}
+
+/// `yew_ctx_target_id` (`ctxmenu.c:138-141`).
+pub fn ctx_target_id(c: CtxMenu) -> int {
+    c.target_id
+}
+
+/// `yew_ctx_target_path` (`ctxmenu.c:143-146`): `none` is C's NULL.
+pub fn ctx_target_path(c: CtxMenu) -> str ! {none} {
+    if !c.has_target_path {
+        return none
+    }
+    c.target_path
+}
+
+/// `yew_ctx_target_rect_get` (`ctxmenu.c:148-151`).
+pub fn ctx_target_rect_get(c: CtxMenu) -> Rect {
+    copy c.target_rect
+}
+
+// ---- geometry ---------------------------------------------------------------
+
+// `cells_of` (`ctxmenu.c:157-163`).
+fn ctx_cells_of(s: str) -> int {
+    let (_, cells) = unicode.str_clip(s.bytes(), 0, s.len, CTX_UNCLIPPED)
+    cells
+}
+
+// `row_cells` (`ctxmenu.c:165-177`): the label, and the accelerator with
+// its gap unless the column has been dropped.
+fn ctx_row_cells(r: CtxRow, with_accel: bool) -> int {
+    if r.separator {
+        return 0
+    }
+    var w = ctx_cells_of(r.label)
+    if with_accel && r.accel.len != 0 {
+        w = w + CTX_GAP + ctx_cells_of(r.accel)
+    }
+    w
+}
+
+// `widest_row` (`ctxmenu.c:179-191`).
+fn ctx_widest_row(c: CtxMenu, with_accel: bool) -> int {
+    var widest = 0
+    var i = 0
+    while i < c.n {
+        let w = ctx_row_cells(c.rows[i], with_accel)
+        if w > widest {
+            widest = w
+        }
+        i += 1
+    }
+    widest
+}
+
+// `box_width_for` (`ctxmenu.c:193-198`).
+fn ctx_box_width_for(widest: int) -> int {
+    let w = widest + 2 * CTX_EDGE
+    if w < CTX_MIN_WIDTH then CTX_MIN_WIDTH else w
+}
+
+// `drop_stray_separators` (`ctxmenu.c:200-222`): every separator that
+// would lead, trail or double up goes, after every shed and once when
+// nothing was shed, so the drawn list depends only on the rows that
+// stayed.
+fn ctx_drop_stray_separators(mut c: CtxMenu) {
+    var out = 0
+    var i = 0
+    while i < c.n {
+        var keep = true
+        if c.rows[i].separator {
+            if out == 0 || c.rows[out - 1].separator {
+                keep = false
+            }
+        }
+        if keep {
+            if out != i {
+                c.rows[out] = copy c.rows[i]
+            }
+            out += 1
+        }
+        i += 1
+    }
+    while out > 0 && c.rows[out - 1].separator {
+        out -= 1
+    }
+    c.n = out
+}
+
+// `shed_priority` (`ctxmenu.c:224-237`).
+fn ctx_shed_priority(mut c: CtxMenu, level: int) {
+    var out = 0
+    var i = 0
+    while i < c.n {
+        if c.rows[i].priority < level {
+            if out != i {
+                c.rows[out] = copy c.rows[i]
+            }
+            out += 1
+        }
+        i += 1
+    }
+    c.n = out
+}
+
+// `shed_to_fit` (`ctxmenu.c:239-259`): whole levels, lowest first, until
+// the rows fit `avail` — shedding "just enough" would make the survivors
+// depend on the terminal height in ways the eye cannot predict.
+fn ctx_shed_to_fit(mut c: CtxMenu, avail: int) -> bool {
+    let built = c.n
+    ctx_drop_stray_separators(mut c)
+    var level = CTX_PRIORITY_MAX
+    while level >= 1 && c.n > avail {
+        ctx_shed_priority(mut c, level)
+        ctx_drop_stray_separators(mut c)
+        level -= 1
+    }
+    c.shed = built - c.n
+    c.n > 0 && c.n <= avail
+}
+
+// `next_usable` (`ctxmenu.c:261-281`): separators and disabled rows are
+// drawn, never reachable.
+fn ctx_next_usable(c: CtxMenu, from: int, step: int) -> int {
+    if c.n == 0 {
+        return -1
+    }
+    var at = from
+    var guard = 0
+    while guard <= c.n {
+        at += step
+        if at < 0 {
+            at = c.n - 1
+        }
+        if at >= c.n {
+            at = 0
+        }
+        if !c.rows[at].separator && c.rows[at].enabled {
+            return at
+        }
+        guard += 1
+    }
+    -1
+}
+
+// `ctx_show_placed` (`ctxmenu.c:283-330`): a menu that cannot hold its
+// priority-0 rows does not open (one half off the screen is worse than
+// none); the accelerators go as a column before any label clips;
+// CLAMP, NEVER FLIP.
+fn ctx_show_placed(mut c: CtxMenu, x_in: int, y_in: int, allowed: Rect) -> bool {
+    c.active = false
+    c.shed = 0
+    c.accels_hidden = false
+    if c.n == 0 || allowed.h < CTX_FLOOR_HEIGHT || allowed.w < CTX_FLOOR_WIDTH {
+        return false
+    }
+    if !ctx_shed_to_fit(mut c, allowed.h - 2) {
+        return false
+    }
+    let h = c.n + 2
+    var w = ctx_box_width_for(ctx_widest_row(c, true))
+    if w > allowed.w {
+        let bare = ctx_box_width_for(ctx_widest_row(c, false))
+        // Only claim the column was dropped when dropping it bought a
+        // cell (`ctxmenu.c:309-312`).
+        c.accels_hidden = bare < w
+        w = if bare > allowed.w then allowed.w else bare
+    }
+    var x = x_in
+    var y = y_in
+    if x + w > allowed.x + allowed.w {
+        x = allowed.x + allowed.w - w
+    }
+    if x < allowed.x {
+        x = allowed.x
+    }
+    if y + h > allowed.y + allowed.h {
+        y = allowed.y + allowed.h - h
+    }
+    if y < allowed.y {
+        y = allowed.y
+    }
+    c.box = rect(x, y, w, h)
+    c.active = true
+    c.chosen = 0
+    c.cursor = ctx_next_usable(c, -1, 1)
+    true
+}
+
+/// `yew_ctx_show` (`ctxmenu.c:332-337`): a keyboard/focus anchor — the
+/// corner one cell below-right, clear of the cell it describes.
+pub fn ctx_show(mut c: CtxMenu, anchor_x: int, anchor_y: int, allowed: Rect) -> bool {
+    ctx_show_placed(mut c, anchor_x + 1, anchor_y + 1, allowed)
+}
+
+/// `yew_ctx_show_at` (`ctxmenu.c:339-344`): a pointer cell — the top-left
+/// BORDER cell exactly under the opening press.
+pub fn ctx_show_at(mut c: CtxMenu, x: int, y: int, allowed: Rect) -> bool {
+    ctx_show_placed(mut c, x, y, allowed)
+}
+
+/// `yew_ctx_active` (`ctxmenu.c:346-349`).
+pub fn ctx_active(c: CtxMenu) -> bool {
+    c.active
+}
+
+/// `yew_ctx_close` (`ctxmenu.c:351-356`).
+pub fn ctx_close(mut c: CtxMenu) {
+    ctx_reset(mut c, 0)
+}
+
+/// `yew_ctx_box` (`ctxmenu.c:358-361`).
+pub fn ctx_box(c: CtxMenu) -> Rect {
+    copy c.box
+}
+
+/// `yew_ctx_kind` (`ctxmenu.c:363-366`).
+pub fn ctx_kind(c: CtxMenu) -> int {
+    c.kind
+}
+
+/// `yew_ctx_cursor` (`ctxmenu.c:368-371`).
+pub fn ctx_cursor(c: CtxMenu) -> int {
+    c.cursor
+}
+
+/// `yew_ctx_rows` (`ctxmenu.c:373-376`): the rows the menu DRAWS — after
+/// shedding, once shown.
+pub fn ctx_rows(c: CtxMenu) -> int {
+    c.n
+}
+
+/// `yew_ctx_row_enabled` (`ctxmenu.c:378-381`).
+pub fn ctx_row_enabled(c: CtxMenu, row: int) -> bool {
+    row >= 0 && row < c.n && c.rows[row].enabled && !c.rows[row].separator
+}
+
+/// `yew_ctx_shed_count` (`ctxmenu.c:383-386`).
+pub fn ctx_shed_count(c: CtxMenu) -> int {
+    c.shed
+}
+
+/// `yew_ctx_priority` (`ctxmenu.c:388-391`).
+pub fn ctx_priority(c: CtxMenu, row: int) -> int {
+    if row >= 0 && row < c.n then c.rows[row].priority else 0
+}
+
+/// `yew_ctx_row_label` (`ctxmenu.c:393-398`): "" for a separator and for
+/// a row that is not there.
+pub fn ctx_row_label(c: CtxMenu, row: int) -> str {
+    if row < 0 || row >= c.n || c.rows[row].separator {
+        return ""
+    }
+    c.rows[row].label
+}
+
+/// `yew_ctx_row_action` (`ctxmenu.c:400-403`).
+pub fn ctx_row_action(c: CtxMenu, row: int) -> int {
+    if row >= 0 && row < c.n then c.rows[row].action else 0
+}
+
+/// `yew_ctx_row_is_sep` (`ctxmenu.c:405-408`).
+pub fn ctx_row_is_sep(c: CtxMenu, row: int) -> bool {
+    row >= 0 && row < c.n && c.rows[row].separator
+}
+
+/// `yew_ctx_accels_hidden` (`ctxmenu.c:410-413`).
+pub fn ctx_accels_hidden(c: CtxMenu) -> bool {
+    c.accels_hidden
+}
+
+// ---- choosing ---------------------------------------------------------------
+
+/// `yew_ctx_hover` (`ctxmenu.c:419-428`): a disabled row does not take the
+/// highlight — the highlight is a promise that Enter will do something.
+pub fn ctx_hover(mut c: CtxMenu, row: int) {
+    if !c.active || row < 0 || row >= c.n {
+        return
+    }
+    if c.rows[row].separator || !c.rows[row].enabled {
+        return
+    }
+    c.cursor = row
+}
+
+/// `yew_ctx_hover_at` (`ctxmenu.c:430-450`): a cell to a row BY THE BOX
+/// GEOMETRY (no region lookup: the table may be mid-frame); border cells,
+/// separators, disabled rows and cells outside map to nothing. True only
+/// when the highlight MOVED, so the router repaints on change.
+pub fn ctx_hover_at(mut c: CtxMenu, x: int, y: int) -> bool {
+    if !c.active {
+        return false
+    }
+    if x < c.box.x + 1 || x >= c.box.x + c.box.w - 1 {
+        return false
+    }
+    if y < c.box.y + 1 || y >= c.box.y + c.box.h - 1 {
+        return false
+    }
+    let row = y - c.box.y - 1
+    if row >= c.n || c.rows[row].separator || !c.rows[row].enabled {
+        return false
+    }
+    if c.cursor == row {
+        return false
+    }
+    c.cursor = row
+    true
+}
+
+/// `yew_ctx_invoke` (`ctxmenu.c:452-460`).
+pub fn ctx_invoke(mut c: CtxMenu, row: int) {
+    if !c.active || row < 0 || row >= c.n {
+        return
+    }
+    if c.rows[row].separator || !c.rows[row].enabled {
+        return
+    }
+    c.chosen = c.rows[row].action
+    c.active = false
+}
+
+/// `yew_ctx_take` (`ctxmenu.c:462-471`): the chosen action or 0; taking it
+/// clears it, so one choice is acted on once.
+pub fn ctx_take(mut c: CtxMenu) -> int {
+    let chosen = c.chosen
+    c.chosen = 0
+    chosen
+}
+
+/// `yew_ctx_key` (`ctxmenu.c:473-509`): the menu's own keymap layer — Up,
+/// Down, Home and End skip separators and disabled rows, Enter invokes,
+/// Esc closes, and everything else is SWALLOWED while a menu is open (a
+/// menu that let `d` through would delete a line behind it).
+pub fn ctx_key(mut c: CtxMenu, k: term.Key) -> bool {
+    if !c.active {
+        return false
+    }
+    if k.ev == term.KEY_RELEASE {
+        return true
+    }
+    let code = k.code
+    if code == term.KEY_ESCAPE {
+        ctx_close(mut c)
+    } else if code == term.KEY_UP {
+        c.cursor = ctx_next_usable(c, c.cursor, -1)
+    } else if code == term.KEY_DOWN {
+        c.cursor = ctx_next_usable(c, c.cursor, 1)
+    } else if code == term.KEY_HOME {
+        c.cursor = ctx_next_usable(c, -1, 1)
+    } else if code == term.KEY_END {
+        c.cursor = ctx_next_usable(c, c.n, -1)
+    } else if code == term.KEY_ENTER {
+        let at = c.cursor
+        ctx_invoke(mut c, at)
+    }
+    true
+}
+
+// ---- drawing ----------------------------------------------------------------
+
+// `blank_of` (`ctxmenu.c:515-524`): C's zeroed `Cell` — width 0, so the
+// fill writes styled blanks.
+fn ctx_blank_of(style: ThemeEnt) -> term.Cell {
+    var b = term.cell_blank()
+    b.w = 0
+    b.fg = copy style.fg
+    b.bg = copy style.bg
+    b.attrs = style.attrs
+    b
+}
+
+// `put_glyph` (`ctxmenu.c:526-530`).
+fn ctx_put_glyph(mut g: term.Grid, y: int, x: int, gl: int, style: ThemeEnt) {
+    let _ = term.grid_puts(mut g, y, x, glyph(gl).bytes(), 0, glyph_len(gl), style.fg, style.bg, style.attrs)
+}
+
+// `put_rule` (`ctxmenu.c:532-540`): one H glyph per cell, one cell wide in
+// both vocabularies.
+fn ctx_put_rule(mut g: term.Grid, y: int, left: int, right: int, style: ThemeEnt) {
+    var x = left
+    while x < right {
+        ctx_put_glyph(mut g, y, x, GLYPH_BORDER_H, style)
+        x += 1
+    }
+}
+
+/// `plain_style` (`ctxmenu.c:542-557`): the colourless fallback C draws
+/// for a NULL style — attributes only (reverse hover; dim greyed rows,
+/// accelerators and rules).
+pub fn ctx_style_plain() -> CtxStyle {
+    let none = ThemeEnt { fg: term.color_default(), bg: term.color_default(), attrs: 0 }
+    var s = CtxStyle {
+        surface: copy none,
+        row: copy none,
+        hover: copy none,
+        disabled: copy none,
+        accel: copy none,
+        sep: copy none,
+    }
+    s.hover.attrs = term.ATTR_REVERSE
+    s.disabled.attrs = term.ATTR_DIM
+    s.accel.attrs = term.ATTR_DIM
+    s.sep.attrs = term.ATTR_DIM
+    s
+}
+
+/// `yew_ctx_draw` (`ctxmenu.c:559-671`): the box and its regions —
+/// `REGION_BLOCK` over the whole box (border included) so the document
+/// beneath is inert, then one `REGION_CTX_ROW` per drawn row from the
+/// SAME cells the row was drawn with, the border excluded. Last-added-
+/// wins makes the menu shadow everything under it. A greyed row is
+/// drawn, never hidden; an accelerator is drawn only where it leaves the
+/// label room; the label clips to the room it has. C's NULL style is
+/// `ctx_style_plain()`.
+pub fn ctx_draw(c: CtxMenu, mut g: term.Grid, mut rs: Regions, style: CtxStyle) {
+    if !c.active {
+        return
+    }
+    let left = c.box.x
+    let right = c.box.x + c.box.w
+    let inner_l = left + 1
+    let inner_r = right - 1
+    let content = c.box.w - 2 * CTX_EDGE
+    term.grid_fill(mut g, c.box.y, left, right, ctx_blank_of(style.surface))
+    ctx_put_glyph(mut g, c.box.y, left, GLYPH_BORDER_TL, style.surface)
+    ctx_put_rule(mut g, c.box.y, inner_l, inner_r, style.surface)
+    ctx_put_glyph(mut g, c.box.y, inner_r, GLYPH_BORDER_TR, style.surface)
+    region_add(mut rs, REGION_BLOCK, copy c.box, 0)
+    var i = 0
+    while i < c.n {
+        let y = c.box.y + 1 + i
+        let row_rect = rect(inner_l, y, inner_r - inner_l, 1)
+        term.grid_fill(mut g, y, left, right, ctx_blank_of(style.surface))
+        if c.rows[i].separator {
+            // A rule joined to the border on both sides, so it reads as
+            // part of the frame (`ctxmenu.c:605-614`).
+            ctx_put_glyph(mut g, y, left, GLYPH_BORDER_TEE_R, style.surface)
+            ctx_put_rule(mut g, y, inner_l, inner_r, style.sep)
+            ctx_put_glyph(mut g, y, inner_r, GLYPH_BORDER_TEE_L, style.surface)
+            region_add(mut rs, REGION_CTX_ROW, row_rect, i)
+            i += 1
+            continue
+        }
+        ctx_put_glyph(mut g, y, left, GLYPH_BORDER_V, style.surface)
+        ctx_put_glyph(mut g, y, inner_r, GLYPH_BORDER_V, style.surface)
+        let enabled = c.rows[i].enabled
+        let text = if !enabled {
+            copy style.disabled
+        } else if i == c.cursor {
+            copy style.hover
+        } else {
+            copy style.row
+        }
+        let accel = if !enabled {
+            copy style.disabled
+        } else if i == c.cursor {
+            copy style.hover
+        } else {
+            copy style.accel
+        }
+        // The row's own surface, border to border, so the highlight spans
+        // the width rather than hugging the label.
+        term.grid_fill(mut g, y, inner_l, inner_r, ctx_blank_of(text))
+        var label_room = content
+        if !c.accels_hidden && c.rows[i].accel.len != 0 {
+            let cells = ctx_cells_of(c.rows[i].accel)
+            if cells + CTX_GAP < content {
+                let _ = term.grid_puts(
+                    mut g,
+                    y,
+                    inner_r - CTX_PAD - cells,
+                    c.rows[i].accel.bytes(),
+                    0,
+                    c.rows[i].accel.len,
+                    accel.fg,
+                    accel.bg,
+                    accel.attrs,
+                )
+                label_room = content - cells - CTX_GAP
+            }
+        }
+        // Clipped to the room the row has: a label that ran under the
+        // accelerator or through the border is the width clamp failing
+        // silently (`ctxmenu.c:646-658`).
+        let (kept, _) = unicode.str_clip(c.rows[i].label.bytes(), 0, c.rows[i].label.len, label_room)
+        let _ = term.grid_puts(
+            mut g,
+            y,
+            inner_l + CTX_PAD,
+            c.rows[i].label.bytes(),
+            0,
+            kept,
+            text.fg,
+            text.bg,
+            text.attrs,
+        )
+        region_add(mut rs, REGION_CTX_ROW, row_rect, i)
+        i += 1
+    }
+    let yb = c.box.y + c.box.h - 1
+    term.grid_fill(mut g, yb, left, right, ctx_blank_of(style.surface))
+    ctx_put_glyph(mut g, yb, left, GLYPH_BORDER_BL, style.surface)
+    ctx_put_rule(mut g, yb, inner_l, inner_r, style.surface)
+    ctx_put_glyph(mut g, yb, inner_r, GLYPH_BORDER_BR, style.surface)
+}
