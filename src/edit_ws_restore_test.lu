@@ -1,0 +1,455 @@
+//! member: false
+//! Ports sagitta tests/unit/test_ws_restore.c:152-950 at9ace98c2.
+//! Eighteen registry-order cases over actual Ed state and file read counts.
+
+use edit
+use term
+use text
+use util
+use ws
+
+struct Fix { root: str, work: str, saved: str, had: bool }
+
+fn fixture() -> Fix {
+    let saved = env_get("XDG_STATE_HOME") else ""
+    let had = saved.len != 0
+    assert(util.mkdirs("target/ws-restore-fixtures", 448))
+    var root = ""
+    loop {
+        var suffix = ""
+        for r in os_random(8) { suffix = "{suffix}{r % 10}" }
+        root = "target/ws-restore-fixtures/{suffix}"
+        fs_create_dir_mode(root, 448) else |e| match e {
+            exists => { continue },
+            _ => { assert(false, "mkdir fixture: {e}") },
+        }
+        break
+    }
+    root = fs_realpath(root) else {
+        assert(false)
+        return Fix { root: "", work: "", saved: "", had: false }
+    }
+    let work = "{root}/work"
+    assert(util.mkdirs(work, 448))
+    env_set("XDG_STATE_HOME", "{root}/state") else { assert(false) }
+    Fix { root: root, work: work, saved: saved, had: had }
+}
+
+fn remove_tree(path: str) {
+    let entries = fs_read_dir(path) else { return }
+    for name in entries {
+        let p = "{path}/{name}"
+        fs_remove(p) else |_| {
+            remove_tree(p)
+            fs_remove_dir(p) else { assert(false, "remove dir {p}") }
+        }
+    }
+}
+
+fn finish(f: Fix) {
+    if f.had {
+        env_set("XDG_STATE_HOME", f.saved) else { assert(false) }
+    } else {
+        env_unset("XDG_STATE_HOME") else { assert(false) }
+    }
+    remove_tree(f.root)
+    fs_remove_dir(f.root) else { assert(false) }
+}
+
+fn fresh(f: Fix) -> edit.Ed {
+    var ed = edit.ed_new()
+    ed.ws_dir = f.work
+    edit.ed_open_scratch(mut ed)
+    ed.grid = term.grid_new(24, 80)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    ed
+}
+
+fn file(f: Fix, name: str, body: str) -> str {
+    let path = "{f.work}/{name}"
+    assert(text.file_write_atomic(path, body.bytes(), 384) == text.SAVE_OK)
+    path
+}
+
+fn apply(f: Fix, bytes: List[byte]) -> edit.Ed {
+    var ed = fresh(f)
+    assert(ws.ws_key(mut ed.state.key, f.work) && ws.ws_ensure_dir(mut ed.state.key))
+    ed.state.ready = true
+    ed.state.writer = true
+    let result = edit.state_apply(mut ed, bytes)
+    assert(result != edit.WS_RECOVERED)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    ed
+}
+
+fn output(ed: edit.Ed) -> str { let b = edit.state_emit_at(ed, 0); str_from_utf8(b) else "" }
+
+fn t_round_trips_tabs_and_groups() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "alpha\nbravo\ncharlie\n")
+    let pb = file(f, "b.txt", "delta\n"), pc = file(f, "c.txt", "echo\n")
+    assert(
+        edit.tab_open(mut a, pa) == 1 &&
+            edit.tab_open(mut a, pb) == 2 &&
+            edit.tab_open(mut a, pc) == 3,
+    )
+    let gid = edit.group_create(mut a, f.work, "grp")
+    edit.group_add_member(mut a, gid, 2)
+    edit.group_add_member(mut a, gid, 3)
+    edit.tab_switch(mut a, 2)
+    let b = apply(f, edit.state_emit_at(a, 0))
+    assert(b.tabs.len == 4 && b.tabs[1].path == pa && b.tabs[2].path == pb && b.tabs[3].path == pc)
+    assert(b.groups.len == 1 && edit.group_member_count(b, b.groups[0].id) == 2)
+    assert(b.tabs[2].group_id == b.groups[0].id && b.tabs[3].group_id == b.groups[0].id)
+    assert(
+        b.tabs[2].group_ordinal == 1 &&
+            b.tabs[3].group_ordinal == 2 &&
+            b.tabs[b.tab_active].path == pb,
+    )
+}
+
+fn t_remaps_group_ids() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "x\n")
+    let g1 = edit.group_create(mut a, f.work, "g1"),
+        g2 = edit.group_create(mut a, f.work, "g2"),
+        g3 = edit.group_create(mut a, f.work, "g3")
+    edit.group_dissolve(mut a, g1)
+    edit.group_dissolve(mut a, g2)
+    let ti = edit.tab_open(mut a, pa)
+    assert(ti >= 0)
+    edit.group_add_member(mut a, g3, ti)
+    let b = apply(f, edit.state_emit_at(a, 0))
+    assert(b.groups.len == 1 && b.groups[0].id == 1 && b.tabs[1].group_id == 1)
+}
+
+fn t_missing_group_record_ungroups_the_tab() {
+    let f = fixture()
+    defer finish(f)
+    let pa = file(f, "a.txt", "x\n")
+    let doc = "{{version:1,groups:[{{id:1,label:\"real\",dir_path:\"\",}},],tabs:[{{id:10,path:\"{pa}\",group:99,group_ordinal:1,deferred:true,}},],active_tab:10,}}"
+    let b = apply(f, doc.bytes())
+    assert(b.tabs.len == 2 && b.tabs[1].group_id == 0 && b.groups.len == 0)
+}
+
+fn t_of_forty_tabs_reads_one_file() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let gid = edit.group_create(mut a, f.work, "many")
+    for i in 0..40 {
+        let path = file(f, "f{i}.txt", "body\n")
+        let ti = edit.tab_open(mut a, path)
+        assert(ti >= 0)
+        edit.group_add_member(mut a, gid, ti)
+    }
+    let bytes = edit.state_emit_at(a, 0)
+    text.file_load_count_reset()
+    var b = apply(f, bytes)
+    assert(b.tabs.len == 41 && text.file_load_count() == 1, "restore40 exactly1read")
+    edit.tab_switch(mut b, 2)
+    assert(text.file_load_count() == 2)
+}
+
+fn make_split(mut a: edit.Ed, ti: int, dir: int) {
+    edit.tab_switch(mut a, ti)
+    edit.layout_compute(mut a, a.pane_root, edit.rect(0, 0, 80, 24))
+    let leaf = edit.pane_split(mut a, a.focus, dir)
+    assert(leaf >= 0)
+    a.focus = leaf
+    a.tabs[ti].focus = leaf
+}
+
+fn t_rebuilds_the_pane_tree() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "one\ntwo\nthree\nfour\nfive\n")
+    assert(edit.tab_open(mut a, pa) == 1)
+    make_split(mut a, 1, edit.SPLIT_H)
+    assert(edit.pane_resize(mut a, a.tabs[1].root, 8))
+    let b = apply(f, edit.state_emit_at(a, 0))
+    let root = b.tabs[1].root
+    assert(
+        !b.panes[root].is_leaf &&
+            b.panes[root].dir == edit.SPLIT_H &&
+            edit.pane_leaf_count(b, root) == 2,
+    )
+    assert(
+        ws.state_ratio_to_permille(b.panes[root].ratio) ==
+            ws.state_ratio_to_permille(a.panes[a.tabs[1].root].ratio),
+    )
+    assert(b.panes[b.panes[root].a].win != b.panes[b.panes[root].b].win)
+}
+
+fn t_clamps_the_viewport_without_following() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    var body = ""
+    for i in 0..200 { body = "{body}line {i}\n" }
+    let pa = file(f, "a.txt", body)
+    assert(edit.tab_open(mut a, pa) == 1)
+    edit.tab_switch(mut a, 1)
+    edit.layout_compute(mut a, a.pane_root, edit.rect(0, 0, 80, 24))
+    a.wins[a.win].cs.curs[0].pos = 0
+    a.wins[a.win].vp.top = 100
+    let b = apply(f, edit.state_emit_at(a, 0))
+    assert(b.wins[b.win].vp.top == 100 && b.wins[b.win].cs.curs[0].pos == 0)
+}
+
+fn t_brings_back_cursors_and_goal() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "alpha\nbravo\ncharlie\ndelta\n")
+    assert(edit.tab_open(mut a, pa) == 1)
+    edit.tab_switch(mut a, 1)
+    a.wins[a.win].cs.curs[0] = text.Cursor { pos: 2, anchor: 2, goal_col: text.CCOL_EOL }
+    assert(text.cset_add(mut a.wins[a.win].cs, text.Cursor { pos: 8, anchor: 8, goal_col: 3 }))
+    let b = apply(f, edit.state_emit_at(a, 0))
+    assert(
+        b.wins[b.win].cs.curs.len == 2 &&
+            b.wins[b.win].cs.curs[0].pos == 2 &&
+            b.wins[b.win].cs.curs[0].goal_col == text.CCOL_EOL,
+    )
+    assert(b.wins[b.win].cs.curs[1].pos == 8 && b.wins[b.win].cs.curs[1].goal_col == 3)
+}
+
+fn missing_case(mode: int) {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "alpha\n"), pb = file(f, "gone.txt", "bravo\n")
+    assert(edit.tab_open(mut a, pa) == 1 && edit.tab_open(mut a, pb) == 2)
+    if mode == 1 {
+        let gid = edit.group_create(mut a, f.work, "grp")
+        edit.group_add_member(mut a, gid, 1)
+        edit.group_add_member(mut a, gid, 2)
+    }
+    let bytes = edit.state_emit_at(a, 0)
+    fs_remove(pb) else { assert(false) }
+    if mode == 2 { assert(util.mkdirs(pb, 448)) }
+    let b = apply(f, bytes)
+    assert(
+        b.tabs.len == 3 &&
+            b.tabs[2].path == pb &&
+            b.tabs[2].missing_at_restore &&
+            !b.tabs[1].missing_at_restore &&
+            b.state.missing_count == 1,
+    )
+    if mode == 1 {
+        assert(
+            b.groups.len == 1 &&
+                edit.group_member_count(b, b.groups[0].id) == 2 &&
+                b.tabs[2].group_ordinal == 2,
+        )
+    }
+}
+
+fn t_keeps_tabs_whose_files_vanished() { missing_case(0) }
+
+fn t_group_survives_a_missing_member() { missing_case(1) }
+
+fn t_treats_a_directory_as_missing() { missing_case(2) }
+
+fn t_save_restore_save_is_a_fixpoint() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "alpha\nbravo\n"), pb = file(f, "b.txt", "charlie\n")
+    assert(edit.tab_open(mut a, pa) == 1 && edit.tab_open(mut a, pb) == 2)
+    let gid = edit.group_create(mut a, f.work, "grp")
+    edit.group_add_member(mut a, gid, 2)
+    make_split(mut a, 2, edit.SPLIT_V)
+    let first = edit.state_emit_at(a, 0)
+    let b = apply(f, first)
+    let second = edit.state_emit_at(b, 0), third = edit.state_emit_at(b, 0)
+    let la = ws.fl_parse(first, 0, first.len), lb = ws.fl_parse(second, 0, second.len)
+    assert(la.ok && lb.ok && edit.comp_bytes_eq(second, third))
+    for key in "tabs groups".words() {
+        let na = ws.fl_get(la.doc, la.doc.root, key.bytes()) else -1
+        let nb = ws.fl_get(lb.doc, lb.doc.root, key.bytes()) else -1
+        assert(ws.fl_len(la.doc, na) == ws.fl_len(lb.doc, nb))
+    }
+}
+
+fn t_preserves_unknown_options() {
+    let f = fixture()
+    defer finish(f)
+    let doc = "{{version:1,options:{{\"from.the.future\":42,wrap:true,}},groups:[],tabs:[],active_tab:0,}}"
+    let b = apply(f, doc.bytes())
+    assert(b.state.literals.options >= 0)
+    let value = ws.fl_get(
+        b.state.literals.doc,
+        b.state.literals.options,
+        "from.the.future".bytes(),
+    ) else -1
+    assert(
+        ws.fl_int_or(b.state.literals.doc, value, 0) == 42 && output(b).contains("from.the.future"),
+    )
+}
+
+fn t_preserves_unknown_root_and_workspace_fields() {
+    let f = fixture()
+    defer finish(f)
+    let doc = "{{version:1,workspace:{{path:\"\",saved_at:0,future_workspace:{{leaf:[1,true,nil,],}},}},options:{{}},groups:[],tabs:[],active_tab:0,files:[],future_root:{{leaf:[2,false,nil,],}},}}"
+    let b = apply(f, doc.bytes())
+    let out = output(b)
+    assert(
+        out.contains("future_workspace") &&
+            out.contains("future_root") &&
+            out.contains("leaf: [\n        1,") &&
+            out.contains("leaf: [\n      2,"),
+    )
+}
+
+fn t_reapply_replaces_retained_entity_fields() {
+    let f = fixture()
+    defer finish(f)
+    let pa = file(f, "a.txt", "alpha\n")
+    let first = "{{version:1,tabs:[{{id:1,path:\"{pa}\",future_tab_key:{{leaf:true,}},}},],active_tab:1,}}"
+    let plain = "{{version:1,tabs:[{{id:1,path:\"{pa}\",}},],active_tab:1,}}"
+    var b = apply(f, first.bytes())
+    assert(b.state.literals.records.len == 1 && output(b).contains("future_tab_key"))
+    assert(edit.state_apply(mut b, plain.bytes()) == edit.WS_RESTORED)
+    assert(b.state.literals.records.len == 0 && !output(b).contains("future_tab_key"))
+}
+
+fn t_marks_cost_no_read_until_hydration() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "alpha\n"), pb = file(f, "b.txt", "bravo\ncharlie\n")
+    assert(edit.tab_open(mut a, pa) == 1 && edit.tab_open(mut a, pb) == 2)
+    edit.tab_switch(mut a, 2)
+    assert(edit.ed_mark_set(mut a, edit.ed_doc(a), 113, 6))
+    edit.tab_switch(mut a, 1)
+    let bytes = edit.state_emit_at(a, 0)
+    text.file_load_count_reset()
+    var b = apply(f, bytes)
+    let bi = edit.ed_buf_index(b, b.tabs[2].buffer_id)
+    assert(text.file_load_count() == 1 && !b.bufs[bi].resident && b.bufs[bi].named.pending_set[16])
+    edit.tab_switch(mut b, 2)
+    assert(
+        b.bufs[bi].resident &&
+            !b.bufs[bi].named.pending_set[16] &&
+            (edit.ed_mark_get(b, bi, 113) else -1) == 6,
+    )
+}
+
+fn t_reads_what_save_wrote() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "alpha\n")
+    edit.state_open(mut a)
+    assert(a.state.writer && edit.tab_open(mut a, pa) == 1 && edit.state_save(mut a))
+    edit.state_close(mut a)
+    var b = fresh(f)
+    edit.state_open(mut b)
+    assert(b.state.writer)
+    assert(
+        edit.ws_restore(mut b) == edit.WS_RESTORED &&
+            b.tabs.len == 2 &&
+            b.tabs[1].path == pa &&
+            !b.state.dirty,
+    )
+    edit.state_close(mut b)
+}
+
+fn t_absent_state_is_fresh() {
+    let f = fixture()
+    defer finish(f)
+    var b = fresh(f)
+    edit.state_open(mut b)
+    assert(edit.ws_restore(mut b) == edit.WS_FRESH && b.tabs.len == 1)
+    edit.state_close(mut b)
+}
+
+fn t_stateless_is_fresh() {
+    let f = fixture()
+    defer finish(f)
+    var b = fresh(f)
+    assert(!b.state.ready && edit.ws_restore(mut b) == edit.WS_FRESH)
+}
+
+fn main() {
+    let chosen = (env_get("YEW_STATE_CASE") else "-1").to_int() else -1
+    if chosen < 0 || chosen == 0 {
+        t_round_trips_tabs_and_groups()
+        print("ws_restore_round_trips_tabs_and_groups: PASS")
+    }
+    if chosen < 0 || chosen == 1 {
+        t_remaps_group_ids()
+        print("ws_restore_remaps_group_ids: PASS")
+    }
+    if chosen < 0 || chosen == 2 {
+        t_missing_group_record_ungroups_the_tab()
+        print("ws_restore_missing_group_record_ungroups_the_tab: PASS")
+    }
+    if chosen < 0 || chosen == 3 {
+        t_of_forty_tabs_reads_one_file()
+        print("ws_restore_of_forty_tabs_reads_one_file: PASS")
+    }
+    if chosen < 0 || chosen == 4 {
+        t_rebuilds_the_pane_tree()
+        print("ws_restore_rebuilds_the_pane_tree: PASS")
+    }
+    if chosen < 0 || chosen == 5 {
+        t_clamps_the_viewport_without_following()
+        print("ws_restore_clamps_the_viewport_without_following: PASS")
+    }
+    if chosen < 0 || chosen == 6 {
+        t_brings_back_cursors_and_goal()
+        print("ws_restore_brings_back_cursors_and_goal: PASS")
+    }
+    if chosen < 0 || chosen == 7 {
+        t_keeps_tabs_whose_files_vanished()
+        print("ws_restore_keeps_tabs_whose_files_vanished: PASS")
+    }
+    if chosen < 0 || chosen == 8 {
+        t_group_survives_a_missing_member()
+        print("ws_restore_group_survives_a_missing_member: PASS")
+    }
+    if chosen < 0 || chosen == 9 {
+        t_treats_a_directory_as_missing()
+        print("ws_restore_treats_a_directory_as_missing: PASS")
+    }
+    if chosen < 0 || chosen == 10 {
+        t_save_restore_save_is_a_fixpoint()
+        print("ws_restore_save_restore_save_is_a_fixpoint: PASS")
+    }
+    if chosen < 0 || chosen == 11 {
+        t_preserves_unknown_options()
+        print("ws_restore_preserves_unknown_options: PASS")
+    }
+    if chosen < 0 || chosen == 12 {
+        t_preserves_unknown_root_and_workspace_fields()
+        print("ws_restore_preserves_unknown_root_and_workspace_fields: PASS")
+    }
+    if chosen < 0 || chosen == 13 {
+        t_reapply_replaces_retained_entity_fields()
+        print("ws_restore_reapply_replaces_retained_entity_fields: PASS")
+    }
+    if chosen < 0 || chosen == 14 {
+        t_marks_cost_no_read_until_hydration()
+        print("ws_restore_marks_cost_no_read_until_hydration: PASS")
+    }
+    if chosen < 0 || chosen == 15 {
+        t_reads_what_save_wrote()
+        print("ws_restore_reads_what_save_wrote: PASS")
+    }
+    if chosen < 0 || chosen == 16 {
+        t_absent_state_is_fresh()
+        print("ws_restore_absent_state_is_fresh: PASS")
+    }
+    if chosen < 0 || chosen == 17 {
+        t_stateless_is_fresh()
+        print("ws_restore_stateless_is_fresh: PASS")
+    }
+}
