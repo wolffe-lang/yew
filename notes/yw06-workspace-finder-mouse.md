@@ -175,7 +175,15 @@ sort in `edit_state_fuzz`; yw07's bump retires both.
 `tools/fuzzgen` (fuzzlib's generator bit for bit, `mutate_dict` and its
 dictionary copied verbatim to `tests/fuzz/dict/fuzz_state.txt`). The
 port's report line equals C's driver's. The campaign, 100,000 cases at
-each of four seeds, port then C, on kasumi: <<FUZZFULL>>. CI runs 2,000
+each of four seeds, port then C, on kasumi: **every report line
+equal to C's** — `hash=5c1e48323b8b4846` (seed 1), `65c1cdbb70f87b14`
+(`0x243f6a8885a308d3`), `a2c2714c22f302de` (`0x9e3779b97f4a7c15`),
+`6f14381560c33873` (`0xd1b54a32d192ed03`); the port's release driver
+2,362–2,738 s and ~300 MB a seed against C's 1,328–1,441 s and ~8 MB,
+niced on the shared cores
+(`notes/yw06-evidence/continuation/fuzz-state-campaign-100k-x4.log`;
+the driver was built at `24bbfc0`, before the forks' merges: the
+2,000-case CI run below is the final head's). CI runs 2,000
 cases at each seed against C's driver (`tools/run-fuzz-state --native
 --campaign --against-oracle`).
 
