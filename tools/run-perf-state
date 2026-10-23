@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# run-perf-state — Sprint 25 §9's workspace-state gates, the port beside C.
+#
+#   tools/run-perf-state [--cpus 8-11] [--build-only]
+#
+# Runs sagitta's own perf_state (`build/perf_state`, built into the oracle
+# tree from its Makefile if tools/oracle has not: `make perf-state`'s
+# binary, its runtime pinned as `make perf-state` pins it) and the port's
+# twin (tools/perf-state/main.lu, release tier, staged beside the port's
+# modules — D32), both under `taskset` on the CPUs given (yw06 ran on
+# kasumi 8-11: 0-3 were another lane's), C first, the port, C again, and
+# prints one ratio line a gate: the port's upper median over C's (the two
+# C runs averaged), and the restore's file reads beside C's.
+#
+# --build-only is the hard compile gate (yew#44's shape): build both
+# harnesses, run neither. Exit 0 but on a harness fault (2) or a broken
+# read contract (1: a restore that reads more than one file, which both
+# harnesses hold hard in every mode); the times are a FINDING for the note.
+set -eu
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export YEW_ROOT
+cd "$YEW_ROOT"
+. tools/lib-toolchain.sh
+
+cpus=8-11
+build_only=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --cpus) cpus=$2; shift 2 ;;
+    --build-only) build_only=1; shift ;;
+    *) echo "run-perf-state: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+
+oracle=$YEW_ROOT/target/oracle/sagitta
+[ -d "$oracle" ] || { echo "run-perf-state: no oracle tree (tools/oracle)" >&2; exit 2; }
+build=$(readlink "$oracle/build" || echo build-gcc)
+cc=gcc
+case "$build" in build-clang) cc=clang ;; esac
+if [ ! -x "$oracle/$build/perf_state" ]; then
+    make -C "$oracle" --no-print-directory CC="$cc" BUILD="$build" "$build/perf_state" >/dev/null
+fi
+
+stage=$YEW_ROOT/target/perf-state
+if [ "$build_only" = 1 ] || [ "${PERF_PREBUILT:-0}" != 1 ] || [ ! -x "$stage/perf-state" ]; then
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    cp tools/perf-state/main.lu "$stage/main.lu"
+    for d in src/*/; do
+        m=$(basename "$d")
+        cp -R "src/$m" "$stage/$m"
+        rm -f "$stage/$m"/*_test.lu
+    done
+    "$WOLF" build --release --deny-warnings "$stage/main.lu" -o "$stage/perf-state"
+fi
+if [ "$build_only" = 1 ]; then
+    echo "run-perf-state: build-only: C and port harnesses built; no measurement"
+    exit 0
+fi
+
+runc() {
+    (cd "$oracle" && YEW_RUNTIME_DIR="$oracle/runtime" taskset -c "$cpus" "$build/perf_state")
+}
+c1=$(runc) || { echo "$c1"; echo "run-perf-state: C's perf_state failed" >&2; }
+port=$(YEW_LOG=/dev/null taskset -c "$cpus" "$stage/perf-state") || true
+c2=$(runc) || true
+echo "$c1" | sed 's/^/C (first): /'
+echo "$port"
+echo "$c2" | sed 's/^/C (again): /'
+python3 -I - "$c1" "$c2" "$port" <<'PY'
+import re, sys
+c1, c2, port = sys.argv[1], sys.argv[2], sys.argv[3]
+def c_ms(text, key):
+    m = re.search(key + r'_ms=([0-9.]+)', text)
+    return float(m.group(1)) if m else None
+def p_ms(text, key):
+    m = re.search(key + r'_ns=([0-9]+)', text)
+    return int(m.group(1)) / 1e6 if m else None
+def reads(text):
+    m = re.search(r'file_reads=([0-9]+)', text)
+    return int(m.group(1)) if m else None
+rows = []
+bad = 0
+for key in ('emit', 'parse', 'restore'):
+    a, b, p = c_ms(c1, key), c_ms(c2, key), p_ms(port, key)
+    if a is None or b is None or p is None:
+        print("run-perf-state: %s missing (C %s/%s, port %s)" % (key, a, b, p))
+        sys.exit(2)
+    c = (a + b) / 2
+    rows.append("%s %.3f/%.3f ms = %.2f" % (key, p, c, p / c if c else float('inf')))
+pr, cr = reads(port), reads(c1)
+print("perf-state: port/C upper medians: " + " | ".join(rows) +
+      " | restore file reads port=%s C=%s" % (pr, cr))
+sys.exit(1 if pr is None or pr > 1 else 0)
+PY
