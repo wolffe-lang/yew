@@ -1,6 +1,7 @@
 #!/bin/bash
 # G20 reduction: each variant built native and --release with a given wolf;
-# the exit status and the first stderr line recorded.
+# the exit status and the first error line recorded (warnings allowed: the
+# reduction is one item a module, W0314).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 for wolf in "$@"; do
@@ -11,11 +12,11 @@ for wolf in "$@"; do
         for tier in native release; do
             flag=""; [ "$tier" = release ] && flag=--release
             out=$(mktemp -d)
-            ( cd "$here/$v" && "$wolf" build --deny-warnings $flag main.lu -o "$out/p" ) > "$out/log" 2>&1
+            ( cd "$here/$v" && "$wolf" build $flag main.lu -o "$out/p" ) > "$out/log" 2>&1
             rc=$?
             run=""
             [ "$rc" = 0 ] && run=$("$out/p")
-            echo "$v $tier build=$rc run=[$run] $(head -1 "$out/log")"
+            echo "$v $tier build=$rc run=[$run] $(grep -m1 -E "error|cannot compile" "$out/log")"
             rm -rf "$out"
         done
     done
