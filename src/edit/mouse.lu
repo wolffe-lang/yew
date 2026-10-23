@@ -352,13 +352,20 @@ fn strip_scroll(mut ed: Ed, row2: bool, delta: int) -> bool {
 }
 
 // `mouse_wheel` (`mouse.c:321-401`): Ctrl+wheel is DELIBERATELY unbound
-// (the terminal's font-size gesture); the completion menu's claim first;
+// (the terminal's font-size gesture); an open context menu is dismissed;
+// the completion menu's claim first;
 // then the region under the pointer. A wheel over a border, a context
 // menu, a modal's BLOCK or nothing at all is swallowed. (The FUSS
 // drawer's scroll, `mouse.c:350-358`, is F mode's: never up before yw13.)
 fn mouse_wheel(mut ed: Ed, k: term.Key) {
     if k.mods & term.MOD_CTRL != 0 {
         return
+    }
+    // A wheel DISMISSES an open menu and is then routed normally:
+    // scrolling the thing under a pop-up that stays put is how a menu ends
+    // up pointing at a row that has moved.
+    if ctx_active(ed.ctx) {
+        menu_close(mut ed)
     }
     if mouse_claimed_by_menu(mut ed, k) {
         return
@@ -378,6 +385,105 @@ fn mouse_wheel(mut ed: Ed, k: term.Key) {
 // `rect_has` (`mouse.c:650-654`).
 fn rect_has(r: Rect, x: int, y: int) -> bool {
     r.w != 0 && r.h != 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+/// `yew_mouse_context_at` (`mouse.c:656-834`), Sprint 57.13 §3: WHAT IS
+/// UNDER THE POINTER — one pure function, so every surface's menu comes
+/// from one answer. A REGION HIT WINS (the renderer registered it in the
+/// statement that drew it); the OPEN MENU answers for its own cells first
+/// (`CTX_KIND_NONE`: there is no menu for a menu); only an unclaimed cell
+/// falls through to geometry — the footer, the strip, the editor. (The
+/// FUSS drawer and backdrop, and a FUSS row's file-or-directory answer,
+/// are F mode's: down before yw13, where C's inactive drawer claims no
+/// cell and a path the tree does not hold is the blank-drawer menu. The
+/// floating panel and the completion popup are yw11's: never open.)
+pub fn mouse_context_at(mut ed: Ed, x: int, y: int) -> CtxContext {
+    var c = ctxcontext_new(CTX_KIND_EDITOR, 0)
+    let hit = region_hit(mut ed.regions, x, y)
+    c.payload = hit.payload
+    c.rect = copy hit.rect
+    if ctx_active(ed.ctx) && rect_has(ctx_box(ed.ctx), x, y) {
+        c.kind = CTX_KIND_NONE
+        c.rect = ctx_box(ed.ctx)
+        return c
+    }
+    let k = hit.kind
+    if k == REGION_PANE {
+        c.kind = CTX_KIND_DOC
+        c.id = hit.payload
+        return c
+    }
+    if k == REGION_PANE_BORDER {
+        c.kind = CTX_KIND_BORDER
+        c.id = hit.payload
+        return c
+    }
+    if k == REGION_TAB {
+        // The row-1 payload convention, once: >= 0 a tab index, < 0 a
+        // negated gid. IDENTITY, not the index.
+        if hit.payload < 0 {
+            c.kind = CTX_KIND_GROUP
+            c.id = 0 - hit.payload
+        } else {
+            c.kind = CTX_KIND_TAB
+            c.id = if hit.payload < ed.tabs.len then ed.tabs[hit.payload].tab_id else 0
+        }
+        return c
+    }
+    if k == REGION_TAB_SCROLL || k == REGION_TAB_NEW {
+        c.kind = CTX_KIND_STRIP
+        return c
+    }
+    if k == REGION_FUSS_ROW {
+        c.id = hit.payload
+        c.kind = CTX_KIND_FUSS_BLANK
+        return c
+    }
+    if k == REGION_PICK_ROW {
+        c.kind = CTX_KIND_PICK_ROW
+        c.id = hit.payload
+        return c
+    }
+    if k == REGION_COMPL_ROW {
+        c.kind = CTX_KIND_COMPL_ROW
+        c.id = hit.payload
+        return c
+    }
+    if k == REGION_GP_ROW {
+        c.kind = CTX_KIND_GP_ROW
+        c.id = hit.payload
+        return c
+    }
+    if k == REGION_GP_NAME {
+        c.kind = CTX_KIND_GP
+        return c
+    }
+    if k == REGION_CTX_ROW {
+        c.kind = CTX_KIND_NONE
+        return c
+    }
+    if k == REGION_BLOCK {
+        // BLOCK is shared by every modal: innermost first.
+        if gp_active(ed) {
+            c.kind = CTX_KIND_GP
+            return c
+        }
+        c.kind = CTX_KIND_EDITOR
+        return c
+    }
+    if rect_has(ed.footer_rect, x, y) {
+        c.kind = CTX_KIND_FOOTER
+        c.rect = copy ed.footer_rect
+        return c
+    }
+    if rect_has(ed.tab_strip_rect, x, y) {
+        c.kind = CTX_KIND_STRIP
+        c.rect = copy ed.tab_strip_rect
+        return c
+    }
+    c.kind = CTX_KIND_EDITOR
+    c.rect = rect(0, 0, ed.grid.cols, ed.grid.rows)
+    c
 }
 
 // `invoke_mouse_named` (`mouse.c:836-846`): a registry command, from the
@@ -512,13 +618,51 @@ fn press_tab(mut ed: Ed, hit: Region) {
     }
 }
 
+// `press_opens_menu` (`mouse.c:1304-1318`): THE MENU GESTURE — the right
+// button, or the left one with Ctrl (a single-button mouse has no second
+// button; invariant 9 from the other side).
+fn press_opens_menu(k: term.Key) -> bool {
+    k.button == term.MB_RIGHT || (k.button == term.MB_LEFT && k.mods & term.MOD_CTRL != 0)
+}
+
+// `press_menu` (`mouse.c:1320-1347`): with a menu open, a press ON it
+// (resolved before the close: the menu answers NONE for its own cells)
+// dismisses and stops — never re-opening a menu on itself, never invoking
+// the row under a right-click; otherwise the menu for what is under the
+// pointer opens AT the pointer.
+fn press_menu(mut ed: Ed, k: term.Key) {
+    if ctx_active(ed.ctx) {
+        let over = mouse_context_at(mut ed, k.col, k.row).kind
+        menu_close(mut ed)
+        if over == CTX_KIND_NONE {
+            return
+        }
+    }
+    let c = mouse_context_at(mut ed, k.col, k.row)
+    if c.kind == CTX_KIND_NONE {
+        return
+    }
+    let _ = menu_open_at(mut ed, c, k.col, k.row, k.col, k.row, MENU_PLACE_AT_POINTER)
+    ed.full_damage = true
+}
+
 // `mouse_press` (`mouse.c:1349-1470`): the hover reveal ends (a press is
-// the end of no-button); the middle button's paste; the completion
-// menu's claim; then the press ARMS with its region captured and routes
-// by that region.
+// the end of no-button); the menu gesture FIRST, never touching the phase
+// machine (Ctrl+left must not arm a drag or enter H behind its menu); an
+// ordinary left press outside an open menu's box dismisses it BEFORE
+// region routing; the middle button's paste; the completion menu's
+// claim; then the press ARMS with its region captured and routes by that
+// region.
 fn mouse_press(mut ed: Ed, k: term.Key) {
     // s57.15 §2's reveal is a NO-BUTTON clock: before every early return.
     ed.mouse.hover_chevron = false
+    if press_opens_menu(k) {
+        press_menu(mut ed, k)
+        return
+    }
+    if k.button == term.MB_LEFT && ctx_active(ed.ctx) && !rect_has(ctx_box(ed.ctx), k.col, k.row) {
+        menu_close(mut ed)
+    }
     let hit = region_hit(mut ed.regions, k.col, k.row)
     if k.button == term.MB_MIDDLE {
         press_middle(mut ed, hit, k)
@@ -563,6 +707,18 @@ fn mouse_press(mut ed: Ed, k: term.Key) {
     } else if hit.kind == REGION_GP_ROW || hit.kind == REGION_GP_NAME {
         if gp_click(mut ed, k.col, k.row) {
             gp_apply(mut ed)
+        }
+    } else if hit.kind == REGION_CTX_ROW {
+        // Highlighting, not invoking: the row fires at release, and only
+        // when the release lands on the same row.
+        ctx_hover(mut ed.ctx, hit.payload)
+        ed.full_damage = true
+    } else if hit.kind == REGION_MENU_ROW || hit.kind == REGION_NONE {
+        // The safety net for an unclaimed cell.
+        if ctx_active(ed.ctx) {
+            menu_close(mut ed)
+            ed.mouse.phase = MP_IDLE
+            ed.mouse.held = 0
         }
     }
     // REGION_TAB_NEW is armed only: a release in the same region invokes
@@ -1092,8 +1248,9 @@ fn chevron_at(mut ed: Ed, x: int, y: int) -> (bool, bool, int) {
 fn hover_track(mut ed: Ed, x: int, y: int) {
     ed.mouse.hover_x = x
     ed.mouse.hover_y = y
+    // AN OPEN MENU OWNS THE HOVER: it reveals nothing until it is gone.
     let (on, _, _) = chevron_at(mut ed, x, y)
-    if !on {
+    if ctx_active(ed.ctx) || !on {
         ed.mouse.hover_chevron = false
         return
     }
@@ -1111,6 +1268,12 @@ fn hover_track(mut ed: Ed, x: int, y: int) {
 // it leaves its cell.
 fn mouse_motion(mut ed: Ed, k: term.Key) {
     if k.button == term.MB_NONE {
+        // `ctx_hover_at` maps the cell by the box's geometry and answers
+        // true ONLY when the highlight moved: a menu-only repaint, never a
+        // full one.
+        if ctx_active(ed.ctx) && ctx_hover_at(mut ed.ctx, k.col, k.row) {
+            ed.overlay_dirty = true
+        }
         hover_track(mut ed, k.col, k.row)
         return
     }
@@ -1200,6 +1363,16 @@ fn mouse_release(mut ed: Ed, k: term.Key) {
             if up.kind == REGION_TAB_NEW && same_rect(up.rect, pr) {
                 invoke_mouse_named(mut ed, "ed.tab.new")
             }
+        } else if kind == REGION_CTX_ROW {
+            // Same row, or nothing: a press that slid onto a neighbour was
+            // a mis-aim.
+            let up = region_hit(mut ed.regions, k.col, k.row)
+            if up.kind == REGION_CTX_ROW && up.payload == ed.mouse.press_rgn.payload {
+                ctx_invoke(mut ed.ctx, up.payload)
+                apply_menu_action(mut ed)
+                menu_settle(mut ed)
+            }
+            ed.full_damage = true
         } else if kind == REGION_FUSS_ROW {
             // The double click opens (`invoke_fuss_open`, `mouse.c:848-
             // 878`): `ed.git.open`, F mode's command (Sprint 51, yw13),
@@ -1493,20 +1666,14 @@ pub fn mouse_on_from_env() -> bool {
 /// — turning the mouse off silences a strip that still has a chevron.
 pub fn mouse_set_enabled(mut ed: Ed, on: bool) {
     ed.mouse_on = on
-    mouse_motion_resync(mut ed)
-}
-
-// The 1003 mode recomputed from its wants (`motion_sync`, `mouse.c:514-
-// 517`) through the tty's cached path.
-fn mouse_motion_resync(mut ed: Ed) {
-    term.tty_mouse_motion(mut ed.tty, motion_wanted(ed))
+    motion_sync(mut ed)
 }
 
 /// `ed.mouse.enable` (`yew_mouse_cmd_enable`, `mouse.c:3063-3071`).
 pub fn mouse_cmd_enable(mut ed: Ed, cx: CmdCtx) -> int {
     let _ = cx.win
     ed.mouse_on = true
-    mouse_motion_resync(mut ed)
+    motion_sync(mut ed)
     ed_msg(mut ed, MSG_INFO, "mouse on")
     CMD_OK
 }
@@ -1518,8 +1685,11 @@ pub fn mouse_cmd_enable(mut ed: Ed, cx: CmdCtx) -> int {
 pub fn mouse_cmd_disable(mut ed: Ed, cx: CmdCtx) -> int {
     let _ = cx.win
     mouse_cancel(mut ed)
+    // Through THE one close path, so the menu the disable dismisses takes
+    // any-motion tracking with it.
+    menu_close(mut ed)
     ed.mouse_on = false
-    mouse_motion_resync(mut ed)
+    motion_sync(mut ed)
     ed_msg(mut ed, MSG_INFO, "mouse off")
     CMD_OK
 }
