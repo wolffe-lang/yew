@@ -100,12 +100,42 @@ fn fl_read_string(src: List[byte], mut r: FlReader, mut doc: FlDoc) -> FlSpan {
     FlSpan { at: start, len: doc.bytes.len - start }
 }
 
+// Match the shipping pure-data reader's reserved bare-key rejection, not
+// the retired hand reader's broader acceptance. Pinned fl/lex.c:21-30;
+// notes/yw06-evidence/codec/logs/shipping-c-witnesses.log records every word.
+fn fl_reserved_key(doc: FlDoc, key: FlSpan) -> str ! {none} {
+    if key.len < 2 || key.len > 8 { return none }
+    let words = match doc.bytes[key.at] as int {
+        97 => "and|as",
+        98 => "break",
+        99 => "catch|continue",
+        101 => "edit|else",
+        102 => "false|fn|for",
+        105 => "if|import|in",
+        108 => "let",
+        109 => "macro",
+        110 => "nil|not",
+        111 => "or",
+        114 => "return",
+        116 => "true|try",
+        119 => "while",
+        _ => "",
+    }
+    for word in words.split("|") {
+        if fl_span_equal(doc.bytes, key, word.bytes(), FlSpan { at: 0, len: word.len }) { return word }
+    }
+    none
+}
+
 fn fl_read_key(src: List[byte], mut r: FlReader, mut doc: FlDoc) -> FlSpan {
     if fl_peek(src, r) == 34 {
         fl_count(mut r)
         return fl_read_string(src, mut r, mut doc)
     }
     let start = doc.bytes.len
+    let key_off = r.at
+    let key_line = r.line
+    let key_col = r.col
     while r.at < r.end {
         let c = fl_peek(src, r)
         if c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 95 || c == 46 {
@@ -115,7 +145,15 @@ fn fl_read_key(src: List[byte], mut r: FlReader, mut doc: FlDoc) -> FlSpan {
         }
     }
     if doc.bytes.len == start { fl_fail(mut r, "expected a key") }
-    FlSpan { at: start, len: doc.bytes.len - start }
+    let span = FlSpan { at: start, len: doc.bytes.len - start }
+    let reserved = fl_reserved_key(doc, span) else ""
+    if reserved.len > 0 && !r.failed {
+        fl_fail(mut r, "pure-literal mode: '{reserved}' not allowed")
+        r.err.off = key_off
+        r.err.line = key_line
+        r.err.col = key_col
+    }
+    span
 }
 
 fn fl_word(src: List[byte], r: FlReader, word: str) -> bool {
@@ -128,15 +166,16 @@ fn fl_word(src: List[byte], r: FlReader, word: str) -> bool {
     true
 }
 
-// Negative accumulation handles INT64_MIN without an overflowing positive
-// magnitude; every multiply/subtract is checked BEFORE evaluating it.
+// Negative accumulation avoids intermediate overflow. Shipping Fletch lexes
+// the positive magnitude before unary minus, so INT64_MIN is rejected too
+// (shipping-c-witnesses.log); the writer still supports all i64 values.
 fn fl_read_int(src: List[byte], mut r: FlReader) -> int {
     let neg = fl_peek(src, r) == 45
     if neg { let _ = fl_advance(src, mut r) }
     var value: int = 0
     var any = false
     var over = false
-    let limit: int = if neg then -9223372036854775807 - 1 else -9223372036854775807
+    let limit: int = -9223372036854775807
     while r.at < r.end {
         let c = fl_peek(src, r)
         if c < 48 || c > 57 { break }
@@ -150,7 +189,7 @@ fn fl_read_int(src: List[byte], mut r: FlReader) -> int {
         }
     }
     if !any { fl_fail(mut r, "expected digits") }
-    if over { fl_fail(mut r, "integer out of range") }
+    if over { fl_fail(mut r, "integer literal does not fit in i64") }
     if neg then value else 0 - value
 }
 
@@ -191,16 +230,52 @@ fn fl_atom(src: List[byte], mut r: FlReader, mut doc: FlDoc) -> int {
     fl_node(mut doc, kind, number, text)
 }
 
-fn fl_attach(mut doc: FlDoc, parent: int, key: FlSpan, child: int) {
+// An index only, never an iteration order: shipping gc.c:651-698 keeps the
+// first key position on overwrite. Without this index, a legal large map
+// requires a quadratic scan merely to detect duplicate byte keys.
+struct FlKeyLink {
+    parent: int,
+    entry: int,
+    next: int,
+}
+
+struct FlKeyIndex {
+    heads: Map[int, int],
+    links: List[FlKeyLink],
+}
+
+fn fl_key_hash(doc: FlDoc, parent: int, key: FlSpan) -> int {
+    var hash: wrapping[u64] = 14695981039346656037
+    hash = (hash ^ parent as wrapping[u64]) * 1099511628211
+    var i = 0
+    while i < key.len {
+        hash = (hash ^ doc.bytes[key.at + i] as int as wrapping[u64]) * 1099511628211
+        i += 1
+    }
+    (hash & 9223372036854775807) as int
+}
+
+fn fl_attach(mut doc: FlDoc, mut index: FlKeyIndex, parent: int, key: FlSpan, child: int) {
     if doc.nodes[parent].kind == FL_MAP {
-        var i = 0
-        while i < doc.nodes[parent].keys.len {
-            if fl_span_equal(doc.bytes, doc.nodes[parent].keys[i], doc.bytes, key) {
-                doc.nodes[parent].items[i] = child
+        let hash = fl_key_hash(doc, parent, key)
+        let head = index.heads[hash] else -1
+        var link = head
+        while link >= 0 {
+            let entry = index.links[link].entry
+            if index.links[link].parent == parent &&
+                fl_span_equal(doc.bytes, doc.nodes[parent].keys[entry], doc.bytes, key) {
+                doc.nodes[parent].items[entry] = child
                 return
             }
-            i += 1
+            link = index.links[link].next
         }
+        let slot = index.links.len
+        (mut index.links).push(FlKeyLink {
+            parent: parent,
+            entry: doc.nodes[parent].keys.len,
+            next: head,
+        })
+        index.heads[hash] = slot
         (mut doc.nodes[parent].keys).push(key)
     }
     (mut doc.nodes[parent].items).push(child)
@@ -225,6 +300,7 @@ pub fn fl_parse(src: List[byte], at: int, end: int) -> FlParseResult {
         fl_fail(mut r, "document exceeds 8 MiB")
     }
     var stack = List[FlFrame]()
+    var index = FlKeyIndex { heads: Map[int, int](), links: List[FlKeyLink]() }
     if !r.failed {
         doc.root = fl_atom(src, mut r, mut doc)
         if !r.failed && doc.nodes[doc.root].kind >= FL_LIST {
@@ -261,7 +337,7 @@ pub fn fl_parse(src: List[byte], at: int, end: int) -> FlParseResult {
         }
         let child = fl_atom(src, mut r, mut doc)
         if r.failed { break }
-        fl_attach(mut doc, parent, key, child)
+        fl_attach(mut doc, mut index, parent, key, child)
         stack[top].after = true
         if doc.nodes[child].kind >= FL_LIST {
             if stack.len >= FL_MAX_DEPTH { fl_fail(mut r, "nesting deeper than 32"); break }
