@@ -396,6 +396,16 @@ neither (`workspace.c`, `fllit.h`, `fl_emit.c`, `fl_parse.c`, `walk.c`,
   as the pin does; share position resolution where it is the same code.
   The earlier instruction to call that serializer was a mechanism error,
   not permission to change the frozen schema. No golden changes.
+- **R-yw06-9 — unsigned coordinate wire values (Decided A, 2026-10-23).**
+  C loads signed literals into unsigned cursor/view/ring/mark fields and
+  emits their signed bit interpretation (`src/ws/state_parse.c:321-334`,
+  `src/ws/state_emit.c:550-565`). Preserve out-of-range values as sparse
+  raw wire metadata beside safe live coordinates until C's clamp point;
+  clear the metadata when an edit or clamp replaces the live value.
+  `top_sub` uses the C u32 mask. Keep this state bridge local rather than
+  retrofit the earlier text and viewport engines to u64. Prove both the
+  no-edit load/save round trip and the same coordinate-moving edit against
+  C, including distinct wide cursors, identity retention and removal.
 - **Decided**: R-yw05-1 = A (2026-10-22). s57.9's C is yw03's `block.c`
   and yw05's `groupfromdir.c` and `groupnav.c` (its unit cases are
   `test_block`'s, `test_groupfromdir`'s and `test_groupnav`'s), its
