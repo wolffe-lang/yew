@@ -508,12 +508,36 @@ One paragraph each; yw01's is drafted in full
   s57.22 after s27's router (R-yw05-1 = A); 14,554 C lines, 24 unit files
   (399 tests), 80 reachable PTY cases; M-YW5's shape, the state codec
   before Fletch, the trust database and the non-UTF-8 paths asked as
-  R-yw06-1..6 (§8's correction).
+  R-yw06-1..6 (§8's correction). **Landed by yw06**
+  (`notes/yw06-workspace-finder-mouse.md`), at wolf 0.2.34 (0.2.35
+  tagged after the pin commit): workspace identity and the session state
+  over the hand codec (the frozen v1 corpus 22/4/20, the C↔port state
+  differential byte-identical both ways), the startup plan, the walk,
+  `.gitignore` (C's measured disk quirks), the filter and the one
+  picker with its four instances and type-to-jump, one router at the
+  pin's state with the context menus and drag, and `:!yew FILE`; the
+  **81** reachable goldens green by name on release and native, and
+  M-YW5's automated twins (twenty resume cycles grid for grid, the
+  restore after SIGKILL, SIGSEGV and a closed terminal) gated in CI;
+  `fuzz_state`, `fuzz_gitignore` and `fuzz_mouse` equal to C's drivers;
+  the per-case checked lane as a CI job (`tools/check-test-cases`); G45
+  (a `read` lend's snapshot, the router's burst 6.68× C) and G46 (the
+  checked machine's per-byte `str` copy) listed; R-yw06-11..14 asked.
 - **yw07 — Fletch core** (s28–s31; `src/fl/` lex, parse, compile, vm,
   value, gc, opcodes, data, module, std*). The frozen spec
   (`.docs/fletch-spec.md`, copied verbatim), lexer, parser, bytecode,
   the VM with switch dispatch, the GC per ruling R3, the std modules.
   Goldens: `tests/fletch/` conformance through `yew fl`. Gaps: G6.
+  **Drafted in full by yw06** (`notes/contracts/yw07-fletch-core.md`):
+  the bump to 0.2.35 first (yew#17, #20, #22, #23, #24, #27, #40, and
+  G20's two local sorts retired); 31 files, 15,868 C lines, 185 unit
+  tests; R-yw07-1..9 asked (the sweep after the toy VM, the value's
+  shape, dispatch without function values across modules, the float
+  conversions, `fl` below `edit`, `suggest`/`trace`/`origin`'s check
+  half pulled forward with their 13 tests, `flcli.c`'s non-interactive
+  forms so the 39 conformance units run, non-UTF-8 paths as bytes,
+  errno names); `stdai.c` is Sprint 48's (campaign 10), not yw09's as
+  §2 says — the draft flags it, undecided.
 - **yw08 — REPL, errors, conformance and perf** (s32, s33; `src/fl/`
   repl, trace, suggest, vmcheck; `src/flcli.c`). `yew fl`, stack
   traces, the error-quality pass, `fl_smoke`'s baselines and the
