@@ -16,7 +16,7 @@ for tier in native release; do
     echo "build $tier exit=$?"
     [ -x "target/mouse-witness/rlc-$tier" ] || continue
     taskset -c 8-11 "target/mouse-witness/rlc-$tier" | sed "s/^/$tier: /"
-    for f in step_read step_mut step_field; do
+    for f in step_read step_mut step_field time_read time_mut time_field; do
         fr=$(objdump -d --no-show-raw-insn "target/mouse-witness/rlc-$tier" | awk "/<[^>]*$f[^>]*>:/,/^\$/" | grep -o 'sub \+\$0x[0-9a-f]*,%rsp' | head -1)
         echo "$tier: $f frame: ${fr:-none}"
     done
