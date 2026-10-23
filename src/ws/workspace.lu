@@ -1,0 +1,125 @@
+//! ws.workspace — stable directory identity and collision probes.
+//! Ports sagitta src/ws/workspace.c:20-247 and workspace.h:34-72 at
+//! 9ace98c2. The shared text.file atomic writer owns durability; the
+//! workspace directory is never an output destination. G40: filesystem
+//! paths remain str, but the public hash consumes arbitrary bytes.
+
+use text
+use util
+
+/// Last collision probe (zero is the bare hash).
+pub const WS_PROBE_MAX: int = 15
+
+/// Canonical workspace identity; stateless keys perform no writes.
+pub struct WsKey {
+    realpath: str,
+    hash: wrapping[u64],
+    probe: int,
+    dir: str,
+    stateless: bool,
+}
+
+/// A key with no filesystem identity and no state access.
+pub fn ws_key_empty() -> WsKey {
+    WsKey { realpath: "", hash: 0, probe: 0, dir: "", stateless: true }
+}
+
+/// FNV-1a over bytes, including NUL and invalid UTF-8 (workspace.c:20-41).
+pub fn fnv1a64(bytes: List[byte]) -> wrapping[u64] {
+    var h: wrapping[u64] = 0xcbf29ce484222325
+    for b in bytes {
+        h = (h ^ b as int as wrapping[u64]) * 0x100000001b3
+    }
+    h
+}
+
+fn ws_join(k: WsKey, tail: str) -> str {
+    if k.dir.len == 0 || k.dir.len + tail.len >= 4096 {
+        return ""
+    }
+    "{k.dir}{tail}"
+}
+
+/// State document path, empty when the key has no directory.
+pub fn ws_state_path(k: WsKey) -> str { ws_join(k, "state.fl") }
+
+/// Undo sidecar directory, empty when the key has no directory.
+pub fn ws_undo_dir(k: WsKey) -> str { ws_join(k, "undo/") }
+
+/// Writer pid lock path, empty when the key has no directory.
+pub fn ws_lock_path(k: WsKey) -> str { ws_join(k, "lock") }
+
+// First fgets line, limited to PATH_MAX-1 bytes (workspace.c:102-133).
+// Empty file is free; an LF-only record is present and mismatches.
+fn ws_probe_matches(dir: str, want: str) -> int {
+    if dir.len + 4 >= 4096 { return -1 }
+    let fd = fs_open("{dir}path") else { return -1 }
+    defer fs_close(fd) else |_| {}
+    let bytes = fs_read_chunk(fd, 4095) else { return -1 }
+    if bytes.len == 0 { return -1 }
+    var n = 0
+    while n < bytes.len && bytes[n] as int != 10 && bytes[n] as int != 0 { n += 1 }
+    while n > 0 && (bytes[n - 1] as int == 10 || bytes[n - 1] as int == 13) { n -= 1 }
+    if n != want.len { return 0 }
+    var i = 0
+    while i < n {
+        if bytes[i] != want.bytes()[i] { return 0 }
+        i += 1
+    }
+    1
+}
+
+/// Identity does not create a directory (workspace.c:135-216).
+pub fn ws_key(mut k: WsKey, dir: str) -> bool {
+    k = ws_key_empty()
+    if dir.len == 0 { return false }
+    let resolved = fs_realpath(dir) else {
+        util.log_warn("workspace {dir} does not resolve; no state")
+        return false
+    }
+    if resolved.len >= 4096 { return false }
+    k.realpath = resolved
+    k.hash = fnv1a64(resolved.bytes())
+    let state_root = util.xdg_state_dir() else {
+        util.log_warn("no usable state directory; this session keeps no state")
+        return false
+    }
+    let hex = text.hex16(k.hash)
+    var probe = 0
+    while probe <= WS_PROBE_MAX {
+        let tail = if probe == 0 then "/workspaces/{hex}/" else "/workspaces/{hex}-{probe}/"
+        if state_root.len + tail.len >= 4096 { return false }
+        let candidate = "{state_root}{tail}"
+        if ws_probe_matches(candidate, resolved) != 0 {
+            k.dir = candidate
+            k.probe = probe
+            k.stateless = false
+            return true
+        }
+        probe += 1
+    }
+    util.log_warn("workspace key {hex} collided past {WS_PROBE_MAX} probes; no state")
+    false
+}
+
+/// Clean/batch callers use this entry before any filesystem access.
+pub fn ws_key_session(mut k: WsKey, dir: str, stateless: bool) -> bool {
+    if stateless {
+        k = ws_key_empty()
+        return false
+    }
+    ws_key(mut k, dir)
+}
+
+/// mkdir -p 0700, then an atomic 0600 path record (workspace.c:218-247).
+pub fn ws_ensure_dir(mut k: WsKey) -> bool {
+    if k.stateless || k.dir.len == 0 { return false }
+    if !util.mkdirs(k.dir, 448) {
+        util.log_warn("cannot create {k.dir}; this session keeps no state")
+        k.stateless = true
+        return false
+    }
+    if k.dir.len + 4 >= 4096 || k.realpath.len + 1 >= 4096 { return false }
+    let line = "{k.realpath}\n"
+    text.file_write_atomic("{k.dir}path", line.bytes(), 384) == text.SAVE_OK
+}
