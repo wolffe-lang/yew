@@ -465,7 +465,14 @@ run): `perf_state` emit 0.59, parse 0.96, restore 1.13;
 `startup.first_paint.workspace50` 1.68; `mem.workspace50` 1.87 (both
 inside 40 MB); `perf_finder` open 1.35, its three in-frame gates 1.00;
 the router's burst 6.68, menu hover 2.01, chevron hover 2.06 (over 2×,
-G45, yw15's); <<MANYBUFFERS>>.
+G45, yw15's); and yw05's rows again over yw06's editor, now that
+`--workspace` restores and saves (`tools/run-perf-panes-tabs`, release
+at `c49b738`, 21:3xZ with one checked-machine process on a core):
+`latency.navigate.many_buffers.p99` **1.69** (C 191/175 µs, port 310 µs;
+yw05 read 1.58–1.77), the tab switch's p99 **1.94**, the two panes'
+1.00, the one pane's 1.02 — every gated p99 within 2×; recorded beside
+them, the many-buffers p50 2.12 and the tab switch's p50 2.28
+(`notes/yw06-evidence/continuation/perf-panes-tabs-c49b738.log`).
 
 **The other gates CI now holds** (all in the oracle job unless named):
 `fuzz_state` (2,000 × 4 seeds), `fuzz_gitignore` (200,000) and
