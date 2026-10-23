@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""check-test-cases: the checked machine one case at a time (G29).
+
+A test file whose whole run is past the checked machine's 20M-step budget
+gets no checked verdict from `tools/check-test` (`wolf test` falls back to
+the native tier for it). Each such file takes a selector (YEW_STATE_CASE,
+YEW_CTX_CASE, YEW_CODEC_FIXTURE, ...) that runs one case alone, and this
+tool runs every case of every file in tools/check-test-cases.txt through
+`wolf conform-run --deny-warnings --checked --json`, the verdict read from
+the JSON, never from an exit status.
+
+  tools/check-test-cases            every file in the table
+  tools/check-test-cases FILE...    those files only (as the table names them)
+
+A counted file (`FILE VAR N`) runs cases 0..N-1, each of which must print a
+case line (`: PASS`, `RED ` or `SKIP`), and then case N, which must print
+none: a case added or removed without the table moving is red. A listed
+file (`FILE VAR @list`) runs each name the list yields. A case that is not
+`exit(0)` is red unless an `allow` row names it with its reason, and an
+allowed case that now exits 0 is red too, so the table cannot rot.
+Run from the repository root inside the container, as tools/check-test is.
+"""
+from pathlib import Path
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+TABLE = ROOT / "tools/check-test-cases.txt"
+CASE_LINE = re.compile(r"(: PASS|^RED |SKIP)", re.M)
+REASONS = {"budget": "step budget exhausted"}
+
+
+def lists(name):
+    if name == "@codec":
+        text = (ROOT / "src/ws_state_corpus_test.lu").read_text()
+        names = []
+        for m in re.finditer(r'^const (?:CANONICAL|NONCANONICAL|INVALID): str = "([^"]*)"', text, re.M):
+            names += m.group(1).split("|")
+        return names
+    if name == "@wsstate-invalid":
+        return sorted(p.name for p in (ROOT / "tests/unit/fixtures/wsstate/v1/invalid").glob("*.fl"))
+    raise SystemExit("check-test-cases: unknown list %s" % name)
+
+
+def table():
+    files, allow = [], {}
+    for n, raw in enumerate(TABLE.read_text().splitlines(), 1):
+        line = raw.split("#", 1)[0].split()
+        if not line:
+            continue
+        if line[0] == "allow" and len(line) == 4 and line[3] in REASONS:
+            allow[(line[1], line[2])] = line[3]
+        elif len(line) == 3 and line[0] != "allow":
+            files.append(tuple(line))
+        else:
+            raise SystemExit("check-test-cases: %s:%d: bad row: %s" % (TABLE.name, n, raw))
+    return files, allow
+
+
+def toolchain():
+    out = subprocess.run(
+        ["sh", "-c", '. tools/lib-toolchain.sh && printf "%s\\n%s\\n" "$WOLF" "$WOLF_STD"'],
+        cwd=ROOT, env=dict(os.environ, YEW_ROOT=str(ROOT)),
+        capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.stderr.write(out.stderr)
+        raise SystemExit(1)
+    wolf, std = out.stdout.splitlines()
+    return wolf, std
+
+
+def run(wolf, env, path, var, case):
+    case_env = dict(env, **{var: case})
+    out = subprocess.run([wolf, "conform-run", "--deny-warnings", "--checked", "--json", path],
+                         cwd=ROOT, env=case_env, capture_output=True, text=True)
+    try:
+        doc = json.loads(out.stdout)
+    except ValueError:
+        return "unreadable", "", (out.stdout + out.stderr).strip()[-400:]
+    verdict = doc.get("verdict") or "none"
+    construct = doc.get("x-unsupported-construct") or doc.get("trap_message") or ""
+    return verdict, construct, doc.get("stdout_inline") or ""
+
+
+def main(argv):
+    files, allow = table()
+    if argv:
+        wanted = set(argv)
+        unknown = wanted - {f[0] for f in files}
+        if unknown:
+            raise SystemExit("check-test-cases: not in the table: " + " ".join(sorted(unknown)))
+        files = [f for f in files if f[0] in wanted]
+    wolf, std = toolchain()
+    (ROOT / "target/test-state").mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, YEW_ROOT=str(ROOT), WOLF_STD=std, YEW_LOG="/dev/null",
+               XDG_STATE_HOME=str(ROOT / "target/test-state"))
+    used = set()
+    bad = 0
+    total = 0
+    for path, var, spec in files:
+        if spec.startswith("@"):
+            cases, past = lists(spec), None
+        else:
+            cases, past = [str(i) for i in range(int(spec))], spec
+        for case in cases:
+            total += 1
+            verdict, construct, out = run(wolf, env, path, var, case)
+            first = next((l for l in out.splitlines() if l.strip()), "")
+            key = (path, case)
+            reason = allow.get(key)
+            used.add(key)
+            if reason:
+                ok = verdict == "unsupported" and construct == REASONS[reason]
+                why = "" if ok else ("allowed %s, now %s: remove the allow row" % (reason, verdict)
+                                     if verdict == "exit(0)" else "allowed %s only" % reason)
+            elif verdict != "exit(0)":
+                ok, why = False, construct
+            elif past is not None and not CASE_LINE.search(out):
+                ok, why = False, "no case line (does the file still have %s cases?)" % spec
+            else:
+                ok, why = True, ""
+            tag = "ok" if ok else "RED"
+            print("check-test-cases: %s %s=%s: %s %s :: %s%s" % (
+                tag, var, case, verdict, construct, first, ("  (" + why + ")") if why else ""), flush=True)
+            bad += 0 if ok else 1
+        if past is not None:
+            verdict, construct, out = run(wolf, env, path, var, past)
+            ok = verdict == "exit(0)" and not CASE_LINE.search(out)
+            print("check-test-cases: %s %s=%s (one past the end): %s :: %s" % (
+                "ok" if ok else "RED", var, past, verdict,
+                "no case line" if ok else "a case line or a refusal: the table's count is stale"), flush=True)
+            bad += 0 if ok else 1
+    stale = [k for k in allow if k not in used and (not argv or k[0] in argv)]
+    for path, case in stale:
+        print("check-test-cases: RED allow row names no case run: %s %s" % (path, case))
+        bad += 1
+    print("check-test-cases: %d cases over %d files, %d red" % (total, len(files), bad))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
