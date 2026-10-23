@@ -26,11 +26,12 @@ for kind in plant fixed; do
   if [ "$kind" = plant ]; then
     python3 -I - "$d/main.lu" <<'PY'
 from pathlib import Path
+import re
 import sys
 p = Path(sys.argv[1]); text = p.read_text()
-old = 'mut menu, mut ed.dbuf, edit.rect(0, 0, 100, 23), style)'
-assert text.count(old) == 1
-p.write_text(text.replace(old, 'mut menu, edit.rect(0, 0, 100, 23), style)'))
+text, count = re.subn(r'(mut menu,\s*)mut ed\.dbuf,\s*', r'\1', text)
+assert count == 1
+p.write_text(text)
 PY
   fi
   set +e
