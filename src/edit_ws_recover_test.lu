@@ -1,0 +1,378 @@
+//! member: false
+//! Ports sagitta tests/unit/test_ws_recover.c:185-630 at9ace98c2.
+//! Fifteen registry-order recovery cases; each failure leaves a usable Ed.
+
+use edit
+use term
+use text
+use util
+use ws
+
+struct Fix { root: str, work: str, saved: str, had: bool }
+
+fn fixture() -> Fix {
+    let saved = env_get("XDG_STATE_HOME") else ""
+    let had = saved.len != 0
+    assert(util.mkdirs("target/ws-recover-fixtures", 448))
+    var root = ""
+    loop {
+        var suffix = ""
+        for r in os_random(8) { suffix = "{suffix}{r % 10}" }
+        root = "target/ws-recover-fixtures/{suffix}"
+        fs_create_dir_mode(root, 448) else |e| match e {
+            exists => { continue },
+            _ => { assert(false, "mkdir fixture: {e}") },
+        }
+        break
+    }
+    root = fs_realpath(root) else {
+        assert(false)
+        return Fix { root: "", work: "", saved: "", had: false }
+    }
+    let work = "{root}/work"
+    assert(util.mkdirs(work, 448))
+    env_set("XDG_STATE_HOME", "{root}/state") else { assert(false) }
+    Fix { root: root, work: work, saved: saved, had: had }
+}
+
+fn remove_tree(path: str) {
+    let entries = fs_read_dir(path) else { return }
+    for name in entries {
+        let p = "{path}/{name}"
+        fs_remove(p) else |_| {
+            remove_tree(p)
+            fs_remove_dir(p) else { assert(false, "remove dir {p}") }
+        }
+    }
+}
+
+fn finish(f: Fix) {
+    if f.had {
+        env_set("XDG_STATE_HOME", f.saved) else { assert(false) }
+    } else {
+        env_unset("XDG_STATE_HOME") else { assert(false) }
+    }
+    remove_tree(f.root)
+    fs_remove_dir(f.root) else { assert(false) }
+}
+
+fn fresh(f: Fix) -> edit.Ed {
+    var ed = edit.ed_new()
+    ed.ws_dir = f.work
+    edit.ed_open_scratch(mut ed)
+    ed.grid = term.grid_new(24, 80)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    ed
+}
+
+fn file(f: Fix, name: str, body: str) -> str {
+    let path = "{f.work}/{name}"
+    assert(text.file_write_atomic(path, body.bytes(), 384) == text.SAVE_OK)
+    path
+}
+
+fn exists(path: str) -> bool { let _ = fs_stat(path) else { return false }; true }
+
+fn plant(ed: edit.Ed, body: str) {
+    assert(
+        text.file_write_atomic(ws.ws_state_path(ed.state.key), body.bytes(), 384) == text.SAVE_OK,
+    )
+}
+
+fn corrupt(ed: edit.Ed) -> List[str] {
+    var names = List[str]()
+    let entries = fs_read_dir(ed.state.key.dir) else { return names }
+    for entry in entries { if entry.starts_with("state.fl.corrupt-") { (mut names).push(entry) } }
+    names
+}
+
+fn content(path: str) -> str {
+    let b = fs_read_bytes(path) else { assert(false); return "" }
+    str_from_utf8(b) else ""
+}
+
+fn alive(ed: edit.Ed) {
+    assert(
+        !ed.quit &&
+            ed.exit_code == 0 &&
+            ed.prompt == edit.PROMPT_NONE &&
+            ed.tabs.len >= 1 &&
+            ed.win >= 0 &&
+            edit.pane_live(ed, ed.pane_root),
+    )
+}
+
+fn bad(body: str) {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    plant(ed, body)
+    assert(edit.ws_restore(mut ed) == edit.WS_RECOVERED && corrupt(ed).len == 1)
+    alive(ed)
+}
+
+fn t_absent_is_silent() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    assert(edit.ws_restore(mut ed) == edit.WS_FRESH && corrupt(ed).len == 0 && !ed.msg.active)
+}
+
+fn t_unreadable_is_not_set_aside() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    plant(ed, "{{version:1,}}")
+    let path = ws.ws_state_path(ed.state.key)
+    fs_set_mode(path, 0) else { assert(false) }
+    defer fs_set_mode(path, 384) else |_| {}
+    assert(
+        edit.ws_restore(mut ed) == edit.WS_FRESH &&
+            corrupt(ed).len == 0 &&
+            exists(path) &&
+            ed.msg.active,
+    )
+}
+
+fn t_parse_error_is_set_aside() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    plant(ed, "{{version:1,tabs:[{{oh no")
+    assert(edit.ws_restore(mut ed) == edit.WS_RECOVERED && !exists(ws.ws_state_path(ed.state.key)))
+    let names = corrupt(ed)
+    assert(
+        names.len == 1 &&
+            names[0].len == 33 &&
+            names[0].bytes()[25] as int == 84 &&
+            names[0].bytes()[32] as int == 90 &&
+            ed.msg.active,
+    )
+    alive(ed)
+}
+
+fn t_bad_version_is_set_aside() { bad("{{version:99,tabs:[],}}") }
+
+fn t_absent_version_is_set_aside() { bad("{{tabs:[],}}") }
+
+fn t_non_map_root_is_set_aside() { bad("[1,2,3,]") }
+
+fn t_empty_file_is_set_aside() { bad("") }
+
+fn t_oversize_is_set_aside_without_reading() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    let fd = fs_open_perm(ws.ws_state_path(ed.state.key), 1, 384) else { assert(false); return }
+    fs_truncate(fd, 9 * 1024 * 1024 + 1) else { assert(false) }
+    fs_close(fd) else { assert(false) }
+    assert(edit.ws_restore(mut ed) == edit.WS_RECOVERED && corrupt(ed).len == 1)
+}
+
+fn t_one_bad_tab_record_keeps_the_rest() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    let a = file(f, "a.txt", "alpha\n"), c = file(f, "c.txt", "charlie\n")
+    plant(
+        ed,
+        "{{version:1,tabs:[{{id:1,path:\"{a}\",}},{{id:2,path:nil,}},{{id:3,path:\"{c}\",}},],active_tab:3,}}",
+    )
+    assert(
+        edit.ws_restore(mut ed) == edit.WS_RESTORED &&
+            ed.tabs.len == 3 &&
+            ed.tabs[1].path == a &&
+            ed.tabs[2].path == c &&
+            corrupt(ed).len == 0,
+    )
+}
+
+fn t_wrong_typed_fields_take_defaults() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    let a = file(f, "a.txt", "alpha\n")
+    plant(
+        ed,
+        "{{version:1,tabs:[{{id:1,path:\"{a}\",group:\"nope\",group_ordinal:true,panes:7,}},],active_tab:1,}}",
+    )
+    assert(
+        edit.ws_restore(mut ed) == edit.WS_RESTORED &&
+            ed.tabs.len == 2 &&
+            ed.tabs[1].group_id == 0 &&
+            edit.pane_live(ed, ed.tabs[1].root) &&
+            corrupt(ed).len == 0,
+    )
+}
+
+fn t_retention_caps_at_five() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    for i in 0..8 {
+        assert(
+            text.file_write_atomic(
+                "{ed.state.key.dir}state.fl.corrupt-2026010{i}T000000Z",
+                "old\n".bytes(),
+                384,
+            ) ==
+                text.SAVE_OK,
+        )
+    }
+    plant(ed, "not a document")
+    assert(edit.ws_restore(mut ed) == edit.WS_RECOVERED && corrupt(ed).len == 5)
+    assert(
+        !exists("{ed.state.key.dir}state.fl.corrupt-20260100T000000Z") &&
+            exists("{ed.state.key.dir}state.fl.corrupt-20260107T000000Z"),
+    )
+}
+
+fn t_move_aside_refuses_existing() {
+    let f = fixture()
+    defer finish(f)
+    let a = file(f, "state.fl", "second bad document"),
+        b = file(f, "state.fl.corrupt-stamp", "first bad document")
+    assert(
+        text.file_move_aside(a, b) != text.SAVE_OK &&
+            content(a) == "second bad document" &&
+            content(b) == "first bad document",
+    )
+}
+
+fn t_set_aside_never_overwrites() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    plant(ed, "first bad document")
+    let first = edit.state_set_aside(ed) else { assert(false); return }
+    plant(ed, "second bad document")
+    let second = edit.state_set_aside(ed) else ""
+    assert(content("{ed.state.key.dir}{first}") == "first bad document")
+    if second.len == 0 {
+        assert(content(ws.ws_state_path(ed.state.key)) == "second bad document")
+    } else {
+        assert(first != second && content("{ed.state.key.dir}{second}") == "second bad document")
+    }
+}
+
+fn t_every_bad_input_still_starts() {
+    for body in [
+        "",
+        "\0\x01\x02\x03",
+        "{{",
+        "}}",
+        "{{version:1",
+        "{{version:\"one\",}}",
+        "[]",
+        "nil",
+        "{{version:1,tabs:nil,}}",
+        "{{version:1,tabs:[nil,],}}",
+        "{{version:1,groups:5,tabs:[],}}",
+        "############\n",
+        "{{version:1,}} trailing garbage",
+    ] {
+        let f = fixture()
+        defer finish(f)
+        var ed = fresh(f)
+        edit.state_open(mut ed)
+        defer edit.state_dispose(mut ed)
+        plant(ed, body)
+        let r = edit.ws_restore(mut ed)
+        assert(r >= edit.WS_FRESH && r <= edit.WS_RECOVERED)
+        alive(ed)
+    }
+}
+
+fn t_a_reader_still_sets_aside() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    edit.state_open(mut ed)
+    defer edit.state_dispose(mut ed)
+    plant(ed, "definitely not fletch")
+    ed.state.writer = false
+    ed.state.owner_pid = 1
+    assert(edit.ws_restore(mut ed) == edit.WS_RECOVERED && corrupt(ed).len == 1)
+}
+
+fn main() {
+    let chosen = (env_get("YEW_STATE_CASE") else "-1").to_int() else -1
+    if chosen < 0 || chosen == 0 {
+        t_absent_is_silent()
+        print("ws_recover_absent_is_silent: PASS")
+    }
+    if chosen < 0 || chosen == 1 {
+        t_unreadable_is_not_set_aside()
+        print("ws_recover_unreadable_is_not_set_aside: PASS")
+    }
+    if chosen < 0 || chosen == 2 {
+        t_parse_error_is_set_aside()
+        print("ws_recover_parse_error_is_set_aside: PASS")
+    }
+    if chosen < 0 || chosen == 3 {
+        t_bad_version_is_set_aside()
+        print("ws_recover_bad_version_is_set_aside: PASS")
+    }
+    if chosen < 0 || chosen == 4 {
+        t_absent_version_is_set_aside()
+        print("ws_recover_absent_version_is_set_aside: PASS")
+    }
+    if chosen < 0 || chosen == 5 {
+        t_non_map_root_is_set_aside()
+        print("ws_recover_non_map_root_is_set_aside: PASS")
+    }
+    if chosen < 0 || chosen == 6 {
+        t_empty_file_is_set_aside()
+        print("ws_recover_empty_file_is_set_aside: PASS")
+    }
+    if chosen < 0 || chosen == 7 {
+        t_oversize_is_set_aside_without_reading()
+        print("ws_recover_oversize_is_set_aside_without_reading: PASS")
+    }
+    if chosen < 0 || chosen == 8 {
+        t_one_bad_tab_record_keeps_the_rest()
+        print("ws_recover_one_bad_tab_record_keeps_the_rest: PASS")
+    }
+    if chosen < 0 || chosen == 9 {
+        t_wrong_typed_fields_take_defaults()
+        print("ws_recover_wrong_typed_fields_take_defaults: PASS")
+    }
+    if chosen < 0 || chosen == 10 {
+        t_retention_caps_at_five()
+        print("ws_recover_retention_caps_at_five: PASS")
+    }
+    if chosen < 0 || chosen == 11 {
+        t_move_aside_refuses_existing()
+        print("ws_recover_move_aside_refuses_existing: PASS")
+    }
+    if chosen < 0 || chosen == 12 {
+        t_set_aside_never_overwrites()
+        print("ws_recover_set_aside_never_overwrites: PASS")
+    }
+    if chosen < 0 || chosen == 13 {
+        t_every_bad_input_still_starts()
+        print("ws_recover_every_bad_input_still_starts: PASS")
+    }
+    if chosen < 0 || chosen == 14 {
+        t_a_reader_still_sets_aside()
+        print("ws_recover_a_reader_still_sets_aside: PASS")
+    }
+}
