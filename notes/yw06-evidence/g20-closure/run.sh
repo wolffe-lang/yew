@@ -8,7 +8,7 @@ for wolf in "$@"; do
     export WOLF_STD=$(dirname "$wolf")/std
     "$wolf" --version | head -1
     echo "std $(cat "$WOLF_STD/STD-REV")"
-    for v in one two named; do
+    for v in one two named twin; do
         for tier in native release; do
             flag=""; [ "$tier" = release ] && flag=--release
             out=$(mktemp -d)
