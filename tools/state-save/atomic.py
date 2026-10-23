@@ -6,6 +6,7 @@ exe=pathlib.Path(sys.argv[1]).resolve()
 mode=sys.argv[2]
 shim=root/'target/oracle/sagitta/build/tests/torture/faultshim.so'
 if not shim.is_file(): raise SystemExit('FAIL missing pinned faultshim')
+(root/'target/state').mkdir(parents=True,exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='save-',dir=root/'target/state') as tmp:
     base=pathlib.Path(tmp); work=base/'work'; home=base/'home'
     work.mkdir(); home.mkdir(); log=base/'calls.log'
