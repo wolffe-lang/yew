@@ -4,7 +4,8 @@
  * >= 20 cycles) and the restore trials of "Zero data loss" / "Terminal
  * restore in the field" (:469, :476) — written over sagitta's own PTY
  * harness at 9ace98c2 (tests/pty/harness.c, the s25 helpers of
- * tests/pty/registry.c:6230-6400), lane evidence, never a golden.
+ * tests/pty/registry.c:6230-6400); a gate of its own (tools/run-trials),
+ * never a golden.
  *
  * registry.c is included whole so its static s25 helpers are in scope;
  * its case table is renamed out of the way and this file's four cases
@@ -29,12 +30,12 @@
  *                           OTHER (YEW_TRIAL_OTHER) and by this one from
  *                           the same saved document: both grids the
  *                           first's, both second saves byte-identical but
- *                           for `saved_at`; run-trials.sh then compares the
+ *                           for `saved_at`; tools/run-trials then compares the
  *                           two directions' first saves (s25's C<->port
  *                           differential, both ways)
  *
  * Signals go only to the editor this runner spawned, inside the lane's
- * container (RULES §5). Build and run: run-trials.sh.
+ * container (RULES §5). Build and run: tools/run-trials.
  */
 #define yew_pty_cases yew_pty_cases_registry
 #include "registry.c"
@@ -254,7 +255,7 @@ static bool trial_resume_by(PtyCtx *c, const char *bin, Bytebuf *out)
  * editors read S1 alike and write the same document from it. (A second
  * save differs from the first by design — restored tabs not yet visited
  * save `deferred: true` — so S1 is never compared with an S2.)
- * run-trials.sh compares the two S1 documents of the two directions.
+ * tools/run-trials compares the two S1 documents of the two directions.
  */
 static void case_trial_cross_differential(PtyCtx *c)
 {
