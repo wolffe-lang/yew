@@ -1,0 +1,162 @@
+//! edit.ws_cmds — five workspace-state commands and guarded forgetting.
+//! Ports sagitta src/edit/ws_cmds.c:36-295 at 9ace98c2. Forget asks
+//! explicitly and never follows a child symlink; migration is a named
+//! refusal because v1 is current, not an unimplemented command.
+
+use text
+use util
+use ws
+
+/// The workspace-forget confirmation (ordinary prompt owns the keyboard).
+pub const PROMPT_WS_FORGET: int = 4
+
+/// Save immediately, distinguishing stateless/read-only state from I/O.
+pub fn ws_cmd_save_state(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.state.ready {
+        ed_msg(mut ed, MSG_ERROR, "this session keeps no workspace state")
+        return CMD_ERR_STATE
+    }
+    if !ed.state.writer {
+        ed_msg(
+            mut ed,
+            MSG_ERROR,
+            "workspace state is owned by pid {ed.state.owner_pid}; this session will not save it",
+        )
+        return CMD_ERR_STATE
+    }
+    if !state_save(mut ed) {
+        ed_msg(mut ed, MSG_ERROR, "could not write workspace state")
+        return CMD_ERR_IO
+    }
+    ed_msg(mut ed, MSG_INFO, "wrote {ws.ws_state_path(ed.state.key)}")
+    CMD_OK
+}
+
+/// Additive restore never closes the session's current tabs.
+pub fn ws_cmd_restore_state(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.state.ready {
+        ed_msg(mut ed, MSG_ERROR, "this session keeps no workspace state")
+        return CMD_ERR_STATE
+    }
+    let before = ed.tabs.len
+    let result = ws_restore(mut ed)
+    if result == WS_RESTORED {
+        ed_msg(mut ed, MSG_INFO, "restored {ed.tabs.len - before} tab(s)")
+        return CMD_OK
+    }
+    if result == WS_RECOVERED { return CMD_ERR_IO }
+    ed_msg(mut ed, MSG_INFO, "no workspace state to restore")
+    CMD_OK
+}
+
+fn ws_read_path_record(ed: Ed) -> str {
+    let path = "{ed.state.key.dir}/path"
+    if path.len >= 4096 { return "" }
+    let fd = fs_open(path) else { return "" }
+    defer fs_close(fd) else |_| {}
+    let bytes = fs_read_chunk(fd, 4095) else { return "" }
+    var n = bytes.len
+    var i = 0
+    while i < n { if bytes[i] as int == 0 { n = i; break }; i += 1 }
+    while n > 0 && (bytes[n - 1] as int == 10 || bytes[n - 1] as int == 13) { n -= 1 }
+    str_from_utf8(bytes[0..n]) else ""
+}
+
+/// Show canonical root, hash/probe, state path, path record and lock owner.
+pub fn ws_cmd_info(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.state.ready {
+        ed_msg(
+            mut ed,
+            MSG_INFO,
+            "workspace {ws_root(ed)} - stateless (this session keeps no state)",
+        )
+        return CMD_OK
+    }
+    let record = ws_read_path_record(ed)
+    let owner = if ed.state.writer {
+        "this session (pid {os_pid()})"
+    } else if ed.state.owner_pid > 0 {
+        "pid {ed.state.owner_pid}"
+    } else {
+        "nobody"
+    }
+    ed_msg(
+        mut ed,
+        MSG_INFO,
+        "workspace {ws_root(ed)} | key {text.hex16(ed.state.key.hash)} probe {ed.state.key.probe} | dir {ed.state.key.dir} | record {if record.len == 0 then "(none)" else record} | lock {owner}",
+    )
+    CMD_OK
+}
+
+/// V1 is current; this reserved command reports why no migration can run.
+pub fn ws_cmd_migrate(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    ed_msg(mut ed, MSG_ERROR, "workspace schema v1 is current; no migration is available")
+    CMD_ERR_STATE
+}
+
+// Bounded recursion (depth <=4), lstat children, never follow symlinks.
+fn ws_remove_tree(dir: str, depth: int) -> bool {
+    if depth > 4 { return false }
+    let entries = fs_read_dir(dir) else |e| match e {
+        not_found => { return true },
+        _ => { return false },
+    }
+    var ok = true
+    for name in entries {
+        let child = "{dir}/{name}"
+        if child.len >= 4096 { ok = false; continue }
+        let stat = fs_lstat(child) else { ok = false; continue }
+        if stat[0] == 1 {
+            if !ws_remove_tree(child, depth + 1) { ok = false }
+        } else {
+            fs_remove(child) else |_| { ok = false }
+        }
+    }
+    fs_remove_dir(dir) else |_| { ok = false }
+    ok
+}
+
+/// Independently refuse a path outside the workspace-state namespace.
+pub fn ws_forget_dir(dir: str) -> bool {
+    if !dir.starts_with("/") { return false }
+    if !dir.contains("/workspaces/") {
+        util.log_warn("refusing to remove {dir}: not a workspace state directory")
+        return false
+    }
+    ws_remove_tree(dir, 0)
+}
+
+/// Consume a pending answer; anything other than lowercase y keeps state.
+pub fn ws_prompt_key(mut ed: Ed, answer: int) -> bool {
+    if !ed.ws_prompt_active { return false }
+    ed.ws_prompt_active = false
+    ed.prompt = PROMPT_NONE
+    if answer != 121 { ed_msg(mut ed, MSG_INFO, "kept workspace state"); return true }
+    if !ed.state.ready {
+        ed_msg(mut ed, MSG_ERROR, "this session keeps no workspace state")
+        return true
+    }
+    let dir = ed.state.key.dir
+    state_dispose(mut ed)
+    if !ws_forget_dir(dir) { ed_msg(mut ed, MSG_ERROR, "could not remove {dir}"); return true }
+    ed_msg(mut ed, MSG_INFO, "removed {dir}")
+    true
+}
+
+/// Ask before any deletion, and leave the cache untouched until explicit yes.
+pub fn ws_cmd_forget(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if !ed.state.ready {
+        ed_msg(mut ed, MSG_ERROR, "this session keeps no workspace state")
+        return CMD_ERR_STATE
+    }
+    ed.ws_prompt_active = true
+    ed.prompt = PROMPT_WS_FORGET
+    ed_msg(mut ed, MSG_WARN, "delete {ed.state.key.dir}? [y] delete [esc] keep")
+    ed.msg.prompt = true
+    CMD_OK
+}
