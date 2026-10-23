@@ -12,4 +12,4 @@ printf 'HOME=%s\nXDG_STATE_HOME=%s\n' "$HOME" "$XDG_STATE_HOME"
 mapfile -t objects < <(find "$oracle/build-gcc/src" -name '*.o' ! -path '*/main.o' | sort)
 gcc -std=c11 -O2 -Wall -Wextra -Werror -I"$oracle/src" -I"$oracle/build-gcc" \
     notes/yw06-evidence/finder-inputs/walk_oracle.c "${objects[@]}" -lm -o "$out/walk-oracle"
-python3 -I notes/yw06-evidence/finder-inputs/witness.py "$out/walk-oracle" "$out/fixtures"
+python3 -I tools/walk-listings/witness.py "$out/walk-oracle" "$out/fixtures"
