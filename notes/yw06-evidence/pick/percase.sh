@@ -14,6 +14,12 @@ for i in $(seq 0 $((n - 1))); do
     name=$(printf '%s' "$out" | grep -o '[a-z_0-9]*: PASS' | head -1)
     msg=$(printf '%s' "$out" | grep -o '"trap_message":"[^"]*"' | head -1)
     echo "case $i ${name:-?} $verdict $msg"
-    if [ "$verdict" = '"verdict":"exit(0)"' ]; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
+    if [ "$verdict" = '"verdict":"exit(0)"' ]; then
+        ok=$((ok + 1))
+    else
+        bad=$((bad + 1))
+        # The machine's own words for anything but exit(0), trimmed.
+        printf '%s' "$out" | grep -o -E '"(verdict|trap_message|message|reason|detail|unsupported)":"[^"]*"' | head -6 | sed 's/^/    /'
+    fi
 done
 echo "percase $file: $ok exit(0), $bad other"
