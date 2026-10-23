@@ -108,10 +108,12 @@ static void case_trial_restore_hangup(PtyCtx *c)
     trial_kill(c, SIGHUP);
 }
 
+/* registry.c #undefs its C() macro at its end, so the rows are spelled
+ * out: {name, profile, rows, cols, fn, xfail_id}. */
 const PtyCase yew_pty_cases[] = {
-    C(trial_resume_cycles20, modern, 24U, 80U, case_trial_resume_cycles20),
-    C(trial_restore_sigkill, modern, 24U, 80U, case_trial_restore_sigkill),
-    C(trial_restore_sigsegv, modern, 24U, 80U, case_trial_restore_sigsegv),
-    C(trial_restore_hangup, modern, 24U, 80U, case_trial_restore_hangup),
+    {"trial_resume_cycles20", "modern", 24U, 80U, case_trial_resume_cycles20, NULL},
+    {"trial_restore_sigkill", "modern", 24U, 80U, case_trial_restore_sigkill, NULL},
+    {"trial_restore_sigsegv", "modern", 24U, 80U, case_trial_restore_sigsegv, NULL},
+    {"trial_restore_hangup", "modern", 24U, 80U, case_trial_restore_hangup, NULL},
     {NULL, NULL, 0U, 0U, NULL, NULL}
 };
