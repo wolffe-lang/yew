@@ -122,7 +122,7 @@ static void case_trial_restore_hangup(PtyCtx *c)
 static bool trial_state_read(PtyCtx *c, Bytebuf *out)
 {
     char dir[PATH_MAX];
-    char path[PATH_MAX + 64];
+    char path[2U * PATH_MAX + 320U];
     DIR *d;
     struct dirent *e;
     FILE *f;
