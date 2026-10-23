@@ -1,0 +1,1525 @@
+//! edit.mouse — THE mouse router: the one place a mouse event turns into
+//! an action (Sprint 27 DoD 2).
+//!
+//! Ports sagitta `src/ui/mouse.c` (3,090 lines) and `ui/mouse.h` (432) at
+//! 9ace98c2 at the pin's state (R-yw06-2 = A), under
+//! `s27-mouse-and-feel.md`, `s57_13-mouse-overhaul-context-menus.md`,
+//! `s57_14-tab-drag-feel.md`, `s57_15-strip-scrolling.md` and
+//! `s57_22-drag-to-spawn-pane.md`. yw05 ported the router's first half
+//! into `edit.input` (click-to-focus, the border drag, the strip's press
+//! and release, the group picker's clicks); it lives here now, as C's
+//! structure.
+//!
+//! THE LAW: THE PRESS CAPTURES ITS REGION (`mouse.h:12-19`). Motion and
+//! release never re-resolve identity: `press_rgn` is stored when the
+//! button goes down and consulted for the rest of the gesture, and the
+//! identity travels as `tab_id` / `gid`, never as an index.
+//! ARMING, NOT DRAGGING: a press arms; the drag begins only once the
+//! pointer leaves the pressed CELL. WHEELS ARE IMPULSES: a wheel never
+//! touches the phase and never sets `held`.
+//!
+//! C's file statics are VALUES of the `Ed` (E1010): the gesture is
+//! `Ed.mouse` (a `MouseState`), the session's mouse switch and the
+//! middle-paste option (`mouse.c:1229`, `:3037`) are `Ed.mouse_on` and
+//! `Ed.middle_paste_on`, the strip's 1003 want is yw05's
+//! `Ed.motion_want_strip`. C's unit engine pointer (`sel_unit`) is a unit
+//! KIND (`edit.motion`'s `UNIT_*`, `UNIT_NONE` for C's NULL), matched in
+//! one place (G19/G20).
+//!
+//! FUSS (`mod/git/fussmode.h`) is yw13's (R-yw06-4 = A): before its
+//! campaign F mode is never up, no FUSS row is registered and the drawer
+//! rectangle is never consulted — the paths C takes when the drawer is
+//! inactive are the ones taken here.
+
+use term
+use text
+
+/// A notch is exactly this many rows, forever (`YEW_WHEEL_ROWS`,
+/// `mouse.h:46`): no acceleration, no momentum.
+pub const WHEEL_ROWS: int = 3
+
+/// Shift+wheel, when wrap is off (`YEW_WHEEL_COLS`).
+pub const WHEEL_COLS: int = 6
+
+/// The dwell over a group while dragging (`YEW_DRAG_DWELL_MS`,
+/// `mouse.h:49-57`): 500 ms at the pin — s27 §4's 400 and s57.14 §3's
+/// 250 were retuned in the field (`s57_14-tab-drag-feel.md:331`).
+pub const DRAG_DWELL_MS: int = 500
+
+/// `YEW_DRAG_FLASH_MS` (`mouse.h:58-65`): DERIVED, `DRAG_DWELL_MS / 4`,
+/// so the cue and the open cannot disagree.
+pub const DRAG_FLASH_MS: int = 125
+
+/// The drag's chevron autoscroll, one entry each (`YEW_DRAG_SCROLL_MS`).
+pub const DRAG_SCROLL_MS: int = 120
+
+/// The chevron hover reveal, one entry each (`YEW_HOVER_SCROLL_MS`,
+/// `mouse.h:67-74`, s57.15 §2).
+pub const HOVER_SCROLL_MS: int = 300
+
+/// The multi-click window (`YEW_CLICK_MULTI_MS`, `mouse.h:75`).
+pub const CLICK_MULTI_MS: int = 400
+
+/// No gesture (`YEW_MP_IDLE`, `mouse.h:78-85`).
+pub const MP_IDLE: int = 0
+
+/// A press is down and has not left its cell.
+pub const MP_ARMED: int = 1
+
+/// A pane border is being dragged.
+pub const MP_DRAG_BORDER: int = 2
+
+/// A tab entry is being carried.
+pub const MP_DRAG_TAB: int = 3
+
+/// A group entry is being carried.
+pub const MP_DRAG_GROUP: int = 4
+
+/// A selection is being dragged out.
+pub const MP_DRAG_SEL: int = 5
+
+/// The router's gesture state (`MouseState`, `mouse.h:87-190`): the
+/// phase, the press and its region CAPTURED at press time, the identity
+/// being carried, the drag's target (a picture: nothing in the tab array
+/// moves until the drop), the clocks, the multi-click run and the
+/// selection drag's unit.
+pub struct MouseState {
+    phase: int,
+    held: int,
+    press_x: int,
+    press_y: int,
+    press_rgn: Region,
+    drag_tab_id: int,
+    drag_gid: int,
+    tab_count_at_press: int,
+    drag_to_slot: int,
+    drag_to_valid: bool,
+    drag_to_tail: bool,
+    autoscroll_ms: int,
+    at_x: int,
+    at_y: int,
+    hover_x: int,
+    hover_y: int,
+    hover_chevron: bool,
+    hover_scroll_ms: int,
+    last_click_ms: int,
+    last_click_x: int,
+    last_click_y: int,
+    last_click_kind: int,
+    last_click_payload: int,
+    click_n: int,
+    drag_row2_pos: int,
+    drag_row2_valid: bool,
+    drag_row2_gid: int,
+    dwell_since_ms: int,
+    dwell_gid: int,
+    preview_gid: int,
+    flash_phase: int,
+    sel_unit: int,
+    sel_anchor_span: text.Span,
+    sel_alt: bool,
+}
+
+/// At rest (`yew_mouse_init`, `mouse.c:56-62`): zeroed, no target slot.
+pub fn mousestate_new() -> MouseState {
+    MouseState {
+        phase: MP_IDLE,
+        held: 0,
+        press_x: 0,
+        press_y: 0,
+        press_rgn: Region { kind: REGION_NONE, rect: rect(0, 0, 0, 0), payload: 0 },
+        drag_tab_id: 0,
+        drag_gid: 0,
+        tab_count_at_press: 0,
+        drag_to_slot: -1,
+        drag_to_valid: false,
+        drag_to_tail: false,
+        autoscroll_ms: 0,
+        at_x: 0,
+        at_y: 0,
+        hover_x: 0,
+        hover_y: 0,
+        hover_chevron: false,
+        hover_scroll_ms: 0,
+        last_click_ms: 0,
+        last_click_x: 0,
+        last_click_y: 0,
+        last_click_kind: REGION_NONE,
+        last_click_payload: 0,
+        click_n: 0,
+        drag_row2_pos: 0,
+        drag_row2_valid: false,
+        drag_row2_gid: 0,
+        dwell_since_ms: 0,
+        dwell_gid: 0,
+        preview_gid: 0,
+        flash_phase: 0,
+        sel_unit: UNIT_NONE,
+        sel_anchor_span: text.span(0, 0),
+        sel_alt: false,
+    }
+}
+
+// ---- small predicates (`mouse.c:32-51`) ------------------------------------
+
+// `is_wheel` (`mouse.c:32-38`).
+fn is_wheel(button: int) -> bool {
+    button == term.MB_WHEEL_UP ||
+        button == term.MB_WHEEL_DOWN ||
+        button == term.MB_WHEEL_LEFT ||
+        button == term.MB_WHEEL_RIGHT
+}
+
+// `wheel_dir` (`mouse.c:40-46`).
+fn wheel_dir(button: int) -> int {
+    if button == term.MB_WHEEL_UP || button == term.MB_WHEEL_LEFT then -1 else 1
+}
+
+// `gesture_reset` (`mouse.c:64-89`): ends a GESTURE without ending the
+// multi-click run — every click ends with a release, and a double-click
+// is two of them, so zeroing the counter at release would make a second
+// click unreadable.
+fn gesture_reset(mut ed: Ed) {
+    let last_ms = ed.mouse.last_click_ms
+    let last_x = ed.mouse.last_click_x
+    let last_y = ed.mouse.last_click_y
+    let last_kind = ed.mouse.last_click_kind
+    let last_payload = ed.mouse.last_click_payload
+    let clicks = ed.mouse.click_n
+    ed.mouse = mousestate_new()
+    ed.mouse.last_click_ms = last_ms
+    ed.mouse.last_click_x = last_x
+    ed.mouse.last_click_y = last_y
+    ed.mouse.last_click_kind = last_kind
+    ed.mouse.last_click_payload = last_payload
+    ed.mouse.click_n = clicks
+}
+
+/// `yew_mouse_gesture_active` (`mouse.c:91-94`): armed or dragging. The
+/// renderer asks so it can draw the preview; Esc asks so it can cancel
+/// before any mode sees the key.
+pub fn mouse_gesture_active(ed: Ed) -> bool {
+    ed.mouse.phase != MP_IDLE
+}
+
+/// `yew_mouse_claimed_by_menu` (`mouse.c:109-170`), the command line's
+/// half (the completion popup's, `ed->win->compl`, is Sprint 44's, yw11:
+/// no popup is open before it): a wheel over the menu scrolls the LIST,
+/// never the selection; a left press on a row is the click; the release
+/// of a press it handled, and a press on the menu's inert block, are
+/// swallowed. Gated on the prompt being open because `REGION_BLOCK` is
+/// shared with the group picker.
+pub fn mouse_claimed_by_menu(mut ed: Ed, key: term.Key) -> bool {
+    if key.kind != term.EV_MOUSE || !ed.cmdline.active {
+        return false
+    }
+    let hit = region_hit(mut ed.regions, key.col, key.row)
+    if hit.kind != REGION_MENU_ROW && hit.kind != REGION_BLOCK {
+        return false
+    }
+    if key.button == term.MB_WHEEL_UP || key.button == term.MB_WHEEL_DOWN {
+        let _ = cmdline_menu_scroll(
+            mut ed,
+            if key.button == term.MB_WHEEL_UP then -WHEEL_ROWS else WHEEL_ROWS,
+        )
+        return true
+    }
+    if key.button != term.MB_LEFT {
+        return false
+    }
+    if key.ev != term.KEY_PRESS {
+        return true
+    }
+    if hit.kind == REGION_MENU_ROW {
+        let _ = cmdline_menu_click(mut ed, hit.payload)
+    }
+    true
+}
+
+// ---- §3: the wheel (`mouse.c:172-401`) ---------------------------------------
+
+// `hscroll_limit` (`mouse.c:178-201`): the widest line CURRENTLY IN VIEW
+// — there is no global "longest line", which would be a full-buffer scan
+// per notch.
+fn hscroll_limit(mut ed: Ed, wi: int) -> int {
+    let bi = ed.wins[wi].buf
+    if bi < 0 || bi >= ed.bufs.len {
+        return 0
+    }
+    var widest = 0
+    var row = 0
+    while row < ed.wins[wi].vp.rows {
+        let (ok, line, _) = vp_line_of_row(mut ed.wins[wi], ed.bufs[bi].ec.tb, row)
+        if !ok {
+            break
+        }
+        let span = text.textbuf_line_span(ed.bufs[bi].ec.tb, line as text.LineNo)
+        let end = text.off_to_ccol(ed.bufs[bi].ec.tb, span, span.hi as text.ByteOff, VP_TABWIDTH) as int
+        if end > widest {
+            widest = end
+        }
+        row += 1
+    }
+    widest
+}
+
+// `wheel_horizontal` (`mouse.c:203-226`): Shift+wheel; a no-op when wrap
+// is on, and silent — a wheel is not a command that can fail.
+fn wheel_horizontal(mut ed: Ed, wi: int, cells: int) {
+    if ed.wins[wi].vp.wrap {
+        return
+    }
+    var want = ed.wins[wi].vp.left + cells
+    if want < 0 {
+        want = 0
+    }
+    let limit = hscroll_limit(mut ed, wi)
+    if want > limit {
+        want = limit
+    }
+    ed.wins[wi].vp.left = want
+}
+
+// `wheel_pane` (`mouse.c:228-256`): the wheel over a pane scrolls THAT
+// pane, focused or not, and moves neither the focus nor the cursor; the
+// viewport's own clamp is all a wheel needs (DoD 5: the scrolloff-
+// restoring call is absent from this whole file).
+fn wheel_pane(mut ed: Ed, hit: Region, k: term.Key) {
+    let leaf = pane_leaf_by_index(ed, hit.payload)
+    if leaf < 0 {
+        return
+    }
+    let w = ed.panes[leaf].win
+    if w < 0 || w >= ed.wins.len {
+        return
+    }
+    let bi = ed.wins[w].buf
+    if bi < 0 || bi >= ed.bufs.len {
+        return
+    }
+    let dir = wheel_dir(k.button)
+    if k.mods & term.MOD_SHIFT != 0 ||
+        k.button == term.MB_WHEEL_LEFT ||
+        k.button == term.MB_WHEEL_RIGHT {
+        wheel_horizontal(mut ed, w, dir * WHEEL_COLS)
+    } else {
+        vp_scroll(mut ed.wins[w], ed.bufs[bi].ec.tb, dir * WHEEL_ROWS)
+    }
+    ed.full_damage = true
+}
+
+// `row2_group` (`mouse.c:258-273`): THE GROUP ROW 2 IS SHOWING — the
+// dwell's preview when there is one, the active tab's group otherwise;
+// the rule the strip paints by and the drop commits by, stated once.
+fn row2_group(ed: Ed) -> int {
+    if ed.mouse.preview_gid != 0 then ed.mouse.preview_gid else active_group_id(ed)
+}
+
+// `region_is_member_row` (`mouse.c:275-280`): row 1 or row 2, from the
+// registered strip rectangle.
+fn region_is_member_row(ed: Ed, hit: Region) -> bool {
+    ed.tab_strip_rect.h >= 2 && hit.rect.y == ed.tab_strip_rect.y + 1
+}
+
+// `strip_scroll` (`mouse.c:282-319`): THE ROUTER'S ONE SCROLL — a chevron
+// click, a wheel notch, the drag autoscroll, the hover reveal. Each is
+// EXPLICIT, so the offset becomes the user's (s57.15 §1); clamped against
+// the list row 2 is SHOWING (`row2_group`); answers whether it MOVED.
+fn strip_scroll(mut ed: Ed, row2: bool, delta: int) -> bool {
+    let cur = if row2 then ed.tab_member_scroll else ed.tab_scroll
+    var limit = ed.tabs.len
+    if row2 {
+        limit = group_member_count(ed, row2_group(ed))
+    }
+    var to = cur + delta
+    if to < 0 {
+        to = 0
+    }
+    if to >= limit {
+        to = if limit > 0 then limit - 1 else 0
+    }
+    tabs_scroll_owned(mut ed, row2)
+    if cur == to {
+        return false
+    }
+    if row2 {
+        ed.tab_member_scroll = to
+    } else {
+        ed.tab_scroll = to
+    }
+    ed.full_damage = true
+    true
+}
+
+// `mouse_wheel` (`mouse.c:321-401`): Ctrl+wheel is DELIBERATELY unbound
+// (the terminal's font-size gesture); the completion menu's claim first;
+// then the region under the pointer. A wheel over a border, a context
+// menu, a modal's BLOCK or nothing at all is swallowed. (The FUSS
+// drawer's scroll, `mouse.c:350-358`, is F mode's: never up before yw13.)
+fn mouse_wheel(mut ed: Ed, k: term.Key) {
+    if k.mods & term.MOD_CTRL != 0 {
+        return
+    }
+    if mouse_claimed_by_menu(mut ed, k) {
+        return
+    }
+    let hit = region_hit(mut ed.regions, k.col, k.row)
+    if hit.kind == REGION_PANE {
+        wheel_pane(mut ed, hit, k)
+    } else if hit.kind == REGION_TAB {
+        let _ = strip_scroll(mut ed, region_is_member_row(ed, hit), wheel_dir(k.button))
+    } else if hit.kind == REGION_TAB_SCROLL {
+        let _ = strip_scroll(mut ed, hit.payload == 2 || hit.payload == -2, wheel_dir(k.button))
+    } else if hit.kind == REGION_GP_ROW || hit.kind == REGION_GP_NAME {
+        gp_scroll(mut ed, wheel_dir(k.button) * WHEEL_ROWS)
+    }
+}
+
+// `rect_has` (`mouse.c:650-654`).
+fn rect_has(r: Rect, x: int, y: int) -> bool {
+    r.w != 0 && r.h != 0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+// `invoke_mouse_named` (`mouse.c:836-846`): a registry command, from the
+// mouse.
+fn invoke_mouse_named(mut ed: Ed, name: str) {
+    let id = cmd_lookup(ed.reg, name)
+    var cx = cmdctx_new(ed.win, SRC_MOUSE)
+    cx.count = 1
+    let _ = ed_cmd_invoke(mut ed, id, mut cx)
+}
+
+// ---- §6: double and triple click, through the unit engines -----------------
+
+// `unit_span_at` (`mouse.c:1132-1141`): THE ENGINES, so the mouse and the
+// keyboard agree on what a word is.
+fn unit_span_at(mut ed: Ed, wi: int, unit: int, at: int, alt: bool) -> text.Span {
+    let bi = ed.wins[wi].buf
+    let u = UnitCtx { has_buf: true, tabwidth: ed.bufs[bi].tabwidth, has_lang: false, has_win: true }
+    unit_span(unit, mut ed.bufs[bi].ec.tb, u, at, alt)
+}
+
+// `click_advance` (`mouse.c:1143-1166`): the multi-click counter — resets
+// on a different CELL (a cell, not a pixel radius) or region; four clicks
+// wrap to one.
+fn click_advance(mut ed: Ed, k: term.Key, hit: Region) -> int {
+    let within = ed.mouse.click_n != 0 &&
+        ed.now_ms - ed.mouse.last_click_ms < CLICK_MULTI_MS &&
+        ed.mouse.last_click_x == k.col &&
+        ed.mouse.last_click_y == k.row &&
+        ed.mouse.last_click_kind == hit.kind &&
+        ed.mouse.last_click_payload == hit.payload
+    ed.mouse.click_n = if within then ed.mouse.click_n % 3 + 1 else 1
+    ed.mouse.last_click_ms = ed.now_ms
+    ed.mouse.last_click_x = k.col
+    ed.mouse.last_click_y = k.row
+    ed.mouse.last_click_kind = hit.kind
+    ed.mouse.last_click_payload = hit.payload
+    ed.mouse.click_n
+}
+
+// `press_pane` (`mouse.c:1168-1229`): focus and the caret at the clicked
+// grapheme; a double click selects the word's span and a triple the
+// line's, entering H with that unit BORROWED — the state `H` plus the
+// unit key would produce, so every H key, the multi-cursor lift and the
+// recorder work on a mouse selection. Alt is the keyboard's own `alt`.
+fn press_pane(mut ed: Ed, hit: Region, k: term.Key) {
+    let alt = k.mods & term.MOD_ALT != 0
+    let clicks = click_advance(mut ed, k, hit)
+    let leaf = pane_leaf_by_index(ed, hit.payload)
+    if leaf < 0 {
+        return
+    }
+    let _ = pane_click(mut ed, k.col, k.row)
+    let w = ed.panes[leaf].win
+    if w < 0 || w >= ed.wins.len || ed.wins[w].buf < 0 || ed.wins[w].cs.curs.len == 0 {
+        return
+    }
+    ed.mouse.sel_alt = alt
+    let p = ed.wins[w].cs.primary
+    let at = ed.wins[w].cs.curs[p].pos
+    if clicks == 1 {
+        // The drag's anchor is the grapheme just clicked, read back from
+        // the cursor rather than recomputed.
+        ed.mouse.sel_unit = UNIT_CHAR
+        ed.mouse.sel_anchor_span = text.span(at, at)
+        return
+    }
+    ed.mouse.sel_unit = if clicks == 2 then UNIT_WORD else UNIT_LINE
+    let unit = ed.mouse.sel_unit
+    ed.mouse.sel_anchor_span = unit_span_at(mut ed, w, unit, at, alt)
+    let _ = mode_enter_highlight(mut ed, if clicks == 2 then MODE_W else MODE_L, false)
+    let p2 = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p2].anchor = ed.mouse.sel_anchor_span.lo
+    ed.wins[w].cs.curs[p2].pos = ed.mouse.sel_anchor_span.hi
+    ed.full_damage = true
+}
+
+/// `yew_mouse_middle_paste` (`mouse.c:1231-1234`): §6's middle-click
+/// paste, OFF by default — X11 primary-selection semantics cannot be
+/// implemented correctly from a terminal.
+pub fn mouse_middle_paste(ed: Ed) -> bool {
+    ed.middle_paste_on
+}
+
+/// `yew_mouse_set_middle_paste` (`mouse.c:1236-1239`).
+pub fn mouse_set_middle_paste(mut ed: Ed, on: bool) {
+    ed.middle_paste_on = on
+}
+
+// `press_middle` (`mouse.c:1241-1264`): at the CLICK position, register
+// `"` as ONE undo transaction through the edit choke point.
+fn press_middle(mut ed: Ed, hit: Region, k: term.Key) {
+    if !ed.middle_paste_on || hit.kind != REGION_PANE {
+        return
+    }
+    let leaf = pane_leaf_by_index(ed, hit.payload)
+    if leaf < 0 || ed.panes[leaf].win < 0 {
+        return
+    }
+    let _ = pane_click(mut ed, k.col, k.row)
+    let w = ed.win
+    let b = ed.wins[w].buf
+    edit_take(mut ed, w)
+    let _ = text.reg_paste(mut ed.regs, mut ed.bufs[b].ec, '"' as int, false, VP_TABWIDTH)
+    edit_give(mut ed, w)
+    ed_finish_edit(mut ed, w)
+    ed.full_damage = true
+}
+
+// `press_border` (`mouse.c:1266-1274`).
+fn press_border(mut ed: Ed, hit: Region) {
+    let split = pane_split_by_index(ed, hit.payload)
+    if split < 0 {
+        return
+    }
+    pane_drag_begin(mut ed, split, ed.mouse.press_x, ed.mouse.press_y)
+    ed.mouse.phase = MP_DRAG_BORDER
+}
+
+// `press_tab` (`mouse.c:1276-1294`): a press on a strip entry ARMS and
+// does nothing visible; the identity is captured now (a negative payload
+// is a group) and the switch happens at release, when the gesture is
+// known to be a click.
+fn press_tab(mut ed: Ed, hit: Region) {
+    ed.mouse.tab_count_at_press = tab_count(ed)
+    if hit.payload < 0 {
+        ed.mouse.drag_gid = 0 - hit.payload
+        ed.mouse.drag_tab_id = 0
+    } else {
+        ed.mouse.drag_gid = 0
+        ed.mouse.drag_tab_id = if hit.payload < ed.tabs.len then ed.tabs[hit.payload].tab_id else 0
+    }
+}
+
+// `mouse_press` (`mouse.c:1349-1470`): the hover reveal ends (a press is
+// the end of no-button); the middle button's paste; the completion
+// menu's claim; then the press ARMS with its region captured and routes
+// by that region.
+fn mouse_press(mut ed: Ed, k: term.Key) {
+    // s57.15 §2's reveal is a NO-BUTTON clock: before every early return.
+    ed.mouse.hover_chevron = false
+    let hit = region_hit(mut ed.regions, k.col, k.row)
+    if k.button == term.MB_MIDDLE {
+        press_middle(mut ed, hit, k)
+        return
+    }
+    if k.button != term.MB_LEFT {
+        return
+    }
+    if mouse_claimed_by_menu(mut ed, k) {
+        return
+    }
+    ed.mouse.held = 1
+    ed.mouse.press_x = k.col
+    ed.mouse.press_y = k.row
+    ed.mouse.press_rgn = copy hit
+    ed.mouse.phase = MP_ARMED
+    ed.mouse.drag_tab_id = 0
+    ed.mouse.drag_gid = 0
+    ed.mouse.drag_to_slot = -1
+    ed.mouse.drag_to_valid = false
+    ed.mouse.dwell_gid = 0
+    ed.mouse.dwell_since_ms = 0
+    if hit.kind != REGION_PANE && hit.kind != REGION_FUSS_ROW {
+        ed.mouse.click_n = 0
+    }
+    if hit.kind == REGION_PANE {
+        press_pane(mut ed, hit, k)
+    } else if hit.kind == REGION_PANE_BORDER {
+        press_border(mut ed, hit)
+    } else if hit.kind == REGION_TAB {
+        press_tab(mut ed, hit)
+    } else if hit.kind == REGION_TAB_SCROLL {
+        let _ = strip_scroll(
+            mut ed,
+            hit.payload == 2 || hit.payload == -2,
+            if hit.payload < 0 then -1 else 1,
+        )
+    } else if hit.kind == REGION_FUSS_ROW {
+        // s57.13 §3: a single click selects (`yew_fuss_select_path`, the
+        // drawer's: inactive before yw13) and the double click opens.
+        let _ = click_advance(mut ed, k, hit)
+    } else if hit.kind == REGION_GP_ROW || hit.kind == REGION_GP_NAME {
+        if gp_click(mut ed, k.col, k.row) {
+            gp_apply(mut ed)
+        }
+    }
+    // REGION_TAB_NEW is armed only: a release in the same region invokes
+    // the command, so a press that slides away creates nothing. BLOCK is
+    // swallowed by construction.
+}
+
+// ---- §2: motion (`mouse.c:1472-2383`) ---------------------------------------
+
+// `drag_select` (`mouse.c:1476-1520`): extends the selection to the
+// pointer; after a multi-click the anchor stays at the first unit's span
+// and the head snaps to the unit under the pointer — never by characters
+// after a word double-click.
+fn drag_select(mut ed: Ed, k: term.Key) {
+    let leaf = pane_leaf_by_index(ed, ed.mouse.press_rgn.payload)
+    if leaf < 0 {
+        return
+    }
+    let w = ed.panes[leaf].win
+    if w < 0 || w >= ed.wins.len || ed.wins[w].buf < 0 || ed.wins[w].cs.curs.len == 0 {
+        return
+    }
+    win_click_to_cursor(mut ed, w, k.col, k.row)
+    let p = ed.wins[w].cs.primary
+    if ed.mouse.sel_unit == UNIT_NONE || ed.mouse.sel_unit == UNIT_CHAR {
+        ed.wins[w].cs.curs[p].anchor = ed.mouse.sel_anchor_span.lo
+        ed.full_damage = true
+        return
+    }
+    let unit = ed.mouse.sel_unit
+    let alt = ed.mouse.sel_alt
+    let head = unit_span_at(mut ed, w, unit, ed.wins[w].cs.curs[p].pos, alt)
+    if head.lo < ed.mouse.sel_anchor_span.lo {
+        ed.wins[w].cs.curs[p].anchor = ed.mouse.sel_anchor_span.hi
+        ed.wins[w].cs.curs[p].pos = head.lo
+    } else {
+        ed.wins[w].cs.curs[p].anchor = ed.mouse.sel_anchor_span.lo
+        ed.wins[w].cs.curs[p].pos = head.hi
+    }
+    ed.full_damage = true
+}
+
+// `begin_drag` (`mouse.c:1522-1554`): a pane drag is a selection, and a
+// selection IS H mode — entered here, never at press (a plain click must
+// not change the mode), and not over a multi-click's borrowed unit.
+fn begin_drag(mut ed: Ed) {
+    let kind = ed.mouse.press_rgn.kind
+    if kind == REGION_PANE {
+        if ed.mouse.sel_unit == UNIT_NONE || ed.mouse.sel_unit == UNIT_CHAR {
+            let _ = mode_enter_highlight(mut ed, MODE_I, false)
+        }
+        ed.mouse.phase = MP_DRAG_SEL
+    } else if kind == REGION_TAB {
+        ed.mouse.phase = if ed.mouse.press_rgn.payload < 0 then MP_DRAG_GROUP else MP_DRAG_TAB
+    }
+}
+
+// ---- §4: tab and group drag-reorder (`mouse.c:1556-2252`) -------------------
+
+// `held_tab_group` (`mouse.c:1560-1566`): the held tab's group, resolved
+// from the id.
+fn held_tab_group(ed: Ed) -> int {
+    let idx = tab_index_of_id(ed, ed.mouse.drag_tab_id)
+    if idx < 0 then 0 else ed.tabs[idx].group_id
+}
+
+// `drag_dwell` (`mouse.c:1568-1637`): the dwell target is the PRE-DRAG
+// slot's payload, never the region table (which describes the previewed
+// strip); arming, not opening — the clock restarts whenever the hovered
+// group changes. A tab never dwells into its own group; a group never
+// into another. Leaving a group from row 1 takes its opened strip away.
+fn drag_dwell(mut ed: Ed, slot: int, on_row1: bool) {
+    var gid = 0
+    if ed.mouse.phase == MP_DRAG_TAB && slot >= 0 {
+        let (ok, pre) = strip_pre_payload(ed, slot)
+        if ok && pre < 0 {
+            gid = 0 - pre
+        }
+    }
+    if gid != 0 && gid == held_tab_group(ed) {
+        gid = 0
+    }
+    if gid != ed.mouse.dwell_gid {
+        ed.mouse.dwell_gid = gid
+        ed.mouse.dwell_since_ms = if gid != 0 then ed.now_ms else 0
+        ed.mouse.flash_phase = 0
+    }
+    if on_row1 && ed.mouse.preview_gid != 0 && ed.mouse.preview_gid != gid {
+        ed.mouse.preview_gid = 0
+        ed.layout_dirty = true
+        ed.full_damage = true
+    }
+}
+
+// `held_pre_slot` (`mouse.c:1639-1653`): the row-1 slot the held entry
+// started in, from the PRE-DRAG payloads; -1 for a member lifted off
+// row 2.
+fn held_pre_slot(ed: Ed) -> int {
+    var i = 0
+    let n = strip_slot_count(ed)
+    while i < n {
+        let (ok, pre) = strip_pre_payload(ed, i)
+        if ok && pre == ed.mouse.press_rgn.payload {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `swap_threshold` (`mouse.c:1655-1702`): where the carried entry changes
+// places with the neighbour on [a0, a1) — half its width for a plain tab,
+// the outer quarter for a GROUP entry (its middle half is a dead band the
+// pointer can rest in, s57.14's second field repair); under four cells
+// the half rule stands.
+fn swap_threshold(ed: Ed, slot: int, a0: int, a1: int, rightwards: bool) -> int {
+    let w = a1 - a0
+    let (ok, pre) = strip_pre_payload(ed, slot)
+    if w < 4 || !ok || pre >= 0 {
+        return a0 + w / 2
+    }
+    if rightwards then a1 - w / 4 else a0 + w / 4
+}
+
+// `carried_span` (`mouse.c:1735-1753`): the cells the carried entry
+// covers at pointer column `col` (its grip is `press_x − press_rgn.rect.x`)
+// and the slot its gap occupies; `ok` false when nothing of ours is on
+// row 1. Answers (ok, slot, c0, c1, lead, trail).
+fn carried_span(ed: Ed, col: int) -> (bool, int, int, int, int, int) {
+    let n = strip_slot_count(ed)
+    let to = if ed.mouse.drag_to_valid then ed.mouse.drag_to_slot else held_pre_slot(ed)
+    if n <= 0 || to < 0 || to >= n {
+        return (false, 0, 0, 0, 0, 0)
+    }
+    let (ok, c0, c1) = strip_slot_cells(ed, to)
+    if !ok {
+        return (false, 0, 0, 0, 0, 0)
+    }
+    let grab = if ed.mouse.press_x > ed.mouse.press_rgn.rect.x {
+        ed.mouse.press_x - ed.mouse.press_rgn.rect.x
+    } else {
+        0
+    }
+    var lead = col - grab
+    if lead < ed.tab_strip_rect.x {
+        lead = ed.tab_strip_rect.x
+    }
+    (true, to, c0, c1, lead, lead + (c1 - c0))
+}
+
+// `drag_target_slot` (`mouse.c:1704-1780`): WHERE THE DRAG IS AIMING,
+// read from the entry the pointer is CARRYING — the carried entry
+// changes places with a neighbour once it has travelled past
+// `swap_threshold`, which also keeps the answer from oscillating.
+fn drag_target_slot(mut ed: Ed, col: int) -> int {
+    let n = strip_slot_count(ed)
+    if n <= 0 {
+        return -1
+    }
+    let (ok, slot, c0, _, lead, trail) = carried_span(ed, col)
+    if !ok {
+        return strip_slot_at(ed, col, ed.tab_strip_rect.y)
+    }
+    var to = slot
+    if lead < c0 {
+        while to > 0 {
+            let (have, a0, a1) = strip_slot_cells(ed, to - 1)
+            if !have || lead >= swap_threshold(ed, to - 1, a0, a1, false) {
+                break
+            }
+            to -= 1
+        }
+    } else if lead > c0 {
+        while to < n - 1 {
+            let (have, a0, a1) = strip_slot_cells(ed, to + 1)
+            if !have || trail <= swap_threshold(ed, to + 1, a0, a1, true) {
+                break
+            }
+            to += 1
+        }
+    }
+    to
+}
+
+// `drag_dwell_slot` (`mouse.c:1782-1830`): WHAT THE CARRIED ENTRY IS
+// RESTING ON — the slot it overlaps most; ties keep the leftmost
+// (invariant 5).
+fn drag_dwell_slot(ed: Ed, col: int) -> int {
+    let n = strip_slot_count(ed)
+    if n <= 0 {
+        return -1
+    }
+    let (ok, _, _, _, lead, trail) = carried_span(ed, col)
+    if !ok {
+        return strip_slot_at(ed, col, ed.tab_strip_rect.y)
+    }
+    var best = -1
+    var best_over = 0
+    var i = 0
+    while i < n {
+        let (have, a0, a1) = strip_slot_cells(ed, i)
+        if have {
+            let lo = if lead > a0 then lead else a0
+            let hi = if trail < a1 then trail else a1
+            if hi - lo > best_over {
+                best_over = hi - lo
+                best = i
+            }
+        }
+        i += 1
+    }
+    best
+}
+
+// `held_member_slot` (`mouse.c:1857-1865`): where the carried tab already
+// sits on row 2 — `group_ordinal − 1` — or -1 when it joins from outside.
+fn held_member_slot(ed: Ed, gid: int) -> int {
+    let idx = tab_index_of_id(ed, ed.mouse.drag_tab_id)
+    if idx < 0 || ed.tabs[idx].group_id != gid || ed.tabs[idx].group_ordinal == 0 {
+        return -1
+    }
+    ed.tabs[idx].group_ordinal - 1
+}
+
+// `drag_target_member` (`mouse.c:1832-1910`): WHERE ON ROW 2 the drag is
+// aiming, a position in the group's FINAL member list, by row 1's rule
+// with no dead band; a tab from outside may answer `n`, "put it last".
+fn drag_target_member(ed: Ed, col: int, gid: int) -> int {
+    let n = strip_member_slot_count(ed)
+    if n <= 0 {
+        return 0
+    }
+    let grab = if ed.mouse.press_x > ed.mouse.press_rgn.rect.x {
+        ed.mouse.press_x - ed.mouse.press_rgn.rect.x
+    } else {
+        0
+    }
+    var lead = col - grab
+    if lead < ed.tab_strip_rect.x {
+        lead = ed.tab_strip_rect.x
+    }
+    var to = if ed.mouse.drag_row2_valid && ed.mouse.drag_row2_gid == gid {
+        ed.mouse.drag_row2_pos
+    } else {
+        held_member_slot(ed, gid)
+    }
+    var seeded = to >= 0 && to < n
+    var c0 = 0
+    var c1 = 0
+    if seeded {
+        let (have, s0, s1) = strip_member_slot_cells(ed, to)
+        seeded = have
+        c0 = s0
+        c1 = s1
+    }
+    if !seeded {
+        to = 0
+        while to < n {
+            let (have, a0, a1) = strip_member_slot_cells(ed, to)
+            if have && lead < a0 + (a1 - a0) / 2 {
+                return to
+            }
+            to += 1
+        }
+        return n
+    }
+    let trail = lead + (c1 - c0)
+    if lead < c0 {
+        while to > 0 {
+            let (have, a0, a1) = strip_member_slot_cells(ed, to - 1)
+            if !have || lead >= a0 + (a1 - a0) / 2 {
+                break
+            }
+            to -= 1
+        }
+    } else if lead > c0 {
+        while to < n - 1 {
+            let (have, a0, a1) = strip_member_slot_cells(ed, to + 1)
+            if !have || trail <= a0 + (a1 - a0) / 2 {
+                break
+            }
+            to += 1
+        }
+    }
+    to
+}
+
+// `drag_row2_clear` (`mouse.c:1912-1922`): row 2 stops previewing.
+fn drag_row2_clear(mut ed: Ed) {
+    if !ed.mouse.drag_row2_valid {
+        return
+    }
+    ed.mouse.drag_row2_valid = false
+    ed.mouse.drag_row2_gid = 0
+    ed.mouse.drag_row2_pos = 0
+    ed.full_damage = true
+}
+
+// `drag_strip_motion` (`mouse.c:1924-2007`): a changed tab count cancels
+// outright (the array is frozen for the drag, so something else moved
+// it); the blank tail of row 1 first, then row 1's target and its dwell
+// slot from the SAME frame; THE HANDOVER — the row the pointer is on owns
+// the preview, row 2 only for a tab.
+fn drag_strip_motion(mut ed: Ed, k: term.Key) {
+    let on_row1 = k.row == ed.tab_strip_rect.y
+    var dwell_slot = -1
+    if tab_count(ed) != ed.mouse.tab_count_at_press {
+        mouse_cancel(mut ed)
+        return
+    }
+    if on_row1 && strip_slot_count(ed) > 0 && k.col >= strip_tail_x(ed) {
+        if !ed.mouse.drag_to_tail {
+            ed.mouse.drag_to_slot = strip_slot_count(ed) - 1
+            ed.mouse.drag_to_valid = true
+            ed.mouse.drag_to_tail = true
+            ed.full_damage = true
+        }
+    } else if on_row1 {
+        let slot = drag_target_slot(mut ed, k.col)
+        dwell_slot = drag_dwell_slot(ed, k.col)
+        if slot >= 0 &&
+            (!ed.mouse.drag_to_valid || ed.mouse.drag_to_slot != slot || ed.mouse.drag_to_tail) {
+            ed.mouse.drag_to_slot = slot
+            ed.mouse.drag_to_valid = true
+            ed.mouse.drag_to_tail = false
+            ed.full_damage = true
+        }
+    }
+    if !on_row1 &&
+        ed.mouse.phase == MP_DRAG_TAB &&
+        ed.tab_strip_rect.h >= 2 &&
+        k.row == ed.tab_strip_rect.y + 1 {
+        let gid = row2_group(ed)
+        if gid == 0 {
+            drag_row2_clear(mut ed)
+        } else {
+            let pos = drag_target_member(ed, k.col, gid)
+            if !ed.mouse.drag_row2_valid ||
+                ed.mouse.drag_row2_gid != gid ||
+                ed.mouse.drag_row2_pos != pos {
+                ed.mouse.drag_row2_valid = true
+                ed.mouse.drag_row2_gid = gid
+                ed.mouse.drag_row2_pos = pos
+                ed.full_damage = true
+            }
+        }
+    } else {
+        drag_row2_clear(mut ed)
+    }
+    drag_dwell(mut ed, dwell_slot, on_row1)
+}
+
+// The lowest tab index among a group's members (the block's start), with
+// no list built (`group_block_start`'s loop, `mouse.c:2033-2051`).
+fn lowest_member(ed: Ed, gid: int) -> int {
+    var lowest = -1
+    var i = 0
+    while i < ed.tabs.len {
+        if ed.tabs[i].group_id == gid && (lowest < 0 || i < lowest) {
+            lowest = i
+        }
+        i += 1
+    }
+    lowest
+}
+
+// `slot_to_tab_index` (`mouse.c:2009-2031`): the tab index a row-1 slot
+// names, against the PRE-DRAG list; a group entry answers its block's
+// start.
+fn slot_to_tab_index(ed: Ed, slot: int) -> int {
+    let (ok, pre) = strip_pre_payload(ed, slot)
+    if !ok {
+        return -1
+    }
+    if pre >= 0 {
+        return pre
+    }
+    lowest_member(ed, 0 - pre)
+}
+
+// `drop_into_group` (`mouse.c:2053-2081`): Sprint 24's exact sequence,
+// called and never re-derived — removal FIRST, then the add, the ordinal
+// in the FINAL list, the block kept contiguous.
+fn drop_into_group(mut ed: Ed, gid: int, pos: int) {
+    let tab_idx = tab_index_of_id(ed, ed.mouse.drag_tab_id)
+    if tab_idx < 0 || gid == 0 {
+        return
+    }
+    if ed.tabs[tab_idx].group_id != 0 {
+        group_remove_member(mut ed, tab_idx)
+    }
+    group_add_member(mut ed, gid, tab_idx)
+    group_set_ordinal(mut ed, tab_idx, pos)
+    let start = lowest_member(ed, gid)
+    if start >= 0 {
+        group_reorder_block(mut ed, gid, start)
+    }
+    state_mark_dirty(mut ed)
+}
+
+// `drop_target_row2` (`mouse.c:2083-2124`): row 2 under the release —
+// the group row 2 is SHOWING, at the ordinal the preview drew (a fresh
+// hit-test of the permuted row would answer the held entry). Answers
+// (ok, gid, pos).
+fn drop_target_row2(ed: Ed, k: term.Key) -> (bool, int, int) {
+    if ed.tab_strip_rect.h < 2 || k.row != ed.tab_strip_rect.y + 1 {
+        return (false, 0, 0)
+    }
+    let gid = row2_group(ed)
+    if gid == 0 {
+        return (false, 0, 0)
+    }
+    if ed.mouse.drag_row2_valid && ed.mouse.drag_row2_gid == gid {
+        return (true, gid, ed.mouse.drag_row2_pos + 1)
+    }
+    (true, gid, drag_target_member(ed, k.col, gid) + 1)
+}
+
+// `drop_out_of_group` (`mouse.c:2126-2173`): ROW 1 IS THE EXIT. `to` was
+// resolved from the pre-drag table before the removal (which can
+// dissolve the group and renumber every slot to its right); `from` is
+// re-derived from the id and the destination clamped.
+fn drop_out_of_group(mut ed: Ed, to_in: int) {
+    var to = to_in
+    var from = tab_index_of_id(ed, ed.mouse.drag_tab_id)
+    var left_group = false
+    if from < 0 {
+        return
+    }
+    if held_tab_group(ed) != 0 {
+        group_remove_member(mut ed, from)
+        left_group = true
+        from = tab_index_of_id(ed, ed.mouse.drag_tab_id)
+        if from < 0 {
+            return
+        }
+        if to >= tab_count(ed) {
+            to = tab_count(ed) - 1
+        }
+        if to < 0 {
+            return
+        }
+    }
+    tab_reorder(mut ed, from, to)
+    if left_group {
+        ed.layout_dirty = true
+    }
+}
+
+// `drag_spawn_target` (`mouse.c:2175-2199`): does a release at (x, y)
+// spawn a pane, out of which leaf? Through the region payload and the
+// frame's leaf table, and `pane_zone_at` alone decides the edge — the
+// affordance asks the same function. A group drag, and a moved tab
+// count, spawn nothing. Answers (ok, leaf, zone).
+fn drag_spawn_target(mut ed: Ed, x: int, y: int) -> (bool, int, PaneZoneHit) {
+    if ed.mouse.phase != MP_DRAG_TAB || ed.mouse.drag_tab_id == 0 {
+        return (false, -1, zonehit_none())
+    }
+    if tab_count(ed) != ed.mouse.tab_count_at_press {
+        return (false, -1, zonehit_none())
+    }
+    let hit = region_hit(mut ed.regions, x, y)
+    if hit.kind != REGION_PANE {
+        return (false, -1, zonehit_none())
+    }
+    let leaf = pane_leaf_by_index(ed, hit.payload)
+    if leaf < 0 {
+        return (false, -1, zonehit_none())
+    }
+    let (ok, zone) = pane_zone_at(ed, leaf, x, y)
+    if !ok {
+        return (false, -1, zonehit_none())
+    }
+    (true, leaf, zone)
+}
+
+// `drag_strip_drop` (`mouse.c:2201-2252`): a cancelled drag (the count
+// moved) mutates nothing; a tab released on row 2 JOINS; a release with
+// no target changes nothing; otherwise a group moves its block and a tab
+// leaves its group onto the slot (EVERY row-1 slot is the exit).
+fn drag_strip_drop(mut ed: Ed, k: term.Key) {
+    if tab_count(ed) != ed.mouse.tab_count_at_press {
+        return
+    }
+    if ed.mouse.phase == MP_DRAG_TAB {
+        let (row2, gid, pos) = drop_target_row2(ed, k)
+        if row2 {
+            drop_into_group(mut ed, gid, pos)
+            ed.full_damage = true
+            return
+        }
+    }
+    if !ed.mouse.drag_to_valid {
+        return
+    }
+    let to = if ed.mouse.drag_to_tail {
+        tab_count(ed) - 1
+    } else {
+        slot_to_tab_index(ed, ed.mouse.drag_to_slot)
+    }
+    if to < 0 {
+        return
+    }
+    if ed.mouse.phase == MP_DRAG_GROUP {
+        group_reorder_block(mut ed, ed.mouse.drag_gid, to)
+    } else {
+        drop_out_of_group(mut ed, to)
+    }
+    state_mark_dirty(mut ed)
+    ed.full_damage = true
+}
+
+// `chevron_at` (`mouse.c:2254-2263`): on a chevron? Its payload's
+// MAGNITUDE names the row (1 or 2), its sign the direction — the one
+// reader of that convention for both clocks. Answers (on, row2, delta).
+fn chevron_at(mut ed: Ed, x: int, y: int) -> (bool, bool, int) {
+    let hit = region_hit(mut ed.regions, x, y)
+    if hit.kind != REGION_TAB_SCROLL {
+        return (false, false, 0)
+    }
+    (true, hit.payload == 2 || hit.payload == -2, if hit.payload < 0 then -1 else 1)
+}
+
+// `hover_track` (`mouse.c:2265-2306`): a no-button report COSTS NOTHING
+// by itself — arriving on a chevron starts a clock stamped on arrival
+// (a pointer merely crossing must not move the strip); leaving stops it.
+fn hover_track(mut ed: Ed, x: int, y: int) {
+    ed.mouse.hover_x = x
+    ed.mouse.hover_y = y
+    let (on, _, _) = chevron_at(mut ed, x, y)
+    if !on {
+        ed.mouse.hover_chevron = false
+        return
+    }
+    if ed.mouse.hover_chevron {
+        return
+    }
+    ed.mouse.hover_chevron = true
+    ed.mouse.hover_scroll_ms = ed.now_ms
+}
+
+// `mouse_motion` (`mouse.c:2308-2370`): no button held is the hover (the
+// open menu's highlight, s57.13 §3, and the chevron reveal) and nothing
+// else — no render, no allocation, no phase change; a held motion
+// repaints only when the pointer changes CELL; an ARMED press drags once
+// it leaves its cell.
+fn mouse_motion(mut ed: Ed, k: term.Key) {
+    if k.button == term.MB_NONE {
+        hover_track(mut ed, k.col, k.row)
+        return
+    }
+    if ed.mouse.phase == MP_IDLE {
+        return
+    }
+    let moved_cell = k.col != ed.mouse.at_x || k.row != ed.mouse.at_y
+    ed.mouse.at_x = k.col
+    ed.mouse.at_y = k.row
+    if ed.mouse.phase == MP_ARMED {
+        if k.col == ed.mouse.press_x && k.row == ed.mouse.press_y {
+            return
+        }
+        begin_drag(mut ed)
+        if ed.mouse.phase == MP_ARMED {
+            return
+        }
+    }
+    let phase = ed.mouse.phase
+    if phase == MP_DRAG_BORDER {
+        pane_drag_motion(mut ed, k.col, k.row)
+    } else if phase == MP_DRAG_SEL {
+        drag_select(mut ed, k)
+    } else if phase == MP_DRAG_TAB || phase == MP_DRAG_GROUP {
+        drag_strip_motion(mut ed, k)
+        if moved_cell {
+            ed.full_damage = true
+        }
+    }
+}
+
+// ---- §2: release (`mouse.c:2372-2540`) --------------------------------------
+
+// `click_tab` (`mouse.c:2385-2402`): resolved from the identity captured
+// at press, never from the cells under the release; an EXPLICIT group
+// entry resumes where the user left off.
+fn click_tab(mut ed: Ed) {
+    if ed.mouse.drag_gid != 0 {
+        let gid = ed.mouse.drag_gid
+        group_note_position(mut ed)
+        group_enter(mut ed, gid)
+        return
+    }
+    if ed.mouse.drag_tab_id != 0 {
+        let idx = tab_index_of_id(ed, ed.mouse.drag_tab_id)
+        if idx >= 0 {
+            tab_switch(mut ed, idx)
+        }
+    }
+}
+
+// `same_rect` — C compares the four fields (`mouse.c:2440-2445`).
+fn same_rect(a: Rect, b: Rect) -> bool {
+    a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+}
+
+// `mouse_release` (`mouse.c:2404-2540`): the completion menu's release
+// is swallowed; a border drag converts cells to a ratio ONCE; an ARMED
+// release is a click on the CAPTURED region; a tab released on a pane's
+// edge zone spawns a pane INSTEAD of dropping into the strip, PERFORMED
+// after the gesture is torn down (s57.22 §6); the dwell-opened strip goes
+// with the gesture.
+fn mouse_release(mut ed: Ed, k: term.Key) {
+    let phase = ed.mouse.phase
+    var spawn_leaf = -1
+    var spawn_zone = zonehit_none()
+    var spawn_tab = 0
+    if k.button != term.MB_LEFT {
+        return
+    }
+    if mouse_claimed_by_menu(mut ed, k) {
+        gesture_reset(mut ed)
+        return
+    }
+    if phase == MP_IDLE {
+        return
+    }
+    if phase == MP_DRAG_BORDER {
+        pane_drag_end(mut ed)
+    } else if phase == MP_ARMED {
+        let kind = ed.mouse.press_rgn.kind
+        if kind == REGION_TAB {
+            click_tab(mut ed)
+        } else if kind == REGION_TAB_NEW {
+            let up = region_hit(mut ed.regions, k.col, k.row)
+            let pr = copy ed.mouse.press_rgn.rect
+            if up.kind == REGION_TAB_NEW && same_rect(up.rect, pr) {
+                invoke_mouse_named(mut ed, "ed.tab.new")
+            }
+        } else if kind == REGION_FUSS_ROW {
+            // The double click opens (`invoke_fuss_open`, `mouse.c:848-
+            // 878`): `ed.git.open`, F mode's command (Sprint 51, yw13),
+            // which refuses by name before it reads its path.
+            let up = region_hit(mut ed.regions, k.col, k.row)
+            if ed.mouse.click_n == 2 &&
+                up.kind == REGION_FUSS_ROW &&
+                up.payload == ed.mouse.press_rgn.payload &&
+                ed.mouse.press_rgn.payload > 0 {
+                invoke_mouse_named(mut ed, "ed.git.open")
+            }
+        }
+    } else if phase == MP_DRAG_TAB || phase == MP_DRAG_GROUP {
+        var spawned = false
+        if phase == MP_DRAG_TAB {
+            let (ok, leaf, zone) = drag_spawn_target(mut ed, k.col, k.row)
+            if ok {
+                spawned = true
+                spawn_leaf = leaf
+                spawn_zone = zone
+                spawn_tab = ed.mouse.drag_tab_id
+            }
+        }
+        if !spawned {
+            drag_strip_drop(mut ed, k)
+        }
+        ed.full_damage = true
+    }
+    // MP_DRAG_SEL: the selection is already live; H keeps it.
+    if ed.mouse.preview_gid != 0 {
+        ed.layout_dirty = true
+        ed.full_damage = true
+    }
+    gesture_reset(mut ed)
+    if spawn_tab != 0 {
+        let _ = pane_open_tab_in_split(mut ed, spawn_tab, spawn_leaf, spawn_zone.dir, spawn_zone.new_first)
+    }
+}
+
+// ---- cancellation (`mouse.c:2542-2613`) --------------------------------------
+
+/// `yew_mouse_cancel` (`mouse.c:2544-2587`): Esc and FOCUS_OUT. The
+/// multi-click run goes even with no gesture in flight, and the hover (a
+/// pointer that left the window rests on nothing); a border drag restores
+/// its entry ratio; a tab or group drag needs nothing undone — the array
+/// was never touched — but its float and gap, and a dwell-opened strip,
+/// need a repaint.
+pub fn mouse_cancel(mut ed: Ed) {
+    ed.mouse.click_n = 0
+    ed.mouse.last_click_ms = 0
+    ed.mouse.hover_chevron = false
+    if ed.mouse.phase == MP_IDLE {
+        return
+    }
+    if ed.mouse.phase == MP_DRAG_BORDER {
+        pane_drag_cancel(mut ed)
+    }
+    if ed.mouse.preview_gid != 0 {
+        ed.layout_dirty = true
+        ed.full_damage = true
+    } else if ed.mouse.phase == MP_DRAG_TAB || ed.mouse.phase == MP_DRAG_GROUP {
+        ed.full_damage = true
+    }
+    ed.mouse = mousestate_new()
+}
+
+/// `yew_mouse_tabs_changed` (`mouse.c:2589-2603`): the tab array gained or
+/// lost an entry; a tab or group drag in flight is cancelled on the spot
+/// (its payload and target slot named entries that have shifted or gone).
+pub fn mouse_tabs_changed(mut ed: Ed) {
+    if ed.mouse.phase == MP_DRAG_TAB || ed.mouse.phase == MP_DRAG_GROUP {
+        mouse_cancel(mut ed)
+    }
+}
+
+// ---- §4: the clocks (`mouse.c:2605-2780`) ------------------------------------
+
+// `dwell_quarter` (`mouse.c:2605-2623`): quarters 0 and 2 are lit; the
+// last is CLAMPED (unreachable at 500 ms, kept for the next retune).
+fn dwell_quarter(elapsed: int) -> int {
+    if elapsed <= 0 {
+        return 0
+    }
+    let q = elapsed / DRAG_FLASH_MS
+    if q >= 3 then 3 else q
+}
+
+/// `yew_mouse_dwell_flash` (`mouse.c:2625-2643`): the group whose row-1
+/// entry is FLASHED at `ed.now_ms`, or 0 — pure in (state, now_ms), so a
+/// blinking cue stays inside invariant 5.
+pub fn mouse_dwell_flash(ed: Ed) -> int {
+    if ed.mouse.phase != MP_DRAG_TAB && ed.mouse.phase != MP_DRAG_GROUP {
+        return 0
+    }
+    if ed.mouse.dwell_gid == 0 || ed.mouse.preview_gid == ed.mouse.dwell_gid {
+        return 0
+    }
+    let elapsed = ed.now_ms - ed.mouse.dwell_since_ms
+    if elapsed >= DRAG_DWELL_MS {
+        return 0
+    }
+    if dwell_quarter(elapsed) % 2 == 0 then ed.mouse.dwell_gid else 0
+}
+
+// `hover_tick` (`mouse.c:2645-2676`): the reveal's step — stops when the
+// pointer left, when the chevron is gone from under it, and when the
+// offset did not move (the end of the list, in the same millisecond).
+fn hover_tick(mut ed: Ed, now: int) {
+    if !ed.mouse.hover_chevron {
+        return
+    }
+    let (on, row2, delta) = chevron_at(mut ed, ed.mouse.hover_x, ed.mouse.hover_y)
+    if !on {
+        ed.mouse.hover_chevron = false
+        return
+    }
+    if now - ed.mouse.hover_scroll_ms < HOVER_SCROLL_MS {
+        return
+    }
+    ed.mouse.hover_scroll_ms = now
+    if !strip_scroll(mut ed, row2, delta) {
+        ed.mouse.hover_chevron = false
+    }
+}
+
+/// `yew_mouse_tick` (`mouse.c:2678-2736`): from the loop's timer path —
+/// dwell and auto-scroll are clocks, not motion counts. The hover runs in
+/// the IDLE phase, before the drag gate; the cue marks damage only at a
+/// quarter's edge; the open at `DRAG_DWELL_MS` grows the strip a row (a
+/// layout change); the autoscroll moves the row UNDER THE POINTER.
+pub fn mouse_tick(mut ed: Ed, now: int) {
+    ed.now_ms = now
+    hover_tick(mut ed, now)
+    if ed.mouse.phase != MP_DRAG_TAB && ed.mouse.phase != MP_DRAG_GROUP {
+        return
+    }
+    if ed.mouse.dwell_gid != 0 && ed.mouse.preview_gid != ed.mouse.dwell_gid {
+        let quarter = dwell_quarter(now - ed.mouse.dwell_since_ms)
+        if quarter != ed.mouse.flash_phase {
+            ed.mouse.flash_phase = quarter
+            ed.full_damage = true
+        }
+    }
+    if ed.mouse.dwell_gid != 0 &&
+        ed.mouse.preview_gid != ed.mouse.dwell_gid &&
+        now - ed.mouse.dwell_since_ms >= DRAG_DWELL_MS {
+        ed.mouse.preview_gid = ed.mouse.dwell_gid
+        ed.layout_dirty = true
+        ed.full_damage = true
+    }
+    let (on, row2, delta) = chevron_at(mut ed, ed.mouse.at_x, ed.mouse.at_y)
+    if on && now - ed.mouse.autoscroll_ms >= DRAG_SCROLL_MS {
+        ed.mouse.autoscroll_ms = now
+        let _ = strip_scroll(mut ed, row2, delta)
+    }
+}
+
+/// `yew_mouse_deadline` (`mouse.c:2738-2780`): when the router next needs
+/// the clock, relative to `now` (0 due, -1 never): the hover's step, and
+/// during a drag every flash edge (`dwell_since + k·FLASH`, then the open)
+/// and the autoscroll's next step — never a spin (invariant 4).
+pub fn mouse_deadline(ed: Ed, now: int) -> int {
+    var next = -1
+    if ed.mouse.hover_chevron {
+        next = ed.mouse.hover_scroll_ms + HOVER_SCROLL_MS
+    }
+    if ed.mouse.phase == MP_DRAG_TAB || ed.mouse.phase == MP_DRAG_GROUP {
+        if ed.mouse.dwell_gid != 0 && ed.mouse.preview_gid != ed.mouse.dwell_gid {
+            let elapsed = now - ed.mouse.dwell_since_ms
+            let quarter = if elapsed <= 0 then 0 else elapsed / DRAG_FLASH_MS
+            let at = if quarter >= 3 {
+                ed.mouse.dwell_since_ms + DRAG_DWELL_MS
+            } else {
+                ed.mouse.dwell_since_ms + (quarter + 1) * DRAG_FLASH_MS
+            }
+            if next < 0 || at < next {
+                next = at
+            }
+        }
+        if region_find(ed.regions, ed.mouse.at_x, ed.mouse.at_y).kind == REGION_TAB_SCROLL {
+            let at = ed.mouse.autoscroll_ms + DRAG_SCROLL_MS
+            if next < 0 || at < next {
+                next = at
+            }
+        }
+    }
+    if next < 0 {
+        return -1
+    }
+    if next <= now then 0 else next - now
+}
+
+/// `yew_mouse_drag_preview` (`mouse.c:2782-2794`): the held entry (the
+/// row-1 payload convention) and the slot it is drawn at; `ok` false with
+/// no tab or group drag targeting. Answers (ok, payload, to_slot).
+pub fn mouse_drag_preview(ed: Ed) -> (bool, int, int) {
+    if ed.mouse.phase != MP_DRAG_TAB && ed.mouse.phase != MP_DRAG_GROUP {
+        return (false, 0, 0)
+    }
+    if !ed.mouse.drag_to_valid {
+        return (false, 0, 0)
+    }
+    (true, ed.mouse.press_rgn.payload, ed.mouse.drag_to_slot)
+}
+
+/// `yew_mouse_drag_float` (`mouse.c:2796-2820`): s57.14 §2's FLOAT — the
+/// held entry and where the pointer has it, for the whole life of a tab or
+/// group drag; `grab_dx` keeps the grip the press took. Answers (ok,
+/// payload, x, y, grab_dx).
+pub fn mouse_drag_float(ed: Ed) -> (bool, int, int, int, int) {
+    if ed.mouse.phase != MP_DRAG_TAB && ed.mouse.phase != MP_DRAG_GROUP {
+        return (false, 0, 0, 0, 0)
+    }
+    let grab = if ed.mouse.press_x > ed.mouse.press_rgn.rect.x {
+        ed.mouse.press_x - ed.mouse.press_rgn.rect.x
+    } else {
+        0
+    }
+    (true, ed.mouse.press_rgn.payload, ed.mouse.at_x, ed.mouse.at_y, grab)
+}
+
+/// `yew_mouse_drag_spawn_zone` (`mouse.c:2822-2846`): the pane a release
+/// RIGHT NOW would spawn — the release's own question asked of the
+/// pointer's cell, so the highlight promises exactly the split the
+/// button-up performs. Answers (ok, leaf, zone).
+pub fn mouse_drag_spawn_zone(mut ed: Ed) -> (bool, int, PaneZoneHit) {
+    let x = ed.mouse.at_x
+    let y = ed.mouse.at_y
+    drag_spawn_target(mut ed, x, y)
+}
+
+/// `yew_mouse_drag_member_preview` (`mouse.c:2848-2857`): ROW 2'S
+/// PREVIEW — the group the carried tab is aimed at and its 0-based
+/// position in that group's FINAL list. Answers (ok, gid, pos).
+pub fn mouse_drag_member_preview(ed: Ed) -> (bool, int, int) {
+    if ed.mouse.phase != MP_DRAG_TAB || !ed.mouse.drag_row2_valid {
+        return (false, 0, 0)
+    }
+    (ed.mouse.drag_row2_gid != 0, ed.mouse.drag_row2_gid, ed.mouse.drag_row2_pos)
+}
+
+/// `yew_mouse_preview_group` (`mouse.c:2859-2862`): the group whose member
+/// strip a dwell opened; 0 when none.
+pub fn mouse_preview_group(ed: Ed) -> int {
+    ed.mouse.preview_gid
+}
+
+// ---- THE entry point (`mouse.c:2864-2903`) ------------------------------------
+
+/// `yew_mouse_event` (`mouse.c:2868-2903`): every mouse event in the
+/// program arrives here, from the loop's one branch (DoD 2). With the
+/// mouse off, events are DROPPED here; a wheel is dispatched before the
+/// phase machine and never touches it.
+pub fn mouse_event(mut ed: Ed, k: term.Key) {
+    if k.kind != term.EV_MOUSE {
+        return
+    }
+    if !mouse_enabled(ed) {
+        return
+    }
+    if is_wheel(k.button) {
+        mouse_wheel(mut ed, k)
+        return
+    }
+    if k.ev == term.KEY_PRESS {
+        mouse_press(mut ed, k)
+    } else if k.ev == term.KEY_REPEAT {
+        mouse_motion(mut ed, k)
+    } else if k.ev == term.KEY_RELEASE {
+        mouse_release(mut ed, k)
+    }
+}
+
+// ---- §9: the runtime toggle (`mouse.c:3032-3090`) ----------------------------
+
+/// `yew_mouse_enabled` (`mouse.c:3039-3052`): the session's switch,
+/// resolved from `YEW_MOUSE` once when the editor is made
+/// (`mouse_on_from_env`) to the same answer `term.input_enable` used.
+pub fn mouse_enabled(ed: Ed) -> bool {
+    ed.mouse_on
+}
+
+/// The switch's starting value: `YEW_MOUSE` read as `term/input.c` reads
+/// it (`mouse.c:3043-3049`).
+pub fn mouse_on_from_env() -> bool {
+    let (value, present) = term.env_getv("YEW_MOUSE")
+    !term.mouse_off_value(value, present)
+}
+
+/// `yew_mouse_set_enabled` (`mouse.c:3054-3061`): the owner's third input
+/// — turning the mouse off silences a strip that still has a chevron.
+pub fn mouse_set_enabled(mut ed: Ed, on: bool) {
+    ed.mouse_on = on
+    mouse_motion_resync(mut ed)
+}
+
+// The 1003 mode recomputed from its wants (`motion_sync`, `mouse.c:514-
+// 517`) through the tty's cached path.
+fn mouse_motion_resync(mut ed: Ed) {
+    term.tty_mouse_motion(mut ed.tty, motion_wanted(ed))
+}
+
+/// `ed.mouse.enable` (`yew_mouse_cmd_enable`, `mouse.c:3063-3071`).
+pub fn mouse_cmd_enable(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    ed.mouse_on = true
+    mouse_motion_resync(mut ed)
+    ed_msg(mut ed, MSG_INFO, "mouse on")
+    CMD_OK
+}
+
+/// `ed.mouse.disable` (`yew_mouse_cmd_disable`, `mouse.c:3073-3090`): any
+/// gesture in flight goes with it (a router that stopped receiving events
+/// mid-drag would sit with the button logically down forever), and 1003
+/// is recomputed after the flag flips.
+pub fn mouse_cmd_disable(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    mouse_cancel(mut ed)
+    ed.mouse_on = false
+    mouse_motion_resync(mut ed)
+    ed_msg(mut ed, MSG_INFO, "mouse off")
+    CMD_OK
+}
