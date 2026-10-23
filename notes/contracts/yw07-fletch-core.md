@@ -585,8 +585,9 @@ threaded through their owner (E1010, G27), and the only module state is
 run of C yew and of the port with a scratch `HOME`, `XDG_CONFIG_HOME`
 and `XDG_STATE_HOME` and an explicit `YEW_RUNTIME_DIR`**: import rows 2
 and 3 read `$XDG_CONFIG_HOME/yew/fl/` and `~/.config/yew/fl/`
-(`fletch-spec.md:452-461`), and `tools/goldens` sets no scratch home
-today (yew#11, open: fix it first, listed to close, never closed here);
+(`fletch-spec.md:452-461`); `tools/goldens` and `tools/oracle` set
+the four scratch homes since yw06 (`tools/lib-test-env.sh`, held by
+`tools/check-test-env`; yew#11 closes with yw06's merge): keep it so;
 the maintainer's configuration and state are never read or written.
 `13-capability/config_main.fl` writes and removes `build/fletch-tmp-io`
 under the runner's directory (`:19-20`, `:96-101`): the conformance
@@ -630,7 +631,7 @@ save), `tools/goldens`, `tools/goldens-yw06-cases.txt`, `tools/oracle`,
 `tools/check-cmdtab`, `.github/workflows/ci.yml`, `docs/MAP.md`,
 `notes/yw06-workspace-finder-mouse.md` (its STOPs and its red-by-name
 list); the wolf 0.2.35 release notes (s250–s259) and the issues
-deliverable 1 adopts (yew#11, #17, #20, #22, #23, #24, #27, #40); pax
+deliverable 1 adopts (yew#17, #20, #22, #23, #24, #27, #40); pax
 trunk's `tools/mkyew` and `user/yew.pin` (read only).
 
 ## Prediction (write before the first change)
