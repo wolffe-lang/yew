@@ -78,7 +78,7 @@ The prediction is `notes/yw06-evidence/prediction.txt`, committed at
 
 | prediction | outcome |
 |---|---|
-| no golden edited; campaigns 03, 04 and yw05's unchanged as the start, the mouse route and the strip's scroll widen | **HIT** for the edit (no golden touched); campaigns 01–05's gates <<CAMPAIGNS>> |
+| no golden edited; campaigns 03, 04 and yw05's unchanged as the start, the mouse route and the strip's scroll widen | **HIT**: no golden touched; campaigns 01, 03, 04 and yw05's half of 05 green by name over yw06's whole editor in PR #50's run (40011667289, oracle job 120613384920, steps 18–23; its plants touched none of them), and again in this PR's run |
 | the codec round-trips the corpus: 22 canonical byte-identical, 4 noncanonical canonical, 20 invalid each reaching a result | **HIT** (`test_state_corpus`, `ws_state_corpus_test`) |
 | the C↔port differential on `s25_resume_exact`'s `state.fl` byte-identical both ways | **HIT**: each editor resumes the other's save to the first grid; the first saves equal (6,182 bytes, `saved_at` aside), the second saves of one S1 equal (6,177) — `tools/run-trials` |
 | the permille fixpoint for all 999 values through `util.f32` | **HIT** (`ws_state_lit_test`, 1..=999, checked `exit(0)`) |
@@ -418,7 +418,11 @@ s57.12 needed no code (yw03's and yw04's commands, on yw05's bump).
 
 **The unit lanes.** `tools/check-test` (the checked machine, whole
 files, falling back to native where it refuses) and `tools/check-test
---native` <<UNITLANES>>. The checked machine one case at a time is
+--native` green at `c49b738` in the container on kasumi: `wolf test:
+129 passed; 0 failed; 0 rejected; 0 unsupported` (56 min, the cores
+shared) and 129 files `[native] ok` (72 min); the gauntlet that ran
+them mirrors CI's port job step for step
+(`notes/yw06-evidence/continuation/gauntlet-port-c49b738.log`). The checked machine one case at a time is
 `tools/check-test-cases` (new): its table (`tools/check-test-cases.txt`)
 holds every test file that reads a `YEW_*_CASE` or `YEW_*_FIXTURE`
 selector — 21 files, 421 cases — and a full run fails if a selector file
@@ -494,14 +498,30 @@ closed unmerged:
   comparison, the `perf_state` compile plant (exit 2) and the plain
   state write in the shim rows (oracle job 120501254955, and macOS
   120501255132).
-- PR #50 (runs 40011439752 and 40011667289): <<PLANT2>>.
+- PR #50 (runs 40011439752 and 40011667289): the stale count and the
+  dropped allow row in the `checked-cases` job (120613384863); the
+  `.git/info/.gitignore` plant in `tools/check-walk-listings` and a
+  cursor plant in `wolf test` (port job 120613384917); the
+  `perf_mouse` and `perf_finder` compile plants (exit 2) and the extra
+  mutation in `fuzz_gitignore`'s comparison (oracle jobs 120613384920
+  and macOS 120613385020). Two of its plants missed, not the gates:
+  the cursor plant sat on the narrow cursor path, which the PTY
+  sessions' restore does not decide, so the 81 goldens and the trials
+  stayed green; the event-count plant changed no input `fuzz_mouse`'s
+  report hashes.
+- PR #51 (run 40027766393): the saved active tab left unrestored —
+  checked first on kasumi, `s25_resume_exact`: "grid differs after quit
+  and reopen" — in the 81 goldens and the trials; one mutation more in
+  `fuzz_mouse`'s comparison: <<PLANT3>>.
 
 Real reds the plants and the gauntlet found on the way, each fixed:
 the fuzzy fuzzer's staging copy missing `util` (PR #48's port job,
 `e79e2c6`); `ci/legs-test.py`'s L4 wiring refusing the new
 `checked-cases` job (PR #50's first run, legs job; `edad410`);
 `shell_self` case 0 past the checked budget (the byte walk,
-`2f5d907`); `tools/perf-mouse` unformatted (`c36559c`).
+`2f5d907`); `tools/perf-mouse` unformatted (`c36559c`); the
+`perf_cmdcomp` harness build past its 15-minute step timeout on the
+runner (PR #50's oracle job, step 15: 15m13s; 30 minutes at `5dc0be3`).
 
 ### 4.9 The `unsafe` census
 
