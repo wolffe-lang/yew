@@ -28,20 +28,26 @@ number from the same run, and a 2x gate holds from the first paint.
 
 ## Status
 
-Campaigns 00 to 04 of sagitta's fifteen and campaign 05's first half
-(yw00 to yw05), at wolf 0.2.34: `util` and `unicode` (tables generated
-from `ucd/16.0.0/`, identical to sagitta's); the terminal (raw mode, the
-input decoder, the cell grid and damage renderer, the restore on every
-exit path); the text engine (piece tree, byte-exact load, the atomic and
-synced save, the crash journal, undo); the modal core (modes, keymaps,
-dispatch, selection, multi-cursor); the `:` prompt with its completion
-engine, the regex engine, search and replace, and shell jobs (`:!`, the
-stream, the region filter, `:r !`, the persistent session); and the
-workspace's first half: the pane tree, tabs with the strip and its
-overflow, and tab groups. Each campaign's PTY goldens are gated by name
-against C yew's (campaign 05's `startup_multiple_files` waits on the
-fuzzy finder, yw06); every path not yet ported hard-errors naming its
-sagitta sprint and the port lane that lands it. The map of every sagitta
+Campaigns 00 to 05 of sagitta's fifteen (yw00 to yw06), at wolf
+0.2.34: `util` and `unicode` (tables generated from `ucd/16.0.0/`,
+identical to sagitta's); the terminal (raw mode, the input decoder, the
+cell grid and damage renderer, the restore on every exit path); the text
+engine (piece tree, byte-exact load, the atomic and synced save, the
+crash journal, undo); the modal core (modes, keymaps, dispatch,
+selection, multi-cursor); the `:` prompt with its completion engine, the
+regex engine, search and replace, and shell jobs (`:!`, the stream, the
+region filter, `:r !`, the persistent session); and the workspace: the
+pane tree, tabs with the strip and its overflow, tab groups, the
+workspace key and its saved session (resumed on the next launch,
+byte-identical to C yew's state file), the startup plan, the fuzzy
+finder over the workspace walk and `.gitignore` with the buffer, undo
+and command pickers, and the mouse: click, wheel, drag and drop with
+the strip's previews, drag-to-spawn and the context menus. Each
+campaign's reachable PTY goldens are gated by name against C yew's
+(campaign 05's eleven that need FUSS or syntax
+highlighting are recorded under the lane that lands them); every path
+not yet ported hard-errors naming its sagitta sprint and the port lane
+that lands it. The map of every sagitta
 directory and sprint to a port lane, and of every wolf gap the port has
 met, is [`docs/MAP.md`](docs/MAP.md); `CHANGELOG.md` has each lane.
 
@@ -51,6 +57,7 @@ met, is [`docs/MAP.md`](docs/MAP.md); `CHANGELOG.md` has each lane.
 tools/fetch-toolchain            # wolf, lupin and std by digest, into .wolf-bin/
 tools/build                      # target/native/yew and target/release/yew
 tools/check-test                 # the unit tests, warnings denied
+tools/check-test-cases           # the checked machine one case at a time (files past its budget)
 tools/check-tables               # tables.lu is the generator's, and sagitta's
 tools/oracle --unit              # C yew at the pin, gcc and clang, its unit suite
 tools/goldens --yew target/release/yew
