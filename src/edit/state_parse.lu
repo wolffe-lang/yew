@@ -1,0 +1,495 @@
+//! edit.state_parse — restore without eager reads, and recover bad caches.
+//! Ports sagitta src/ws/state_parse.c:64-1178 at 9ace98c2. The document
+//! is validated before touching live editor state. Groups are LOOKED UP
+//! before tabs regardless of input key order (the stale header is not code).
+//! G40 byte paths survive as orphan identities, never invented fs paths.
+
+use std.time
+use text
+use util
+use ws
+
+/// There was no usable tab in the document (including absent state).
+pub const WS_FRESH: int = 0
+
+/// At least one named tab was restored/reused.
+pub const WS_RESTORED: int = 1
+
+/// Bad cache; startup continues after attempting a non-clobbering rename.
+pub const WS_RECOVERED: int = 2
+
+fn sp_get(ed: Ed, node: int, key: str) -> int {
+    ws.fl_get(ed.state.literals.doc, node, key.bytes()) else -1
+}
+
+fn sp_at(ed: Ed, node: int, index: int) -> int {
+    ws.fl_at(ed.state.literals.doc, node, index) else -1
+}
+
+fn sp_len(ed: Ed, node: int) -> int { ws.fl_len(ed.state.literals.doc, node) }
+
+fn sp_int(ed: Ed, node: int, key: str, dflt: int) -> int {
+    ws.fl_int_or(ed.state.literals.doc, sp_get(ed, node, key), dflt)
+}
+
+fn sp_str(ed: Ed, node: int, dflt: str) -> str {
+    let span = ws.fl_string_span(ed.state.literals.doc, node) else { return dflt }
+    str_from_utf8(ed.state.literals.doc.bytes[span.at..span.at + span.len]) else dflt
+}
+
+fn sp_retain(mut ed: Ed, kind: int, owner: int, entity: int, node: int) {
+    ws.state_record_retain(mut ed.state.literals, kind, owner, entity, node)
+}
+
+fn sp_token(mut ed: Ed, kind: int, owner: int, node: int) -> int {
+    ws.state_record_retain_token(mut ed.state.literals, kind, owner, node)
+}
+
+fn sp_nonnegative(n: int) -> int { if n < 0 then 9223372036854775807 else n }
+
+// Raw-path association is sparse: ordinary UTF-8 paths allocate no extra row.
+fn sp_file_buffer(mut ed: Ed, node: int) -> int {
+    let bytes = ws.fl_string_bytes(ed.state.literals.doc, node) else { return -1 }
+    if bytes.len == 0 { return -1 }
+    var valid = true
+    for b in bytes { if b as int == 0 { valid = false; break } }
+    let path = str_from_utf8(bytes) else { valid = false; "" }
+    if valid { return ws_file_buf(mut ed, canonical_path(path)) }
+    for row in ed.state.byte_paths {
+        if comp_bytes_eq(row.bytes, bytes) { return ed_buf_index(ed, row.buffer_id) }
+    }
+    // Create the buffer without giving the filesystem a lossy spelling.
+    let bi = ws_file_buf(mut ed, "")
+    if bi < 0 { return -1 }
+    ed.bufs[bi].flags = ed.bufs[bi].flags - (ed.bufs[bi].flags & BUF_SCRATCH)
+    ed.bufs[bi].has_path = true
+    ed.bufs[bi].resident = false
+    (mut ed.state.byte_paths).push(StatePath { buffer_id: ed.bufs[bi].id, bytes: bytes })
+    bi
+}
+
+fn sp_byte_path(ed: Ed, bi: int) -> bool {
+    for row in ed.state.byte_paths { if row.buffer_id == ed.bufs[bi].id { return true } }
+    false
+}
+
+fn sp_ring_entry(mut ed: Ed, node: int, kind: int, owner: int) -> text.JumpEntry ! {none} {
+    let bi = sp_file_buffer(mut ed, sp_get(ed, node, "path"))
+    if bi < 0 { return none }
+    var je = text.jump_entry_zero()
+    je.buf_id = ed.bufs[bi].id
+    je.line_hint = sp_nonnegative(sp_int(ed, node, "line", 0))
+    je.stamp_ms = sp_nonnegative(sp_int(ed, node, "stamp", 0))
+    je.state_token = sp_token(mut ed, kind, owner, node)
+    je
+}
+
+fn sp_ring(mut ed: Ed, node: int, kind: int, entry_kind: int, owner: int) -> text.JumpList {
+    var ring = text.jumplist_new()
+    sp_retain(mut ed, kind, owner, 0, node)
+    let entries = sp_get(ed, node, "entries")
+    var i = 0
+    while i < sp_len(ed, entries) && i < ws.STATE_MAX_JUMPS {
+        let je = sp_ring_entry(mut ed, sp_at(ed, entries, i), entry_kind, owner) else {
+            i += 1
+            continue
+        }
+        (mut ring.e).push(je)
+        ring.len += 1
+        ring.head = ring.len % text.JUMPLIST_MAX
+        i += 1
+    }
+    let cur = sp_int(ed, node, "cur", ring.len)
+    ring.cur = if cur >= 0 && cur <= ring.len then cur else ring.len
+    ring
+}
+
+fn sp_win(mut ed: Ed, wi: int, rec: int) {
+    let id = ed.wins[wi].id
+    sp_retain(mut ed, ws.STATE_REC_WIN, 0, id, rec)
+    let curs = sp_get(ed, rec, "cursors")
+    var i = 0
+    while i < sp_len(ed, curs) && i < ws.STATE_MAX_CURSORS {
+        let node = sp_at(ed, curs, i)
+        let cur = text.Cursor {
+            pos: sp_nonnegative(sp_int(ed, node, "pos", 0)),
+            anchor: sp_nonnegative(sp_int(ed, node, "anchor", 0)),
+            goal_col: ws.state_goal_from_i64(sp_int(ed, node, "goal", -1)),
+        }
+        var stamp = 0
+        if i == 0 {
+            ed.wins[wi].cs.curs[ed.wins[wi].cs.primary] = cur
+            stamp = ed.wins[wi].cs.stamps[ed.wins[wi].cs.primary]
+        } else {
+            let added = ed.wins[wi].cs.next_stamp
+            if text.cset_add(mut ed.wins[wi].cs, cur) {
+                for s in ed.wins[wi].cs.stamps { if s == added { stamp = added; break } }
+            }
+        }
+        if stamp != 0 { sp_retain(mut ed, ws.STATE_REC_CURSOR, id, stamp, node) }
+        i += 1
+    }
+    let primary = sp_int(ed, rec, "primary", 0)
+    if primary >= 0 && primary < ed.wins[wi].cs.curs.len { ed.wins[wi].cs.primary = primary }
+    let bi = ed.wins[wi].buf
+    if bi >= 0 && ed.bufs[bi].resident {
+        text.cset_normalize(ed.bufs[bi].ec.tb, mut ed.wins[wi].cs)
+    }
+    let view = sp_get(ed, rec, "view")
+    if view >= 0 {
+        sp_retain(mut ed, ws.STATE_REC_VIEW, id, 0, view)
+        ed.wins[wi].vp.top = sp_nonnegative(sp_int(ed, view, "top", 0))
+        ed.wins[wi].vp.top_sub = sp_nonnegative(sp_int(ed, view, "top_sub", 0))
+        ed.wins[wi].vp.left = sp_nonnegative(sp_int(ed, view, "left", 0))
+        ed.wins[wi].vp.wrap = ws.fl_bool_or(ed.state.literals.doc, sp_get(ed, view, "wrap"), false)
+    }
+    let jumps = sp_get(ed, rec, "jumps")
+    if jumps >= 0 {
+        ed.wins[wi].jumps = sp_ring(mut ed, jumps, ws.STATE_REC_JUMPS, ws.STATE_REC_JUMP_ENTRY, id)
+    }
+}
+
+struct StateWinSlots { wins: List[int], used: List[bool], leaves: int }
+
+// Recursion is capped at schema depth eight before entering another frame.
+fn sp_panes(mut ed: Ed, node: int, mut slots: StateWinSlots, depth: int, owner: int) -> int {
+    if node < 0 || depth > ws.STATE_MAX_PANE_DEPTH { return -1 }
+    let split = sp_get(ed, node, "split")
+    let has_split = (
+        ws.fl_string_span(ed.state.literals.doc, split) else ws.FlSpan { at: 0, len: -1 }
+    ).len >=
+        0
+    if !has_split {
+        if slots.leaves >= PANE_MAX_LEAVES || slots.wins.len == 0 { return -1 }
+        var idx = sp_int(ed, node, "win", 0)
+        if idx < 0 || idx >= slots.wins.len || slots.used[idx] {
+            idx = -1
+            var k = 0
+            while k < slots.wins.len { if !slots.used[k] { idx = k; break }; k += 1 }
+            if idx < 0 { return -1 }
+        }
+        slots.used[idx] = true
+        slots.leaves += 1
+        let p = pane_new_leaf(mut ed, slots.wins[idx])
+        ed.panes[p].state_token = sp_token(mut ed, ws.STATE_REC_PANE, owner, node)
+        return p
+    }
+    let p = pane_alloc(mut ed)
+    ed.panes[p].is_leaf = false
+    ed.panes[p].dir = if sp_str(ed, split, "").starts_with("v") then SPLIT_V else SPLIT_H
+    ed.panes[p].ratio = ws.state_permille_to_ratio(sp_int(ed, node, "ratio_permille", 500))
+    ed.panes[p].state_token = sp_token(mut ed, ws.STATE_REC_PANE, owner, node)
+    let a = sp_panes(mut ed, sp_get(ed, node, "a"), mut slots, depth + 1, owner)
+    let b = sp_panes(mut ed, sp_get(ed, node, "b"), mut slots, depth + 1, owner)
+    if a < 0 || b < 0 { pane_release(mut ed, p); return if a >= 0 then a else b }
+    ed.panes[p].a = a
+    ed.panes[p].b = b
+    ed.panes[a].parent = p
+    ed.panes[b].parent = p
+    p
+}
+
+fn sp_wins(mut ed: Ed, ti: int, rec: int, bi: int) {
+    let wins = sp_get(ed, rec, "wins")
+    if sp_len(ed, wins) == 0 { return }
+    var slots = StateWinSlots { wins: List[int](), used: List[bool](), leaves: 0 }
+    var i = 0
+    while i < sp_len(ed, wins) && i < PANE_MAX_LEAVES {
+        let wi = ed_win_clone(mut ed, ed.win)
+        if wi < 0 { break }
+        ed_win_set_buffer(mut ed, wi, bi)
+        sp_win(mut ed, wi, sp_at(ed, wins, i))
+        (mut slots.wins).push(wi)
+        (mut slots.used).push(false)
+        i += 1
+    }
+    let root = sp_panes(mut ed, sp_get(ed, rec, "panes"), mut slots, 0, ed.tabs[ti].tab_id)
+    if root < 0 { for wi in slots.wins { ed_win_release(mut ed, wi) }; return }
+    i = 0
+    while i < slots.wins.len { if !slots.used[i] { ed_win_release(mut ed, slots.wins[i]) }; i += 1 }
+    var focus = pane_first_leaf(ed, root)
+    let want = sp_int(ed, rec, "focus", 0)
+    if want >= 0 && want < slots.wins.len {
+        let leaves = pane_collect_leaves(ed, root, PANE_MAX_LEAVES)
+        for p in leaves { if ed.panes[p].win == slots.wins[want] { focus = p; break } }
+    }
+    let old = ed.tabs[ti].root
+    let was_live = old == ed.pane_root
+    if pane_live(ed, old) {
+        let leaves = pane_collect_leaves(ed, old, PANE_MAX_LEAVES)
+        for p in leaves { ed_win_release(mut ed, ed.panes[p].win) }
+        pane_free(mut ed, old)
+    }
+    ed.tabs[ti].root = root
+    ed.tabs[ti].focus = focus
+    if was_live {
+        ed.pane_root = root
+        ed.focus = focus
+        ed.win = ed.panes[focus].win
+        ed.layout_dirty = true
+        ed.full_damage = true
+    }
+}
+
+fn sp_groups(mut ed: Ed, root: int) -> List[ws.StateId] {
+    var ids = List[ws.StateId]()
+    let list = sp_get(ed, root, "groups")
+    var i = 0
+    while i < sp_len(ed, list) {
+        let node = sp_at(ed, list, i)
+        let file_id = sp_int(ed, node, "id", 0) & 4294967295
+        if file_id == 0 { i += 1; continue }
+        let dir = sp_str(ed, sp_get(ed, node, "dir_path"), "")
+        let label = sp_str(ed, sp_get(ed, node, "label"), "")
+        let live = group_create(mut ed, dir, label)
+        sp_retain(mut ed, ws.STATE_REC_GROUP, 0, live, node)
+        ws.state_idmap_put(mut ids, file_id, live)
+        let last = sp_str(ed, sp_get(ed, node, "last_active_member"), "")
+        if last.len > 0 { group_set_last_member(mut ed, live, last, true) }
+        i += 1
+    }
+    ids
+}
+
+fn sp_tab(mut ed: Ed, bi: int) -> int {
+    var i = 0
+    while i < ed.tabs.len { if ed.tabs[i].buffer_id == ed.bufs[bi].id { return i }; i += 1 }
+    if ed.tabs.len >= TAB_MAX { return -1 }
+    let wi = ed_win_clone(mut ed, ed.win)
+    if wi < 0 { return -1 }
+    ed_win_set_buffer(mut ed, wi, bi)
+    apply_win_opts(ed.opts, mut ed.wins[wi])
+    let leaf = pane_new_leaf(mut ed, wi)
+    let id = ed.next_tab_id
+    ed.next_tab_id += 1
+    let path = ed.bufs[bi].path
+    var tab = tab_value(id, ed.bufs[bi].id, leaf, path, path)
+    tab.has_path = true
+    (mut ed.tabs).push(tab)
+    ed.tabs.len - 1
+}
+
+fn sp_readable(path: str) -> bool {
+    let stat = fs_stat(path) else { return false }
+    if stat[0] != 0 { return false }
+    let fd = fs_open(path) else { return false }
+    fs_close(fd) else |_| {}
+    true
+}
+
+fn sp_tabs(mut ed: Ed, root: int, gids: List[ws.StateId]) -> (List[ws.StateId], int) {
+    var tids = List[ws.StateId]()
+    var indices = List[int](), ordinals = List[int]()
+    let list = sp_get(ed, root, "tabs")
+    var first = -1, i = 0, dropped = 0
+    if sp_len(ed, list) > ws.STATE_MAX_TABS {
+        util.log_warn("workspace state lists {sp_len(ed, list)} tabs; keeping {ws.STATE_MAX_TABS}")
+    }
+    while i < sp_len(ed, list) && i < ws.STATE_MAX_TABS {
+        let rec = sp_at(ed, list, i)
+        let bi = sp_file_buffer(mut ed, sp_get(ed, rec, "path"))
+        if bi < 0 {
+            dropped += 1
+            i += 1
+            continue
+        }
+        let ti = sp_tab(mut ed, bi)
+        if ti < 0 {
+            dropped += 1
+            i += 1
+            continue
+        }
+        if first < 0 { first = ti }
+        ws.state_idmap_put(mut tids, sp_int(ed, rec, "id", 0) & 4294967295, ed.tabs[ti].tab_id)
+        sp_retain(mut ed, ws.STATE_REC_TAB, 0, ed.tabs[ti].tab_id, rec)
+        if sp_byte_path(ed, bi) || !sp_readable(ed.bufs[bi].path) {
+            ed.tabs[ti].missing_at_restore = true
+            ed.state.missing_count += 1
+        }
+        let gid = ws.state_idmap_get(gids, sp_int(ed, rec, "group", 0) & 4294967295)
+        if gid != 0 {
+            let ordinal = sp_int(ed, rec, "group_ordinal", 0)
+            group_add_member(mut ed, gid, ti)
+            if ordinal > 0 {
+                (mut indices).push(ti)
+                (mut ordinals).push(
+                    if ordinal > ws.STATE_MAX_TABS then ws.STATE_MAX_TABS else ordinal,
+                )
+            }
+        }
+        sp_wins(mut ed, ti, rec, bi)
+        i += 1
+    }
+    i = 0
+    while i < indices.len { group_set_ordinal(mut ed, indices[i], ordinals[i]); i += 1 }
+    if dropped > 0 { util.log_info("workspace state: {dropped} tab record(s) dropped") }
+    (tids, first)
+}
+
+fn sp_files(mut ed: Ed, root: int) {
+    let list = sp_get(ed, root, "files")
+    var i = 0
+    while i < sp_len(ed, list) && i < ws.STATE_MAX_FILES {
+        let rec = sp_at(ed, list, i)
+        let bi = sp_file_buffer(mut ed, sp_get(ed, rec, "path"))
+        if bi < 0 { i += 1; continue }
+        let id = ed.bufs[bi].id
+        sp_retain(mut ed, ws.STATE_REC_FILE, 0, id, rec)
+        let marks = sp_get(ed, rec, "marks")
+        var m = 0
+        while m < sp_len(ed, marks) {
+            let mk = sp_at(ed, marks, m)
+            let name = sp_str(ed, sp_get(ed, mk, "name"), "")
+            if name.len == 1 && name.bytes()[0] as int >= 97 && name.bytes()[0] as int <= 122 {
+                let c = name.bytes()[0] as int
+                ed.bufs[bi].named.pending[c - 97] = sp_nonnegative(sp_int(ed, mk, "pos", 0))
+                ed.bufs[bi].named.pending_set[c - 97] = true
+                sp_retain(mut ed, ws.STATE_REC_MARK, id, c, mk)
+            }
+            m += 1
+        }
+        let changes = sp_get(ed, rec, "changes")
+        if changes >= 0 {
+            ed.bufs[bi].ec.changes.ring = sp_ring(
+                mut ed,
+                changes,
+                ws.STATE_REC_CHANGES,
+                ws.STATE_REC_CHANGE_ENTRY,
+                id,
+            )
+        }
+        sp_retain(mut ed, ws.STATE_REC_UNDO, id, 0, sp_get(ed, rec, "undo"))
+        i += 1
+    }
+}
+
+/// Rename bad bytes without clobbering another copy, keeping newest five.
+pub fn state_set_aside(ed: Ed) -> str ! {none} {
+    if !ed.state.ready { return none }
+    let iso = time.to_iso8601(time.unix_ms())
+    if iso.len != 24 { return none }
+    let stamp = "{iso[0..4]}{iso[5..7]}{iso[8..10]}T{iso[11..13]}{iso[14..16]}{iso[17..19]}Z"
+    let name = "state.fl.corrupt-{stamp}"
+    let path = "{ed.state.key.dir}/{name}"
+    if path.len >= 4096 { return none }
+    if text.file_move_aside(ws.ws_state_path(ed.state.key), path) != text.SAVE_OK { return none }
+    let entries = fs_read_dir(ed.state.key.dir) else { return name }
+    var names = List[str]()
+    for entry in entries {
+        if entry.starts_with("state.fl.corrupt-") && names.len < 64 { (mut names).push(entry) }
+    }
+    // Stable newest-first insertion sort; at most 64 names, C's cap.
+    var i = 1
+    while i < names.len {
+        let value = names[i]
+        var at = i
+        while at > 0 && names[at - 1] < value { names[at] = names[at - 1]; at -= 1 }
+        names[at] = value
+        i += 1
+    }
+    i = 5
+    while i < names.len { fs_remove("{ed.state.key.dir}/{names[i]}") else |_| {}; i += 1 }
+    name
+}
+
+fn sp_recover(mut ed: Ed, why: str) -> int {
+    util.log_warn("workspace state unusable: {why}")
+    let name = state_set_aside(ed) else ""
+    ed_msg(
+        mut ed,
+        MSG_WARN,
+        if name.len == 0 {
+            "workspace state was unreadable"
+        } else {
+            "workspace state was unreadable; saved as {name}"
+        },
+    )
+    WS_RECOVERED
+}
+
+/// Parse/validate before mutation, then options/groups/tabs/files/active/prune.
+pub fn state_apply(mut ed: Ed, bytes: List[byte]) -> int {
+    let parsed = ws.fl_parse(bytes, 0, bytes.len)
+    if !parsed.ok {
+        return sp_recover(mut ed, "{parsed.err.line}:{parsed.err.col}: {parsed.err.msg}")
+    }
+    if !ws.state_validate_v1(parsed.doc) {
+        return sp_recover(mut ed, "root/version is not workspace v1")
+    }
+    state_retained_clear(mut ed)
+    var literals = ws.state_literals_from(take parsed.doc) else {
+        return sp_recover(mut ed, "invalid version")
+    }
+    literals.bool_options = ed.state.literals.bool_options
+    ed.state.literals.bool_options = List[ws.StateBoolOption]()
+    ed.state.literals = literals
+    let root = ed.state.literals.doc.root
+    let saved = sp_str(ed, sp_get(ed, ed.state.literals.workspace, "path"), "")
+    if saved.len != 0 && saved != ws_root(ed) {
+        util.log_info("workspace state was written for {saved}; restoring into {ws_root(ed)}")
+    }
+    let gids = sp_groups(mut ed, root)
+    let (tids, first) = sp_tabs(mut ed, root, gids)
+    sp_files(mut ed, root)
+    let active = ws.state_idmap_get(tids, sp_int(ed, root, "active_tab", 0) & 4294967295)
+    var index = if active == 0 then -1 else tab_index_of_id(ed, active)
+    if index < 0 { index = first }
+    if index >= 0 { tab_switch(mut ed, index) }
+    group_prune_empty(mut ed)
+    ws.state_records_finish(mut ed.state.literals)
+    if first < 0 then WS_FRESH else WS_RESTORED
+}
+
+/// Restore the state file, layout at current geometry, clamp rather than follow.
+pub fn ws_restore(mut ed: Ed) -> int {
+    if !ed.state.ready { return WS_FRESH }
+    let path = ws.ws_state_path(ed.state.key)
+    let stat = fs_stat(path) else |e| match e {
+        not_found => { return WS_FRESH },
+        _ => { ed_msg(mut ed, MSG_WARN, "workspace state could not be read"); return WS_FRESH },
+    }
+    if stat[0] != 0 {
+        ed_msg(mut ed, MSG_WARN, "workspace state could not be read")
+        return WS_FRESH
+    }
+    if stat[1] > ws.FL_MAX_BYTES { return sp_recover(mut ed, "larger than the 8 MiB cap") }
+    let fd = fs_open(path) else {
+        ed_msg(mut ed, MSG_WARN, "workspace state could not be read")
+        return WS_FRESH
+    }
+    var bytes = List[byte]()
+    var failed = false
+    loop {
+        let chunk = fs_read_chunk(fd, 65536) else |e| match e {
+            eof => { break },
+            _ => { failed = true; break },
+        }
+        for b in chunk { (mut bytes).push(b) }
+        if bytes.len > ws.FL_MAX_BYTES { break }
+    }
+    fs_close(fd) else |_| {}
+    if failed { ed_msg(mut ed, MSG_WARN, "workspace state could not be read"); return WS_FRESH }
+    if bytes.len > ws.FL_MAX_BYTES { return sp_recover(mut ed, "larger than the 8 MiB cap") }
+    let result = state_apply(mut ed, bytes)
+    ed_layout(mut ed)
+    var i = 0
+    while i < ed.wins.len {
+        let bi = ed.wins[i].buf
+        if ed.wins[i].id != 0 && bi >= 0 && ed.bufs[bi].resident {
+            vp_clamp(mut ed.wins[i], ed.bufs[bi].ec.tb)
+        }
+        i += 1
+    }
+    if ed.state.missing_count == 1 {
+        ed_msg(mut ed, MSG_WARN, "1 file in this workspace is no longer on disk")
+    } else if ed.state.missing_count > 1 {
+        ed_msg(
+            mut ed,
+            MSG_WARN,
+            "{ed.state.missing_count} files in this workspace are no longer on disk",
+        )
+    }
+    ed.state.dirty = false
+    ed.cursor_follow_pending = false
+    result
+}

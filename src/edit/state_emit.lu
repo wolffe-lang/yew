@@ -1,0 +1,272 @@
+//! edit.state_emit — live v1 state, with one pre-order window collection.
+//! Ports sagitta src/ws/state_emit.c:395-820 at 9ace98c2. The pure
+//! literal/retention writer is ws; every live id and mark is read here.
+//! No filesystem calls occur during emission; undo stays a sidecar.
+
+use std.time
+use text
+use ws
+
+fn se_map(mut e: ws.FlEmit, key: str) { ws.fl_map_open(mut e, key.len != 0, key.bytes()) }
+
+fn se_list(mut e: ws.FlEmit, key: str) { ws.fl_list_open(mut e, key.len != 0, key.bytes()) }
+
+fn se_int(mut e: ws.FlEmit, key: str, value: int) { ws.fl_int(mut e, true, key.bytes(), value) }
+
+fn se_str(mut e: ws.FlEmit, key: str, value: str) {
+    ws.fl_str(mut e, true, key.bytes(), value.bytes())
+}
+
+fn se_bool(mut e: ws.FlEmit, key: str, value: bool) { ws.fl_bool(mut e, true, key.bytes(), value) }
+
+fn se_unknown(mut e: ws.FlEmit, ed: Ed, kind: int, owner: int, entity: int) {
+    ws.state_emit_record_unknown(mut e, ed.state.literals, kind, owner, entity)
+}
+
+// G40's invalid paths are carried byte-for-byte, never passed to fs APIs.
+fn se_path(mut e: ws.FlEmit, ed: Ed, bi: int, fallback: str, present: bool) {
+    if bi >= 0 {
+        for row in ed.state.byte_paths {
+            if row.buffer_id == ed.bufs[bi].id {
+                ws.fl_str(mut e, true, "path".bytes(), row.bytes)
+                return
+            }
+        }
+    }
+    if present { se_str(mut e, "path", fallback) } else { ws.fl_nil(mut e, true, "path".bytes()) }
+}
+
+fn se_win_index(ed: Ed, order: List[int], wi: int) -> int {
+    var i = 0
+    while i < order.len { if ed.panes[order[i]].win == wi { return i }; i += 1 }
+    0
+}
+
+fn se_panes(mut e: ws.FlEmit, ed: Ed, key: str, p: int, order: List[int], owner: int) {
+    se_map(mut e, key)
+    if !pane_live(ed, p) {
+        se_int(mut e, "win", 0)
+    } else {
+        if ed.panes[p].is_leaf {
+            se_int(mut e, "win", se_win_index(ed, order, ed.panes[p].win))
+        } else {
+            se_str(mut e, "split", if ed.panes[p].dir == SPLIT_H then "h" else "v")
+            se_int(mut e, "ratio_permille", ws.state_ratio_to_permille(ed.panes[p].ratio))
+            se_panes(mut e, ed, "a", ed.panes[p].a, order, owner)
+            se_panes(mut e, ed, "b", ed.panes[p].b, order, owner)
+        }
+        se_unknown(mut e, ed, ws.STATE_REC_PANE, owner, ed.panes[p].state_token)
+    }
+    ws.fl_map_close(mut e)
+}
+
+fn se_ring_entry(mut e: ws.FlEmit, ed: Ed, je: text.JumpEntry, kind: int, owner: int) {
+    let bi = ed_buf_index(ed, je.buf_id)
+    var line = je.line_hint, col = 0
+    if bi >= 0 &&
+        ed.bufs[bi].resident &&
+        ed.bufs[bi].ec.has_marks &&
+        text.mark_alive(ed.bufs[bi].ec.marks, je.mark) {
+        let pos = text.mark_pos(ed.bufs[bi].ec.marks, je.mark) as int
+        line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff) as int
+        col = pos - text.textbuf_line_start(ed.bufs[bi].ec.tb, line as text.LineNo) as int
+    }
+    se_map(mut e, "")
+    if bi >= 0 {
+        se_path(mut e, ed, bi, ed.bufs[bi].path, ed.bufs[bi].has_path)
+    } else {
+        ws.fl_nil(mut e, true, "path".bytes())
+    }
+    se_int(mut e, "line", line)
+    se_int(mut e, "col", col)
+    se_int(mut e, "stamp", je.stamp_ms)
+    se_unknown(mut e, ed, kind, owner, je.state_token)
+    ws.fl_map_close(mut e)
+}
+
+fn se_ring(
+    mut e: ws.FlEmit,
+    ed: Ed,
+    key: str,
+    ring: text.JumpList,
+    kind: int,
+    entry_kind: int,
+    owner: int,
+) {
+    se_map(mut e, key)
+    se_int(mut e, "cur", ring.cur)
+    se_list(mut e, "entries")
+    var i = 0
+    while i < ring.len && i < ws.STATE_MAX_JUMPS {
+        let je = copy ring.e[text.ring_slot(ring.head, ring.len, text.JUMPLIST_MAX, i)]
+        se_ring_entry(mut e, ed, je, entry_kind, owner)
+        i += 1
+    }
+    ws.fl_list_close(mut e)
+    se_unknown(mut e, ed, kind, owner, 0)
+    ws.fl_map_close(mut e)
+}
+
+fn se_goal(ed: Ed, wi: int, c: text.Cursor) -> int {
+    if c.goal_col != text.CCOL_HERE { return ws.state_goal_to_i64(c.goal_col) }
+    let bi = ed.wins[wi].buf
+    if bi < 0 || !ed.bufs[bi].resident { return 0 }
+    let tabw = if ed.bufs[bi].tabwidth != 0 then ed.bufs[bi].tabwidth else VP_TABWIDTH
+    ws.state_goal_to_i64(text.cursor_goal(ed.bufs[bi].ec.tb, c, tabw) as int)
+}
+
+fn se_win(mut e: ws.FlEmit, ed: Ed, wi: int) {
+    se_map(mut e, "")
+    se_list(mut e, "cursors")
+    var i = 0
+    while i < ed.wins[wi].cs.curs.len && i < ws.STATE_MAX_CURSORS {
+        let c = copy ed.wins[wi].cs.curs[i]
+        se_map(mut e, "")
+        se_int(mut e, "pos", c.pos)
+        se_int(mut e, "anchor", c.anchor)
+        se_int(mut e, "goal", se_goal(ed, wi, c))
+        se_unknown(mut e, ed, ws.STATE_REC_CURSOR, ed.wins[wi].id, ed.wins[wi].cs.stamps[i])
+        ws.fl_map_close(mut e)
+        i += 1
+    }
+    ws.fl_list_close(mut e)
+    se_int(mut e, "primary", ed.wins[wi].cs.primary)
+    se_map(mut e, "view")
+    se_int(mut e, "top", ed.wins[wi].vp.top)
+    se_int(mut e, "top_sub", ed.wins[wi].vp.top_sub)
+    se_int(mut e, "left", ed.wins[wi].vp.left)
+    se_bool(mut e, "wrap", ed.wins[wi].vp.wrap)
+    se_unknown(mut e, ed, ws.STATE_REC_VIEW, ed.wins[wi].id, 0)
+    ws.fl_map_close(mut e)
+    se_ring(
+        mut e,
+        ed,
+        "jumps",
+        ed.wins[wi].jumps,
+        ws.STATE_REC_JUMPS,
+        ws.STATE_REC_JUMP_ENTRY,
+        ed.wins[wi].id,
+    )
+    se_unknown(mut e, ed, ws.STATE_REC_WIN, 0, ed.wins[wi].id)
+    ws.fl_map_close(mut e)
+}
+
+fn se_tab(mut e: ws.FlEmit, ed: Ed, ti: int) {
+    // ONE collection is used for panes.win, focus and wins (C:410-439).
+    let order = pane_collect_leaves(ed, ed.tabs[ti].root, PANE_MAX_LEAVES)
+    se_map(mut e, "")
+    let id = ed.tabs[ti].tab_id
+    let bi = ed_buf_index(ed, ed.tabs[ti].buffer_id)
+    se_int(mut e, "id", id)
+    se_path(mut e, ed, bi, ed.tabs[ti].path, ed.tabs[ti].has_path)
+    se_int(mut e, "group", ed.tabs[ti].group_id)
+    se_int(mut e, "group_ordinal", ed.tabs[ti].group_ordinal)
+    se_bool(mut e, "deferred", ti != ed.tab_active && !tab_is_resident(ed, ti))
+    let focused = ed.tabs[ti].focus
+    se_int(
+        mut e,
+        "focus",
+        if pane_live(ed, focused) then se_win_index(ed, order, ed.panes[focused].win) else 0,
+    )
+    se_panes(mut e, ed, "panes", ed.tabs[ti].root, order, id)
+    se_list(mut e, "wins")
+    for leaf in order { se_win(mut e, ed, ed.panes[leaf].win) }
+    ws.fl_list_close(mut e)
+    se_unknown(mut e, ed, ws.STATE_REC_TAB, 0, id)
+    ws.fl_map_close(mut e)
+}
+
+fn se_files(mut e: ws.FlEmit, ed: Ed) {
+    se_list(mut e, "files")
+    var i = 0, written = 0
+    while i < ed.bufs.len && written < ws.STATE_MAX_FILES {
+        if !ed.bufs[i].has_path || ed.bufs[i].flags & BUF_SCRATCH != 0 { i += 1; continue }
+        let id = ed.bufs[i].id
+        se_map(mut e, "")
+        se_path(mut e, ed, i, ed.bufs[i].path, true)
+        se_list(mut e, "marks")
+        var m = 0
+        while m < 26 {
+            if ed.bufs[i].named.set[m] || ed.bufs[i].named.pending_set[m] {
+                let name = "abcdefghijklmnopqrstuvwxyz"[m..m + 1]
+                se_map(mut e, "")
+                se_str(mut e, "name", name)
+                let pos = ed_mark_get(ed, i, 97 + m) else ed.bufs[i].named.pending[m]
+                se_int(mut e, "pos", pos)
+                se_unknown(mut e, ed, ws.STATE_REC_MARK, id, 97 + m)
+                ws.fl_map_close(mut e)
+            }
+            m += 1
+        }
+        ws.fl_list_close(mut e)
+        se_ring(
+            mut e,
+            ed,
+            "changes",
+            ed.bufs[i].ec.changes.ring,
+            ws.STATE_REC_CHANGES,
+            ws.STATE_REC_CHANGE_ENTRY,
+            id,
+        )
+        se_map(mut e, "undo")
+        var hash = ws.fnv1a64(ed.bufs[i].path.bytes())
+        for row in ed.state.byte_paths {
+            if row.buffer_id == id { hash = ws.fnv1a64(row.bytes); break }
+        }
+        se_str(mut e, "file", "{text.hex16(hash)}.yewu")
+        se_int(mut e, "version", 1)
+        se_unknown(mut e, ed, ws.STATE_REC_UNDO, id, 0)
+        ws.fl_map_close(mut e)
+        se_unknown(mut e, ed, ws.STATE_REC_FILE, 0, id)
+        ws.fl_map_close(mut e)
+        written += 1
+        i += 1
+    }
+    ws.fl_list_close(mut e)
+}
+
+/// Emit canonical v1 with the caller's wall-clock seconds (deterministic tests).
+pub fn state_emit_at(ed: Ed, saved_at: int) -> List[byte] {
+    var e = ws.fl_emit()
+    se_map(mut e, "")
+    se_int(mut e, "version", ws.STATE_VERSION)
+    se_str(mut e, "writer", "yew")
+    se_map(mut e, "workspace")
+    se_str(mut e, "path", ws_root(ed))
+    se_int(mut e, "saved_at", saved_at)
+    ws.state_emit_unknown(mut e, ed.state.literals, true)
+    ws.fl_map_close(mut e)
+    ws.state_emit_options(mut e, ed.state.literals)
+    se_list(mut e, "groups")
+    for g in ed.groups {
+        se_map(mut e, "")
+        se_int(mut e, "id", g.id)
+        se_str(mut e, "label", g.label)
+        se_str(mut e, "dir_path", g.dir_path)
+        if g.has_last {
+            se_str(mut e, "last_active_member", g.last_active_member)
+        } else {
+            ws.fl_nil(mut e, true, "last_active_member".bytes())
+        }
+        se_unknown(mut e, ed, ws.STATE_REC_GROUP, 0, g.id)
+        ws.fl_map_close(mut e)
+    }
+    ws.fl_list_close(mut e)
+    se_list(mut e, "tabs")
+    var i = 0
+    while i < ed.tabs.len && i < ws.STATE_MAX_TABS { se_tab(mut e, ed, i); i += 1 }
+    ws.fl_list_close(mut e)
+    let active = ed.tab_active
+    se_int(
+        mut e,
+        "active_tab",
+        if active >= 0 && active < ed.tabs.len then ed.tabs[active].tab_id else 0,
+    )
+    se_files(mut e, ed)
+    ws.state_emit_unknown(mut e, ed.state.literals, false)
+    ws.fl_map_close(mut e)
+    ws.fl_emit_finish(take e)
+}
+
+/// Emit live state; saved_at is display-only wall-clock seconds.
+pub fn state_emit(ed: Ed) -> List[byte] { state_emit_at(ed, time.unix_ms() / 1000) }

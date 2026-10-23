@@ -1,0 +1,219 @@
+//! edit.state_save — workspace owner, pid lease and coalesced atomic save.
+//! Ports sagitta src/ws/state_save.c:56-325 and state.h:115-174 at
+//! 9ace98c2. Fatal paths never call this module. All writes reuse
+//! text.file_write_atomic; a failed save leaves dirty set.
+
+use text
+use util
+use ws
+
+/// Workspace timer callback kind (distinct from search/tab/message kinds).
+pub const TIMER_STATE_SAVE: int = 40
+
+/// Coalesce from the FIRST change; continuous changes cannot postpone saves.
+pub const STATE_SAVE_DEBOUNCE_MS: int = 2000
+
+/// Original bytes of a G40 path that the filesystem's str API cannot name.
+pub struct StatePath { buffer_id: int, bytes: List[byte] }
+
+/// Single-session workspace state, stateless until explicitly opened.
+pub struct WsState {
+    key: ws.WsKey,
+    ready: bool,
+    dirty: bool,
+    writer: bool,
+    owner_told: bool,
+    owner_pid: int,
+    timer: int,
+    writes: int,
+    literals: ws.StateLiterals,
+    missing_count: int,
+    byte_paths: List[StatePath],
+}
+
+/// Empty state does not read or write anything.
+pub fn state_new() -> WsState {
+    WsState {
+        key: ws.ws_key_empty(),
+        ready: false,
+        dirty: false,
+        writer: false,
+        owner_told: false,
+        owner_pid: 0,
+        timer: TIMER_NONE,
+        writes: 0,
+        literals: ws.state_literals(),
+        missing_count: 0,
+        byte_paths: List[StatePath](),
+    }
+}
+
+// strtol's leading whitespace/sign and numeric-prefix semantics, bounded by
+// the same 31-byte read as C (state_save.c:70-91).
+fn state_lock_read(path: str) -> int {
+    let fd = fs_open(path) else { return 0 }
+    defer fs_close(fd) else |_| {}
+    let bytes = fs_read_chunk(fd, 31) else { return 0 }
+    var i = 0
+    while i < bytes.len &&
+        (bytes[i] as int == 32 || bytes[i] as int >= 9 && bytes[i] as int <= 13) { i += 1 }
+    if i < bytes.len && bytes[i] as int == 45 { return 0 }
+    if i < bytes.len && bytes[i] as int == 43 { i += 1 }
+    var pid: int = 0
+    while i < bytes.len && bytes[i] as int >= 48 && bytes[i] as int <= 57 {
+        let d = bytes[i] as int - 48
+        if pid > (9223372036854775807 - d) / 10 { return 0 }
+        pid = pid * 10 + d
+        i += 1
+    }
+    pid
+}
+
+fn state_pid_alive(pid: int) -> bool {
+    if pid <= 0 { return false }
+    os_signal_send(pid, 0) else |e| match e {
+        denied => { return true },
+        _ => { return false },
+    }
+    true
+}
+
+fn state_lock_claim(mut s: WsState) {
+    s.writer = false
+    s.owner_pid = 0
+    let path = ws.ws_lock_path(s.key)
+    if path.len == 0 { return }
+    let mine = os_pid()
+    let held = state_lock_read(path)
+    if held != 0 && held != mine && state_pid_alive(held) {
+        s.owner_pid = held
+        util.log_info("workspace state is owned by pid {held}; this session will not save it")
+        return
+    }
+    let line = "{mine}\n"
+    if text.file_write_atomic(path, line.bytes(), 384) != text.SAVE_OK {
+        util.log_warn("cannot write {path}; this session will not save workspace state")
+        return
+    }
+    let readback = state_lock_read(path)
+    if readback != mine { s.owner_pid = readback; return }
+    s.writer = true
+}
+
+/// Compute identity and claim its pid lease; clean sessions return before I/O.
+pub fn state_open(mut ed: Ed) {
+    ed.state = state_new()
+    if !ws.ws_key_session(mut ed.state.key, ws_root(ed), ed.clean) { return }
+    if !ws.ws_ensure_dir(mut ed.state.key) { return }
+    ed.state.ready = true
+    state_lock_claim(mut ed.state)
+}
+
+/// Emit the complete live state and atomically replace the document.
+pub fn state_save(mut ed: Ed) -> bool {
+    if !ed.state.ready || !ed.state.writer { return false }
+    let path = ws.ws_state_path(ed.state.key)
+    if path.len == 0 { return false }
+    var ok = false
+    region save {
+        let bytes = state_emit(ed)
+        ok = text.file_write_atomic(path, bytes, 384) == text.SAVE_OK
+    }
+    if !ok { util.log_warn("cannot write {path}"); return false }
+    ed.state.dirty = false
+    ed.state.writes += 1
+    true
+}
+
+/// Mark a state mutation and arm one 2000ms timer, without sliding it.
+pub fn state_mark_dirty(mut ed: Ed) {
+    if !ed.state.ready { return }
+    if !ed.state.writer {
+        if !ed.state.owner_told && ed.state.owner_pid > 0 {
+            ed.state.owner_told = true
+            ed_msg(
+                mut ed,
+                MSG_WARN,
+                "workspace state is owned by pid {ed.state.owner_pid}; this session will not save it",
+            )
+        }
+        return
+    }
+    ed.state.dirty = true
+    if ed.state.timer != TIMER_NONE { return }
+    ed.state.timer = timer_add(
+        mut ed.timers,
+        ed.now_ms + STATE_SAVE_DEBOUNCE_MS,
+        TIMER_STATE_SAVE,
+        0,
+    )
+}
+
+/// Loop callback; never a signal handler callback.
+pub fn state_save_timer(mut ed: Ed) {
+    ed.state.timer = TIMER_NONE
+    if ed.state.dirty { let _ = state_save(mut ed) }
+}
+
+/// Forget identity tokens before replacing their retained document owner.
+pub fn state_retained_clear(mut ed: Ed) {
+    var i = 0
+    while i < ed.panes.len { ed.panes[i].state_token = 0; i += 1 }
+    i = 0
+    while i < ed.wins.len {
+        var j = 0
+        while j < ed.wins[i].jumps.e.len { ed.wins[i].jumps.e[j].state_token = 0; j += 1 }
+        i += 1
+    }
+    i = 0
+    while i < ed.bufs.len {
+        var j = 0
+        while j < ed.bufs[i].ec.changes.ring.e.len {
+            ed.bufs[i].ec.changes.ring.e[j].state_token = 0
+            j += 1
+        }
+        i += 1
+    }
+    ws.state_records_reset(mut ed.state.literals)
+}
+
+/// Idempotent teardown, releasing only our own lock and saving nothing.
+pub fn state_dispose(mut ed: Ed) {
+    if ed.state.timer != TIMER_NONE {
+        let _ = timer_cancel(mut ed.timers, ed.state.timer)
+        ed.state.timer = TIMER_NONE
+    }
+    if ed.state.writer {
+        ed.state.writer = false
+        let path = ws.ws_lock_path(ed.state.key)
+        if path.len != 0 && state_lock_read(path) == os_pid() { fs_remove(path) else |_| {} }
+    }
+    state_retained_clear(mut ed)
+    ed.state.literals = ws.state_literals()
+    ed.state.ready = false
+    ed.state.dirty = false
+}
+
+/// Clean quit and TERM/HUP save even when no structural change was dirty.
+pub fn state_close(mut ed: Ed) {
+    if ed.state.ready && ed.state.writer { let _ = state_save(mut ed) }
+    state_dispose(mut ed)
+}
+
+/// Typed boolean overlay; only a changed value dirties the workspace.
+pub fn state_option_bool_set(mut ed: Ed, key: str, value: bool) -> bool {
+    let changed = ws.state_option_bool_set(mut ed.state.literals, key.bytes(), value)
+    if changed { state_mark_dirty(mut ed) }
+    changed
+}
+
+/// Effective retained/overridden boolean, or the caller's default.
+pub fn state_option_bool(ed: Ed, key: str, dflt: bool) -> bool {
+    ws.state_option_bool(ed.state.literals, key.bytes(), dflt)
+}
+
+/// Retained string option; unsupported UTF-8 uses the supplied default.
+pub fn state_option_str(ed: Ed, key: str, dflt: str) -> str {
+    let span = ws.state_option_string_span(ed.state.literals, key.bytes()) else { return dflt }
+    str_from_utf8(ed.state.literals.doc.bytes[span.at..span.at + span.len]) else dflt
+}
