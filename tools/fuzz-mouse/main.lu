@@ -1,0 +1,388 @@
+//! fuzz-mouse — Sprint 27's router fuzz: the port of sagitta
+//! `tests/fuzz/fuzz_mouse.c` (464 lines) over the generator of
+//! `tests/fuzz/fuzzlib.c` (`yew_fuzz_main`) at 9ace98c2, which
+//! `tools/fuzzgen` ports C's bit for bit, so a seed's `hash=` is C's for
+//! the same seed and iterations — the witness that the port ran the same
+//! sessions.
+//!
+//! The check is C's `run_session` (`fuzz_mouse.c:243-460`): a fresh
+//! editor on a scratch buffer, six tabs and a two-member group, then
+//! 25,000 mouse events written as a terminal writes them (SGR and X10
+//! reports, motion with and without a button — s57.13's base 35 —
+//! ctrl+left, releases with no press, wheel bursts, coordinates far off
+//! the grid, a truncated introducer) and fed THROUGH THE DECODER
+//! (`term.input_feed` / `term.input_next`), the strip painted before
+//! each. After every event: the region table is not left frozen; mode
+//! 1003 is armed IF AND ONLY IF an open menu or a drawn chevron wants it
+//! (s57.15 §2, checked before the event and again after a menu's Esc);
+//! a wheel never leaves a button held; the tab array never moves during
+//! a drag; the active index and the strip stay in range. A tab is closed
+//! under the gesture one event in 512. At the end a cancel must reach
+//! IDLE with nothing held, and at least a quarter of the events must
+//! have reached the router. A trap anywhere is the crash C reports.
+//!
+//!   fuzz-mouse [--iters=N] [--seed=N]
+//!
+//! Defaults are C's (`--iters=200000 --seed=1`); C's own campaign counts
+//! SESSIONS (`MOUSE_FUZZ_EVENTS=100000` over 25,000-event sessions at
+//! four seeds, Makefile:173-178, 2309-2314): `tools/run-fuzz-mouse
+//! --campaign`. One region a session: its editor dies with it (G33).
+
+use edit
+use fuzzgen
+use term
+
+const EPOCH: int = 64
+
+// `FZ_ROWS`, `FZ_COLS`, `FZ_TABS`, `FZ_EVENTS` (`fuzz_mouse.c:66-74`).
+const FZ_ROWS: int = 24
+
+const FZ_COLS: int = 80
+
+const FZ_TABS: int = 6
+
+const FZ_EVENTS: int = 25000
+
+// `FZ_MOD_CTRL` (`:122-125`): the SGR modifier bit a terminal sets for
+// Ctrl.
+const FZ_MOD_CTRL: int = 16
+
+struct Rng {
+    s: wrapping[u64],
+}
+
+// `rng_next` (`fuzz_mouse.c:55-59`).
+fn rng_next(mut r: Rng) -> int {
+    r.s = r.s * 6364136223846793005 + 1442695040888963407
+    (r.s >> 33) as int
+}
+
+// `rng_below` (`:61-64`).
+fn rng_below(mut r: Rng, n: int) -> int {
+    if n == 0 {
+        return 0
+    }
+    rng_next(mut r) % n
+}
+
+fn push_str(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+// `emit_sgr` (`:86-94`): one SGR (1006) report, `cb` carrying the button
+// and modifier bits exactly as a terminal encodes them.
+fn emit_sgr(mut out: List[byte], cb: int, x: int, y: int, release: bool) {
+    let fin = if release then "m" else "M"
+    push_str(mut out, "\u{1b}[<{cb};{x};{y}{fin}")
+}
+
+// `emit_x10` (`:96-110`): an X10 report, its bytes saturating as C's u8
+// casts do.
+fn emit_x10(mut out: List[byte], cb: int, x: int, y: int) {
+    (mut out).push(27 as byte)
+    (mut out).push('[' as int as byte)
+    (mut out).push('M' as int as byte)
+    (mut out).push((32 + (cb & 255)) as byte)
+    (mut out).push((32 + (x & 255)) as byte)
+    (mut out).push((32 + (y & 255)) as byte)
+}
+
+// `fz_coord` (`:112-120`): mostly on the grid, sometimes far outside it.
+fn fz_coord(mut r: Rng, limit: int) -> int {
+    let pick = rng_below(mut r, 16)
+    if pick == 0 {
+        return 0
+    }
+    if pick == 1 {
+        return limit + 1 + rng_below(mut r, 4)
+    }
+    if pick == 2 {
+        return 60000 + rng_below(mut r, 6000)
+    }
+    1 + rng_below(mut r, limit)
+}
+
+// `emit_random_event` (`:127-185`).
+fn emit_random_event(mut r: Rng, mut out: List[byte]) {
+    let shape = rng_below(mut r, 100)
+    let x = fz_coord(mut r, FZ_COLS)
+    let y = fz_coord(mut r, FZ_ROWS)
+    let mods = rng_below(mut r, 8) * 4
+    if shape < 20 {
+        emit_sgr(mut out, 0 | mods, x, y, false)
+    } else if shape < 30 {
+        emit_sgr(mut out, 32 | mods, x, y, false)
+    } else if shape < 40 {
+        // s57.13 §1: MOTION WITH NO BUTTON HELD, base 35.
+        emit_sgr(mut out, 35 | mods, x, y, false)
+    } else if shape < 46 {
+        // CTRL+LEFT, the second way to open a menu.
+        emit_sgr(mut out, 0 | FZ_MOD_CTRL, x, y, false)
+    } else if shape < 58 {
+        // A release, often with no matching press.
+        let b = rng_below(mut r, 3)
+        emit_sgr(mut out, b | mods, x, y, true)
+    } else if shape < 74 {
+        // Wheel bursts: several notches with no release between.
+        let n = 1 + rng_below(mut r, 6)
+        var i = 0
+        while i < n {
+            let w = rng_below(mut r, 4)
+            emit_sgr(mut out, 64 + w + mods, x, y, false)
+            i += 1
+        }
+    } else if shape < 84 {
+        emit_sgr(mut out, 2 | mods, x, y, false)
+    } else if shape < 90 {
+        emit_sgr(mut out, 1 | mods, x, y, false)
+    } else if shape < 96 {
+        let cb = rng_below(mut r, 96)
+        emit_x10(mut out, cb, x, y)
+    } else {
+        // Malformed: a truncated SGR introducer.
+        push_str(mut out, "\u{1b}[<")
+    }
+}
+
+// `Snap` / `snap_take` / `snap_eq` (`:191-213`): the order, by tab id,
+// capped at FZ_TABS + 2 as C's array is.
+fn snap_take(ed: edit.Ed) -> List[int] {
+    var s = List[int]()
+    var n = edit.tab_count(ed)
+    if n > FZ_TABS + 2 {
+        n = FZ_TABS + 2
+    }
+    var i = 0
+    while i < n {
+        (mut s).push(ed.tabs[i].tab_id)
+        i += 1
+    }
+    s
+}
+
+fn snap_eq(a: List[int], b: List[int]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `motion_wanted` (`:223-229`): who wants mode 1003 right now — spelled
+// out here rather than asked of the router, so the fuzzer checks the
+// claim and not the implementation of it.
+fn motion_wanted(ed: edit.Ed) -> bool {
+    edit.mouse_enabled(ed) && (edit.ctx_active(ed.ctx) || edit.mouse_chevron_drawn(ed))
+}
+
+// `fz_paint` (`:231-241`): a frame, so the region table and the strip's
+// slot table are live.
+fn fz_paint(mut ed: edit.Ed) {
+    edit.region_frame_begin(mut ed.regions)
+    if ed.layout_dirty {
+        edit.ed_layout(mut ed)
+    }
+    let tr = copy ed.tab_strip_rect
+    edit.tab_strip_draw(mut ed, tr)
+    edit.pane_tables_reset(mut ed)
+    let root = ed.pane_root
+    let leaf = edit.pane_table_add_leaf(mut ed, root)
+    edit.region_add(mut ed.regions, edit.REGION_PANE, copy ed.panes[ed.pane_root].rect, leaf)
+}
+
+fn esc_key() -> term.Key {
+    var k = term.key_new()
+    k.kind = term.EV_KEY
+    k.code = term.KEY_ESCAPE
+    k
+}
+
+// `run_session` (`:243-460`): "" when every event held.
+fn run_session(data: List[byte]) -> str {
+    var rng = Rng { s: 2611923443488327891 }
+    for b in data {
+        rng.s = rng.s * 31 + b as int as wrapping[u64]
+    }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    ed.grid = term.grid_new(FZ_ROWS, FZ_COLS)
+    ed.grid_ready = true
+    var i = 0
+    while i < FZ_TABS {
+        let _ = edit.tab_open(mut ed, "/tmp/yew-fzmouse-{i}.txt")
+        i += 1
+    }
+    // A group, so the negative-payload path and the dwell are both
+    // reachable from random coordinates.
+    let g = edit.group_create(mut ed, "/src", "grp")
+    edit.group_add_member(mut ed, g, 4)
+    edit.group_add_member(mut ed, g, 5)
+    edit.tab_switch(mut ed, 0)
+    edit.ed_layout(mut ed)
+    ed.now_ms = 1000
+    var inp = term.input_new(term.caps_new())
+    var held = List[int]()
+    var holding = false
+    var event = 0
+    var why = ""
+    while why.len == 0 && event < FZ_EVENTS {
+        var stream = List[byte]()
+        emit_random_event(mut rng, mut stream)
+        term.input_feed(mut inp, stream, 0, stream.len)
+        fz_paint(mut ed)
+        var key = term.key_new()
+        while why.len == 0 && term.input_next(mut inp, ed.now_ms, mut key) {
+            if key.kind != term.EV_MOUSE {
+                continue
+            }
+            event += 1
+            // The freeze must never be left on.
+            if edit.region_frozen(ed.regions) {
+                why = "region table left frozen after event {event}"
+                break
+            }
+            // MODE 1003 IS ARMED IF AND ONLY IF someone wants it.
+            if motion_wanted(ed) != term.tty_mouse_motion_active(ed.tty) {
+                let armed = if term.tty_mouse_motion_active(ed.tty) then "armed" else "disarmed"
+                let there = if motion_wanted(ed) then "there is" else "there is no"
+                why = "1003 {armed} but {there} a chevron or menu, event {event}"
+                break
+            }
+            if key.ev == term.KEY_PRESS && key.button == term.MB_LEFT {
+                held = snap_take(ed)
+                holding = true
+            }
+            edit.mouse_event(mut ed, key)
+            // Wheels are impulses: they never leave a button down.
+            if key.button >= term.MB_WHEEL_UP && key.button <= term.MB_WHEEL_RIGHT &&
+                ed.mouse.phase == edit.MP_IDLE && ed.mouse.held != 0 {
+                why = "a wheel notch left a button held"
+                break
+            }
+            // Nothing in the tab array moves while a drag is in flight.
+            if holding && key.ev == term.KEY_REPEAT &&
+                (ed.mouse.phase == edit.MP_DRAG_TAB || ed.mouse.phase == edit.MP_DRAG_GROUP) {
+                if !snap_eq(held, snap_take(ed)) {
+                    why = "the tab array moved during a drag"
+                    break
+                }
+            }
+            if key.ev == term.KEY_RELEASE {
+                holding = false
+            }
+            // The active index stays in range.
+            if ed.tab_active < -1 || ed.tab_active >= edit.tab_count(ed) {
+                why = "active tab index {ed.tab_active} out of range ({edit.tab_count(ed)} tabs)"
+                break
+            }
+            // Every Rect the layout produced stays inside the grid.
+            if ed.tab_strip_rect.y + ed.tab_strip_rect.h > ed.grid.rows ||
+                ed.tab_strip_rect.x + ed.tab_strip_rect.w > ed.grid.cols {
+                why = "the strip left the grid"
+                break
+            }
+            ed.now_ms += 1 + rng_below(mut rng, 200)
+            let now = ed.now_ms
+            edit.mouse_tick(mut ed, now)
+            // Menus are closed THROUGH THE ROUTER'S OWN Esc path.
+            if edit.ctx_active(ed.ctx) {
+                let _ = edit.mouse_menu_key(mut ed, esc_key())
+            }
+            if term.tty_mouse_motion_active(ed.tty) && !edit.mouse_chevron_drawn(ed) {
+                why = "1003 survived a menu close, event {event}"
+                break
+            }
+            // Occasionally close a tab under the gesture.
+            if rng_below(mut rng, 512) == 0 && edit.tab_count(ed) > 1 {
+                let victim = rng_below(mut rng, edit.tab_count(ed))
+                let _ = edit.tab_close(mut ed, victim)
+            }
+        }
+    }
+    // Quiescence: an explicit cancel returns the router to idle.
+    if why.len == 0 {
+        edit.mouse_cancel(mut ed)
+        if ed.mouse.phase != edit.MP_IDLE || ed.mouse.held != 0 {
+            why = "cancel left phase={ed.mouse.phase} held={ed.mouse.held}"
+        }
+    }
+    if why.len == 0 && event < FZ_EVENTS / 4 {
+        // The fuzzer must not be able to pass by doing nothing.
+        why = "only {event} events reached the router"
+    }
+    edit.ctx_close(mut ed.ctx)
+    why
+}
+
+fn main() -> int {
+    let (ok, seed, iters) = fuzzgen.parse_args(env_args())
+    if !ok {
+        eprint("usage: fuzz-mouse [--seed=N] [--iters=N]")
+        return 2
+    }
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    let (cok, corpus) = fuzzgen.corpus_for("fuzz_mouse")
+    if !cok {
+        return 2
+    }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > EPOCH then EPOCH else iters - done
+        region epoch {
+            var r = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut r, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut r, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, o) = fuzzgen.mutate(mut r, input, corpus)
+                    input = next
+                    op = o
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut r, input)
+                var bad = false
+                region session {
+                    let why = run_session(input)
+                    if why.len != 0 {
+                        eprint(
+                            "fuzz_mouse: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                        )
+                        eprint("fuzz_mouse: input={fuzzgen.hex_of(input)}")
+                        bad = true
+                    }
+                }
+                if bad {
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = r.state
+            hash = r.hash
+        }
+        done += n
+    }
+    if failed {
+        return 1
+    }
+    print(
+        "fuzz_mouse: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok",
+    )
+    0
+}
