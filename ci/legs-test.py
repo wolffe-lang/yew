@@ -16,9 +16,12 @@
   L4  the wiring of .github/workflows/ci.yml: `legs` is the first job and
       runs this file before ci/legs.py; `port` and `oracle` need it and
       take their hosts from it, read with a default, with no host list of
-      their own; `checked-cases` (yw06: the checked machine one case at a
-      time) needs it too and runs on one ubuntu host, the checked machine
-      being the same on every host; the outputs are declared; the trunk
+      their own; `unit` (the Linux unit lanes in three shards) and `fuzz`
+      (the Linux fuzzers in three families) need it and run on ubuntu, and
+      the port and oracle jobs leave those steps to them on Linux alone;
+      `checked-cases` (yw06: the checked machine one case at a time) needs
+      it too and runs on one ubuntu host, the checked machine being the
+      same on every host; the outputs are declared; the trunk
       push, the pull request, the nightly and the dispatch are there; cancel-in-progress
       is for pull requests only and every other run has a group of its own
       run id; a red nightly, and only a red nightly, runs
@@ -108,7 +111,7 @@ say(night == BEFORE, "L3 the nightly runs exactly the legs every push ran before
 # --- L4 the wiring -----------------------------------------------------------------
 wf = open(WORKFLOW, encoding="utf-8").read()
 JOBS = re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", wf[wf.index("\njobs:\n"):], re.M)
-say(JOBS == ["legs", "port", "checked-cases", "oracle", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
+say(JOBS == ["legs", "port", "unit", "fuzz", "checked-cases", "oracle", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
 blocks = {}
 for j in JOBS:
     m = re.search(r"^  %s:\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)" % re.escape(j), wf, re.M | re.S)
@@ -124,6 +127,23 @@ for j in ("port", "oracle"):
     say("    needs: legs\n" in b and ("        include: ${{ fromJSON(needs.legs.outputs.matrix_%s || '[]') }}\n" % j) in b
         and "    runs-on: ${{ matrix.os }}\n" in b and not re.search(r"^          - os: ", b, re.M),
         "L4 %s needs the legs and takes its hosts from them, with a default, and no host list of its own" % j)
+un = blocks["unit"]
+say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-latest$", un, re.M) is not None
+    and "        shard: [1, 2, 3]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/3\n" in un
+    and "run: tools/check-test --native --shard ${{ matrix.shard }}/3\n" in un,
+    "L4 unit needs the legs and runs both unit lanes in three shards on ubuntu")
+fz = blocks["fuzz"]
+say("    needs: legs\n" in fz and re.search(r"^    runs-on: ubuntu-latest$", fz, re.M) is not None
+    and "        family: [port, against-c-1, against-c-2]\n" in fz and "run: tools/oracle --cc gcc --build-only\n" in fz,
+    "L4 fuzz needs the legs and runs three fuzzer families on ubuntu, C's drivers built for two")
+# every fuzzer the port and oracle jobs run on macOS is a `fuzz` step on Linux, so no
+# fuzzer leaves a host: the same step names, each skipped on Linux where it was
+moved = [m.group(1) for j in ("port", "oracle") for m in re.finditer(
+    r"^      - name: (.*)\n        if: \$\{\{ (?:.*) && runner.os != 'Linux' \}\}$", blocks[j], re.M)]
+fuzz_names = re.findall(r"^      - name: (.*)$", fz, re.M)
+say(len(moved) == 15 and all(n in fuzz_names for n in moved if not n.startswith(("wolf test", "the same tests")))
+    and sum(1 for n in moved if n.startswith(("wolf test", "the same tests"))) == 2,
+    "L4 every step the port and oracle jobs leave on Linux is a unit or fuzz step there (%d moved)" % len(moved))
 cc = blocks["checked-cases"]
 say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-latest$", cc, re.M) is not None
     and "matrix" not in cc and "run: python3 -I tools/check-test-cases\n" in cc,
@@ -137,7 +157,7 @@ g = g.group(1).rstrip() if g else ""
 say(g.endswith("|| format('ci-{0}-{1}', github.event_name, github.run_id) }}") and "github.head_ref" in g,
     "L4 a pull request's runs share its branch's group; every other run has a group of its own run id")
 n = blocks["nightly-red"]
-say("    needs: [legs, port, checked-cases, oracle]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
+say("    needs: [legs, port, unit, fuzz, checked-cases, oracle]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
     and "      issues: write\n" in n and "        run: ci/nightly-red.sh\n" in n and "WORKFLOW: ${{ github.workflow }}" in n,
     "L4 a red nightly, and only a red nightly, runs ci/nightly-red.sh with issues: write")
 
