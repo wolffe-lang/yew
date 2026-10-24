@@ -31,14 +31,11 @@
 //!   (`copy_xattrs`, `file.c:1300-1335`); the port cannot read or write
 //!   one, so an atomic save drops them. No test or torture lane carries
 //!   an attribute.
-//! - **No full stat on a handle.** `fs_fstat` answers three words; C's
-//!   identity checks `fstat` the descriptor it holds. The port `fs_stat`s
-//!   the PATH it just opened, a window C does not have.
-//! - **No `O_NOFOLLOW`, no `access(2)`, no write-only open without
-//!   truncation.** A final symlink is refused by an `fs_lstat` before the
-//!   open; directory writability is the mode bits against this process's
-//!   ids (`directory_writable`); an in-place write opens read-write (open
-//!   mode 3), which C's `O_WRONLY` does not need.
+//! - **No write-only existing-file open without truncation.** In-place
+//!   writes still use read-write mode 3, which also permits creation;
+//!   C's O_WRONLY needs neither read permission nor O_CREAT. This remains
+//!   G32's unretired surface. At 0.2.35 the no-follow bit and full handle
+//!   stat DO replace the old lstat/open and path-stat race windows.
 
 use unicode
 use util
@@ -232,6 +229,12 @@ fn path_stat(path: str) -> Stat {
         io => { return stat_none(false, false) },
     }
     stat_of(w)
+}
+
+// The identity of the open file, not a second walk of its name (G32).
+fn fd_stat(fd: int) -> Stat {
+    let words = fs_fstat_record(fd) else { return stat_none(false, false) }
+    stat_of(words)
 }
 
 fn path_lstat(path: str) -> Stat {
@@ -739,11 +742,7 @@ fn content_matches_disk(meta: FileMeta, tb: TextBuf, path: str, before: Stat) ->
     if !meta.disk_snapshot_valid {
         return (false, false)
     }
-    let lst = path_lstat(path)
-    if !lst.ok || lst.kind == KIND_LINK {
-        return (false, true)
-    }
-    let fd = fs_open(path) else {
+    let fd = fs_open_mode(path, 16) else {
         return (false, true)
     }
     var ok = true
@@ -775,7 +774,7 @@ fn content_matches_disk(meta: FileMeta, tb: TextBuf, path: str, before: Stat) ->
             ok = false
         }
     }
-    let after = path_stat(path)
+    let after = fd_stat(fd)
     if !after.ok {
         io_error = true
         ok = false
@@ -856,38 +855,13 @@ fn stat_matches_meta(st: Stat, meta: FileMeta) -> bool {
         st.mtime_ns == meta.mtime_ns
 }
 
-// No `access(2)` in wolf 0.2.33: a directory is writable when its mode has
-// a write bit and the bit that applies to this process's effective ids is
-// set (root writes anywhere). ACLs and a read-only mount are not seen.
+// `directory_writable` (file.c:690-699): C deliberately rejects a
+// directory with no write bits even for root, then asks access(W_OK).
 fn directory_writable(path: str) -> bool {
     let st = path_stat(path)
-    if !st.ok {
-        return false
-    }
-    if st.mode & 146 == 0 {
-        return false
-    }
-    let euid = os_euid() else -1
-    if euid == 0 {
-        return true
-    }
-    if st.uid == euid {
-        return st.mode & 128 != 0
-    }
-    let egid = os_egid() else -1
-    var in_group = st.gid == egid
-    if !in_group {
-        let groups = os_groups() else List[int]()
-        for g in groups {
-            if g == st.gid {
-                in_group = true
-            }
-        }
-    }
-    if in_group {
-        return st.mode & 16 != 0
-    }
-    st.mode & 2 != 0
+    if !st.ok || st.mode & 146 == 0 { return false }
+    fs_access(path, 2) else |_| { return false }
+    true
 }
 
 fn make_dir_0700(path: str) -> bool {
@@ -1189,16 +1163,14 @@ fn open_temp(dir: str, base: str, mode: int) -> (int, str, int) {
 // `copy_path_to_backup`, `file.c:1026-1118`: answers COPY_*.
 fn copy_path_to_backup(src_path: str, bak_path: str, meta: FileMeta) -> int {
     let dir = path_dirname(bak_path)
-    let lst = path_lstat(src_path)
-    if !lst.ok || lst.kind == KIND_LINK {
-        return if lst.denied then COPY_PERM else COPY_IO
-    }
-    let src = fs_open(src_path) else |e| match e {
+    let src = fs_open_mode(src_path, 16) else |e| match e {
         denied => { return COPY_PERM },
         not_found => { return COPY_IO },
+        exists => { return COPY_IO },
+        invalid => { return COPY_IO },
         io => { return COPY_IO },
     }
-    let src_st = path_stat(src_path)
+    let src_st = fd_stat(src)
     if !stat_matches_meta(src_st, meta) {
         fs_close(src) else {}
         return COPY_STALE
@@ -1209,7 +1181,7 @@ fn copy_path_to_backup(src_path: str, bak_path: str, meta: FileMeta) -> int {
         return why
     }
     var ok = true
-    let bak_st = path_stat(tmp)
+    let bak_st = fd_stat(bak)
     if !bak_st.ok ||
         bak_st.kind != KIND_FILE ||
         bak_st.dev == src_st.dev && bak_st.ino == src_st.ino {
@@ -1262,15 +1234,10 @@ fn copy_path_to_backup(src_path: str, bak_path: str, meta: FileMeta) -> int {
 
 // `restore_backup`, `file.c:1120-1150`.
 fn restore_backup(bak_path: str, dst_path: str) -> bool {
-    let bl = path_lstat(bak_path)
-    let dl = path_lstat(dst_path)
-    if !bl.ok || bl.kind == KIND_LINK || !dl.ok || dl.kind == KIND_LINK {
+    let bak = fs_open_mode(bak_path, 16) else {
         return false
     }
-    let bak = fs_open(bak_path) else {
-        return false
-    }
-    let dst = fs_open_mode(dst_path, 3) else {
+    let dst = fs_open_mode(dst_path, 3 + 16) else {
         fs_close(bak) else {}
         return false
     }
@@ -1325,7 +1292,7 @@ fn inplace_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts) -> (int, 
             io => { return (SAVE_IO, stat_none(false, false)) },
         }
         var ok = write_and_cut(fd, tb, meta.had_bom)
-        let saved = path_stat(dst)
+        let saved = fd_stat(fd)
         if !saved.ok {
             ok = false
         }
@@ -1366,12 +1333,7 @@ fn inplace_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts) -> (int, 
         }
         return (if why == COPY_PERM then SAVE_PERM else SAVE_IO, stat_none(false, false))
     }
-    let dl = path_lstat(dst)
-    if !dl.ok || dl.kind == KIND_LINK {
-        let _ = discard_backup(pending)
-        return (if dl.denied then SAVE_PERM else SAVE_IO, stat_none(false, false))
-    }
-    let fd = fs_open_mode(dst, 3) else |e| match e {
+    let fd = fs_open_mode(dst, 3 + 16) else |e| match e {
         denied => {
             let _ = discard_backup(pending)
             return (SAVE_PERM, stat_none(false, false))
@@ -1393,14 +1355,14 @@ fn inplace_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts) -> (int, 
             return (SAVE_IO, stat_none(false, false))
         },
     }
-    let st = path_stat(dst)
+    let st = fd_stat(fd)
     if !stat_matches_meta(st, meta) {
         fs_close(fd) else {}
         let _ = discard_backup(pending)
         return (SAVE_CHANGED_ON_DISK, stat_none(false, false))
     }
     var ok = write_and_cut(fd, tb, meta.had_bom)
-    let saved = path_stat(dst)
+    let saved = fd_stat(fd)
     if !saved.ok {
         ok = false
     }
@@ -1544,7 +1506,7 @@ fn atomic_save(tb: TextBuf, meta: FileMeta, dst: str, opts: SaveOpts, force_atom
         // G5 (wolf-lang#685): C copies the target's extended attributes
         // here (`copy_xattrs`); wolf 0.2.33 has no xattr call.
     }
-    let saved = path_stat(tmp)
+    let saved = fd_stat(fd)
     if !saved.ok {
         fs_close(fd) else {}
         let _ = remove_quiet(tmp)
