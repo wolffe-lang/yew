@@ -500,9 +500,21 @@ them, the many-buffers p50 2.12 and the tab switch's p50 2.28
 report lines equal byte for byte; the `perf_state`, `perf_mouse` and
 `perf_finder` harnesses' builds as hard steps; the save's two
 fault-shim rows in a container; the walk's listings against C's (the
-port job, `tools/check-walk-listings`); and the port job's timeout
-raised to 240 minutes (yw05-tail's run took 166 of 180, and yw06 adds 28
-test files to both unit lanes).
+port job, `tools/check-walk-listings`). **The Linux jobs split** (`ci: the
+fuzzers run as their own jobs`): the first PR run (40037661631) was cut by
+time caps, not by a failure — the port job at its 240 minutes in its
+fuzzers (wolf test 92 minutes, the native lane 120), the oracle job at
+its 180 in `fuzz_groups` — so on Linux the two unit lanes run as three
+`unit` shards (`tools/check-test --shard I/N`, every Nth file of the
+sorted list: ~70 minutes each by that run's per-file times; a three-file
+probe on kasumi, `notes/yw06-evidence/continuation/check-test-shard-probe-009ec09.log`)
+and the fuzzers as three `fuzz` families (the port's own, ~45 minutes;
+the campaigns against C's drivers in two halves, ~60 and ~50), every CI
+size unchanged; macOS keeps its unit lanes and fuzzers in its port
+(nightly) and oracle jobs; the caps are each job's need (port 60, 240 on
+macOS's nightly; oracle 150, 210 on macOS; unit and fuzz 120;
+checked-cases 60), and `ci/legs-test.py` L4 checks that every step the
+port and oracle jobs leave on Linux is a `unit` or `fuzz` step there.
 
 **Seen red.** Every new gate was planted in a PR's own run and the PR
 closed unmerged:
