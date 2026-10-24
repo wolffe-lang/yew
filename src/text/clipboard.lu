@@ -22,38 +22,16 @@
 //!    `term.env_process()`; C's process-global terminal OOB queue is the
 //!    renderer's (`term.render_oob_*`, yw01), so `clip_after_render` and
 //!    `clip_pump` take the `term.Render`.
-//!  - `access(name, X_OK)` has no wolf call: `exec_ok` reads the mode
-//!    bits against the real uid, gid and supplementary groups as
-//!    access(2) does, root needing any execute bit (ACLs and noexec
-//!    mounts unread).
-//!  - `pbcopy` is gated in C at compile time (`__APPLE__ && aarch64`);
-//!    since wolf 0.2.35, os_name/os_arch gate the same host (G31).
-//!  - **The subprocess writer and reader fork (G30's fork half, `os_fork`,
-//!    since the 0.2.34 pin; yw05).** C's writer double-forks so the tool is
-//!    no child of the editor and then writes the payload into the tool's
-//!    stdin from the loop NON-BLOCKINGLY (`O_NONBLOCK`, `POLLOUT`), learning
-//!    the tool's pid and its exec status through two pipes
-//!    (`clipboard.c:558-661`, `829-893`). wolf has no non-blocking pipe
-//!    write and no write-readiness wait (G30's other half, wolf-lang#818),
-//!    so the port moves the blocking write into the fork: the editor forks a
-//!    MIDDLE process (`clip_writer_middle`), which starts the tool on a
-//!    data pipe (`process.start_job`, SIGPIPE back to the default as C's
-//!    `clip_child_sigpipe_default`), writes the whole payload into it —
-//!    blocking there is the middle's, never the editor's — and exits; when
-//!    it exits the tool is reparented, as C's grandchild is. One status
-//!    pipe carries what C's pid and exec pipes carry, as lines: `pid N`,
-//!    `exec E` (the start failed, `E` the host's errno), then `done`,
-//!    `epipe` or `write E`. The editor only reads that pipe, never blocking
-//!    (`os_signal_wait_fds` with a zero deadline before each read), keeps
-//!    C's deadline (the tool and the middle killed when it passes), and
-//!    reaps a middle only once its status pipe reads end-of-file, so the
-//!    `os_wait_status` that reaps it never waits on a live process (wolf has
-//!    no per-child `WNOHANG`; `os_wait_poll` would reap a job's child). The
-//!    READER forks a middle too: the tool writes into the editor's data
-//!    pipe directly, as C's does, and the middle waits for the tool and
-//!    reports `status S`, so the editor's read keeps C's deadline and the
-//!    tool's exit status without ever blocking on a child
-//!    (`clipboard.c:918-1099`).
+//!  - executable lookup uses access(X_OK), then a regular-file stat.
+//!  - automatic pbcopy is limited to macOS arm64 through os_name/os_arch.
+//!  - since 0.2.35, the editor owns the non-blocking data-pipe writer
+//!    (fs_set_nonblock/fs_write_some, G30). Its loop waits for bit 62's
+//!    write readiness, with the same deadline as C. The forked middle
+//!    only starts the tool, reports its pid/exec status and exits; it
+//!    never writes the payload. The tool is reparented, as C's double fork.
+//!    One status pipe carries `pid N` or `exec E`, the process.start_job
+//!    handshake making a reported pid an exec-success acknowledgement.
+//!    The reader's middle still reports the tool's final exit status.
 //!  - the waits name `URGENT` (SIGURG), a meaning the editor never listens
 //!    for: `os_signal_wait_fds` wants a non-empty set, and a meaning the
 //!    loop listens for (`term.tty_signal_set`) would be taken off its queue
@@ -63,7 +41,6 @@
 //!    `fork()` failing does (the writer demotes its backend, the reader
 //!    warns "cannot start reader"); the tests SKIP those halves by name.
 
-use std.env as std_env
 use std.fs
 use std.io as std_io
 use std.process
@@ -249,39 +226,11 @@ fn clip_remote() -> bool {
     nonempty_env("SSH_TTY") || nonempty_env("SSH_CONNECTION")
 }
 
-// access(2)'s X_OK over the stat record, by the real ids (see the header).
-fn access_x(info: fs.Info) -> bool {
-    let uid = std_env.uid() else -1
-    if uid == 0 {
-        return info.mode & 73 != 0
-    }
-    if info.uid == uid {
-        return info.mode & 64 != 0
-    }
-    var in_group = false
-    let gid = std_env.gid() else -1
-    if info.gid == gid {
-        in_group = true
-    } else {
-        let groups = std_env.groups() else List[int]()
-        for g in groups {
-            if g == info.gid {
-                in_group = true
-            }
-        }
-    }
-    if in_group {
-        return info.mode & 8 != 0
-    }
-    info.mode & 1 != 0
-}
-
 // `access(path, X_OK) == 0 && stat(path) == 0 && S_ISREG`.
 fn exec_ok(path: str) -> bool {
-    let info = fs.stat(path) else {
-        return false
-    }
-    info.kind == 0 && access_x(info)
+    fs_access(path, 1) else |_| { return false }
+    let info = fs.stat(path) else { return false }
+    info.kind == 0
 }
 
 // `clip_path_exec`, `clipboard.c:141-185`: a name with a slash is itself;
@@ -664,55 +613,26 @@ fn write_line(mut f: fs.File, line: str) {
     fs.write(mut f, line + "\n") else |_| {}
 }
 
-/// The forked writer's middle (`clipboard.c:593-641`, the `middle == 0`
-/// branch, with the editor's non-blocking write moved here, the header):
-/// start the tool on a data pipe, its output and errors on the null
-/// device and SIGPIPE back to the default; report `pid N`, or `exec E`
-/// when it does not start; write all of `bytes` into its stdin; report
-/// `done`, `epipe` or `write E`; and end without running anything of the
-/// editor's. Reusable for any descriptor-fed child: `cmd` is the argv,
-/// `status` the write end the parent reads (the region filter's write
-/// side has the same shape, R-yw04-3).
-pub fn clip_writer_middle(cmd: List[str], bytes: List[byte], status: fs.File) {
+// The forked middle (clipboard.c:593-641): start the tool on the
+// parent's data pipe, report exec success/failure, and exit immediately.
+fn clip_writer_middle(cmd: List[str], data: fs.File, status: fs.File) {
     var st = copy status
-    let data = process.pipe() else |_| {
-        write_line(mut st, "exec {os_error()}")
-        os_exit(0)
-        return
-    }
     let null_out = fs.open_append("/dev/null") else |_| {
         write_line(mut st, "exec {os_error()}")
         os_exit(0)
         return
     }
-    var c = process.from_argv(cmd)
-    process.set_stdin(mut c, data.read)
-    process.set_stdout(mut c, null_out)
-    process.set_stderr(mut c, null_out)
-    let tool = process.start_job(c, -1, signal.broken_pipe()) else |_| {
+    var command = process.from_argv(cmd)
+    process.set_stdin(mut command, data)
+    process.set_stdout(mut command, null_out)
+    process.set_stderr(mut command, null_out)
+    let tool = process.start_job(command, -1, signal.broken_pipe()) else |_| {
         write_line(mut st, "exec {os_error()}")
         os_exit(0)
         return
     }
     let pid = process.pid(tool) else 0
     write_line(mut st, "pid {pid}")
-    fs.close(take data.read) else |_| {}
-    fs.close(take null_out) else |_| {}
-    var w = copy data.write
-    if bytes.len > 0 {
-        fs.write_chunk(mut w, bytes) else |_| {
-            let e = os_error()
-            if e == 32 {
-                write_line(mut st, "epipe")
-            } else {
-                write_line(mut st, "write {e}")
-            }
-            os_exit(0)
-            return
-        }
-    }
-    fs.close(take w) else |_| {}
-    write_line(mut st, "done")
     os_exit(0)
 }
 
@@ -728,25 +648,45 @@ fn clip_spawn_writer(mut c: Clipboard, backend: int, target: int, now_ms: int) -
     if c.reap.len >= CLIP_REAP_MAX {
         return false
     }
+    let data = process.pipe() else |_| { return false }
     let sp = process.pipe() else |_| {
+        close_fd(data.read.fd)
+        close_fd(data.write.fd)
         return false
     }
-    let rfd = sp.read.fd
-    let wfd = sp.write.fd
+    let rfd = sp.read.fd, wfd = sp.write.fd
+    fs_set_nonblock(data.write.fd, true) else |_| {
+        close_fd(data.read.fd)
+        close_fd(data.write.fd)
+        close_fd(rfd)
+        close_fd(wfd)
+        return false
+    }
+    fs_set_nonblock(rfd, true) else |_| {
+        close_fd(data.read.fd)
+        close_fd(data.write.fd)
+        close_fd(rfd)
+        close_fd(wfd)
+        return false
+    }
     let (pid, h) = os_fork() else |_| {
+        close_fd(data.read.fd)
+        close_fd(data.write.fd)
         close_fd(rfd)
         close_fd(wfd)
         return false
     }
     if pid == 0 {
         close_fd(rfd)
-        clip_writer_middle(cmd, c.active.bytes, fs.File { fd: wfd })
+        close_fd(data.write.fd)
+        clip_writer_middle(cmd, data.read, fs.File { fd: wfd })
         os_exit(0)
     }
     close_fd(wfd)
+    close_fd(data.read.fd)
     (mut c.reap).push(ClipChild { slot: h, fd: rfd, buf: List[byte](), eof: false })
     c.middle = h
-    c.write_fd = -1
+    c.write_fd = data.write.fd
     c.pid_fd = -1
     c.exec_fd = rfd
     c.tool_pid = 0
@@ -762,6 +702,7 @@ fn clip_spawn_writer(mut c: Clipboard, backend: int, target: int, now_ms: int) -
 
 // `clip_close_active`, `clipboard.c:663-680`.
 fn clip_close_active(mut c: Clipboard) {
+    close_fd(c.write_fd)
     c.middle = -1
     c.write_fd = -1
     c.pid_fd = -1
@@ -897,8 +838,17 @@ fn kill_active(c: Clipboard) {
     }
 }
 
-// One step of the active write: its status lines, then its deadline.
-// Answers whether the write is still in flight.
+// A bounded copied slice dies after this one non-blocking write. A List
+// slice is not a view; never retain a shrinking copy of a large payload.
+fn clip_write_some_at(fd: int, bytes: List[byte], at: int) -> int ! {busy, invalid, io} {
+    let end = if bytes.len - at > 65536 then at + 65536 else bytes.len
+    region write_chunk {
+        fs_write_some(fd, bytes[at..end])?
+    }
+}
+
+// C's order (clipboard.c:829-893): exec status, deadline, writes until
+// busy. The middle may already be reaped once its status pipe reaches EOF.
 fn clip_pump_active(mut c: Clipboard, now_ms: int) -> bool {
     let k = active_child(c)
     if k < 0 {
@@ -908,51 +858,27 @@ fn clip_pump_active(mut c: Clipboard, now_ms: int) -> bool {
     }
     var ch = copy c.reap[k]
     child_drain(mut ch)
-    var verdict = ""
+    var exec_failed = false
     var code = 0
     loop {
         let (line, ok) = child_line(mut ch)
-        if !ok {
-            break
-        }
+        if !ok { break }
         if line.starts_with("pid ") {
             c.tool_pid = line_number(line, "pid")
-            c.exec_ready = true
+            c.exec_ready = c.tool_pid > 0
         } else if line.starts_with("exec ") {
-            verdict = "exec"
+            exec_failed = true
             code = line_number(line, "exec")
-        } else if line.starts_with("write ") {
-            verdict = "write"
-            code = line_number(line, "write")
-        } else if line == "epipe" || line == "done" {
-            verdict = line
-        }
-        if verdict.len != 0 {
-            break
         }
     }
+    let ended = ch.eof
     c.reap[k] = ch
-    if verdict == "done" {
-        c.written = c.active.bytes.len
-        clip_close_active(mut c)
-        return false
-    }
-    if verdict == "exec" {
+    if exec_failed {
         util.log_warn("clipboard: writer exec failed: {os_error_text(code)}; demoting backend")
         clip_retry_active(mut c)
         return false
     }
-    if verdict == "epipe" {
-        util.log_warn("clipboard: writer closed its pipe; demoting backend")
-        clip_retry_active(mut c)
-        return false
-    }
-    if verdict == "write" {
-        util.log_warn("clipboard: write failed: {os_error_text(code)}")
-        clip_retry_active(mut c)
-        return false
-    }
-    if c.reap[k].eof {
+    if ended && !c.exec_ready {
         util.log_warn("clipboard: writer exec status failed; demoting backend")
         clip_retry_active(mut c)
         return false
@@ -963,12 +889,36 @@ fn clip_pump_active(mut c: Clipboard, now_ms: int) -> bool {
         clip_retry_active(mut c)
         return false
     }
-    true
+    if !c.exec_ready { return true }
+    while c.written < c.active.bytes.len {
+        let n = clip_write_some_at(c.write_fd, c.active.bytes, c.written) else |e| match e {
+            busy => { return true },
+            invalid => {
+                util.log_warn("clipboard: write failed: invalid byte buffer")
+                clip_retry_active(mut c)
+                return false
+            },
+            io => {
+                let why = os_error()
+                if why == 32 {
+                    util.log_warn("clipboard: writer closed its pipe; demoting backend")
+                } else {
+                    util.log_warn("clipboard: write failed: {os_error_text(why)}")
+                }
+                clip_retry_active(mut c)
+                return false
+            },
+        }
+        assert(n > 0, "fs_write_some made no progress on nonempty bytes")
+        c.written += n
+    }
+    clip_close_active(mut c)
+    false
 }
 
 /// Drive the active subprocess write (`yew_clip_pump`, `clipboard.c:829-
-/// 893`): read its middle's verdict, close it on `done`, demote and retry
-/// its backend on a failure or the deadline, start what is queued.
+/// 893`): read exec status, write until busy, close at completion, demote
+/// and retry on failure or deadline, then start what is queued.
 pub fn clip_pump(mut c: Clipboard, mut r: term.Render, now_ms: int) {
     var fallbacks = 0
     if !c.initialized {
@@ -990,13 +940,12 @@ pub fn clip_pump(mut c: Clipboard, mut r: term.Render, now_ms: int) {
     }
 }
 
-/// The descriptor the loop waits on for the writer (`yew_clip_write_fd`):
-/// the active write's status pipe, readable when the middle reports or
-/// ends; -1 with none. The editor never holds a write end (the header).
+/// The wait element for the writer: bit 62 requests write readiness for
+/// the data pipe; until exec is acknowledged, watch its status pipe for
+/// reads instead. This is an os_signal_wait_fds element, not a raw handle.
 pub fn clip_write_fd(c: Clipboard) -> int {
-    if !c.initialized || !c.active_valid {
-        return -1
-    }
+    if !c.initialized || !c.active_valid { return -1 }
+    if c.exec_ready && c.write_fd >= 0 { return c.write_fd + 4611686018427387904 }
     let k = active_child(c)
     if k < 0 then -1 else c.reap[k].fd
 }
@@ -1246,6 +1195,7 @@ pub fn clip_shutdown(mut c: Clipboard) {
         }
         kill_active(c)
     }
+    close_fd(c.write_fd)
     for ch in c.reap {
         close_fd(ch.fd)
         child_reap(ch)
