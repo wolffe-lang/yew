@@ -1,6 +1,6 @@
 # yew
 
-yew — the maintainer's modal terminal editor ("tmux and vim had a baby":
+yew — a modal terminal editor ("tmux and vim had a baby":
 C11 + POSIX, zero dependencies, 218 KLOC at
 [tenseleyFlow/sagitta](https://github.com/tenseleyFlow/sagitta), with
 its scripting language Fletch) — ported to wolf, **byte-identical**, so
@@ -29,7 +29,7 @@ number from the same run, and a 2x gate holds from the first paint.
 ## Status
 
 Campaigns 00 to 05 of sagitta's fifteen (yw00 to yw06), at wolf
-0.2.34: `util` and `unicode` (tables generated from `ucd/16.0.0/`,
+0.2.35 (lupin 0.1.56): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
 identical to sagitta's); the terminal (raw mode, the input decoder, the
 cell grid and damage renderer, the restore on every exit path); the text
 engine (piece tree, byte-exact load, the atomic and synced save, the
@@ -51,12 +51,22 @@ that lands it. The map of every sagitta
 directory and sprint to a port lane, and of every wolf gap the port has
 met, is [`docs/MAP.md`](docs/MAP.md); `CHANGELOG.md` has each lane.
 
+The 0.2.35 adoption restores read-only callbacks and shared stable sorting,
+uses the standard terminal wrappers and non-blocking clipboard writes, and
+reuses menu and tab-frame storage. Fletch is not implemented in this cut.
+Mutable callbacks and some allocation/filesystem work remain open in the
+map. The measured startup and tab-switch pin regressions are named MISS
+rows tracked by yew#55 / wolf-lang#918, to be re-measured at the next pin;
+first Backspace remains yew#53. Other host/metric rows keep the 2× gate.
+
 ## Build and test
 
 ```sh
 tools/fetch-toolchain            # wolf, lupin and std by digest, into .wolf-bin/
 tools/build                      # target/native/yew and target/release/yew
-tools/check-test                 # the unit tests, warnings denied
+tools/check-test                 # output/refusals visible; native fallback counted
+tools/check-test --native        # all unit files built and run natively
+tools/check-test --no-native-fallback # strict checked-only run (refusals fail)
 tools/check-test-cases           # the checked machine one case at a time (files past its budget)
 tools/check-tables               # tables.lu is the generator's, and sagitta's
 tools/oracle --unit              # C yew at the pin, gcc and clang, its unit suite
