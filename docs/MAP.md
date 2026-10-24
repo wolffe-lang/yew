@@ -442,6 +442,14 @@ maintainer.
   sample follows motions, Insert, newlines and an idle pause, not a first
   callback invocation. No attribution claimed until the table is read.
 
+
+- **R-yw07-12 — cold-open sampling, decided A** (the orchestrator under
+  ruling #118, 2026-10-24). The port's gate reader takes the median of
+  five cold opens per binary, retaining every raw trial; C's harness is
+  unchanged. Other metric readers keep their original first observation.
+  A bounded same-bits original-path/copy-path comparison is also approved,
+  five observations per path, interleaved. The 2× limit is not relaxed.
+
 ## 7. The next contracts
 
 One paragraph each; yw01's is drafted in full
