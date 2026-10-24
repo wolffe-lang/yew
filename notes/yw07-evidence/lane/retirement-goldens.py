@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 root = Path.cwd()
 workflow = (root / ".github/workflows/ci.yml").read_text()
@@ -26,6 +27,9 @@ assert len(workspace) == 81
 cases += workspace
 assert len(cases) == len(set(cases)) == 287
 assert all(re.fullmatch(r"[a-z0-9_]+", c) for c in cases)
+if "--list-only" in sys.argv:
+    print("retirement-goldens: 287 unique gated CI cases")
+    raise SystemExit(0)
 out = root / "target/yw07/retirement-goldens"
 out.mkdir(parents=True, exist_ok=True)
 subprocess.run(["tools/goldens", "--yew", "target/release/yew", "--suite", "version,help"], check=True)

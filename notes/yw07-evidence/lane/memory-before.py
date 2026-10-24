@@ -2,6 +2,7 @@
 """Strict wrapper around yw05's unchanged PTY RSS instrument; run inside ctr."""
 from pathlib import Path
 import hashlib
+from datetime import datetime, timezone
 import os
 import re
 import shutil
@@ -9,8 +10,9 @@ import subprocess
 import sys
 
 root = Path.cwd()
-base = root / "target/yw07/memory-before"
-base.mkdir(parents=True, exist_ok=True)
+base = root / ("target/yw07/memory-before-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+base.mkdir(parents=True, exist_ok=False)
+print("memory-before output:", base, flush=True)
 driver = root / "notes/yw05-evidence/hot/ptymem-hot.py"
 binaries = [("C", root / "target/oracle/sagitta/build/yew"),
             ("port", root / "target/release/yew")]
@@ -22,7 +24,7 @@ for phase in ("prompt-menu", "lines40", "pane-lines40"):
         run.mkdir(exist_ok=False)
         for part in ("home", "config", "state", "cache"):
             (run / part).mkdir()
-        path = run / "m.txt"
+        path = base / "m.txt"
         shutil.copyfile(root / "README.md", path)
         env = dict(os.environ, HOME=str(run / "home"), XDG_CONFIG_HOME=str(run / "config"),
                    XDG_STATE_HOME=str(run / "state"), XDG_CACHE_HOME=str(run / "cache"),

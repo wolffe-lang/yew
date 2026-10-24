@@ -13,6 +13,7 @@ stage() {
     echo "lane KiB=$used"
     [ "$used" -lt 20971520 ] || { echo 'lane exceeds 20 GiB: prune before continuing'; return 1; }
 }
+stage python3 -I notes/yw07-evidence/lane/retirement-goldens.py --list-only
 stage tools/check-fmt
 stage python3 -I tools/check-test-cases-selftest
 stage tools/build --all
