@@ -445,8 +445,10 @@ maintainer.
 
 - **R-yw07-12 — cold-open sampling, decided A** (the orchestrator under
   ruling #118, 2026-10-24). The port's gate reader takes the median of
-  five cold opens per binary, retaining every raw trial; C's harness is
-  unchanged. Other metric readers keep their original first observation.
+  five C-stable trials for every editor ratio (extended A), retaining every
+  raw trial. C-again fold drift above 1.25 discards that row's trial and
+  asks for another; the first five valid triples are used, never selected
+  by port speed. C's harness is unchanged.
   A bounded same-bits original-path/copy-path comparison is also approved,
   five observations per path, interleaved. The 2× limit is not relaxed.
 
