@@ -11,7 +11,7 @@ files=(src/term/tty.lu src/edit/cmdparse.lu src/ws/state_lit.lu
     src/ws_state_sort_test.lu src/text_clipboard_host_test.lu)
 .wolf-bin/wolf fmt "${files[@]}"
 git diff --stat
-for f in src/term_wait_storage_test.lu src/ws_state_sort_test.lu src/text_clipboard_host_test.lu src/term_tty_test.lu src/edit_cmdparse_test.lu src/ws_state_corpus_test.lu; do
+for f in src/term_wait_storage_test.lu src/ws_state_sort_test.lu src/text_clipboard_host_test.lu src/term_tty_test.lu src/edit_cmdparse_test.lu; do
     date -u
     echo "CHECKED $f"
     .wolf-bin/wolf test --deny-warnings --nocapture --no-native-fallback "$f"
@@ -21,6 +21,14 @@ for f in src/term_wait_storage_test.lu src/ws_state_sort_test.lu src/text_clipbo
     echo "RELEASE $f"
     .wolf-bin/wolf build --release --deny-warnings "$f" -o target/yw07/test
     target/yw07/test
+done
+# The large corpus is deliberately case-sliced on the checked machine (G29).
+python3 -I tools/check-test-cases src/ws_state_corpus_test.lu
+for tier in native release; do
+    flags=()
+    [ "$tier" = native ] || flags+=(--release)
+    .wolf-bin/wolf build "${flags[@]}" --deny-warnings src/ws_state_corpus_test.lu -o target/yw07/corpus
+    target/yw07/corpus
 done
 # HOME is scratch; the control lives beside this clone.
 old="$(dirname "$PWD")/archives/wolf-0.2.34/wolf-0.2.34-x86_64-unknown-linux-gnu/wolf"
