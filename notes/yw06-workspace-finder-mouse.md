@@ -423,8 +423,11 @@ digest inside the container (`notes/yw06-evidence/continuation/static-b8fc689.lo
     sha256 ce8ee7aefaa7364ee08396a140a13ecb13ae4b59086c938540448cb7a433306e  (read twice)
     bytes  20434568
 
-Everything after `b8fc689` is notes only (`git diff -w b8fc689 HEAD --
-src tools ci .github` is empty), so it is the final head's binary. The
+Nothing the build reads changed after `b8fc689` (`git diff b8fc689 HEAD
+-- src tools/build tools/lib-toolchain.sh tools/lib-toml.sh
+tools/fetch-toolchain wolf-toolchain.toml` is empty; the later commits are
+CI, `tools/check-test`'s shards and notes), so it is the final head's
+binary. The
 digest is handed back for pax's `user/yew.pin`, a pax lane's change
 (px58's pin is yew `77c1083`); the size, unstripped with its debug
 info, is yw15's row. A trial build at `5a49ba2` read the same shape
