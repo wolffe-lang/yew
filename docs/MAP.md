@@ -430,6 +430,17 @@ maintainer.
   read-only retirements proceed; their mutable-registry half stays open
   under G48, wolf-lang#917. Never two representations for one registry.
 
+
+- **R-yw07-11 — the performance attribution control, decided A** (the
+  orchestrator under ruling #118, 2026-10-24). Compare 280012fe on its
+  original pin, 7a9ae6e plus ONLY the three missing Mode fields set false
+  and `out.shell = copy c`, and 35e21b9, three times each. The middle
+  cell is "pin + compile compatibility", never "pin only"; literal
+  7a9ae6e is BUILD-RED (E0408, then E1004), not a timing row. Preserve
+  the existing explicit RAW_CR/RAW_OUTPUT additions. The first Backspace
+  sample follows motions, Insert, newlines and an idle pause, not a first
+  callback invocation. No attribution claimed until the table is read.
+
 ## 7. The next contracts
 
 One paragraph each; yw01's is drafted in full
