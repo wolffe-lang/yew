@@ -537,23 +537,89 @@ single-threaded core. No other module `var` was added under `src/fl`,
   - `fl_api_headless_test`: 17 cases on every tier, and 17 of 17 checked
     one at a time.
 
-### The cmdcomp_shell reading (yew#70's run 40167646446)
+### The final run's two red rows: both trunk code, both nondeterministic
 
-- **40167646446** (yew#70, at `42354f0`): `unit (linux x86-64, shard 2/3)`
-  failed on `src/edit_cmdcomp_shell_test.lu::main ... FAILED (trap(assert))`
-  on the checked machine. The same file was native-green in the same job and
-  green on kasumi. The file is unchanged since trunk.
-- **40177235318** (at `f3c3694`): the checked machine refused the same file
-  on its step budget and `wolf test` ran it natively (`... ok [native: step
-  budget exhausted]`, `cmdcomp_shell_test: 18 cases pass`).
+yew#70's ci run 40212903979 at `efe5e64` is red on two rows. Neither step
+was armed or changed by this lane:
+- `git diff origin/trunk..yw07b` does not touch `tools/check-test`,
+  `tools/torture-live`, `tools/torture-replica.py` or `tools/build-torture`;
+- `ci.yml`'s diff leaves the unit job's `tools/check-test --shard` step and
+  the torture-live step as trunk has them;
+- the code under both is trunk's.
 
-The reading: the file rewrites the process-wide `$PATH`, while `wolf test`
-runs the shard's files concurrently in one process. So a neighbour's
-`$PATH` can change the checked run's answer. The remedy is a test-isolation
-fix in yew, a lane fix, with a yew issue citing both runs. The failure
-has not recurred: 40177235318 gave a budget refusal and a native pass,
-not an assert. On the orchestrator's disposition the issue is filed only
-if it recurs.
+Both rows were green at `706933b`, in run 40208663320, which the
+`efe5e64` push cancelled after these jobs had passed these steps. There
+is no difference between `706933b` and `efe5e64` outside `notes/` and
+`docs/`.
+
+**Row 1: `unit (linux x86-64, shard 2/3)`.**
+
+At 16:43:39Z the checked run printed `test
+src/edit_cmdcomp_shell_test.lu::main ... FAILED (trap(assert))`. The same
+job's native lane printed `cmdcomp_shell_test: 18 cases pass` and
+`check-test: src/edit_cmdcomp_shell_test.lu [native] ok`.
+
+The checked whole-file verdict of this unchanged file at the 0.2.35 pin:
+
+| run | head | checked verdict |
+|---|---|---|
+| 40160707930 | trunk `12442b8`, push | `refused it (step budget exhausted); running it natively`, then `ok` |
+| 40199656604 | trunk `12442b8`, schedule | the same |
+| 40177235318 | `f3c3694` | the same |
+| 40208663320 | `706933b` | the same |
+| 40167646446 | `42354f0` | `FAILED (trap(assert))` |
+| 40212903979 | `efe5e64` | `FAILED (trap(assert))` |
+
+Before the pin, at `280012fe` (40098593868, 40069862282), the checked
+run passed outright.
+
+The file runs second in its shard, after `args_test`, on trunk and here
+alike. `wolf test` reports the shard's files one at a time in path order,
+so the earlier reading, a neighbour rewriting `$PATH` concurrently, does
+not fit:
+- `text_clipboard_host_test`, the shard's other `$PATH` writer, ran 30
+  minutes later;
+- the first 31 files of shard 2, `edit_cmdcomp_shell_test`'s
+  predecessors among them, are the same on trunk and on this branch.
+
+On kasumi, eight checked runs of the file at `706933b`'s tree, with
+`conform-run --checked --json` and the file whole, all answer `unsupported
+| step budget exhausted`. The runs were:
+- plain;
+- at a third of a core;
+- at about a fiftieth of a core;
+- with `/tmp` on tmpfs.
+
+None gives the trap (`notes/yw07b-evidence/lane/cmdcomp-probe/`). So the
+trap is not runner speed and not `/tmp`'s readdir order. `wolf test`
+prints no trap message, and that message is what the remedy needs. This
+is the yew issue below, not a yw07b change.
+
+**Row 2: `oracle (ubuntu-latest, --cc clang --cc gcc)`, "the live-editor
+torture lane in a container".**
+
+The run printed `torture-live: driver: torture: injected ENOSPC did not
+preserve/recover (exit=0 expected=0 injected=1 oracle=1 exact=0)`, then
+`torture-live: driver RED (exit 1)`, the replica `GREEN`, and `torture-live:
+RED`.
+
+The same lane printed `storage ENOSPC preserves old+journal ok` in:
+- trunk's 40199656604, 40160707930, 40160662241, 40098593868,
+  40069862282, 39968966081 and 39907558934;
+- this branch's 40167646446 and 40177235318;
+- 40208663320 at `706933b`.
+
+In `kill9.c:929-965`'s terms the red means three things:
+- the injected ENOSPC was logged (`injected=1`);
+- the journal recovers (`oracle=1`);
+- the destination is not the old bytes (`exact=0`).
+
+That is the shape of a fault armed after the save had already replaced
+the file. `yew-live-torture.c`'s feeder arms the shim with `SIGUSR2` 50 ms
+after the paste's frame and then writes `s`, with no handshake that the
+arm landed. Read that way, the red is a race between the arm and the
+save, in the oracle's driver against the port's editor. It is a reading,
+not a reproduction. It is the second yew issue below.
 
 ### Known limits, named in the code
 
@@ -591,8 +657,28 @@ row and closed unmerged by the orchestrator.
 To file (the orchestrator files them):
 - **yew**: the 11 release MISS rows of the Fletch VM, one row per issue
   line, for yw08 under R-yw08-3 and R-yw07b-9. The shape is yew#30's.
-- **yew**, only if `edit_cmdcomp_shell_test` fails again: the test
-  isolation of its `$PATH` rewrite, citing 40167646446 and 40177235318.
+- **yew**: `edit_cmdcomp_shell_test`'s whole-file checked run is
+  nondeterministic in CI at the 0.2.35 pin.
+  - It gives `FAILED (trap(assert))` in 40167646446 and 40212903979. It
+    gives `refused it (step budget exhausted)` in 40160707930,
+    40199656604, 40177235318 and 40208663320, the last at the same code
+    as 40212903979.
+  - Eight kasumi runs never trap (`notes/yw07b-evidence/lane/cmdcomp-probe/`).
+  - First step: record the trap message, which `wolf test` does not
+    print. Run the file under `wolf conform-run --checked --json` in the
+    unit job when its checked verdict is a trap.
+  - Then fix the test or file the checked machine's nondeterminism
+    against wolf-interp.
+- **yew**: torture-live's ENOSPC lane races the feeder's fault arm
+  against the save.
+  - The row: `injected ENOSPC did not preserve/recover (exit=0 expected=0
+    injected=1 oracle=1 exact=0)` in 40212903979.
+  - It was green in ten other runs, including 40208663320 at the same
+    code.
+  - The feeder (`yew-live-torture.c`, the pin's oracle, read-only to the
+    port) sends `SIGUSR2` and writes `s` with no armed-handshake.
+  - Record it as a flaky oracle lane for the maintainer, and watch the
+    nightly for a second occurrence.
 - **wolf-lang**: none new from this lane. G52 (wolf-lang#942), G53
   (wolf-lang#943) and G54 (wolf-lang#948) are filed. So is G51
   (wolf-std#103).
