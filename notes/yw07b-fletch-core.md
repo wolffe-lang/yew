@@ -155,13 +155,13 @@ was measured.
 | The float corpus needs an exact conversion for at least one libc surface | Yes, `fl.float` (`c1917ec`). NaN sign and payload stay open as G51 | held |
 | Checked budget exhaustion is named, never passed | Every budget-bound case is an `allow` row with its reason in `tools/check-test-cases.txt`, and a row that starts passing goes red | held |
 | 198 cases and 39 units pass, the units normal, stressed and twice, byte-identical | `check-fl-cases`: 198 rows over 17 files, ok. `check-fletch-goldens`: 39 of 39 by name in all three runs, byte-identical | held |
-| The full GC-stress wolf/C ratio is 1.9 | 1.807 | held (better) |
+| The full GC-stress wolf/C ratio is 1.9 | 1.706 at `706933b`, 11 samples (min/min 1.73). It was 1.807 at an earlier tree | held (better) |
 | `fl_smoke`'s collection counts are 0, 0, 155 | 0, 0, 155, equal to C's (`notes/yw07b-evidence/core/smoke-c.txt`, `smoke-release.txt`) | held |
 | AST and disassembly dumps and opcode traces are byte-identical to the pin | 178 of 178 dumps. 21 of 21 traces, two processes each, normal and stressed | held |
 | Three fuzzers match C at 200,000 × seed 1 | `fuzz_fl_lex`, `fuzz_fl_parse` (with its data mode) and `fuzz_fl_std` report C's line | held |
 | The data bridge matches the hand codec on 22 canonical, 4 noncanonical and 20 invalid documents | 22 / 4 / 20 (`d5f848c`) | held |
 | Every touched perf row meets 2×, and the startup and motion budgets stay hard | `parse_only` meets 2×. 11 of 13 release rows miss. The startup and motion_dispatch budgets hold on release | missed; R-yw07b-9 |
-| The static binary is ET_EXEC with no PT_INTERP and runs `--version` and `fl -e` | [static-line] | [static-held] |
+| The static binary is ET_EXEC with no PT_INTERP and runs `--version` and `fl -e` | `tools/build --static` at `706933b` in `localhost/px13-ubuntu` (Ubuntu 24.04.5, glibc 2.39-0ubuntu8.9). The result is `Type: EXEC`, `PT_INTERP=0`, statically linked; `--version` prints `yew 1.0.0-dev`; `fl -e` and `fl FILE` print `hello, world`; sha256 `aa89f0e40ddf35826091dad584bd17ad983561b5ab3c38b2ad4f5a9636b83fb3` (read twice); 21,162,368 bytes | held |
 | No golden, oracle fixture, baseline or pin changes | None changed (Forbidden, above) | held |
 | No row-pool shape revived; mutable callbacks keep one kind-id/match | Held (Forbidden, above) | held |
 | G50 carried, never silently worked around; the #17/#27/#23/#40 portions stay open | G50 stays open, and the four issues stay open as yw07 left them | held |
@@ -368,9 +368,10 @@ message from where it stopped, and no detached job was duplicated.
   job to one host, and `aaaa987` changed the job's shape, so the red was
   correct. `706933b` holds the test to the four-shard shape. It passes on
   `706933b`'s workflow and FAILs on the one-host workflow of `3a2786e`.
-- The local gates, on kasumi CPUs 8–11 in one lane container under the
-  lock, at the tree of `706933b`. Logs are in
-  `notes/yw07b-evidence/lane/gates/`.
+- **The local gates** ran on kasumi CPUs 8–11 in one lane container under
+  the lock, at the tree of `706933b` (`f45ce81`). After that tree only notes
+  and docs change, so these verdicts hold for the final head's code. Logs
+  are in `notes/yw07b-evidence/lane/gates/`; every step exited 0.
 
 | gate | verdict |
 |---|---|
@@ -380,27 +381,44 @@ message from where it stopped, and no detached job was duplicated.
 | `tools/check-fl-trace` | 60 opcodes match the pin; 21 fixtures, C and the port, two processes each, normal and stressed: PASS |
 | `tools/smoke-fl`, C yew and the port | `12 rows ok`, twice |
 | `python3 -I tools/check-fl-cases` (and `--selftest`) | `198 rows over 17 files; ok` |
-| the three Fletch fuzzers against C's drivers, 200,000 × seed 1 | [fuzz-line] |
+| `tools/check-test-cases-selftest`, `tools/test-check-test-cases` | the 8 adapter controls and the shard partition PASS; the allowance controls OK |
+| `tools/check-test-cases` over `fl_std_io_test` and `fl_api_headless_test` | `30 cases over 2 files, 0 red` |
+| `fuzz_fl_lex` against C's driver | `seed=1 iters=200000 corpus=120 hash=fbb01f1cebb66b40 ok`, both |
+| `fuzz_fl_parse` (its data mode included) against C's driver | `seed=1 iters=200000 corpus=120 hash=5f59d6272d103c77 ok`, both |
+| `fuzz_fl_std` against C's driver | `seed=1 iters=200000 corpus=8 hash=18a19f695b1ac125 ok`, both |
+
+The other selector files' checked runs were done by their forks, each
+case alone, normal and stressed: core's 41, fmt's fmt, math and data rows,
+and front's lex, parse, re and re-direct. They are under each fork's
+evidence directory. CI's four checked-cases shards run them all again at
+the final head.
 
 ### M-YW6 and the GC-stress run
 
-All four M-YW6 artifacts that are yw07b's are in CI by name:
-- the 39 conformance runs, normal, stressed and twice
-  (`tools/check-fletch-goldens`);
+M-YW6 has four artifacts. yw07b's share of them is in CI by name:
 - `yew fl FILE` and `yew fl -e` printing `hello, world` (`tools/smoke-fl`'s
-  two rows from `smoke.sh`).
+  two rows from `smoke.sh`);
+- the 39 conformance runs, normal, stressed and twice
+  (`tools/check-fletch-goldens`).
 
-The REPL golden and the coverage ledger are yw08's (its drafted contract,
-deliverables 5 and 7).
+The REPL golden `s33_hello_world_repl` and the coverage ledger beside the
+conformance gate are yw08's (its drafted contract, deliverables 5 and 7).
 
-**The GC-stress wolf/C ratio is 1.807**, against a prediction of 1.9.
+**The GC-stress wolf/C ratio is 1.706 at `706933b`**, against a prediction
+of 1.9.
 - The run: the 39-unit suite under `YEW_FL_GC_STRESS=1`, C yew and the
-  port's release build alternating, 7 samples each, the whole suite's wall
+  port's release build alternating, 11 samples each, the whole suite's wall
   time with its process spawns.
-- Medians: 160.3 ms for the port, 88.7 ms for C.
+- Medians: 270.0 ms for the port, 158.3 ms for C. The minima are 152.7 ms
+  and 88.4 ms, a ratio of 1.73.
 - All 39 PASS on both, on every sample.
-- Evidence: `notes/yw07b-evidence/lane/gcstress/` (`samples.tsv`,
-  `summary.txt`, `inner.sh`).
+- Evidence: `notes/yw07b-evidence/lane/gcstress-706933b/`.
+- These samples were noisier than an earlier 7-sample run at the tree of
+  `2c8245b`, before front's parse changes. That run gave a median ratio of
+  1.807 and a min ratio of 1.83, with C at 87–111 ms
+  (`notes/yw07b-evidence/lane/gcstress/`). A 7-sample run minutes before
+  the final one gave 1.421 (`gcstress-706933b-noisy/`).
+- Every run is under 2× and under the prediction.
 
 ### Performance (deliverable 10's rows; the 2× bar)
 
@@ -441,7 +459,13 @@ same run: one warmup and 11 in-process samples, medians. Evidence:
     was not adopted.
 
   Counts and timers only; no generated code was read.
-- Recommended ruling: **R-yw07b-9**, below.
+- Recommended ruling: **R-yw07b-9 = A** (`docs/MAP.md` §6). The rows go
+  in a yew issue and are ratcheted in yw08 under R-yw08-3 A: a function
+  profile with counts only, and a wolf-lang codegen issue with a reduced
+  witness for each row that stays over. The 2× bar stays, no row is
+  waived, and the merge does not wait on them. The alternatives are to
+  hold the merge (B) or to rebaseline the bar (C), which only the
+  maintainer can choose.
 
 ### The value, the heap and the toy VM's verdict
 
@@ -595,7 +619,7 @@ yew#17, yew#23, yew#27 and yew#40 stay open as yw07 left them. G50
   end of the port job.
 - [x] The 39 conformance runs, normal, stressed and twice, byte-identical
   (M-YW6's conformance artifact). Locally green, and in CI by name.
-- [x] The GC-stress run with its wolf/C ratio: 1.807.
+- [x] The GC-stress run with its wolf/C ratio: 1.706 at `706933b`.
 - [x] The dump, trace and smoke differentials and the three fuzzers
   against C, in CI by name.
 - [x] Every gate seen red on a plant (the table above).
@@ -616,7 +640,12 @@ yew#17, yew#23, yew#27 and yew#40 stay open as yw07 left them. G50
   - §7's yw07b paragraph and the pointer to yw08.
 - [x] yw08's contract drafted in full and brought to this head
   (`0b13303`, `149ebc9`).
-- [x] The static binary: [static-done].
+- [x] The static binary at `706933b`:
+  - ET_EXEC with no PT_INTERP;
+  - `--version` and `fl -e` run;
+  - sha256 `aa89f0e40ddf35826091dad584bd17ad983561b5ab3c38b2ad4f5a9636b83fb3`,
+    21,162,368 bytes, for pax's `user/yew.pin`. That pin is a pax lane's
+    change.
 - [x] `bash wolf/tools/lane-audit.sh yew yw07b 70` from the org root. Its
   last line is in the PR body.
 - [ ] CI green at the final head. The orchestrator watches the run named
