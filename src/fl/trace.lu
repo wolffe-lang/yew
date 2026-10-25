@@ -1,0 +1,222 @@
+//! fl.trace — Sprint 32 §6's stack traces, sagitta 9ace98c2
+//! src/fl/trace.h:1-49 and trace.c:1-337, pulled forward by R-yw07-6.
+//! Built ONCE, when an error escapes every frame (vm.c:1554-1561), the first
+//! attach being the true one; innermost first, the middle elided past 32
+//! frames, one caret quoting the innermost frame's source line.
+
+use util
+
+/// trace.h:31-36: past this many frames the middle is elided.
+pub const FL_TRACE_MAX_FRAMES: int = 32
+
+/// Frames kept from the innermost end.
+pub const FL_TRACE_HEAD: int = 16
+
+/// Frames kept from the outermost end.
+pub const FL_TRACE_TAIL: int = 16
+
+fn frame_fn(vm: FlVm, i: int) -> int {
+    let cl = fl_obj_index(vm, vm.frames[i].cl)
+    fl_obj_index(vm, vm.gc.slots[cl].fn_value)
+}
+
+/// trace.c:18-46's closed naming table, asserted row by row by the tests.
+fn frame_name(vm: FlVm, fun: int, mut out: List[byte]) {
+    let id = vm.gc.slots[fun].name_id
+    let named = id > 0 && id < vm.strings.items.len
+    match vm.gc.slots[fun].fnkind {
+        1 => {
+            util.buf_append_str(mut out, "macro ")
+            if named { for b in vm.strings.items[id] { (mut out).push(b) } } else { (mut out).push(63 as byte) }
+        },
+        2 => util.buf_append_str(mut out, "<module init>"),
+        3 => util.buf_append_str(mut out, "<script>"),
+        4 => util.buf_append_str(mut out, "<repl>"),
+        _ => {
+            if named {
+                for b in vm.strings.items[id] { (mut out).push(b) }
+            } else {
+                util.buf_append_str(mut out, "<fn>")
+            }
+        },
+    }
+}
+
+/// trace.c:50-70: the greatest line run at or below `pc` (runs are keyed
+/// by instruction start).
+fn site_at(vm: FlVm, fun: int, pc: int) -> (int, int) {
+    var lo: int = 0
+    var hi = vm.gc.slots[fun].lines.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if vm.gc.slots[fun].lines[mid].pc <= pc { lo = mid + 1 } else { hi = mid }
+    }
+    if lo == 0 { return (0, 0) }
+    (vm.gc.slots[fun].lines[lo - 1].line, vm.gc.slots[fun].lines[lo - 1].col)
+}
+
+fn frame_pc(vm: FlVm, i: int) -> int {
+    let off = vm.frames[i].ip
+    if off == 0 then 0 else off - 1
+}
+
+/// trace.c:79-118: `name (file:line:col)`. The innermost frame reports
+/// the raising instruction; a frame below one entered through a native
+/// reports its own saved CALL; every other frame the CALL it sits at.
+fn frame_line(vm: FlVm, i: int, mut out: List[byte]) {
+    let fun = frame_fn(vm, i)
+    frame_name(vm, fun, mut out)
+    let pc = if i + 1 == vm.frames.len || vm.frames[i + 1].via_native != 0 {
+        frame_pc(vm, i)
+    } else {
+        vm.frames[i + 1].call_pc
+    }
+    let (line, col) = site_at(vm, fun, pc)
+    let file_id = vm.gc.slots[fun].file_id
+    util.buf_append_str(mut out, " (")
+    if file_id >= 0 && file_id < vm.dc.files.len {
+        util.buf_append_str(mut out, vm.dc.files[file_id].path)
+    } else {
+        (mut out).push(63 as byte)
+    }
+    util.buf_append_str(mut out, ":{line}:{col})")
+}
+
+/// trace.c:128-137: the line as a string, rooted across the push.
+fn push_line(mut vm: FlVm, list_root: int, mut line: List[byte]) {
+    let v = fl_str_new(mut vm, line)
+    let root = fl_temp_push(mut vm, v)
+    let l = fl_temp_get(vm, list_root)
+    let s = fl_temp_get(vm, root)
+    fl_list_push(mut vm, l, s)
+    fl_temp_pop(mut vm, 1)
+    (mut line).reset()
+}
+
+/// trace.c:151-212: the innermost frame's source line and one caret under
+/// its column; nothing when the source is unavailable.
+fn render_caret(vm: FlVm, mut out: List[byte]) {
+    if vm.frames.len == 0 { return }
+    let fi = vm.frames.len - 1
+    let fun = frame_fn(vm, fi)
+    let file_id = vm.gc.slots[fun].file_id
+    if file_id < 0 || file_id >= vm.dc.files.len { return }
+    let n = vm.dc.files[file_id].src.len
+    if n == 0 { return }
+    let (line, col) = site_at(vm, fun, frame_pc(vm, fi))
+    if line == 0 { return }
+    var at: int = 0
+    var seen: int = 1
+    while at < n && seen < line {
+        if vm.dc.files[file_id].src[at] as int == 10 { seen += 1 }
+        at += 1
+    }
+    if seen != line { return }
+    var eol = at
+    while eol < n && vm.dc.files[file_id].src[eol] as int != 10 { eol += 1 }
+    let gutter = "{line}"
+    util.buf_append_str(mut out, "\n  {gutter} | ")
+    for j in at..eol { (mut out).push(vm.dc.files[file_id].src[j]) }
+    util.buf_append_str(mut out, "\n  ")
+    for _ in 0..gutter.len { (mut out).push(32 as byte) }
+    util.buf_append_str(mut out, " | ")
+    var i: int = 1
+    while i < col && at + i - 1 < eol {
+        let c = vm.dc.files[file_id].src[at + i - 1]
+        (mut out).push(if c as int == 9 then 9 as byte else 32 as byte)
+        i += 1
+    }
+    util.buf_append_str(mut out, "^\n")
+}
+
+/// trace.c:214-288: attach `trace` (a list of frame lines) to the escaping
+/// error map once, and capture the caret while the frames still exist.
+pub fn fl_trace_attach(mut vm: FlVm) {
+    if vm.err.t != FL_MAP || vm.frames.len == 0 { return }
+    let tk = fl_str_text(mut vm, "trace")
+    let _ = fl_map_get(vm, vm.err, tk) else {
+        fl_trace_build(mut vm)
+        return
+    }
+}
+
+fn fl_trace_build(mut vm: FlVm) {
+    let err_root = fl_temp_push(mut vm, copy vm.err)
+    let l = fl_list_new(mut vm)
+    let list_root = fl_temp_push(mut vm, l)
+    var bb = List[byte]()
+    let nf = vm.frames.len
+    var i = nf
+    while i > 0 {
+        i -= 1
+        let shown = nf - 1 - i
+        if nf > FL_TRACE_MAX_FRAMES && shown == FL_TRACE_HEAD {
+            util.buf_append_str(mut bb, "... {nf - FL_TRACE_HEAD - FL_TRACE_TAIL} frames elided ...")
+            push_line(mut vm, list_root, mut bb)
+        }
+        if nf > FL_TRACE_MAX_FRAMES && shown >= FL_TRACE_HEAD && shown < nf - FL_TRACE_TAIL { continue }
+        frame_line(vm, i, mut bb)
+        push_line(mut vm, list_root, mut bb)
+        let via = vm.frames[i].via_native
+        if via != 0 {
+            util.buf_append_str(mut bb, "<native ")
+            if via > 0 && via < vm.strings.items.len {
+                for b in vm.strings.items[via] { (mut bb).push(b) }
+            } else {
+                (mut bb).push(63 as byte)
+            }
+            (mut bb).push(62 as byte)
+            push_line(mut vm, list_root, mut bb)
+        }
+    }
+    let key = fl_str_text(mut vm, "trace")
+    let err = fl_temp_get(vm, err_root)
+    let lines = fl_temp_get(vm, list_root)
+    let _ = fl_map_set(mut vm, err, key, lines)
+    fl_temp_pop(mut vm, 2)
+    var caret = List[byte]()
+    render_caret(vm, mut caret)
+    vm.err_caret = str_from_utf8(caret) else ""
+}
+
+fn err_str(mut vm: FlVm, err: FlValue, key: str) -> List[byte] ! {none} {
+    if err.t != FL_MAP { return none }
+    let k = fl_str_text(mut vm, key)
+    let got = fl_map_get(vm, err, k) else { return none }
+    if got.t != FL_STR { return none }
+    copy vm.gc.slots[fl_obj_index(vm, got)].bytes
+}
+
+fn upto_nul(mut out: List[byte], b: List[byte]) {
+    for x in b {
+        if x as int == 0 { break }
+        (mut out).push(x)
+    }
+}
+
+/// trace.c:303-337: the §6 block — `error: KIND: msg`, each frame as
+/// `  at ...` (the elision line takes no `at`), then the captured caret.
+pub fn fl_trace_render(mut vm: FlVm, err: FlValue, mut out: List[byte]) {
+    util.buf_append_str(mut out, "error: ")
+    let kind = err_str(mut vm, err, "kind") else "?".bytes()
+    upto_nul(mut out, kind)
+    util.buf_append_str(mut out, ": ")
+    let msg = err_str(mut vm, err, "msg") else "?".bytes()
+    upto_nul(mut out, msg)
+    (mut out).push(10 as byte)
+    if err.t != FL_MAP { return }
+    let tk = fl_str_text(mut vm, "trace")
+    let tv = fl_map_get(vm, err, tk) else { return }
+    if tv.t != FL_LIST { return }
+    let at = fl_obj_index(vm, tv)
+    for j in 0..vm.gc.slots[at].vals.len {
+        let s = copy vm.gc.slots[at].vals[j]
+        if s.t != FL_STR { continue }
+        let b = copy vm.gc.slots[fl_obj_index(vm, s)].bytes
+        let elision = b.len > 4 && b[0] as int == 46 && b[1] as int == 46 && b[2] as int == 46 && b[3] as int == 32
+        util.buf_append_str(mut out, if elision then "  " else "  at ")
+        upto_nul(mut out, b)
+        (mut out).push(10 as byte)
+    }
+    util.buf_append_str(mut out, vm.err_caret)
+}
