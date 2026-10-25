@@ -258,9 +258,21 @@ def emit_lu(d):
         print('}')
         print()
     print('fn main() {')
-    for n in names:
-        print('    %s()' % n)
-    print('    print("PASS stdre direct: %d cases")' % len(CASES))
+    print('    // G29: YEW_FL_RE_DIRECT_CASE selects one case alone for the checked')
+    print('    // machine (tools/check-test-cases.txt); unset, every case runs.')
+    print('    let only = (env_get("YEW_FL_RE_DIRECT_CASE") else "-1").to_int() else -1')
+    print('    var ran = 0')
+    print('    for n in 0..%d {' % len(names))
+    print('        if only >= 0 && n != only { continue }')
+    print('        match n {')
+    for k, n in enumerate(names):
+        print('            %d => { %s() },' % (k, n))
+    print('            _ => { assert(false, "unregistered stdre direct case") },')
+    print('        }')
+    print('        print("fl_std_re_direct case {n}: PASS")')
+    print('        ran += 1')
+    print('    }')
+    print('    print("stdre direct: {ran} of %d cases run")' % len(names))
     print('}')
 
 if __name__ == '__main__':
