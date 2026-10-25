@@ -115,7 +115,7 @@ the `s57_*` sequence are placed with their consumers).
 | 03 modal core | s13, s14, s15, s16, s17 | yw03 | M-YW3: campaign 03's PTY and script goldens |
 | 04 execute and search | s18, s18.5, s19, s20, s21; s57.17, s57.18, s57.21, s57.23–s57.32 (the `:` prompt, its readline keys and `:!` completion; s57.21 placed by yw03) | yw04 | M-YW4: the regex corpus and the `:!` goldens |
 | 05 UI and workspace | s22, s23, s24, s25, s26, s27; s57.5–s57.16, s57.20, s57.22, s56.5 (the field repairs) | yw05 (s22–s24, s57.8), **yw06** (s25–s27, s56.5 §1 and §6, s57.11, s57.12, and s57.13–s57.15 and s57.22 after s27's router, R-yw05-1 = A); **Decided** (R-yw06-4 = A): yw13 takes s56.5 §2–§4 and §7, s57.5, s57.6 §2–§3 and s57.7 (the FUSS drawer: `fuss_drawer_*` 6, `startup_directory_workspace`, `test_fussdrawer` 27, `test_fussexpand` 7), yw11 s56.5 §5 (`test_shadow_layout` 10) and s57.6 §1's LSP and symbol-index halves, yw10 s57.6's syntax half and s57.9's two goldens (`wolf.fl`'s colours); s57.9's and s57.10's C is in files yw03 and yw05 ported; s57.20 has no C at the pin; s57.16's auto-pairing landed early in yw03 (`edit.pairs`: `init.fl` turns it on, so every campaign-03 bracket goes through it) | M-YW5 as R-yw06-3 = A shapes it: the 81 reachable goldens by name and the automated twins of s42 §10's boxes (yw06's gate: CI's `goldens, campaign 05's workspace, finder and mouse` and `M-YW5's trials` steps; the field gate stays the maintainer's, after yw10 and yw09); M-YW-PAX1 |
-| 06 Fletch core | s28, s29, s30, s31, s32, s33 | yw07 (s28–s31), yw08 (s32, s33) | M-YW6: the Fletch conformance and GC-stress runs |
+| 06 Fletch core | s28, s29, s30, s31, s32, s33 | yw07 (the 0.2.35 pin), **yw07b** (s28–s31, and from s32 §1, §6–§7 the non-interactive `yew fl`, the trace and the suggestions, R-yw07-6/-7 A), yw08 (s32 §2–§5 and §8–§9: the prompt, the fuzzer, the bug report; s33's ledger, bench gates and M-YW6's last two artifacts) | M-YW6: the Fletch conformance and GC-stress runs (yw07b: the 39 units by name, stressed and twice, and smoke.sh's two hello-world rows); the prompt's golden and the coverage gate (yw08) |
 | 07 Fletch in the editor | s34, s35, s36, s37, s38 | yw09 | M-YW7: round-trip and batch |
 | 08 highlighting | s39, s40, s41, s41.5, s42, s42.5 | yw10 | M-YW8: all 432 syntax goldens; M-YW-PAX2 |
 | 09 completion and LSP | s43, s44, s45, s46, s47 | yw11 | M-YW9 |
@@ -515,8 +515,9 @@ maintainer.
 - **R-yw07b-1 — the GC's sweep after the toy VM, decided A** (the
   orchestrator under ruling #118, 2026-10-25; subject to override). The
   toy VM (`notes/yw07-evidence/toyvm/`, never linked into `yew`) held
-  memory flat over 100,000 collections (ledger 482,976 bytes at
-  collection 1,000 and at 100,000; RSS 2,785,280 → 2,789,376), collected
+  memory flat over 100,000 collections (the compacting sweep, release:
+  ledger 484,896 bytes at collection 1,000 and at 100,000, RSS 2,887,680
+  → 2,891,776; the non-moving control 482,976 flat), collected
   the unrooted cycle, kept each of the eight roots, and trapped the
   planted stale index under stress in both sweeps (exit 134). Release
   ratios against C's `fl_smoke --perf` from the same run, compacting:
@@ -708,11 +709,26 @@ One paragraph each; yw01's is drafted in full
   forms so the 39 conformance units run, non-UTF-8 paths as bytes,
   errno names); `stdai.c` is Sprint 48's (campaign 10), not yw09's as
   §2 says — the draft flags it, undecided.
-- **yw08 — REPL, errors, conformance and perf** (s32, s33; `src/fl/`
-  repl, trace, suggest, vmcheck; `src/flcli.c`). `yew fl`, stack
-  traces, the error-quality pass, `fl_smoke`'s baselines and the
-  config-load gate. Goldens: the 39 conformance runs and the GC-stress
-  run (M-YW6).
+- **yw07b — Fletch core, the implementation** (deliverables 2–10 of
+  yw07's adopted contract). The toy VM and R-yw07b-1; the front end, the
+  values, the compiler, the VM with one `match`, the compacting heap, the
+  std modules with the editor API's headless natives (R-yw07-6 A), the
+  module loader, the data bridge beside the hand codec, `suggest`,
+  `trace`, and `yew fl`'s non-interactive forms (R-yw07-7 A,
+  `src/flcli/`). Gates: the 198 pinned cases by name
+  (`tools/check-fl-cases`), the 39 units by name, stressed and twice
+  (`tools/check-fletch-goldens`), the dump differentials
+  (`tools/check-fl-dump`), `tools/smoke-fl`, and the three fuzzers against
+  C's drivers. The perf rows are recorded beside C's on kasumi; every row
+  above 2× is a named MISS (`notes/yw07b-fletch-core.md`).
+- **yw08 — the prompt, the bug report, the ledger and the perf gates**
+  (s32 §2–§5 and §8–§9, s33 §3–§6; `src/fl/` repl, vmcheck; `flcli`'s
+  prompt and `--selftest-fl-bug`). **Drafted in full by yw07b**
+  (`notes/contracts/yw08-repl-errors-conformance-perf.md`): the prompt
+  over the one line editor (R-yw08-1), the exit-4 report (R-yw08-2),
+  `fuzz_fl_vm`, the coverage ledger, `perf_fletch`'s gates with yw07b's
+  MISS rows to ratchet or dispose (R-yw08-3), and M-YW6's prompt golden
+  and coverage gate.
 - **yw09 — Fletch in the editor** (s34–s38; `src/fl/` flapi, flconf,
   fleval, flhook, flruntime, fltxn, handle, record, macrolib, origin;
   `src/edit/batch.c`). Editor handles and the capability-checked
