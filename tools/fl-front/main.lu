@@ -1,0 +1,213 @@
+//! Frontend-only differential, fuzz and smoke harness; not the yew fl CLI.
+//! sagitta 9ace98c2 flcli.c:346-431, tests/fuzz/fuzz_fl_lex.c:35-96,
+//! fuzz_fl_parse.c:51-158,213-244; s29-lexer-parser.md:226-227.
+//! Parser fuzz explicitly names the pending deliverable-6 fl_data_read
+//! subcheck. It never presents the frontend subset as the whole C fuzzer.
+
+use fl
+use std.fs
+use fuzzgen
+use util
+
+fn emit_bytes(mut fd: fs.File, bytes: List[byte]) {
+    fs.write_chunk(mut fd, bytes) else |_| { os_exit(3) }
+}
+
+fn ast(path: str) -> int {
+    let src = fs_read_bytes(path) else |_| { eprint("cannot read {path}"); return 3 }
+    var dc = fl.fl_diag_init()
+    var strings = fl.fl_strings()
+    let id = fl.fl_diag_add_file(mut dc, path, src)
+    let p = fl.fl_parse(src, id, mut dc, mut strings)
+    var err = fs.stderr()
+    for diag in dc.entries {
+        var out = List[byte]()
+        fl.fl_diag_render(mut out, dc, diag.level, diag.sp, diag.msg)
+        emit_bytes(mut err, out)
+    }
+    if p.had_error { return 1 }
+    if p.incomplete {
+        eprint("{path}: error: unexpected end of input; a bracket or block is still open")
+        return 1
+    }
+    var out = List[byte]()
+    fl.fl_ast_dump(mut out, p, strings)
+    var stdout = fs.stdout()
+    emit_bytes(mut stdout, out)
+    0
+}
+
+fn lex_check(bytes: List[byte]) -> str {
+    var dc = fl.fl_diag_init()
+    var strings = fl.fl_strings()
+    let id = fl.fl_diag_add_file(mut dc, "fuzz.fl", bytes)
+    var lx = fl.fl_lex_init(id)
+    var previous = 0
+    var steps = 0
+    loop {
+        let token = fl.fl_lex_next(mut lx, bytes, mut dc, mut strings)
+        if token.kind == fl.FL_T_EOF { break }
+        if lx.at <= previous {
+            return "lexer made no progress at offset {previous} (kind {token.kind})"
+        }
+        previous = lx.at
+        steps += 1
+        if steps > bytes.len + 2 { return "lexer produced {steps} tokens for {bytes.len} bytes" }
+    }
+    let again = fl.fl_lex_next(mut lx, bytes, mut dc, mut strings)
+    if again.kind != fl.FL_T_EOF { return "lexer yielded kind {again.kind} after EOF" }
+    ""
+}
+
+fn parse_check(bytes: List[byte]) -> str {
+    var dc = fl.fl_diag_init()
+    var strings = fl.fl_strings()
+    let id = fl.fl_diag_add_file(mut dc, "fuzz.fl", bytes)
+    let p = fl.fl_parse(bytes, id, mut dc, mut strings)
+    if dc.nerrors > fl.FL_PARSE_MAX_ERRORS + 1 {
+        return "{dc.nerrors} diagnostics exceeds the cap of 20"
+    }
+    if p.incomplete && p.had_error { return "incomplete and had_error are both set" }
+    for node_id in p.stmts {
+        if node_id < 0 || node_id >= p.nodes.len { return "invalid statement index" }
+    }
+    let before = dc.nerrors
+    let literal = fl.fl_parse_literal(bytes, id, mut dc, mut strings)
+    let errors = dc.nerrors - before
+    if literal.root >= 0 && errors > 0 {
+        return "pure-literal returned a value AND reported errors"
+    }
+    if literal.root < 0 && errors == 0 && bytes.len != 0 {
+        return "pure-literal rejected bytes silently"
+    }
+    // Stronger than the C root-only check: check EVERY allocated node.
+    if literal.root >= 0 {
+        for node in literal.nodes {
+            if node.kind != fl.FL_A_LIT && node.kind != fl.FL_A_LIST && node.kind != fl.FL_A_MAP {
+                return "pure-literal produced banned node kind {node.kind}"
+            }
+        }
+    }
+    ""
+}
+
+fn check_bytes(bytes: List[byte], parsing: bool) -> str {
+    if !parsing { return lex_check(bytes) }
+    let first = parse_check(bytes)
+    if first != "" { return first }
+    var frame = List[byte]()
+    util.buf_append_str(mut frame, "{{name:\"")
+    util.buf_append(mut frame, bytes)
+    util.buf_append_str(
+        mut frame,
+        "\",version:\"1.0.0\",api:1,entry:\"src/main.fl\",capabilities:[],events:[]}}",
+    )
+    parse_check(frame)
+}
+
+fn fuzz(args: List[str], parsing: bool) -> int {
+    let (ok, seed, iters) = fuzzgen.parse_args(args)
+    if !ok { eprint("usage: fl-front lex-fuzz|parse-fuzz-front [--iters=N] [--seed=N]"); return 2 }
+    let target = if parsing then "fuzz_fl_parse" else "fuzz_fl_lex"
+    if parsing {
+        eprint("PENDING deliverable6: fl_data_read raw/framed subchecks; frontend invariants ONLY")
+    }
+    let (cok, corpus, dict) = fuzzgen.corpus_dict_from(target, "tests/fuzz/corpus/fl_parse")
+    if !cok { return 2 }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > 64 then 64 else iters - done
+        region epoch {
+            var rng = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut rng, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut rng, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, operation) = fuzzgen.mutate_dict(mut rng, input, corpus, dict)
+                    input = next
+                    op = operation
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut rng, input)
+                var why = ""
+                region trial {
+                    why = copy check_bytes(input, parsing)
+                    if region_bytes(trial) > 67108864 { why = "frontend region grew past 64 MiB" }
+                }
+                if why != "" {
+                    eprint(
+                        "{target}: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                    )
+                    eprint("{target}: input={fuzzgen.hex_of(input)}")
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = rng.state
+            hash = rng.hash
+        }
+        done += n
+    }
+    if failed { return 1 }
+    let report = if parsing then "fuzz_fl_parse_frontend" else target
+    print("{report}: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok")
+    0
+}
+
+fn perf() -> int {
+    var bytes = List[byte]()
+    (mut bytes).push(91 as byte)
+    while bytes.len < 512000 - 2 { util.buf_append_str(mut bytes, "123,") }
+    (mut bytes).push(93 as byte)
+    // Batch to resolve below the millisecond clock's single-tick precision.
+    let start = time_now_ms()
+    var nodes = 0
+    for _ in 0..10 {
+        region trial {
+            var dc = fl.fl_diag_init()
+            var strings = fl.fl_strings()
+            let id = fl.fl_diag_add_file(mut dc, "perf.fl", bytes)
+            let p = fl.fl_parse_literal(bytes, id, mut dc, mut strings)
+            assert(p.root >= 0 && !p.had_error && !p.incomplete)
+            nodes = p.nodes.len
+        }
+    }
+    let elapsed = time_now_ms() - start
+    // The size is observed through reserved list allocations: same header
+    // and exact reserve size, so the difference is one scalar node's stride.
+    var one = 0
+    var two = 0
+    region size1 {
+        var items = List[fl.FlNode]()
+        (mut items).reserve(1024)
+        one = region_bytes(size1)
+    }
+    region size2 {
+        var items = List[fl.FlNode]()
+        (mut items).reserve(2048)
+        two = region_bytes(size2)
+    }
+    print(
+        "front-perf: bytes={bytes.len} nodes={nodes} rounds=10 elapsed_ms={elapsed} node_stride={(two - one) / 1024}",
+    )
+    0
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len == 2 && args[0] == "ast" { return ast(args[1]) }
+    if args.len > 0 && args[0] == "lex-fuzz" { return fuzz(args[1..], false) }
+    if args.len > 0 && args[0] == "parse-fuzz-front" { return fuzz(args[1..], true) }
+    if args.len == 1 && args[0] == "perf" { return perf() }
+    eprint("usage: fl-front ast FILE | lex-fuzz ARGS | parse-fuzz-front ARGS | perf")
+    2
+}
