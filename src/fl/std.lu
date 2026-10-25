@@ -82,3 +82,206 @@ pub fn fl_arg_fn(mut vm: FlVm, base: int, i: int) -> FlValue ! {arg} {
     fl_arg_type_error(mut vm, i, "fn", v)
     arg
 }
+
+/// One builtin module: its name and its native rows in C's declaration order.
+pub struct FlModuleDef { name: str, defs: List[FlNativeDef] }
+
+/// sagitta std.c:43-50's FL_MODULES. REGISTRATION ORDER IS PART OF THE
+/// CONTRACT: `--list-natives` walks it, and s33's ledger diffs that output.
+/// Global native kind ids are family * 1000 + row: prelude 0, str 1, list 2,
+/// map 3, math 4, fmt 5, io 6, re 7, buf 8, win 9, cur 10, span 11, opt 12,
+/// ed 13, ai 14 (R10's one kind-id representation, never function values).
+pub fn fl_std_modules() -> List[FlModuleDef] {
+    [
+        FlModuleDef { name: "str", defs: fl_str_defs() },
+        FlModuleDef { name: "list", defs: fl_list_defs() },
+        FlModuleDef { name: "map", defs: fl_map_defs() },
+        FlModuleDef { name: "math", defs: fl_math_defs() },
+        FlModuleDef { name: "fmt", defs: fl_fmt_defs() },
+        FlModuleDef { name: "io", defs: fl_io_defs() },
+        FlModuleDef { name: "re", defs: fl_re_defs() },
+        FlModuleDef { name: "buf", defs: fl_buf_defs() },
+        FlModuleDef { name: "win", defs: fl_win_defs() },
+        FlModuleDef { name: "cur", defs: fl_cur_defs() },
+        FlModuleDef { name: "span", defs: fl_span_defs() },
+        FlModuleDef { name: "opt", defs: fl_opt_defs() },
+        FlModuleDef { name: "ed", defs: fl_ed_defs() },
+        FlModuleDef { name: "ai", defs: fl_ai_defs() },
+    ]
+}
+
+/// std.c:55-102: one frozen map of qualified natives per module, then its
+/// constants (math's six), stored in vm.builtins under the module's name.
+fn fl_register_module(mut vm: FlVm, md: FlModuleDef) {
+    let m = fl_map_new(mut vm)
+    // Protected for the whole build, as gc.h rule 2 has it in C.
+    let root = fl_temp_push(mut vm, m)
+    for d in md.defs {
+        let qual = "{md.name}.{d.name}"
+        let id = fl_intern(mut vm.strings, qual.bytes(), 0, qual.len)
+        let nat = fl_native_new(mut vm, id, d.kind, d.min_ar, d.max_ar, d.caps)
+        let key = fl_str_text(mut vm, d.name)
+        let module = fl_temp_get(vm, root)
+        assert(fl_map_set(mut vm, module, key, nat))
+    }
+    if md.name == "math" {
+        let module = fl_temp_get(vm, root)
+        fl_math_constants(mut vm, module)
+    }
+    let frozen = fl_temp_get(vm, root)
+    fl_freeze(mut vm, frozen)
+    let name = fl_str_text(mut vm, md.name)
+    let builtins = copy vm.builtins
+    let module = fl_temp_get(vm, root)
+    assert(fl_map_set(mut vm, builtins, name, module))
+    fl_temp_pop(mut vm, 1)
+}
+
+/// The prelude's seven rows, std.c:242-257, keyed by interned id because
+/// GET_GLOBAL looks the prelude up with the same constant as a global.
+pub fn fl_prelude_defs() -> List[FlNativeDef] {
+    [
+        fl_native_def("error", 0, 1, 1, 0, ""),
+        fl_native_def("on", 1, 2, 2, 0, ""),
+        fl_native_def("record", 2, 1, 1, 0, ""),
+        fl_native_def("replay", 3, 1, 2, 0, ""),
+        fl_native_def("set", 4, 1, 1, 0, ""),
+        fl_native_def("bind", 5, 3, 4, 0, ""),
+        fl_native_def("unbind", 6, 2, 2, 0, ""),
+    ]
+}
+
+/// Register the builtin modules in C's order, then the prelude (std.c:259-267).
+pub fn fl_std_register(mut vm: FlVm) {
+    for md in fl_std_modules() { fl_register_module(mut vm, md) }
+    for d in fl_prelude_defs() {
+        let id = fl_intern(mut vm.strings, d.name.bytes(), 0, d.name.len)
+        let nat = fl_native_new(mut vm, id, d.kind, d.min_ar, d.max_ar, 0)
+        let root = fl_temp_push(mut vm, nat)
+        let prelude = copy vm.prelude
+        let native = fl_temp_get(vm, root)
+        assert(fl_map_set(mut vm, prelude, fl_int(id), native))
+        fl_temp_pop(mut vm, 1)
+    }
+}
+
+/// `--list-natives`: every qualified native, one a line, in registration
+/// order; answers the count (std.c:269-290).
+pub fn fl_std_list_natives(mut out: List[byte]) -> int {
+    var n: int = 0
+    for md in fl_std_modules() {
+        for d in md.defs {
+            for b in md.name.bytes() { (mut out).push(b) }
+            (mut out).push(46 as byte)
+            for b in d.name.bytes() { (mut out).push(b) }
+            (mut out).push(10 as byte)
+            n += 1
+        }
+    }
+    n
+}
+
+/// A qualified native's signature text, none when it is not registered
+/// (std.c:292-314).
+pub fn fl_std_sig(qualified: str) -> str ! {none} {
+    for md in fl_std_modules() {
+        let prefix = "{md.name}."
+        if !qualified.starts_with(prefix) { continue }
+        let rest = qualified[prefix.len..qualified.len]
+        for d in md.defs { if d.name == rest { return copy d.sig } }
+        return none
+    }
+    none
+}
+
+/// §9's `error(v)` (std.c:113-146): a string raises {kind: "user", msg: v};
+/// a map is raised as it stands once its kind is a string.
+fn fl_prelude_error(mut vm: FlVm, base: int) -> FlValue {
+    let v = copy vm.stack[base]
+    if v.t == FL_MAP {
+        let key = fl_str_text(mut vm, "kind")
+        let k = fl_map_get(vm, vm.stack[base], key) else {
+            return fl_raise(mut vm, "type", "error: the map has no 'kind'")
+        }
+        if k.t != FL_STR {
+            return fl_raise(mut vm, "type", "error: 'kind' must be a str, found {fl_type_name(k.t)}")
+        }
+        vm.err = copy vm.stack[base]
+        vm.raised = true
+        return fl_nil()
+    }
+    if v.t != FL_STR {
+        return fl_raise(
+            mut vm,
+            "type",
+            "error: argument 1 must be a str or a map, found {fl_type_name(v.t)}",
+        )
+    }
+    let at = fl_obj_index(vm, v)
+    let msg = copy vm.gc.slots[at].bytes
+    fl_raise_bytes(mut vm, "user", msg)
+}
+
+/// std.c:148-166: a register name is one letter a-z or A-Z.
+fn fl_named_register(mut vm: FlVm, base: int, native: str) -> bool {
+    let v = copy vm.stack[base]
+    if v.t != FL_STR {
+        let _ = fl_raise(mut vm, "type", "{native}: argument 1 must be a str, found {fl_type_name(v.t)}")
+        return false
+    }
+    let at = fl_obj_index(vm, v)
+    var ok = vm.gc.slots[at].bytes.len == 1
+    if ok {
+        let c = vm.gc.slots[at].bytes[0] as int
+        ok = c >= 97 && c <= 122 || c >= 65 && c <= 90
+    }
+    if !ok { let _ = fl_raise(mut vm, "type", "{native}: register must be one letter a-z/A-Z") }
+    ok
+}
+
+/// `record`/`replay` (std.c:168-224) as a headless VM runs them: the
+/// register is checked, then invoke_macro_command's editor check raises.
+/// The count bound is YEW_COUNT_MAX (edit/dispatch.h:12).
+fn fl_prelude_macro(mut vm: FlVm, base: int, argc: int, replay: bool) -> FlValue {
+    let native = if replay then "replay" else "record"
+    if !fl_named_register(mut vm, base, native) { return fl_nil() }
+    if replay && argc == 2 {
+        let c = copy vm.stack[base + 1]
+        if c.t != FL_INT {
+            return fl_raise(mut vm, "type", "replay: argument 2 must be an int, found {fl_type_name(c.t)}")
+        }
+        if c.i < 1 || c.i > 99999 { return fl_raise(mut vm, "type", "replay: count must be 1..99999") }
+    }
+    let command = if replay then "ed.macro.replay" else "ed.macro.record"
+    fl_raise(mut vm, "handle", "{command}: no editor is attached")
+}
+
+fn fl_prelude_dispatch(mut vm: FlVm, local: int, base: int, argc: int) -> FlValue {
+    match local {
+        0 => fl_prelude_error(mut vm, base),
+        2 => fl_prelude_macro(mut vm, base, argc, false),
+        3 => fl_prelude_macro(mut vm, base, argc, true),
+        _ => fl_prelude_api_dispatch(mut vm, local, base, argc),
+    }
+}
+
+/// The VM's one native dispatcher (R10): family by kind / 1000, the row
+/// by kind % 1000; CALL has already checked arity and set cur_native.
+pub fn fl_native_dispatch(mut vm: FlVm, kind: int, base: int, argc: int) -> FlValue {
+    let local = kind % 1000
+    match kind / 1000 {
+        0 => fl_prelude_dispatch(mut vm, local, base, argc),
+        1 => fl_std_str_dispatch(mut vm, local, base, argc),
+        2 => fl_std_list_dispatch(mut vm, local, base, argc),
+        3 => fl_std_map_dispatch(mut vm, local, base, argc),
+        4 => fl_std_math_dispatch(mut vm, local, base, argc),
+        5 => fl_std_fmt_dispatch(mut vm, local, base, argc),
+        6 => fl_std_io_dispatch(mut vm, local, base, argc),
+        7 => fl_std_re_dispatch(mut vm, local, base, argc),
+        8..=14 => fl_std_api_dispatch(mut vm, kind, base, argc),
+        _ => {
+            assert(false)
+            fl_nil()
+        },
+    }
+}
