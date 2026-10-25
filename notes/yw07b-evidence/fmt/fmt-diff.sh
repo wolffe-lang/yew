@@ -6,7 +6,7 @@ ev=notes/yw07b-evidence/fmt; out=target/fmt-diff; mkdir -p $out
 stage=target/fmt-probe
 rm -rf $stage; mkdir -p $stage
 cp $ev/probe/main.lu $stage/main.lu
-for m in fl flfix unicode util; do mkdir -p $stage/$m; cp src/$m/*.lu $stage/$m/; find $stage/$m -name '*_test.lu' -delete; done
+for d in src/*/; do m=$(basename $d); mkdir -p $stage/$m; cp src/$m/*.lu $stage/$m/; find $stage/$m -name '*_test.lu' -delete; done
 W=/home/mfwolffe/lanes/yw07b/yew/.wolf-bin/wolf
 export WOLF_STD=/home/mfwolffe/lanes/yw07b/yew/.wolf-bin/std
 $W build --deny-warnings $stage/main.lu -o target/fmt-probe.bin > target/fmt-probe.build.log 2>&1 || { echo BUILD-FAIL; tail -30 target/fmt-probe.build.log; exit 1; }
