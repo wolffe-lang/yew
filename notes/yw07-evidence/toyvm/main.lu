@@ -1,0 +1,747 @@
+//! yw07b's throwaway VM, never linked into yew. Sagitta 9ace98c2:
+//! s30-values-vm.md:465-511 roots/protection; src/fl/gc.c:37-59 pending,
+//! :431-460 collection/accounting; tests/perf/fl_smoke.c:112-123 programs.
+//! R-yw07-2 A: scalar tag/int/f64 values. R10: mutable calls by name.
+//! Payloads stay in fixed physical slots: no pop/refill/push row pool (G50).
+
+struct Value { t: int, i: int, f: f64 }
+
+struct Slot {
+    t: int,
+    marked: bool,
+    generation: int,
+    next: int,
+    pc: int,
+    values: List[Value],
+    index: List[int],
+}
+
+// Root indices: 0 uses stack[0..sp], 1 frames, 2 open upvalues,
+// 3 globals, 4 modules, 5 handles, 6 temporaries, 7 compile chain.
+struct Root { values: List[Value] }
+
+struct Frame { pc: int, base: int }
+
+struct Op { code: int, a: int, b: int }
+
+struct Vm {
+    slots: List[Slot],
+    roots: List[Root],
+    gray: List[int],
+    remap: List[int],
+    frames: List[Frame],
+    stack: List[Value],
+    sp: int,
+    base: int,
+    pc: int,
+    half: int,
+    used: int,
+    capacity: int,
+    free: int,
+    compact: bool,
+    stress: bool,
+    pending: bool,
+    bytes: int,
+    next_gc: int,
+    collections: int,
+    live: int,
+    max_pause_ns: int,
+}
+
+fn nil() -> Value { Value { t: 0, i: 0, f: 0.0 } }
+
+fn number(i: int) -> Value { Value { t: 2, i: i, f: 0.0 } }
+
+fn empty_slot() -> Slot {
+    Slot {
+        t: -1,
+        marked: false,
+        generation: 0,
+        next: -1,
+        pc: 0,
+        values: List[Value](),
+        index: List[int](),
+    }
+}
+
+fn vm_new(compact: bool, stress: bool, capacity: int) -> Vm {
+    var vm = Vm {
+        slots: List[Slot](),
+        roots: List[Root](),
+        gray: List[int](),
+        remap: List[int](),
+        frames: List[Frame](),
+        stack: List[Value](),
+        sp: 0,
+        base: 0,
+        pc: 0,
+        half: 0,
+        used: 0,
+        capacity: capacity,
+        free: -1,
+        compact: compact,
+        stress: stress,
+        pending: false,
+        bytes: 0,
+        next_gc: 262144,
+        collections: 0,
+        live: 0,
+        max_pause_ns: 0,
+    }
+    (mut vm.slots).reserve(2 * capacity)
+    (mut vm.remap).reserve(2 * capacity)
+    (mut vm.gray).reserve(capacity)
+    (mut vm.frames).reserve(256)
+    (mut vm.stack).reserve(16384)
+    for _ in 0..2 * capacity {
+        (mut vm.slots).push(empty_slot())
+        (mut vm.remap).push(-1)
+    }
+    for _ in 0..16384 { (mut vm.stack).push(nil()) }
+    for _ in 0..8 {
+        var root = Root { values: List[Value]() }
+        (mut root.values).reserve(256)
+        (mut vm.roots).push(root)
+    }
+    vm
+}
+
+fn valid(vm: Vm, v: Value) -> bool {
+    if v.t < 4 { return true }
+    let width = 2 * vm.capacity
+    let at = v.i % width
+    vm.slots[at].t == v.t && vm.slots[at].generation == v.i / width
+}
+
+fn address(vm: Vm, v: Value) -> int {
+    assert(v.t >= 4 && valid(vm, v))
+    v.i % (2 * vm.capacity)
+}
+
+fn reference(vm: Vm, at: int) -> Value {
+    Value {
+        t: vm.slots[at].t,
+        i: vm.slots[at].generation * (2 * vm.capacity) + at,
+        f: 0.0,
+    }
+}
+
+fn alloc(mut vm: Vm, tag: int) -> Value {
+    var at: int = 0
+    if !vm.compact && vm.free >= 0 {
+        at = vm.free
+        vm.free = vm.slots[at].next
+    } else {
+        assert(vm.used < vm.capacity)
+        at = vm.half * vm.capacity + vm.used
+        vm.used += 1
+    }
+    vm.slots[at].t = tag
+    vm.slots[at].marked = false
+    vm.slots[at].generation += 1
+    vm.slots[at].pc = 0
+    (mut vm.slots[at].values).reset()
+    (mut vm.slots[at].index).reset()
+    // LP64 shell charges: list 40, map 56, closure 40, upvalue 48.
+    vm.bytes += if tag == 5 then 56 else if tag == 7 then 48 else 40
+    if vm.stress || vm.bytes > vm.next_gc { vm.pending = true }
+    reference(vm, at)
+}
+
+fn mark(mut vm: Vm, v: Value) {
+    if v.t < 4 { return }
+    let at = address(vm, v)
+    if !vm.slots[at].marked {
+        vm.slots[at].marked = true
+        (mut vm.gray).push(at)
+    }
+}
+
+fn remapped(vm: Vm, v: Value) -> Value {
+    if v.t < 4 { return v }
+    let at = address(vm, v)
+    let dest = vm.remap[at]
+    assert(dest >= 0)
+    reference(vm, dest)
+}
+
+fn collect(mut vm: Vm) {
+    let start = os_clock_ns()
+    (mut vm.gray).reset()
+    for i in 0..vm.sp { let v = copy vm.stack[i]; mark(mut vm, v) }
+    for r in 1..8 {
+        for i in 0..vm.roots[r].values.len {
+            let v = copy vm.roots[r].values[i]
+            mark(mut vm, v)
+        }
+    }
+    while vm.gray.len > 0 {
+        let at = (mut vm.gray).pop() else -1
+        for j in 0..vm.slots[at].values.len {
+            let v = copy vm.slots[at].values[j]
+            mark(mut vm, v)
+        }
+    }
+    var live: int = 0
+    let old = vm.half * vm.capacity
+    if vm.compact {
+        let spare = (1 - vm.half) * vm.capacity
+        for i in 0..vm.used {
+            let src = old + i
+            vm.remap[src] = -1
+            if !vm.slots[src].marked { continue }
+            let dst = spare + live
+            vm.remap[src] = dst
+            vm.slots[dst].t = vm.slots[src].t
+            vm.slots[dst].pc = vm.slots[src].pc
+            vm.slots[dst].generation += 1
+            vm.slots[dst].marked = false
+            (mut vm.slots[dst].values).reset()
+            (mut vm.slots[dst].index).reset()
+            for j in 0..vm.slots[src].values.len {
+                let v = copy vm.slots[src].values[j]
+                (mut vm.slots[dst].values).push(v)
+            }
+            for j in 0..vm.slots[src].index.len {
+                let v = vm.slots[src].index[j]
+                (mut vm.slots[dst].index).push(v)
+            }
+            live += 1
+        }
+        for i in 0..live {
+            let dst = spare + i
+            for j in 0..vm.slots[dst].values.len {
+                vm.slots[dst].values[j] = remapped(vm, vm.slots[dst].values[j])
+            }
+        }
+        for i in 0..vm.sp { vm.stack[i] = remapped(vm, vm.stack[i]) }
+        for r in 1..8 {
+            for j in 0..vm.roots[r].values.len {
+                vm.roots[r].values[j] = remapped(vm, vm.roots[r].values[j])
+            }
+        }
+        for i in 0..vm.used {
+            let at = old + i
+            // Old-half tags poisoned before its retained buffers are reset.
+            vm.slots[at].t = -1
+            vm.slots[at].marked = false
+            (mut vm.slots[at].values).reset()
+            (mut vm.slots[at].index).reset()
+        }
+        vm.half = 1 - vm.half
+        vm.used = live
+    } else {
+        vm.free = -1
+        for i in 0..vm.used {
+            if vm.slots[i].t >= 4 && vm.slots[i].marked {
+                vm.slots[i].marked = false
+                live += 1
+            } else {
+                vm.slots[i].t = -1
+                (mut vm.slots[i].values).reset()
+                (mut vm.slots[i].index).reset()
+                vm.slots[i].next = vm.free
+                vm.free = i
+            }
+        }
+    }
+    // The pin recomputes only sizeof(FlObj) per survivor (gc.c:451-455),
+    // NOT full payload sizes. Match that schedule rather than the draft prose.
+    vm.bytes = live * 16
+    vm.next_gc = vm.bytes * 2
+    if vm.next_gc < 262144 { vm.next_gc = 262144 }
+    vm.pending = false
+    vm.live = live
+    vm.collections += 1
+    let elapsed = os_clock_ns() - start
+    if elapsed > vm.max_pause_ns { vm.max_pause_ns = elapsed }
+}
+
+fn boundary(mut vm: Vm) { if vm.pending { collect(mut vm) } }
+
+fn push(mut vm: Vm, v: Value) {
+    assert(vm.sp < vm.stack.len)
+    vm.stack[vm.sp] = v
+    vm.sp += 1
+}
+
+fn pop(mut vm: Vm) -> Value {
+    assert(vm.sp > 0)
+    vm.sp -= 1
+    copy vm.stack[vm.sp]
+}
+
+fn root_push(mut vm: Vm, kind: int, v: Value) {
+    (mut vm.roots[kind].values).push(v)
+}
+
+fn root_pop(mut vm: Vm, kind: int) {
+    let _ = (mut vm.roots[kind].values).pop() else nil()
+}
+
+fn map_grow(mut vm: Vm, at: int) {
+    let n = if vm.slots[at].index.len == 0 then 16 else vm.slots[at].index.len * 2
+    (mut vm.slots[at].index).reset()
+    for _ in 0..n { (mut vm.slots[at].index).push(-1) }
+    var entry: int = 0
+    while entry < vm.slots[at].values.len {
+        let key = copy vm.slots[at].values[entry].i
+        var bucket = key % n
+        while vm.slots[at].index[bucket] >= 0 { bucket = (bucket + 1) % n }
+        vm.slots[at].index[bucket] = entry
+        entry += 2
+    }
+}
+
+fn store(mut vm: Vm, obj: Value, key: Value, value: Value) {
+    let at = address(vm, obj)
+    if obj.t == 4 {
+        assert(key.i >= 0 && key.i < vm.slots[at].values.len)
+        vm.slots[at].values[key.i] = value
+    } else {
+        assert(obj.t == 5 && key.t == 2 && key.i >= 0)
+        if vm.slots[at].index.len == 0 ||
+            (vm.slots[at].values.len / 2 + 1) * 10 >= vm.slots[at].index.len * 7 {
+            map_grow(mut vm, at)
+        }
+        let n = vm.slots[at].index.len
+        var bucket = key.i % n
+        while vm.slots[at].index[bucket] >= 0 {
+            let e = vm.slots[at].index[bucket]
+            if vm.slots[at].values[e].i == key.i {
+                vm.slots[at].values[e + 1] = value
+                return
+            }
+            bucket = (bucket + 1) % n
+        }
+        vm.slots[at].index[bucket] = vm.slots[at].values.len
+        (mut vm.slots[at].values).push(key)
+        (mut vm.slots[at].values).push(value)
+    }
+}
+
+// 16 opcodes: constants, +, -, <, get/set local, jumps, call/return,
+// list/map construction, index store, capture/call/get upvalue, motion error.
+fn execute(mut vm: Vm, code: List[Op], entry: int) -> Value {
+    vm.pc = entry
+    loop {
+        boundary(mut vm)
+        let ins = copy code[vm.pc]
+        vm.pc += 1
+        match ins.code {
+            0 => { push(mut vm, number(ins.a)) },
+            1 => {
+                let b = pop(mut vm)
+                let a = pop(mut vm)
+                push(mut vm, number(a.i + b.i))
+            },
+            2 => {
+                let b = pop(mut vm)
+                let a = pop(mut vm)
+                push(mut vm, number(a.i - b.i))
+            },
+            3 => {
+                let b = pop(mut vm)
+                let a = pop(mut vm)
+                push(mut vm, number(if a.i < b.i then 1 else 0))
+            },
+            4 => { let v = copy vm.stack[vm.base + ins.a]; push(mut vm, v) },
+            5 => { let v = pop(mut vm); vm.stack[vm.base + ins.a] = v },
+            6 => { vm.pc = ins.a },
+            7 => { let v = pop(mut vm); if v.i == 0 { vm.pc = ins.a } },
+            8 => {
+                assert(vm.frames.len < 256)
+                (mut vm.frames).push(Frame { pc: vm.pc, base: vm.base })
+                root_push(mut vm, 1, nil())
+                vm.base = vm.sp - ins.b
+                vm.pc = ins.a
+            },
+            9 => {
+                let v = pop(mut vm)
+                if vm.frames.len == 0 { return v }
+                vm.sp = vm.base
+                let frame = (mut vm.frames).pop() else Frame { pc: 0, base: 0 }
+                root_pop(mut vm, 1)
+                vm.pc = frame.pc
+                vm.base = frame.base
+                push(mut vm, v)
+            },
+            10 => {
+                let obj = alloc(mut vm, ins.a)
+                let at = address(vm, obj)
+                let start = vm.sp - ins.b
+                for i in start..vm.sp {
+                    let v = copy vm.stack[i]
+                    (mut vm.slots[at].values).push(v)
+                }
+                vm.sp = start
+                push(mut vm, obj)
+            },
+            11 => {
+                let v = pop(mut vm)
+                let key = pop(mut vm)
+                let obj = pop(mut vm)
+                store(mut vm, obj, key, v)
+            },
+            12 => {
+                let captured = pop(mut vm)
+                let up = alloc(mut vm, 7)
+                let u = address(vm, up)
+                (mut vm.slots[u].values).push(captured)
+                let cl = alloc(mut vm, 6)
+                let c = address(vm, cl)
+                vm.slots[c].pc = ins.a
+                (mut vm.slots[c].values).push(up)
+                push(mut vm, cl)
+            },
+            13 => {
+                let cl = pop(mut vm)
+                let c = address(vm, cl)
+                let dest = vm.slots[c].pc
+                (mut vm.frames).push(Frame { pc: vm.pc, base: vm.base })
+                root_push(mut vm, 1, cl)
+                vm.base = vm.sp - ins.b
+                vm.pc = dest
+            },
+            14 => {
+                let cl = copy vm.roots[1].values[vm.roots[1].values.len - 1]
+                let c = address(vm, cl)
+                let up = copy vm.slots[c].values[0]
+                let u = address(vm, up)
+                let v = copy vm.slots[u].values[0]
+                push(mut vm, v)
+            },
+            15 => {
+                // Null-host motion raises a transient map then catches it.
+                // A toy shape, not a claim of real-VM opcode/charge parity.
+                let err = alloc(mut vm, 5)
+                store(mut vm, err, number(0), number(2))
+            },
+            _ => { assert(false) },
+        }
+    }
+}
+
+fn op(mut code: List[Op], kind: int, a: int, b: int) {
+    (mut code).push(Op { code: kind, a: a, b: b })
+}
+
+fn fib_program(n: int) -> List[Op] {
+    var c = List[Op]()
+    op(mut c, 0, n, 0)
+    op(mut c, 8, 3, 1)
+    op(mut c, 9, 0, 0)
+    op(mut c, 4, 0, 0)
+    op(mut c, 0, 2, 0)
+    op(mut c, 3, 0, 0)
+    op(mut c, 7, 9, 0)
+    op(mut c, 4, 0, 0)
+    op(mut c, 9, 0, 0)
+    op(mut c, 4, 0, 0)
+    op(mut c, 0, 1, 0)
+    op(mut c, 2, 0, 0)
+    op(mut c, 8, 3, 1)
+    op(mut c, 4, 0, 0)
+    op(mut c, 0, 2, 0)
+    op(mut c, 2, 0, 0)
+    op(mut c, 8, 3, 1)
+    op(mut c, 1, 0, 0)
+    op(mut c, 9, 0, 0)
+    c
+}
+
+fn loop_program(map: bool, n: int) -> List[Op] {
+    var c = List[Op]()
+    op(mut c, 10, 5, 0) // local 0: map
+    op(mut c, 0, 0, 0) // local 1: i
+    op(mut c, 4, 1, 0)
+    op(mut c, 0, n, 0)
+    op(mut c, 3, 0, 0)
+    op(mut c, 7, if map then 16 else 13, 0)
+    if map {
+        op(mut c, 4, 0, 0)
+        op(mut c, 4, 1, 0)
+        op(mut c, 4, 1, 0)
+        op(mut c, 11, 0, 0)
+    } else {
+        op(mut c, 15, 0, 0)
+    }
+    op(mut c, 4, 1, 0)
+    op(mut c, 0, 1, 0)
+    op(mut c, 1, 0, 0)
+    op(mut c, 5, 1, 0)
+    op(mut c, 6, 2, 0)
+    op(mut c, 4, 1, 0)
+    op(mut c, 9, 0, 0)
+    c
+}
+
+fn check_roots(compact: bool) {
+    var vm = vm_new(compact, true, 32)
+    for r in 0..8 {
+        let obj = alloc(mut vm, 4)
+        let at = address(vm, obj)
+        (mut vm.slots[at].values).push(number(100 + r))
+        if r == 0 { push(mut vm, obj) } else { root_push(mut vm, r, obj) }
+        boundary(mut vm)
+        let kept = if r == 0 then copy vm.stack[0] else copy vm.roots[r].values[0]
+        let k = address(vm, kept)
+        assert(vm.slots[k].values[0].i == 100 + r && vm.live == 1)
+        if r == 0 { vm.sp = 0 } else { root_pop(mut vm, r) }
+        collect(mut vm)
+        assert(vm.live == 0)
+    }
+    // Actual operand stack is an independent root too.
+    let obj = alloc(mut vm, 4)
+    push(mut vm, obj)
+    boundary(mut vm)
+    assert(vm.live == 1 && valid(vm, vm.stack[0]))
+    vm.sp = 0
+    collect(mut vm)
+    assert(vm.live == 0)
+}
+
+fn check_cycle(compact: bool) {
+    var vm = vm_new(compact, true, 32)
+    let a = alloc(mut vm, 4)
+    let b = alloc(mut vm, 4)
+    let ai = address(vm, a)
+    let bi = address(vm, b)
+    (mut vm.slots[ai].values).push(b)
+    (mut vm.slots[bi].values).push(a)
+    root_push(mut vm, 6, a)
+    collect(mut vm)
+    assert(vm.live == 2)
+    let kept = copy vm.roots[6].values[0]
+    let ka = address(vm, kept)
+    let kb = address(vm, vm.slots[ka].values[0])
+    assert(vm.slots[kb].values[0].i == kept.i)
+    root_pop(mut vm, 6)
+    collect(mut vm)
+    assert(vm.live == 0)
+}
+
+fn check_vm(compact: bool) {
+    var vm = vm_new(compact, true, 64)
+    let fib = fib_program(10)
+    assert(execute(mut vm, fib, 0).i == 55)
+    vm.sp = 0
+    vm.base = 0
+    let mapcode = loop_program(true, 100)
+    assert(execute(mut vm, mapcode, 0).i == 100)
+    let m = address(vm, vm.stack[0])
+    assert(vm.slots[m].values.len == 200)
+    for i in 0..100 { assert(vm.slots[m].values[i * 2 + 1].i == i) }
+    vm.sp = 0
+    vm.base = 0
+    var c = List[Op]()
+    op(mut c, 0, 41, 0)
+    op(mut c, 12, 4, 0)
+    op(mut c, 13, 0, 0)
+    op(mut c, 9, 0, 0)
+    op(mut c, 14, 0, 0)
+    op(mut c, 0, 1, 0)
+    op(mut c, 1, 0, 0)
+    op(mut c, 9, 0, 0)
+    assert(execute(mut vm, c, 0).i == 42)
+    vm.sp = 0
+    vm.base = 0
+    let motion = loop_program(false, 100)
+    assert(execute(mut vm, motion, 0).i == 100)
+    vm.sp = 0
+    vm.base = 0
+    (mut c).reset()
+    op(mut c, 0, 7, 0)
+    op(mut c, 0, 8, 0)
+    op(mut c, 10, 4, 2)
+    op(mut c, 4, 0, 0)
+    op(mut c, 0, 1, 0)
+    op(mut c, 0, 99, 0)
+    op(mut c, 11, 0, 0)
+    op(mut c, 4, 0, 0)
+    op(mut c, 9, 0, 0)
+    let result = execute(mut vm, c, 0)
+    let at = address(vm, result)
+    assert(vm.slots[at].values[0].i == 7 && vm.slots[at].values[1].i == 99)
+}
+
+fn reentrant(mut vm: Vm, code: List[Op]) {
+    // list.map-shaped native holds its subject in temp[0], then calls VM.
+    let result = execute(mut vm, code, 0)
+    assert(result.i == 1)
+}
+
+fn check_stale(compact: bool, plant: bool) {
+    var vm = vm_new(compact, true, 64)
+    let obj = alloc(mut vm, 4)
+    root_push(mut vm, 6, obj)
+    var c = List[Op]()
+    op(mut c, 15, 0, 0)
+    op(mut c, 0, 1, 0)
+    op(mut c, 9, 0, 0)
+    if compact {
+        reentrant(mut vm, c)
+        assert(!valid(vm, obj)) // original half is poisoned
+        assert(valid(vm, vm.roots[6].values[0]))
+        if plant { let _ = address(vm, obj) }
+    } else {
+        // Non-moving collector preserves a protected subject's identity.
+        reentrant(mut vm, c)
+        assert(valid(vm, obj))
+        // Deliberate omitted protection: reclaim then reuse the same slot.
+        root_pop(mut vm, 6)
+        reentrant(mut vm, c)
+        var replacement = alloc(mut vm, 4)
+        while replacement.i % 128 != obj.i % 128 { replacement = alloc(mut vm, 4) }
+        assert(replacement.i != obj.i)
+        assert(!valid(vm, obj))
+        if plant { let _ = address(vm, obj) }
+    }
+}
+
+fn rss() -> int {
+    // util/rss.lu's procfs read, in caller-selected scratch region.
+    let fd = fs_open("/proc/self/smaps_rollup") else |_| { return -1 }
+    let bytes = fs_read_chunk(fd, 16384) else |_| {
+        fs_close(fd) else |_| {}
+        return -1
+    }
+    fs_close(fd) else |_| {}
+    let text = str_from_utf8(bytes) else ""
+    for line in text.lines() {
+        if line.starts_with("Rss:") {
+            for word in line[4..].words() { return (word.to_int() else -1) * 1024 }
+        }
+    }
+    -1
+}
+
+fn memory(compact: bool) {
+    region arena {
+        var vm = vm_new(compact, true, 64)
+        let obj = alloc(mut vm, 4)
+        let root_at = address(vm, obj)
+        for j in 0..16 { (mut vm.slots[root_at].values).push(number(j)) }
+        (mut vm.slots[root_at].values).push(obj)
+        root_push(mut vm, 6, obj)
+        var first: int = 0
+        var last: int = 0
+        var rss_first: int = 0
+        var rss_last: int = 0
+        for i in 1..=100000 {
+            let dead = alloc(mut vm, 4)
+            let at = address(vm, dead)
+            for j in 0..16 { (mut vm.slots[at].values).push(number(j)) }
+            boundary(mut vm)
+            if i == 1000 {
+                first = region_bytes(arena)
+                region sample { rss_first = rss() }
+            }
+            if i == 100000 {
+                last = region_bytes(arena)
+                region sample { rss_last = rss() }
+            }
+        }
+        assert(first == last)
+        assert(rss_first > 0 && rss_last > 0 && rss_last - rss_first <= 2097152)
+        assert(vm.collections == 100000 && vm.live == 1)
+        print(
+            "memory compact={compact} collections={vm.collections} ledger1000={first} ledger100000={last} rss1000={rss_first} rss100000={rss_last} max_pause_ns={vm.max_pause_ns}",
+        )
+    }
+}
+
+fn performance(compact: bool, shape: str, rounds: int) {
+    var best: int = 9223372036854775807
+    var collections: int = 0
+    var worst: int = 0
+    for _ in 0..rounds {
+        // As C's fl_smoke.c:272-287, fresh VM outside the timed interval.
+        // This toy has no parser/compiler: program construction is timed.
+        region run {
+            var vm = vm_new(compact, false, 16384)
+            let start = os_clock_ns()
+            let code = if shape == "fib24" {
+                fib_program(24)
+            } else {
+                loop_program(shape == "map10k", if shape == "map10k" then 10000 else 100000)
+            }
+            let answer = execute(mut vm, code, 0).i
+            let elapsed = os_clock_ns() - start
+            assert(
+                answer ==
+                    (
+                        if shape == "fib24" {
+                            46368
+                        } else if shape == "map10k" {
+                            10000
+                        } else {
+                            100000
+                        }
+                    ),
+            )
+            if elapsed < best { best = elapsed }
+            if vm.max_pause_ns > worst { worst = vm.max_pause_ns }
+            collections = vm.collections
+        }
+    }
+    print(
+        "perf compact={compact} shape={shape} reps={rounds} best_ns={best} collections={collections} max_pause_ns={worst}",
+    )
+}
+
+fn layout() {
+    var value_bytes: int = 0
+    var int_bytes: int = 0
+    region values {
+        var xs = List[Value]()
+        let before = region_bytes(values)
+        (mut xs).reserve(1024)
+        value_bytes = region_bytes(values) - before
+        assert(xs.len == 0)
+    }
+    region ints {
+        var xs = List[int]()
+        let before = region_bytes(ints)
+        (mut xs).reserve(1024)
+        int_bytes = region_bytes(ints) - before
+        assert(xs.len == 0)
+    }
+    print("layout reserve=1024 value_bytes={value_bytes} int_bytes={int_bytes} c_value_stride=16")
+}
+
+fn main() -> int {
+    let args = env_args()
+    let action = if args.len == 0 then "test" else args[0]
+    let compact = args.len < 2 || args[1] != "nonmoving"
+    if action == "layout" { layout(); return 0 }
+    if action == "memory" { memory(compact); return 0 }
+    if action == "plant" { check_stale(compact, true); return 1 }
+    if action == "perf" {
+        assert(args.len >= 3)
+        performance(compact, args[2], if args.len >= 4 then (args[3].to_int() else 10) else 10)
+        return 0
+    }
+    check_roots(compact)
+    check_cycle(compact)
+    check_vm(compact)
+    check_stale(compact, false)
+    print("toyvm compact={compact}: roots=8 stack=1 cycle=1 opcodes=16 reentrant=1 PASS")
+    0
+}
+
+fn test_compact_roots() { check_roots(true) }
+
+fn test_fixed_roots() { check_roots(false) }
+
+fn test_compact_cycle() { check_cycle(true) }
+
+fn test_fixed_cycle() { check_cycle(false) }
+
+fn test_compact_vm() { check_vm(true) }
+
+fn test_fixed_vm() { check_vm(false) }
+
+fn test_compact_reentry() { check_stale(true, false) }
+
+fn test_fixed_reentry() { check_stale(false, false) }
