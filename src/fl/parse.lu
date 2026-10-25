@@ -1,0 +1,917 @@
+//! fl.parse — bounded recursive descent and precedence climbing.
+//! Ports sagitta 9ace98c2 src/fl/parse.c:12-1410, parse.h:21-54.
+//! One newline rule; pure-literal descent never calls expression descent.
+//! Child arrays are immutable ranges, finalized once, into program.edges.
+
+/// Maximum ordinary errors (one additional final cap message).
+pub const FL_PARSE_MAX_ERRORS: int = 20
+
+/// Bound on input-driven parser recursion.
+pub const FL_PARSE_MAX_DEPTH: int = 256
+
+struct Parser {
+    lx: FlLexer,
+    cur: FlTok,
+    prev_kind: int,
+    depth: int,
+    rdepth: int,
+    nerrors: int,
+    ntok: int,
+    panicking: bool,
+    gave_up: bool,
+    incomplete: bool,
+    had_error: bool,
+    prog: FlProgram,
+}
+
+fn p_continues(k: int) -> bool {
+    k >= FL_T_PLUS && k <= FL_T_GE ||
+        k == FL_T_COMMA ||
+        k == FL_T_AND ||
+        k == FL_T_OR ||
+        k == FL_T_NOT
+}
+
+fn p_nl_terminates(p: Parser) -> bool { p.depth == 0 && !p_continues(p.prev_kind) }
+
+fn p_advance(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) {
+    p.prev_kind = p.cur.kind
+    let k = p.cur.kind
+    if k == FL_T_LPAREN || k == FL_T_LBRACKET || k == FL_T_ATBRACKET || k == FL_M_LPAREN {
+        p.depth += 1
+    }
+    if k == FL_T_RPAREN || k == FL_T_RBRACKET || k == FL_M_END || k == FL_M_RPAREN {
+        if p.depth > 0 { p.depth -= 1 }
+    }
+    p.ntok += 1
+    loop {
+        p.cur = fl_lex_next(mut p.lx, src, mut dc, mut strings)
+        if p.cur.kind == FL_T_ERROR {
+            p.had_error = true
+            p.nerrors += 1
+            if p.nerrors >= FL_PARSE_MAX_ERRORS {
+                p.gave_up = true
+                if !dc.muted {
+                    fl_diag_emit(mut dc, FL_DIAG_ERROR, p.cur.sp, "too many errors, giving up")
+                    dc.muted = true
+                }
+            }
+            continue
+        }
+        if p.cur.kind == FL_T_NEWLINE && !p_nl_terminates(p) { continue }
+        break
+    }
+}
+
+fn p_match(
+    mut p: Parser,
+    src: List[byte],
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+    kind: int,
+) -> bool {
+    if p.cur.kind != kind { return false }
+    p_advance(mut p, src, mut dc, mut strings)
+    true
+}
+
+fn p_error(mut p: Parser, mut dc: DiagCtx, sp: FlSpan, msg: str) {
+    if p.panicking || p.gave_up { return }
+    p.had_error = true
+    p.incomplete = false
+    p.nerrors += 1
+    fl_diag_emit(mut dc, FL_DIAG_ERROR, sp, msg)
+    if p.nerrors >= FL_PARSE_MAX_ERRORS {
+        p.gave_up = true
+        fl_diag_emit(mut dc, FL_DIAG_ERROR, sp, "too many errors, giving up")
+        dc.muted = true
+    } else {
+        p.panicking = true
+    }
+}
+
+fn p_here(mut p: Parser, mut dc: DiagCtx, msg: str) {
+    let sp = copy p.cur.sp
+    p_error(mut p, mut dc, sp, msg)
+}
+
+fn p_expected(mut p: Parser, mut dc: DiagCtx, what: str) {
+    let found = fl_tok_spelling(p.cur.kind)
+    p_here(mut p, mut dc, "expected {what}, found '{found}'")
+}
+
+fn p_closer(
+    mut p: Parser,
+    src: List[byte],
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+    kind: int,
+    what: str,
+) {
+    if p_match(mut p, src, mut dc, mut strings, kind) { return }
+    if p.cur.kind == FL_T_EOF && !p.had_error { p.incomplete = true; return }
+    let k = p.cur.kind
+    if k == FL_T_LPAREN || k == FL_T_LBRACKET || k == FL_T_LBRACE || k == FL_T_ATBRACKET {
+        let depth0 = p.depth
+        p_advance(mut p, src, mut dc, mut strings)
+        while p.cur.kind != FL_T_EOF && p.depth > depth0 {
+            p_advance(mut p, src, mut dc, mut strings)
+        }
+        if p.cur.kind == FL_T_EOF && !p.had_error { p.incomplete = true; return }
+        if p_match(mut p, src, mut dc, mut strings, kind) { return }
+    }
+    p_expected(mut p, mut dc, what)
+}
+
+fn p_stmt_keyword(k: int) -> bool {
+    k == FL_T_LET ||
+        k == FL_T_FN ||
+        k == FL_T_IF ||
+        k == FL_T_WHILE ||
+        k == FL_T_FOR ||
+        k == FL_T_RETURN ||
+        k == FL_T_BREAK ||
+        k == FL_T_CONTINUE ||
+        k == FL_T_IMPORT ||
+        k == FL_T_MACRO ||
+        k == FL_T_EDIT ||
+        k == FL_T_TRY ||
+        k == FL_T_CATCH ||
+        k == FL_T_ELSE
+}
+
+fn p_sync(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings, in_block: bool) {
+    p.panicking = false
+    while p.cur.kind != FL_T_EOF {
+        if p.prev_kind == FL_T_SEMI { return }
+        if p.cur.kind == FL_T_NEWLINE || p.cur.kind == FL_T_SEMI {
+            p_advance(mut p, src, mut dc, mut strings)
+            return
+        }
+        if p_stmt_keyword(p.cur.kind) { return }
+        let k = p.cur.kind
+        if in_block &&
+            (k == FL_T_RBRACE || k == FL_T_RBRACKET || k == FL_T_RPAREN || k == FL_M_END) {
+            return
+        }
+        p_advance(mut p, src, mut dc, mut strings)
+    }
+}
+
+fn p_add(mut p: Parser, n: FlNode) -> int {
+    let id = p.prog.nodes.len
+    (mut p.prog.nodes).push(n)
+    id
+}
+
+fn p_nil(mut p: Parser) -> int { let n = fl_node(FL_A_LIT, p.cur.sp); p_add(mut p, n) }
+
+fn p_edges(mut p: Parser, edges: List[int]) -> int {
+    let offset = p.prog.edges.len
+    (mut p.prog.edges).reserve(offset + edges.len)
+    for id in edges { (mut p.prog.edges).push(id) }
+    offset
+}
+
+fn p_enter(mut p: Parser, mut dc: DiagCtx) -> bool {
+    if p.rdepth >= FL_PARSE_MAX_DEPTH { p_here(mut p, mut dc, "nesting too deep"); return false }
+    p.rdepth += 1
+    true
+}
+
+fn p_binding(k: int) -> int {
+    if k == FL_T_OR { return 1 }
+    if k == FL_T_AND { return 2 }
+    if k == FL_T_EQEQ || k == FL_T_BANGEQ { return 3 }
+    if k >= FL_T_LT && k <= FL_T_GE { return 4 }
+    if k == FL_T_PLUS || k == FL_T_MINUS { return 5 }
+    if k == FL_T_STAR || k == FL_T_SLASH || k == FL_T_PERCENT { return 6 }
+    0
+}
+
+fn p_list(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_LIST, p.cur.sp)
+    let depth0 = p.depth
+    var items = List[int]()
+    p_advance(mut p, src, mut dc, mut strings)
+    while p.cur.kind != FL_T_RBRACKET && p.cur.kind != FL_T_EOF {
+        let child = p_expr(mut p, src, mut dc, mut strings)
+        (mut items).push(child)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_COMMA) { break }
+    }
+    p_closer(mut p, src, mut dc, mut strings, FL_T_RBRACKET, "']'")
+    p.depth = depth0
+    n.a = p_edges(mut p, items)
+    n.b = items.len
+    p_add(mut p, n)
+}
+
+fn p_map_key(
+    mut p: Parser,
+    src: List[byte],
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+    pure: bool,
+) -> int {
+    var n = fl_node(FL_A_LIT, p.cur.sp)
+    let ident = p.cur.kind == FL_T_IDENT
+    n.a = if p.cur.kind == FL_T_INT then FL_L_INT else FL_L_STR
+    n.i = p.cur.i
+    p_advance(mut p, src, mut dc, mut strings)
+    if ident && p.cur.kind == FL_T_DOT {
+        var dotted = fl_string(strings, n.i)
+        while p_match(mut p, src, mut dc, mut strings, FL_T_DOT) {
+            (mut dotted).push(46 as byte)
+            if p.cur.kind != FL_T_IDENT {
+                if pure {
+                    let found = fl_tok_spelling(p.cur.kind)
+                    p_here(
+                        mut p,
+                        mut dc,
+                        "pure-literal mode: expected a map-key identifier after '.', found '{found}'",
+                    )
+                } else {
+                    p_expected(mut p, mut dc, "a map-key identifier after '.'")
+                }
+                break
+            }
+            for b in strings.items[p.cur.i] { (mut dotted).push(b) }
+            p_advance(mut p, src, mut dc, mut strings)
+        }
+        n.i = fl_intern(mut strings, dotted, 0, dotted.len)
+    }
+    p_add(mut p, n)
+}
+
+fn p_map(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_MAP, p.cur.sp)
+    let depth0 = p.depth
+    var keys = List[int]()
+    var vals = List[int]()
+    p.depth += 1
+    p_advance(mut p, src, mut dc, mut strings)
+    while p.cur.kind != FL_T_RBRACE && p.cur.kind != FL_T_EOF {
+        if p.cur.kind != FL_T_IDENT && p.cur.kind != FL_T_STRING && p.cur.kind != FL_T_INT {
+            p_expected(mut p, mut dc, "a map key (identifier, string or integer)")
+            break
+        }
+        let key = p_map_key(mut p, src, mut dc, mut strings, false)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_COLON) {
+            p_expected(mut p, mut dc, "':'")
+        }
+        (mut keys).push(key)
+        let val = p_expr(mut p, src, mut dc, mut strings)
+        (mut vals).push(val)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_COMMA) { break }
+    }
+    p.depth = depth0
+    p_closer(mut p, src, mut dc, mut strings, FL_T_RBRACE, "'}}'")
+    n.a = p_edges(mut p, keys)
+    n.b = p_edges(mut p, vals)
+    n.c = keys.len
+    p_add(mut p, n)
+}
+
+fn p_params(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> (int, int) {
+    var params = List[int]()
+    var n = 0
+    while p.cur.kind == FL_T_IDENT {
+        if n < 64 { (mut params).push(p.cur.i) }
+        n += 1
+        p_advance(mut p, src, mut dc, mut strings)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_COMMA) { break }
+    }
+    if n > 64 { p_here(mut p, mut dc, "too many parameters (max 64)") }
+    (p_edges(mut p, params), params.len)
+}
+
+fn p_fn_expr(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_FN_EXPR, p.cur.sp)
+    p_advance(mut p, src, mut dc, mut strings)
+    if !p_match(mut p, src, mut dc, mut strings, FL_T_LPAREN) { p_expected(mut p, mut dc, "'('") }
+    let (offset, count) = p_params(mut p, src, mut dc, mut strings)
+    n.b = offset
+    n.c = count
+    p_closer(mut p, src, mut dc, mut strings, FL_T_RPAREN, "')'")
+    n.d = if p.cur.kind == FL_T_LBRACE {
+        p_block(mut p, src, mut dc, mut strings)
+    } else {
+        p_expr(mut p, src, mut dc, mut strings)
+    }
+    p_add(mut p, n)
+}
+
+fn p_primary(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    let k = p.cur.kind
+    var n = fl_node(FL_A_LIT, p.cur.sp)
+    if k == FL_T_NIL ||
+        k == FL_T_TRUE ||
+        k == FL_T_FALSE ||
+        k == FL_T_INT ||
+        k == FL_T_FLOAT ||
+        k == FL_T_STRING {
+        if k == FL_T_TRUE || k == FL_T_FALSE {
+            n.a = FL_L_BOOL
+            n.i = if k == FL_T_TRUE then 1 else 0
+        }
+        if k == FL_T_INT { n.a = FL_L_INT; n.i = p.cur.i }
+        if k == FL_T_FLOAT { n.a = FL_L_FLOAT; n.f = p.cur.f }
+        if k == FL_T_STRING { n.a = FL_L_STR; n.i = p.cur.i }
+        p_advance(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_IDENT {
+        n.kind = FL_A_IDENT
+        n.a = p.cur.i
+        p_advance(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_LPAREN {
+        let depth0 = p.depth
+        p_advance(mut p, src, mut dc, mut strings)
+        let child = p_expr(mut p, src, mut dc, mut strings)
+        p_closer(mut p, src, mut dc, mut strings, FL_T_RPAREN, "')'")
+        p.depth = depth0
+        return child
+    }
+    if k == FL_T_LBRACKET { return p_list(mut p, src, mut dc, mut strings) }
+    if k == FL_T_LBRACE { return p_map(mut p, src, mut dc, mut strings) }
+    if k == FL_T_FN { return p_fn_expr(mut p, src, mut dc, mut strings) }
+    if k == FL_T_ATBRACKET { return p_motion_block(mut p, src, mut dc, mut strings) }
+    if k == FL_T_EQ {
+        p_here(mut p, mut dc, "'=' is a statement; did you mean '=='?")
+        p_advance(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k >= FL_M_COUNT && k <= FL_M_END {
+        p_here(mut p, mut dc, "motion word outside '@[ ... ]'")
+        p_advance(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_EOF && !p.had_error { p.incomplete = true; return p_add(mut p, n) }
+    p_expected(mut p, mut dc, "an expression")
+    p_add(mut p, n)
+}
+
+fn p_postfix(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var id = p_primary(mut p, src, mut dc, mut strings)
+    loop {
+        let sp = copy p.cur.sp
+        if p.cur.kind == FL_T_LPAREN {
+            let depth0 = p.depth
+            var args = List[int]()
+            p_advance(mut p, src, mut dc, mut strings)
+            while p.cur.kind != FL_T_RPAREN && p.cur.kind != FL_T_EOF {
+                let child = p_expr(mut p, src, mut dc, mut strings)
+                (mut args).push(child)
+                if !p_match(mut p, src, mut dc, mut strings, FL_T_COMMA) { break }
+            }
+            p_closer(mut p, src, mut dc, mut strings, FL_T_RPAREN, "')'")
+            p.depth = depth0
+            var n = fl_node(FL_A_CALL, sp)
+            n.a = id
+            n.b = p_edges(mut p, args)
+            n.c = args.len
+            id = p_add(mut p, n)
+            continue
+        }
+        if p.cur.kind == FL_T_LBRACKET {
+            let depth0 = p.depth
+            p_advance(mut p, src, mut dc, mut strings)
+            var n = fl_node(FL_A_INDEX, sp)
+            n.a = id
+            n.b = p_expr(mut p, src, mut dc, mut strings)
+            p_closer(mut p, src, mut dc, mut strings, FL_T_RBRACKET, "']'")
+            p.depth = depth0
+            id = p_add(mut p, n)
+            continue
+        }
+        if p_match(mut p, src, mut dc, mut strings, FL_T_DOT) {
+            var n = fl_node(FL_A_FIELD, sp)
+            n.a = id
+            if p.cur.kind == FL_T_IDENT {
+                n.b = p.cur.i
+                p_advance(mut p, src, mut dc, mut strings)
+            } else {
+                p_expected(mut p, mut dc, "a field name")
+            }
+            id = p_add(mut p, n)
+            continue
+        }
+        break
+    }
+    id
+}
+
+fn p_unary(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    // C's recursive unary chain is equivalent to this reverse fold. Keeping
+    // input-sized recursion out preserves the same AST without stack risk.
+    var ops = List[FlTok]()
+    while p.cur.kind == FL_T_NOT || p.cur.kind == FL_T_MINUS {
+        (mut ops).push(copy p.cur)
+        p_advance(mut p, src, mut dc, mut strings)
+    }
+    var id = p_postfix(mut p, src, mut dc, mut strings)
+    var i = ops.len
+    while i > 0 {
+        i -= 1
+        var n = fl_node(FL_A_UNOP, ops[i].sp)
+        n.a = ops[i].kind
+        n.b = id
+        id = p_add(mut p, n)
+    }
+    id
+}
+
+fn p_binary(
+    mut p: Parser,
+    src: List[byte],
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+    min_bp: int,
+) -> int {
+    if !p_enter(mut p, mut dc) { return p_nil(mut p) }
+    var lhs = p_unary(mut p, src, mut dc, mut strings)
+    loop {
+        let bp = p_binding(p.cur.kind)
+        if bp == 0 || bp < min_bp { break }
+        var n = fl_node(FL_A_BINOP, p.cur.sp)
+        n.a = p.cur.kind
+        n.b = lhs
+        p_advance(mut p, src, mut dc, mut strings)
+        n.c = p_binary(mut p, src, mut dc, mut strings, bp + 1)
+        lhs = p_add(mut p, n)
+    }
+    p.rdepth -= 1
+    lhs
+}
+
+fn p_expr(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    p_binary(mut p, src, mut dc, mut strings, 1)
+}
+
+fn p_one_motion(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_MOTION, p.cur.sp)
+    n.i = 1
+    if p.cur.kind == FL_M_COUNT {
+        n.i = p.cur.i
+        n.flags = 2
+        p_advance(mut p, src, mut dc, mut strings)
+    }
+    let k = p.cur.kind
+    if k == FL_M_UNIT || k == FL_M_ARROW {
+        n.a = if k == FL_M_UNIT then FL_MK_UNIT else FL_MK_ARROW
+        n.b = p.cur.i
+        if p.cur.alt { n.flags += 1 }
+        p_advance(mut p, src, mut dc, mut strings)
+    } else if k == FL_M_INSERT || k == FL_M_WORD {
+        n.a = if k == FL_M_INSERT then FL_MK_INSERT else FL_MK_WORD
+        n.c = p.cur.i
+        p_advance(mut p, src, mut dc, mut strings)
+    } else if k == FL_M_DEL || k == FL_M_ESC {
+        n.a = if k == FL_M_DEL then FL_MK_DEL else FL_MK_ESC
+        p_advance(mut p, src, mut dc, mut strings)
+    } else if k == FL_M_H {
+        n.a = FL_MK_HIGHLIGHT
+        p_advance(mut p, src, mut dc, mut strings)
+        if !p_match(mut p, src, mut dc, mut strings, FL_M_LPAREN) {
+            p_expected(mut p, mut dc, "'(' after 'H'")
+        }
+        let (offset, count) = p_motion_seq(mut p, src, mut dc, mut strings, true)
+        if !p_match(mut p, src, mut dc, mut strings, FL_M_RPAREN) {
+            p_expected(mut p, mut dc, "')'")
+        }
+        n.d = offset
+        n.e = count
+    } else {
+        p_expected(mut p, mut dc, "a motion word")
+    }
+    p_add(mut p, n)
+}
+
+fn p_motion_seq(
+    mut p: Parser,
+    src: List[byte],
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+    nested: bool,
+) -> (int, int) {
+    let stop = if nested then FL_M_RPAREN else FL_M_END
+    var items = List[int]()
+    while p.cur.kind != stop && p.cur.kind != FL_T_EOF {
+        if !p_enter(mut p, mut dc) { break }
+        let child = p_one_motion(mut p, src, mut dc, mut strings)
+        (mut items).push(child)
+        p.rdepth -= 1
+        if p.panicking || p.gave_up { break }
+    }
+    (p_edges(mut p, items), items.len)
+}
+
+fn p_motion_block(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_MOTION_BLOCK, p.cur.sp)
+    let depth0 = p.depth
+    p_advance(mut p, src, mut dc, mut strings)
+    let (offset, count) = p_motion_seq(mut p, src, mut dc, mut strings, false)
+    n.a = offset
+    n.b = count
+    p_closer(mut p, src, mut dc, mut strings, FL_M_END, "']'")
+    p.depth = depth0
+    p_add(mut p, n)
+}
+
+fn p_term(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings, what: str) {
+    if p.cur.kind == FL_T_EOF { return }
+    if p_match(mut p, src, mut dc, mut strings, FL_T_NEWLINE) ||
+        p_match(mut p, src, mut dc, mut strings, FL_T_SEMI) {
+        return
+    }
+    if p.cur.kind == FL_T_RBRACE { return }
+    let found = fl_tok_spelling(p.cur.kind)
+    p_here(mut p, mut dc, "expected end of statement after {what}, found '{found}'")
+}
+
+fn p_block(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_BLOCK, p.cur.sp)
+    let depth0 = p.depth
+    var items = List[int]()
+    if !p_match(mut p, src, mut dc, mut strings, FL_T_LBRACE) {
+        if p.cur.kind == FL_T_EOF && !p.had_error {
+            p.incomplete = true
+        } else if p.cur.kind == FL_T_EQ {
+            p_here(mut p, mut dc, "'=' is a statement; did you mean '=='?")
+        } else {
+            p_expected(mut p, mut dc, "'{{'")
+        }
+        return p_add(mut p, n)
+    }
+    while p.cur.kind != FL_T_RBRACE && p.cur.kind != FL_T_EOF {
+        if p_match(mut p, src, mut dc, mut strings, FL_T_NEWLINE) ||
+            p_match(mut p, src, mut dc, mut strings, FL_T_SEMI) {
+            continue
+        }
+        if !p_enter(mut p, mut dc) { break }
+        let before = p.ntok
+        let child = p_stmt(mut p, src, mut dc, mut strings)
+        p.rdepth -= 1
+        (mut items).push(child)
+        if p.panicking { p_sync(mut p, src, mut dc, mut strings, true) }
+        if p.gave_up { break }
+        if p.ntok == before { p_advance(mut p, src, mut dc, mut strings) }
+    }
+    p_closer(mut p, src, mut dc, mut strings, FL_T_RBRACE, "'}}'")
+    p.depth = depth0
+    n.a = p_edges(mut p, items)
+    n.b = items.len
+    p_add(mut p, n)
+}
+
+fn p_block_newlines(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) {
+    while p.cur.kind == FL_T_NEWLINE { p_advance(mut p, src, mut dc, mut strings) }
+}
+
+fn p_name(
+    mut p: Parser,
+    src: List[byte],
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+    what: str,
+) -> int {
+    if p.cur.kind != FL_T_IDENT { p_expected(mut p, mut dc, what); return 0 }
+    let id = p.cur.i
+    p_advance(mut p, src, mut dc, mut strings)
+    id
+}
+
+fn p_stmt(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    let k = p.cur.kind
+    let sp = copy p.cur.sp
+    if k == FL_T_LET {
+        var n = fl_node(FL_A_LET, sp)
+        n.b = -1
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_name(mut p, src, mut dc, mut strings, "a name after 'let'")
+        if p_match(mut p, src, mut dc, mut strings, FL_T_EQ) {
+            n.b = p_expr(mut p, src, mut dc, mut strings)
+        }
+        p_term(mut p, src, mut dc, mut strings, "'let'")
+        return p_add(mut p, n)
+    }
+    if k == FL_T_FN {
+        var n = fl_node(FL_A_FN, sp)
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_name(mut p, src, mut dc, mut strings, "a function name")
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_LPAREN) {
+            p_expected(mut p, mut dc, "'('")
+        }
+        let (offset, count) = p_params(mut p, src, mut dc, mut strings)
+        n.b = offset
+        n.c = count
+        p_closer(mut p, src, mut dc, mut strings, FL_T_RPAREN, "')'")
+        n.d = p_block(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_MACRO {
+        var n = fl_node(FL_A_MACRO, sp)
+        n.b = -1
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_name(mut p, src, mut dc, mut strings, "a macro name")
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_EQ) { p_expected(mut p, mut dc, "'='") }
+        if p.cur.kind == FL_T_ATBRACKET {
+            n.b = p_motion_block(mut p, src, mut dc, mut strings)
+        } else {
+            p_expected(mut p, mut dc, "a motion block")
+        }
+        p_term(mut p, src, mut dc, mut strings, "'macro'")
+        return p_add(mut p, n)
+    }
+    if k == FL_T_IMPORT {
+        var n = fl_node(FL_A_IMPORT, sp)
+        p_advance(mut p, src, mut dc, mut strings)
+        if p.cur.kind == FL_T_IDENT {
+            n.b = p.cur.i
+            p_advance(mut p, src, mut dc, mut strings)
+        } else if p.cur.kind == FL_T_STRING {
+            n.a = p.cur.i
+            n.flags = 1
+            p_advance(mut p, src, mut dc, mut strings)
+            if !p_match(mut p, src, mut dc, mut strings, FL_T_AS) {
+                p_expected(mut p, mut dc, "'as'")
+            }
+            n.b = p_name(mut p, src, mut dc, mut strings, "a name after 'as'")
+        } else {
+            p_expected(mut p, mut dc, "a module name or a quoted path")
+        }
+        p_term(mut p, src, mut dc, mut strings, "'import'")
+        return p_add(mut p, n)
+    }
+    if k == FL_T_IF {
+        var n = fl_node(FL_A_IF, sp)
+        n.c = -1
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_expr(mut p, src, mut dc, mut strings)
+        n.b = p_block(mut p, src, mut dc, mut strings)
+        p_block_newlines(mut p, src, mut dc, mut strings)
+        if p_match(mut p, src, mut dc, mut strings, FL_T_ELSE) {
+            if p.cur.kind == FL_T_IF {
+                // The C else-if call lacks a guard. Bound the same recursive
+                // descent here just as blocks and expressions are bounded.
+                if p_enter(mut p, mut dc) {
+                    n.c = p_stmt(mut p, src, mut dc, mut strings)
+                    p.rdepth -= 1
+                }
+            } else {
+                n.c = p_block(mut p, src, mut dc, mut strings)
+            }
+        }
+        return p_add(mut p, n)
+    }
+    if k == FL_T_WHILE {
+        var n = fl_node(FL_A_WHILE, sp)
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_expr(mut p, src, mut dc, mut strings)
+        n.b = p_block(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_FOR {
+        var n = fl_node(FL_A_FOR, sp)
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_name(mut p, src, mut dc, mut strings, "a loop variable")
+        if p_match(mut p, src, mut dc, mut strings, FL_T_COMMA) {
+            n.b = p_name(mut p, src, mut dc, mut strings, "a second loop variable")
+        }
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_IN) { p_expected(mut p, mut dc, "'in'") }
+        n.c = p_expr(mut p, src, mut dc, mut strings)
+        n.d = p_block(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_RETURN {
+        var n = fl_node(FL_A_RETURN, sp)
+        n.a = -1
+        p_advance(mut p, src, mut dc, mut strings)
+        if p.cur.kind != FL_T_NEWLINE &&
+            p.cur.kind != FL_T_SEMI &&
+            p.cur.kind != FL_T_EOF &&
+            p.cur.kind != FL_T_RBRACE {
+            n.a = p_expr(mut p, src, mut dc, mut strings)
+        }
+        p_term(mut p, src, mut dc, mut strings, "'return'")
+        return p_add(mut p, n)
+    }
+    if k == FL_T_BREAK || k == FL_T_CONTINUE {
+        let n = fl_node(if k == FL_T_BREAK then FL_A_BREAK else FL_A_CONTINUE, sp)
+        p_advance(mut p, src, mut dc, mut strings)
+        p_term(mut p, src, mut dc, mut strings, if k == FL_T_BREAK then "'break'" else "'continue'")
+        return p_add(mut p, n)
+    }
+    if k == FL_T_EDIT {
+        var n = fl_node(FL_A_EDIT, sp)
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_block(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_TRY {
+        var n = fl_node(FL_A_TRY, sp)
+        p_advance(mut p, src, mut dc, mut strings)
+        n.a = p_block(mut p, src, mut dc, mut strings)
+        p_block_newlines(mut p, src, mut dc, mut strings)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_CATCH) {
+            p_expected(mut p, mut dc, "'catch'")
+        }
+        n.c = p_name(mut p, src, mut dc, mut strings, "an error variable after 'catch'")
+        n.b = p_block(mut p, src, mut dc, mut strings)
+        return p_add(mut p, n)
+    }
+    if k == FL_T_LBRACE {
+        p_here(mut p, mut dc, "map literal cannot start a statement; parenthesize")
+        var n = fl_node(FL_A_EXPR_STMT, sp)
+        n.a = -1
+        return p_add(mut p, n)
+    }
+    let lhs = p_expr(mut p, src, mut dc, mut strings)
+    if p.cur.kind == FL_T_EQ {
+        let eq = copy p.cur.sp
+        p_advance(mut p, src, mut dc, mut strings)
+        let kind = p.prog.nodes[lhs].kind
+        if kind != FL_A_IDENT && kind != FL_A_INDEX && kind != FL_A_FIELD {
+            p_error(mut p, mut dc, eq, "cannot assign to this expression")
+        }
+        var n = fl_node(FL_A_ASSIGN, sp)
+        n.a = lhs
+        n.b = p_expr(mut p, src, mut dc, mut strings)
+        p_term(mut p, src, mut dc, mut strings, "assignment")
+        return p_add(mut p, n)
+    }
+    var n = fl_node(FL_A_EXPR_STMT, sp)
+    n.a = lhs
+    p_term(mut p, src, mut dc, mut strings, "expression")
+    p_add(mut p, n)
+}
+
+fn p_init(src: List[byte], file_id: int, mut dc: DiagCtx, mut strings: FlStrings) -> Parser {
+    dc.muted = false
+    let sp = FlSpan { file_id: file_id, line: 1, col: 1, len: 0 }
+    var p = Parser {
+        lx: fl_lex_init(file_id),
+        cur: lex_token(FL_T_INT, sp),
+        prev_kind: FL_T_NEWLINE,
+        depth: 0,
+        rdepth: 0,
+        nerrors: 0,
+        ntok: 0,
+        panicking: false,
+        gave_up: false,
+        incomplete: false,
+        had_error: false,
+        prog: fl_program(),
+    }
+    p_advance(mut p, src, mut dc, mut strings)
+    p
+}
+
+/// Parse ordinary Fletch. Walkable nodes remain even after diagnostics.
+pub fn fl_parse(
+    src: List[byte],
+    file_id: int,
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+) -> FlProgram {
+    var p = p_init(src, file_id, mut dc, mut strings)
+    while p.cur.kind != FL_T_EOF && !p.gave_up {
+        if p_match(mut p, src, mut dc, mut strings, FL_T_NEWLINE) ||
+            p_match(mut p, src, mut dc, mut strings, FL_T_SEMI) {
+            continue
+        }
+        let before = p.ntok
+        let child = p_stmt(mut p, src, mut dc, mut strings)
+        (mut p.prog.stmts).push(child)
+        if p.panicking { p_sync(mut p, src, mut dc, mut strings, false) }
+        if p.ntok == before { p_advance(mut p, src, mut dc, mut strings) }
+    }
+    p.prog.had_error = p.had_error
+    p.prog.incomplete = !p.had_error && (p.depth > 0 || p_continues(p.prev_kind) || p.incomplete)
+    p.prog
+}
+
+// Separate grammar, spec 12.1: no route from these functions to p_expr.
+fn pl_reject(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    let found = fl_tok_spelling(p.cur.kind)
+    p_here(mut p, mut dc, "pure-literal mode: '{found}' not allowed")
+    p_advance(mut p, src, mut dc, mut strings)
+    -1
+}
+
+fn pl_list(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_LIST, p.cur.sp)
+    var items = List[int]()
+    p_advance(mut p, src, mut dc, mut strings)
+    while p.cur.kind != FL_T_RBRACKET && p.cur.kind != FL_T_EOF {
+        let v = pl_value(mut p, src, mut dc, mut strings)
+        if v < 0 { break }
+        (mut items).push(v)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_COMMA) { break }
+    }
+    p_closer(mut p, src, mut dc, mut strings, FL_T_RBRACKET, "']'")
+    n.a = p_edges(mut p, items)
+    n.b = items.len
+    p_add(mut p, n)
+}
+
+fn pl_map(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    var n = fl_node(FL_A_MAP, p.cur.sp)
+    let depth0 = p.depth
+    var keys = List[int]()
+    var vals = List[int]()
+    p.depth += 1
+    p_advance(mut p, src, mut dc, mut strings)
+    while p.cur.kind != FL_T_RBRACE && p.cur.kind != FL_T_EOF {
+        if p.cur.kind != FL_T_IDENT && p.cur.kind != FL_T_STRING && p.cur.kind != FL_T_INT {
+            let _ = pl_reject(mut p, src, mut dc, mut strings)
+            break
+        }
+        let key = p_map_key(mut p, src, mut dc, mut strings, true)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_COLON) {
+            p_expected(mut p, mut dc, "':'")
+        }
+        let val = pl_value(mut p, src, mut dc, mut strings)
+        if val < 0 { break }
+        (mut keys).push(key)
+        (mut vals).push(val)
+        if !p_match(mut p, src, mut dc, mut strings, FL_T_COMMA) { break }
+    }
+    p.depth = depth0
+    p_closer(mut p, src, mut dc, mut strings, FL_T_RBRACE, "'}}'")
+    n.a = p_edges(mut p, keys)
+    n.b = p_edges(mut p, vals)
+    n.c = keys.len
+    p_add(mut p, n)
+}
+
+fn pl_value(mut p: Parser, src: List[byte], mut dc: DiagCtx, mut strings: FlStrings) -> int {
+    let sp = copy p.cur.sp
+    if !p_enter(mut p, mut dc) { return -1 }
+    var negate = false
+    if p.cur.kind == FL_T_MINUS {
+        negate = true
+        p_advance(mut p, src, mut dc, mut strings)
+        if p.cur.kind != FL_T_INT && p.cur.kind != FL_T_FLOAT {
+            p.rdepth -= 1
+            p_expected(mut p, mut dc, "a number after '-'")
+            return -1
+        }
+    }
+    let k = p.cur.kind
+    var n = fl_node(FL_A_LIT, sp)
+    if k == FL_T_NIL ||
+        k == FL_T_TRUE ||
+        k == FL_T_FALSE ||
+        k == FL_T_INT ||
+        k == FL_T_FLOAT ||
+        k == FL_T_STRING {
+        if k == FL_T_TRUE || k == FL_T_FALSE {
+            n.a = FL_L_BOOL
+            n.i = if k == FL_T_TRUE then 1 else 0
+        }
+        if k == FL_T_INT { n.a = FL_L_INT; n.i = if negate then -p.cur.i else p.cur.i }
+        if k == FL_T_FLOAT { n.a = FL_L_FLOAT; n.f = if negate then -p.cur.f else p.cur.f }
+        if k == FL_T_STRING { n.a = FL_L_STR; n.i = p.cur.i }
+        p_advance(mut p, src, mut dc, mut strings)
+        p.rdepth -= 1
+        return p_add(mut p, n)
+    }
+    if k == FL_T_LBRACKET {
+        let id = pl_list(mut p, src, mut dc, mut strings)
+        p.rdepth -= 1
+        return id
+    }
+    if k == FL_T_LBRACE {
+        let id = pl_map(mut p, src, mut dc, mut strings)
+        p.rdepth -= 1
+        return id
+    }
+    p.rdepth -= 1
+    pl_reject(mut p, src, mut dc, mut strings)
+}
+
+/// Pure literal grammar: root only, stmts stays empty. A failed parse has
+/// root=-1; an unfinished container matches C's partial literal tree.
+pub fn fl_parse_literal(
+    src: List[byte],
+    file_id: int,
+    mut dc: DiagCtx,
+    mut strings: FlStrings,
+) -> FlProgram {
+    var p = p_init(src, file_id, mut dc, mut strings)
+    while p_match(mut p, src, mut dc, mut strings, FL_T_NEWLINE) {}
+    var root = pl_value(mut p, src, mut dc, mut strings)
+    while p_match(mut p, src, mut dc, mut strings, FL_T_NEWLINE) {}
+    if root >= 0 && p.cur.kind != FL_T_EOF {
+        let found = fl_tok_spelling(p.cur.kind)
+        p_here(mut p, mut dc, "pure-literal mode: '{found}' not allowed")
+        root = -1
+    }
+    p.prog.root = if p.had_error then -1 else root
+    p.prog.had_error = p.had_error
+    p.prog.incomplete = p.incomplete && !p.had_error
+    p.prog
+}
