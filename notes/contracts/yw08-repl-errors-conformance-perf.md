@@ -66,7 +66,8 @@ count at the pin.
      refusals.
    - Unit: `test_fl_chunkcheck` (5). PTY: `s32_bug_restores_the_terminal`.
      Smoke: `smoke.sh:506-525`, added to `tools/smoke-fl`, which yw07b
-     ported with ten rows.
+     ported with twelve rows (`smoke.sh`'s ten and its two hello-world
+     rows).
 4. **`fuzz_fl_vm`** (s32 §8: no bytecode verifier, source-level fuzzing
    only). The driver over the `fl_vm` corpus at C's size and seed, its
    report line C's driver's byte for byte (`--against-oracle`, the
@@ -81,28 +82,39 @@ count at the pin.
 6. **The bench suite's gates** (s33 §5; R-yw08-3). `perf_fletch.c`'s rows
    in the port's in-process harness beside C's from the same run, on
    kasumi under `taskset`, in a container, 11 samples with a warmup, the
-   median and the min. The rows are `startup` (≤ 2 ms, hard),
+   median and the min. The harness exists: yw07b's `tools/run-perf-fletch`
+   (`--release`, `--native`, `--rows`, and `--advisory` for hosted CI) over
+   `tools/fl-headless` and C's `perf_fletch` build. This lane adds the
+   regression gate and the CI step. The rows are `startup` (≤ 2 ms, hard),
    `motion_dispatch` (≤ 1 µs an op, hard), `fib27`, `strbuild_join`,
    `strbuild_concat` (its `> 20` ratio), `map_heavy`, `list_sort`,
    `gc_pause` and `parse_only`. Two parts:
    - Every ratio at the 2× bar. yw07b's named MISS rows are this lane's to
      ratchet or to dispose by ruling, and its final numbers are in
-     `notes/yw07b-fletch-core.md`.
+     `notes/yw07b-fletch-core.md`. Eleven of 13 release rows miss there.
+     `parse_only` meets the bar since yw07b's interner and `p_edges` fixes
+     (`1a560e7`, `ad4bf79`). `startup` and `motion_dispatch` miss the
+     ratio but hold their absolute budgets.
    - The regression gate's two conditions (median > baseline × 1.15 and
      min > baseline × 1.10).
    `config_load` needs the config runtime (`bind` and friends,
    editor-attached) and is yw09's, as yw07b named it.
 7. **M-YW6** (s33 §6), all four artifacts in CI:
    - `yew fl FILE` prints `hello, world`;
-   - `yew fl -e` does the same;
+   - `yew fl -e` does the same. These two are already CI rows in yw07b's
+     `tools/smoke-fl` (`91cc4e9`);
    - the `s33_hello_world_repl` PTY golden;
    - `tools/check-fletch-goldens` (yw07b's 39 units by name, stressed and
      twice) together with the coverage gate.
 8. **The dispatch-parity gate re-aimed** (R-yw07-3 A,
    `Makefile:3136-3167`). The 21 `fl_smoke --trace` fixtures against C's
-   `CFLAGS_FL_TRACE=1` build, twice across processes. yw07b's core fork
-   ran it (`notes/yw07b-evidence/core/oracle-trace*.txt`); this lane makes
-   it a CI step by name.
+   `CFLAGS_FL_TRACE=1` build, twice across processes. This is DONE in
+   yw07b:
+   - `tools/check-fl-trace` is a CI step by name (`e98b696`);
+   - it names the first differing fixture (`0c56cb3`);
+   - it was seen red on yew#74.
+
+   This lane keeps it green through the prompt's changes and adds no step.
 9. **The note and the map.** `notes/yw08-…md` with the five sections;
    `docs/MAP.md` §2's yw08 rows, §5's new gaps, §6's rulings, §7's yw08
    and yw09 paragraphs, and yw09's contract drafted in full.
@@ -161,7 +173,8 @@ fuzz sizes). The yew repo at yw07b's merge: `src/fl/` (the VM, its
 refusals this lane retires), `tools/check-fl-cases` and
 `tools/fl-cases.txt` (198 rows; this lane adds test_fl_repl's 10 and
 test_fl_chunkcheck's 5 as their own rows), `tools/check-fletch-goldens`,
-`tools/check-fl-dump`, `tools/smoke-fl`, `tools/run-fuzz-fl-front`,
+`tools/check-fl-dump`, `tools/check-fl-trace`, `tools/smoke-fl`,
+`tools/run-fuzz-fl-front`, `tools/run-perf-fletch`,
 `notes/yw07b-fletch-core.md` (its perf table and its open issues),
 `notes/yw07b-evidence/core/` (the in-process perf harness and the trace
 differential), `docs/MAP.md`.
