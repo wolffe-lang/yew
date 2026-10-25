@@ -66,6 +66,7 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | the diagnostic sink callback (`fl_diag_set_sink`) | `fl.DiagCtx.entries` read by the consumer, and an `echo` flag the CLI sets to write each rendered diagnostic to stderr as it is emitted (yw07b) | no mutable callback ABI (G48); the flag is a value |
 | process-global caches (`stdre.c:69`'s `g_cache`) | a VALUE on the VM (`FlVm.re_cache`, the 64-entry LRU) (yw07b) | module state of a run-time value is E1010 (G27) |
 | the module table's exports pointers (`FlModule.exports`) | `vm.mods` rows without a heap reference; each row's exports map rooted in `vm.modules` under the row index, read through `fl_module_exports` (yw07b) | a reference held outside the roots goes stale at a compaction |
+| `vec_reserve(v, v->len + n)` before an append (C's `Vec` grows geometrically) | reserve once, to the final size, or not at all: `List.push` amortizes; never `reserve(len + n)` per append (yw07b: `fl.parse`'s `p_edges`, `ad4bf79`) | `List.reserve(n)` grows to exactly `n`, so a reserve per append reallocates and copies the whole list every time: quadratic. On `runtime/init.fl` (2,689 nodes) it cost about 745 page faults and memcpy at 41% of samples a parse; dropping it took `parse_only` from 10.15× to 1.05–1.20× of C with the interner change (`notes/yw07b-evidence/front/perf/parse-only-ab.txt`) |
 
 ## 2. Source directories
 
