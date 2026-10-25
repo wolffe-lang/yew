@@ -1,0 +1,570 @@
+//! fl.stdre — the `re` module over yew's own regex engine (src/search).
+//! Ports sagitta 9ace98c2 src/fl/stdre.c:41-690: the compile cache 52-175,
+//! the flag and limit arguments 181-221, match maps 227-291, the
+//! empty-match rule 306-320, the scan 322-365, the template language
+//! 371-438, the natives 444-669 and RE_DEFS 673-686.
+//! C's 64-entry LRU `g_cache` (stdre.c:69) is process-global; module state
+//! of a run-time value is E1010 (G27), so the cache is a VALUE the VM holds
+//! (`FlVm.re_cache`, an `FlReCache`), keyed as C keys it by the pattern's
+//! bytes and the flags, ticked and evicted as C's is. The answers are a
+//! pure function of (pattern, flags), so they do not change past 64
+//! patterns.
+//! C's pin keeps an outer scan's program alive while re.replace_fn's
+//! callback compiles others. Here the callback can evict the outer's
+//! table slot, so re.replace_fn scans its own copy of the program; the pin
+//! count is kept so the table resets exactly when C's arena does.
+//! Each compile allocates its program in the VM's region; an evicted or
+//! reset entry's storage is held until that region ends (G33), where C's
+//! arena reset reclaims it. That is allocation-pending, with no
+//! boundedness claim (G54, wolf-lang#948).
+//! Arguments are VM-stack roots; only re.replace_fn re-enters the VM, and
+//! it re-reads the subject and the callback from their slots after every
+//! call.
+
+use search
+use text
+use unicode
+use util
+
+// stdre.c:41-46.
+const STDRE_CACHE_N: int = 64
+
+const STDRE_MAX_RESULTS: int = 100000
+
+/// One compiled program (stdre.c:52-58): the pattern's bytes, compared
+/// verbatim, the flags, and the LRU tick.
+pub struct FlReEntry {
+    pat: List[byte],
+    flags: int,
+    used: int,
+    re: search.Re,
+}
+
+/// The VM's compile cache (stdre.c:60-69), plus the engine's reusable
+/// storage: the property and fold tables every compile shares, the search
+/// scratch, the empty piece tree a byte search passes beside its subject,
+/// and the match record the engine writes.
+pub struct FlReCache {
+    e: List[FlReEntry],
+    tick: int,
+    pin: int,
+    props: search.ReCache,
+    sc: search.ReScratch,
+    tb: text.TextBuf,
+    m: search.ReMatch,
+}
+
+/// An empty cache, the one FlVm.re_cache is initialised with.
+pub fn fl_re_cache_new() -> FlReCache {
+    FlReCache {
+        e: List[FlReEntry](),
+        tick: 0,
+        pin: 0,
+        props: search.re_cache_new(),
+        sc: search.re_scratch_new(),
+        tb: text.textbuf_new(),
+        m: search.re_match_new(),
+    }
+}
+
+fn stdre_same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len { if a[i] != b[i] { return false } }
+    true
+}
+
+// stdre.c:83-97: a hit refreshes the entry's tick; -1 is a miss.
+fn stdre_lookup(mut cache: FlReCache, pat: List[byte], flags: int) -> int {
+    for i in 0..cache.e.len {
+        if cache.e[i].flags == flags && stdre_same(cache.e[i].pat, pat) {
+            cache.tick += 1
+            cache.e[i].used = cache.tick
+            return i
+        }
+    }
+    -1
+}
+
+// stdre.c:99-120: append while there is room, else replace the least
+// recently used entry (the first of equal ticks); answers the slot.
+fn stdre_put(mut cache: FlReCache, take pat: List[byte], flags: int, take re: search.Re) -> int {
+    cache.tick += 1
+    let row = FlReEntry { pat: pat, flags: flags, used: cache.tick, re: re }
+    if cache.e.len < STDRE_CACHE_N {
+        (mut cache.e).push(row)
+        return cache.e.len - 1
+    }
+    var lru = 0
+    for i in 1..cache.e.len { if cache.e[i].used < cache.e[lru].used { lru = i } }
+    cache.e[lru] = row
+    lru
+}
+
+// C's fl_raise formats into a 1 KiB buffer and stores it with strlen
+// (vm.c:216-229): a message stops at its first NUL and at 1023 bytes. The
+// two messages here that carry a pattern-supplied byte keep that cut.
+fn stdre_raise_bytes(mut vm: FlVm, kind: str, msg: List[byte]) {
+    var cut = List[byte]()
+    for b in msg {
+        if b == 0 as byte || cut.len == 1023 { break }
+        (mut cut).push(b)
+    }
+    let _ = fl_raise_bytes(mut vm, kind, cut)
+}
+
+// stdre.c:131-175: the cached program's slot, or `raised`. The table is
+// emptied when it is full and nothing is pinned, before the compile.
+fn stdre_compile(mut vm: FlVm, pat: FlValue, flags: int) -> int ! {raised} {
+    let p = fl_obj_index(vm, pat)
+    let hit = stdre_lookup(mut vm.re_cache, vm.gc.slots[p].bytes, flags)
+    if hit >= 0 { return hit }
+    if vm.gc.slots[p].bytes.len > search.RE_MAX_PATTERN * 4 {
+        let _ = fl_raise(mut vm, "limit", "regex: the pattern exceeds 65536 bytes")
+        return raised
+    }
+    if vm.re_cache.e.len == STDRE_CACHE_N && vm.re_cache.pin == 0 { (mut vm.re_cache.e).reset() }
+    var err = search.re_err_new()
+    let re = search.re_compile_cached(
+        vm.gc.slots[p].bytes,
+        flags,
+        mut vm.re_cache.props,
+        mut err,
+    ) else {
+        let why = if err.msg.len == 0 then "invalid pattern" else err.msg
+        let _ = fl_raise(mut vm, "type", "regex: {why} at pattern offset {err.off}")
+        return raised
+    }
+    let key = copy vm.gc.slots[p].bytes
+    stdre_put(mut vm.re_cache, take key, flags, take re)
+}
+
+// stdre.c:181-206: absent or nil is no flags; any other letter is named.
+fn stdre_flags(mut vm: FlVm, base: int, argc: int, i: int) -> int ! {raised} {
+    if argc <= i || vm.stack[base + i].t == FL_NIL { return 0 }
+    let f = fl_arg_str(mut vm, base, i) else { return raised }
+    let at = fl_obj_index(vm, f)
+    var out = 0
+    for k in 0..vm.gc.slots[at].bytes.len {
+        let b = vm.gc.slots[at].bytes[k]
+        if b == 105 as byte {
+            out = out | search.RE_ICASE
+        } else if b == 115 as byte {
+            out = out | search.RE_DOTALL
+        } else if b == 108 as byte {
+            out = out | search.RE_LITERAL
+        } else {
+            var msg = List[byte]()
+            util.buf_append_str(mut msg, "re: unknown flag '")
+            (mut msg).push(b)
+            util.buf_append_str(mut msg, "'; the flags are i, s and l")
+            stdre_raise_bytes(mut vm, "type", msg)
+            return raised
+        }
+    }
+    out
+}
+
+// stdre.c:209-221: absent, nil or negative is every match (-1 here).
+fn stdre_limit(mut vm: FlVm, base: int, argc: int, i: int) -> int ! {raised} {
+    if argc <= i || vm.stack[base + i].t == FL_NIL { return -1 }
+    let v = fl_arg_int(mut vm, base, i) else { return raised }
+    if v >= 0 then v else -1
+}
+
+// stdre.c:322-359's scan_open: the subject and the pattern, the flags,
+// the limit when the native takes one (limiti > 0), then the compile.
+// Answers the cache slot and the limit.
+fn stdre_open(mut vm: FlVm, base: int, argc: int, flagi: int, limiti: int) -> (int, int) ! {
+    raised,
+} {
+    let _ = fl_arg_str(mut vm, base, 0) else { return raised }
+    let pat = fl_arg_str(mut vm, base, 1) else { return raised }
+    let flags = stdre_flags(mut vm, base, argc, flagi)?
+    var limit = -1
+    if limiti != 0 { limit = stdre_limit(mut vm, base, argc, limiti)? }
+    let k = stdre_compile(mut vm, pat, flags)?
+    (k, limit)
+}
+
+// stdre.c:233-239: subject[lo..hi), or "" for an inverted or overlong span.
+fn stdre_slice(mut vm: FlVm, s: FlValue, lo: int, hi: int) -> FlValue {
+    let at = fl_obj_index(vm, s)
+    if hi < lo || hi > vm.gc.slots[at].bytes.len { return fl_str_new(mut vm, List[byte]()) }
+    let bytes = copy vm.gc.slots[at].bytes[lo..hi]
+    fl_str_new(mut vm, bytes)
+}
+
+// stdre.c:227-231 for lo, hi and text, in that insertion order; text is
+// built before its key, as C evaluates map_put's argument first.
+fn stdre_span(mut vm: FlVm, map: FlValue, s: FlValue, lo: int, hi: int) {
+    let klo = fl_str_text(mut vm, "lo")
+    assert(fl_map_set(mut vm, map, klo, fl_int(lo)))
+    let khi = fl_str_text(mut vm, "hi")
+    assert(fl_map_set(mut vm, map, khi, fl_int(hi)))
+    let text = stdre_slice(mut vm, s, lo, hi)
+    let ktext = fl_str_text(mut vm, "text")
+    assert(fl_map_set(mut vm, map, ktext, text))
+}
+
+// stdre.c:258-291: `{lo, hi, text, groups}`, groups[g] exactly what $g
+// expands to, group 0 included, and nil for a group that did not take
+// part (the engine's unset slot, -1 here for C's UINT64_MAX).
+fn stdre_match_map(mut vm: FlVm, s: FlValue, m: search.ReMatch) -> FlValue {
+    let r = fl_map_new(mut vm)
+    let root = fl_temp_push(mut vm, r)
+    stdre_span(mut vm, r, s, m.lo[0], m.hi[0])
+    let gs = fl_list_new(mut vm)
+    let _ = fl_temp_push(mut vm, gs)
+    for g in 0..m.ngroups {
+        if g != 0 && m.lo[g] == -1 {
+            fl_list_push(mut vm, gs, fl_nil())
+        } else {
+            let one = fl_map_new(mut vm)
+            stdre_span(mut vm, one, s, m.lo[g], m.hi[g])
+            fl_list_push(mut vm, gs, one)
+        }
+    }
+    fl_temp_pop(mut vm, 1)
+    let kgroups = fl_str_text(mut vm, "groups")
+    assert(fl_map_set(mut vm, r, kgroups, gs))
+    let out = fl_temp_get(vm, root)
+    fl_temp_pop(mut vm, 1)
+    out
+}
+
+// stdre.c:306-320, THE EMPTY-MATCH RULE: after a zero-width match the scan
+// resumes one CODEPOINT on (an invalid byte is one), and a zero-width match
+// at the very end ends it. Answers (next, done).
+fn stdre_advance(vm: FlVm, s: FlValue, lo: int, hi: int) -> (int, bool) {
+    if hi > lo { return (hi, false) }
+    let at = fl_obj_index(vm, s)
+    let len = vm.gc.slots[at].bytes.len
+    if hi >= len { return (hi, true) }
+    let (_, k) = unicode.utf8_decode(vm.gc.slots[at].bytes, hi, len)
+    (hi + (if k == 0 then 1 else k), false)
+}
+
+fn stdre_append(mut out: List[byte], bytes: List[byte], lo: int, hi: int) {
+    var i = lo
+    while i < hi {
+        (mut out).push(bytes[i])
+        i += 1
+    }
+}
+
+// The leftmost-first match of cache slot k at or after `from`, into the
+// cache's match record.
+fn stdre_search(mut vm: FlVm, k: int, s: FlValue, from: int) -> bool {
+    let at = fl_obj_index(vm, s)
+    let inp = search.re_input_bytes(vm.gc.slots[at].bytes.len)
+    search.re_search_ws(
+        mut vm.re_cache.sc,
+        vm.re_cache.e[k].re,
+        vm.re_cache.tb,
+        vm.gc.slots[at].bytes,
+        inp,
+        from as text.ByteOff,
+        mut vm.re_cache.m,
+    )
+}
+
+// stdre.c:371-438, the template language: `$0`..`$9`, `${N}`, `$$`; any
+// other `$` raises. Expands into out and answers "", or the raise's kind
+// with its message in msg. A group that did not take part expands to
+// nothing.
+fn stdre_expand(
+    mut out: List[byte],
+    mut msg: List[byte],
+    tpl: List[byte],
+    s: List[byte],
+    m: search.ReMatch,
+    ngroups: int,
+) -> str {
+    var i = 0
+    while i < tpl.len {
+        let start = i
+        if tpl[i] != 36 as byte {
+            (mut out).push(tpl[i])
+            i += 1
+            continue
+        }
+        i += 1
+        if i >= tpl.len {
+            util.buf_append_str(mut msg, "re: the template ends in '$' at byte {start}")
+            return "type"
+        }
+        if tpl[i] == 36 as byte {
+            (mut out).push(36 as byte)
+            i += 1
+            continue
+        }
+        var g = 0
+        let c = tpl[i] as int
+        if c >= 48 && c <= 57 {
+            g = c - 48
+            i += 1
+        } else if c == 123 {
+            var any = false
+            i += 1
+            while i < tpl.len &&
+                tpl[i] as int >= 48 &&
+                tpl[i] as int <= 57 &&
+                g < search.RE_MAX_GROUPS {
+                g = g * 10 + (tpl[i] as int - 48)
+                any = true
+                i += 1
+            }
+            if !any || i >= tpl.len || tpl[i] != 125 as byte {
+                util.buf_append_str(mut msg, "re: expected ${{N}} at byte {start}")
+                return "type"
+            }
+            i += 1
+        } else {
+            util.buf_append_str(mut msg, "re: '$' is followed by '")
+            (mut msg).push(tpl[i])
+            util.buf_append_str(mut msg, "' at byte {start}; write '$$' for a literal dollar")
+            return "type"
+        }
+        if g >= ngroups {
+            util.buf_append_str(
+                mut msg,
+                "re: the template names group {g}, the pattern has {ngroups}",
+            )
+            return "index"
+        }
+        if m.lo[g] != -1 && m.hi[g] > m.lo[g] { stdre_append(mut out, s, m.lo[g], m.hi[g]) }
+    }
+    ""
+}
+
+// stdre.c:466-488.
+fn stdre_find(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    var from = 0
+    if argc >= 4 && vm.stack[base + 3].t != FL_NIL {
+        from = fl_arg_int(mut vm, base, 3) else { return fl_nil() }
+    }
+    let (k, _) = stdre_open(mut vm, base, argc, 2, 0) else { return fl_nil() }
+    let s = copy vm.stack[base]
+    let len = fl_str_len(vm, s)
+    if from < 0 || from > len {
+        return fl_raise(mut vm, "index", "re.find: byte {from} is outside a subject of {len} bytes")
+    }
+    if !stdre_search(mut vm, k, s, from) { return fl_nil() }
+    let m = copy vm.re_cache.m
+    stdre_match_map(mut vm, s, m)
+}
+
+// stdre.c:490-517: non-overlapping, at most `limit`, and refused past
+// 100,000 matches.
+fn stdre_find_all(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    let (k, limit) = stdre_open(mut vm, base, argc, 2, 3) else { return fl_nil() }
+    let s = copy vm.stack[base]
+    let r = fl_list_new(mut vm)
+    let root = fl_temp_push(mut vm, r)
+    var at = 0
+    var count = 0
+    var done = false
+    while !done && (limit < 0 || count < limit) && stdre_search(mut vm, k, s, at) {
+        if fl_list_len(vm, r) >= STDRE_MAX_RESULTS {
+            fl_temp_pop(mut vm, 1)
+            return fl_raise(mut vm, "limit", "re.find_all: more than 100000 matches")
+        }
+        let m = copy vm.re_cache.m
+        let map = stdre_match_map(mut vm, s, m)
+        fl_list_push(mut vm, r, map)
+        count += 1
+        let (next, end) = stdre_advance(vm, s, m.lo[0], m.hi[0])
+        at = next
+        done = end
+    }
+    fl_temp_pop(mut vm, 1)
+    r
+}
+
+// stdre.c:519-558: the template is read before the scan opens. A
+// zero-width match copies the codepoint it stepped over.
+fn stdre_replace(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    let tpl = fl_arg_str(mut vm, base, 2) else { return fl_nil() }
+    let (k, limit) = stdre_open(mut vm, base, argc, 3, 4) else { return fl_nil() }
+    let s = copy vm.stack[base]
+    let si = fl_obj_index(vm, s)
+    let ti = fl_obj_index(vm, tpl)
+    let ngroups = search.re_group_count(vm.re_cache.e[k].re)
+    var out = List[byte]()
+    var at = 0
+    var count = 0
+    var done = false
+    // Nothing here re-enters the VM, so the engine's match record is read
+    // in place: a copy per match would be held to the region's end (G33).
+    var msg = List[byte]()
+    while !done && (limit < 0 || count < limit) && stdre_search(mut vm, k, s, at) {
+        let lo = vm.re_cache.m.lo[0]
+        let hi = vm.re_cache.m.hi[0]
+        stdre_append(mut out, vm.gc.slots[si].bytes, at, lo)
+        let kind = stdre_expand(
+            mut out,
+            mut msg,
+            vm.gc.slots[ti].bytes,
+            vm.gc.slots[si].bytes,
+            vm.re_cache.m,
+            ngroups,
+        )
+        if kind.len != 0 {
+            stdre_raise_bytes(mut vm, kind, msg)
+            return fl_nil()
+        }
+        count += 1
+        let (next, end) = stdre_advance(vm, s, lo, hi)
+        at = next
+        done = end
+        if hi == lo && at > hi { stdre_append(mut out, vm.gc.slots[si].bytes, hi, at) }
+    }
+    let len = vm.gc.slots[si].bytes.len
+    if at < len { stdre_append(mut out, vm.gc.slots[si].bytes, at, len) }
+    fl_str_new(mut vm, out)
+}
+
+// stdre.c:560-610: the callback is checked before the scan opens and
+// handed each match map. It re-enters the VM and may use `re` itself, so
+// the scan runs its own copy of the program, keeps C's pin, and re-reads
+// the subject and the callback from their slots after every call.
+fn stdre_replace_fn(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    let _ = fl_arg_fn(mut vm, base, 2) else { return fl_nil() }
+    let (k, limit) = stdre_open(mut vm, base, argc, 3, 4) else { return fl_nil() }
+    let re = copy vm.re_cache.e[k].re
+    vm.re_cache.pin += 1
+    var out = List[byte]()
+    var at = 0
+    var count = 0
+    var done = false
+    while !done && (limit < 0 || count < limit) {
+        let s = copy vm.stack[base]
+        let si = fl_obj_index(vm, s)
+        let inp = search.re_input_bytes(vm.gc.slots[si].bytes.len)
+        let found = search.re_search_ws(
+            mut vm.re_cache.sc,
+            re,
+            vm.re_cache.tb,
+            vm.gc.slots[si].bytes,
+            inp,
+            at as text.ByteOff,
+            mut vm.re_cache.m,
+        )
+        if !found { break }
+        let m = copy vm.re_cache.m
+        let arg = stdre_match_map(mut vm, s, m)
+        stdre_append(mut out, vm.gc.slots[si].bytes, at, m.lo[0])
+        let root = fl_temp_push(mut vm, arg)
+        let callback = copy vm.stack[base + 2]
+        let got = fl_vm_call(mut vm, callback, [fl_temp_get(vm, root)])
+        fl_temp_pop(mut vm, 1)
+        if vm.raised {
+            vm.re_cache.pin -= 1
+            return fl_nil()
+        }
+        if got.t != FL_STR {
+            vm.re_cache.pin -= 1
+            let word = fl_type_name(got.t)
+            return fl_raise(
+                mut vm,
+                "type",
+                "re.replace_fn: the function must return str, found {word}",
+            )
+        }
+        util.buf_append(mut out, vm.gc.slots[fl_obj_index(vm, got)].bytes)
+        count += 1
+        let moved = copy vm.stack[base]
+        let (next, end) = stdre_advance(vm, moved, m.lo[0], m.hi[0])
+        at = next
+        done = end
+        if m.hi[0] == m.lo[0] && at > m.hi[0] {
+            stdre_append(mut out, vm.gc.slots[fl_obj_index(vm, moved)].bytes, m.hi[0], at)
+        }
+    }
+    vm.re_cache.pin -= 1
+    let s = copy vm.stack[base]
+    let si = fl_obj_index(vm, s)
+    let len = vm.gc.slots[si].bytes.len
+    if at < len { stdre_append(mut out, vm.gc.slots[si].bytes, at, len) }
+    fl_str_new(mut vm, out)
+}
+
+// stdre.c:612-652: separators drop; a zero-width separator's piece runs to
+// where the scan resumes, and one at the very end adds nothing.
+fn stdre_split(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    let (k, limit) = stdre_open(mut vm, base, argc, 2, 3) else { return fl_nil() }
+    let s = copy vm.stack[base]
+    let r = fl_list_new(mut vm)
+    let root = fl_temp_push(mut vm, r)
+    var at = 0
+    var count = 0
+    var done = false
+    while !done && (limit < 0 || count < limit) && stdre_search(mut vm, k, s, at) {
+        let lo = vm.re_cache.m.lo[0]
+        let hi = vm.re_cache.m.hi[0]
+        let (next, end) = stdre_advance(vm, s, lo, hi)
+        done = end
+        if done && hi == lo { break }
+        let piece = stdre_slice(mut vm, s, at, if hi > lo then lo else next)
+        fl_list_push(mut vm, r, piece)
+        at = next
+        count += 1
+        if fl_list_len(vm, r) >= STDRE_MAX_RESULTS {
+            fl_temp_pop(mut vm, 1)
+            return fl_raise(mut vm, "limit", "re.split: more than 100000 pieces")
+        }
+    }
+    let tail = stdre_slice(mut vm, s, at, fl_str_len(vm, s))
+    fl_list_push(mut vm, r, tail)
+    fl_temp_pop(mut vm, 1)
+    r
+}
+
+/// Dispatch a LOCAL re-table index; global native ids are 7000 + kind.
+pub fn fl_std_re_dispatch(mut vm: FlVm, kind: int, base: int, argc: int) -> FlValue {
+    assert(kind >= 0 && kind < 7)
+    if kind == 0 {
+        // stdre.c:444-464: a yes/no question, so the engine skips the
+        // group bookkeeping (NOCAPTURE, a cache key of its own).
+        let s = fl_arg_str(mut vm, base, 0) else { return fl_nil() }
+        let pat = fl_arg_str(mut vm, base, 1) else { return fl_nil() }
+        let flags = stdre_flags(mut vm, base, argc, 2) else { return fl_nil() }
+        let k = stdre_compile(mut vm, pat, flags | search.RE_NOCAPTURE) else { return fl_nil() }
+        let at = fl_obj_index(vm, s)
+        let inp = search.re_input_bytes(vm.gc.slots[at].bytes.len)
+        return fl_bool(
+            search.re_test_ws(
+                mut vm.re_cache.sc,
+                vm.re_cache.e[k].re,
+                vm.re_cache.tb,
+                vm.gc.slots[at].bytes,
+                inp,
+                0 as text.ByteOff,
+            ),
+        )
+    }
+    if kind == 1 { return stdre_find(mut vm, base, argc) }
+    if kind == 2 { return stdre_find_all(mut vm, base, argc) }
+    if kind == 3 { return stdre_replace(mut vm, base, argc) }
+    if kind == 4 { return stdre_replace_fn(mut vm, base, argc) }
+    if kind == 5 { return stdre_split(mut vm, base, argc) }
+    // stdre.c:654-669: s21's own escaper.
+    let s = fl_arg_str(mut vm, base, 0) else { return fl_nil() }
+    let at = fl_obj_index(vm, s)
+    var out = List[byte]()
+    search.re_quote(mut out, vm.gc.slots[at].bytes, 0, vm.gc.slots[at].bytes.len)
+    fl_str_new(mut vm, out)
+}
+
+/// Pinned RE_DEFS order, signatures and arities (stdre.c:673-686).
+pub fn fl_re_defs() -> List[FlNativeDef] {
+    [
+        fl_native_def("test", 7000, 2, 3, 0, "(s, pat, [flags]) -> bool"),
+        fl_native_def("find", 7001, 2, 4, 0, "(s, pat, [flags], [from]) -> map|nil"),
+        fl_native_def("find_all", 7002, 2, 4, 0, "(s, pat, [flags], [limit]) -> list"),
+        fl_native_def("replace", 7003, 3, 5, 0, "(s, pat, tmpl, [flags], [limit]) -> str"),
+        fl_native_def("replace_fn", 7004, 3, 5, 0, "(s, pat, f, [flags], [limit]) -> str"),
+        fl_native_def("split", 7005, 2, 4, 0, "(s, pat, [flags], [limit]) -> list"),
+        fl_native_def("escape", 7006, 1, 1, 0, "(s) -> str"),
+    ]
+}
