@@ -170,9 +170,10 @@ was measured.
 
 ### Commits, by deliverable
 
-The branch's own commits, oldest first in each group (`git log
---no-merges origin/trunk..yw07b`). The merge commits fold each fork back
-in, and one brings in trunk's `12442b8`.
+The branch's own commits through `65acadd`, oldest first in each group
+(`git log --no-merges origin/trunk..yw07b`). The one commit that adds this
+list comes after them. The merge commits fold each fork back in, and one
+brings in trunk's `12442b8`.
 
 - **Predictions**
   - `c8545f9` Record Fletch implementation predictions
@@ -279,6 +280,7 @@ in, and one brings in trunk's `12442b8`.
   - `a3aba10` Port test_fl_std_io's 13 cases over flfix, YEW_IO_CASE per case
   - `6c2bdb6` Port test_fl_caps's 5 cases over flfix
   - `e177428` Test the editor API's headless natives over every line of 34-editor.fl and kind_handle.fl, YEW_API_CASE per case
+  - `75cd7f9` Record the io fork's tier runs: three test files native and release, normal and stressed, and 30 checked cases
 - **Deliverable 9, `yew fl`'s non-interactive forms (lead)**
   - `2de2ca2` Port yew fl's non-interactive forms
   - `4556407` Re-point edit's Fletch refusals at yw09
@@ -306,12 +308,14 @@ in, and one brings in trunk's `12442b8`.
   - `0692ae2` Keep the checked-cases job's comment beside the job
   - `fb29781` Reuse fuzz_fl_lex's driver build for fuzz_fl_parse in CI
   - `706933b` Hold the checked-cases job to its four ubuntu shards in legs-test
+  - `f45ce81` Record the lane's container gates at 706933b
 - **Performance: controls, the perf runner and the recorded rows**
   - `f86f727` Record rejected dispatch performance controls
   - `1c314dd` Record the field-lend performance control
   - `303162f` Record plain and profile-guided release controls
   - `39e118b` Package Fletch performance rows and explicit advisory gates
   - `69c6230` Record the release and native perf rows and the GC-stress ratio
+  - `98e4b8d` Record the static binary and the GC-stress ratio at 706933b
 - **Rulings, MAP, the yw08 draft, the ledger and the note**
   - `6de9bb2` Record yw07b rulings, the tag erratum and gaps G52-G54
   - `8ba6036` Record the yw07b fork scope ledger
@@ -328,6 +332,8 @@ in, and one brings in trunk's `12442b8`.
   - `5333b30` Map List.reserve's exact growth as a per-append pitfall
   - `149ebc9` Bring yw08's draft to yw07b's head: the trace gate done, the perf harness, parse_only met
   - `8e289e5` Ask R-yw07b-9, the Fletch VM's release MISS rows, and close yw07b's MAP paragraph
+  - `be4044a` Write the lane note's five sections and close the fork ledger
+  - `65acadd` Complete the lane note: the static binary, the final gates and the GC-stress ratio
 - **Lane housekeeping**
   - `a7dc914` Pass YEW_FL_GC_STRESS into the lane container
   - `73a6d21` Format the lead's Fletch files with wolf fmt
