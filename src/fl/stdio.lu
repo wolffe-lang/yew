@@ -1,0 +1,767 @@
+//! fl.stdio — the `io` module, sagitta 9ace98c2 src/fl/stdio.c:1-1007.
+//! Every filesystem entry point checks a capability FIRST, through
+//! fl_cap_check, which reads the grant from the DEFINING module of the
+//! calling function (stdio.c:1-12, spec §13); io.print and io.eprint need
+//! none. Paths are Fletch bytes: an embedded NUL and the empty path are
+//! refused as C refuses them (stdio.c:107-138). io.write is atomic
+//! through yew's own text.file save (stdio.c:276-306); `fl` uses `text`
+//! and never `edit` (R-yw07-5).
+//!
+//! **Errno names (R-yw07-9, as R-yw07b-7 implements it).** C's messages
+//! carry the errno's NAME from its own 26-name table (stdio.c:59-94). The
+//! port reads the host's number for the failing call with os_error()
+//! (`[os.fs.error]`) and names it through the host's own numbering:
+//! linux and PAX (the Linux ABI) beside macOS, which numbers EAGAIN,
+//! ELOOP, ENAMETOOLONG, ENOTEMPTY and EOVERFLOW differently. Both tables
+//! were read black-box, `notes/yw07b-evidence/io/errno/errno-numbers.*`;
+//! a number outside them is C's `errno N` (stdio.c:96-104), and a host
+//! outside both names every number that way. Where os_error() is 0 (a
+//! failure the toolchain decided before asking the host, which none of
+//! these calls can meet), the row and a probe stand in (`io_probe_name`).
+//!
+//! **G40 (R-yw07-8).** A wolf fs path is a `str`: a Fletch path that is
+//! not UTF-8 raises kind `io` naming G40 at the point C would reach the
+//! filesystem, an io.glob entry whose path is not UTF-8 is matched but
+//! never descended, and io.env cannot return a value that is not UTF-8
+//! (G40's kin). No unit case, conformance unit or golden reaches them.
+//!
+//! **Output.** io.print writes descriptor 1 and io.eprint descriptor 2
+//! per call (`[os.fs.std]`); C's stdout is a stdio stream the host
+//! flushes, so only the interleaving of the two streams on one sink can
+//! differ.
+
+use text
+use util
+
+// stdio.c:49-55.
+const IO_MAX: int = 67108864
+
+const IO_GLOB_MAX_DEPTH: int = 64
+
+const IO_GLOB_MAX_RESULTS: int = 100000
+
+/// stdio.c:59-94's names by Linux's numbers (linux, and PAX's Linux ABI).
+fn io_errno_linux(e: int) -> str {
+    match e {
+        1 => "EPERM",
+        2 => "ENOENT",
+        4 => "EINTR",
+        5 => "EIO",
+        9 => "EBADF",
+        11 => "EAGAIN",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        14 => "EFAULT",
+        16 => "EBUSY",
+        17 => "EEXIST",
+        18 => "EXDEV",
+        19 => "ENODEV",
+        20 => "ENOTDIR",
+        21 => "EISDIR",
+        22 => "EINVAL",
+        23 => "ENFILE",
+        24 => "EMFILE",
+        27 => "EFBIG",
+        28 => "ENOSPC",
+        29 => "ESPIPE",
+        30 => "EROFS",
+        36 => "ENAMETOOLONG",
+        39 => "ENOTEMPTY",
+        40 => "ELOOP",
+        75 => "EOVERFLOW",
+        _ => "",
+    }
+}
+
+/// The same names by macOS's numbers.
+fn io_errno_macos(e: int) -> str {
+    match e {
+        1 => "EPERM",
+        2 => "ENOENT",
+        4 => "EINTR",
+        5 => "EIO",
+        9 => "EBADF",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        14 => "EFAULT",
+        16 => "EBUSY",
+        17 => "EEXIST",
+        18 => "EXDEV",
+        19 => "ENODEV",
+        20 => "ENOTDIR",
+        21 => "EISDIR",
+        22 => "EINVAL",
+        23 => "ENFILE",
+        24 => "EMFILE",
+        27 => "EFBIG",
+        28 => "ENOSPC",
+        29 => "ESPIPE",
+        30 => "EROFS",
+        35 => "EAGAIN",
+        62 => "ELOOP",
+        63 => "ENAMETOOLONG",
+        66 => "ENOTEMPTY",
+        84 => "EOVERFLOW",
+        _ => "",
+    }
+}
+
+/// `errno_name` (stdio.c:59-94) for `host`'s numbering, "" when unnamed.
+pub fn fl_io_errno_name(host: str, e: int) -> str {
+    if host == "linux" || host == "pax" { return io_errno_linux(e) }
+    if host == "macos" { return io_errno_macos(e) }
+    ""
+}
+
+/// stdio.c:96-104: the name, or `errno N` for a number without one.
+fn io_errno_text(e: int) -> str {
+    let name = fl_io_errno_name(os_name(), e)
+    if name.len != 0 then name else "errno {e}"
+}
+
+fn io_raise_named(mut vm: FlVm, name: str, path: List[byte]) -> FlValue {
+    var msg = List[byte]()
+    util.buf_append_str(mut msg, "{name}: ")
+    for b in path { (mut msg).push(b) }
+    fl_raise_bytes(mut vm, "io", msg)
+}
+
+/// `io_err` (stdio.c:96-104) over a host number.
+fn io_err(mut vm: FlVm, e: int, path: List[byte]) -> FlValue {
+    io_raise_named(mut vm, io_errno_text(e), path)
+}
+
+/// The fallback where os_error() is 0: a row that determines a name
+/// names it; `io` asks the path (a stat, then a listing for an rmdir).
+pub fn fl_io_probe_name(row: str, path: str, removing: bool) -> str {
+    if row == "not_found" { return "ENOENT" }
+    if row == "exists" { return "EEXIST" }
+    if row == "denied" { return "EACCES" }
+    let w = fs_stat(path) else {
+        let n = os_error()
+        return if n != 0 then io_errno_text(n) else "EIO"
+    }
+    if w[0] != 1 { return "EIO" }
+    if !removing { return "EISDIR" }
+    let entries = fs_read_dir_entries(path) else List[List[byte]]()
+    if entries.len != 0 then "ENOTEMPTY" else "EIO"
+}
+
+/// A failed fs call: the host's number, else the row's probe.
+fn io_fail(mut vm: FlVm, row: str, ptext: str, path: List[byte], removing: bool) -> FlValue {
+    let e = os_error()
+    let name = if e != 0 then io_errno_text(e) else fl_io_probe_name(row, ptext, removing)
+    io_raise_named(mut vm, name, path)
+}
+
+/// `path_of` (stdio.c:107-138): the path's bytes, refusing an embedded
+/// NUL (the kernel would act on a shorter path) and the empty path.
+fn io_path_of(mut vm: FlVm, s: FlValue) -> List[byte] ! {raised} {
+    let at = fl_obj_index(vm, s)
+    let n = vm.gc.slots[at].bytes.len
+    for i in 0..n {
+        if vm.gc.slots[at].bytes[i] as int == 0 {
+            let _ = fl_raise(mut vm, "io", "path contains a NUL byte at offset {i}")
+            return raised
+        }
+    }
+    if n == 0 {
+        let _ = fl_raise(mut vm, "io", "the path is empty")
+        return raised
+    }
+    copy vm.gc.slots[at].bytes
+}
+
+/// `arg_path` (stdio.c:140-151): the capability first, so a denied call
+/// never reveals whether its path was well formed.
+fn io_arg_path(mut vm: FlVm, base: int, i: int, cap: int) -> List[byte] ! {raised} {
+    if !fl_cap_check(mut vm, cap) { return raised }
+    let s = fl_arg_str(mut vm, base, i) else { return raised }
+    io_path_of(mut vm, s)?
+}
+
+/// G40 (R-yw07-8): a path a wolf fs call can name, at the point C would
+/// reach the filesystem with it.
+fn io_text(mut vm: FlVm, path: List[byte]) -> str ! {raised} {
+    let ptext = str_from_utf8(path) else {
+        var msg = List[byte]()
+        util.buf_append_str(
+            mut msg,
+            "the path is not UTF-8, which a wolf fs call cannot name (G40): ",
+        )
+        for b in path { (mut msg).push(b) }
+        let _ = fl_raise_bytes(mut vm, "io", msg)
+        return raised
+    }
+    ptext
+}
+
+fn io_close(fd: int) { fs_close(fd) else |_| {} }
+
+/// `slurp` (stdio.c:153-200): the whole file, a directory named EISDIR
+/// on every host, at most 64 MiB.
+fn io_slurp(mut vm: FlVm, path: List[byte]) -> List[byte] ! {raised} {
+    let ptext = io_text(mut vm, path)?
+    let fd = fs_open(ptext) else |e| {
+        let _ = io_fail(mut vm, "{e}", ptext, path, false)
+        return raised
+    }
+    let st = fs_fstat_record(fd) else |e| {
+        let _ = io_fail(mut vm, "{e}", ptext, path, false)
+        io_close(fd)
+        return raised
+    }
+    if st[0] == 1 {
+        io_close(fd)
+        let _ = io_raise_named(mut vm, "EISDIR", path)
+        return raised
+    }
+    var out = List[byte]()
+    loop {
+        let chunk = fs_read_chunk(fd, 65536) else |e| match e {
+            eof => { break },
+            io => {
+                let _ = io_fail(mut vm, "io", ptext, path, false)
+                io_close(fd)
+                return raised
+            },
+        }
+        for b in chunk { (mut out).push(b) }
+        if out.len > IO_MAX {
+            io_close(fd)
+            var msg = List[byte]()
+            util.buf_append_str(mut msg, "io.read: ")
+            for b in path { (mut msg).push(b) }
+            util.buf_append_str(mut msg, " exceeds 64 MiB")
+            let _ = fl_raise_bytes(mut vm, "limit", msg)
+            return raised
+        }
+    }
+    io_close(fd)
+    out
+}
+
+/// io.read and io.read_lines (stdio.c:202-237): the bytes verbatim, or
+/// str.split_lines of them, literally the one shared implementation.
+fn io_read(mut vm: FlVm, base: int, lines: bool) -> FlValue {
+    let path = io_arg_path(mut vm, base, 0, FL_CAP_FS_READ) else { return fl_nil() }
+    let bytes = io_slurp(mut vm, path) else { return fl_nil() }
+    if lines { return fl_split_lines(mut vm, bytes) }
+    fl_str_new(mut vm, bytes)
+}
+
+/// io.stdin (stdio.c:239-274): standard input to its end. The editor's
+/// batch-claim check (`vm->ed`) is yw09's; a headless VM has no editor.
+fn io_stdin(mut vm: FlVm) -> FlValue {
+    var bytes = List[byte]()
+    loop {
+        let chunk = fs_read_chunk(0, 65536) else |e| match e {
+            eof => { break },
+            io => { return io_err(mut vm, os_error(), "stdin".bytes()) },
+        }
+        if bytes.len > IO_MAX - chunk.len {
+            return fl_raise(mut vm, "limit", "io.stdin input exceeds {IO_MAX} bytes")
+        }
+        for b in chunk { (mut bytes).push(b) }
+    }
+    fl_str_new(mut vm, bytes)
+}
+
+/// io.write (stdio.c:276-306): atomic through text.file's one primitive,
+/// temporary, sync, rename, directory sync; the failing step's number
+/// survives its cleanup (text.AtomicWriteResult.os_errno).
+fn io_write(mut vm: FlVm, base: int) -> FlValue {
+    let path = io_arg_path(mut vm, base, 0, FL_CAP_FS_WRITE) else { return fl_nil() }
+    let body = fl_arg_str(mut vm, base, 1) else { return fl_nil() }
+    let ptext = io_text(mut vm, path) else { return fl_nil() }
+    let bytes = copy vm.gc.slots[fl_obj_index(vm, body)].bytes
+    let r = text.file_write_atomic_result(ptext, bytes, 438)
+    if r.error != text.SAVE_OK {
+        return io_err(mut vm, if r.os_errno == 0 then 5 else r.os_errno, path)
+    }
+    fl_nil()
+}
+
+/// io.append (stdio.c:308-354): O_APPEND|O_CREAT, 0666.
+fn io_append(mut vm: FlVm, base: int) -> FlValue {
+    let path = io_arg_path(mut vm, base, 0, FL_CAP_FS_WRITE) else { return fl_nil() }
+    let body = fl_arg_str(mut vm, base, 1) else { return fl_nil() }
+    let ptext = io_text(mut vm, path) else { return fl_nil() }
+    let fd = fs_open_perm(ptext, 2, 438) else |e| {
+        return io_fail(mut vm, "{e}", ptext, path, false)
+    }
+    let bytes = copy vm.gc.slots[fl_obj_index(vm, body)].bytes
+    if bytes.len != 0 {
+        fs_write_chunk(fd, bytes) else |e| {
+            let failed = io_fail(mut vm, "{e}", ptext, path, false)
+            io_close(fd)
+            return failed
+        }
+    }
+    fs_close(fd) else |e| { return io_fail(mut vm, "{e}", ptext, path, false) }
+    fl_nil()
+}
+
+/// io.exists and io.is_dir (stdio.c:360-385): false on ANY error.
+fn io_query(mut vm: FlVm, base: int, want_dir: bool) -> FlValue {
+    let path = io_arg_path(mut vm, base, 0, FL_CAP_FS_READ) else { return fl_nil() }
+    let ptext = io_text(mut vm, path) else { return fl_nil() }
+    let w = fs_stat(ptext) else { return fl_bool(false) }
+    fl_bool(!want_dir || w[0] == 1)
+}
+
+/// io.size (stdio.c:387-404).
+fn io_size(mut vm: FlVm, base: int) -> FlValue {
+    let path = io_arg_path(mut vm, base, 0, FL_CAP_FS_READ) else { return fl_nil() }
+    let ptext = io_text(mut vm, path) else { return fl_nil() }
+    let w = fs_stat(ptext) else |e| { return io_fail(mut vm, "{e}", ptext, path, false) }
+    fl_int(w[1])
+}
+
+/// io.remove (stdio.c:406-430): lstat, so a link is removed as a link;
+/// a directory goes through rmdir and must be empty.
+fn io_remove(mut vm: FlVm, base: int) -> FlValue {
+    let path = io_arg_path(mut vm, base, 0, FL_CAP_FS_WRITE) else { return fl_nil() }
+    let ptext = io_text(mut vm, path) else { return fl_nil() }
+    let w = fs_lstat(ptext) else |e| { return io_fail(mut vm, "{e}", ptext, path, false) }
+    if w[0] == 1 {
+        fs_remove_dir(ptext) else |e| { return io_fail(mut vm, "{e}", ptext, path, true) }
+    } else {
+        fs_remove(ptext) else |e| { return io_fail(mut vm, "{e}", ptext, path, false) }
+    }
+    fl_nil()
+}
+
+/// One mkdir(path, 0777); with `parents` an existing entry is no error.
+fn io_mkdir_one(mut vm: FlVm, prefix: List[byte], parents: bool) -> bool {
+    let ptext = str_from_utf8(prefix) else {
+        assert(false, "io.mkdir: a prefix of a UTF-8 path cut at '/' is UTF-8")
+        ""
+    }
+    fs_create_dir_mode(ptext, 511) else |e| {
+        let n = os_error()
+        let name = if n != 0 then io_errno_text(n) else fl_io_probe_name("{e}", ptext, false)
+        if parents && name == "EEXIST" { return true }
+        // Reported while still truncated: the level that failed is the
+        // actionable half of the path (stdio.c:440-444).
+        let _ = io_raise_named(mut vm, name, prefix)
+        return false
+    }
+    true
+}
+
+/// io.mkdir (stdio.c:432-472): one level; `parents` walks the prefixes.
+fn io_mkdir(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    let path = io_arg_path(mut vm, base, 0, FL_CAP_FS_WRITE) else { return fl_nil() }
+    let parents = argc >= 2 && fl_truthy(vm.stack[base + 1])
+    let _ = io_text(mut vm, path) else { return fl_nil() }
+    if parents {
+        for i in 1..path.len {
+            if path[i] as int != 47 { continue }
+            if !io_mkdir_one(mut vm, path[0..i], true) { return fl_nil() }
+        }
+    }
+    if !io_mkdir_one(mut vm, path, parents) { return fl_nil() }
+    fl_nil()
+}
+
+/// io.env (stdio.c:474-500): the one getenv a script can reach, behind
+/// fs.read; the name is a path_of (no NUL, not empty).
+fn io_env(mut vm: FlVm, base: int) -> FlValue {
+    if !fl_cap_check(mut vm, FL_CAP_FS_READ) { return fl_nil() }
+    let s = fl_arg_str(mut vm, base, 0) else { return fl_nil() }
+    let name = io_path_of(mut vm, s) else { return fl_nil() }
+    let ptext = str_from_utf8(name) else {
+        var msg = List[byte]()
+        util.buf_append_str(
+            mut msg,
+            "io.env: a name that is not UTF-8 cannot be read (G40's kin): ",
+        )
+        for b in name { (mut msg).push(b) }
+        return fl_raise_bytes(mut vm, "io", msg)
+    }
+    let value = env_get(ptext) else |e| match e {
+        missing => { return fl_nil() },
+        utf8 => {
+            return fl_raise(
+                mut vm,
+                "io",
+                "io.env: the value of {ptext} is not UTF-8, which a wolf environment read cannot return (G40's kin)",
+            )
+        },
+    }
+    fl_str_text(mut vm, value)
+}
+
+/// io.print and io.eprint (stdio.c:516-547): the display forms joined by
+/// one space, a newline, one unbuffered write to descriptor 1 or 2 (the
+/// CLI's own stdout path, so the two never reorder); no capability. A
+/// value the renderer refuses raises before anything is written.
+fn io_print(mut vm: FlVm, base: int, argc: int, fd: int) -> FlValue {
+    var out = List[byte]()
+    for i in 0..argc {
+        if i != 0 { (mut out).push(32 as byte) }
+        let v = copy vm.stack[base + i]
+        if !fl_fmt_display(mut vm, mut out, v) { return fl_nil() }
+    }
+    (mut out).push(10 as byte)
+    fs_write_chunk(fd, out) else |_| {}
+    fl_nil()
+}
+
+// ---------------------------------------------------------------- glob
+
+/// `class_match` (stdio.c:566-608): a bracket class at `at` against `c`;
+/// answers (hit, the index after the class).
+fn glob_class(p: List[byte], at: int, c: int) -> (bool, int) {
+    let pn = p.len
+    var i = at + 1
+    var neg = false
+    var hit = false
+    if i < pn && (p[i] as int == 33 || p[i] as int == 94) {
+        neg = true
+        i += 1
+    }
+    // A `]` first is a literal `]`.
+    if i < pn && p[i] as int == 93 {
+        if c == 93 { hit = true }
+        i += 1
+    }
+    while i < pn && p[i] as int != 93 {
+        if p[i] as int == 92 && i + 1 < pn { i += 1 }
+        let lo = p[i] as int
+        if i + 2 < pn && p[i + 1] as int == 45 && p[i + 2] as int != 93 {
+            i += 2
+            if p[i] as int == 92 && i + 1 < pn { i += 1 }
+            let hi = p[i] as int
+            if c >= lo && c <= hi { hit = true }
+        } else if c == lo {
+            hit = true
+        }
+        i += 1
+    }
+    // An unterminated class consumes the rest of the pattern.
+    let next = if i < pn then i + 1 else pn
+    (if neg then !hit else hit, next)
+}
+
+/// `comp_match` (stdio.c:610-650): `*` `?` `[..]` `\` within one
+/// component, a `*` that backtracks.
+fn glob_match(p: List[byte], s: List[byte]) -> bool {
+    let pn = p.len
+    let sn = s.len
+    var pi = 0
+    var si = 0
+    var star = -1
+    var star_s = 0
+    while si < sn {
+        if pi < pn && p[pi] as int == 42 {
+            star = pi
+            pi += 1
+            star_s = si
+            continue
+        }
+        if pi < pn && p[pi] as int == 63 {
+            pi += 1
+            si += 1
+            continue
+        }
+        if pi < pn && p[pi] as int == 91 {
+            let (hit, next) = glob_class(p, pi, s[si] as int)
+            if hit {
+                pi = next
+                si += 1
+                continue
+            }
+        } else if pi < pn {
+            var lit = pi
+            if p[lit] as int == 92 && lit + 1 < pn { lit += 1 }
+            if p[lit] == s[si] {
+                pi = lit + 1
+                si += 1
+                continue
+            }
+        }
+        if star == -1 { return false }
+        pi = star + 1
+        star_s += 1
+        si = star_s
+    }
+    while pi < pn && p[pi] as int == 42 { pi += 1 }
+    pi == pn
+}
+
+/// The walk's state (stdio.c:652-659's GlobCtx): the components, the
+/// matches as bytes, and whether a raise is in flight.
+/// `last_kind` is the lstat kind of the path C's `here` buffer spells
+/// now: C re-terminates `here` only when it writes, so after a nested
+/// walk the `is_dir_nofollow(here->data)` before a `**` descent reads the
+/// LAST path that walk wrote (stdio.c:790-800). The port answers that
+/// check from the kind of the last write, as C's lstat of it does; so
+/// `**/**/c.txt` descends no further than C does. `cut` is set when the
+/// root holds a NUL: C's C strings then all end there.
+struct Glob {
+    comp: List[List[byte]],
+    out: List[List[byte]],
+    failed: bool,
+    last_kind: int,
+    cut: bool,
+    cut_dir: bool,
+}
+
+fn glob_bytes_less(a: List[byte], b: List[byte]) -> bool {
+    let n = if a.len < b.len then a.len else b.len
+    for i in 0..n {
+        if a[i] != b[i] { return a[i] as int < b[i] as int }
+    }
+    a.len < b.len
+}
+
+// Entries compare by name, the bytes after fs_read_dir_entries' kind.
+fn glob_entry_less(a: List[byte], b: List[byte]) -> bool {
+    let n = if a.len < b.len then a.len else b.len
+    for i in 1..n {
+        if a[i] != b[i] { return a[i] as int < b[i] as int }
+    }
+    a.len < b.len
+}
+
+// C hands `here` to opendir as a C string: it ends at its first NUL.
+fn glob_cstr(here: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    for b in here {
+        if b as int == 0 { break }
+        (mut out).push(b)
+    }
+    out
+}
+
+/// `names_read` (stdio.c:690-716): one directory's entries sorted
+/// bytewise (readdir order differs between filesystems); none when it
+/// cannot be read, or (G40) when its path is not UTF-8.
+fn glob_names(here: List[byte]) -> List[List[byte]] ! {none} {
+    let ptext = str_from_utf8(glob_cstr(here)) else { return none }
+    var names = fs_read_dir_entries(ptext) else { return none }
+    util.sort_stable(mut names, glob_entry_less)
+    names
+}
+
+/// `glob_add` (stdio.c:728-740).
+fn glob_add(mut vm: FlVm, mut g: Glob, take path: List[byte]) -> bool {
+    if g.out.len >= IO_GLOB_MAX_RESULTS {
+        g.failed = true
+        let _ = fl_raise(mut vm, "limit", "io.glob: more than {IO_GLOB_MAX_RESULTS} matches")
+        return false
+    }
+    (mut g.out).push(path)
+    true
+}
+
+/// `glob_walk` (stdio.c:742-813). An entry's own kind is its lstat's
+/// (fs_read_dir_entries' byte 0), so a symlinked directory is matched but
+/// never descended.
+fn glob_walk(mut vm: FlVm, mut g: Glob, here: List[byte], ci: int, depth: int) {
+    if g.failed { return }
+    if depth > IO_GLOB_MAX_DEPTH {
+        g.failed = true
+        let _ = fl_raise(mut vm, "limit", "io.glob: deeper than {IO_GLOB_MAX_DEPTH} directories")
+        return
+    }
+    // `here` is re-terminated: it spells this directory again.
+    g.last_kind = 1
+    // An unreadable directory is skipped, not fatal.
+    let names = glob_names(here) else { return }
+    let ncomp = g.comp.len
+    let leaf = ci + 1 == ncomp
+    let comp = copy g.comp[ci]
+    let dbl = comp.len == 2 && comp[0] as int == 42 && comp[1] as int == 42
+    for entry in names {
+        if g.failed { break }
+        let name = entry[1..entry.len]
+        // Dot-files only when the component asks for them.
+        if name[0] as int == 46 && !(comp.len > 0 && comp[0] as int == 46) { continue }
+        g.last_kind = entry[0] as int
+        let is_dir = if g.cut then g.cut_dir else g.last_kind == 1
+        var path = List[byte]()
+        (mut path).reserve(here.len + 1 + name.len)
+        for b in here { (mut path).push(b) }
+        (mut path).push(47 as byte)
+        for b in name { (mut path).push(b) }
+        if dbl {
+            // `**` matches this level too: the rest is tried here and
+            // one level down.
+            if leaf {
+                let found = glob_cstr(path)
+                if !glob_add(mut vm, mut g, take found) { break }
+            } else if glob_match(g.comp[ci + 1], name) {
+                if ci + 2 == ncomp {
+                    let found = glob_cstr(path)
+                    if !glob_add(mut vm, mut g, take found) { break }
+                } else if is_dir {
+                    glob_walk(mut vm, mut g, path, ci + 2, depth + 1)
+                }
+            }
+            if g.failed { break }
+            // C's check of `here` here reads the last path written.
+            let again = if g.cut then g.cut_dir else g.last_kind == 1
+            if again { glob_walk(mut vm, mut g, path, ci, depth + 1) }
+            continue
+        }
+        if !glob_match(comp, name) { continue }
+        if leaf {
+            let found = glob_cstr(path)
+            if !glob_add(mut vm, mut g, take found) { break }
+        } else if is_dir {
+            glob_walk(mut vm, mut g, path, ci + 1, depth + 1)
+        }
+    }
+}
+
+/// `default_root` (stdio.c:855-887): the directory of the calling
+/// module, never the cwd; `.` only when the caller has no file.
+fn glob_default_root(vm: FlVm) -> List[byte] {
+    let o = fl_cap_origin(vm)
+    var out = List[byte]()
+    if o.path_id > 0 && o.path_id < vm.strings.items.len {
+        let p = copy vm.strings.items[o.path_id]
+        var slash = -1
+        for j in 0..p.len { if p[j] as int == 47 { slash = j } }
+        if slash > 0 {
+            for j in 0..slash { (mut out).push(p[j]) }
+            return out
+        }
+        if slash == 0 {
+            (mut out).push(47 as byte)
+            return out
+        }
+    }
+    (mut out).push(46 as byte)
+    out
+}
+
+/// io.glob (stdio.c:889-983): sorted bytewise over the whole result and
+/// deduplicated (stdio.c:830-853).
+fn io_glob(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    if !fl_cap_check(mut vm, FL_CAP_FS_READ) { return fl_nil() }
+    let pat = fl_arg_str(mut vm, base, 0) else { return fl_nil() }
+    var root = fl_nil()
+    if argc >= 2 { root = fl_arg_str(mut vm, base, 1) else { return fl_nil() } }
+    let p = copy vm.gc.slots[fl_obj_index(vm, pat)].bytes
+    if p.len == 0 { return fl_raise(mut vm, "type", "io.glob: the pattern is empty") }
+    for b in p {
+        if b as int == 0 {
+            return fl_raise(mut vm, "type", "io.glob: the pattern contains a NUL byte")
+        }
+    }
+    // Split on '/'; an empty component is dropped, the root carries the anchor.
+    var comp = List[List[byte]]()
+    var i = 0
+    while i < p.len {
+        let start = i
+        while i < p.len && p[i] as int != 47 { i += 1 }
+        if i > start {
+            if comp.len == IO_GLOB_MAX_DEPTH {
+                return fl_raise(
+                    mut vm,
+                    "limit",
+                    "io.glob: more than {IO_GLOB_MAX_DEPTH} path components",
+                )
+            }
+            (mut comp).push(p[start..i])
+        }
+        if i < p.len { i += 1 }
+    }
+    if comp.len == 0 { return fl_raise(mut vm, "type", "io.glob: the pattern has no components") }
+    var here = List[byte]()
+    if p[0] as int == 47 {
+        // An absolute pattern anchors itself; the root is ignored. C then
+        // opens the empty prefix (stdio.c:945-950 with :756-760), which
+        // fails, so such a pattern matches nothing; the port does as C.
+    } else if root.t == FL_STR {
+        let r = copy vm.gc.slots[fl_obj_index(vm, root)].bytes
+        if r.len == 0 { return fl_raise(mut vm, "type", "io.glob: the root is empty") }
+        // G40: C opens a root that is not UTF-8; a wolf fs call cannot.
+        let _ = io_text(mut vm, glob_cstr(r)) else { return fl_nil() }
+        var n = r.len
+        while n > 1 && r[n - 1] as int == 47 { n -= 1 }
+        // A root of "/" becomes the empty prefix (stdio.c:960-963).
+        if !(n == 1 && r[0] as int == 47) { here = r[0..n] }
+    } else {
+        here = glob_default_root(vm)
+    }
+    // A NUL in the root ends every C string C hands the kernel there.
+    let cut_at = glob_cstr(here)
+    let cut = cut_at.len != here.len
+    var cut_dir = false
+    if cut {
+        let cut_text = str_from_utf8(cut_at) else ""
+        let w = fs_lstat(cut_text) else List[int]()
+        cut_dir = w.len != 0 && w[0] == 1
+    }
+    var g = Glob {
+        comp: comp,
+        out: List[List[byte]](),
+        failed: false,
+        last_kind: 1,
+        cut: cut,
+        cut_dir: cut_dir,
+    }
+    glob_walk(mut vm, mut g, here, 0, 0)
+    if g.failed { return fl_nil() }
+    util.sort_stable(mut g.out, glob_bytes_less)
+    let list = fl_list_new(mut vm)
+    let root_at = fl_temp_push(mut vm, list)
+    for k in 0..g.out.len {
+        if k != 0 && !glob_bytes_less(g.out[k - 1], g.out[k]) { continue }
+        let v = fl_str_new(mut vm, g.out[k])
+        let list_now = fl_temp_get(vm, root_at)
+        fl_list_push(mut vm, list_now, v)
+    }
+    let out = fl_temp_get(vm, root_at)
+    fl_temp_pop(mut vm, 1)
+    out
+}
+
+/// Pinned IO_DEFS rows (stdio.c:986-1003); caps 1 = fs.read, 2 = fs.write.
+pub fn fl_io_defs() -> List[FlNativeDef] {
+    [
+        fl_native_def("stdin", 6000, 0, 0, 0, "() -> str"),
+        fl_native_def("read", 6001, 1, 1, 1, "(path) -> str"),
+        fl_native_def("read_lines", 6002, 1, 1, 1, "(path) -> list"),
+        fl_native_def("write", 6003, 2, 2, 2, "(path, s) -> nil"),
+        fl_native_def("append", 6004, 2, 2, 2, "(path, s) -> nil"),
+        fl_native_def("exists", 6005, 1, 1, 1, "(path) -> bool"),
+        fl_native_def("is_dir", 6006, 1, 1, 1, "(path) -> bool"),
+        fl_native_def("size", 6007, 1, 1, 1, "(path) -> int"),
+        fl_native_def("remove", 6008, 1, 1, 2, "(path) -> nil"),
+        fl_native_def("mkdir", 6009, 1, 2, 2, "(path, [parents]) -> nil"),
+        fl_native_def("glob", 6010, 1, 2, 1, "(pattern, [root]) -> list"),
+        fl_native_def("env", 6011, 1, 1, 1, "(name) -> str|nil"),
+        fl_native_def("print", 6012, 0, 255, 0, "(...) -> nil"),
+        fl_native_def("eprint", 6013, 0, 255, 0, "(...) -> nil"),
+    ]
+}
+
+/// Dispatch a LOCAL io-table index; global native ids are 6000 + local.
+pub fn fl_std_io_dispatch(mut vm: FlVm, local: int, base: int, argc: int) -> FlValue {
+    match local {
+        0 => io_stdin(mut vm),
+        1 => io_read(mut vm, base, false),
+        2 => io_read(mut vm, base, true),
+        3 => io_write(mut vm, base),
+        4 => io_append(mut vm, base),
+        5 => io_query(mut vm, base, false),
+        6 => io_query(mut vm, base, true),
+        7 => io_size(mut vm, base),
+        8 => io_remove(mut vm, base),
+        9 => io_mkdir(mut vm, base, argc),
+        10 => io_glob(mut vm, base, argc),
+        11 => io_env(mut vm, base),
+        12 => io_print(mut vm, base, argc, 1),
+        13 => io_print(mut vm, base, argc, 2),
+        _ => {
+            assert(false)
+            fl_nil()
+        },
+    }
+}

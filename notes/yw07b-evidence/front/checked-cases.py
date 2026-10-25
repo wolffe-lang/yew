@@ -15,7 +15,10 @@ rows = []
 for suite in ('lex', 'parse'):
     source = (root / f'src/fl_{suite}_test.lu').read_text()
     prefix = source[:source.index('fn main()')]
-    names = re.findall(r'fn (t_\w+)\(\)', prefix)
+    defined = re.findall(r'^fn (\w+)\(\)', prefix, re.M)
+    main = source[source.index('fn main()'):]
+    names = sorted((n for n in defined if re.search(r'\b' + n + r'\(\)', main)),
+                   key=lambda n: re.search(r'\b' + n + r'\(\)', main).start())
     for case, name in enumerate(names):
         entry = stage / f'{suite}_case_test.lu'
         entry.write_text(prefix + f'fn main() {{ {name}(); print("PASS {name}") }}\n')

@@ -1,0 +1,272 @@
+//! fuzz-fl-std — Sprint 31's stdlib fuzzer, sagitta 9ace98c2
+//! tests/fuzz/fuzz_fl_std.c:1-355 over fuzzlib.c's generator (tools/fuzzgen):
+//! every `str` and every `fmt` native, walked through the registered module
+//! map, driven with the input bytes as a STRING ARGUMENT, then fmt.f with
+//! the input as its TEMPLATE. THE PROPERTY: every outcome is a value or a
+//! raise whose kind is one of §9.1's thirteen (tests/fuzz/fl_kinds.h:19-33).
+//! The bytes are never cleaned. Natives are called as C calls them, the
+//! arguments on the VM stack and the dispatcher entered directly (no CALL
+//! arity check: the fuzzer passes min_ar, then max_ar, capped at five).
+//! The report line's `hash=` covers every generated input: C's for the same
+//! seed and iterations is the witness that both fed their check the same
+//! stream. GC stress is set on C's slice of the campaign (data[0] & 3 == 0);
+//! the port collects only at instruction boundaries, which no native here
+//! reaches, so stress there marks the collector pending and no more.
+//! Each input gets a fresh VM inside one `region trial`, the VM's whole life.
+
+use fl
+use fuzzgen
+
+// fuzz_fl_std.c:33-40: a multi-cluster subject, at most five arguments.
+const MAX_INPUT: int = 4096
+
+const MAX_ARGS: int = 5
+
+// fl_kinds.h:19-33's closed set.
+fn spec_kind(k: List[byte]) -> bool {
+    let text = str_from_utf8(k) else { return false }
+    for kind in "type|arity|name|index|key|div|capability|io|import|motion|user|limit|handle".split(
+        "|",
+    ) {
+        if text == kind { return true }
+    }
+    false
+}
+
+// fuzz_fl_std.c:42-58: the in-flight error's kind, "" when there is none
+// (C's %.*s into a 64-byte buffer: 63 bytes, cut at a NUL).
+fn err_kind(mut vm: fl.FlVm) -> List[byte] {
+    var out = List[byte]()
+    let err = copy vm.err
+    if err.t != fl.FL_MAP { return out }
+    let key = fl.fl_str_text(mut vm, "kind")
+    let got = fl.fl_map_get(vm, err, key) else { return out }
+    if got.t != fl.FL_STR { return out }
+    for b in vm.gc.slots[fl.fl_obj_index(vm, got)].bytes {
+        if b as int == 0 || out.len >= 63 { break }
+        (mut out).push(b)
+    }
+    out
+}
+
+fn native_name(vm: fl.FlVm, name_id: int) -> str {
+    if name_id <= 0 || name_id >= vm.strings.items.len { return "?" }
+    str_from_utf8(vm.strings.items[name_id]) else "?"
+}
+
+// fuzz_fl_std.c:60-103: one call and the property around it; "" holds.
+fn call_native(mut vm: fl.FlVm, nat: fl.FlValue, args: List[fl.FlValue], nargs: int) -> str {
+    let at = fl.fl_obj_index(vm, nat)
+    let name_id = vm.gc.slots[at].name_id
+    let kind = vm.gc.slots[at].native_kind
+    let slots = vm.sp
+    for i in 0..nargs {
+        vm.stack[vm.sp] = copy args[i]
+        vm.sp += 1
+    }
+    vm.cur_native = name_id
+    vm.err = fl.fl_nil()
+    vm.raised = false
+    let _ = fl.fl_native_dispatch(mut vm, kind, slots, nargs)
+    vm.sp = slots
+    if !vm.raised { return "" }
+    vm.raised = false
+    let k = err_kind(mut vm)
+    let nm = native_name(vm, name_id)
+    if k.len == 0 { return "{nm} failed without an error value" }
+    if !spec_kind(k) { return "{nm} raised unknown kind '{str_from_utf8(k) else "?"}'" }
+    ""
+}
+
+// fuzz_fl_std.c:105-150: argument shapes chosen by a byte of the input.
+fn build_args(
+    shape: int,
+    subject: fl.FlValue,
+    n1: int,
+    n2: int,
+    small: fl.FlValue,
+    list: fl.FlValue,
+) -> List[fl.FlValue] {
+    let s = shape % 4
+    if s == 0 {
+        return [copy subject, fl.fl_int(n1), fl.fl_int(n2), copy small, fl.fl_int(n1)]
+    }
+    if s == 1 { return [copy subject, copy small, copy small, fl.fl_int(n1), fl.fl_int(n2)] }
+    if s == 2 { return [copy list, copy small, copy subject, fl.fl_int(n1), fl.fl_int(n2)] }
+    [copy subject, copy subject, copy subject, copy subject, copy subject]
+}
+
+fn bytes_range(data: List[byte], lo: int, hi: int) -> List[byte] {
+    var out = List[byte]()
+    (mut out).reserve(hi - lo)
+    for i in lo..hi { (mut out).push(data[i]) }
+    out
+}
+
+// fuzz_fl_std.c:152-233: walk one builtin module's map, call every native.
+fn sweep_module(mut vm: fl.FlVm, modname: str, want: int, data: List[byte]) -> str {
+    let len = data.len
+    let key = fl.fl_str_text(mut vm, modname)
+    let builtins = copy vm.builtins
+    let modv = fl.fl_map_get(vm, builtins, key) else { return "no builtin module {modname}" }
+    if modv.t != fl.FL_MAP { return "no builtin module {modname}" }
+    let subject_v = fl.fl_str_new(mut vm, data)
+    let rs = fl.fl_temp_push(mut vm, subject_v)
+    // Two indices that straddle the subject's ends.
+    let n1 = if len < 2 then 0 else data[1] as int - 64
+    let n2 = if len < 3 then 1 else data[2] as int - 64
+    let small_bytes = if len < 4 {
+        bytes_range("a".bytes(), 0, 1)
+    } else {
+        bytes_range(data, 3, if len < 5 then 4 else 5)
+    }
+    let small_v = fl.fl_str_new(mut vm, small_bytes)
+    let rm = fl.fl_temp_push(mut vm, small_v)
+    let list_v = fl.fl_list_new(mut vm)
+    let rl = fl.fl_temp_push(mut vm, list_v)
+    fl.fl_list_push(mut vm, list_v, subject_v)
+    fl.fl_list_push(mut vm, list_v, small_v)
+    var called = 0
+    var shape = if len == 0 then 0 else data[0] as int
+    var cursor = 0
+    loop {
+        let (next, _, v) = fl.fl_map_iter(vm, modv, cursor) else break
+        cursor = next
+        // a constant, not a function
+        if v.t != fl.FL_NATIVE { continue }
+        let at = fl.fl_obj_index(vm, v)
+        let min_ar = vm.gc.slots[at].min_ar
+        let max_ar = vm.gc.slots[at].max_ar
+        called += 1
+        let subject = fl.fl_temp_get(vm, rs)
+        let small = fl.fl_temp_get(vm, rm)
+        let list = fl.fl_temp_get(vm, rl)
+        let args = build_args(shape, subject, n1, n2, small, list)
+        let why = call_native(mut vm, v, args, if min_ar > MAX_ARGS then MAX_ARGS else min_ar)
+        if why != "" {
+            fl.fl_temp_pop(mut vm, 3)
+            return why
+        }
+        // And once at the maximum arity, so the optional arguments are reached.
+        if max_ar != 255 && max_ar != min_ar {
+            let again = build_args(shape + 1, subject, n1, n2, small, list)
+            let why2 = call_native(mut vm, v, again, if max_ar > MAX_ARGS then MAX_ARGS else max_ar)
+            if why2 != "" {
+                fl.fl_temp_pop(mut vm, 3)
+                return why2
+            }
+        }
+        shape += 1
+    }
+    fl.fl_temp_pop(mut vm, 3)
+    // A FUZZER THAT COVERS NOTHING PASSES EVERY ITERATION.
+    if called < want { return "{modname}: swept {called} natives, expected {want}" }
+    ""
+}
+
+// fuzz_fl_std.c:235-305: fmt.f with the input as its TEMPLATE.
+fn sweep_template(mut vm: fl.FlVm, data: List[byte]) -> str {
+    let key = fl.fl_str_text(mut vm, "fmt")
+    let builtins = copy vm.builtins
+    let modv = fl.fl_map_get(vm, builtins, key) else { return "" }
+    if modv.t != fl.FL_MAP { return "" }
+    let fkey = fl.fl_str_text(mut vm, "f")
+    let fv = fl.fl_map_get(vm, modv, fkey) else { return "" }
+    if fv.t != fl.FL_NATIVE { return "" }
+    let template = fl.fl_str_new(mut vm, data)
+    let arg = fl.fl_str_text(mut vm, "arg")
+    let at = fl.fl_obj_index(vm, fv)
+    let slots = vm.sp
+    for v in [template, fl.fl_int(42), arg, fl.fl_float(1.5)] {
+        vm.stack[vm.sp] = v
+        vm.sp += 1
+    }
+    vm.cur_native = vm.gc.slots[at].name_id
+    vm.err = fl.fl_nil()
+    vm.raised = false
+    let kind = vm.gc.slots[at].native_kind
+    let out = fl.fl_native_dispatch(mut vm, kind, slots, 4)
+    vm.sp = slots
+    if !vm.raised {
+        if out.t != fl.FL_STR { return "fmt.f returned {fl.fl_type_name(out.t)}, not a string" }
+        return ""
+    }
+    vm.raised = false
+    let k = err_kind(mut vm)
+    if !spec_kind(k) { return "fmt.f raised unknown kind '{str_from_utf8(k) else "?"}'" }
+    ""
+}
+
+// fuzz_fl_std.c:307-349: one input on a fresh VM; "" when it held.
+fn check_fl_std(input: List[byte]) -> str {
+    let len = if input.len > MAX_INPUT then MAX_INPUT else input.len
+    let data = bytes_range(input, 0, len)
+    var vm = fl.fl_vm_new(take fl.fl_strings())
+    // GC STRESS on a slice of the campaign, C's own selection.
+    if len != 0 && data[0] as int & 3 == 0 { vm.gc.stress = true }
+    fl.fl_std_register(mut vm)
+    // All five grants: io is not swept, but the origin is never the reason.
+    vm.root_origin.kind = fl.FL_ORIGIN_CLI
+    vm.root_origin.caps = fl.FL_CAP_ALL
+    let a = sweep_module(mut vm, "str", 30, data)
+    if a != "" { return a }
+    let b = sweep_module(mut vm, "fmt", 7, data)
+    if b != "" { return b }
+    sweep_template(mut vm, data)
+}
+
+fn main() -> int {
+    let (ok, seed, iters) = fuzzgen.parse_args(env_args())
+    if !ok {
+        eprint("usage: fuzz-fl-std [--iters=N] [--seed=N]")
+        return 2
+    }
+    let target = "fuzz_fl_std"
+    let (cok, corpus, dict) = fuzzgen.corpus_dict_from(target, "tests/fuzz/corpus/fl_std")
+    if !cok { return 2 }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > 64 then 64 else iters - done
+        region epoch {
+            var rng = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut rng, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut rng, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, operation) = fuzzgen.mutate_dict(mut rng, input, corpus, dict)
+                    input = next
+                    op = operation
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut rng, input)
+                var why = ""
+                region trial {
+                    why = copy check_fl_std(input)
+                }
+                if why != "" {
+                    eprint(
+                        "{target}: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                    )
+                    eprint("{target}: input={fuzzgen.hex_of(input)}")
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = rng.state
+            hash = rng.hash
+        }
+        done += n
+    }
+    if failed { return 1 }
+    print("{target}: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok")
+    0
+}
