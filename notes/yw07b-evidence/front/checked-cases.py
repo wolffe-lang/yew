@@ -7,10 +7,10 @@ import subprocess
 root = Path(__file__).resolve().parents[3]
 stage = root / 'target/front/checked'
 stage.mkdir(parents=True, exist_ok=True)
-for name in ('fl', 'util', 'unicode'):
-    link = stage / name
-    if not link.exists():
-        link.symlink_to(root / 'src' / name, target_is_directory=True)
+for d in (root / 'src').iterdir():
+    link = stage / d.name
+    if d.is_dir() and not link.exists():
+        link.symlink_to(d, target_is_directory=True)
 rows = []
 for suite in ('lex', 'parse'):
     source = (root / f'src/fl_{suite}_test.lu').read_text()
