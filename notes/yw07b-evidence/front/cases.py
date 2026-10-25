@@ -3,7 +3,7 @@
 
 usage: cases.py FILE [--stress] [--only NAME...]
 
-Each `fn t_*` before `fn main()` runs alone (the file's helpers kept
+Each zero-argument case main() calls runs alone (the file's helpers kept
 verbatim) under `wolf test --deny-warnings --nocapture --no-native-fallback`,
 with YEW_FL_GC_STRESS=1 under --stress. A checked-machine step-budget
 exhaustion is UNSUPPORTED, never a pass. Writes one log per case and a TSV
@@ -33,7 +33,10 @@ for d in (root / 'src').iterdir():
             link.symlink_to(d, target_is_directory=True)
 source = src_file.read_text()
 prefix = source[:source.index('fn main()')]
-names = re.findall(r'^fn (t_\w+)\(\)', prefix, re.M)
+main = source[source.index('fn main()'):]
+# The cases are the zero-argument calls main makes, in its order: t_* or
+# sagitta's registry names alike.
+names = re.findall(r'^\s+(\w+)\(\)\s*$', main, re.M)
 if only:
     names = [n for n in names if n in only]
 env = dict(os.environ)
