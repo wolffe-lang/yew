@@ -22,8 +22,8 @@
       oracle campaigns on macOS with their original commands; macos-perf
       carries the six oracle measurements, with no new host exclusion;
       `checked-cases` (yw06: the checked machine one case at a time) needs
-      it too and runs on one ubuntu host, the checked machine being the
-      same on every host; the outputs are declared; the trunk
+      it too and runs on ubuntu only, the checked machine being the same
+      on every host, in four shards of its run list (yw07b); the outputs are declared; the trunk
       push, the pull request, the nightly and the dispatch are there; cancel-in-progress
       is for pull requests only and every other run has a group of its own
       run id; a red nightly, and only a red nightly, runs
@@ -149,8 +149,9 @@ say(len(moved) == 15 and all(n in fuzz_names for n in moved if not n.startswith(
     "L4 every step the port and oracle jobs leave on Linux is a unit or fuzz step there (%d moved)" % len(moved))
 cc = blocks["checked-cases"]
 say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-latest$", cc, re.M) is not None
-    and "matrix" not in cc and "run: python3 -I tools/check-test-cases\n" in cc,
-    "L4 checked-cases needs the legs and runs tools/check-test-cases on one ubuntu host")
+    and "        shard: [1, 2, 3, 4]\n" in cc and not re.search(r"^\s+(os|include):", cc, re.M)
+    and "run: python3 -I tools/check-test-cases --shard ${{ matrix.shard }}/4\n" in cc,
+    "L4 checked-cases needs the legs and runs tools/check-test-cases in four shards on ubuntu")
 say(re.search(r"^  push:\n    branches: \[trunk\]\n", wf, re.M) is not None and re.search(r"^  pull_request:\s*$", wf, re.M) is not None
     and re.search(r"^  schedule:\n(\s+#.*\n)*\s+- cron: ", wf, re.M) is not None and re.search(r"^  workflow_dispatch:\s*$", wf, re.M) is not None,
     "L4 the trunk push, the pull request, the nightly and the dispatch are there")
