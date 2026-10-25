@@ -1,0 +1,346 @@
+//! fl.stdlist — the `list` module's natives.
+//! Ports sagitta 9ace98c2 src/fl/stdlist.c:13-582 (idx_of 13-22, the plain
+//! operations 31-261, the default total order 273-334, sort 336-415, the
+//! walks 421-552, LIST_DEFS 558-577) and src/util/sort.c:9-68
+//! (yew_sort_stable's bottom-up merge: its comparisons, their count and
+//! their order).
+//! Arguments are VM-stack roots (CALL put them there). A callback re-enters
+//! the VM through fl_vm_call, and a collection inside it MOVES objects (R3's
+//! compacting sweep), so every heap reference is re-read from its rooted
+//! slot (vm.stack[base + i] or a fl_temp_push index) after each call, never
+//! held in a local across one. Sort keeps only scalar permutation indices in
+//! its merge buffers; the values stay in one rooted scratch list.
+//! Caller-owned native temporaries (sort's index lists, a callback's
+//! argument list) are allocation-pending with no boundedness claim (G54,
+//! wolf-lang#948): no region wraps them.
+
+// stdlist.c:13-22: a negative index counts from the end; `end` admits len.
+fn stdlist_index(mut vm: FlVm, index: int, len: int, end: bool) -> int ! {arg} {
+    let at = if index < 0 then len + index else index
+    if at < 0 || at > len || !end && at == len {
+        let _ = fl_raise(mut vm, "index", "index {index} out of range for length {len}")
+        return arg
+    }
+    at
+}
+
+// stdlist.c:273-288: nil < bool < int|float < str < list < map < fn < handle.
+fn stdlist_band(tag: int) -> int {
+    match tag {
+        0 => 0,
+        1 => 1,
+        2 | 3 => 2,
+        4 => 3,
+        5 => 4,
+        6 => 5,
+        7..=9 => 6,
+        _ => 7,
+    }
+}
+
+// stdlist.c:296-334: the default total order. NaN is equal to everything in
+// its band. Same-band objects with no natural order fall back to their
+// allocation sequence (`aux`, gc.c:46), never an address. C reads a reserved
+// handle's scalar payload as an object pointer there (`a.as.o->aux` on two
+// distinct handles, undefined); the port orders two distinct handles by
+// payload instead, an oracle defect reported to the lane lead.
+fn stdlist_cmp(vm: FlVm, a: FlValue, b: FlValue) -> int {
+    let ba = stdlist_band(a.t)
+    let bb = stdlist_band(b.t)
+    if ba != bb { return if ba < bb then -1 else 1 }
+    if ba == 0 { return 0 }
+    if ba == 1 { return a.i - b.i }
+    if ba == 2 {
+        let x = if a.t == FL_INT then a.i as f64 else a.f
+        let y = if b.t == FL_INT then b.i as f64 else b.f
+        return if x < y then -1 else if x > y then 1 else 0
+    }
+    if ba == 3 {
+        let x = fl_obj_index(vm, a)
+        let y = fl_obj_index(vm, b)
+        return stdstr_cmp(vm.gc.slots[x].bytes, vm.gc.slots[y].bytes)
+    }
+    if a.i == b.i { return 0 }
+    if !fl_is_obj(a) || !fl_is_obj(b) { return if a.i < b.i then -1 else 1 }
+    let x = fl_obj_index(vm, a)
+    let y = fl_obj_index(vm, b)
+    if vm.gc.slots[x].aux < vm.gc.slots[y].aux then -1 else 1
+}
+
+// Push input[lo..hi) onto out; nothing here collects.
+fn stdlist_append(mut vm: FlVm, out: FlValue, input: FlValue, lo: int, hi: int) {
+    var i = lo
+    while i < hi {
+        let value = fl_list_get(vm, input, i) else fl_nil()
+        fl_list_push(mut vm, out, value)
+        i += 1
+    }
+}
+
+// stdlist.c:342-371: compare scratch[a] against scratch[b], the comparator
+// called through the VM when one was given. `raised` once it has raised or
+// answered a non-int; the caller then never calls it again.
+fn stdlist_order(mut vm: FlVm, base: int, argc: int, root: int, a: int, b: int) -> int ! {raised} {
+    let scratch = fl_temp_get(vm, root)
+    let x = fl_list_get(vm, scratch, a) else fl_nil()
+    let y = fl_list_get(vm, scratch, b) else fl_nil()
+    if argc < 2 { return stdlist_cmp(vm, x, y) }
+    let callback = copy vm.stack[base + 1]
+    let result = fl_vm_call(mut vm, callback, [x, y])
+    if vm.raised { return raised }
+    if result.t != FL_INT {
+        let word = fl_type_name(result.t)
+        let _ = fl_raise(
+            mut vm,
+            "type",
+            "list.sort: the comparator must return an int, found {word}",
+        )
+        return raised
+    }
+    if result.i < 0 then -1 else if result.i > 0 then 1 else 0
+}
+
+// stdlist.c:373-415 over util/sort.c:9-68. The values are sorted as a
+// permutation of a rooted scratch list's indices: merge_runs compares the
+// right run's head against the left's and keeps the left on a tie, and the
+// passes, the comparisons and their order are C's. Committed only on
+// success: a raise leaves the list as it was.
+fn stdlist_sort(mut vm: FlVm, base: int, argc: int) -> FlValue {
+    let list = fl_arg_list(mut vm, base, 0) else { return fl_nil() }
+    if argc >= 2 { let _ = fl_arg_fn(mut vm, base, 1) else { return fl_nil() } }
+    let n = fl_list_len(vm, list)
+    if n < 2 { return fl_nil() }
+    let scratch = fl_list_new(mut vm)
+    let root = fl_temp_push(mut vm, scratch)
+    stdlist_append(mut vm, scratch, list, 0, n)
+    var items = List[int]()
+    var spare = List[int]()
+    for i in 0..n {
+        (mut items).push(i)
+        (mut spare).push(i)
+    }
+    var width = 1
+    loop {
+        var lo = 0
+        while lo < n {
+            let mid = if n - lo < width then n else lo + width
+            let hi = if n - mid < width then n else mid + width
+            var left = lo
+            var right = mid
+            var out = lo
+            while left < mid && right < hi {
+                let c = stdlist_order(mut vm, base, argc, root, items[right], items[left]) else {
+                    fl_temp_pop(mut vm, 1)
+                    return fl_nil()
+                }
+                if c < 0 {
+                    spare[out] = items[right]
+                    right += 1
+                } else {
+                    spare[out] = items[left]
+                    left += 1
+                }
+                out += 1
+            }
+            while left < mid {
+                spare[out] = items[left]
+                left += 1
+                out += 1
+            }
+            while right < hi {
+                spare[out] = items[right]
+                right += 1
+                out += 1
+            }
+            lo = hi
+        }
+        for i in 0..n { items[i] = spare[i] }
+        if width >= n - width { break }
+        width *= 2
+    }
+    // stdlist.c:406-409 writes the list's first l->n slots. A comparator
+    // that grew the list makes C read past the scratch's length (undefined);
+    // the port commits the n sorted values and leaves the grown tail.
+    let target = copy vm.stack[base]
+    let sorted = fl_temp_get(vm, root)
+    let len = fl_list_len(vm, target)
+    for i in 0..(if len < n then len else n) {
+        let value = fl_list_get(vm, sorted, items[i]) else fl_nil()
+        assert(fl_list_set(mut vm, target, i, value))
+    }
+    fl_temp_pop(mut vm, 1)
+    fl_nil()
+}
+
+// stdlist.c:421-552: map 14, filter 15, reduce 16, any 17, all 18. The
+// length and l[i] are re-read every turn, as C's `i < l->n` and `l->v[i]`
+// are, so a callback that grows the source list is walked over too.
+fn stdlist_walk(mut vm: FlVm, kind: int, base: int) -> FlValue {
+    let _ = fl_arg_fn(mut vm, base, 1) else { return fl_nil() }
+    // map and filter build one rooted list; reduce roots its one
+    // accumulator, replaced each turn (stdlist.c:489-513); any/all root none.
+    var root = -1
+    if kind == 14 || kind == 15 {
+        let out = fl_list_new(mut vm)
+        root = fl_temp_push(mut vm, out)
+    } else if kind == 16 {
+        let init = copy vm.stack[base + 2]
+        root = fl_temp_push(mut vm, init)
+    }
+    var i = 0
+    while i < fl_list_len(vm, vm.stack[base]) {
+        let item = fl_list_get(vm, vm.stack[base], i) else fl_nil()
+        // filter keeps the item it handed over (stdlist.c:464-471) even when
+        // the callback replaced l[i]; rooted, so a collection remaps it.
+        var held = -1
+        if kind == 15 { held = fl_temp_push(mut vm, item) }
+        let callback = copy vm.stack[base + 1]
+        var args = List[FlValue]()
+        if kind == 16 { (mut args).push(fl_temp_get(vm, root)) }
+        (mut args).push(item)
+        let result = fl_vm_call(mut vm, callback, args)
+        if vm.raised {
+            if held >= 0 { fl_temp_pop(mut vm, 1) }
+            if root >= 0 { fl_temp_pop(mut vm, 1) }
+            return fl_nil()
+        }
+        if kind == 14 {
+            let out = fl_temp_get(vm, root)
+            fl_list_push(mut vm, out, result)
+        } else if kind == 15 {
+            if fl_truthy(result) {
+                let out = fl_temp_get(vm, root)
+                let kept = fl_temp_get(vm, held)
+                fl_list_push(mut vm, out, kept)
+            }
+            fl_temp_pop(mut vm, 1)
+        } else if kind == 16 {
+            vm.temp[root] = result
+        } else if fl_truthy(result) != (kind == 18) {
+            return fl_bool(kind != 18)
+        }
+        i += 1
+    }
+    if root < 0 { return fl_bool(kind == 18) }
+    let out = fl_temp_get(vm, root)
+    fl_temp_pop(mut vm, 1)
+    out
+}
+
+/// Dispatch a LOCAL list-table index; global native ids are 2000 + kind.
+pub fn fl_std_list_dispatch(mut vm: FlVm, kind: int, base: int, argc: int) -> FlValue {
+    assert(kind >= 0 && kind < 19)
+    let list = fl_arg_list(mut vm, base, 0) else { return fl_nil() }
+    let len = fl_list_len(vm, list)
+    if kind == 0 { return fl_int(len) }
+    if kind == 1 {
+        // stdlist.c:42-53: fl_list_push bumps mods, then the native's bump.
+        let value = copy vm.stack[base + 1]
+        fl_list_push(mut vm, list, value)
+        vm.gc.slots[fl_obj_index(vm, list)].mods += 1
+        return fl_nil()
+    }
+    if kind == 2 {
+        if len == 0 { return fl_raise(mut vm, "index", "list.pop: the list is empty") }
+        return fl_list_remove(mut vm, list, len - 1) else fl_nil()
+    }
+    if kind == 3 || kind == 4 || kind == 6 {
+        let index = fl_arg_int(mut vm, base, 1) else { return fl_nil() }
+        if kind == 6 && argc >= 3 {
+            // stdlist.c:129-139: a default turns the miss into a value.
+            let at = if index < 0 then len + index else index
+            if at < 0 || at >= len { return copy vm.stack[base + 2] }
+        }
+        let at = stdlist_index(mut vm, index, len, kind == 3) else { return fl_nil() }
+        if kind == 4 { return fl_list_remove(mut vm, list, at) else fl_nil() }
+        if kind == 6 { return fl_list_get(vm, list, at) else fl_nil() }
+        // stdlist.c:80-84: grow by one nil (a bump), shift, store, bump.
+        let value = copy vm.stack[base + 2]
+        fl_list_push(mut vm, list, fl_nil())
+        let slot = fl_obj_index(vm, list)
+        var i = len
+        while i > at {
+            vm.gc.slots[slot].vals[i] = copy vm.gc.slots[slot].vals[i - 1]
+            i -= 1
+        }
+        vm.gc.slots[slot].vals[at] = value
+        vm.gc.slots[slot].mods += 1
+        return fl_nil()
+    }
+    if kind == 5 {
+        fl_list_clear(mut vm, list)
+        return fl_nil()
+    }
+    if kind == 7 || kind == 8 {
+        // stdlist.c:150-176: §5.2 equality, so an int finds an equal float.
+        var found = -1
+        for i in 0..len {
+            let value = fl_list_get(vm, list, i) else fl_nil()
+            if fl_equal(vm, value, vm.stack[base + 1]) {
+                found = i
+                break
+            }
+        }
+        return if kind == 7 then fl_int(found) else fl_bool(found >= 0)
+    }
+    if kind == 9 || kind == 10 || kind == 12 {
+        var lo = 0
+        var hi = len
+        var other = fl_nil()
+        if kind == 9 {
+            // stdlist.c:188-194: both bounds read, then both resolved.
+            let a = fl_arg_int(mut vm, base, 1) else { return fl_nil() }
+            var b = len
+            if argc >= 3 { b = fl_arg_int(mut vm, base, 2) else { return fl_nil() } }
+            lo = stdlist_index(mut vm, a, len, true) else { return fl_nil() }
+            hi = stdlist_index(mut vm, b, len, true) else { return fl_nil() }
+        }
+        if kind == 10 { other = fl_arg_list(mut vm, base, 1) else { return fl_nil() } }
+        let result = fl_list_new(mut vm)
+        let root = fl_temp_push(mut vm, result)
+        stdlist_append(mut vm, result, list, lo, hi)
+        if kind == 10 { stdlist_append(mut vm, result, other, 0, fl_list_len(vm, other)) }
+        let out = fl_temp_get(vm, root)
+        fl_temp_pop(mut vm, 1)
+        return out
+    }
+    if kind == 11 {
+        // stdlist.c:225-243: element-wise in place, so mods does not move.
+        let slot = fl_obj_index(vm, list)
+        var i = 0
+        while i + 1 < len - i {
+            let tmp = copy vm.gc.slots[slot].vals[i]
+            vm.gc.slots[slot].vals[i] = copy vm.gc.slots[slot].vals[len - 1 - i]
+            vm.gc.slots[slot].vals[len - 1 - i] = tmp
+            i += 1
+        }
+        return fl_nil()
+    }
+    if kind == 13 { return stdlist_sort(mut vm, base, argc) }
+    stdlist_walk(mut vm, kind, base)
+}
+
+/// Pinned LIST_DEFS order, signatures and arities (stdlist.c:558-577).
+pub fn fl_list_defs() -> List[FlNativeDef] {
+    [
+        fl_native_def("len", 2000, 1, 1, 0, "(l) -> int"),
+        fl_native_def("push", 2001, 2, 2, 0, "(l, v) -> nil"),
+        fl_native_def("pop", 2002, 1, 1, 0, "(l) -> v"),
+        fl_native_def("insert", 2003, 3, 3, 0, "(l, i, v) -> nil"),
+        fl_native_def("remove", 2004, 2, 2, 0, "(l, i) -> v"),
+        fl_native_def("clear", 2005, 1, 1, 0, "(l) -> nil"),
+        fl_native_def("get", 2006, 2, 3, 0, "(l, i, [default]) -> v"),
+        fl_native_def("index_of", 2007, 2, 2, 0, "(l, v) -> int"),
+        fl_native_def("contains", 2008, 2, 2, 0, "(l, v) -> bool"),
+        fl_native_def("slice", 2009, 2, 3, 0, "(l, lo, [hi]) -> list"),
+        fl_native_def("concat", 2010, 2, 2, 0, "(a, b) -> list"),
+        fl_native_def("reverse", 2011, 1, 1, 0, "(l) -> nil"),
+        fl_native_def("copy", 2012, 1, 1, 0, "(l) -> list"),
+        fl_native_def("sort", 2013, 1, 2, 0, "(l, [cmp]) -> nil"),
+        fl_native_def("map", 2014, 2, 2, 0, "(l, f) -> list"),
+        fl_native_def("filter", 2015, 2, 2, 0, "(l, f) -> list"),
+        fl_native_def("reduce", 2016, 3, 3, 0, "(l, f, init) -> v"),
+        fl_native_def("any", 2017, 2, 2, 0, "(l, f) -> bool"),
+        fl_native_def("all", 2018, 2, 2, 0, "(l, f) -> bool"),
+    ]
+}
