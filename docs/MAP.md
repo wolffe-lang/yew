@@ -535,7 +535,7 @@ maintainer.
 - **R-yw07b-5 — `list.sort`'s default order on two reserved handles,
   asked (recommend A).** `default_cmp`'s fallback (`stdlist.c:330-332`)
   compares two distinct objects by `as.o->aux`. For a reserved handle tag
-  (`FL_BUF`..`FL_WIN`, Sprint 34's), `as` holds a scalar handle, not an
+  (`FL_BUF`..`FL_REGEX`, Sprint 34's handles), `as` holds a scalar handle, not an
   object pointer, so C dereferences a scalar as a pointer: undefined
   behaviour with no portable answer. Headless, no handle value exists
   before yw09, so no golden or unit case reaches it. (A) the port orders
