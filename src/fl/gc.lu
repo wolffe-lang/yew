@@ -1,0 +1,445 @@
+//! fl.gc — sagitta 9ace98c2 src/fl/gc.c:24-695 and gc.h.
+//! R1 A: paired fixed physical slots, retaining all per-slot payload buffers.
+//! Compact only at VM instruction boundaries. C's LP64 charges are separate
+//! from wolf storage; gc.c:451-455 recomputes HEADERS ONLY after a sweep.
+
+/// Paired heap slots, weak strings, and C-compatible scheduling counters.
+pub struct FlGc {
+    slots: List[FlObj],
+    remap: List[int],
+    gray: List[int],
+    strings: List[FlValue],
+    half: int,
+    used: int,
+    next_seq: int,
+    bytes: int,
+    next_gc: int,
+    pending: bool,
+    stress: bool,
+    collections: int,
+    pause_total_ns: int,
+    pause_max_ns: int,
+}
+
+fn fl_empty_slot() -> FlObj {
+    FlObj {
+        t: -1,
+        marked: false,
+        flags: 0,
+        aux: 0,
+        generation: 0,
+        bytes: List[byte](),
+        vals: List[FlValue](),
+        ents: List[FlMapEnt](),
+        idx: List[int](),
+        cap: 0,
+        icap: 0,
+        ndead: 0,
+        mods: 0,
+        code: List[byte](),
+        lines: List[FlLineRun](),
+        ops: List[FlMotionOp](),
+        name_id: 0,
+        arity: 0,
+        nup: 0,
+        fnkind: 0,
+        max_stack: 0,
+        file_id: 0,
+        origin: FlOrigin { kind: 0, path_id: 0, caps: 0, principal_id: 0 },
+        fn_value: fl_nil(),
+        globals: fl_nil(),
+        closed: fl_nil(),
+        recv: fl_nil(),
+        slot: -1,
+        native_kind: 0,
+        min_ar: 0,
+        max_ar: 0,
+        has_recv: 0,
+        caps: 0,
+    }
+}
+
+/// Initialize an empty heap with the 256 KiB first threshold.
+pub fn fl_gc_init() -> FlGc {
+    FlGc {
+        slots: List[FlObj](),
+        remap: List[int](),
+        gray: List[int](),
+        strings: List[FlValue](),
+        half: 0,
+        used: 0,
+        next_seq: 0,
+        bytes: 0,
+        next_gc: 262144,
+        pending: false,
+        stress: false,
+        collections: 0,
+        pause_total_ns: 0,
+        pause_max_ns: 0,
+    }
+}
+
+fn fl_slot_reset(mut gc: FlGc, at: int) {
+    gc.slots[at].t = -1
+    gc.slots[at].marked = false
+    gc.slots[at].flags = 0
+    gc.slots[at].aux = 0
+    (mut gc.slots[at].bytes).reset()
+    (mut gc.slots[at].vals).reset()
+    (mut gc.slots[at].ents).reset()
+    (mut gc.slots[at].idx).reset()
+    (mut gc.slots[at].code).reset()
+    (mut gc.slots[at].lines).reset()
+    (mut gc.slots[at].ops).reset()
+    gc.slots[at].cap = 0
+    gc.slots[at].icap = 0
+    gc.slots[at].ndead = 0
+    gc.slots[at].mods = 0
+    gc.slots[at].name_id = 0
+    gc.slots[at].arity = 0
+    gc.slots[at].nup = 0
+    gc.slots[at].fnkind = 0
+    gc.slots[at].max_stack = 0
+    gc.slots[at].file_id = 0
+    gc.slots[at].origin = FlOrigin { kind: 0, path_id: 0, caps: 0, principal_id: 0 }
+    gc.slots[at].fn_value = fl_nil()
+    gc.slots[at].globals = fl_nil()
+    gc.slots[at].closed = fl_nil()
+    gc.slots[at].recv = fl_nil()
+    gc.slots[at].slot = -1
+    gc.slots[at].native_kind = 0
+    gc.slots[at].min_ar = 0
+    gc.slots[at].max_ar = 0
+    gc.slots[at].has_recv = 0
+    gc.slots[at].caps = 0
+}
+
+/// C object shell sizes, not Wolf slot size. Payload arrays are charged by
+/// their constructors, exactly where the pinned collector charges them.
+pub fn fl_gc_alloc(mut vm: FlVm, tag: int, charge: int) -> FlValue {
+    let at = vm.gc.used * 2 + vm.gc.half
+    assert(at < 1048576)
+    if at >= vm.gc.slots.len {
+        (mut vm.gc.slots).push(fl_empty_slot())
+        (mut vm.gc.slots).push(fl_empty_slot())
+        (mut vm.gc.remap).push(-1)
+        (mut vm.gc.remap).push(-1)
+    }
+    fl_slot_reset(mut vm.gc, at)
+    vm.gc.slots[at].generation += 1
+    vm.gc.slots[at].t = tag
+    vm.gc.next_seq += 1
+    vm.gc.slots[at].aux = vm.gc.next_seq
+    vm.gc.used += 1
+    vm.gc.bytes += charge
+    if vm.gc.stress || vm.gc.bytes > vm.gc.next_gc { vm.gc.pending = true }
+    fl_reference(vm, at)
+}
+
+/// Root a value and return its stable temp index; traps past 32 roots.
+pub fn fl_temp_push(mut vm: FlVm, v: FlValue) -> int {
+    assert(vm.temp.len < 32)
+    let at = vm.temp.len
+    (mut vm.temp).push(v)
+    at
+}
+
+/// Read a remapped temp root; traps for an invalid root index.
+pub fn fl_temp_get(vm: FlVm, at: int) -> FlValue { copy vm.temp[at] }
+
+/// Drop n temp roots; traps if more roots are dropped than protected.
+pub fn fl_temp_pop(mut vm: FlVm, n: int) {
+    assert(n >= 0 && n <= vm.temp.len)
+    for _ in 0..n { let _ = (mut vm.temp).pop() else fl_nil() }
+}
+
+/// Protect one temporary through subsequent callback collections.
+pub fn fl_gc_protect(mut vm: FlVm, v: FlValue) { let _ = fl_temp_push(mut vm, v) }
+
+/// Release n temporary roots in stack order.
+pub fn fl_gc_release(mut vm: FlVm, n: int) { fl_temp_pop(mut vm, n) }
+
+/// Copy verbatim bytes into a string, weakly interning lengths at most 64.
+pub fn fl_str_new(mut vm: FlVm, bytes: List[byte]) -> FlValue {
+    let hash = fl_hash_bytes(bytes)
+    if bytes.len <= 64 {
+        for j in 0..vm.gc.strings.len {
+            let v = copy vm.gc.strings[j]
+            let at = fl_obj_index(vm, v)
+            if vm.gc.slots[at].aux != hash || vm.gc.slots[at].bytes.len != bytes.len { continue }
+            var eq = true
+            for k in 0..bytes.len { if vm.gc.slots[at].bytes[k] != bytes[k] { eq = false; break } }
+            if eq { return v }
+        }
+    }
+    let v = fl_gc_alloc(mut vm, 4, 24 + bytes.len + 1)
+    let at = fl_obj_index(vm, v)
+    vm.gc.slots[at].aux = hash
+    for b in bytes { (mut vm.gc.slots[at].bytes).push(b) }
+    if bytes.len <= 64 {
+        vm.gc.slots[at].flags = 1
+        (mut vm.gc.strings).push(v)
+    }
+    v
+}
+
+/// Construct a byte string from UTF-8 text.
+pub fn fl_str_text(mut vm: FlVm, text: str) -> FlValue { fl_str_new(mut vm, text.bytes()) }
+
+/// Allocate an empty list without collecting mid-instruction.
+pub fn fl_list_new(mut vm: FlVm) -> FlValue { fl_gc_alloc(mut vm, 5, 40) }
+
+/// Allocate an empty insertion-ordered map.
+pub fn fl_map_new(mut vm: FlVm) -> FlValue { fl_gc_alloc(mut vm, 6, 56) }
+
+/// Append a value and advance the structural modification counter.
+pub fn fl_list_push(mut vm: FlVm, list: FlValue, v: FlValue) {
+    let at = fl_obj_index(vm, list)
+    if vm.gc.slots[at].vals.len == vm.gc.slots[at].cap {
+        let cap = if vm.gc.slots[at].cap == 0 then 8 else vm.gc.slots[at].cap * 2
+        vm.gc.bytes += (cap - vm.gc.slots[at].vals.len) * 16
+        vm.gc.slots[at].cap = cap
+        (mut vm.gc.slots[at].vals).reserve(cap)
+    }
+    (mut vm.gc.slots[at].vals).push(v)
+    vm.gc.slots[at].mods += 1
+}
+
+/// Insert or overwrite a key; false means an unhashable key.
+pub fn fl_map_set(mut vm: FlVm, m: FlValue, k: FlValue, v: FlValue) -> bool {
+    if !fl_hashable(k) { return false }
+    let at = fl_obj_index(vm, m)
+    let hash = fl_hash_value(vm, k)
+    let (p, found) = fl_map_probe(vm, at, k, hash)
+    if found {
+        let row = vm.gc.slots[at].idx[p] - 1
+        vm.gc.slots[at].ents[row].v = v
+        return true
+    }
+    if vm.gc.slots[at].icap == 0 || (vm.gc.slots[at].ents.len + 1) * 10 > vm.gc.slots[at].icap * 7 {
+        let cap = if vm.gc.slots[at].icap == 0 then 8 else vm.gc.slots[at].icap * 2
+        vm.gc.slots[at].icap = cap
+        while vm.gc.slots[at].idx.len < cap { (mut vm.gc.slots[at].idx).push(0) }
+        vm.gc.bytes += cap * 4
+        fl_map_reindex(mut vm, at)
+    }
+    if vm.gc.slots[at].ents.len == vm.gc.slots[at].cap {
+        let cap = if vm.gc.slots[at].cap == 0 then 8 else vm.gc.slots[at].cap * 2
+        vm.gc.slots[at].cap = cap
+        vm.gc.bytes += cap * 40
+        (mut vm.gc.slots[at].ents).reserve(cap)
+    }
+    (mut vm.gc.slots[at].ents).push(FlMapEnt { k: k, v: v, hash: hash, dead: false })
+    vm.gc.slots[at].mods += 1
+    var dest = hash & vm.gc.slots[at].icap - 1
+    while vm.gc.slots[at].idx[dest] != 0 { dest = dest + 1 & vm.gc.slots[at].icap - 1 }
+    vm.gc.slots[at].idx[dest] = vm.gc.slots[at].ents.len
+    true
+}
+
+fn fl_mark(mut vm: FlVm, v: FlValue) {
+    if !fl_is_obj(v) { return }
+    let at = fl_obj_index(vm, v)
+    if vm.gc.slots[at].marked { return }
+    vm.gc.slots[at].marked = true
+    (mut vm.gc.gray).push(at)
+}
+
+fn fl_mark_roots(mut vm: FlVm) {
+    for i in 0..vm.sp { let v = copy vm.stack[i]; fl_mark(mut vm, v) }
+    for i in 0..vm.frames.len { let v = copy vm.frames[i].cl; fl_mark(mut vm, v) }
+    for i in 0..vm.open_upvals.len { let v = copy vm.open_upvals[i]; fl_mark(mut vm, v) }
+    let g = copy vm.globals
+    fl_mark(mut vm, g)
+    let m = copy vm.modules
+    fl_mark(mut vm, m)
+    let b = copy vm.builtins
+    fl_mark(mut vm, b)
+    let p = copy vm.prelude
+    fl_mark(mut vm, p)
+    let e = copy vm.err
+    fl_mark(mut vm, e)
+    for i in 0..vm.host_roots.len { let v = copy vm.host_roots[i]; fl_mark(mut vm, v) }
+    for i in 0..vm.temp.len { let v = copy vm.temp[i]; fl_mark(mut vm, v) }
+    for i in 0..vm.compiling.len { let v = copy vm.compiling[i]; fl_mark(mut vm, v) }
+}
+
+fn fl_blacken(mut vm: FlVm, at: int) {
+    // All reference-bearing fields are nil on other tags. Dead map rows
+    // deliberately remain children until map compaction (gc.c:144-152).
+    for i in 0..vm.gc.slots[at].vals.len {
+        let v = copy vm.gc.slots[at].vals[i]
+        fl_mark(mut vm, v)
+    }
+    for i in 0..vm.gc.slots[at].ents.len {
+        let k = copy vm.gc.slots[at].ents[i].k
+        let v = copy vm.gc.slots[at].ents[i].v
+        fl_mark(mut vm, k)
+        fl_mark(mut vm, v)
+    }
+    let f = copy vm.gc.slots[at].fn_value
+    fl_mark(mut vm, f)
+    let g = copy vm.gc.slots[at].globals
+    fl_mark(mut vm, g)
+    let c = copy vm.gc.slots[at].closed
+    fl_mark(mut vm, c)
+    let r = copy vm.gc.slots[at].recv
+    fl_mark(mut vm, r)
+}
+
+fn fl_copy_slot(mut gc: FlGc, src: int, dst: int) {
+    fl_slot_reset(mut gc, dst)
+    gc.slots[dst].generation += 1
+    gc.slots[dst].t = gc.slots[src].t
+    gc.slots[dst].flags = gc.slots[src].flags
+    gc.slots[dst].aux = gc.slots[src].aux
+    gc.slots[dst].cap = gc.slots[src].cap
+    gc.slots[dst].icap = gc.slots[src].icap
+    gc.slots[dst].ndead = gc.slots[src].ndead
+    gc.slots[dst].mods = gc.slots[src].mods
+    gc.slots[dst].name_id = gc.slots[src].name_id
+    gc.slots[dst].arity = gc.slots[src].arity
+    gc.slots[dst].nup = gc.slots[src].nup
+    gc.slots[dst].fnkind = gc.slots[src].fnkind
+    gc.slots[dst].max_stack = gc.slots[src].max_stack
+    gc.slots[dst].file_id = gc.slots[src].file_id
+    gc.slots[dst].origin = copy gc.slots[src].origin
+    gc.slots[dst].fn_value = copy gc.slots[src].fn_value
+    gc.slots[dst].globals = copy gc.slots[src].globals
+    gc.slots[dst].closed = copy gc.slots[src].closed
+    gc.slots[dst].recv = copy gc.slots[src].recv
+    gc.slots[dst].slot = gc.slots[src].slot
+    gc.slots[dst].native_kind = gc.slots[src].native_kind
+    gc.slots[dst].min_ar = gc.slots[src].min_ar
+    gc.slots[dst].max_ar = gc.slots[src].max_ar
+    gc.slots[dst].has_recv = gc.slots[src].has_recv
+    gc.slots[dst].caps = gc.slots[src].caps
+    for j in 0..gc.slots[src].bytes.len {
+        let v = copy gc.slots[src].bytes[j]
+        (mut gc.slots[dst].bytes).push(v)
+    }
+    for j in 0..gc.slots[src].vals.len {
+        let v = copy gc.slots[src].vals[j]
+        (mut gc.slots[dst].vals).push(v)
+    }
+    for j in 0..gc.slots[src].ents.len {
+        let v = copy gc.slots[src].ents[j]
+        (mut gc.slots[dst].ents).push(v)
+    }
+    for j in 0..gc.slots[src].idx.len {
+        let v = copy gc.slots[src].idx[j]
+        (mut gc.slots[dst].idx).push(v)
+    }
+    for j in 0..gc.slots[src].code.len {
+        let v = copy gc.slots[src].code[j]
+        (mut gc.slots[dst].code).push(v)
+    }
+    for j in 0..gc.slots[src].lines.len {
+        let v = copy gc.slots[src].lines[j]
+        (mut gc.slots[dst].lines).push(v)
+    }
+    for j in 0..gc.slots[src].ops.len {
+        let v = copy gc.slots[src].ops[j]
+        (mut gc.slots[dst].ops).push(v)
+    }
+}
+
+fn fl_remap(vm: FlVm, v: FlValue) -> FlValue {
+    if !fl_is_obj(v) { return v }
+    let at = fl_obj_index(vm, v)
+    assert(vm.gc.remap[at] >= 0)
+    fl_reference(vm, vm.gc.remap[at])
+}
+
+fn fl_remap_roots(mut vm: FlVm) {
+    for i in 0..vm.sp { vm.stack[i] = fl_remap(vm, vm.stack[i]) }
+    for i in 0..vm.frames.len { vm.frames[i].cl = fl_remap(vm, vm.frames[i].cl) }
+    for i in 0..vm.open_upvals.len { vm.open_upvals[i] = fl_remap(vm, vm.open_upvals[i]) }
+    vm.globals = fl_remap(vm, vm.globals)
+    vm.modules = fl_remap(vm, vm.modules)
+    vm.builtins = fl_remap(vm, vm.builtins)
+    vm.prelude = fl_remap(vm, vm.prelude)
+    vm.err = fl_remap(vm, vm.err)
+    for i in 0..vm.host_roots.len { vm.host_roots[i] = fl_remap(vm, vm.host_roots[i]) }
+    for i in 0..vm.temp.len { vm.temp[i] = fl_remap(vm, vm.temp[i]) }
+    for i in 0..vm.compiling.len { vm.compiling[i] = fl_remap(vm, vm.compiling[i]) }
+}
+
+/// Mark, compact, remap every root, then poison and reset the old half.
+pub fn fl_gc_collect(mut vm: FlVm) {
+    let start = os_clock_ns()
+    (mut vm.gc.gray).reset()
+    fl_mark_roots(mut vm)
+    while vm.gc.gray.len > 0 {
+        let at = (mut vm.gc.gray).pop() else -1
+        fl_blacken(mut vm, at)
+    }
+    // Weak intern roots are removed BEFORE copying/resetting any slot.
+    var w: int = 0
+    let ns = vm.gc.strings.len
+    for i in 0..ns {
+        let v = copy vm.gc.strings[i]
+        if vm.gc.slots[fl_obj_index(vm, v)].marked { vm.gc.strings[w] = v; w += 1 }
+    }
+    while vm.gc.strings.len > w { let _ = (mut vm.gc.strings).pop() else fl_nil() }
+    let old_half = vm.gc.half
+    let old_used = vm.gc.used
+    let new_half = 1 - old_half
+    var live: int = 0
+    for i in 0..old_used {
+        let src = i * 2 + old_half
+        vm.gc.remap[src] = -1
+        if vm.gc.slots[src].marked {
+            let dst = live * 2 + new_half
+            fl_copy_slot(mut vm.gc, src, dst)
+            vm.gc.remap[src] = dst
+            live += 1
+        }
+    }
+    fl_remap_roots(mut vm)
+    for i in 0..vm.gc.strings.len { vm.gc.strings[i] = fl_remap(vm, vm.gc.strings[i]) }
+    for i in 0..live {
+        let at = i * 2 + new_half
+        for j in 0..vm.gc.slots[at].vals.len {
+            vm.gc.slots[at].vals[j] = fl_remap(vm, vm.gc.slots[at].vals[j])
+        }
+        for j in 0..vm.gc.slots[at].ents.len {
+            vm.gc.slots[at].ents[j].k = fl_remap(vm, vm.gc.slots[at].ents[j].k)
+            vm.gc.slots[at].ents[j].v = fl_remap(vm, vm.gc.slots[at].ents[j].v)
+        }
+        vm.gc.slots[at].fn_value = fl_remap(vm, vm.gc.slots[at].fn_value)
+        vm.gc.slots[at].globals = fl_remap(vm, vm.gc.slots[at].globals)
+        vm.gc.slots[at].closed = fl_remap(vm, vm.gc.slots[at].closed)
+        vm.gc.slots[at].recv = fl_remap(vm, vm.gc.slots[at].recv)
+    }
+    for i in 0..old_used { fl_slot_reset(mut vm.gc, i * 2 + old_half) }
+    vm.gc.half = new_half
+    vm.gc.used = live
+    vm.gc.bytes = live * 16
+    vm.gc.next_gc = vm.gc.bytes * 2
+    if vm.gc.next_gc < 262144 { vm.gc.next_gc = 262144 }
+    vm.gc.pending = false
+    vm.gc.collections += 1
+    let dt = os_clock_ns() - start
+    vm.gc.pause_total_ns += dt
+    if dt > vm.gc.pause_max_ns { vm.gc.pause_max_ns = dt }
+}
+
+/// Allocate native metadata for the single kind-id dispatcher (R10).
+pub fn fl_native_new(
+    mut vm: FlVm,
+    name_id: int,
+    kind: int,
+    min_ar: int,
+    max_ar: int,
+    caps: int,
+) -> FlValue {
+    let v = fl_gc_alloc(mut vm, 9, 56)
+    let at = fl_obj_index(vm, v)
+    vm.gc.slots[at].name_id = name_id
+    vm.gc.slots[at].native_kind = kind
+    vm.gc.slots[at].min_ar = min_ar
+    vm.gc.slots[at].max_ar = max_ar
+    vm.gc.slots[at].caps = caps
+    v
+}
