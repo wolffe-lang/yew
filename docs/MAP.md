@@ -232,6 +232,24 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G51 | **The public std float conversion/bit APIs canonicalize NaN sign and payload**, while C's conversion sites preserve a negative NaN spelling (`-nan`, `-nan.0`) and `strtod("nan(123)")`'s payload on Linux. | yw07b, R-yw07-4 | OPEN, not accepted: finite/inf/negative-zero conversions matched the generated Linux corpus; NaN identity/spellings did not. Host-C agreement is a separate pending CI gate; stop if it differs. | `notes/yw07b-evidence/floats/linux-comparison.json`: 110963 bit inputs, 221904 parses, 4771387 answer lines; signed/payload NaN witness in `probe/main.lu`; `src/fl/float.lu` names the limitation. | **wolf-std#103** (preserving binary64 bit conversion; host-C agreement remains an independent gate) |
 
 
+**yw07b float-host rulings (R-yw07b-2 and R-yw07b-3, coordinator under
+ruling #118, subject to override):** Linux glibc C is the float-seam oracle.
+The actual Linux/macOS answer streams of run `40166616917` contain 1,081
+differences: **1,080 NaN-sign presentation** rows (fixed 486, exponent 486,
+general 81, shortest 27), plus **one separate NaN payload grammar** row:
+`nan(+1)` consumes 3 bytes on glibc and 7 on Apple libc, both returning the
+same quiet NaN. These two exact classes alone are excluded from the
+cross-host byte-identity claim. Every other consumption or non-NaN
+difference remains fatal; macOS C continues to run as information.
+`host-compare.py` reads every answer, validates the input digest and stream
+length, and admits the second class only for the exact `P nan(+1)` input
+and observed result/end-offset pair. Fifteen controls include the original
+eleven rejection/acceptance cases and four exact-grammar boundary checks.
+The full classified evidence is `notes/yw07b-evidence/floats/host-comparison.json`.
+This is NOT acceptance of the port's G51 differences against Linux: those
+remain open under wolf-std#103.
+
+
 ### yw07 retirement cut
 
 The pin is wolf 0.2.35 / lupin 0.1.56. This lane ends at deliverable 1;
