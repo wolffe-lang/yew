@@ -1,6 +1,11 @@
 //! fl.vm — sagitta 9ace98c2 src/fl/vm.h:19-362, vm.c:119-240.
 //! Scalar frame coordinates; rooted heap references are refreshed after GC.
 
+use unicode
+use util
+
+fn fl_no_line(line: int) { let _ = line }
+
 /// Rooted closure and scalar call coordinates; call_pc belongs to caller.
 pub struct FlFrame {
     cl: FlValue,
@@ -40,6 +45,8 @@ pub struct FlVm {
     edit_depth: int,
     steps: int,
     step_limit: int,
+    line_observer: fn(int) -> (),
+    observed_lines: List[int],
     tracing: bool,
     trace: List[byte],
 }
@@ -71,6 +78,8 @@ pub fn fl_vm_new(take strings: FlStrings) -> FlVm {
         edit_depth: 0,
         steps: 0,
         step_limit: 0,
+        line_observer: fl_no_line,
+        observed_lines: List[int](),
         tracing: false,
         trace: List[byte](),
     }
@@ -90,12 +99,17 @@ pub fn fl_vm_new(take strings: FlStrings) -> FlVm {
 
 /// Build kind/msg error map, set raised, and return nil.
 pub fn fl_raise(mut vm: FlVm, kind: str, msg: str) -> FlValue {
+    fl_raise_bytes(mut vm, kind, msg.bytes())
+}
+
+/// Raise a byte-verbatim diagnostic, including non-UTF-8 suggestion candidates.
+pub fn fl_raise_bytes(mut vm: FlVm, kind: str, msg: List[byte]) -> FlValue {
     let m = fl_map_new(mut vm)
     let k = fl_str_text(mut vm, "kind")
     let v = fl_str_text(mut vm, kind)
     assert(fl_map_set(mut vm, m, k, v))
     let mk = fl_str_text(mut vm, "msg")
-    let mv = fl_str_text(mut vm, msg)
+    let mv = fl_str_new(mut vm, msg)
     assert(fl_map_set(mut vm, m, mk, mv))
     vm.err = m
     vm.raised = true
@@ -104,3 +118,806 @@ pub fn fl_raise(mut vm: FlVm, kind: str, msg: str) -> FlValue {
 
 /// Set the instruction budget and restart the step counter.
 pub fn fl_vm_set_step_limit(mut vm: FlVm, steps: int) { vm.step_limit = steps; vm.steps = 0 }
+
+fn fl_push(mut vm: FlVm, v: FlValue) {
+    if vm.sp >= 16384 { let _ = fl_raise(mut vm, "limit", "value stack exhausted"); return }
+    vm.stack[vm.sp] = copy v
+    vm.sp += 1
+}
+
+fn fl_pop(mut vm: FlVm) -> FlValue {
+    assert(vm.sp > 0)
+    vm.sp -= 1
+    copy vm.stack[vm.sp]
+}
+
+fn fl_capture_upval(mut vm: FlVm, slot: int) -> FlValue {
+    var pos: int = 0
+    while pos < vm.open_upvals.len {
+        let v = copy vm.open_upvals[pos]
+        let at = fl_obj_index(vm, v)
+        if vm.gc.slots[at].slot == slot { return v }
+        if vm.gc.slots[at].slot < slot { break }
+        pos += 1
+    }
+    let v = fl_gc_alloc(mut vm, 11, 48)
+    let at = fl_obj_index(vm, v)
+    vm.gc.slots[at].slot = slot
+    (mut vm.open_upvals).push(v)
+    var j = vm.open_upvals.len - 1
+    while j > pos { vm.open_upvals[j] = copy vm.open_upvals[j - 1]; j -= 1 }
+    vm.open_upvals[pos] = v
+    v
+}
+
+fn fl_close_upvals(mut vm: FlVm, floor: int) {
+    var n: int = 0
+    while n < vm.open_upvals.len {
+        let v = copy vm.open_upvals[n]
+        let at = fl_obj_index(vm, v)
+        if vm.gc.slots[at].slot < floor { break }
+        vm.gc.slots[at].closed = copy vm.stack[vm.gc.slots[at].slot]
+        vm.gc.slots[at].slot = -1
+        n += 1
+    }
+    let len = vm.open_upvals.len
+    for i in n..len { vm.open_upvals[i - n] = copy vm.open_upvals[i] }
+    for _ in 0..n { let _ = (mut vm.open_upvals).pop() else fl_nil() }
+}
+
+fn fl_read8(mut vm: FlVm, fi: int, fun: int) -> int {
+    let pc = vm.frames[fi].ip
+    let n = vm.gc.slots[fun].code[pc] as int
+    vm.frames[fi].ip += 1
+    n
+}
+
+fn fl_read16(mut vm: FlVm, fi: int, fun: int) -> int {
+    let lo = fl_read8(mut vm, fi, fun)
+    lo | fl_read8(mut vm, fi, fun) << 8
+}
+
+fn fl_number(v: FlValue) -> f64 { if v.t == 2 then v.i as f64 else v.f }
+
+fn fl_wrapped(a: int, b: int, op: int) -> int {
+    let x = a as wrapping[int]
+    let y = b as wrapping[int]
+    let r = if op == 17 then x + y else if op == 18 then x - y else x * y
+    r as int
+}
+
+fn fl_arith(mut vm: FlVm, a: FlValue, b: FlValue, op: int) -> FlValue {
+    if op == 17 && a.t == 4 && b.t == 4 {
+        var bytes = List[byte]()
+        let ai = fl_obj_index(vm, a)
+        let bi = fl_obj_index(vm, b)
+        for x in vm.gc.slots[ai].bytes { (mut bytes).push(x) }
+        for x in vm.gc.slots[bi].bytes { (mut bytes).push(x) }
+        return fl_str_new(mut vm, bytes)
+    }
+    if op == 17 && a.t == 5 && b.t == 5 {
+        let out = fl_list_new(mut vm)
+        let ai = fl_obj_index(vm, a)
+        let bi = fl_obj_index(vm, b)
+        for j in 0..vm.gc.slots[ai].vals.len {
+            let v = copy vm.gc.slots[ai].vals[j]
+            fl_list_push(mut vm, out, v)
+        }
+        for j in 0..vm.gc.slots[bi].vals.len {
+            let v = copy vm.gc.slots[bi].vals[j]
+            fl_list_push(mut vm, out, v)
+        }
+        return out
+    }
+    if op == 21 {
+        if a.t != 2 || b.t != 2 { return fl_raise(mut vm, "type", "'%' needs two ints") }
+        if b.i == 0 { return fl_raise(mut vm, "div", "modulo by zero") }
+        if a.i == -9223372036854775807 - 1 && b.i == -1 { return fl_int(0) }
+        return fl_int(a.i % b.i)
+    }
+    if a.t == 2 && b.t == 2 {
+        if op != 20 { return fl_int(fl_wrapped(a.i, b.i, op)) }
+        if b.i == 0 { return fl_raise(mut vm, "div", "division by zero") }
+        if a.i == -9223372036854775807 - 1 && b.i == -1 { return fl_int(a.i) }
+        return fl_int(a.i / b.i)
+    }
+    if (a.t == 2 || a.t == 3) && (b.t == 2 || b.t == 3) {
+        let x = fl_number(a)
+        let y = fl_number(b)
+        return fl_float(
+            if op == 17 {
+                x + y
+            } else if op == 18 {
+                x - y
+            } else if op == 19 {
+                x * y
+            } else {
+                x / y
+            },
+        )
+    }
+    if op == 17 {
+        return fl_raise(mut vm, "type", "cannot add {fl_type_name(a.t)} and {fl_type_name(b.t)}")
+    }
+    if op == 20 {
+        return fl_raise(
+            mut vm,
+            "type",
+            "cannot apply '/' to {fl_type_name(a.t)} and {fl_type_name(b.t)}",
+        )
+    }
+    let name = if op == 18 then "-" else "*"
+    fl_raise(mut vm, "type", "cannot apply '{name}' to {fl_type_name(a.t)} and {fl_type_name(b.t)}")
+}
+
+fn fl_cmp(mut vm: FlVm, a: FlValue, b: FlValue, op: int) -> FlValue {
+    if op == 24 || op == 25 { return fl_bool(fl_equal(vm, a, b) == (op == 24)) }
+    if a.t == 2 && b.t == 2 {
+        return fl_bool(
+            if op == 26 {
+                a.i < b.i
+            } else if op == 27 {
+                a.i <= b.i
+            } else if op == 28 {
+                a.i > b.i
+            } else {
+                a.i >= b.i
+            },
+        )
+    }
+    if (a.t == 2 || a.t == 3) && (b.t == 2 || b.t == 3) {
+        let x = fl_number(a)
+        let y = fl_number(b)
+        return fl_bool(
+            if op == 26 {
+                x < y
+            } else if op == 27 {
+                x <= y
+            } else if op == 28 {
+                x > y
+            } else {
+                x >= y
+            },
+        )
+    }
+    if a.t == 4 && b.t == 4 {
+        let ai = fl_obj_index(vm, a)
+        let bi = fl_obj_index(vm, b)
+        let an = vm.gc.slots[ai].bytes.len
+        let bn = vm.gc.slots[bi].bytes.len
+        var cmp: int = 0
+        for j in 0..(if an < bn then an else bn) {
+            cmp = vm.gc.slots[ai].bytes[j] as int - vm.gc.slots[bi].bytes[j] as int
+            if cmp != 0 { break }
+        }
+        if cmp == 0 { cmp = if an < bn then -1 else if an > bn then 1 else 0 }
+        return fl_bool(
+            if op == 26 {
+                cmp < 0
+            } else if op == 27 {
+                cmp <= 0
+            } else if op == 28 {
+                cmp > 0
+            } else {
+                cmp >= 0
+            },
+        )
+    }
+    fl_raise(mut vm, "type", "cannot compare {fl_type_name(a.t)} and {fl_type_name(b.t)}")
+}
+
+fn fl_native_invoke(mut vm: FlVm, callee: FlValue, base: int, argc: int, direct: bool) -> FlValue {
+    let at = fl_obj_index(vm, callee)
+    let min_ar = vm.gc.slots[at].min_ar
+    let max_ar = vm.gc.slots[at].max_ar
+    let name_id = vm.gc.slots[at].name_id
+    if argc < min_ar || max_ar != 255 && argc > max_ar {
+        let name = fl_cspelling(vm, name_id)
+        let plural = if min_ar == 1 then "" else "s"
+        if direct { return fl_raise(mut vm, "arity", "{name} got {argc} arguments") }
+        if max_ar == 255 {
+            return fl_raise(
+                mut vm,
+                "arity",
+                "{name} expects at least {min_ar} argument{plural}, got {argc}",
+            )
+        }
+        if min_ar == max_ar {
+            return fl_raise(mut vm, "arity", "{name} expects {min_ar} argument{plural}, got {argc}")
+        }
+        return fl_raise(mut vm, "arity", "{name} expects {min_ar}..{max_ar} arguments, got {argc}")
+    }
+    vm.cur_native = name_id
+    let kind = vm.gc.slots[at].native_kind
+    var call_base = base
+    var call_n = argc
+    if vm.gc.slots[at].has_recv != 0 {
+        call_base -= 1
+        vm.stack[call_base] = copy vm.gc.slots[at].recv
+        call_n += 1
+    }
+    fl_native_dispatch(mut vm, kind, call_base, call_n)
+}
+
+fn fl_frame_push(
+    mut vm: FlVm,
+    callee: FlValue,
+    nargs: int,
+    base: int,
+    call_pc: int,
+    native: int,
+) -> bool {
+    if callee.t != 8 {
+        let _ = fl_raise(mut vm, "type", "cannot call {fl_type_name(callee.t)}")
+        return false
+    }
+    let ci = fl_obj_index(vm, callee)
+    let fun = copy vm.gc.slots[ci].fn_value
+    let fi = fl_obj_index(vm, fun)
+    let arity = vm.gc.slots[fi].arity
+    if nargs != arity {
+        let _ = fl_raise(mut vm, "arity", "expected {arity} arguments, got {nargs}")
+        return false
+    }
+    if vm.frames.len >= 256 {
+        let _ = fl_raise(mut vm, "limit", "call depth exceeded")
+        return false
+    }
+    if vm.sp + vm.gc.slots[fi].max_stack >= 16384 {
+        let _ = fl_raise(mut vm, "limit", "value stack exhausted")
+        return false
+    }
+    let edit_depth = vm.edit_depth
+    (mut vm.frames).push(FlFrame {
+        cl: copy callee,
+        ip: 0,
+        base: base,
+        call_pc: call_pc,
+        via_native: native,
+        edit_depth: edit_depth,
+    })
+    true
+}
+
+/// Wrap a compiled function in a closure of the current module globals.
+pub fn fl_closure_new(mut vm: FlVm, fun: FlValue) -> FlValue {
+    let cl = fl_gc_alloc(mut vm, 8, 48)
+    let at = fl_obj_index(vm, cl)
+    vm.gc.slots[at].fn_value = copy fun
+    vm.gc.slots[at].globals = copy vm.globals
+    cl
+}
+
+fn fl_iter_next(mut vm: FlVm, fi: int, base: int, dist: int, two: bool) {
+    let subject = copy vm.stack[base]
+    let cursor = vm.stack[base + 1].i
+    let snapshot = vm.stack[base + 2].i
+    if subject.t == 5 {
+        let at = fl_obj_index(vm, subject)
+        if vm.gc.slots[at].mods != snapshot {
+            let _ = fl_raise(mut vm, "index", "list modified during iteration")
+            return
+        }
+        if cursor >= vm.gc.slots[at].vals.len { vm.frames[fi].ip += dist; return }
+        vm.stack[base + 1] = fl_int(cursor + 1)
+        let v = copy vm.gc.slots[at].vals[cursor]
+        if two { fl_push(mut vm, fl_int(cursor)) }
+        fl_push(mut vm, v)
+    } else if subject.t == 6 {
+        let at = fl_obj_index(vm, subject)
+        if vm.gc.slots[at].mods != snapshot {
+            let _ = fl_raise(mut vm, "key", "map modified during iteration")
+            return
+        }
+        let (next, k, v) = fl_map_iter(vm, subject, cursor) else {
+            vm.frames[fi].ip += dist
+            return
+        }
+        vm.stack[base + 1] = fl_int(next)
+        fl_push(mut vm, k)
+        if two { fl_push(mut vm, v) }
+    } else if subject.t == 4 && !two {
+        let at = fl_obj_index(vm, subject)
+        let len = vm.gc.slots[at].bytes.len
+        if cursor >= len { vm.frames[fi].ip += dist; return }
+        var next = unicode.gb_next_bytes(vm.gc.slots[at].bytes, len, cursor)
+        if next <= cursor { next = cursor + 1 }
+        vm.stack[base + 1] = fl_int(next)
+        let bytes = copy vm.gc.slots[at].bytes[cursor..next]
+        let v = fl_str_new(mut vm, bytes)
+        fl_push(mut vm, v)
+    } else {
+        let _ = fl_raise(
+            mut vm,
+            "type",
+            if two {
+                "two-variable for needs a list or a map, found {fl_type_name(subject.t)}"
+            } else {
+                "cannot iterate {fl_type_name(subject.t)}"
+            },
+        )
+    }
+}
+
+fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
+    while vm.frames.len > base {
+        if vm.gc.pending { fl_gc_collect(mut vm) }
+        if vm.step_limit != 0 {
+            vm.steps += 1
+            if vm.steps > vm.step_limit { let _ = fl_raise(mut vm, "limit", "step limit exceeded") }
+        }
+        if !vm.raised {
+            let fi = vm.frames.len - 1
+            let cl = copy vm.frames[fi].cl
+            let ci = fl_obj_index(vm, cl)
+            let fun = copy vm.gc.slots[ci].fn_value
+            let fnidx = fl_obj_index(vm, fun)
+            let framebase = vm.frames[fi].base
+            let pc = vm.frames[fi].ip
+            let op = fl_read8(mut vm, fi, fnidx)
+            if vm.tracing { (mut vm.trace).push(op as byte) }
+            match op {
+                0 => { // CONST
+                    let k = fl_read16(mut vm, fi, fnidx)
+                    let v = copy vm.gc.slots[fnidx].vals[k]
+                    fl_push(mut vm, v)
+                },
+                1 => fl_push(mut vm, fl_nil()), // NIL
+                2 => fl_push(mut vm, fl_bool(true)), // TRUE
+                3 => fl_push(mut vm, fl_bool(false)), // FALSE
+                4 => {
+                    let n = fl_read8(mut vm, fi, fnidx)
+                    fl_push(mut vm, fl_int(if n >= 128 then n - 256 else n))
+                }, // INT8
+                5 => {
+                    let n = fl_read8(mut vm, fi, fnidx)
+                    for _ in 0..n { fl_push(mut vm, fl_nil()) }
+                }, // NIL_N
+                6 => { let _ = fl_pop(mut vm) }, // POP
+                7 => { let n = fl_read8(mut vm, fi, fnidx); vm.sp -= n }, // POPN
+                8 => { let v = copy vm.stack[vm.sp - 1]; fl_push(mut vm, v) }, // DUP
+                9 => {
+                    let n = fl_read8(mut vm, fi, fnidx)
+                    let v = copy vm.stack[framebase + n]
+                    fl_push(mut vm, v)
+                }, // GET_LOCAL
+                10 => {
+                    let n = fl_read8(mut vm, fi, fnidx)
+                    let v = fl_pop(mut vm)
+                    vm.stack[framebase + n] = v
+                }, // SET_LOCAL
+                11 | 12 => { // GET_UPVAL / SET_UPVAL
+                    let n = fl_read8(mut vm, fi, fnidx)
+                    let u = copy vm.gc.slots[ci].vals[n]
+                    let ui = fl_obj_index(vm, u)
+                    let slot = vm.gc.slots[ui].slot
+                    if op == 11 {
+                        let v = if slot < 0 {
+                            copy vm.gc.slots[ui].closed
+                        } else {
+                            copy vm.stack[slot]
+                        }
+                        fl_push(mut vm, v)
+                    } else {
+                        let v = fl_pop(mut vm)
+                        if slot < 0 { vm.gc.slots[ui].closed = v } else { vm.stack[slot] = v }
+                    }
+                },
+                13 => {
+                    let n = fl_read8(mut vm, fi, fnidx)
+                    fl_close_upvals(mut vm, framebase + n)
+                    vm.sp = framebase + n
+                }, // CLOSE_UPVALS
+                14 | 15 | 16 => { // GET_GLOBAL / SET_GLOBAL / DEF_GLOBAL
+                    let k = fl_read16(mut vm, fi, fnidx)
+                    let name = copy vm.gc.slots[fnidx].vals[k]
+                    let globals = copy vm.gc.slots[ci].globals
+                    if op == 14 {
+                        let value = fl_map_get(vm, globals, name) else fl_map_get(
+                            vm,
+                            vm.prelude,
+                            name,
+                        ) else {
+                            let message = fl_missing_global(vm, globals, name.i)
+                            let _ = fl_raise_bytes(mut vm, "name", message)
+                            fl_nil()
+                        }
+                        if !vm.raised { fl_push(mut vm, value) }
+                    } else {
+                        var found = true
+                        if op == 15 {
+                            let _ = fl_map_get(vm, globals, name) else { found = false; fl_nil() }
+                        }
+                        if !found {
+                            let message = "undefined name '{fl_cspelling(vm, name.i)}'"
+                            let _ = fl_raise(mut vm, "name", message)
+                        } else {
+                            let v = fl_pop(mut vm)
+                            assert(fl_map_set(mut vm, globals, name, v))
+                        }
+                    }
+                },
+                17..=21 => { // ADD / SUB / MUL / DIV / MOD
+                    let b = fl_pop(mut vm)
+                    let a = fl_pop(mut vm)
+                    let v = fl_arith(mut vm, a, b, op)
+                    if !vm.raised { fl_push(mut vm, v) }
+                },
+                22 => { // NEG
+                    let a = copy vm.stack[vm.sp - 1]
+                    if a.t == 2 {
+                        vm.stack[vm.sp - 1] = fl_int(fl_wrapped(0, a.i, 18))
+                    } else if a.t == 3 {
+                        vm.stack[vm.sp - 1] = fl_float(-a.f)
+                    } else {
+                        let _ = fl_raise(mut vm, "type", "cannot negate {fl_type_name(a.t)}")
+                    }
+                },
+                23 => { vm.stack[vm.sp - 1] = fl_bool(!fl_truthy(vm.stack[vm.sp - 1])) }, // NOT
+                24..=29 => { // EQ / NE / LT / LE / GT / GE
+                    let b = fl_pop(mut vm)
+                    let a = fl_pop(mut vm)
+                    let v = fl_cmp(mut vm, a, b, op)
+                    if !vm.raised { fl_push(mut vm, v) }
+                },
+                30..=35 => { // JUMP / JUMP_BACK / conditional / short-circuit
+                    let d = fl_read16(mut vm, fi, fnidx)
+                    var go = true
+                    if op == 32 || op == 33 {
+                        let v = fl_pop(mut vm)
+                        go = fl_truthy(v) == (op == 33)
+                    }
+                    if op == 34 || op == 35 { go = fl_truthy(vm.stack[vm.sp - 1]) == (op == 34) }
+                    if go { vm.frames[fi].ip += if op == 31 then -d else d }
+                },
+                36 => { // CALL
+                    let n = fl_read8(mut vm, fi, fnidx)
+                    let callee = copy vm.stack[vm.sp - n - 1]
+                    let callbase = vm.sp - n - 1
+                    if callee.t == 9 {
+                        let result = fl_native_invoke(mut vm, callee, callbase + 1, n, false)
+                        if !vm.raised { vm.sp = callbase; fl_push(mut vm, result) }
+                    } else {
+                        let _ = fl_frame_push(mut vm, callee, n, callbase, pc, 0)
+                    }
+                },
+                37 | 38 | 56 => { // RETURN / RETURN_NIL / HALT
+                    let result = if op == 37 then fl_pop(mut vm) else fl_nil()
+                    vm.edit_depth = vm.frames[fi].edit_depth
+                    fl_close_upvals(mut vm, framebase)
+                    let _ = (mut vm.frames).pop() else FlFrame {
+                        cl: fl_nil(),
+                        ip: 0,
+                        base: 0,
+                        call_pc: 0,
+                        via_native: 0,
+                        edit_depth: 0,
+                    }
+                    if vm.frames.len == base { return result }
+                    vm.sp = framebase
+                    fl_push(mut vm, result)
+                },
+                39 => { // CLOSURE
+                    let k = fl_read16(mut vm, fi, fnidx)
+                    let f = copy vm.gc.slots[fnidx].vals[k]
+                    let nup = vm.gc.slots[fl_obj_index(vm, f)].nup
+                    let made = fl_closure_new(mut vm, f)
+                    let mi = fl_obj_index(vm, made)
+                    vm.gc.slots[mi].globals = copy vm.gc.slots[ci].globals
+                    vm.gc.slots[mi].nup = nup
+                    vm.gc.bytes += nup * 8
+                    for _ in 0..nup {
+                        let local = fl_read8(mut vm, fi, fnidx)
+                        let ix = fl_read8(mut vm, fi, fnidx)
+                        let up = if local != 0 {
+                            fl_capture_upval(mut vm, framebase + ix)
+                        } else {
+                            copy vm.gc.slots[ci].vals[ix]
+                        }
+                        (mut vm.gc.slots[mi].vals).push(up)
+                    }
+                    fl_push(mut vm, made)
+                },
+                40 => { // LIST
+                    let n = fl_read16(mut vm, fi, fnidx)
+                    let l = fl_list_new(mut vm)
+                    for j in 0..n {
+                        let v = copy vm.stack[vm.sp - n + j]
+                        fl_list_push(mut vm, l, v)
+                    }
+                    vm.sp -= n
+                    fl_push(mut vm, l)
+                },
+                41 => { // MAP
+                    let n = fl_read16(mut vm, fi, fnidx)
+                    let m = fl_map_new(mut vm)
+                    for j in 0..n {
+                        let k = copy vm.stack[vm.sp - 2 * n + 2 * j]
+                        let v = copy vm.stack[vm.sp - 2 * n + 2 * j + 1]
+                        if !fl_map_set(mut vm, m, k, v) {
+                            let _ = fl_raise(
+                                mut vm,
+                                "key",
+                                "{fl_type_name(k.t)} is not a valid map key",
+                            )
+                            break
+                        }
+                    }
+                    if !vm.raised { vm.sp -= 2 * n; fl_push(mut vm, m) }
+                },
+                42 | 43 => { // INDEX_GET / INDEX_SET
+                    let v = if op == 43 then fl_pop(mut vm) else fl_nil()
+                    let i = fl_pop(mut vm)
+                    let container = fl_pop(mut vm)
+                    if container.t == 5 && (op == 42 || i.t == 2) {
+                        let len = fl_list_len(vm, container)
+                        if i.t != 2 {
+                            let _ = fl_raise(mut vm, "type", "list index must be an int")
+                        } else if i.i < 0 || i.i >= len {
+                            let _ = fl_raise(
+                                mut vm,
+                                "index",
+                                "index {i.i} out of range (len {len})",
+                            )
+                        } else if op == 42 {
+                            let got = fl_list_get(vm, container, i.i) else fl_nil()
+                            fl_push(mut vm, got)
+                        } else {
+                            assert(fl_list_set(mut vm, container, i.i, v))
+                        }
+                    } else if container.t == 6 {
+                        if op == 42 {
+                            let got = fl_map_get(vm, container, i) else {
+                                let _ = fl_raise(mut vm, "key", "no such key")
+                                fl_nil()
+                            }
+                            if !vm.raised { fl_push(mut vm, got) }
+                        } else if !fl_map_set(mut vm, container, i, v) {
+                            let _ = fl_raise(
+                                mut vm,
+                                "key",
+                                "{fl_type_name(i.t)} is not a valid map key",
+                            )
+                        }
+                    } else {
+                        let _ = fl_raise(
+                            mut vm,
+                            "type",
+                            if op == 42 {
+                                "cannot index {fl_type_name(container.t)}"
+                            } else {
+                                "cannot assign into {fl_type_name(container.t)}"
+                            },
+                        )
+                    }
+                },
+                44 | 45 => { // FIELD_GET / FIELD_SET
+                    let k = fl_read16(mut vm, fi, fnidx)
+                    let id = vm.gc.slots[fnidx].vals[k].i
+                    let value = if op == 45 then fl_pop(mut vm) else fl_nil()
+                    let container = fl_pop(mut vm)
+                    let name = fl_cspelling(vm, id)
+                    if op == 45 && container.t != 6 {
+                        let _ = fl_raise(
+                            mut vm,
+                            "type",
+                            "cannot set a field on {fl_type_name(container.t)}",
+                        )
+                    } else if op == 45 && fl_frozen(vm, container) {
+                        let _ = fl_raise(mut vm, "type", "object is frozen")
+                    } else {
+                        let key = fl_str_text(mut vm, name)
+                        if op == 45 {
+                            assert(fl_map_set(mut vm, container, key, value))
+                        } else {
+                            var found = container.t == 6
+                            var got = fl_nil()
+                            if found {
+                                got = fl_map_get(vm, container, key) else {
+                                    found = false
+                                    fl_nil()
+                                }
+                            }
+                            if found {
+                                fl_push(mut vm, got)
+                            } else {
+                                let message = fl_missing_field(vm, container, name)
+                                let _ = fl_raise_bytes(mut vm, "key", message)
+                            }
+                        }
+                    }
+                },
+                46 => { // ITER_NEW
+                    let subject = copy vm.stack[vm.sp - 1]
+                    let mods = if subject.t == 5 || subject.t == 6 {
+                        vm.gc.slots[fl_obj_index(vm, subject)].mods
+                    } else {
+                        0
+                    }
+                    fl_push(mut vm, fl_int(0))
+                    fl_push(mut vm, fl_int(mods))
+                },
+                47 | 48 => { // ITER_NEXT1 / ITER_NEXT2
+                    let slot = fl_read8(mut vm, fi, fnidx)
+                    let d = fl_read16(mut vm, fi, fnidx)
+                    fl_iter_next(mut vm, fi, framebase + slot, d, op == 48)
+                },
+                49 => { // MOTION (null host)
+                    let _ = fl_read16(mut vm, fi, fnidx)
+                    let _ = fl_raise(mut vm, "motion", "no editor host")
+                },
+                50 => { // IMPORT
+                    let k = fl_read16(mut vm, fi, fnidx)
+                    let path = fl_read8(mut vm, fi, fnidx)
+                    let id = vm.gc.slots[fnidx].vals[k].i
+                    let result = fl_import(mut vm, id, path != 0)
+                    if !vm.raised { fl_push(mut vm, result) }
+                },
+                51 => { vm.edit_depth += 1 }, // EDIT_BEGIN (null host)
+                52 => { assert(vm.edit_depth > 0); vm.edit_depth -= 1 }, // EDIT_END
+                53 => { vm.err = fl_pop(mut vm); vm.raised = true }, // THROW
+                54 => { // TRY_PUSH
+                    let d = fl_read16(mut vm, fi, fnidx)
+                    if vm.handlers.len >= 64 {
+                        let _ = fl_raise(mut vm, "limit", "too many nested try blocks")
+                    } else {
+                        let h = FlHandler {
+                            pc: vm.frames[fi].ip + d,
+                            sp: vm.sp,
+                            frame: vm.frames.len,
+                            edit_depth: vm.edit_depth,
+                        }
+                        (mut vm.handlers).push(h)
+                    }
+                },
+                55 => {
+                    let _ = (mut vm.handlers).pop() else {
+                        assert(false)
+                        FlHandler { pc: 0, sp: 0, frame: 0, edit_depth: 0 }
+                    }
+                }, // TRY_POP
+                57 => { // LIST_APPEND
+                    let s = fl_read8(mut vm, fi, fnidx)
+                    let v = fl_pop(mut vm)
+                    let l = copy vm.stack[framebase + s]
+                    fl_list_push(mut vm, l, v)
+                },
+                58 => { vm.stack[vm.sp - 1] = fl_bool(vm.stack[vm.sp - 1].t != 0) }, // NOT_NIL
+                59 => { // TRACE_LINE
+                    let line = fl_read16(mut vm, fi, fnidx)
+                    (mut vm.observed_lines).push(line)
+                    let observer = vm.line_observer
+                    observer(line)
+                },
+                _ => assert(false),
+            }
+        }
+        if vm.raised {
+            let nh = vm.handlers.len
+            var target = if base < vm.frames.len then vm.frames[base].edit_depth else 0
+            if nh != 0 && vm.handlers[nh - 1].frame > base {
+                target = vm.handlers[nh - 1].edit_depth
+            }
+            vm.edit_depth = target
+            if nh == 0 { fl_trace_attach(mut vm) }
+            if nh == 0 || vm.handlers[nh - 1].frame <= base { return copy vm.err }
+            let h = (mut vm.handlers).pop() else FlHandler { pc: 0, sp: 0, frame: 0, edit_depth: 0 }
+            fl_close_upvals(mut vm, h.sp)
+            while vm.frames.len > h.frame {
+                let _ = (mut vm.frames).pop() else FlFrame {
+                    cl: fl_nil(),
+                    ip: 0,
+                    base: 0,
+                    call_pc: 0,
+                    via_native: 0,
+                    edit_depth: 0,
+                }
+            }
+            vm.sp = h.sp
+            let err = copy vm.err
+            vm.err = fl_nil()
+            vm.raised = false
+            fl_push(mut vm, err)
+            vm.frames[h.frame - 1].ip = h.pc
+        }
+    }
+    fl_nil()
+}
+
+/// Execute a compiled top-level chunk, resetting transient VM state on exit.
+pub fn fl_vm_run(mut vm: FlVm, entry: FlValue) -> FlValue {
+    let cl = fl_closure_new(mut vm, entry)
+    (mut vm.frames).reset()
+    (mut vm.handlers).reset()
+    (mut vm.open_upvals).reset()
+    vm.edit_depth = 0
+    vm.sp = 0
+    vm.raised = false
+    vm.err = fl_nil()
+    fl_push(mut vm, cl)
+    let _ = fl_frame_push(mut vm, cl, 0, 0, 0, 0)
+    let result = if vm.raised then copy vm.err else fl_vm_exec(mut vm, 0)
+    // Close captured slots before making a failed run's stack reusable.
+    fl_close_upvals(mut vm, 0)
+    (mut vm.frames).reset()
+    (mut vm.handlers).reset()
+    (mut vm.open_upvals).reset()
+    vm.edit_depth = 0
+    vm.sp = 0
+    result
+}
+
+/// Reentrant call; arguments are rooted in VM slots for the whole callback.
+pub fn fl_vm_call(mut vm: FlVm, callee: FlValue, args: List[FlValue]) -> FlValue {
+    let base = vm.frames.len
+    let slots = vm.sp
+    fl_push(mut vm, callee)
+    for v in args { fl_push(mut vm, v) }
+    var result = fl_nil()
+    if callee.t == 9 {
+        result = fl_native_invoke(mut vm, callee, slots + 1, args.len, true)
+    } else if fl_frame_push(mut vm, callee, args.len, slots, 0, vm.cur_native) {
+        result = fl_vm_exec(mut vm, base)
+    }
+    if vm.raised {
+        fl_close_upvals(mut vm, slots)
+        while vm.frames.len > base {
+            let _ = (mut vm.frames).pop() else FlFrame {
+                cl: fl_nil(),
+                ip: 0,
+                base: 0,
+                call_pc: 0,
+                via_native: 0,
+                edit_depth: 0,
+            }
+        }
+    }
+    vm.sp = slots
+    result
+}
+
+/// Install a read-only line observer; bind the function field before invocation (G47).
+pub fn fl_vm_set_line_observer(mut vm: FlVm, observer: fn(int) -> ()) {
+    vm.line_observer = observer
+}
+
+fn fl_missing_global(vm: FlVm, globals: FlValue, name: int) -> List[byte] {
+    var sg = fl_suggest_new()
+    let gi = fl_obj_index(vm, globals)
+    for row in vm.gc.slots[gi].ents {
+        if !row.dead && row.k.t == 2 && row.k.i > 0 && row.k.i < vm.strings.items.len {
+            fl_suggest_add(mut sg, vm.strings.items[row.k.i], 2)
+        }
+    }
+    let bi = fl_obj_index(vm, vm.builtins)
+    for row in vm.gc.slots[bi].ents {
+        if !row.dead && row.k.t == 4 {
+            fl_suggest_add(mut sg, vm.gc.slots[fl_obj_index(vm, row.k)].bytes, 3)
+        }
+    }
+    var detail = List[byte]()
+    let n = fl_suggest_render(mut sg, vm.strings.items[name], mut detail)
+    var out = List[byte]()
+    util.buf_append_str(mut out, "undefined name '{fl_cspelling(vm, name)}'")
+    if n != 0 { util.buf_append_str(mut out, "; "); for b in detail { (mut out).push(b) } }
+    out
+}
+
+fn fl_missing_field(vm: FlVm, container: FlValue, name: str) -> List[byte] {
+    var out = List[byte]()
+    util.buf_append_str(mut out, "no field '{name}' on {fl_type_name(container.t)}")
+    if container.t != 6 { return out }
+    var sg = fl_suggest_new()
+    let ci = fl_obj_index(vm, container)
+    for row in vm.gc.slots[ci].ents {
+        if !row.dead && row.k.t == 4 {
+            fl_suggest_add(mut sg, vm.gc.slots[fl_obj_index(vm, row.k)].bytes, 2)
+        }
+    }
+    var detail = List[byte]()
+    if fl_suggest_render(mut sg, name.bytes(), mut detail) != 0 {
+        util.buf_append_str(mut out, "; ")
+        for b in detail { (mut out).push(b) }
+    }
+    out
+}
