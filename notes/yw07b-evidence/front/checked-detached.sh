@@ -11,8 +11,10 @@ cd "$repo"
 names=$(python3 - "$file" <<'P'
 import re, sys
 s = open(sys.argv[1]).read()
-m = s[s.index('fn main()'):]
-print(' '.join(re.findall(r'^\s+(\w+)\(\)\s*$', m, re.M)))
+p, m = s[:s.index('fn main()')], s[s.index('fn main()'):]
+d = re.findall(r'^fn (\w+)\(\)', p, re.M)
+print(' '.join(sorted((n for n in d if re.search(r'\b' + n + r'\(\)', m)),
+                      key=lambda n: re.search(r'\b' + n + r'\(\)', m).start())))
 P
 )
 for n in $names; do

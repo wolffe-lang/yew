@@ -36,7 +36,9 @@ prefix = source[:source.index('fn main()')]
 main = source[source.index('fn main()'):]
 # The cases are the zero-argument calls main makes, in its order: t_* or
 # sagitta's registry names alike.
-names = re.findall(r'^\s+(\w+)\(\)\s*$', main, re.M)
+defined = re.findall(r'^fn (\w+)\(\)', prefix, re.M)
+names = sorted((n for n in defined if re.search(r'\b' + n + r'\(\)', main)),
+               key=lambda n: re.search(r'\b' + n + r'\(\)', main).start())
 if only:
     names = [n for n in names if n in only]
 env = dict(os.environ)
