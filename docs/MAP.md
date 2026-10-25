@@ -708,11 +708,26 @@ One paragraph each; yw01's is drafted in full
   forms so the 39 conformance units run, non-UTF-8 paths as bytes,
   errno names); `stdai.c` is Sprint 48's (campaign 10), not yw09's as
   §2 says — the draft flags it, undecided.
-- **yw08 — REPL, errors, conformance and perf** (s32, s33; `src/fl/`
-  repl, trace, suggest, vmcheck; `src/flcli.c`). `yew fl`, stack
-  traces, the error-quality pass, `fl_smoke`'s baselines and the
-  config-load gate. Goldens: the 39 conformance runs and the GC-stress
-  run (M-YW6).
+- **yw07b — Fletch core, the implementation** (deliverables 2–10 of
+  yw07's adopted contract). The toy VM and R-yw07b-1; the front end, the
+  values, the compiler, the VM with one `match`, the compacting heap, the
+  std modules with the editor API's headless natives (R-yw07-6 A), the
+  module loader, the data bridge beside the hand codec, `suggest`,
+  `trace`, and `yew fl`'s non-interactive forms (R-yw07-7 A,
+  `src/flcli/`). Gates: the 198 pinned cases by name
+  (`tools/check-fl-cases`), the 39 units by name, stressed and twice
+  (`tools/check-fletch-goldens`), the dump differentials
+  (`tools/check-fl-dump`), `tools/smoke-fl`, and the three fuzzers against
+  C's drivers. The perf rows are recorded beside C's on kasumi; every row
+  above 2× is a named MISS (`notes/yw07b-fletch-core.md`).
+- **yw08 — the prompt, the bug report, the ledger and the perf gates**
+  (s32 §2–§5 and §8–§9, s33 §3–§6; `src/fl/` repl, vmcheck; `flcli`'s
+  prompt and `--selftest-fl-bug`). **Drafted in full by yw07b**
+  (`notes/contracts/yw08-repl-errors-conformance-perf.md`): the prompt
+  over the one line editor (R-yw08-1), the exit-4 report (R-yw08-2),
+  `fuzz_fl_vm`, the coverage ledger, `perf_fletch`'s gates with yw07b's
+  MISS rows to ratchet or dispose (R-yw08-3), and M-YW6's prompt golden
+  and coverage gate.
 - **yw09 — Fletch in the editor** (s34–s38; `src/fl/` flapi, flconf,
   fleval, flhook, flruntime, fltxn, handle, record, macrolib, origin;
   `src/edit/batch.c`). Editor handles and the capability-checked
