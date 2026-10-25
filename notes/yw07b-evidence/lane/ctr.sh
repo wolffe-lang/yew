@@ -13,4 +13,5 @@ exec flock "$HOME/lanes/kasumi-cores-8-11.lock" podman run --rm --network none \
   -e XDG_STATE_HOME="$s/state" -e XDG_CACHE_HOME="$s/cache" \
   -e TMPDIR="$s/tmp" -e YEW_RUNTIME_DIR="$d/runtime" \
   -e TERM=xterm-256color -e CARGO_INCREMENTAL=0 \
+  ${YEW_FL_GC_STRESS:+-e YEW_FL_GC_STRESS="$YEW_FL_GC_STRESS"} \
   localhost/px13-ubuntu taskset -c 8-11 bash -c 'ulimit -c 0; exec "$@"' bash "$@"
