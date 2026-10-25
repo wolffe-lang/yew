@@ -58,7 +58,21 @@ The pre-change prediction is `notes/yw07b-evidence/prediction.txt`
 
 ## Evidence index
 
-Pending at the final head.
+Pending at the final head, except the gates seen red below.
+
+### Gates seen red
+
+Each plant is a draft PR on a `yw07b-plant-*` branch, red on the named
+row and closed unmerged by the orchestrator.
+
+| PR | plant head | run | gate | red row |
+|---|---|---|---|---|
+| yew#67 | `16158a5d` | 40165616674 | collector: the toy VM's root control | `test_compact_roots`, `test_fixed_roots`, `test_compact_cycle` FAILED (trap(assert)) |
+| yew#68 | `383a6d3f` | 40165620144 | collector: the generation control | `test_compact_reentry`, `test_fixed_reentry` FAILED (trap(assert)) |
+| yew#69 | `8907d201` | 40165623757 | collector: the memory control | `wolf-trap: assert` |
+| yew#71 | `9990410f` | 40183128447 | `tools/check-fletch-goldens` (io.print doubles its separator) | `FAIL 01-lexical.fl`, line 58 OUT not satisfied `\|255 255 1000000\|`, then `FAIL 02-grammar.fl`; `again: 19 of 39 units PASS by name`, `RED` |
+| yew#72 | `2a88441d` | 40183131866 | `tools/check-fl-dump` (the AST printer's `(let` gains a space) | `FAIL --dump-ast tests/fletch/01-lexical.fl (exit C=0 port=0)`; `total=178 pass=148 fail=30` |
+| yew#73 | `1b1474cd` | 40183134255 | `tools/smoke-fl` (an io error exits 1) | after the oracle's 12 rows, the port's `FAIL fl exit 3 (io escaping) (exit 1, want 3)` |
 
 ## Done-when
 
