@@ -1,0 +1,802 @@
+//! fl.compile — sagitta 9ace98c2 src/fl/compile.c:14-1537, compile.h.
+//! Compiler frames are indexed scratch, never aliases into growing storage.
+//! Compilation never collects; final functions root nested constants before
+//! the first instruction boundary. Float bit dedup uses public std APIs;
+//! G51 still limits NaN sign/payload fidelity, not finite/signed-zero identity.
+
+use std.math.float as floats
+
+struct FlLocal { name: int, depth: int, captured: bool }
+
+struct FlUpDesc { index: int, is_local: bool }
+
+struct FlCompLoop { start: int, breaks: List[int], conts: List[int], floor: int, try_depth: int }
+
+struct FlCompiler {
+    code: List[byte],
+    consts: List[FlValue],
+    lines: List[FlLineRun],
+    globals: List[int],
+    locals: List[FlLocal],
+    ups: List[FlUpDesc],
+    loops: List[FlCompLoop],
+    scope_depth: int,
+    ntry: int,
+    depth: int,
+    max_depth: int,
+    name_id: int,
+    arity: int,
+    file_id: int,
+    origin: FlOrigin,
+    failed: bool,
+    trace_mode: int,
+}
+
+struct FlCompState { frames: List[FlCompiler] }
+
+fn fl_comp_new(file: int, origin: FlOrigin) -> FlCompiler {
+    FlCompiler {
+        code: List[byte](),
+        consts: List[FlValue](),
+        lines: List[FlLineRun](),
+        globals: List[int](),
+        locals: List[FlLocal](),
+        ups: List[FlUpDesc](),
+        loops: List[FlCompLoop](),
+        scope_depth: 0,
+        ntry: 0,
+        depth: 0,
+        max_depth: 0,
+        name_id: 0,
+        arity: 0,
+        file_id: file,
+        origin: copy origin,
+        failed: false,
+        trace_mode: 0,
+    }
+}
+
+fn fl_cerror(mut cs: FlCompState, c: int, mut vm: FlVm, sp: FlSpan, msg: str) {
+    if cs.frames[c].failed { return }
+    cs.frames[c].failed = true
+    fl_diag_emit(mut vm.dc, 0, sp, msg)
+}
+
+fn fl_cdepth(mut cs: FlCompState, c: int, by: int) {
+    cs.frames[c].depth += by
+    if cs.frames[c].depth > cs.frames[c].max_depth { cs.frames[c].max_depth = cs.frames[c].depth }
+    if cs.frames[c].depth < 0 { cs.frames[c].depth = 0 }
+}
+
+fn fl_emit(mut cs: FlCompState, c: int, op: int, sp: FlSpan) {
+    let n = cs.frames[c].lines.len
+    if n == 0 ||
+        cs.frames[c].lines[n - 1].line != sp.line ||
+        cs.frames[c].lines[n - 1].col != sp.col {
+        let pc = cs.frames[c].code.len
+        (mut cs.frames[c].lines).push(FlLineRun { pc: pc, line: sp.line, col: sp.col })
+    }
+    (mut cs.frames[c].code).push(op as byte)
+    let effect = fl_op_effect(op)
+    if effect != -128 { fl_cdepth(mut cs, c, effect) }
+}
+
+fn fl_emit8(mut cs: FlCompState, c: int, n: int) { (mut cs.frames[c].code).push(n as byte) }
+
+fn fl_emit16(mut cs: FlCompState, c: int, n: int) {
+    fl_emit8(mut cs, c, n & 255)
+    fl_emit8(mut cs, c, n >> 8)
+}
+
+fn fl_cconst(mut cs: FlCompState, c: int, mut vm: FlVm, v: FlValue, sp: FlSpan) -> int {
+    for i in 0..cs.frames[c].consts.len {
+        let old = copy cs.frames[c].consts[i]
+        if old.t != v.t { continue }
+        let equal = if v.t == 3 then floats.to_bits(old.f) == floats.to_bits(v.f) else old.i == v.i
+        if equal { return i }
+    }
+    if cs.frames[c].consts.len >= 65535 {
+        fl_cerror(mut cs, c, mut vm, sp, "too many constants in one function")
+        return 0
+    }
+    (mut cs.frames[c].consts).push(copy v)
+    cs.frames[c].consts.len - 1
+}
+
+fn fl_cname(mut cs: FlCompState, c: int, mut vm: FlVm, name: int, sp: FlSpan) -> int {
+    fl_cconst(mut cs, c, mut vm, fl_int(name), sp)
+}
+
+fn fl_cjump(mut cs: FlCompState, c: int, op: int, sp: FlSpan) -> int {
+    fl_emit(mut cs, c, op, sp)
+    fl_emit16(mut cs, c, 65535)
+    cs.frames[c].code.len - 2
+}
+
+fn fl_cpatch(mut cs: FlCompState, c: int, mut vm: FlVm, site: int, sp: FlSpan) {
+    let dist = cs.frames[c].code.len - site - 2
+    if dist > 65535 { fl_cerror(mut cs, c, mut vm, sp, "function too large"); return }
+    cs.frames[c].code[site] = dist as byte
+    cs.frames[c].code[site + 1] = (dist >> 8) as byte
+}
+
+fn fl_cback(mut cs: FlCompState, c: int, mut vm: FlVm, target: int, sp: FlSpan) {
+    fl_emit(mut cs, c, 31, sp)
+    let dist = cs.frames[c].code.len + 2 - target
+    if dist > 65535 {
+        fl_cerror(mut cs, c, mut vm, sp, "function too large")
+        fl_emit16(mut cs, c, 0)
+        return
+    }
+    fl_emit16(mut cs, c, dist)
+}
+
+fn fl_cclose(mut cs: FlCompState, c: int, floor: int, sp: FlSpan) {
+    let n = cs.frames[c].locals.len
+    if n == floor { return }
+    var captured = false
+    for i in floor..n { if cs.frames[c].locals[i].captured { captured = true } }
+    fl_emit(mut cs, c, if captured then 13 else 7, sp)
+    fl_emit8(mut cs, c, if captured then floor else n - floor)
+    fl_cdepth(mut cs, c, -(n - floor))
+}
+
+fn fl_cend(mut cs: FlCompState, c: int, sp: FlSpan) {
+    var floor = cs.frames[c].locals.len
+    while floor > 0 && cs.frames[c].locals[floor - 1].depth >= cs.frames[c].scope_depth {
+        floor -= 1
+    }
+    fl_cclose(mut cs, c, floor, sp)
+    while cs.frames[c].locals.len > floor {
+        let _ = (mut cs.frames[c].locals).pop() else FlLocal { name: 0, depth: 0, captured: false }
+    }
+    cs.frames[c].scope_depth -= 1
+}
+
+fn fl_chidden(mut cs: FlCompState, c: int, mut vm: FlVm, sp: FlSpan) {
+    if cs.frames[c].locals.len >= 256 {
+        fl_cerror(mut cs, c, mut vm, sp, "too many locals in one function (max 256)")
+        return
+    }
+    let depth = cs.frames[c].scope_depth
+    (mut cs.frames[c].locals).push(FlLocal { name: 0, depth: depth, captured: false })
+}
+
+fn fl_cspelling(vm: FlVm, id: int) -> str {
+    str_from_utf8(vm.strings.items[id]) else "<invalid UTF-8>"
+}
+
+fn fl_clocal(mut cs: FlCompState, c: int, mut vm: FlVm, name: int, sp: FlSpan) {
+    if cs.frames[c].locals.len >= 256 {
+        fl_cerror(mut cs, c, mut vm, sp, "too many locals in one function (max 256)")
+        return
+    }
+    var i = cs.frames[c].locals.len
+    while i > 0 {
+        i -= 1
+        let l = copy cs.frames[c].locals[i]
+        if l.depth != -1 && l.depth < cs.frames[c].scope_depth { break }
+        if l.name == name {
+            fl_cerror(
+                mut cs,
+                c,
+                mut vm,
+                sp,
+                "'{fl_cspelling(vm, name)}' is already declared in this scope",
+            )
+            return
+        }
+    }
+    (mut cs.frames[c].locals).push(FlLocal { name: name, depth: -1, captured: false })
+}
+
+fn fl_cinit(mut cs: FlCompState, c: int) {
+    let n = cs.frames[c].locals.len
+    if n > 0 { cs.frames[c].locals[n - 1].depth = cs.frames[c].scope_depth }
+}
+
+fn fl_cresolve(mut cs: FlCompState, c: int, mut vm: FlVm, name: int, sp: FlSpan) -> int {
+    var i = cs.frames[c].locals.len
+    while i > 0 {
+        i -= 1
+        if cs.frames[c].locals[i].name == name {
+            if cs.frames[c].locals[i].depth == -1 {
+                fl_cerror(
+                    mut cs,
+                    c,
+                    mut vm,
+                    sp,
+                    "cannot read '{fl_cspelling(vm, name)}' in its own initializer",
+                )
+            }
+            return i
+        }
+    }
+    -1
+}
+
+fn fl_cupadd(
+    mut cs: FlCompState,
+    c: int,
+    mut vm: FlVm,
+    index: int,
+    local: bool,
+    sp: FlSpan,
+) -> int {
+    for i in 0..cs.frames[c].ups.len {
+        if cs.frames[c].ups[i].index == index && cs.frames[c].ups[i].is_local == local { return i }
+    }
+    if cs.frames[c].ups.len >= 256 {
+        fl_cerror(mut cs, c, mut vm, sp, "too many captured variables (max 256)")
+        return 0
+    }
+    (mut cs.frames[c].ups).push(FlUpDesc { index: index, is_local: local })
+    cs.frames[c].ups.len - 1
+}
+
+fn fl_cupresolve(mut cs: FlCompState, c: int, mut vm: FlVm, name: int, sp: FlSpan) -> int {
+    if c == 0 { return -1 }
+    let local = fl_cresolve(mut cs, c - 1, mut vm, name, sp)
+    if local >= 0 {
+        cs.frames[c - 1].locals[local].captured = true
+        return fl_cupadd(mut cs, c, mut vm, local, true, sp)
+    }
+    let up = fl_cupresolve(mut cs, c - 1, mut vm, name, sp)
+    if up >= 0 { return fl_cupadd(mut cs, c, mut vm, up, false, sp) }
+    -1
+}
+
+fn fl_cglobal(mut cs: FlCompState, c: int, mut vm: FlVm, name: int, sp: FlSpan) {
+    for j in 0..cs.frames[c].globals.len {
+        if cs.frames[c].globals[j] == name {
+            fl_cerror(
+                mut cs,
+                c,
+                mut vm,
+                sp,
+                "'{fl_cspelling(vm, name)}' is already declared in this module",
+            )
+            return
+        }
+    }
+    (mut cs.frames[c].globals).push(name)
+}
+
+fn fl_cbinop(tok: int) -> int {
+    match tok {
+        15 => 17,
+        16 => 18,
+        17 => 19,
+        18 => 20,
+        19 => 21,
+        21 => 24,
+        22 => 25,
+        23 => 26,
+        24 => 27,
+        25 => 28,
+        _ => 29,
+    }
+}
+
+fn fl_cmotion_node(p: FlProgram, id: int, mut ops: List[FlMotionOp]) {
+    let n = copy p.nodes[id]
+    let start = ops.len
+    (mut ops).push(FlMotionOp { kind: n.a, ch: n.b, flags: n.flags, count: n.i, arg: n.c })
+    for j in 0..n.e { fl_cmotion_node(p, p.edges[n.d + j], mut ops) }
+    if n.a == FL_MK_HIGHLIGHT { ops[start].arg = ops.len - start - 1 }
+}
+
+fn fl_cfinish(cs: FlCompState, c: int, mut vm: FlVm) -> FlValue {
+    let f = fl_gc_alloc(mut vm, 7, 96)
+    let at = fl_obj_index(vm, f)
+    for b in cs.frames[c].code { (mut vm.gc.slots[at].code).push(b) }
+    for v in cs.frames[c].consts { (mut vm.gc.slots[at].vals).push(copy v) }
+    for l in cs.frames[c].lines { (mut vm.gc.slots[at].lines).push(copy l) }
+    vm.gc.slots[at].file_id = cs.frames[c].file_id
+    vm.gc.slots[at].name_id = cs.frames[c].name_id
+    vm.gc.slots[at].arity = cs.frames[c].arity
+    vm.gc.slots[at].nup = cs.frames[c].ups.len
+    vm.gc.slots[at].max_stack = cs.frames[c].max_depth
+    vm.gc.slots[at].origin = copy cs.frames[c].origin
+    f
+}
+
+fn fl_cfunction(
+    mut cs: FlCompState,
+    c: int,
+    mut vm: FlVm,
+    p: FlProgram,
+    n: FlNode,
+    name: int,
+    macro_fn: bool,
+) {
+    let file = cs.frames[c].file_id
+    let origin = copy cs.frames[c].origin
+    var sub = fl_comp_new(file, origin)
+    sub.trace_mode = cs.frames[c].trace_mode
+    sub.name_id = name
+    sub.arity = if macro_fn then 0 else n.c
+    (mut cs.frames).push(take sub)
+    let sc = c + 1
+    fl_chidden(mut cs, sc, mut vm, n.sp)
+    if !macro_fn {
+        for i in 0..n.c {
+            fl_clocal(mut cs, sc, mut vm, p.edges[n.b + i], n.sp)
+            fl_cinit(mut cs, sc)
+        }
+    }
+    fl_cdepth(mut cs, sc, if macro_fn then 1 else n.c + 1)
+    let body = if macro_fn then n.b else n.d
+    if body >= 0 && p.nodes[body].kind == 14 {
+        fl_cstmt(mut cs, sc, mut vm, p, body)
+        fl_emit(mut cs, sc, 38, n.sp)
+    } else {
+        fl_cexpr(mut cs, sc, mut vm, p, body)
+        fl_emit(mut cs, sc, 37, n.sp)
+    }
+    if cs.frames[sc].failed {
+        cs.frames[c].failed = true
+        let _ = (mut cs.frames).pop() else fl_comp_new(file, origin)
+        return
+    }
+    let f = fl_cfinish(cs, sc, mut vm)
+    if macro_fn { vm.gc.slots[fl_obj_index(vm, f)].fnkind = 1 }
+    (mut vm.compiling).push(f)
+    let k = fl_cconst(mut cs, c, mut vm, f, n.sp)
+    fl_emit(mut cs, c, 39, n.sp)
+    fl_emit16(mut cs, c, k)
+    let nu = cs.frames[sc].ups.len
+    for j in 0..nu {
+        let up = copy cs.frames[sc].ups[j]
+        fl_emit8(mut cs, c, if up.is_local then 1 else 0)
+        fl_emit8(mut cs, c, up.index)
+    }
+    let _ = (mut cs.frames).pop() else fl_comp_new(file, origin)
+}
+
+fn fl_cexpr(mut cs: FlCompState, c: int, mut vm: FlVm, p: FlProgram, id: int) {
+    if id < 0 { fl_emit(mut cs, c, 1, FlSpan { file_id: 0, line: 0, col: 0, len: 0 }); return }
+    if cs.frames[c].failed { return }
+    let n = copy p.nodes[id]
+    match n.kind {
+        21 => { // literal
+            if n.a == 0 {
+                fl_emit(mut cs, c, 1, n.sp)
+            } else if n.a == 1 {
+                fl_emit(mut cs, c, if n.i != 0 then 2 else 3, n.sp)
+            } else if n.a == 2 && n.i >= -128 && n.i <= 127 {
+                fl_emit(mut cs, c, 4, n.sp)
+                fl_emit8(mut cs, c, n.i)
+            } else {
+                var v = fl_nil()
+                if n.a == 2 {
+                    v = fl_int(n.i)
+                } else if n.a == 3 {
+                    v = fl_float(n.f)
+                } else {
+                    // Owning copy only at this allocation boundary avoids an
+                    // overlapping mutable VM and lent identifier byte buffer.
+                    let bytes = copy vm.strings.items[n.i]
+                    v = fl_str_new(mut vm, bytes)
+                }
+                fl_emit(mut cs, c, 0, n.sp)
+                let k = fl_cconst(mut cs, c, mut vm, v, n.sp)
+                fl_emit16(mut cs, c, k)
+            }
+        },
+        20 => {
+            var slot = fl_cresolve(mut cs, c, mut vm, n.a, n.sp)
+            if slot >= 0 {
+                fl_emit(mut cs, c, 9, n.sp)
+                fl_emit8(mut cs, c, slot)
+            } else {
+                slot = fl_cupresolve(mut cs, c, mut vm, n.a, n.sp)
+                if slot >= 0 {
+                    fl_emit(mut cs, c, 11, n.sp)
+                    fl_emit8(mut cs, c, slot)
+                } else {
+                    fl_emit(mut cs, c, 14, n.sp)
+                    let k = fl_cname(mut cs, c, mut vm, n.a, n.sp)
+                    fl_emit16(mut cs, c, k)
+                }
+            }
+        },
+        15 => {
+            fl_cexpr(mut cs, c, mut vm, p, n.b)
+            if n.a == 27 || n.a == 44 {
+                let site = fl_cjump(mut cs, c, if n.a == 27 then 35 else 34, n.sp)
+                fl_emit(mut cs, c, 6, n.sp)
+                fl_cexpr(mut cs, c, mut vm, p, n.c)
+                fl_cpatch(mut cs, c, mut vm, site, n.sp)
+            } else {
+                fl_cexpr(mut cs, c, mut vm, p, n.c)
+                fl_emit(mut cs, c, fl_cbinop(n.a), n.sp)
+            }
+        },
+        16 => {
+            fl_cexpr(mut cs, c, mut vm, p, n.b)
+            fl_emit(mut cs, c, if n.a == 43 then 23 else 22, n.sp)
+        },
+        17 => {
+            fl_cexpr(mut cs, c, mut vm, p, n.a)
+            for j in 0..n.c { fl_cexpr(mut cs, c, mut vm, p, p.edges[n.b + j]) }
+            if n.c > 255 {
+                fl_cerror(mut cs, c, mut vm, n.sp, "too many call arguments (max 255)")
+                return
+            }
+            fl_emit(mut cs, c, 36, n.sp)
+            fl_emit8(mut cs, c, n.c)
+            fl_cdepth(mut cs, c, -n.c)
+        },
+        18 => {
+            fl_cexpr(mut cs, c, mut vm, p, n.a)
+            fl_cexpr(mut cs, c, mut vm, p, n.b)
+            fl_emit(mut cs, c, 42, n.sp)
+        },
+        19 => {
+            fl_cexpr(mut cs, c, mut vm, p, n.a)
+            fl_emit(mut cs, c, 44, n.sp)
+            let k = fl_cname(mut cs, c, mut vm, n.b, n.sp)
+            fl_emit16(mut cs, c, k)
+        },
+        22 => {
+            for j in 0..n.b { fl_cexpr(mut cs, c, mut vm, p, p.edges[n.a + j]) }
+            fl_emit(mut cs, c, 40, n.sp)
+            fl_emit16(mut cs, c, n.b)
+            fl_cdepth(mut cs, c, -n.b + 1)
+        },
+        23 => {
+            for j in 0..n.c {
+                fl_cexpr(mut cs, c, mut vm, p, p.edges[n.a + j])
+                fl_cexpr(mut cs, c, mut vm, p, p.edges[n.b + j])
+            }
+            fl_emit(mut cs, c, 41, n.sp)
+            fl_emit16(mut cs, c, n.c)
+            fl_cdepth(mut cs, c, -n.c * 2 + 1)
+        },
+        24 => fl_cfunction(mut cs, c, mut vm, p, n, 0, false),
+        25 => {
+            let motion = fl_gc_alloc(mut vm, 10, 32)
+            let mi = fl_obj_index(vm, motion)
+            // Headless C accepts arbitrary command words; editor validation is
+            // an attached-host operation and remains yw09's named boundary.
+            for j in 0..n.b { fl_cmotion_node(p, p.edges[n.a + j], mut vm.gc.slots[mi].ops) }
+            fl_emit(mut cs, c, 49, n.sp)
+            let k = fl_cconst(mut cs, c, mut vm, motion, n.sp)
+            fl_emit16(mut cs, c, k)
+        },
+        _ => {
+            fl_cerror(mut cs, c, mut vm, n.sp, "this expression is not compilable yet")
+            fl_emit(mut cs, c, 1, n.sp)
+        },
+    }
+}
+
+fn fl_cstmt(mut cs: FlCompState, c: int, mut vm: FlVm, p: FlProgram, id: int) {
+    if id < 0 || cs.frames[c].failed { return }
+    let n = copy p.nodes[id]
+    if cs.frames[c].trace_mode == 2 && n.kind != 14 {
+        fl_emit(mut cs, c, 59, n.sp)
+        fl_emit16(mut cs, c, if n.sp.line > 65535 then 65535 else n.sp.line)
+    }
+    let top = c == 0 && cs.frames[c].scope_depth == 0
+    match n.kind {
+        0 => { // let
+            if top {
+                let k = fl_cname(mut cs, c, mut vm, n.a, n.sp)
+                fl_cglobal(mut cs, c, mut vm, n.a, n.sp)
+                if n.b >= 0 {
+                    fl_cexpr(mut cs, c, mut vm, p, n.b)
+                } else {
+                    fl_emit(mut cs, c, 1, n.sp)
+                }
+                fl_emit(mut cs, c, 16, n.sp)
+                fl_emit16(mut cs, c, k)
+            } else {
+                fl_clocal(mut cs, c, mut vm, n.a, n.sp)
+                if n.b >= 0 {
+                    fl_cexpr(mut cs, c, mut vm, p, n.b)
+                } else {
+                    fl_emit(mut cs, c, 1, n.sp)
+                }
+                fl_cinit(mut cs, c)
+            }
+        },
+        1 => {
+            let tgt = copy p.nodes[n.a]
+            if tgt.kind == 20 {
+                var slot = fl_cresolve(mut cs, c, mut vm, tgt.a, tgt.sp)
+                fl_cexpr(mut cs, c, mut vm, p, n.b)
+                if slot >= 0 {
+                    fl_emit(mut cs, c, 10, tgt.sp)
+                    fl_emit8(mut cs, c, slot)
+                } else {
+                    slot = fl_cupresolve(mut cs, c, mut vm, tgt.a, tgt.sp)
+                    if slot >= 0 {
+                        fl_emit(mut cs, c, 12, tgt.sp)
+                        fl_emit8(mut cs, c, slot)
+                    } else {
+                        fl_emit(mut cs, c, 15, tgt.sp)
+                        let k = fl_cname(mut cs, c, mut vm, tgt.a, tgt.sp)
+                        fl_emit16(mut cs, c, k)
+                    }
+                }
+            } else {
+                fl_cexpr(mut cs, c, mut vm, p, tgt.a)
+                if tgt.kind == 18 { fl_cexpr(mut cs, c, mut vm, p, tgt.b) }
+                fl_cexpr(mut cs, c, mut vm, p, n.b)
+                if tgt.kind == 18 {
+                    fl_emit(mut cs, c, 43, tgt.sp)
+                } else {
+                    fl_emit(mut cs, c, 45, tgt.sp)
+                    let k = fl_cname(mut cs, c, mut vm, tgt.b, tgt.sp)
+                    fl_emit16(mut cs, c, k)
+                }
+            }
+        },
+        2 | 3 => {
+            if top {
+                fl_cglobal(mut cs, c, mut vm, n.a, n.sp)
+            } else {
+                fl_clocal(mut cs, c, mut vm, n.a, n.sp)
+                fl_cinit(mut cs, c)
+            }
+            fl_cfunction(mut cs, c, mut vm, p, n, n.a, n.kind == 3)
+            if top && !cs.frames[c].failed {
+                fl_emit(mut cs, c, 16, n.sp)
+                let k = fl_cname(mut cs, c, mut vm, n.a, n.sp)
+                fl_emit16(mut cs, c, k)
+            }
+        },
+        4 => {
+            let what = if n.flags != 0 then n.a else n.b
+            fl_emit(mut cs, c, 50, n.sp)
+            let k = fl_cname(mut cs, c, mut vm, what, n.sp)
+            fl_emit16(mut cs, c, k)
+            fl_emit8(mut cs, c, if n.flags != 0 then 1 else 0)
+            if top {
+                let nk = fl_cname(mut cs, c, mut vm, n.b, n.sp)
+                fl_cglobal(mut cs, c, mut vm, n.b, n.sp)
+                fl_emit(mut cs, c, 16, n.sp)
+                fl_emit16(mut cs, c, nk)
+            } else {
+                fl_clocal(mut cs, c, mut vm, n.b, n.sp)
+                fl_cinit(mut cs, c)
+            }
+        },
+        5 => {
+            fl_cexpr(mut cs, c, mut vm, p, n.a)
+            let e = fl_cjump(mut cs, c, 32, n.sp)
+            fl_cstmt(mut cs, c, mut vm, p, n.b)
+            let end = fl_cjump(mut cs, c, 30, n.sp)
+            fl_cpatch(mut cs, c, mut vm, e, n.sp)
+            if n.c >= 0 { fl_cstmt(mut cs, c, mut vm, p, n.c) }
+            fl_cpatch(mut cs, c, mut vm, end, n.sp)
+        },
+        6 | 7 => fl_cloop(mut cs, c, mut vm, p, n),
+        8 => {
+            if n.a >= 0 {
+                fl_cexpr(mut cs, c, mut vm, p, n.a)
+                fl_emit(mut cs, c, 37, n.sp)
+            } else {
+                fl_emit(mut cs, c, 38, n.sp)
+            }
+        },
+        9 | 10 => {
+            let nl = cs.frames[c].loops.len
+            if nl == 0 {
+                fl_cerror(
+                    mut cs,
+                    c,
+                    mut vm,
+                    n.sp,
+                    if n.kind == 9 then "'break' outside a loop" else "'continue' outside a loop",
+                )
+                return
+            }
+            let li = nl - 1
+            let nt = cs.frames[c].ntry
+            let depth = cs.frames[c].loops[li].try_depth
+            for _ in depth..nt { fl_emit(mut cs, c, 55, n.sp) }
+            let floor = cs.frames[c].loops[li].floor
+            fl_cclose(mut cs, c, floor, n.sp)
+            let site = fl_cjump(mut cs, c, 30, n.sp)
+            if n.kind == 9 {
+                if cs.frames[c].loops[li].breaks.len < 64 {
+                    (mut cs.frames[c].loops[li].breaks).push(site)
+                }
+            } else if cs.frames[c].loops[li].conts.len < 64 {
+                (mut cs.frames[c].loops[li].conts).push(site)
+            }
+        },
+        11 => {
+            fl_emit(mut cs, c, 51, n.sp)
+            fl_cstmt(mut cs, c, mut vm, p, n.a)
+            fl_emit(mut cs, c, 52, n.sp)
+        },
+        12 => {
+            let site = fl_cjump(mut cs, c, 54, n.sp)
+            cs.frames[c].ntry += 1
+            fl_cstmt(mut cs, c, mut vm, p, n.a)
+            fl_emit(mut cs, c, 55, n.sp)
+            cs.frames[c].ntry -= 1
+            let end = fl_cjump(mut cs, c, 30, n.sp)
+            fl_cpatch(mut cs, c, mut vm, site, n.sp)
+            cs.frames[c].scope_depth += 1
+            fl_clocal(mut cs, c, mut vm, n.c, n.sp)
+            fl_cinit(mut cs, c)
+            fl_cdepth(mut cs, c, 1)
+            fl_cstmt(mut cs, c, mut vm, p, n.b)
+            fl_cend(mut cs, c, n.sp)
+            fl_cpatch(mut cs, c, mut vm, end, n.sp)
+        },
+        13 => { fl_cexpr(mut cs, c, mut vm, p, n.a); fl_emit(mut cs, c, 6, n.sp) },
+        14 => {
+            cs.frames[c].scope_depth += 1
+            var i: int = 0
+            while i < n.b {
+                var run: int = 0
+                while i + run < n.b {
+                    let st = copy p.nodes[p.edges[n.a + i + run]]
+                    if st.kind != 0 || st.b >= 0 { break }
+                    run += 1
+                }
+                if run >= 2 && run <= 255 && cs.frames[c].trace_mode != 2 {
+                    let first = copy p.nodes[p.edges[n.a + i]]
+                    for j in 0..run {
+                        let st = copy p.nodes[p.edges[n.a + i + j]]
+                        fl_clocal(mut cs, c, mut vm, st.a, st.sp)
+                        fl_cinit(mut cs, c)
+                    }
+                    fl_emit(mut cs, c, 5, first.sp)
+                    fl_emit8(mut cs, c, run)
+                    fl_cdepth(mut cs, c, run)
+                    i += run
+                } else {
+                    fl_cstmt(mut cs, c, mut vm, p, p.edges[n.a + i])
+                    i += 1
+                }
+            }
+            fl_cend(mut cs, c, n.sp)
+        },
+        _ => { fl_cexpr(mut cs, c, mut vm, p, id); fl_emit(mut cs, c, 6, n.sp) },
+    }
+}
+
+fn fl_cloop(mut cs: FlCompState, c: int, mut vm: FlVm, p: FlProgram, n: FlNode) {
+    if cs.frames[c].loops.len >= 64 {
+        fl_cerror(mut cs, c, mut vm, n.sp, "loops nested too deeply")
+        return
+    }
+    let is_for = n.kind == 7
+    let two = n.b != 0
+    if is_for {
+        cs.frames[c].scope_depth += 1
+        fl_cexpr(mut cs, c, mut vm, p, n.c)
+        fl_emit(mut cs, c, 46, n.sp)
+        for _ in 0..3 { fl_chidden(mut cs, c, mut vm, n.sp) }
+    }
+    let start = cs.frames[c].code.len
+    let floor = cs.frames[c].locals.len
+    let depth = cs.frames[c].ntry
+    let li = cs.frames[c].loops.len
+    (mut cs.frames[c].loops).push(FlCompLoop {
+        start: start,
+        breaks: List[int](),
+        conts: List[int](),
+        floor: floor,
+        try_depth: depth,
+    })
+    var site: int = 0
+    if is_for {
+        fl_emit(mut cs, c, if two then 48 else 47, n.sp)
+        fl_emit8(mut cs, c, floor - 3)
+        site = cs.frames[c].code.len
+        fl_emit16(mut cs, c, 65535)
+        // The pinned C adds this on top of the table effect; preserve its
+        // conservative max_stack rather than silently "fixing" the oracle.
+        fl_cdepth(mut cs, c, if two then 2 else 1)
+        cs.frames[c].scope_depth += 1
+        fl_clocal(mut cs, c, mut vm, n.a, n.sp)
+        fl_cinit(mut cs, c)
+        if two { fl_clocal(mut cs, c, mut vm, n.b, n.sp); fl_cinit(mut cs, c) }
+        fl_cstmt(mut cs, c, mut vm, p, n.d)
+        fl_cend(mut cs, c, n.sp)
+    } else {
+        fl_cexpr(mut cs, c, mut vm, p, n.a)
+        site = fl_cjump(mut cs, c, 32, n.sp)
+        fl_cstmt(mut cs, c, mut vm, p, n.b)
+    }
+    let nc = cs.frames[c].loops[li].conts.len
+    for j in 0..nc {
+        let s = cs.frames[c].loops[li].conts[j]
+        fl_cpatch(mut cs, c, mut vm, s, n.sp)
+    }
+    fl_cback(mut cs, c, mut vm, start, n.sp)
+    fl_cpatch(mut cs, c, mut vm, site, n.sp)
+    let nb = cs.frames[c].loops[li].breaks.len
+    for j in 0..nb {
+        let s = cs.frames[c].loops[li].breaks[j]
+        fl_cpatch(mut cs, c, mut vm, s, n.sp)
+    }
+    let _ = (mut cs.frames[c].loops).pop() else FlCompLoop {
+        start: 0,
+        breaks: List[int](),
+        conts: List[int](),
+        floor: 0,
+        try_depth: 0,
+    }
+    if is_for { fl_cend(mut cs, c, n.sp) }
+}
+
+/// Compile a clean parsed script; none means a diagnostic was appended to vm.dc.
+pub fn fl_compile(mut vm: FlVm, p: FlProgram, file_id: int, origin: FlOrigin) -> FlValue ! {none} {
+    fl_compile_entry(mut vm, p, file_id, origin, false, 0)?
+}
+
+/// Compile the expression-returning entry used by CLI -e (interactive REPL is yw08).
+pub fn fl_compile_repl(mut vm: FlVm, p: FlProgram, file_id: int, origin: FlOrigin) -> FlValue ! {
+    none,
+} {
+    fl_compile_entry(mut vm, p, file_id, origin, true, 0)?
+}
+
+fn fl_compile_entry(
+    mut vm: FlVm,
+    p: FlProgram,
+    file_id: int,
+    origin: FlOrigin,
+    repl: bool,
+    trace_mode: int,
+) -> FlValue ! {none} {
+    if p.had_error || p.incomplete { return none }
+    let root_base = vm.compiling.len
+    var cs = FlCompState { frames: List[FlCompiler]() }
+    (mut cs.frames).push(fl_comp_new(file_id, origin))
+    cs.frames[0].trace_mode = trace_mode
+    var end = FlSpan { file_id: file_id, line: 0, col: 0, len: 0 }
+    fl_chidden(mut cs, 0, mut vm, end)
+    fl_cdepth(mut cs, 0, 1)
+    for j in 0..p.stmts.len {
+        let n = copy p.nodes[p.stmts[j]]
+        if trace_mode == 1 {
+            fl_emit(mut cs, 0, 59, n.sp)
+            fl_emit16(mut cs, 0, if n.sp.line > 65535 then 65535 else n.sp.line)
+        }
+        if repl && j + 1 == p.stmts.len && n.kind == 13 {
+            fl_cexpr(mut cs, 0, mut vm, p, n.a)
+            fl_emit(mut cs, 0, 37, n.sp)
+            break
+        }
+        fl_cstmt(mut cs, 0, mut vm, p, p.stmts[j])
+    }
+    if p.stmts.len != 0 {
+        end = copy p.nodes[p.stmts[p.stmts.len - 1]].sp
+    } else {
+        end.line = 1
+        end.col = 1
+    }
+    fl_emit(mut cs, 0, 56, end)
+    while vm.compiling.len > root_base { let _ = (mut vm.compiling).pop() else fl_nil() }
+    if cs.frames[0].failed { return none }
+    let f = fl_cfinish(cs, 0, mut vm)
+    vm.gc.slots[fl_obj_index(vm, f)].fnkind = if repl then 4 else 3
+    f
+}
+
+/// Compile explicit top-level profile markers; ordinary compilation emits none.
+pub fn fl_compile_profiled(
+    mut vm: FlVm,
+    p: FlProgram,
+    file_id: int,
+    origin: FlOrigin,
+) -> FlValue ! {none} {
+    fl_compile_entry(mut vm, p, file_id, origin, false, 1)?
+}
+
+/// Compile statement coverage markers, including nested function bodies.
+pub fn fl_compile_covered(mut vm: FlVm, p: FlProgram, file_id: int, origin: FlOrigin) -> FlValue ! {
+    none,
+} {
+    fl_compile_entry(mut vm, p, file_id, origin, false, 2)?
+}
