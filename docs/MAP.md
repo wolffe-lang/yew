@@ -583,6 +583,41 @@ maintainer.
   an empty string at once, named in `src/fl/stdstr.lu` (recommended: C's
   answer is a process abort or a hang, which no golden reaches); (B) a
   STOP until C is fixed.
+- **R-yw07b-9 — the Fletch VM's release MISS rows, asked (recommend A).**
+  `tools/run-perf-fletch --release` at the tree of `3bb5f11` (kasumi CPUs
+  8–11, C's `perf_fletch` rows from the same run) puts 11 of 13 rows over
+  the 2× bar: fib24 4.18, map10k 3.28, motion100k 2.24, startup 3.84,
+  motion_dispatch 2.39, fib27 4.29, map_heavy 5.34, strbuild_join 3.96,
+  strbuild_concat 3.92, join5k 3.37 and list_sort 4.19. `parse_only` meets
+  it at 1.30. `startup` (0.19 ms) and `motion_dispatch` (490 ns/op) hold
+  their absolute budgets of 2 ms and 1 µs.
+  - Everything else the lane owes is green: the 39 conformance units
+    (normal, stressed and twice), the 198 cases, and the dumps, traces and
+    fuzzers equal to C.
+  - The toy VM ran fib24 / map10k / motion100k at 1.05 / 0.73 / 0.46 with
+    the same 24 B value and compacting heap. That reads as the full VM's
+    per-instruction work, not the value or heap shape. It is a reading
+    from timers, not a profile.
+  - Core's rejected controls and PGO's 6–8% are recorded (`f86f727`,
+    `1c314dd`, `303162f`).
+
+  The options:
+  - (A) merge yw07b with the rows named MISS in a yew issue, and ratchet
+    them in yw08 under R-yw08-3 (A): profile by function with counts only,
+    keep what moves a row, and file a wolf-lang codegen issue with a
+    reduced witness for each row that stays over. The 2× bar stays and no
+    row is waived. Recommended: yw08's deliverable 6 owns the gate, the
+    rows share one cause that a function profile can split, and holding
+    the merge keeps 39/39 conformance off trunk without making the
+    measurement any closer.
+  - (B) hold yw07b until every release row meets 2×, which is track rule
+    4 read strictly.
+  - (C) rebaseline the bar for Fletch. Only the maintainer can choose this
+    one; it is not recommended.
+
+  Native stays R-yw07b-1's named backend MISS whatever the ruling: 60–194×
+  on every row, and `motion_dispatch` native at 15.9 µs/op also misses its
+  absolute budget.
 - **The 17 value tags: an erratum to the adopted contract.** Deliverable
   4 says "the 15 tags" (`s30:47-98`). The pinned `value.h` declares 17,
   `FL_NIL` to `FL_REGEX` with `FL_MOTION_PROG` and `FL_UPVAL` separate,
@@ -720,8 +755,11 @@ One paragraph each; yw01's is drafted in full
   (`tools/check-fl-cases`), the 39 units by name, stressed and twice
   (`tools/check-fletch-goldens`), the dump differentials
   (`tools/check-fl-dump`), `tools/smoke-fl`, and the three fuzzers against
-  C's drivers. The perf rows are recorded beside C's on kasumi; every row
-  above 2× is a named MISS (`notes/yw07b-fletch-core.md`).
+  C's drivers, and the executed-opcode traces (`tools/check-fl-trace`).
+  The perf rows are recorded beside C's on kasumi (`tools/run-perf-fletch`).
+  Every row above 2× is a named MISS (R-yw07b-9;
+  `notes/yw07b-fletch-core.md`). The GC-stress run's wolf/C ratio is
+  1.807.
 - **yw08 — the prompt, the bug report, the ledger and the perf gates**
   (s32 §2–§5 and §8–§9, s33 §3–§6; `src/fl/` repl, vmcheck; `flcli`'s
   prompt and `--selftest-fl-bug`). **Drafted in full by yw07b**
