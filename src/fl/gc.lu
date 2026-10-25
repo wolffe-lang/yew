@@ -2,6 +2,8 @@
 //! R1 A: paired fixed physical slots, retaining all per-slot payload buffers.
 //! Compact only at VM instruction boundaries. C's LP64 charges are separate
 //! from wolf storage; gc.c:451-455 recomputes HEADERS ONLY after a sweep.
+//! R10 root providers: VM-owned context IDs and one kind match, never stored
+//! external pointers/borrows or a second mutable-callback representation.
 
 /// Paired heap slots, weak strings, and C-compatible scheduling counters.
 pub struct FlGc {
@@ -293,6 +295,7 @@ fn fl_mark_roots(mut vm: FlVm) {
     for i in 0..vm.host_roots.len { let v = copy vm.host_roots[i]; fl_mark(mut vm, v) }
     for i in 0..vm.temp.len { let v = copy vm.temp[i]; fl_mark(mut vm, v) }
     for i in 0..vm.compiling.len { let v = copy vm.compiling[i]; fl_mark(mut vm, v) }
+    fl_gc_visit_providers(mut vm, false)
 }
 
 fn fl_blacken(mut vm: FlVm, at: int) {
@@ -394,6 +397,7 @@ fn fl_remap_roots(mut vm: FlVm) {
     for i in 0..vm.host_roots.len { vm.host_roots[i] = fl_remap(vm, vm.host_roots[i]) }
     for i in 0..vm.temp.len { vm.temp[i] = fl_remap(vm, vm.temp[i]) }
     for i in 0..vm.compiling.len { vm.compiling[i] = fl_remap(vm, vm.compiling[i]) }
+    fl_gc_visit_providers(mut vm, true)
 }
 
 /// Mark, compact, remap every root, then poison and reset the old half.
@@ -474,4 +478,86 @@ pub fn fl_native_new(
     vm.gc.slots[at].max_ar = max_ar
     vm.gc.slots[at].caps = caps
     v
+}
+
+/// Stable VM-owned context for the headless (kind 0) root provider.
+/// Only registered providers root these values; removed contexts are not roots.
+pub struct FlGcContext { values: List[FlValue], calls: int }
+
+/// Mutable root callback representation fixed by R10.
+pub struct FlGcProvider { kind: int, context_id: int }
+
+/// Create an empty host-owned root slot and return its stable index.
+/// Values must be re-read from this slot after any collection.
+pub fn fl_gc_host_root_add(mut vm: FlVm, value: FlValue) -> int {
+    let slot = vm.host_roots.len
+    while vm.host_roots_live.len < slot { (mut vm.host_roots_live).push(false) }
+    (mut vm.host_roots).push(copy value)
+    (mut vm.host_roots_live).push(true)
+    slot
+}
+
+/// Read a registered host slot; invalid or removed slots trap.
+pub fn fl_gc_host_root_get(vm: FlVm, slot: int) -> FlValue {
+    assert(slot >= 0 && slot < vm.host_roots_live.len && vm.host_roots_live[slot])
+    copy vm.host_roots[slot]
+}
+
+/// Replace what a registered host slot roots; invalid or removed slots trap.
+pub fn fl_gc_host_root_set(mut vm: FlVm, slot: int, value: FlValue) {
+    assert(slot >= 0 && slot < vm.host_roots_live.len && vm.host_roots_live[slot])
+    vm.host_roots[slot] = copy value
+}
+
+/// Unregister a host slot; absent/already removed slots are a no-op.
+pub fn fl_gc_host_root_remove(mut vm: FlVm, slot: int) {
+    if slot < 0 || slot >= vm.host_roots_live.len || !vm.host_roots_live[slot] { return }
+    vm.host_roots[slot] = fl_nil()
+    vm.host_roots_live[slot] = false
+}
+
+/// Allocate a VM-owned headless provider context, initially unregistered.
+pub fn fl_gc_provider_context(mut vm: FlVm) -> int {
+    let id = vm.provider_contexts.len
+    (mut vm.provider_contexts).push(FlGcContext { values: List[FlValue](), calls: 0 })
+    id
+}
+
+/// Register a (kind,context) pair once; invalid contexts/kinds or ninth row trap.
+pub fn fl_gc_root_provider(mut vm: FlVm, kind: int, context_id: int) {
+    assert(kind == 0 && context_id >= 0 && context_id < vm.provider_contexts.len)
+    for p in vm.providers { if p.kind == kind && p.context_id == context_id { return } }
+    assert(vm.providers.len < 8)
+    (mut vm.providers).push(FlGcProvider { kind: kind, context_id: context_id })
+}
+
+/// Unregister a provider, preserving the remaining order; absence is a no-op.
+pub fn fl_gc_root_provider_remove(mut vm: FlVm, kind: int, context_id: int) {
+    for i in 0..vm.providers.len {
+        if vm.providers[i].kind != kind || vm.providers[i].context_id != context_id { continue }
+        for j in i..vm.providers.len - 1 { vm.providers[j] = copy vm.providers[j + 1] }
+        let _ = (mut vm.providers).pop() else FlGcProvider { kind: -1, context_id: -1 }
+        return
+    }
+}
+
+fn fl_gc_visit_providers(mut vm: FlVm, remap: bool) {
+    for i in 0..vm.providers.len {
+        let p = copy vm.providers[i]
+        match p.kind {
+            0 => { // headless provider; yw09 adds host kinds to this match.
+                let id = p.context_id
+                if !remap { vm.provider_contexts[id].calls += 1 }
+                for j in 0..vm.provider_contexts[id].values.len {
+                    let value = copy vm.provider_contexts[id].values[j]
+                    if remap {
+                        vm.provider_contexts[id].values[j] = fl_remap(vm, value)
+                    } else {
+                        fl_mark(mut vm, value)
+                    }
+                }
+            },
+            _ => assert(false),
+        }
+    }
 }
