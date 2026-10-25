@@ -229,6 +229,9 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G50 | **A List owned outside `region scratch`, then `reserve()`d inside it, can take a region buffer that escapes its lifetime.** The checked machine passes; native and release terminate with SIGSEGV (139). | yw07 (reusable menu rows) | avoid the pop/refill/push pool idiom; retain fixed physical slots and refill directly, with a separate live prefix. The no-region and direct-in-place witness controls pass all three tiers. | `notes/yw07-evidence/reuse-row-move/main.lu`, `plain/`, `inplace/`, `run.log` (wolf 0.2.35) | **wolf-lang#919** (region-escape buffer ownership) |
 
 
+| G51 | **The public std float conversion/bit APIs canonicalize NaN sign and payload**, while C's conversion sites preserve a negative NaN spelling (`-nan`, `-nan.0`) and `strtod("nan(123)")`'s payload on Linux. | yw07b, R-yw07-4 | OPEN, not accepted: finite/inf/negative-zero conversions matched the generated Linux corpus; NaN identity/spellings did not. Host-C agreement is a separate pending CI gate; stop if it differs. | `notes/yw07b-evidence/floats/linux-comparison.json`: 110963 bit inputs, 221904 parses, 4771387 answer lines; signed/payload NaN witness in `probe/main.lu`; `src/fl/float.lu` names the limitation. | wolf-std / wolf-lang (preserving binary64 bit conversion; issue to be filed by the orchestrator after the host witness) |
+
+
 ### yw07 retirement cut
 
 The pin is wolf 0.2.35 / lupin 0.1.56. This lane ends at deliverable 1;
