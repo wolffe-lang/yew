@@ -230,6 +230,9 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 
 
 | G51 | **The public std float conversion/bit APIs canonicalize NaN sign and payload**, while C's conversion sites preserve a negative NaN spelling (`-nan`, `-nan.0`) and `strtod("nan(123)")`'s payload on Linux. | yw07b, R-yw07-4 | OPEN, not accepted: finite/inf/negative-zero conversions matched the generated Linux corpus; NaN identity/spellings did not. Host-C agreement is a separate pending CI gate; stop if it differs. | `notes/yw07b-evidence/floats/linux-comparison.json`: 110963 bit inputs, 221904 parses, 4771387 answer lines; signed/payload NaN witness in `probe/main.lu`; `src/fl/float.lu` names the limitation. | **wolf-std#103** (preserving binary64 bit conversion; host-C agreement remains an independent gate) |
+| G52 | **A copied lent `str.bytes()` view stored into an owned struct field**: `(mut files).push(File { src: copy src })` with `src` the lent `"abc".bytes()` builds and exits 0 on the checked machine; native and release refuse it (exit 4, "a lent bytes() view in a value position" at the `copy`). | yw07b (the diagnostic context's file table, `fl.diag`) | build the owned value once at its boundary (`reserve` + `push` of each byte) where the file is registered; named in `src/fl/diag.lu` | `notes/yw07b-evidence/front/lent-bytes/` (`main.lu`, `run.log`, `checked.json`) | **wolf-lang#942** (a tier disagreement: an explicit `copy` should materialise the view on every tier) |
+| G53 | **The checked machine's retained-byte ledger grows on `List.reset()` + push** where native and release reuse the storage: 8 scalar pushes, then 100 × (`reset` + 8 pushes), reads 128 → 12,928 bytes checked and 240 → 240 native. | yw07b (the GC's fixed slots, whose payloads are `reset` and refilled) | no workaround in source; the residency gate is native/release (`region_bytes` and RSS flat), and a checked-machine ledger reading is never quoted as residency | `notes/yw07b-evidence/core/reset-ledger/` (`main.lu`, `checked.log`, `native.log`) | **wolf-lang#943** (checked-machine accounting, or compiled tiers reusing storage the model calls retained: a tier disagreement) |
+| G54 | **A tier disagreement on a region-built large value rooted into the VM**: one `region` builds a 100,000-byte Fletch string and a 64-element list, roots them in the VM's stack, and reads and collects after the region. checked exit 0; native exit 139; release exit 139. The 1,024-byte control exits 0 on all three tiers. | yw07b (a native's caller-owned temporaries) | none: no scratch `region` wraps a native's allocation until the issue is answered, and caller-owned native temporaries stay allocation-pending with no boundedness claim. Only the witness program and its exit status per tier are recorded. | `notes/yw07b-evidence/stdlib/scratch-once/` (exit 0 / 139 / 139), `scratch-small/` (0 / 0 / 0), `scratch-escape/` (20 rounds: checked step budget, native 139, release 139); each `main.lu` + `run.log` | **wolf-lang#948** (native and release exit 139 where checked exits 0) |
 
 
 **yw07b float-host rulings (R-yw07b-2 and R-yw07b-3, coordinator under
@@ -500,6 +503,42 @@ maintainer.
   by port speed. C's harness is unchanged.
   A bounded same-bits original-path/copy-path comparison is also approved,
   five observations per path, interleaved. The 2× limit is not relaxed.
+
+- **R-yw07b-1 — the GC's sweep after the toy VM, decided A** (the
+  orchestrator under ruling #118, 2026-10-25; subject to override). The
+  toy VM (`notes/yw07-evidence/toyvm/`, never linked into `yew`) held
+  memory flat over 100,000 collections (ledger 482,976 bytes at
+  collection 1,000 and at 100,000; RSS 2,785,280 → 2,789,376), collected
+  the unrooted cycle, kept each of the eight roots, and trapped the
+  planted stale index under stress in both sweeps (exit 134). Release
+  ratios against C's `fl_smoke --perf` from the same run, compacting:
+  fib24 1.05, map10k 0.73, motion100k 0.46. The native tier misses
+  (8.07, 3.95, 2.79): a named backend MISS, never a waiver. G6's shape
+  (b) is refused by E1006 (`toyvm/shared-cycle/`). R3's compacting
+  sweep stands; the real VM's own ratios are deliverable 4's rows.
+  Evidence: `notes/yw07b-evidence/toyvm/`.
+
+- **R-yw07b-4 — DIV on a non-numeric operand, provisional** (the
+  orchestrator under ruling #118, 2026-10-25; the defect is put to the
+  maintainer, who may override). sagitta `vm.c:793-807` reads the
+  operands' union as doubles without checking the tags, so `"a" / 2`
+  divides pointer bits: the two-process C witness prints different
+  values (`notes/yw07b-evidence/core/div-c-1.txt`, `div-c-2.txt`). An
+  answer that changes between processes cannot be ported byte for byte.
+  The port raises `cannot apply '/' to <left type> and <right type>`
+  (kind `type`), the wording of the VM's other arithmetic refusals
+  (`src/fl/vm.lu:246`). This is ONE named oracle-defect exception, and
+  every other arithmetic answer is C's. A golden, unit case or
+  conformance unit that reaches it is a STOP with its diff (the 39 units'
+  run re-derives it, deliverable 7).
+
+- **The 17 value tags: an erratum to the adopted contract.** Deliverable
+  4 says "the 15 tags" (`s30:47-98`). The pinned `value.h` declares 17,
+  `FL_NIL` to `FL_REGEX` with `FL_MOTION_PROG` and `FL_UPVAL` separate,
+  and `FL_TYPE_COUNT` = 17. The pin wins over the sprint text (the
+  contract's own rule: "the C at the pin, not the sprint text"), so
+  `src/fl/value.lu` carries 17 discriminants and `fl_type_name` C's 17
+  names. The contract text stands as drafted, with this erratum.
 
 ## 7. The next contracts
 

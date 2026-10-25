@@ -1,0 +1,314 @@
+//! fl.module — `import`, sagitta 9ace98c2 src/fl/module.h:1-94 and
+//! module.c:1-666 (spec §11's four rows, `fletch-spec.md:452-461`).
+//! The cache key is (realpath, origin kind, principal), never the path
+//! alone (module.h:4-27); a body runs against its own fresh globals and
+//! its exports are the non-underscore names re-keyed by string and frozen.
+//! The quoted path is used verbatim: no extension, no `~`, no cwd.
+//! fl_module_eval_path/load_path/eval_source and drop_principal are the
+//! macro library's and the plugins' (yw09, yw14) and have no caller here.
+//! C's default build embeds no runtime (EMBED_RUNTIME=0), so
+//! yew_runtime_asset_resolve answers NULL there and the import rows read
+//! files only; the port does the same (edit.runtime's embedded copies are
+//! the editor's startup fallback, not an import row).
+
+use util
+
+/// module.h:31: the three states of a cached module.
+pub const FL_MOD_LOADING: int = 0
+
+/// A module whose body completed; its exports are in vm.modules.
+pub const FL_MOD_READY: int = 1
+
+/// module.h:35-37: how deep imports may nest (the temp-root stack is 32).
+pub const FL_MOD_MAX_DEPTH: int = 16
+
+/// One cached module (module.h:39-45). The exports map lives in
+/// vm.modules under the row's index, the collector's root, never here.
+pub struct FlModule { path_id: int, origin: FlOrigin, state: int, importer: int }
+
+/// C's YEW_RUNTIME_DIR_DEFAULT for PREFIX=/usr/local (runtime_asset.c:254-268).
+pub const FL_RUNTIME_PREFIX: str = "/usr/local/share/yew/runtime"
+
+const FL_MOD_MAX_BYTES: int = 8388608
+
+fn mod_find(vm: FlVm, path_id: int, kind: int, principal_id: int) -> int {
+    for i in 0..vm.mods.len {
+        let m = copy vm.mods[i]
+        if m.path_id == path_id && m.origin.kind == kind && m.origin.principal_id == principal_id {
+            return i
+        }
+    }
+    -1
+}
+
+fn mod_add(mut vm: FlVm, path_id: int, origin: FlOrigin, importer: int) -> int {
+    (mut vm.mods).push(FlModule { path_id: path_id, origin: origin, state: FL_MOD_LOADING, importer: importer })
+    vm.mods.len - 1
+}
+
+fn mod_fn_origin(vm: FlVm, frame: int) -> FlOrigin {
+    let cl = fl_obj_index(vm, vm.frames[frame].cl)
+    let fun = fl_obj_index(vm, vm.gc.slots[cl].fn_value)
+    copy vm.gc.slots[fun].origin
+}
+
+/// module.c:126-143: the module whose body the innermost non-builtin frame
+/// is executing, or -1 at the top level.
+fn mod_current(vm: FlVm) -> int {
+    var i = vm.frames.len
+    while i > 0 {
+        i -= 1
+        let o = mod_fn_origin(vm, i)
+        if o.kind == FL_ORIGIN_BUILTIN || o.path_id == 0 { continue }
+        let k = mod_find(vm, o.path_id, o.kind, o.principal_id)
+        if k != -1 { return k }
+    }
+    -1
+}
+
+/// spec §13's defining-module origin (origin.c:211-227): builtin frames are
+/// transparent; a native the host called reads the root origin.
+pub fn fl_cap_origin(vm: FlVm) -> FlOrigin {
+    var i = vm.frames.len
+    while i > 0 {
+        i -= 1
+        let o = mod_fn_origin(vm, i)
+        if o.kind != FL_ORIGIN_BUILTIN { return o }
+    }
+    copy vm.root_origin
+}
+
+/// origin.c:241-260: the origin's path when it has one, else its kind.
+pub fn fl_origin_name(vm: FlVm, o: FlOrigin) -> List[byte] {
+    if o.path_id > 0 && o.path_id < vm.strings.items.len { return copy vm.strings.items[o.path_id] }
+    var out = List[byte]()
+    util.buf_append_str(mut out, fl_origin_kind_name(o.kind))
+    out
+}
+
+/// origin.c:262-275: true when the calling module holds `need`, else the
+/// capability raise. Plugins' grant registry is yw14's (YEW_WITH_PLUGINS).
+pub fn fl_cap_check(mut vm: FlVm, need: int) -> bool {
+    let o = fl_cap_origin(vm)
+    if o.caps & need == need { return true }
+    var msg = List[byte]()
+    util.buf_append_str(mut msg, "{fl_cap_name(need)} denied to ")
+    for b in fl_origin_name(vm, o) { (mut msg).push(b) }
+    let _ = fl_raise_bytes(mut vm, "capability", msg)
+    false
+}
+
+fn chain_line(mut out: List[byte], vm: FlVm, path_id: int, first: bool) {
+    util.buf_append_str(mut out, "\n  ")
+    if !first { util.buf_append_str(mut out, "-> ") }
+    if path_id > 0 && path_id < vm.strings.items.len {
+        for b in vm.strings.items[path_id] { (mut out).push(b) }
+    } else {
+        (mut out).push(63 as byte)
+    }
+}
+
+/// module.c:158-188: the whole chain in load order, the re-entered module
+/// at both ends.
+fn cycle_err(mut vm: FlVm, hit: int) -> FlValue {
+    var chain = List[int]()
+    var i = mod_current(vm)
+    while i != -1 && chain.len < FL_MOD_MAX_DEPTH + 1 {
+        (mut chain).push(i)
+        if i == hit { break }
+        i = if vm.mods[i].importer == 0 then -1 else vm.mods[i].importer - 1
+    }
+    let total = chain.len
+    var out = List[byte]()
+    util.buf_append_str(mut out, "import cycle:")
+    var n = total
+    while n > 0 {
+        n -= 1
+        chain_line(mut out, vm, vm.mods[chain[n]].path_id, n + 1 == total)
+    }
+    chain_line(mut out, vm, vm.mods[hit].path_id, false)
+    fl_raise_bytes(mut vm, "import", out)
+}
+
+fn mod_join(dir: List[byte], rel: List[byte]) -> List[byte] {
+    // G52 (wolf-lang#942): an argument may be a lent bytes() view, so the
+    // owned value is built byte by byte rather than `copy`d.
+    var out = List[byte]()
+    (mut out).reserve(dir.len + 1 + rel.len)
+    for x in dir { (mut out).push(x) }
+    if dir.len != 0 && dir[dir.len - 1] as int != 47 { (mut out).push(47 as byte) }
+    for b in rel { (mut out).push(b) }
+    out
+}
+
+fn mod_realpath(path: List[byte]) -> str ! {none} {
+    let text = str_from_utf8(path) else { return none }
+    fs_realpath(text) else { return none }
+}
+
+fn mod_tried(mut tried: List[byte], cand: List[byte]) {
+    util.buf_append_str(mut tried, "\n  ")
+    for b in cand { (mut tried).push(b) }
+}
+
+/// module.c:225-286: beside the importer, then $XDG_CONFIG_HOME/yew/fl
+/// (or ~/.config/yew/fl), then the runtime directory, each attempt
+/// recorded; the shipped runtime is deliberately last (A3).
+fn mod_resolve(vm: FlVm, o: FlOrigin, rel: List[byte], mut tried: List[byte]) -> str ! {none} {
+    if o.path_id > 0 && o.path_id < vm.strings.items.len {
+        let p = copy vm.strings.items[o.path_id]
+        var slash = -1
+        for j in 0..p.len { if p[j] as int == 47 { slash = j } }
+        if slash >= 0 {
+            let n = if slash == 0 then 1 else slash
+            let cand = mod_join(p[0..n], rel)
+            mod_tried(mut tried, cand)
+            let real = mod_realpath(cand) else ""
+            if real.len != 0 { return real }
+        }
+    }
+    let cfg = util.xdg_config_dir() else ""
+    if cfg.len != 0 {
+        let cand = mod_join("{cfg}/fl".bytes(), rel)
+        mod_tried(mut tried, cand)
+        let real = mod_realpath(cand) else ""
+        if real.len != 0 { return real }
+    }
+    var runtime = env_get("YEW_RUNTIME_DIR") else ""
+    if runtime.len == 0 { runtime = FL_RUNTIME_PREFIX }
+    let cand = mod_join(runtime.bytes(), rel)
+    mod_tried(mut tried, cand)
+    let real = mod_realpath(cand) else ""
+    if real.len != 0 { return real }
+    none
+}
+
+/// module.c:290-362: the whole file, at most 8 MiB.
+fn mod_read(mut vm: FlVm, path: str) -> List[byte] ! {raised} {
+    if fs_is_dir(path) { let _ = fl_raise(mut vm, "import", "cannot read {path}"); return raised }
+    let src = fs_read_bytes(path) else |_| {
+        let _ = fl_raise(mut vm, "import", "cannot read {path}")
+        return raised
+    }
+    if src.len > FL_MOD_MAX_BYTES {
+        let _ = fl_raise(mut vm, "limit", "{path} exceeds 8 MiB")
+        return raised
+    }
+    src
+}
+
+/// module.c:366-391: everything the body bound, minus `_` names, keyed by
+/// string and frozen.
+fn collect_exports(mut vm: FlVm, globals_root: int) -> FlValue {
+    let ex = fl_map_new(mut vm)
+    let root = fl_temp_push(mut vm, ex)
+    var cursor: int = 0
+    loop {
+        let (next, k, v) = fl_map_iter(vm, fl_temp_get(vm, globals_root), cursor) else { break }
+        cursor = next
+        if k.t != FL_INT || k.i <= 0 || k.i >= vm.strings.items.len { continue }
+        let name = copy vm.strings.items[k.i]
+        if name.len == 0 || name[0] as int == 95 { continue }
+        let key = fl_str_new(mut vm, name)
+        let ex_now = fl_temp_get(vm, root)
+        assert(fl_map_set(mut vm, ex_now, key, v))
+    }
+    let frozen = fl_temp_get(vm, root)
+    fl_freeze(mut vm, frozen)
+    let out = fl_temp_get(vm, root)
+    fl_temp_pop(mut vm, 1)
+    out
+}
+
+/// module.c:393-441: parse, compile and run the body against fresh
+/// globals carried on its own closure.
+fn run_body(mut vm: FlVm, idx: int, path: str, src: List[byte]) -> bool {
+    let file_id = fl_diag_add_file(mut vm.dc, path, src)
+    let p = fl_parse(src, file_id, mut vm.dc, mut vm.strings)
+    if p.had_error {
+        let _ = fl_raise(mut vm, "import", "{path} did not parse")
+        return false
+    }
+    let origin = copy vm.mods[idx].origin
+    let fun = fl_compile(mut vm, p, file_id, origin) else {
+        let _ = fl_raise(mut vm, "import", "{path} did not compile")
+        return false
+    }
+    vm.gc.slots[fl_obj_index(vm, fun)].fnkind = 2
+    let fresh = fl_map_new(mut vm)
+    let groot = fl_temp_push(mut vm, fresh)
+    let cl = fl_closure_new(mut vm, fun)
+    let ci = fl_obj_index(vm, cl)
+    vm.gc.slots[ci].globals = fl_temp_get(vm, groot)
+    let _ = fl_vm_call(mut vm, cl, List[FlValue]())
+    let ok = !vm.raised
+    if ok {
+        let ex = collect_exports(mut vm, groot)
+        vm.mods[idx].state = FL_MOD_READY
+        let modules = copy vm.modules
+        assert(fl_map_set(mut vm, modules, fl_int(idx), ex))
+    }
+    fl_temp_pop(mut vm, 1)
+    ok
+}
+
+fn mod_exports(vm: FlVm, idx: int) -> FlValue {
+    fl_map_get(vm, vm.modules, fl_int(idx)) else {
+        assert(false)
+        fl_nil()
+    }
+}
+
+/// `import NAME` and `import "PATH" as x` (module.c:546-666): a bare
+/// identifier is a builtin and nothing else, ever; a path resolves through
+/// the three directories. A raise leaves vm.raised set and answers nil.
+pub fn fl_import(mut vm: FlVm, id: int, is_path: bool) -> FlValue {
+    let o = fl_cap_origin(vm)
+    if id <= 0 || id >= vm.strings.items.len {
+        return fl_raise(mut vm, "import", "the import names nothing")
+    }
+    let text = copy vm.strings.items[id]
+    if !is_path {
+        let k = fl_str_new(mut vm, text)
+        let m = fl_map_get(vm, vm.builtins, k) else fl_nil()
+        if m.t != FL_NIL { return m }
+        var msg = List[byte]()
+        util.buf_append_str(mut msg, "there is no builtin module '")
+        for b in text { (mut msg).push(b) }
+        util.buf_append_str(mut msg, "'; they are ")
+        var first = true
+        var cursor: int = 0
+        loop {
+            let (next, mk, _) = fl_map_iter(vm, vm.builtins, cursor) else { break }
+            cursor = next
+            if mk.t != FL_STR { continue }
+            if !first { util.buf_append_str(mut msg, ", ") }
+            for b in vm.gc.slots[fl_obj_index(vm, mk)].bytes { (mut msg).push(b) }
+            first = false
+        }
+        return fl_raise_bytes(mut vm, "import", msg)
+    }
+    if vm.mods.len >= FL_MOD_MAX_DEPTH * 64 { return fl_raise(mut vm, "limit", "too many modules loaded") }
+    var tried = List[byte]()
+    let real = mod_resolve(vm, o, text, mut tried) else {
+        var msg = List[byte]()
+        util.buf_append_str(mut msg, "cannot find '")
+        for b in text { (mut msg).push(b) }
+        util.buf_append_str(mut msg, "'; tried:")
+        for b in tried { (mut msg).push(b) }
+        return fl_raise_bytes(mut vm, "import", msg)
+    }
+    let rid = fl_intern(mut vm.strings, real.bytes(), 0, real.len)
+    var idx = mod_find(vm, rid, o.kind, o.principal_id)
+    if idx != -1 {
+        if vm.mods[idx].state == FL_MOD_LOADING { return cycle_err(mut vm, idx) }
+        // The SAME map every time: two imports of one file are identical.
+        return mod_exports(vm, idx)
+    }
+    let src = mod_read(mut vm, real) else { return fl_nil() }
+    let cur = mod_current(vm)
+    let sub = FlOrigin { kind: o.kind, path_id: rid, caps: o.caps, principal_id: o.principal_id }
+    idx = mod_add(mut vm, rid, sub, if cur == -1 then 0 else cur + 1)
+    if !run_body(mut vm, idx, real, src) { return fl_nil() }
+    mod_exports(vm, idx)
+}
