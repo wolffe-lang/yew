@@ -7,15 +7,22 @@
 # Writes OUTDIR/pid, OUTDIR/log (verdict lines), OUTDIR/exit (when done).
 set -u
 tree=$1; out=$2; batch=$3; shift 3
+files=("$@")
+phases=${PHASES:-tiers plain stress}
 mkdir -p "$out"; echo $$ > "$out/pid"; : > "$out/log"; rm -f "$out/exit"
 cd "$tree"
 ctr=/home/mfwolffe/lanes/yw07b/front/notes/yw07b-evidence/lane/ctr.sh
-for file in "$@"; do
+tfiles=("${files[@]}")
+case " $phases " in *" tiers "*) ;; *) tfiles=() ;; esac
+for file in "${tfiles[@]}"; do
   "$ctr" . bash -c "notes/yw07b-evidence/front/tiers.sh $file native release native-stress release-stress" 2>&1 \
     | grep -E '^(native|release)' | sed "s|^|$file |" >> "$out/log"
 done
-for mode in "" --stress; do
-  for file in "$@"; do
+modes=()
+case " $phases " in *" plain "*) modes+=("") ;; esac
+case " $phases " in *" stress "*) modes+=(--stress) ;; esac
+for mode in "${modes[@]}"; do
+  for file in "${files[@]}"; do
     names=$(python3 - "$file" <<'P'
 import re, sys
 s = open(sys.argv[1]).read()
