@@ -1,0 +1,306 @@
+//! fl.data — Sprint 36's canonical Fletch pure-data bridge, sagitta 9ace98c2
+//! src/fl/data.h:1-30 and data.c:1-372 (8fd95304, "Route workspace state
+//! through Fletch data"). Reading is syntax only: fl_parse_literal has no
+//! production for a call, an import, an identifier used as a value or a
+//! statement, so this path grants and executes nothing. Maps keep their
+//! source insertion order. Allocation only marks the collector pending;
+//! nothing collects until a VM instruction boundary, so the tree is built
+//! unrooted as C builds it, and the caller roots the answer.
+
+use util
+
+/// data.h:20-25: the document cap (8 MiB).
+pub const FL_DATA_MAX_BYTES: int = 8388608
+
+/// data.h:20-25: every node visited, map keys included.
+pub const FL_DATA_MAX_NODES: int = 1000000
+
+/// data.h:20-25: container nesting, the root at depth 1.
+pub const FL_DATA_MAX_DEPTH: int = 32
+
+/// data.h:20-25: a decoded string's bytes.
+pub const FL_DATA_MAX_STRING: int = 4096
+
+// data.c:11-16's DataRead.
+struct FlDataRead {
+    nodes: int,
+    failed: bool,
+}
+
+// data.c:18-27: the first failure only.
+fn data_error(mut r: FlDataRead, mut dc: DiagCtx, sp: FlSpan, msg: str) {
+    if r.failed { return }
+    r.failed = true
+    fl_diag_emit(mut dc, FL_DIAG_ERROR, sp, "pure-literal data: {msg}")
+}
+
+// data.c:29-108: the literal tree as values; recursion is bounded by the
+// 32-level cap (and the parser's own depth limit below it).
+fn data_from_node(
+    mut vm: FlVm,
+    mut r: FlDataRead,
+    mut dc: DiagCtx,
+    p: FlProgram,
+    node: int,
+    depth: int,
+) -> FlValue {
+    if node < 0 || r.failed { return fl_nil() }
+    let n = copy p.nodes[node]
+    r.nodes += 1
+    if r.nodes > FL_DATA_MAX_NODES {
+        data_error(mut r, mut dc, n.sp, "node cap exceeded")
+        return fl_nil()
+    }
+    if depth > FL_DATA_MAX_DEPTH {
+        // The frozen state reader's position: after the map key and the
+        // separator that led to the over-deep value (data.c:41-44).
+        var sp = copy n.sp
+        sp.col += 3
+        r.failed = true
+        fl_diag_emit(mut dc, FL_DIAG_ERROR, sp, "pure-literal data: nesting deeper than 32")
+        return fl_nil()
+    }
+    if n.kind == FL_A_LIT {
+        if n.a == FL_L_NIL { return fl_nil() }
+        if n.a == FL_L_BOOL { return fl_bool(n.i != 0) }
+        if n.a == FL_L_INT { return fl_int(n.i) }
+        if n.a == FL_L_FLOAT { return fl_float(n.f) }
+        if n.a == FL_L_STR {
+            if vm.strings.items[n.i].len > FL_DATA_MAX_STRING {
+                data_error(mut r, mut dc, n.sp, "string exceeds the 4096-byte cap")
+                return fl_nil()
+            }
+            let bytes = copy vm.strings.items[n.i]
+            return fl_str_new(mut vm, bytes)
+        }
+    } else if n.kind == FL_A_LIST {
+        let list = fl_list_new(mut vm)
+        var i = 0
+        while i < n.b && !r.failed {
+            let item = data_from_node(mut vm, mut r, mut dc, p, p.edges[n.a + i], depth + 1)
+            fl_list_push(mut vm, list, item)
+            i += 1
+        }
+        return list
+    } else if n.kind == FL_A_MAP {
+        let map = fl_map_new(mut vm)
+        var i = 0
+        while i < n.c && !r.failed {
+            let key_node = p.edges[n.a + i]
+            let k = data_from_node(mut vm, mut r, mut dc, p, key_node, depth + 1)
+            let v = data_from_node(mut vm, mut r, mut dc, p, p.edges[n.b + i], depth + 1)
+            if !fl_map_set(mut vm, map, k, v) {
+                data_error(mut r, mut dc, p.nodes[key_node].sp, "unhashable map key")
+                break
+            }
+            i += 1
+        }
+        return map
+    }
+    data_error(mut r, mut dc, n.sp, "non-data AST node")
+    fl_nil()
+}
+
+// data.c:110-162: (complete, end line, end column). A mismatched closer
+// answers complete, since the parser diagnoses it.
+fn data_complete(src: List[byte]) -> (bool, int, int) {
+    let cap = FL_DATA_MAX_DEPTH + 2
+    var stack = List[int]()
+    for _ in 0..cap { (mut stack).push(0) }
+    var depth = 0
+    var ln = 1
+    var cl = 1
+    var string = false
+    var escape = false
+    var comment = false
+    for b in src {
+        let c = b as int
+        if comment {
+            if c == 10 { comment = false }
+        } else if string {
+            if escape {
+                escape = false
+            } else if c == 92 {
+                escape = true
+            } else if c == 34 {
+                string = false
+            }
+        } else if c == 35 {
+            comment = true
+        } else if c == 34 {
+            string = true
+        } else if c == 123 || c == 91 {
+            if depth < cap { stack[depth] = c }
+            depth += 1
+        } else if c == 125 || c == 93 {
+            let want = if c == 125 then 123 else 91
+            if depth == 0 || depth > cap || stack[depth - 1] != want { return (true, ln, cl) }
+            depth -= 1
+        }
+        if c == 10 {
+            ln += 1
+            cl = 1
+        } else {
+            cl += 1
+        }
+    }
+    (depth == 0 && !string && !escape, ln, cl)
+}
+
+/// data.c:164-200: one pure-literal document as values, or nil with the
+/// first error in `dc` (a nil document reads nil with no error; callers
+/// test fl_diag_errors). Strings intern into the VM's own table.
+pub fn fl_data_read(mut vm: FlVm, src: List[byte], mut dc: DiagCtx) -> FlValue {
+    if src.len > FL_DATA_MAX_BYTES {
+        fl_diag_emit(
+            mut dc,
+            FL_DIAG_ERROR,
+            FlSpan { file_id: 0, line: 1, col: 1, len: 1 },
+            "pure-literal data: document exceeds 8 MiB",
+        )
+        return fl_nil()
+    }
+    let file_id = fl_diag_add_file(mut dc, "<data>", src)
+    let p = fl_parse_literal(src, file_id, mut dc, mut vm.strings)
+    if p.root < 0 { return fl_nil() }
+    let (complete, end_line, end_col) = data_complete(src)
+    if !complete {
+        fl_diag_emit(
+            mut dc,
+            FL_DIAG_ERROR,
+            FlSpan { file_id: file_id, line: end_line, col: end_col, len: 1 },
+            "pure-literal data: unterminated container",
+        )
+        return fl_nil()
+    }
+    var r = FlDataRead { nodes: 0, failed: false }
+    let result = data_from_node(mut vm, mut r, mut dc, p, p.root, 1)
+    if r.failed then fl_nil() else result
+}
+
+// data.c:202-208.
+fn data_indent(mut out: List[byte], depth: int) {
+    for _ in 0..depth { util.buf_append_str(mut out, "  ") }
+}
+
+// data.c:210-239: the frozen escape table, src/ws/fl_emit.c's.
+fn data_string(mut out: List[byte], s: List[byte]) {
+    (mut out).push(34 as byte)
+    for x in s {
+        let c = x as int
+        if c == 34 {
+            util.buf_append_str(mut out, "\\\"")
+        } else if c == 92 {
+            util.buf_append_str(mut out, "\\\\")
+        } else if c == 10 {
+            util.buf_append_str(mut out, "\\n")
+        } else if c == 9 {
+            util.buf_append_str(mut out, "\\t")
+        } else if c == 13 {
+            util.buf_append_str(mut out, "\\r")
+        } else if c == 0 {
+            util.buf_append_str(mut out, "\\0")
+        } else if c < 32 || c == 127 {
+            util.buf_append_str(mut out, "\\x")
+            (mut out).push("0123456789abcdef".bytes()[c / 16])
+            (mut out).push("0123456789abcdef".bytes()[c % 16])
+        } else {
+            (mut out).push(x)
+        }
+    }
+    (mut out).push(34 as byte)
+}
+
+// data.c:241-256: [a-z_][a-z0-9_]*, reserved words included, as C.
+fn data_bare_key(s: List[byte]) -> bool {
+    if s.len == 0 { return false }
+    let first = s[0] as int
+    if !(first >= 97 && first <= 122 || first == 95) { return false }
+    for i in 1..s.len {
+        let c = s[i] as int
+        if !(c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 95) { return false }
+    }
+    true
+}
+
+// data.c:260-279.
+fn data_key(vm: FlVm, mut out: List[byte], key: FlValue) {
+    if key.t == FL_STR {
+        let at = fl_obj_index(vm, key)
+        if data_bare_key(vm.gc.slots[at].bytes) {
+            util.buf_append(mut out, vm.gc.slots[at].bytes)
+        } else {
+            data_string(mut out, vm.gc.slots[at].bytes)
+        }
+    } else if key.t == FL_INT {
+        util.buf_append_str(mut out, "{key.i}")
+    } else if key.t == FL_BOOL {
+        util.buf_append_str(mut out, if key.i != 0 then "true" else "false")
+    } else {
+        assert(false, "fletch data: unhashable map key reached writer")
+    }
+}
+
+// data.c:281-299: `%.17g`, with `.0` when no `.`, `e` or `E` appears, so
+// infinity writes `inf.0` (G51: a negative NaN's sign is the std seam's).
+fn data_float(mut out: List[byte], value: f64) {
+    let text = float_general(value, 17)
+    var fractional = false
+    for b in text.bytes() {
+        let c = b as int
+        // C maps a locale's ',' to '.'; the process never leaves "C".
+        if c == 44 { (mut out).push(46 as byte) } else { (mut out).push(b) }
+        if c == 44 || c == 46 || c == 101 || c == 69 { fractional = true }
+    }
+    if !fractional { util.buf_append_str(mut out, ".0") }
+}
+
+// data.c:301-365.
+fn data_value(vm: FlVm, mut out: List[byte], v: FlValue, depth: int, comma: bool) {
+    if v.t == FL_NIL {
+        util.buf_append_str(mut out, "nil")
+    } else if v.t == FL_BOOL {
+        util.buf_append_str(mut out, if v.i != 0 then "true" else "false")
+    } else if v.t == FL_INT {
+        util.buf_append_str(mut out, "{v.i}")
+    } else if v.t == FL_FLOAT {
+        data_float(mut out, v.f)
+    } else if v.t == FL_STR {
+        data_string(mut out, vm.gc.slots[fl_obj_index(vm, v)].bytes)
+    } else if v.t == FL_LIST {
+        let at = fl_obj_index(vm, v)
+        util.buf_append_str(mut out, "[\n")
+        for i in 0..vm.gc.slots[at].vals.len {
+            data_indent(mut out, depth + 1)
+            let item = copy vm.gc.slots[at].vals[i]
+            data_value(vm, mut out, item, depth + 1, true)
+        }
+        data_indent(mut out, depth)
+        (mut out).push(93 as byte)
+    } else if v.t == FL_MAP {
+        util.buf_append_str(mut out, "{{\n")
+        var cursor = 0
+        loop {
+            let (next, key, val) = fl_map_iter(vm, v, cursor) else break
+            cursor = next
+            data_indent(mut out, depth + 1)
+            data_key(vm, mut out, key)
+            util.buf_append_str(mut out, ": ")
+            data_value(vm, mut out, val, depth + 1, true)
+        }
+        data_indent(mut out, depth)
+        (mut out).push(125 as byte)
+    } else {
+        assert(false, "fletch data: non-data value '{fl_type_name(v.t)}'")
+    }
+    if comma { (mut out).push(44 as byte) }
+    (mut out).push(10 as byte)
+}
+
+/// data.c:367-372: the canonical document form (Sprint 25's), appended to
+/// `out` at `indent` levels; the final newline is the writer's. A value
+/// outside the data kinds traps, as C's YEW_BUG.
+pub fn fl_data_write(vm: FlVm, mut out: List[byte], v: FlValue, indent: int) {
+    data_indent(mut out, indent)
+    data_value(vm, mut out, v, indent, false)
+}
