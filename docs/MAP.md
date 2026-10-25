@@ -551,6 +551,28 @@ maintainer.
   `stdlist.lu` (recommended); (B) raise on a mutation during the sort, a
   behaviour C does not have.
 
+- **R-yw07b-7 — errno names from the host's errno, asked (recommend A,
+  implemented by the io fork).** R-yw07-9 assumed "the fs rows carry no
+  errno" and recovered names by probes. At 0.2.35 `os_error()` answers the
+  host's errno for the last fallible fs call, on every tier. (A) `fl.stdio`
+  maps that number through a per-host number-to-name table (Linux and PAX,
+  macOS), derived black-box and witnessed against C yew at the pin, to C's
+  26-name table (`stdio.c:59-94`), with C's `errno N` fallback for an
+  unknown number. The probes stay only for an `os_error()` of 0, and
+  `text.AtomicWriteResult` carries the number captured at the failing call,
+  as C's `yew_file_write_atomic_result` saves errno (`file.c:1386-1393`)
+  (recommended: exact where probes cannot be, e.g. ELOOP, ENAMETOOLONG, or
+  EACCES against EPERM); (B) R-yw07-9's probes as written.
+- **R-yw07b-8 — `str.repeat`'s wrapped product, asked (recommend A).**
+  `s_repeat` checks the cap on `(size_t)len * (size_t)times`
+  (`stdstr.c:703`). A product past 2^64 wraps, and a wrapped product under
+  the 64 MiB cap sends C into `times` appends that end in an allocation
+  abort. An empty string with a huge count loops `times` times appending
+  nothing. (A) the port refuses every result over the cap by the quotient
+  test (`times > cap / len`, kind `limit`, C's message) and answers `""` for
+  an empty string at once, named in `src/fl/stdstr.lu` (recommended: C's
+  answer is a process abort or a hang, which no golden reaches); (B) a
+  STOP until C is fixed.
 - **The 17 value tags: an erratum to the adopted contract.** Deliverable
   4 says "the 15 tags" (`s30:47-98`). The pinned `value.h` declares 17,
   `FL_NIL` to `FL_REGEX` with `FL_MOTION_PROG` and `FL_UPVAL` separate,

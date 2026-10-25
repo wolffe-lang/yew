@@ -1,0 +1,341 @@
+//! flcli — `yew fl`, the Fletch entry point: sagitta 9ace98c2
+//! src/flcli.c:1-649, its non-interactive forms (R-yw07-7 A): FILE, -e,
+//! -c, --dump-ast, --dump-bytecode, --list-natives, --help, --caps and
+//! --origin, and stdin read as one script when it is not a terminal. The
+//! prompt (stdin a terminal) and --selftest-fl-bug are s32's REPL and bug
+//! report and refuse by name, naming yw08. THE EXIT CODES ARE A CONTRACT:
+//! 0 ran, 1 compile or runtime error, 3 unreadable FILE or a `capability`
+//! or `io` error reaching the top, never 2. Diagnostics go to stderr and
+//! io.print to stdout. No terminal ownership in any form here.
+//! `fl` sits below `edit` (R-yw07-5): this driver is the VM's host.
+
+use fl
+use std.fs as fs
+use std.io as std_io
+use util
+
+/// flcli.c:64-92, byte for byte.
+const FL_USAGE: str = """
+Usage:
+  yew fl                  On a terminal, start the prompt (:help
+                          for its commands, :quit to leave).
+                          Otherwise read a script from stdin.
+  yew fl FILE             Evaluate FILE.
+  yew fl -e EXPR          Evaluate EXPR; print its value if non-nil.
+  yew fl -c FILE          Parse and compile only; do not run.
+  yew fl --dump-ast FILE  Print the AST.
+  yew fl --dump-bytecode FILE
+                          Disassemble every function.
+  yew fl --list-natives   List every module builtin as
+                          module.name, one per line.  §9's
+                          `error` is a prelude name, not a
+                          module's, and is not listed.
+
+Options, before any of the above:
+  --caps SPEC             Grants for the entry script: 'all',
+                          'none', or a comma-separated list of
+                          fs.read, fs.write, shell, net.
+  --origin KIND           cli (default), config, workspace, plugin.
+                          Lowers what the script may reach; §13
+                          decides the rest from the module it is in.
+
+Exit: 0 ran, 1 compile or runtime error, 3 unreadable file or a
+denied capability, 4 internal error.
+
+A `yew fl` script takes no arguments; use `yew --batch SCRIPT --
+ARGS...` when a script needs argv.  A stepping debugger is not a
+1.0 feature:
+the trace, --dump-bytecode and io.print are the debugging story.
+"""
+
+/// repl.h:17-20: the printed value's depth and byte caps.
+const FL_REPL_MAX_DEPTH: int = 8
+
+const FL_REPL_MAX_BYTES: int = 2000
+
+fn out_bytes(b: List[byte]) {
+    var o = fs.stdout()
+    fs.write_chunk(mut o, b) else |_| {}
+}
+
+fn err_bytes(b: List[byte]) {
+    var e = fs.stderr()
+    fs.write_chunk(mut e, b) else |_| {}
+}
+
+fn err_text(s: str) {
+    var b = List[byte]()
+    util.buf_append_str(mut b, s)
+    err_bytes(b)
+}
+
+/// The run state the four file-reading modes share (flcli.c:234-241).
+struct FlRun { vm: fl.FlVm, origin: fl.FlOrigin, nerr: int }
+
+fn run_open(kind: int, caps: int) -> FlRun {
+    var strings = fl.fl_strings()
+    var vm = fl.fl_vm_new(take strings)
+    vm.dc.echo = true
+    fl.fl_std_register(mut vm)
+    FlRun { vm: vm, origin: fl.fl_origin_new(kind, caps), nerr: 0 }
+}
+
+/// flcli.c:283-292: the script's realpath, so a relative import resolves
+/// beside it; the host's natives read it as the root origin.
+fn run_anchor(mut r: FlRun, path: str) {
+    let real = fs_realpath(path) else ""
+    if real.len != 0 {
+        r.origin.path_id = fl.fl_intern(mut r.vm.strings, real.bytes(), 0, real.len)
+    }
+    r.vm.root_origin = copy r.origin
+}
+
+fn err_kind(mut vm: fl.FlVm, err: fl.FlValue) -> str {
+    if err.t != fl.FL_MAP { return "" }
+    let k = fl.fl_str_text(mut vm, "kind")
+    let got = fl.fl_map_get(vm, err, k) else { return "" }
+    if got.t != fl.FL_STR { return "" }
+    str_from_utf8(vm.gc.slots[fl.fl_obj_index(vm, got)].bytes) else ""
+}
+
+/// flcli.c:319-334: the §6 block on stderr; `capability` and `io` mean
+/// the environment refused, so they exit 3.
+fn report_raise(mut vm: fl.FlVm, err: fl.FlValue) -> int {
+    let kind = err_kind(mut vm, err)
+    var out = List[byte]()
+    fl.fl_trace_render(mut vm, err, mut out)
+    err_bytes(out)
+    if kind == "capability" || kind == "io" { return util.EXIT_IO }
+    util.EXIT_ERR
+}
+
+/// flcli.c:347-367: parse, and `incomplete` IS AN ERROR HERE — a
+/// truncated file is not a program.
+fn cli_parse(mut r: FlRun, name: str, src: List[byte]) -> fl.FlProgram ! {failed} {
+    let file_id = fl.fl_diag_add_file(mut r.vm.dc, name, src)
+    let p = fl.fl_parse(src, file_id, mut r.vm.dc, mut r.vm.strings)
+    if p.had_error { return failed }
+    if p.incomplete {
+        err_text("{name}: error: unexpected end of input; a bracket or block is still open\n")
+        r.nerr += 1
+        return failed
+    }
+    p
+}
+
+/// flcli.c:369-381: compile under the run's origin as a script chunk.
+fn cli_compile(mut r: FlRun, name: str, src: List[byte]) -> fl.FlValue ! {failed} {
+    let p = cli_parse(mut r, name, src) else { return failed }
+    let f = fl.fl_compile(mut r.vm, p, 0, r.origin) else { return failed }
+    r.vm.gc.slots[fl.fl_obj_index(r.vm, f)].fnkind = 3
+    f
+}
+
+/// repl.c:62-86's yew_fl_print_result: nil prints nothing; a value past
+/// 2000 bytes is cut with its count.
+fn print_result(mut vm: fl.FlVm, v: fl.FlValue) {
+    if v.t == fl.FL_NIL { return }
+    var bb = List[byte]()
+    var out = List[byte]()
+    if !fl.fl_fmt_repl(mut vm, mut bb, v, FL_REPL_MAX_DEPTH) {
+        util.buf_append_str(mut out, "<unprintable>\n")
+        out_bytes(out)
+        return
+    }
+    if bb.len > FL_REPL_MAX_BYTES {
+        for i in 0..FL_REPL_MAX_BYTES { (mut out).push(bb[i]) }
+        util.buf_append_str(mut out, "\u{2026} ({bb.len - FL_REPL_MAX_BYTES} more bytes)")
+    } else {
+        for b in bb { (mut out).push(b) }
+    }
+    (mut out).push(10 as byte)
+    out_bytes(out)
+}
+
+/// flcli.c:385-409.
+fn mode_eval(mut r: FlRun, name: str, src: List[byte], print_value: bool) -> int {
+    let f = cli_compile(mut r, name, src) else { return util.EXIT_ERR }
+    let res = fl.fl_vm_run(mut r.vm, f)
+    if r.vm.raised {
+        r.vm.raised = false
+        return report_raise(mut r.vm, res)
+    }
+    if print_value { print_result(mut r.vm, res) }
+    util.EXIT_OK
+}
+
+/// flcli.c:438-456: EVERY function, the nested ones from the constant pool.
+fn disasm_fn(mut out: List[byte], vm: fl.FlVm, f: fl.FlValue, depth: int) {
+    if depth > 32 { return }
+    let at = fl.fl_obj_index(vm, f)
+    let id = vm.gc.slots[at].name_id
+    util.buf_append_str(mut out, "-- ")
+    if id > 0 && id < vm.strings.items.len {
+        for b in vm.strings.items[id] { (mut out).push(b) }
+    } else {
+        util.buf_append_str(mut out, "<fn>")
+    }
+    util.buf_append_str(mut out, "/{vm.gc.slots[at].arity}\n")
+    fl.fl_disasm_chunk(vm, f, mut out)
+    (mut out).push(10 as byte)
+    for i in 0..vm.gc.slots[at].vals.len {
+        let k = copy vm.gc.slots[at].vals[i]
+        if k.t == fl.FL_FN { disasm_fn(mut out, vm, k, depth + 1) }
+    }
+}
+
+fn run_mode(mut r: FlRun, mode: int, name: str, src: List[byte]) -> int {
+    match mode {
+        0 => mode_eval(mut r, name, src, false),
+        1 => {
+            let _ = cli_compile(mut r, name, src) else { return util.EXIT_ERR }
+            util.EXIT_OK
+        },
+        2 => {
+            let p = cli_parse(mut r, name, src) else { return util.EXIT_ERR }
+            var out = List[byte]()
+            fl.fl_ast_dump(mut out, p, r.vm.strings)
+            out_bytes(out)
+            util.EXIT_OK
+        },
+        _ => {
+            let f = cli_compile(mut r, name, src) else { return util.EXIT_ERR }
+            var out = List[byte]()
+            disasm_fn(mut out, r.vm, f, 0)
+            out_bytes(out)
+            util.EXIT_OK
+        },
+    }
+}
+
+/// flcli.c:113-146 and :476-497: load `path` and hand it to `mode`; an
+/// unreadable file is exit 3.
+fn with_file(path: str, mode: int, kind: int, caps: int) -> int {
+    var r = run_open(kind, caps)
+    if fs_is_dir(path) {
+        err_text("yew: cannot read {path}\n")
+        return util.EXIT_IO
+    }
+    let src = fs_read_bytes(path) else |_| {
+        err_text("yew: cannot read {path}\n")
+        return util.EXIT_IO
+    }
+    run_anchor(mut r, path)
+    run_mode(mut r, mode, path, src)
+}
+
+/// flcli.c:530-562: stdin that is not a terminal, read as one script.
+fn run_stdin(kind: int, caps: int) -> int {
+    var r = run_open(kind, caps)
+    var input = fs.stdin()
+    var src = List[byte]()
+    loop {
+        let chunk = fs.read_chunk(mut input, 65536) else |e| match e {
+            eof => { break },
+            io => {
+                err_text("yew: cannot read stdin\n")
+                return util.EXIT_IO
+            },
+        }
+        for b in chunk { (mut src).push(b) }
+    }
+    mode_eval(mut r, "<stdin>", src, false)
+}
+
+/// flcli.c:149-213: "all", "none" or fs.read,fs.write,shell,net; an
+/// unknown name is a usage error, never a silently empty grant.
+fn parse_caps(s: str) -> int ! {bad} {
+    if s == "none" { return 0 }
+    if s == "all" { return fl.FL_CAP_ALL }
+    var got = 0
+    var at = 0
+    while at < s.len {
+        var end = at
+        while end < s.len && s.bytes()[end] as int != 44 { end += 1 }
+        let word = s[at..end]
+        let bit = if word == "fs.read" {
+            fl.FL_CAP_FS_READ
+        } else if word == "fs.write" {
+            fl.FL_CAP_FS_WRITE
+        } else if word == "shell" {
+            fl.FL_CAP_SHELL
+        } else if word == "net" {
+            fl.FL_CAP_NET
+        } else {
+            return bad
+        }
+        got = got | bit
+        at = if end < s.len then end + 1 else end
+    }
+    got
+}
+
+/// flcli.c:215-232.
+fn parse_origin(s: str) -> int ! {bad} {
+    if s == "cli" { return fl.FL_ORIGIN_CLI }
+    if s == "config" { return fl.FL_ORIGIN_CONFIG }
+    if s == "workspace" { return fl.FL_ORIGIN_WORKSPACE }
+    if s == "plugin" { return fl.FL_ORIGIN_PLUGIN }
+    bad
+}
+
+fn list_natives() -> int {
+    var out = List[byte]()
+    let _ = fl.fl_std_list_natives(mut out)
+    out_bytes(out)
+    util.EXIT_OK
+}
+
+fn refuse(what: str) -> int {
+    err_text("yew: error: not yet ported: {what}: sagitta Sprint 32 (yw08)\n")
+    util.EXIT_ERR
+}
+
+/// flcli.c:594-649's yew_fl_main; `argv[0]` is "fl". --caps/--origin are
+/// stripped first and accepted only before the form.
+pub fn yew_fl_main(argv0: List[str]) -> int {
+    var caps = fl.FL_CAP_ALL
+    var kind = fl.FL_ORIGIN_CLI
+    var at = 0
+    while argv0.len - at >= 3 && (argv0[at + 1] == "--caps" || argv0[at + 1] == "--origin") {
+        let opt = argv0[at + 1]
+        let value = argv0[at + 2]
+        if opt == "--caps" {
+            caps = parse_caps(value) else {
+                err_text("yew: bad {opt} value '{value}'\n")
+                return util.EXIT_ERR
+            }
+        } else {
+            kind = parse_origin(value) else {
+                err_text("yew: bad {opt} value '{value}'\n")
+                return util.EXIT_ERR
+            }
+        }
+        at += 2
+    }
+    let argc = argv0.len - at
+    if argc == 1 {
+        let tty = std_io.is_terminal(fs.stdin()) else false
+        if tty { return refuse("yew fl's prompt") }
+        return run_stdin(kind, caps)
+    }
+    let a1 = argv0[at + 1]
+    if argc == 2 && a1 == "--selftest-fl-bug" { return refuse("yew fl --selftest-fl-bug") }
+    if argc == 2 && a1 == "--list-natives" { return list_natives() }
+    if argc == 2 && a1 == "--help" {
+        print_raw(FL_USAGE)
+        return util.EXIT_OK
+    }
+    if argc == 3 && a1 == "-e" {
+        var r = run_open(kind, caps)
+        var src = List[byte]()
+        util.buf_append_str(mut src, argv0[at + 2])
+        return mode_eval(mut r, "<expr>", src, true)
+    }
+    if argc == 3 && a1 == "-c" { return with_file(argv0[at + 2], 1, kind, caps) }
+    if argc == 3 && a1 == "--dump-ast" { return with_file(argv0[at + 2], 2, kind, caps) }
+    if argc == 3 && a1 == "--dump-bytecode" { return with_file(argv0[at + 2], 3, kind, caps) }
+    if argc == 2 && !a1.starts_with("-") { return with_file(a1, 0, kind, caps) }
+    err_text(FL_USAGE)
+    util.EXIT_ERR
+}
