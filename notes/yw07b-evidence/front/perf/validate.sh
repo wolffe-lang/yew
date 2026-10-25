@@ -12,4 +12,4 @@ tools/check-fl-dump target/native/yew "$oracle/sagitta/build/yew" 2>&1 | tail -4
 for f in src/fl_lex_test.lu src/fl_parse_test.lu; do
   notes/yw07b-evidence/front/tiers.sh $f native release 2>&1 | sed "s|^|$f |"
 done
-python3 notes/yw07b-evidence/front/checked-cases.py 2>&1 | tail -3
+for f in src/fl_lex_test.lu src/fl_parse_test.lu; do python3 notes/yw07b-evidence/front/cases.py $f | tail -1; done
