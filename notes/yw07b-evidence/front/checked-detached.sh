@@ -4,7 +4,7 @@
 #   setsid -f bash checked-detached.sh FILE OUTDIR [--stress]
 # Writes OUTDIR/pid, OUTDIR/log (one verdict line per case), OUTDIR/exit.
 set -u
-repo=/home/mfwolffe/lanes/yw07b/front
+repo=${REPO:-/home/mfwolffe/lanes/yw07b/front}
 file=$1; out=$2; mode=${3:-}
 mkdir -p "$out"; echo $$ > "$out/pid"; : > "$out/log"; rm -f "$out/exit"
 cd "$repo"
