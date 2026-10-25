@@ -4,7 +4,7 @@ root=pathlib.Path('/home/mfwolffe/lanes/yw07b/core')
 stage=root/'target/checked-vm';stage.mkdir(exist_ok=True)
 for name in ['fl','unicode','util']:shutil.copytree(root/'src'/name,stage/name,dirs_exist_ok=True)
 source=(root/'src/fl_vm_test.lu').read_text()
-names=re.findall(r'^fn (t_\w+)\(\)',source,re.M);assert len(names)==30
+names=[line.split()[1] for line in (root/'tools/fl-cases.txt').read_text().splitlines() if line.startswith('vm ')];assert len(names)==30
 rows=[];failed=0
 selected={int(x) for x in os.environ.get("CASE_FILTER","").split(",") if x}
 tag=os.environ.get("CASE_TAG","")
