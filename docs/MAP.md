@@ -515,8 +515,9 @@ maintainer.
 - **R-yw07b-1 — the GC's sweep after the toy VM, decided A** (the
   orchestrator under ruling #118, 2026-10-25; subject to override). The
   toy VM (`notes/yw07-evidence/toyvm/`, never linked into `yew`) held
-  memory flat over 100,000 collections (ledger 482,976 bytes at
-  collection 1,000 and at 100,000; RSS 2,785,280 → 2,789,376), collected
+  memory flat over 100,000 collections (the compacting sweep, release:
+  ledger 484,896 bytes at collection 1,000 and at 100,000, RSS 2,887,680
+  → 2,891,776; the non-moving control 482,976 flat), collected
   the unrooted cycle, kept each of the eight roots, and trapped the
   planted stale index under stress in both sweeps (exit 134). Release
   ratios against C's `fl_smoke --perf` from the same run, compacting:
