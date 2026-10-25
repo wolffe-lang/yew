@@ -1,0 +1,404 @@
+//! fl.stdfmt — Sprint 31's `fmt` module, sagitta 9ace98c2 src/fl/stdfmt.c:1-1276:
+//! std.h:120-149's three renderers (stdfmt.c:298-640), the §6 directive
+//! grammar (:711-966), the seven natives (:969-1260) and FMT_DEFS
+//! (:1264-1272). A TEMPLATE IS DATA, NEVER A FORMAT: fmt.f ends in a string
+//! or a raise. fmt.repr's text re-reads through fl_parse_literal or it raises.
+//! Floats go through fl.float (R-yw07-4); G51 / wolf-std#103 (NaN sign) stays
+//! open there. No native here reenters the VM, so no object moves while one
+//! runs (collection waits for an instruction boundary). Raise text is C's
+//! fl_raise (vm.c:206-233): each `%.*s` operand stops at its first NUL and
+//! the message keeps vsnprintf's 1023 bytes.
+
+use util
+
+// stdfmt.c:65-67: cycles are caught by the open-container stack; this is
+// only the backstop for a legitimately deep value.
+const FMT_MAX_DEPTH: int = 64
+
+// ---------------------------------------------------------------- //
+// Small emitters (stdfmt.c:85-247)                                 //
+// ---------------------------------------------------------------- //
+
+// C's `%.*s`: an operand stops at its first NUL byte.
+fn fmt_put_upto_nul(mut out: List[byte], b: List[byte], lo: int, hi: int) {
+    var i = lo
+    while i < hi {
+        if b[i] as int == 0 { return }
+        (mut out).push(b[i])
+        i += 1
+    }
+}
+
+// vm.c:216-229: vsnprintf into a 1 KiB buffer keeps 1023 bytes.
+fn fmt_raise_msg(mut vm: FlVm, kind: str, msg: List[byte]) -> FlValue {
+    if msg.len <= 1023 { return fl_raise_bytes(mut vm, kind, msg) }
+    var cut = List[byte]()
+    (mut cut).reserve(1023)
+    for i in 0..1023 { (mut cut).push(msg[i]) }
+    fl_raise_bytes(mut vm, kind, cut)
+}
+
+fn fmt_truncate(mut b: List[byte], n: int) {
+    while b.len > n { let _ = (mut b).pop() else 0 as byte }
+}
+
+// stdfmt.c:94-99.
+fn fmt_hex2(mut out: List[byte], c: int) {
+    util.buf_append_str(mut out, "\\x")
+    (mut out).push("0123456789abcdef".bytes()[c / 16])
+    (mut out).push("0123456789abcdef".bytes()[c % 16])
+}
+
+// stdfmt.c:134-161: digits from the remainder's magnitude, so INT64_MIN
+// needs no negation (wolf's % takes the dividend's sign).
+fn fmt_radix(mut out: List[byte], v: int, radix: int, upper: bool) {
+    let digits = if upper {
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    } else {
+        "0123456789abcdefghijklmnopqrstuvwxyz"
+    }
+    var tmp = List[byte]()
+    var m = v
+    loop {
+        var d = m % radix
+        if d < 0 { d = -d }
+        (mut tmp).push(digits.bytes()[d])
+        m = m / radix
+        if m == 0 { break }
+    }
+    if v < 0 { (mut out).push(45 as byte) }
+    var n = tmp.len
+    while n > 0 {
+        n -= 1
+        (mut out).push(tmp[n])
+    }
+}
+
+// stdfmt.c:238-275: `"` `\` `\n` `\t` `\r` `\0`, bytes below 0x20 and 0x7F
+// as lowercase \xNN, every other byte verbatim (invariant 2).
+fn fmt_quoted(mut out: List[byte], s: List[byte]) {
+    (mut out).push(34 as byte)
+    for x in s {
+        let c = x as int
+        if c == 34 {
+            util.buf_append_str(mut out, "\\\"")
+        } else if c == 92 {
+            util.buf_append_str(mut out, "\\\\")
+        } else if c == 10 {
+            util.buf_append_str(mut out, "\\n")
+        } else if c == 9 {
+            util.buf_append_str(mut out, "\\t")
+        } else if c == 13 {
+            util.buf_append_str(mut out, "\\r")
+        } else if c == 0 {
+            util.buf_append_str(mut out, "\\0")
+        } else if c < 32 || c == 127 {
+            fmt_hex2(mut out, c)
+        } else {
+            (mut out).push(x)
+        }
+    }
+    (mut out).push(34 as byte)
+}
+
+// stdfmt.c:277-296: bare only when it lexes back as an IDENT.
+fn fmt_bare_key(s: List[byte]) -> bool {
+    if s.len == 0 { return false }
+    for i in 0..s.len {
+        let c = s[i] as int
+        let alpha = c >= 97 && c <= 122 || c >= 65 && c <= 90 || c == 95
+        if !alpha && !(i > 0 && c >= 48 && c <= 57) { return false }
+    }
+    !fl_kw_reserved(s)
+}
+
+// ---------------------------------------------------------------- //
+// str / repr (stdfmt.c:249-640)                                    //
+// ---------------------------------------------------------------- //
+
+// stdfmt.c:298-320's Rw: quoting and refusing are separate axes; `open`
+// holds the slot of every container between the root and here, and
+// membership IS the cycle test.
+struct FmtRw {
+    quote: bool,
+    refuse: bool,
+    max_depth: int,
+    indent: int,
+    path: List[byte],
+    open: List[int],
+}
+
+// stdfmt.c:324-333.
+fn fmt_rw_newline(w: FmtRw, mut out: List[byte], depth: int) {
+    if w.indent == 0 { return }
+    (mut out).push(10 as byte)
+    var i = 0
+    while i < depth * w.indent {
+        (mut out).push(32 as byte)
+        i += 1
+    }
+}
+
+// stdfmt.c:335-341.
+fn fmt_rw_cycle(mut vm: FlVm, w: FmtRw) -> bool {
+    var msg = List[byte]()
+    util.buf_append_str(mut msg, "fmt.repr: cycle at ")
+    fmt_put_upto_nul(mut msg, w.path, 0, w.path.len)
+    let _ = fmt_raise_msg(mut vm, "type", msg)
+    false
+}
+
+// stdfmt.c:342-364: (ok, dup); ok is false only having raised the limit.
+fn fmt_rw_enter(mut vm: FlVm, mut w: FmtRw, at: int) -> (bool, bool) {
+    for o in w.open { if o == at { return (true, true) } }
+    if w.open.len >= w.max_depth {
+        if w.refuse {
+            let _ = fl_raise(mut vm, "limit", "fmt.repr: nested deeper than {w.max_depth}")
+            return (false, false)
+        }
+        // display gives up quietly rather than lying
+        return (true, true)
+    }
+    (mut w.open).push(at)
+    (true, false)
+}
+
+fn fmt_rw_leave(mut w: FmtRw) { let _ = (mut w.open).pop() else 0 }
+
+// stdfmt.c:366-405.
+fn fmt_rw_list(mut vm: FlVm, mut w: FmtRw, mut out: List[byte], v: FlValue) -> bool {
+    let at = fl_obj_index(vm, v)
+    let (ok, dup) = fmt_rw_enter(mut vm, mut w, at)
+    if !ok { return false }
+    if dup {
+        if w.refuse { return fmt_rw_cycle(mut vm, w) }
+        util.buf_append_str(mut out, "[...]")
+        return true
+    }
+    let depth = w.open.len
+    let n = vm.gc.slots[at].vals.len
+    (mut out).push(91 as byte)
+    for i in 0..n {
+        let mark = w.path.len
+        util.buf_append_str(mut w.path, "[{i}]")
+        fmt_rw_newline(w, mut out, depth)
+        let item = copy vm.gc.slots[at].vals[i]
+        if !fmt_rw_value(mut vm, mut w, mut out, item) { return false }
+        // A comma after EVERY element in the pretty form; the single-line
+        // form drops the last one.
+        if w.indent != 0 || i + 1 < n { (mut out).push(44 as byte) }
+        if w.indent == 0 && i + 1 < n { (mut out).push(32 as byte) }
+        fmt_truncate(mut w.path, mark)
+    }
+    fmt_rw_newline(w, mut out, depth - 1)
+    (mut out).push(93 as byte)
+    fmt_rw_leave(mut w)
+    true
+}
+
+// stdfmt.c:407-446: §12's pl_entry spells IDENT, STRING and unsigned INT.
+fn fmt_rw_key(mut vm: FlVm, w: FmtRw, mut out: List[byte], k: FlValue) -> bool {
+    if k.t == FL_STR {
+        let at = fl_obj_index(vm, k)
+        if fmt_bare_key(vm.gc.slots[at].bytes) {
+            util.buf_append(mut out, vm.gc.slots[at].bytes)
+        } else {
+            fmt_quoted(mut out, vm.gc.slots[at].bytes)
+        }
+        return true
+    }
+    if k.t == FL_INT {
+        if w.refuse && k.i < 0 {
+            let _ = fl_raise(
+                mut vm,
+                "type",
+                "fmt.repr: map key {k.i} is negative, which pure-literal syntax cannot spell",
+            )
+            return false
+        }
+        fmt_radix(mut out, k.i, 10, false)
+        return true
+    }
+    if k.t == FL_BOOL {
+        let word = if k.i != 0 then "true" else "false"
+        if w.refuse {
+            let _ = fl_raise(
+                mut vm,
+                "type",
+                "fmt.repr: map key {word} is a bool, which pure-literal syntax cannot spell",
+            )
+            return false
+        }
+        util.buf_append_str(mut out, word)
+        return true
+    }
+    // fl_hashable already closed the key set to these three.
+    (mut out).push(63 as byte)
+    true
+}
+
+// stdfmt.c:448-505.
+fn fmt_rw_map(mut vm: FlVm, mut w: FmtRw, mut out: List[byte], v: FlValue) -> bool {
+    let at = fl_obj_index(vm, v)
+    let (ok, dup) = fmt_rw_enter(mut vm, mut w, at)
+    if !ok { return false }
+    if dup {
+        if w.refuse { return fmt_rw_cycle(mut vm, w) }
+        util.buf_append_str(mut out, "{{...}}")
+        return true
+    }
+    let depth = w.open.len
+    let live = fl_map_count(vm, v)
+    (mut out).push(123 as byte)
+    var cursor = 0
+    var seen = 0
+    loop {
+        let (next, k, val) = fl_map_iter(vm, v, cursor) else break
+        cursor = next
+        let mark = w.path.len
+        if k.t == FL_STR {
+            (mut w.path).push(46 as byte)
+            util.buf_append(mut w.path, vm.gc.slots[fl_obj_index(vm, k)].bytes)
+        } else if k.t == FL_INT {
+            util.buf_append_str(mut w.path, "[{k.i}]")
+        } else {
+            util.buf_append_str(mut w.path, if k.i != 0 then "[true]" else "[false]")
+        }
+        fmt_rw_newline(w, mut out, depth)
+        if !fmt_rw_key(mut vm, w, mut out, k) { return false }
+        util.buf_append_str(mut out, ": ")
+        if !fmt_rw_value(mut vm, mut w, mut out, val) { return false }
+        seen += 1
+        if w.indent != 0 || seen < live { (mut out).push(44 as byte) }
+        if w.indent == 0 && seen < live { (mut out).push(32 as byte) }
+        fmt_truncate(mut w.path, mark)
+    }
+    fmt_rw_newline(w, mut out, depth - 1)
+    (mut out).push(125 as byte)
+    fmt_rw_leave(mut w)
+    true
+}
+
+// stdfmt.c:507-529: functions, natives and the reserved handles.
+fn fmt_rw_uncodeable(mut vm: FlVm, w: FmtRw, mut out: List[byte], v: FlValue) -> bool {
+    let nm = fl_type_name(v.t)
+    if w.refuse {
+        let _ = fl_raise(mut vm, "type", "fmt.repr: a {nm} has no pure-literal form")
+        return false
+    }
+    (mut out).push(60 as byte)
+    util.buf_append_str(mut out, nm)
+    if v.t == FL_CLOSURE || v.t == FL_NATIVE {
+        let at = fl_obj_index(vm, v)
+        var id = vm.gc.slots[at].name_id
+        if v.t == FL_CLOSURE {
+            let f = copy vm.gc.slots[at].fn_value
+            id = vm.gc.slots[fl_obj_index(vm, f)].name_id
+        }
+        if id > 0 && id < vm.strings.items.len {
+            (mut out).push(32 as byte)
+            fmt_put_upto_nul(mut out, vm.strings.items[id], 0, vm.strings.items[id].len)
+        }
+    }
+    (mut out).push(62 as byte)
+    true
+}
+
+// stdfmt.c:531-595.
+fn fmt_rw_value(mut vm: FlVm, mut w: FmtRw, mut out: List[byte], v: FlValue) -> bool {
+    if v.t == FL_NIL {
+        util.buf_append_str(mut out, "nil")
+        return true
+    }
+    if v.t == FL_BOOL {
+        util.buf_append_str(mut out, if v.i != 0 then "true" else "false")
+        return true
+    }
+    if v.t == FL_INT {
+        // INT64_MIN has no literal: §1.4 folds the sign after the magnitude.
+        if w.refuse && v.i == -9223372036854775807 - 1 {
+            let _ = fl_raise(
+                mut vm,
+                "type",
+                "fmt.repr: -9223372036854775808 has no integer literal; its magnitude is one past the i64 maximum",
+            )
+            return false
+        }
+        fmt_radix(mut out, v.i, 10, false)
+        return true
+    }
+    if v.t == FL_FLOAT {
+        let x = v.f
+        if x != x || x > 1.7976931348623157e308 || x < -1.7976931348623157e308 {
+            let word = if x != x then "nan" else if x > 0.0 then "inf" else "-inf"
+            if w.refuse {
+                let _ = fl_raise(mut vm, "type", "fmt.repr: {word} has no float literal")
+                return false
+            }
+            util.buf_append_str(mut out, word)
+            return true
+        }
+        util.buf_append_str(mut out, float_shortest(x))
+        return true
+    }
+    if v.t == FL_STR {
+        // Bare only at the ROOT of a display.
+        let at = fl_obj_index(vm, v)
+        if !w.quote && w.open.len == 0 {
+            util.buf_append(mut out, vm.gc.slots[at].bytes)
+        } else {
+            fmt_quoted(mut out, vm.gc.slots[at].bytes)
+        }
+        return true
+    }
+    if v.t == FL_LIST { return fmt_rw_list(mut vm, mut w, mut out, v) }
+    if v.t == FL_MAP { return fmt_rw_map(mut vm, mut w, mut out, v) }
+    fmt_rw_uncodeable(mut vm, w, mut out, v)
+}
+
+// stdfmt.c:597-619's render_at/render: `out` belongs to the caller either way.
+fn fmt_render(
+    mut vm: FlVm,
+    mut out: List[byte],
+    v: FlValue,
+    quote: bool,
+    refuse: bool,
+    indent: int,
+    max_depth: int,
+) -> bool {
+    var w = FmtRw {
+        quote: quote,
+        refuse: refuse,
+        max_depth: max_depth,
+        indent: indent,
+        path: List[byte](),
+        open: List[int](),
+    }
+    fmt_rw_value(mut vm, mut w, mut out, v)
+}
+
+/// std.h:120-131, stdfmt.c:621-624: display (fmt.str, io.print), best-effort;
+/// it never raises.
+pub fn fl_fmt_display(mut vm: FlVm, mut out: List[byte], v: FlValue) -> bool {
+    fmt_render(mut vm, mut out, v, false, false, 0, FMT_MAX_DEPTH)
+}
+
+/// std.h:133-141, stdfmt.c:626-629: pure-literal source; false having raised
+/// on a value §12 cannot spell.
+pub fn fl_fmt_repr(mut vm: FlVm, mut out: List[byte], v: FlValue) -> bool {
+    fmt_render(mut vm, mut out, v, true, true, 0, FMT_MAX_DEPTH)
+}
+
+/// std.h:143-149, stdfmt.c:631-640: repr's quoting with display's elision;
+/// a max_depth of 0 means the 64 backstop.
+pub fn fl_fmt_repl(mut vm: FlVm, mut out: List[byte], v: FlValue, max_depth: int) -> bool {
+    fmt_render(
+        mut vm,
+        mut out,
+        v,
+        true,
+        false,
+        0,
+        if max_depth == 0 then FMT_MAX_DEPTH else max_depth,
+    )
+}
