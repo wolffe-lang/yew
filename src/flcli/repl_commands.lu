@@ -1,0 +1,243 @@
+//! REPL commands: sagitta 9ace98c2 src/fl/repl.c:38-60,128-379.
+//! State owns only the last load path; the caller owns the session VM.
+//! No scratch region wraps VM allocation while G54 remains unanswered.
+
+use fl
+use util
+
+/// The only state a REPL command retains between entries.
+pub struct FlRepl { last_load: str, has_load: bool }
+
+/// No successful load has occurred yet.
+pub fn repl_new() -> FlRepl { FlRepl { last_load: "", has_load: false } }
+
+fn repl_commands() -> List[str] {
+    ["help", "quit", "load", "reload", "globals", "disasm", "caps", "q"]
+}
+
+fn repl_equal(bytes: List[byte], s: str) -> bool {
+    if bytes.len != s.len { return false }
+    for i in 0..bytes.len { if bytes[i] != s.bytes()[i] { return false } }
+    true
+}
+
+fn repl_append(mut out: List[byte], bytes: List[byte]) {
+    for b in bytes { (mut out).push(b) }
+}
+
+fn repl_cbytes(bytes: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    for b in bytes { if b == 0 as byte { break }; (mut out).push(b) }
+    out
+}
+
+fn repl_help(mut out: List[byte]) {
+    let names = repl_commands()
+    let args = ["[NAME]", "", "PATH", "", "", "NAME", "", ""]
+    let docs = [
+        "this table, or what NAME is",
+        "leave; :q is the same",
+        "evaluate PATH here, keeping its globals",
+        "evaluate the last :load again",
+        "the names you have bound, in order",
+        "the bytecode of a function",
+        "this prompt's origin and its grants",
+        "leave",
+    ]
+    for i in 0..names.len {
+        if names[i] == "q" { continue }
+        util.buf_append_str(mut out, "  :{names[i]}")
+        for _ in names[i].len..8 { (mut out).push(32 as byte) }
+        util.buf_append_str(mut out, " {args[i]}")
+        for _ in args[i].len..7 { (mut out).push(32 as byte) }
+        util.buf_append_str(mut out, " {docs[i]}\n")
+    }
+    util.buf_append_str(
+        mut out,
+        "\n  Enter runs the line; an open bracket or a trailing operator\n  continues it.  Ctrl-C discards what you are typing, Ctrl-D on\n  an empty line leaves, Ctrl-L clears the screen.\n\n  There is no stepping debugger and no breakpoints in 1.0: the\n  trace, :disasm and io.print are the debugging story.  The\n  language is .docs/fletch-spec.md.\n",
+    )
+}
+
+fn repl_globals(mut vm: fl.FlVm, mut out: List[byte]) {
+    var cursor = 0
+    var shown = 0
+    loop {
+        let (next, key, value) = fl.fl_map_iter(vm, vm.globals, cursor) else { break }
+        cursor = next
+        if key.t != fl.FL_INT { continue }
+        var builtin = false
+        var bc = 0
+        loop {
+            let (bn, _, bv) = fl.fl_map_iter(vm, vm.builtins, bc) else { break }
+            bc = bn
+            if bv.t == value.t && bv.i == value.i { builtin = true }
+        }
+        if builtin || key.i <= 0 || key.i >= vm.strings.items.len { continue }
+        util.buf_append_str(mut out, "  ")
+        repl_append(mut out, vm.strings.items[key.i])
+        util.buf_append_str(mut out, " = ")
+        print_result_into(mut vm, value, mut out)
+        if value.t == fl.FL_NIL { util.buf_append_str(mut out, "nil\n") }
+        shown += 1
+    }
+    if shown == 0 { util.buf_append_str(mut out, "  (none yet)\n") }
+}
+
+fn repl_caps(vm: fl.FlVm, mut out: List[byte]) {
+    let origin = fl.fl_cap_origin(vm)
+    util.buf_append_str(mut out, "  origin: ")
+    repl_append(mut out, fl.fl_origin_name(vm, origin))
+    util.buf_append_str(mut out, "\n  grants:")
+    for bit in [
+        fl.FL_CAP_FS_READ,
+        fl.FL_CAP_FS_WRITE,
+        fl.FL_CAP_SHELL,
+        fl.FL_CAP_NET,
+        fl.FL_CAP_CLIPBOARD,
+    ] {
+        if origin.caps & bit != 0 { util.buf_append_str(mut out, " {fl.fl_cap_name(bit)}") }
+    }
+    if origin.caps == 0 { util.buf_append_str(mut out, " (none)") }
+    (mut out).push(10 as byte)
+}
+
+fn repl_diagnostics(vm: fl.FlVm, from: int, mut out: List[byte]) {
+    for i in from..vm.dc.entries.len {
+        let d = copy vm.dc.entries[i]
+        fl.fl_diag_render(mut out, vm.dc, d.level, d.sp, d.msg)
+    }
+}
+
+fn repl_load(mut state: FlRepl, mut vm: fl.FlVm, path: str, mut out: List[byte]) {
+    let src = fs_read_bytes(path) else |_| {
+        util.buf_append_str(mut out, "  cannot read {path}\n")
+        return
+    }
+    let first = vm.dc.entries.len
+    let id = fl.fl_diag_add_file(mut vm.dc, path, src)
+    let p = fl.fl_parse(src, id, mut vm.dc, mut vm.strings)
+    if p.had_error || p.incomplete {
+        repl_diagnostics(vm, first, mut out)
+        util.buf_append_str(mut out, "  {path} did not parse\n")
+        return
+    }
+    let f = fl.fl_compile(mut vm, p, id, fl.fl_cap_origin(vm)) else {
+        repl_diagnostics(vm, first, mut out)
+        util.buf_append_str(mut out, "  {path} did not compile\n")
+        return
+    }
+    vm.gc.slots[fl.fl_obj_index(vm, f)].fnkind = 3
+    let result = fl.fl_vm_run(mut vm, f)
+    repl_diagnostics(vm, first, mut out)
+    if vm.raised {
+        vm.raised = false
+        fl.fl_trace_render(mut vm, result, mut out)
+        return
+    }
+    state.last_load = copy path
+    state.has_load = true
+    util.buf_append_str(mut out, "  loaded {path}\n")
+}
+
+/// Recognize a leading colon, execute its command and append C's output.
+/// Returns (recognized, quit). Call only for a fresh, non-continuation entry.
+/// Filesystem arguments outside UTF-8 refuse by name under the existing G40.
+pub fn repl_command(mut state: FlRepl, mut vm: fl.FlVm, line: List[byte], mut out: List[byte]) -> (
+    bool,
+    bool,
+) {
+    var at = 0
+    while at < line.len && (line[at] == 32 as byte || line[at] == 9 as byte) { at += 1 }
+    if at >= line.len || line[at] != 58 as byte { return (false, false) }
+    at += 1
+    var name0 = List[byte]()
+    while at < line.len &&
+        line[at] != 32 as byte &&
+        line[at] != 9 as byte &&
+        line[at] != 10 as byte &&
+        name0.len < 63 {
+        (mut name0).push(line[at])
+        at += 1
+    }
+    while at < line.len && (line[at] == 32 as byte || line[at] == 9 as byte) { at += 1 }
+    var arg0 = List[byte]()
+    while at < line.len && line[at] != 10 as byte && arg0.len < 1023 {
+        (mut arg0).push(line[at])
+        at += 1
+    }
+    while arg0.len > 0 && (arg0[arg0.len - 1] == 32 as byte || arg0[arg0.len - 1] == 9 as byte) {
+        let _ = (mut arg0).pop()
+    }
+    let name = repl_cbytes(name0)
+    let arg = repl_cbytes(arg0)
+    if repl_equal(name, "quit") || repl_equal(name, "q") { return (true, true) }
+    if repl_equal(name, "help") {
+        if arg.len == 0 {
+            repl_help(mut out)
+        } else {
+            let text = str_from_utf8(arg) else ""
+            let sig = fl.fl_std_sig(text) else ""
+            if sig.len != 0 {
+                util.buf_append_str(mut out, "  {text} {sig}\n")
+            } else {
+                util.buf_append_str(mut out, "  no builtin called '")
+                repl_append(mut out, arg)
+                util.buf_append_str(mut out, "'\n")
+            }
+        }
+        return (true, false)
+    }
+    if repl_equal(name, "globals") { repl_globals(mut vm, mut out); return (true, false) }
+    if repl_equal(name, "caps") { repl_caps(vm, mut out); return (true, false) }
+    if repl_equal(name, "disasm") {
+        if arg.len == 0 {
+            util.buf_append_str(mut out, "  :disasm needs a name\n")
+        } else {
+            let key = fl.fl_int(fl.fl_intern(mut vm.strings, arg, 0, arg.len))
+            let got = fl.fl_map_get(vm, vm.globals, key) else fl.fl_nil()
+            if got.t == fl.FL_CLOSURE {
+                let fnvalue = copy vm.gc.slots[fl.fl_obj_index(vm, got)].fn_value
+                fl.fl_disasm_chunk(vm, fnvalue, mut out)
+            } else {
+                util.buf_append_str(mut out, "  no function called '")
+                repl_append(mut out, arg)
+                util.buf_append_str(mut out, "'\n")
+            }
+        }
+        return (true, false)
+    }
+    if repl_equal(name, "load") {
+        if arg.len == 0 {
+            util.buf_append_str(mut out, "  :load needs a path\n")
+        } else {
+            let path = str_from_utf8(arg) else {
+                util.buf_append_str(mut out, "  not yet ported: non-UTF-8 filesystem path (G40)\n")
+                return (true, false)
+            }
+            repl_load(mut state, mut vm, path, mut out)
+        }
+        return (true, false)
+    }
+    if repl_equal(name, "reload") {
+        if state.has_load {
+            let path = copy state.last_load
+            repl_load(mut state, mut vm, path, mut out)
+        } else {
+            util.buf_append_str(mut out, "  nothing has been :load'ed yet\n")
+        }
+        return (true, false)
+    }
+    util.buf_append_str(mut out, "  unknown command ':")
+    repl_append(mut out, name)
+    util.buf_append_str(mut out, "'; ")
+    var sg = fl.fl_suggest_new()
+    for candidate in repl_commands() {
+        fl.fl_suggest_add(mut sg, candidate.bytes(), fl.FL_SCOPE_LOCAL)
+    }
+    if fl.fl_suggest_render(mut sg, name, mut out) == 0 {
+        let _ = (mut out).pop()
+        let _ = (mut out).pop()
+    }
+    (mut out).push(10 as byte)
+    (true, false)
+}
