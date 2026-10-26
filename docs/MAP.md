@@ -72,7 +72,7 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 
 | sagitta `src/` | files | C lines | port lane | wolf unit(s) | what it needs beyond wolf-std |
 |---|---|---|---|---|---|
-| `src/*.c` (`main`, `args`, `flcli`, `syncli`, `tutor`) | 9 | 3,846 | yw01 (`main`, `args`), **yw07b** (`flcli`'s non-interactive forms, R-yw07-7 A: FILE, `-e`, `-c`, `--dump-ast`, `--dump-bytecode`, `--list-natives`, `--help`, `--caps`, `--origin`, stdin as a script), yw08 (`flcli`'s prompt and `--selftest-fl-bug`, which the port refuses by name), yw10 (`syncli`), yw16 (`tutor`) | `src/yew.lu`, `args` and `flcli` (`src/flcli/flcli.lu`, the VM's host: `fl` below `edit`, R-yw07-5) | — |
+| `src/*.c` (`main`, `args`, `flcli`, `syncli`, `tutor`) | 9 | 3,846 | yw01 (`main`, `args`), **yw07b** (`flcli`'s non-interactive forms, R-yw07-7 A: FILE, `-e`, `-c`, `--dump-ast`, `--dump-bytecode`, `--list-natives`, `--help`, `--caps`, `--origin`, stdin as a script), **yw08** (`flcli`'s prompt and `--selftest-fl-bug`: `src/flcli/repl.lu`, `repl_commands.lu`; the refusals retired), yw10 (`syncli`), yw16 (`tutor`) | `src/yew.lu`, `args` and `flcli` (`src/flcli/flcli.lu`, the VM's host: `fl` below `edit`, R-yw07-5) | — |
 | `src/util/` | 31 | 3,572 | **yw00** (arena, vec, strmap, intern, buf, sort), yw01 (`log`, `xdg`, `base64`), yw15 (`prof`, `calib`, `memacct`), **yw06** (`rss`: `YEW_PROF=1`'s checkpoints from `/proc/self`, which `mem.workspace50` reads), yw12 (`secret`; its name fragments pulled forward by yw04 for the history suggestions), yw01 (`runtime_asset`, `runtime_blob`) | `util` | `log`: `$XDG_STATE_HOME` and never fds 0–2 (fine); `memacct`: a resident-byte model wolf lacks (§5 G12; `rss` reads `/proc` on linux, and off linux answers 0 where C's macOS reads `ru_maxrss`, G12's) |
 | `src/unicode/` | 21 | 12,534 | **yw00** (`utf8`, `grapheme`, `width`, `tables`), **yw02** (`coords`, `u16` — ported INTO `text`: `coords` reads the piece tree and the tree calls the grapheme index, a module cycle, E0303), **yw03** (`wordbreak`, `tables_wb`; `case`, `tables_case` — the selection case commands, `sel_actions.c:665`, needed them first), **yw04** (`category`, `tables_cat`: the generator's `--category`, byte-identical to sagitta's arrays) | `unicode` | none; the generator grew `--word-break` and `--case` (yw03) and `--category` (yw04) |
 | `src/term/` | 10 | 4,910 | **yw01** | `term` (aliasing `std.term`) | the fatal-signal restore (§5 G1); a wait over tty + signals + job pipes (G2) |
@@ -81,7 +81,7 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | `src/search/` | 16 | 7,491 | **yw04** (`parse`, `compile`, `pike`, `dfa`, `literal`, `pack`, `regex`, `search` and `replace` → `search`, below `edit`; `overlay` and `searchui` take the `Ed` and are `edit.overlay`, `edit.searchui`) | `search` (aliasing `std.search`) | none; the port's regex is a `std.regex` candidate; a vectorized byte search (G42) |
 | `src/ui/` | 74 | 46,140 | **yw03** (`viewport`, `statusline`, `gutter`, `message`, `draw`, `win`: sprint 15 is campaign 03's — corrected by yw02 — and every one takes the `Ed` that `edit` calls them with, a cycle wolf refuses (E0303), so they are `src/edit/*.lu` with sagitta's names; plus the two interims the goldens need: `tabs`' single-tab strip, `edit.tabs`, R-yw03-3, and a narrow `:` from `cmdline`, `edit.cmdline`, R-yw03-1), **yw05** (`layout` — the pane tree in cells, the ratio as C's float bits (G44) —, `region` in full, `glyphs`, `tabs` in full, `strip` — s23 §3's engine, corrected from yw06 —, `groups`, `groupnav`, `grouppicker`, `groupfromdir`, the border and dim-inactive half of `draw`, and the mouse router's click-to-focus, border drag and strip press/release; every one takes the `Ed`, so `src/edit/*.lu` with sagitta's names), **yw06** (`filter`, `picker`, `pickers`, `typejump`, the rest of `mouse` — one router at the pin's state, R-yw06-2 —, `ctxmenu` and `ctxrows` with `mouse.c`'s `ed.ui.context_menu` as `edit.ctxcmd`; all take the `Ed`, so `src/edit/*.lu`), **yw04** (`cmdline` in full as `edit.cmdline` with `cmdline_hist`, `cmdline_comp`, `cmdline_shell`, `cmdline_seams` and the interim `option_cmdline` — `:set NAME VALUE` over `Opts` until yw09; `cmdhist`, `cmdparse`, `cmdedit` — `A-e`'s `*command-line*` tab over a narrow `ed.tab.close`, R-yw04-5 —, `cmdcomp` with its `:!` half in `edit.cmdcomp_shell`, `compgen`, `compspec` — the 24 `runtime/completions/*.fl` copied verbatim, read by `edit.fldata` (R-yw04-4) —, `comphelp`, `compfish`, `shctx`, `menu` — s18.5 §5's ranked list, `menu.h:4-13` — and a narrow `region`, the menu's rows only, R-yw04-2), yw11 (`complmenu`, s44's) | `edit` (campaign 03's), `ui` (later) | none known |
 | `src/ws/` | 28 | 10,820 | **yw06** (`workspace`, `walk`, `gitignore`, the hand codec `fl_emit`/`fl_parse`/`fllit`/`state_lit` as the interim production path — R-yw06-1, its strings `List[byte]` —, and `state_emit`/`state_parse`/`state_save`, which take the `Ed` and are `edit.state_*`), **yw04** (`fuzzy` with `finder.h`, pulled forward from s26 by s18.5 §1, `finder.h:5-7`: `ws.fuzzy`, the `ws` module's first file), yw09 (`state_fletch`, the swap to Fletch data that retires the hand codec, and `trust*` with `flconf.c`, its only consumer: R-yw06-5), yw11 (`sym*`) | `ws` | `realpath` (G4); XDG dirs; non-UTF-8 entry names (G40: skipped by the walk and logged, R-yw06-6) |
-| `src/fl/` | 61 | 26,269 | yw07 (the 0.2.35 pin), **yw07b** (lex, parse, ast, compile, vm, value, gc, opcodes, diag, dump, data, module, std, stdstr, stdlist, stdmap, stdmath, stdfmt, stdio, stdre; pulled forward by R-yw07-6 A: suggest, trace, origin's check half `origin.c:203-275`, flapi's descriptor table with its headless path, the prelude's editor natives and `stdai`'s headless `ai.backend` — `stdai.c` is Sprint 48's, campaign 10, not yw09's), yw08 (repl, vmcheck), yw09 (flapi's editor-attached path, flconf, fleval, flhook, flruntime, fltxn, handle, record, macrolib, motion_tab, the rest of origin) | `fl`, plus `flfix` (the shared unit fixture, `tests/unit/flfix.{h,c}`) | none: G6 closed by the toy VM (R-yw07b-1); G51–G54 met |
+| `src/fl/` | 61 | 26,269 | yw07 (the 0.2.35 pin), **yw07b** (lex, parse, ast, compile, vm, value, gc, opcodes, diag, dump, data, module, std, stdstr, stdlist, stdmap, stdmath, stdfmt, stdio, stdre; pulled forward by R-yw07-6 A: suggest, trace, origin's check half `origin.c:203-275`, flapi's descriptor table with its headless path, the prelude's editor natives and `stdai`'s headless `ai.backend` — `stdai.c` is Sprint 48's, campaign 10, not yw09's), **yw08** (repl, vmcheck, and the structured invariant report as `vmbug`), yw09 (flapi's editor-attached path, flconf, fleval, flhook, flruntime, fltxn, handle, record, macrolib, motion_tab, the rest of origin) | `fl`, plus `flfix` (the shared unit fixture, `tests/unit/flfix.{h,c}`) | none: G6 closed by the toy VM (R-yw07b-1); G51–G54 met |
 | `src/syn/` | 14 | 13,064 | yw10 | `syn` | none known |
 | `src/mod/lsp/` | 21 | 11,283 | yw11 | `lsp` | `std.json` exists; incremental `didChange` is the port's own |
 | `src/mod/ai/` | 37 | 12,093 | yw12 | `ai` | an HTTP/1.1 client over `std.net` (the port's own; a std candidate, G9) |
@@ -195,7 +195,7 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G8 | **a sub-millisecond clock.** Every perf gate is nanoseconds (`budgets.txt`); the port's harness needs `CLOCK_MONOTONIC` at ns. | yw01's gates, every lane's ratio | `clock_ms`, `time_now_ms`, `time_unix_ms` — milliseconds. `tools/perf-unicode` batches 32 scans a round to measure. | `notes/yw00-evidence/witness/clock-ms.lu`: two `clock_ms` reads around a 100 us loop answer the same value | wolf-lang (gap: `clock_ns()`); wolf-std (`time.now` at ns) |
 | G9 | **an HTTP/1.1 client** (localhost only; TLS through curl). | yw12 | `std.net` has sockets and lobo's server-side; no client. The port writes its own over `net_connect`, a std candidate. | — | wolf-std (candidate, not a gap) |
 | G10 | **`wolf test` discovers `test_*` only in a package's alphabetically first file.** | every lane's tests | `ubcheck::discover_tests` reads `pkg.files[0]` (`crates/wolf_mem/src/ubcheck.rs:2356-2374` at `72de141f`): `src/util/arena_test.lu` had its `test_*` run one by one, `src/util/buf_test.lu` beside it fell back to `main`. | `notes/yw00-evidence/witness/test-discovery/` (two files, one `wolf test` run) | wolf-lang (bug) |
-| G11 | **no bitwise not.** `~x` is not wolf syntax (E0107). | every bit-field unit | `x - (x & m)` clears bits; `x ^ m` flips them. Grammar has `&`, `\|`, `^`, `<<`, `>>`. | `notes/yw00-evidence/witness/bitnot.lu` | wolf-lang (gap or spec note: `~`, or a `bits.not`)  **yw07 adoption:** 0.2.35 / s252 clarifies integer `!x` (not `~x`); release adopted in `7a9ae6e`. Existing explicit mask expressions remain; no new port-wide rewrite is claimed. |
+| G11 | **no bitwise not.** `~x` is not wolf syntax (E0107). | every bit-field unit | `x - (x & m)` clears bits; `x ^ m` flips them. Grammar has `&`, `\|`, `^`, `<<`, `>>`. | `notes/yw00-evidence/witness/bitnot.lu` | wolf-lang (gap or spec note: `~`, or a `bits.not`)  **yw07 adoption:** 0.2.35 / s252 clarifies integer `!x` (not `~x`); release adopted in `7a9ae6e`. Existing explicit mask expressions remain; no new port-wide rewrite is claimed.  **yw08 correction (yew#12):** the premise was wrong: integer `!` is the complement at its own width since v0.2.26 (spec `[type.int.not]`, ruling #51). Every `x - (x & m)` in shipping source is now `x & !m`, as C's `x & ~m` (twenty sites in eleven files, `2a290fc`..`cda7f43`, layout `d703f73`); `src/edit_ctxrows_test.lu`'s setup line stays (no unit case edited). Nothing to file. |
 | G12 | **a resident-byte model per structure** (`memacct.h`: `arena_resident_bytes`, `strmap_insert_cost`), the symbol index's memory cap (s57.33). | yw11 | `region_bytes(r)` is a region's ledger, per tier; no per-value cost. The cap can be charged by the region holding the index. | — | nothing yet; yw11 decides |
 | G13 | **`==` on a `List`** is refused (`no Eq for these this edition`). | tests, buffers | element-wise loops (`same_bytes`). The conservatism ledger, known. | the generator's `--check` needed its own compare | nothing new to file |
 | G14 | **a `match` arm cannot assign** (E0208): `0 => d.x = v` | the decoder's state | if-chains (`unicode.utf8.pend_set`). | — | spec question for the orchestrator (grammar), not a bug |
@@ -244,6 +244,8 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G54 | **A tier disagreement on a region-built large value rooted into the VM**: one `region` builds a 100,000-byte Fletch string and a 64-element list, roots them in the VM's stack, and reads and collects after the region. checked exit 0; native exit 139; release exit 139. The 1,024-byte control exits 0 on all three tiers. | yw07b (a native's caller-owned temporaries) | none: no scratch `region` wraps a native's allocation until the issue is answered, and caller-owned native temporaries stay allocation-pending with no boundedness claim. Only the witness program and its exit status per tier are recorded. | `notes/yw07b-evidence/stdlib/scratch-once/` (exit 0 / 139 / 139), `scratch-small/` (0 / 0 / 0), `scratch-escape/` (20 rounds: checked step budget, native 139, release 139); each `main.lu` + `run.log` | **wolf-lang#948** (native and release exit 139 where checked exits 0) |
 
 | G55 | **The terminal mode word cannot read or set ONLCR.** `RAW_OUTPUT=0` enables OPOST only (`wolf_rt/src/term.rs:212-215` at v0.2.35). | yw08's line-oriented raw REPL; C `tty.c:514-531` enables OPOST and ONLCR | Keep OPOST on. ONLCR cannot be repaired when it was initially off; no subprocess workaround and no full-flag parity claim. The ordinary-default PTY goldens pass. | `notes/yw08-evidence/onlcr/probe.py`, `run.log`, `C.bytes`, `wolf.bytes`: isolated child PTYs with ONLCR cleared before exec; both exit 0, C prints CRLF and the port bare LF | **wolf-lang, to file by the orchestrator**: `notes/yw08-evidence/onlcr/issue.txt`; an `os_term` output-flag surface carrying ONLCR or an opaque/raw termios word, including restoration |
+| G56 | **The native tier lowers a dense integer `match` as a compare chain**: 60 literal arms, each op read from a 1,000,000-entry list so the dispatch cannot be hoisted, cost 1.4 / 4.3 / 7.4 ns per op at arms 0 / 30 / 59 on native and a flat 1.5 / 1.6 / 1.6 ns on release. | yw07b/yw08 (the Fletch VM's 57-arm dispatch; part of R-yw07b-1's native MISS rows, 60-194x) | none in source: the release tier dispatches by table, and the native tier is a named backend MISS | `notes/yw08-evidence/perf/witness-match/` (`main.lu`, `run.sh`, `run.log`; kasumi 12-15, three runs per tier) | **wolf-lang, to file by the orchestrator** (native codegen: a jump table for a dense integer `match`) |
+| G57 | **Release codegen of the 4,747-instruction dispatch loop is fragile, and its per-instruction helpers never inline at WIR level.** `fl_read8`/`fl_push`/`fl_pop`/`fl_read16` carry effect-token parameters and several blocks, so `wolf_wir`'s inliner skips them (`inline.rs:22-27`, `decide()`); the summary keeps them as call edges of `fl_vm_exec`. In a small loop the call costs 2-4% on release (15% native); in the VM, writing the 43 call sites inline by hand makes fib24/fib27 1.8x SLOWER, and moving the cold arms out moves no row beyond host drift. | yw08 (yew#77, R-yw08-3) | none adopted; the rows stay named MISS (`tools/perf-fletch-misses.txt`) | `notes/yw08-evidence/perf/witness-inline/` (reduced: the small-loop half); `notes/yw08-evidence/perf/experiments/` (the VM half, not reduced: `inline-exec.py` regenerates the variant from `src/fl/vm.lu`, `summary.txt`, the logs); `perf/profile/named.txt` (counts by name) | **wolf-lang, to file by the orchestrator** (release codegen: why the inline variant of one large function doubles its cost; whether the token-parameter rule should admit small multi-block leaves) |
 
 
 **yw07b float-host rulings (R-yw07b-2 and R-yw07b-3, coordinator under
@@ -629,7 +631,46 @@ maintainer.
   names. The contract text stands as drafted, with this erratum.
 
 - **R-yw08-1 provenance correction** (coordinator, 2026-10-26): the draft's proposed `yew_cmdline_edit_key` is not a pinned C API. s32's correction C1 and `repl.c:385-408` share TextBuf/Cursor/EditCtx but retain the REPL's own key switch because registry dispatch needs Ed. The port follows that shape, not an invented seam.
-- **R-yw08-4 — completion prose, accepted A** (coordinator, 2026-10-26): the pinned `repl.c:848-926` key switch has no Tab-completion branch. Preserve the pinned C key behavior, not the earlier sprint/draft prose promising completion. No oracle or golden is changed.
+- **R-yw08-4 — completion prose, accepted A** (recorded by the Codex lane as the coordinator's, 2026-10-26; the crawl does not log it, so the orchestrator confirms): the pinned `repl.c:848-926` key switch has no Tab-completion branch. Preserve the pinned C key behavior, not the earlier sprint/draft prose promising completion. No oracle or golden is changed.
+
+- **R-yw08-2 — the bug report's static buffer: implemented as (A).** A
+  4,096-byte `List[byte]` reserved at VM init (`vm.bug_report`,
+  `FL_BUG_REPORT_CAP`, `src/fl/vmbug.lu`), only reset and refilled, never
+  walking a value: 100 reports at zero allocations (`tools/check-fl-report`),
+  the thirteen guards exit 4 with structured reasons (`tools/check-fl-invariants`).
+- **R-yw08-3 — the MISS rows: (A) carried out, nothing adopted.** Counts by
+  function (`notes/yw08-evidence/perf/profile/named.txt`): per fib27 run
+  `fl_read8` 13.0M entries, `fl_push` 5.7M, `fl_pop` 4.4M, one
+  `fl_close_upvals` and one `fl_map_probe` per call. Four experiments against
+  same-session controls (`perf/experiments/summary.txt`): the helpers written
+  inline (fib +82%), the cold arms outlined twice (inside host drift, list_sort
+  +18% the first time), the reference assert dropped as a measurement (inside
+  drift). The eleven release rows stay named MISS on yew#77
+  (`tools/perf-fletch-misses.txt`) and are held to `tools/perf-fletch-baseline.txt`
+  by the regression gate; G56 and G57 carry the witnesses. Recommended: (A)
+  continues; the 2x bar stays; the wolf-lang issues are filed from G56/G57.
+  The maintainer's (B), a Fletch-specific bar, remains not recommended.
+- **R-yw08-5 — `YEW_FL_VM_CHECKS` mirrors C's `FL_CHECKS` switch: accepted A**
+  (the orchestrator, crawl-54, 2026-10-26).
+- **R-yw08-6 — fuzz_fl_vm's per-input watchdog.** C arms `alarm(5)` in the
+  check and an `ITIMER_PROF` timer in `fuzzlib.c`; the port runs no code in a
+  handler. (A) a wall-clock progress pipe the driver writes before each input,
+  watched by `tools/fuzz-fl-vm/watch.py` (exit 124 naming the input, as C's
+  `_Exit(124)`), implemented; the slowest of 200,000 inputs takes 1 ms against
+  the 5,000 ms bound. (B) the other port fuzzers' shape, a whole-run `timeout`
+  only. Recommended A.
+- **R-yw08-7 — the port's Fletch perf baseline.** (A) the maximum over three
+  control sessions on kasumi, implemented (`tools/perf-fletch-baseline.txt`;
+  session drift reached 16% on one row); (B) one session, which flags the host;
+  (C) wait for yw15's designated quiet host (Sprint 56's model). Recommended A
+  until yw15, which recalibrates.
+- **R-yw08-8 — the editor ledger's start-up rows.** yw07's two yew#55 rows
+  pass at the 0.2.35 pin: 1.31 and 1.19 by the R12 method over 20 trials, and
+  1.31 over three interleaved rounds of 50 starts (#66's ask). (A) return
+  them to the 2x gate (implemented, `585b57f`; tab-switch p99 re-measured at
+  the closeout) and close #55's start-up half and #66; (B) keep them named
+  until a re-pin. Recommended A. It reverses yw07's disposition on
+  measurement, so it is the orchestrator's to accept or revert.
 
 ## 7. The next contracts
 
@@ -766,20 +807,37 @@ One paragraph each; yw01's is drafted in full
   `notes/yw07b-fletch-core.md`). The GC-stress run's wolf/C ratio is
   1.807.
 - **yw08 — the prompt, the bug report, the ledger and the perf gates**
-  (s32 §2–§5 and §8–§9, s33 §3–§6; `src/fl/` repl, vmcheck; `flcli`'s
-  prompt and `--selftest-fl-bug`). **Drafted in full by yw07b**
-  (`notes/contracts/yw08-repl-errors-conformance-perf.md`): the prompt
-  over the one line editor (R-yw08-1), the exit-4 report (R-yw08-2),
-  `fuzz_fl_vm`, the coverage ledger, `perf_fletch`'s gates with yw07b's
-  MISS rows to ratchet or dispose (R-yw08-3), and M-YW6's prompt golden
-  and coverage gate.
-- **yw09 — Fletch in the editor** (s34–s38; `src/fl/` flapi, flconf,
-  fleval, flhook, flruntime, fltxn, handle, record, macrolib, origin;
-  `src/edit/batch.c`). Editor handles and the capability-checked
-  binding layer, the recorder and the round-trip law (the port's own
-  round-trip harness, since sagitta's is in-process), `init.fl` and the
-  workspace `.yew.fl` trust prompt, `--batch`, the macro UX. Goldens:
-  the script suite and the round-trip and batch tests (M-YW7).
+  (s32 §2–§5 and §8–§9, s33 §3–§6; `src/fl/` repl, vmcheck, vmbug;
+  `flcli`'s prompt and `--selftest-fl-bug`), adopted from yw07b's draft
+  (`notes/contracts/yw08-repl-errors-conformance-perf.md`) and landed
+  (`notes/yw08-repl-errors-conformance-perf.md`): the prompt over the shared
+  text primitives (s32 C1, R-yw08-1's correction) with history, continuation,
+  the `:`-commands and the restore on every exit; the structured exit-4 report
+  from reserved storage (R-yw08-2) with `--selftest-fl-bug` and
+  `YEW_FL_DUMP_BAD_CHUNK`; the 10 + 5 pinned cases; the three PTY goldens by
+  name; `fuzz_fl_vm` equal to C's report line with its watchdog and tally
+  floor (R-yw08-6); the coverage gate and ledger through sagitta's own script;
+  the Fletch bench gate (C's regression rule, budgets policy, a baseline and a
+  named-MISS ledger, R-yw08-3/-7); M-YW6's four artifacts in CI; yew#12
+  retired; the yew#55 start-up rows back on the 2x gate (R-yw08-8).
+- **yw09 — Fletch in the editor** (s34–s38, drafted in full:
+  `notes/contracts/yw09-fletch-in-the-editor.md`). `src/fl/` handle, flhook,
+  motion_tab, fltxn, flruntime, fleval, record, flconf, macrolib and
+  flapi's editor-attached half; `src/edit/` option, batch, the REC chip of
+  statusline; `src/ws/` trust, trust_prompt, state_fletch; `src/ui/`
+  macrobrowse; `runtime/init.fl` live and the keys_default shrink. Editor
+  handles and the capability-checked binding layer, `edit{}` and `on()`, the
+  recorder and the round-trip law (the port's own round-trip harness, since
+  sagitta's links the editor), `init.fl` and the workspace trust prompt,
+  `--batch`, the macro UX. Goldens at the pin (not the sprint prose's names):
+  the script suite (94 `.fl`: 00–47, `macroux_*` 21 and the rest) through
+  `tests/script/runner.c`, the round-trip runner (2,000 seeds) and its 6
+  fixtures, the 21 recorder `.rec` files, 10 PTY cases (s35 3, s37 1,
+  s38 6), `fuzz_flapi` and `fuzz_record` with their corpora,
+  `batch_kill9`, and the editor rows of `perf_fletch` (`config_load`,
+  `config_reload_500`, `macrolib_scan_200`, `motion_editor`,
+  `query_cur_pos`, `insert_100k`) beside `perf_record`, `batch` and
+  `script_suite` (M-YW7).
 - **yw10 — highlighting** (s39–s42.5; `src/syn/`, `src/syncli.c`,
   `runtime/syntax/`, `runtime/themes/`). The incremental line-state
   engine, definitions as Fletch data, the 48 shipped modes and two
