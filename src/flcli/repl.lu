@@ -1,0 +1,209 @@
+//! Interactive prompt: sagitta 9ace98c2 src/fl/repl.c:381-963.
+//! s32 correction C1: TextBuf/Cursor/EditCtx are shared with the editor;
+//! key dispatch is the REPL's own, since the editor registry needs Ed.
+//! No alternate screen. G54 forbids a scratch region around VM allocation.
+
+use edit
+use fl
+use term
+use text
+use unicode
+use util
+
+struct ReplLine { ec: text.EditCtx, cur: text.Cursor }
+
+fn line_new() -> ReplLine {
+    var tb = text.textbuf_new()
+    ReplLine { ec: text.editctx_new(take tb), cur: text.cursor_at(text.byteoff(0)) }
+}
+
+fn line_insert(mut line: ReplLine, bytes: List[byte]) {
+    if bytes.len == 0 || !text.edit_insert(mut line.ec, text.byteoff(line.cur.pos), bytes) {
+        return
+    }
+    line.cur.pos += bytes.len
+    line.cur.anchor = line.cur.pos
+}
+
+fn line_delete(mut line: ReplLine, lo: int, hi: int) {
+    if hi <= lo || !text.edit_delete(mut line.ec, text.span(lo, hi)) { return }
+    line.cur.pos = lo
+    line.cur.anchor = lo
+}
+
+fn line_set(mut line: ReplLine, bytes: List[byte]) {
+    let len = text.textbuf_len(line.ec.tb)
+    line_delete(mut line, 0, len)
+    line_insert(mut line, bytes)
+}
+
+fn line_word_left(line: ReplLine) -> int {
+    let bytes = text.textbuf_bytes(line.ec.tb)
+    var at = line.cur.pos
+    while at > 0 && (bytes[at - 1] == 32 as byte || bytes[at - 1] == 9 as byte) { at -= 1 }
+    while at > 0 && bytes[at - 1] != 32 as byte && bytes[at - 1] != 9 as byte { at -= 1 }
+    at
+}
+
+fn repl_redraw(line: ReplLine, continued: bool) {
+    let prompt = if continued then "... " else "fl> "
+    let bytes = text.textbuf_bytes(line.ec.tb)
+    var out = List[byte]()
+    util.buf_append_str(mut out, "\r{prompt}")
+    repl_append(mut out, bytes)
+    util.buf_append_str(mut out, "\x1b[K")
+    let width = unicode.str_width(bytes, 0, line.cur.pos, 1)
+    let cells = if width < 0 then 0 else width
+    util.buf_append_str(mut out, "\r\x1b[{prompt.len + cells}C")
+    out_bytes(out)
+}
+
+fn repl_entry(
+    mut state: FlRepl,
+    mut vm: fl.FlVm,
+    mut pending: List[byte],
+    mut out: List[byte],
+) -> bool {
+    if pending.len == 0 { return false }
+    let (command, quit) = repl_command(mut state, mut vm, pending, mut out)
+    if command { (mut pending).reset(); return quit }
+    if fl.fl_repl_classify(mut vm.strings, pending) == fl.FL_REPL_CONTINUE { return false }
+    vm.dc = fl.fl_diag_init()
+    let id = fl.fl_diag_add_file(mut vm.dc, "<repl>", pending)
+    let p = fl.fl_parse(pending, id, mut vm.dc, mut vm.strings)
+    if p.had_error {
+        repl_diagnostics(vm, 0, mut out)
+        (mut pending).reset()
+        return false
+    }
+    let origin = copy vm.root_origin
+    let f = fl.fl_compile_repl(mut vm, p, id, origin) else {
+        repl_diagnostics(vm, 0, mut out)
+        (mut pending).reset()
+        return false
+    }
+    let result = fl.fl_vm_run(mut vm, f)
+    repl_diagnostics(vm, 0, mut out)
+    if vm.raised {
+        vm.raised = false
+        fl.fl_trace_render(mut vm, result, mut out)
+    } else {
+        print_result_into(mut vm, result, mut out)
+    }
+    (mut pending).reset()
+    false
+}
+
+fn repl_main() -> int {
+    var tty = term.tty_new()
+    term.tty_open(mut tty) else |_| { return util.EXIT_IO }
+    term.tty_set_output_processing(mut tty, true)
+    term.tty_raw(mut tty) else |_| { term.tty_close(mut tty); return util.EXIT_IO }
+    var run = run_open(fl.FL_ORIGIN_REPL, fl.FL_CAP_ALL)
+    run.vm.dc.echo = false
+    run.vm.root_origin = copy run.origin
+    var state = repl_new()
+    var line = line_new()
+    var input = term.input_new(tty.caps)
+    var hist = edit.hist_open("fl")
+    var hcur = edit.histcur_new()
+    edit.hist_cur_reset(mut hcur, List[byte]())
+    var pending = List[byte]()
+    var out = List[byte]()
+    var quit = false
+    print_raw("yew {util.VERSION} -- :help for help, :quit to leave\r\n")
+    repl_redraw(line, false)
+    while !quit {
+        let (ready, meaning) = term.tty_wait(mut tty, List[int](), -1) else { break }
+        if meaning != 0 { let _ = term.tty_on_signal(mut tty, meaning); continue }
+        if ready != 0 { continue }
+        let bytes = term.tty_read(tty) else |_| { break }
+        term.input_feed(mut input, bytes, 0, bytes.len)
+        var key = term.key_new()
+        while term.input_next(mut input, 0, mut key) {
+            if key.ev == term.KEY_RELEASE { continue }
+            (mut out).reset()
+            let ctrl = key.mods & term.MOD_CTRL != 0
+            if key.code == term.KEY_ENTER || key.code == 106 && ctrl {
+                let typed = text.textbuf_bytes(line.ec.tb)
+                let opened = pending.len == 0
+                print_raw("\r\n")
+                repl_append(mut pending, typed)
+                (mut pending).push(10 as byte)
+                line_set(mut line, List[byte]())
+                quit = repl_entry(mut state, mut run.vm, mut pending, mut out)
+                if opened && pending.len == 0 && typed.len != 0 { edit.hist_add(mut hist, typed) }
+                if out.len != 0 { out_bytes(out) }
+                if quit { break }
+                repl_redraw(line, pending.len != 0)
+                continue
+            }
+            var redraw = true
+            if key.code == term.KEY_BACKSPACE {
+                if line.cur.pos != 0 {
+                    var probe = copy line.cur
+                    text.cursor_left(mut line.ec.tb, mut probe)
+                    let hi = line.cur.pos
+                    line_delete(mut line, probe.pos, hi)
+                }
+            } else if key.code == term.KEY_DELETE {
+                if line.cur.pos < text.textbuf_len(line.ec.tb) {
+                    var probe = copy line.cur
+                    text.cursor_right(line.ec.tb, mut probe)
+                    let lo = line.cur.pos
+                    line_delete(mut line, lo, probe.pos)
+                }
+            } else if key.code == term.KEY_LEFT {
+                if ctrl {
+                    line.cur.pos = line_word_left(line)
+                } else {
+                    text.cursor_left(mut line.ec.tb, mut line.cur)
+                }
+                line.cur.anchor = line.cur.pos
+            } else if key.code == term.KEY_RIGHT {
+                text.cursor_right(line.ec.tb, mut line.cur)
+                line.cur.anchor = line.cur.pos
+            } else if key.code == term.KEY_HOME {
+                text.cursor_line_home(line.ec.tb, mut line.cur)
+                line.cur.anchor = line.cur.pos
+            } else if key.code == term.KEY_END {
+                text.cursor_line_end(mut line.ec.tb, mut line.cur)
+                line.cur.anchor = line.cur.pos
+            } else if key.code == term.KEY_UP {
+                let found = edit.hist_prev(hist, mut hcur) else { continue }
+                line_set(mut line, found)
+            } else if key.code == term.KEY_DOWN {
+                let found = edit.hist_next(hist, mut hcur) else { continue }
+                line_set(mut line, found)
+            } else if key.code == 99 && ctrl {
+                (mut pending).reset()
+                line_set(mut line, List[byte]())
+                print_raw("\r\n")
+            } else if key.code == 100 && ctrl {
+                let empty = text.textbuf_len(line.ec.tb) == 0 && pending.len == 0
+                if empty {
+                    print_raw("\r\n")
+                    quit = true
+                    break
+                }
+                (mut pending).reset()
+                line_set(mut line, List[byte]())
+                print_raw("\r\n")
+            } else if key.code == 108 && ctrl {
+                print_raw("\x1b[2J\x1b[H")
+            } else if key.code < term.KEY_BASE &&
+                key.text.len != 0 &&
+                key.mods & (term.MOD_ALT | term.MOD_CTRL | term.MOD_SUPER) == 0 {
+                line_insert(mut line, key.text)
+            } else {
+                redraw = false
+            }
+            if redraw { repl_redraw(line, pending.len != 0) }
+        }
+    }
+    text.textbuf_free(mut line.ec.tb)
+    edit.hist_flush(mut hist)
+    edit.hist_cur_dispose(mut hcur)
+    term.tty_close(mut tty)
+    util.EXIT_OK
+}
