@@ -28,7 +28,7 @@ number from the same run, and a 2x gate holds from the first paint.
 
 ## Status
 
-Campaigns 00 to 05 of sagitta's fifteen (yw00 to yw06), at wolf
+Campaigns 00 to 06 of sagitta's fifteen (yw00 to yw08), at wolf
 0.2.35 (lupin 0.1.56): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
 identical to sagitta's); the terminal (raw mode, the input decoder, the
 cell grid and damage renderer, the restore on every exit path); the text
@@ -42,8 +42,14 @@ workspace key and its saved session (resumed on the next launch,
 byte-identical to C yew's state file), the startup plan, the fuzzy
 finder over the workspace walk and `.gitignore` with the buffer, undo
 and command pickers, and the mouse: click, wheel, drag and drop with
-the strip's previews, drag-to-spawn and the context menus. Each
-campaign's reachable PTY goldens are gated by name against C yew's
+the strip's previews, drag-to-spawn and the context menus; and Fletch,
+the editor's scripting language, as `yew fl`: the lexer, parser,
+compiler and VM with its collector and standard modules, the
+interactive prompt, and the structured report a broken VM invariant
+exits with (campaign 06's 39 conformance units, its coverage ledger and
+three fuzzers against C's drivers). Fletch inside the running editor
+(bindings, the recorder, `init.fl`, `--batch`) is campaign 07's, yw09.
+Each campaign's reachable PTY goldens are gated by name against C yew's
 (campaign 05's eleven that need FUSS or syntax
 highlighting are recorded under the lane that lands them); every path
 not yet ported hard-errors naming its sagitta sprint and the port lane
@@ -53,11 +59,12 @@ met, is [`docs/MAP.md`](docs/MAP.md); `CHANGELOG.md` has each lane.
 
 The 0.2.35 adoption restores read-only callbacks and shared stable sorting,
 uses the standard terminal wrappers and non-blocking clipboard writes, and
-reuses menu and tab-frame storage. Fletch is not implemented in this cut.
-Mutable callbacks and some allocation/filesystem work remain open in the
-map. The measured startup and tab-switch pin regressions are named MISS
-rows tracked by yew#55 / wolf-lang#918, to be re-measured at the next pin;
-first Backspace remains yew#53. Other host/metric rows keep the 2× gate.
+reuses menu and tab-frame storage. Mutable callbacks and some
+allocation/filesystem work remain open in the map. The start-up rows meet
+the 2× gate again (yew#55); the tab-switch row stays named under yew#55
+and first Backspace under yew#53. Eleven of Fletch's thirteen release
+bench rows are over 2× and named under yew#77, and its native tier is a
+named backend MISS. Other host/metric rows keep the 2× gate.
 
 ## Build and test
 
@@ -71,6 +78,8 @@ tools/check-test-cases           # the checked machine one case at a time (files
 tools/check-tables               # tables.lu is the generator's, and sagitta's
 tools/oracle --unit              # C yew at the pin, gcc and clang, its unit suite
 tools/goldens --yew target/release/yew
+tools/check-fletch-goldens target/release/yew   # Fletch: 39 units, stressed and twice
+tools/check-fletch-coverage target/release/yew  # the coverage gate and its ledger
 ```
 
 Builds and tests run on linux x86-64 and macOS arm64; on linux aarch64
