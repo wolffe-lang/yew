@@ -5,6 +5,32 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw08 — the Fletch prompt, its bug report, the ledger and the perf gates (2026-10-26)
+
+- The pin kept at wolf 0.2.35 / lupin 0.1.56 (the latest releases, read
+  at launch and at the takeover).
+- `yew fl` with a terminal (s32 §2–§5): the prompt over the shared
+  TextBuf/Cursor primitives (s32 C1), `fl` history, multiline
+  continuation, the `:`-commands, result printing shared with `flcli`,
+  the terminal restored on every exit; `test_fl_repl`'s 10 cases and the
+  `s32_repl_session` / `s33_hello_world_repl` goldens by name.
+- The structured exit-4 report (s32 §9): `fl_chunk_check`, the report
+  from a reserved 4 KiB buffer, `--selftest-fl-bug`,
+  `YEW_FL_DUMP_BAD_CHUNK`, the thirteen guards; `test_fl_chunkcheck`'s 5
+  cases, `s32_bug_restores_the_terminal`, fourteen `yew fl` smoke rows.
+- `fuzz_fl_vm` (s32 §8): its report line C's driver's at 200,000 inputs,
+  a per-input watchdog, and a tally floor so a driver that skips its body
+  cannot pass.
+- The coverage gate and ledger (s33 §3–§4) through sagitta's own script
+  against the port; the Fletch bench gate (s33 §5): C's two-condition
+  regression rule, the budgets policy, a kasumi baseline and a
+  named-MISS ledger (eleven release rows over 2×, yew#77), in CI with
+  timing advisory and sanity hard.
+- yew#12 retired (integer `!` for every mask clear); the yew#55
+  start-up rows back on the editor's 2× gate; `tools/check-test` prints
+  a checked trap's conform-run record (yew#78); `tools/check-fmt` names
+  every non-canonical file.
+
 ### yw06 — workspace, finder and mouse (2026-10-23)
 
 - yw05-tail first (PR #46); the pin kept at wolf 0.2.34 / lupin 0.1.55 /
