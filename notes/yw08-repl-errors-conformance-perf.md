@@ -14,8 +14,8 @@ The contract's rules, as kept:
 - No golden, unit case, conformance file, sagitta baseline or ledger edited.
   The two new files under `tools/` (`perf-fletch-baseline.txt`,
   `perf-fletch-misses.txt`) are the port's own measurements and dispositions.
-  The two guided fuzz seeds are copied from the pin byte for byte, blob shas
-  `dd1912e4` and `7927d4a4`.
+  The two guided fuzz seeds are copied from the pin byte for byte: their
+  `git hash-object` equals the pin's tree entries (`6caa3ae`).
 - sagitta read and cited only, at `9ace98c2`. No other editor's, VM's,
   line editor's or readline's source. The wolf-lang repository was read for
   its spec and its inliner's documented rules (`spec/01-grammar.md` §3.2;
