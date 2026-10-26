@@ -27,7 +27,7 @@ The format follows Keep a Changelog; the port has no release yet.
   named-MISS ledger (eleven release rows over 2×, yew#77), in CI with
   timing advisory and sanity hard.
 - yew#12 retired (integer `!` for every mask clear); the yew#55
-  start-up rows back on the editor's 2× gate; `tools/check-test` prints
+  start-up and tab-switch rows back on the editor's 2× gate; `tools/check-test` prints
   a checked trap's conform-run record (yew#78); `tools/check-fmt` names
   every non-canonical file.
 
