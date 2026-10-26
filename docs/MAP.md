@@ -667,9 +667,11 @@ maintainer.
 - **R-yw08-8 — the editor ledger's start-up rows.** yw07's two yew#55 rows
   pass at the 0.2.35 pin: 1.31 and 1.19 by the R12 method over 20 trials, and
   1.31 over three interleaved rounds of 50 starts (#66's ask). (A) return
-  them to the 2x gate (implemented, `585b57f`; tab-switch p99 re-measured at
-  the closeout) and close #55's start-up half and #66; (B) keep them named
-  until a re-pin. Recommended A. It reverses yw07's disposition on
+  them to the 2x gate (implemented, `585b57f`), with the tab-switch p99,
+  also yew#55, which passes at 1.67 at the closeout; recommend closing #55
+  and #66; (B) keep them named until a re-pin. Recommended A. (yw15's first
+  Backspace row, yew#53, also passes there at 1.11, and at 0.78 in the
+  earlier rerun: for yw15 or the orchestrator to retire.) It reverses yw07's disposition on
   measurement, so it is the orchestrator's to accept or revert.
 
 ## 7. The next contracts
@@ -819,7 +821,7 @@ One paragraph each; yw01's is drafted in full
   floor (R-yw08-6); the coverage gate and ledger through sagitta's own script;
   the Fletch bench gate (C's regression rule, budgets policy, a baseline and a
   named-MISS ledger, R-yw08-3/-7); M-YW6's four artifacts in CI; yew#12
-  retired; the yew#55 start-up rows back on the 2x gate (R-yw08-8).
+  retired; the yew#55 rows back on the 2x gate (R-yw08-8).
 - **yw09 — Fletch in the editor** (s34–s38, drafted in full:
   `notes/contracts/yw09-fletch-in-the-editor.md`). `src/fl/` handle, flhook,
   motion_tab, fltxn, flruntime, fleval, record, flconf, macrolib and
