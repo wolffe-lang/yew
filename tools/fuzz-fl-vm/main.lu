@@ -1,0 +1,258 @@
+//! fuzz-fl-vm — Sprint 32 §8's VM fuzzer, sagitta 9ace98c2
+//! tests/fuzz/fuzz_fl_vm.c:1-175 over fuzzlib.c's generator (tools/fuzzgen).
+//! SOURCE IN, never bytecode (s32 §8: there is no loader, so random
+//! bytecode has no door): each input is parsed, compiled and run in a fresh
+//! VM with the deny-all origin (CLI, zero capabilities: io is unreachable)
+//! and no editor host (a motion block raises), at C's step limit of
+//! 5,000,000 and C's 64 KiB input cap, GC stress on one input in sixteen
+//! (data[0] & 15 == 0, fuzz_fl_vm.c:115-116).
+//!
+//! THE PROPERTY, per input (fuzz_fl_vm.c:120-162, s32 §8's list): parse
+//! diagnostics at most FL_PARSE_MAX_ERRORS + 1; a parse or compile failure
+//! is a fine outcome; a raise carries an error map whose `kind` is one of
+//! §9.1's thirteen (tests/fuzz/fl_kinds.h:19-33); and the VM is reusable
+//! afterwards: sp at the floor, no frames, no handlers. The port also
+//! asserts no open upvalues and checks after EVERY outcome, not only after
+//! a raise (the contract's "frames, handlers, open upvalues and sp all
+//! clean"); C's fl_vm_run (vm.c:1595-1660) and the port's (vm.lu:956-975)
+//! both reset the four at the outermost entry, which is what this guards.
+//!
+//! The VM's per-instruction checks are ON (vm.checks, C's FL_VM_CHECKS):
+//! s32 §8 runs them "in the sanitize and fuzz lanes" (Makefile:358-370).
+//! C's oracle build has them off; they only add YEW_BUG exits on a
+//! compiler bug and do not touch the report line.
+//!
+//! The report line's `hash=` covers every generated input, so equality with
+//! C's driver at the same seed and iterations is the witness that both fed
+//! their check the same stream. C's per-input watchdog (alarm(5) in the
+//! check, ITIMER_PROF in fuzzlib.c:1125-1209) is tools/run-fuzz-fl-vm's
+//! watch.py over an inherited progress pipe: one byte before each input,
+//! no signal handler in the VM. The slowest input's wall time goes to
+//! stderr, so the watchdog's margin is measured, not assumed.
+
+use fl
+use fuzzgen
+
+// fuzz_fl_vm.c:37-42.
+const MAX_INPUT: int = 65536
+
+const STEPS: int = 5000000
+
+// fuzz_fl_vm.c:115-116: GC stress for one input in sixteen.
+fn stress_for(data: List[byte]) -> bool {
+    data.len != 0 && (data[0] as int & 15) == 0
+}
+
+// fl_kinds.h:19-33's closed set (yew_fl_fuzz_spec_kind).
+fn spec_kind(kind: str) -> bool {
+    for k in "type|arity|name|index|key|div|capability|io|import|motion|user|limit|handle".split(
+        "|",
+    ) {
+        if k == kind { return true }
+    }
+    false
+}
+
+// The four fields fl_vm_run must leave clean; "" when they are.
+fn state_error(vm: fl.FlVm) -> str {
+    if vm.sp != 0 || vm.frames.len != 0 || vm.handlers.len != 0 || vm.open_upvals.len != 0 {
+        return "after execution: sp+{vm.sp} frames={vm.frames.len} handlers={vm.handlers.len} upvalues={vm.open_upvals.len}"
+    }
+    ""
+}
+
+// fuzz_fl_vm.c:60-75: the raised error's kind, "" when there is none
+// (C's %.*s into a 64-byte buffer: at most 63 bytes, cut at a NUL).
+fn err_kind(mut vm: fl.FlVm, err: fl.FlValue) -> str {
+    if err.t != fl.FL_MAP { return "" }
+    let key = fl.fl_str_text(mut vm, "kind")
+    let got = fl.fl_map_get(vm, err, key) else { return "" }
+    if got.t != fl.FL_STR { return "" }
+    var out = List[byte]()
+    for b in vm.gc.slots[fl.fl_obj_index(vm, got)].bytes {
+        if b as int == 0 || out.len >= 63 { break }
+        (mut out).push(b)
+    }
+    str_from_utf8(out) else "?"
+}
+
+/// What the campaign did, for its stderr summary (never the report line):
+/// inputs that reached the VM, how many raised, how many of those ran under
+/// GC stress, and the collections they did.
+struct Tally {
+    ran: int,
+    raised: int,
+    stressed: int,
+    collections: int,
+}
+
+// fuzz_fl_vm.c:77-169: one input; "" when every invariant held.
+fn check_fl_vm(input: List[byte], mut t: Tally) -> str {
+    let size = if input.len > MAX_INPUT then MAX_INPUT else input.len
+    var data = List[byte]()
+    (mut data).reserve(size)
+    for i in 0..size { (mut data).push(input[i]) }
+    var vm = fl.fl_vm_new(take fl.fl_strings())
+    fl.fl_std_register(mut vm)
+    vm.checks = true
+    fl.fl_vm_set_step_limit(mut vm, STEPS)
+    // DENY-ALL (fuzz_fl_vm.c:104-112): the CLI origin, path 0, no caps.
+    vm.root_origin = fl.fl_origin_new(fl.FL_ORIGIN_CLI, 0)
+    if stress_for(data) { vm.gc.stress = true }
+    let id = fl.fl_diag_add_file(mut vm.dc, "fuzz.fl", data)
+    let p = fl.fl_parse(data, id, mut vm.dc, mut vm.strings)
+    // The cap PLUS the one that says it gave up (fuzz_fl_vm.c:120-129).
+    if vm.dc.nerrors > fl.FL_PARSE_MAX_ERRORS + 1 {
+        return "{vm.dc.nerrors} diagnostics, cap is {fl.FL_PARSE_MAX_ERRORS} + 1"
+    }
+    // A parse failure is a fine outcome; so is a compile failure.
+    if p.had_error || p.incomplete { return state_error(vm) }
+    let origin = copy vm.root_origin
+    let fun = fl.fl_compile(mut vm, p, id, origin) else { return state_error(vm) }
+    let result = fl.fl_vm_run(mut vm, fun)
+    t.ran += 1
+    if vm.gc.stress { t.stressed += 1 }
+    t.collections += vm.gc.collections
+    if vm.raised {
+        t.raised += 1
+        let kind = err_kind(mut vm, result)
+        if kind == "" { return "raised without an error value" }
+        if !spec_kind(kind) { return "raised unknown kind '{kind}'" }
+    }
+    state_error(vm)
+}
+
+// The driver's own controls: the state check fires on each of its four
+// fields, the stress predicate is C's slice (precedence pinned), and the
+// four outcomes (value, raise, parse error, the step/stack limit) all hold.
+fn selftest() -> int {
+    var vm = fl.fl_vm_new(take fl.fl_strings())
+    assert(state_error(vm) == "")
+    vm.sp = 1
+    assert(state_error(vm) != "")
+    vm.sp = 0
+    (mut vm.frames).push(
+        fl.FlFrame { cl: fl.fl_nil(), ip: 0, base: 0, call_pc: 0, via_native: 0, edit_depth: 0 },
+    )
+    assert(state_error(vm) != "")
+    (mut vm.frames).reset()
+    (mut vm.handlers).push(fl.FlHandler { pc: 0, sp: 0, frame: 0, edit_depth: 0 })
+    assert(state_error(vm) != "")
+    (mut vm.handlers).reset()
+    (mut vm.open_upvals).push(fl.fl_nil())
+    assert(state_error(vm) != "")
+    (mut vm.open_upvals).reset()
+    assert(state_error(vm) == "")
+    assert(!stress_for(List[byte]()))
+    assert(stress_for([0 as byte]))
+    assert(stress_for([16 as byte, 1 as byte]))
+    assert(stress_for([0x30 as byte]))
+    assert(!stress_for([1 as byte]))
+    assert(!stress_for([15 as byte]))
+    assert(!stress_for([0x31 as byte]))
+    assert(spec_kind("limit") && spec_kind("motion") && !spec_kind("") && !spec_kind("limits"))
+    var t = Tally { ran: 0, raised: 0, stressed: 0, collections: 0 }
+    for src in [
+        "return 1\n",
+        "return 1/0\n",
+        "return )\n",
+        "fn r(n) {{ return r(n+1) }}\nreturn r(0)\n",
+        "while true {{ }}\n",
+        "macro m = @[ 2v ]\nreturn m()\n",
+    ] {
+        assert(check_fl_vm(src.bytes(), mut t) == "")
+    }
+    // Five of the six reach the VM (the `)` is a parse error); four of
+    // those raise: div, the frame limit, the step limit, motion (no host).
+    assert(t.ran == 5 && t.raised == 4)
+    print("fuzz_fl_vm: state, stress-slice, kind and outcome controls PASS")
+    0
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len == 1 && args[0] == "--selftest" { return selftest() }
+    let (ok, seed, iters) = fuzzgen.parse_args(args)
+    if !ok || iters < 1 {
+        eprint("usage: fuzz-fl-vm [--iters=N] [--seed=N] | --selftest")
+        return 2
+    }
+    let raw = (env_get("YEW_FL_FUZZ_WATCH_FD") else "-1").to_int() else -1
+    let watch = if raw >= 0 {
+        fs_adopt(raw) else |_| { eprint("fuzz_fl_vm: cannot adopt watchdog pipe"); return 2 }
+    } else {
+        -1
+    }
+    defer { if watch >= 0 { fs_close(watch) else |_| {} } }
+    if watch < 0 {
+        eprint("fuzz_fl_vm: no watchdog; instruction limit only (use tools/run-fuzz-fl-vm)")
+    }
+    let target = "fuzz_fl_vm"
+    // yew_fuzz_main(..., "fuzz_fl_vm", "tests/fuzz/corpus/fl_vm", ...):
+    // the built-ins, the named corpus, the guided one, the dictionary.
+    let (cok, corpus, dict) = fuzzgen.corpus_dict_from(target, "tests/fuzz/corpus/fl_vm")
+    if !cok { return 2 }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    var tally = Tally { ran: 0, raised: 0, stressed: 0, collections: 0 }
+    var slowest_ms = 0
+    var slowest_iter = 0
+    while done < iters && !failed {
+        let n = if iters - done > 64 then 64 else iters - done
+        region epoch {
+            var rng = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut rng, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut rng, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, operation) = fuzzgen.mutate_dict(mut rng, input, corpus, dict)
+                    input = next
+                    op = operation
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut rng, input)
+                if watch >= 0 {
+                    fs_write_chunk(watch, ".".bytes()) else |_| {
+                        eprint("fuzz_fl_vm: watchdog pipe closed")
+                        return 1
+                    }
+                }
+                let t0 = time_now_ms()
+                var why = ""
+                region trial {
+                    why = copy check_fl_vm(input, mut tally)
+                }
+                let spent = time_now_ms() - t0
+                if spent > slowest_ms {
+                    slowest_ms = spent
+                    slowest_iter = done + k
+                }
+                if why != "" {
+                    eprint(
+                        "{target}: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                    )
+                    eprint("{target}: input={fuzzgen.hex_of(input)}")
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = rng.state
+            hash = rng.hash
+        }
+        done += n
+    }
+    if failed { return 1 }
+    eprint(
+        "{target}: ran={tally.ran} raised={tally.raised} stressed={tally.stressed} collections={tally.collections} slowest iter={slowest_iter} ms={slowest_ms} (watchdog 5000 ms)",
+    )
+    print("{target}: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok")
+    0
+}
