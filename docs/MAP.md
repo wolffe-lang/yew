@@ -243,6 +243,8 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G53 | **The checked machine's retained-byte ledger grows on `List.reset()` + push** where native and release reuse the storage: 8 scalar pushes, then 100 × (`reset` + 8 pushes), reads 128 → 12,928 bytes checked and 240 → 240 native. | yw07b (the GC's fixed slots, whose payloads are `reset` and refilled) | no workaround in source; the residency gate is native/release (`region_bytes` and RSS flat), and a checked-machine ledger reading is never quoted as residency | `notes/yw07b-evidence/core/reset-ledger/` (`main.lu`, `checked.log`, `native.log`) | **wolf-lang#943** (checked-machine accounting, or compiled tiers reusing storage the model calls retained: a tier disagreement) |
 | G54 | **A tier disagreement on a region-built large value rooted into the VM**: one `region` builds a 100,000-byte Fletch string and a 64-element list, roots them in the VM's stack, and reads and collects after the region. checked exit 0; native exit 139; release exit 139. The 1,024-byte control exits 0 on all three tiers. | yw07b (a native's caller-owned temporaries) | none: no scratch `region` wraps a native's allocation until the issue is answered, and caller-owned native temporaries stay allocation-pending with no boundedness claim. Only the witness program and its exit status per tier are recorded. | `notes/yw07b-evidence/stdlib/scratch-once/` (exit 0 / 139 / 139), `scratch-small/` (0 / 0 / 0), `scratch-escape/` (20 rounds: checked step budget, native 139, release 139); each `main.lu` + `run.log` | **wolf-lang#948** (native and release exit 139 where checked exits 0) |
 
+| G55 | **The terminal mode word cannot read or set ONLCR.** `RAW_OUTPUT=0` enables OPOST only (`wolf_rt/src/term.rs:212-215` at v0.2.35). | yw08's line-oriented raw REPL; C `tty.c:514-531` enables OPOST and ONLCR | Keep OPOST on. ONLCR cannot be repaired when it was initially off; no subprocess workaround and no full-flag parity claim. The ordinary-default PTY goldens pass. | `notes/yw08-evidence/onlcr/probe.py`, `run.log`, `C.bytes`, `wolf.bytes`: isolated child PTYs with ONLCR cleared before exec; both exit 0, C prints CRLF and the port bare LF | **wolf-lang, to file by the orchestrator**: `notes/yw08-evidence/onlcr/issue.txt`; an `os_term` output-flag surface carrying ONLCR or an opaque/raw termios word, including restoration |
+
 
 **yw07b float-host rulings (R-yw07b-2 and R-yw07b-3, coordinator under
 ruling #118, subject to override):** Linux glibc C is the float-seam oracle.
@@ -625,6 +627,9 @@ maintainer.
   contract's own rule: "the C at the pin, not the sprint text"), so
   `src/fl/value.lu` carries 17 discriminants and `fl_type_name` C's 17
   names. The contract text stands as drafted, with this erratum.
+
+- **R-yw08-1 provenance correction** (coordinator, 2026-10-26): the draft's proposed `yew_cmdline_edit_key` is not a pinned C API. s32's correction C1 and `repl.c:385-408` share TextBuf/Cursor/EditCtx but retain the REPL's own key switch because registry dispatch needs Ed. The port follows that shape, not an invented seam.
+- **R-yw08-4 — completion prose, accepted A** (coordinator, 2026-10-26): the pinned `repl.c:848-926` key switch has no Tab-completion branch. Preserve the pinned C key behavior, not the earlier sprint/draft prose promising completion. No oracle or golden is changed.
 
 ## 7. The next contracts
 
