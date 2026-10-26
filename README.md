@@ -60,9 +60,9 @@ met, is [`docs/MAP.md`](docs/MAP.md); `CHANGELOG.md` has each lane.
 The 0.2.35 adoption restores read-only callbacks and shared stable sorting,
 uses the standard terminal wrappers and non-blocking clipboard writes, and
 reuses menu and tab-frame storage. Mutable callbacks and some
-allocation/filesystem work remain open in the map. The start-up rows meet
-the 2× gate again (yew#55); the tab-switch row stays named under yew#55
-and first Backspace under yew#53. Eleven of Fletch's thirteen release
+allocation/filesystem work remain open in the map. The start-up and tab-switch
+rows meet the 2× gate again (yew#55); first Backspace stays named under
+yew#53. Eleven of Fletch's thirteen release
 bench rows are over 2× and named under yew#77, and its native tier is a
 named backend MISS. Other host/metric rows keep the 2× gate.
 
