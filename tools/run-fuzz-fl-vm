@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# run-fuzz-fl-vm — Sprint 32 §8's VM fuzz: source in, parse, compile, run in
+# a deny-all VM; every outcome a value, a parse or compile failure, or a
+# raise of one of the 13 kinds of tests/fuzz/fl_kinds.h, and the VM clean
+# (sp, frames, handlers, open upvalues) after every input.
+#
+#   tools/run-fuzz-fl-vm [--native] [--against-oracle] [--iters=N] [--seed=N]
+#
+# Builds tools/fuzz-fl-vm/main.lu (tools/build-fuzz-fl-vm; FUZZ_PREBUILT=1
+# runs the driver already built), runs the driver's and the watchdog's own
+# controls, then the campaign from the repository root under watch.py: C's
+# five-second per-input watchdog (fuzz_fl_vm.c:92-94, fuzzlib.c:1184-1209)
+# over a progress pipe the driver writes one byte to before each input,
+# exit 124 naming the input on a stall. The defaults are sagitta's (200,000
+# iterations, seed 1: `make fuzz-iter`, Makefile:2269). `--against-oracle`
+# also runs C's own driver ($SAGITTA_TREE/build/fuzz_fl_vm, default
+# target/oracle/sagitta, which tools/oracle builds) with the same arguments
+# and requires the two report lines to be equal byte for byte; a missing C
+# driver is exit 2, never a silent pass. Exit is the driver's: 0 when every
+# input held, 1 with the failing input printed as hex, 2 on a usage error,
+# 124 on a watchdog expiry.
+set -euo pipefail
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export YEW_ROOT
+cd "$YEW_ROOT"
+native=; oracle=0; args=()
+for a in "$@"; do
+    case "$a" in
+    --native) native=--native ;;
+    --against-oracle) oracle=1 ;;
+    --iters=*|--seed=*) args+=("$a") ;;
+    *) echo "run-fuzz-fl-vm: unknown argument $a" >&2; exit 2 ;;
+    esac
+done
+tree=${SAGITTA_TREE:-target/oracle/sagitta}
+if [ "$oracle" = 1 ] && [ ! -x "$tree/build/fuzz_fl_vm" ]; then
+    echo "run-fuzz-fl-vm: $tree/build/fuzz_fl_vm is not built (tools/oracle builds it)" >&2
+    exit 2
+fi
+if [ "${FUZZ_PREBUILT:-0}" != 1 ]; then tools/build-fuzz-fl-vm $native; fi
+# Private HOME/XDG roots for the run (yew#11); the build above needs none.
+. tools/lib-test-env.sh
+test_env_begin
+export YEW_RUNTIME_DIR="$YEW_ROOT/runtime"
+# YEW_FL_GC_STRESS=1 is passed through: every input then runs under stress
+# (s32 DoD 8's GC-stress campaign) and the report line is unchanged.
+unset YEW_FL_DUMP_BAD_CHUNK
+python3 -I tools/fuzz-fl-vm/watch.py --selftest
+target/tools/fuzz-fl-vm --selftest
+rc=0
+err=target/fuzz-fl-vm/driver.stderr
+port=$(python3 -I tools/fuzz-fl-vm/watch.py target/fuzz-fl-vm/worker.pid \
+    target/tools/fuzz-fl-vm "${args[@]}" 2>"$err") || rc=$?
+cat "$err" >&2
+echo "port: $port"
+[ "$rc" = 0 ] || { echo "run-fuzz-fl-vm: the port's driver exited $rc" >&2; exit "$rc"; }
+# The report line's hash covers the generated stream, not the check, so a
+# driver that skipped its body would still equal C's. The driver's tally
+# (stderr) must show the campaign executed: inputs reached the VM and some
+# raised, and once 1,000 inputs ran, the collector ran and C's
+# one-in-sixteen stress slice was reached (seed 1 at 200,000: 24,778 ran, 15,103
+# raised, 367 stressed, 390 collections; yw08 evidence fuzz/).
+tally=$(grep -E '^fuzz_fl_vm: ran=[0-9]+ raised=[0-9]+ stressed=[0-9]+ collections=[0-9]+ ' "$err" | tail -1) || true
+[ -n "$tally" ] || { echo "run-fuzz-fl-vm: the driver printed no tally" >&2; exit 1; }
+field() { printf '%s\n' "$tally" | sed -E "s/.* $1=([0-9]+).*/\\1/"; }
+ran=$(field ran); raised=$(field raised); stressed=$(field stressed); collections=$(field collections)
+if [ "$ran" -lt 1 ] || [ "$raised" -lt 1 ] ||
+    { [ "$ran" -ge 1000 ] && { [ "$stressed" -lt 1 ] || [ "$collections" -lt 1 ]; }; }; then
+    echo "run-fuzz-fl-vm: the campaign did not execute its inputs (ran=$ran raised=$raised stressed=$stressed collections=$collections)" >&2
+    exit 1
+fi
+if [ "$oracle" = 1 ]; then
+    c=$(cd "$tree" && build/fuzz_fl_vm "${args[@]}") || { echo "C:    $c"; exit 1; }
+    echo "C:    $c"
+    if [ "$port" != "$c" ]; then
+        echo "run-fuzz-fl-vm: the port's report differs from C's" >&2
+        exit 1
+    fi
+    echo "PASS: oracle/port report lines identical"
+fi
