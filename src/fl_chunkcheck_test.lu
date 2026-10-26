@@ -1,0 +1,143 @@
+//! member: false
+//! Ports sagitta 9ace98c2 tests/unit/test_fl_chunkcheck.c:1-208.
+//! Five cases in registry.c:1884-1888 order. Mutations are test-only:
+//! there is no foreign-bytecode loader or production mutation API.
+
+use fl
+use flfix
+
+fn build(mut f: flfix.FlFix, src: str) -> fl.FlValue {
+    f.vm.dc = fl.fl_diag_init()
+    let id = fl.fl_diag_add_file(mut f.vm.dc, "t.fl", src.bytes())
+    let p = fl.fl_parse(src.bytes(), id, mut f.vm.dc, mut f.vm.strings)
+    assert(!p.had_error)
+    fl.fl_compile(mut f.vm, p, id, f.origin) else { assert(false); fl.fl_nil() }
+}
+
+fn find_op(vm: fl.FlVm, fun: fl.FlValue, want: int) -> int {
+    let at = fl.fl_obj_index(vm, fun)
+    var pc = 0
+    while pc < vm.gc.slots[at].code.len {
+        let op = vm.gc.slots[at].code[pc] as int
+        if op == want { return pc }
+        var n = 1
+        for shape in fl.fl_op_operands(op).bytes() { n += if shape == 119 as byte then 2 else 1 }
+        pc += n
+    }
+    vm.gc.slots[at].code.len
+}
+
+fn reject(vm: fl.FlVm, fun: fl.FlValue, fragment: str) {
+    let why = fl.fl_chunk_check(vm, fun)
+    assert(why.len != 0, "expected rejection mentioning {fragment}")
+    assert(why.contains(fragment), "want {fragment} in {why}")
+}
+
+fn fl_chunkcheck_accepts_what_the_compiler_emits() {
+    var f = flfix.open()
+    let progs = [
+        "return 1\n",
+        "let a = 1\nlet b = a + 2\nreturn b\n",
+        "fn f(x) {{ if x > 1 {{ return x }} return 0 }}\nreturn f(2)\n",
+        "let t = 0\nfor x in [1, 2, 3] {{ t = t + x }}\nreturn t\n",
+        "let n = 0\nwhile n < 5 {{ n = n + 1 }}\nreturn n\n",
+        "try {{ return 1 / 0 }} catch e {{ return e.kind }}\n",
+        "fn c(s) {{ let n = s\nreturn fn() {{ n = n + 1\nreturn n }} }}\nreturn c(1)()\n",
+        "return {{a: 1, b: [2, 3]}}\n",
+        "macro m = @[ 2v ]\nreturn 1\n",
+    ]
+    for src in progs {
+        let fun = build(mut f, src)
+        let why = fl.fl_chunk_check(f.vm, fun)
+        assert(why.len == 0, "rejected compiler output: {why}")
+    }
+    flfix.close(mut f)
+}
+
+fn fl_chunkcheck_rejects_a_bad_jump() {
+    var f = flfix.open()
+    let src = "let n = 0\nwhile n < 5 {{ n = n + 1 }}\nreturn n\n"
+    let fun = build(mut f, src)
+    let at = find_op(f.vm, fun, fl.FL_OP_JUMP_IF_FALSE)
+    let fi = fl.fl_obj_index(f.vm, fun)
+    assert(at < f.vm.gc.slots[fi].code.len)
+    f.vm.gc.slots[fi].code[at + 1] = 255 as byte
+    f.vm.gc.slots[fi].code[at + 2] = 255 as byte
+    reject(f.vm, fun, "jump target outside the chunk")
+    let other = build(mut f, src)
+    let op = find_op(f.vm, other, fl.FL_OP_JUMP_IF_FALSE)
+    let oi = fl.fl_obj_index(f.vm, other)
+    f.vm.gc.slots[oi].code[op + 1] = 1 as byte
+    f.vm.gc.slots[oi].code[op + 2] = 0 as byte
+    reject(f.vm, other, "not an instruction start")
+    flfix.close(mut f)
+}
+
+fn fl_chunkcheck_rejects_a_bad_index() {
+    var f = flfix.open()
+    let fun = build(mut f, "return \"a\"\n")
+    let at = find_op(f.vm, fun, fl.FL_OP_CONST)
+    let fi = fl.fl_obj_index(f.vm, fun)
+    assert(at < f.vm.gc.slots[fi].code.len)
+    f.vm.gc.slots[fi].code[at + 1] = 255 as byte
+    f.vm.gc.slots[fi].code[at + 2] = 255 as byte
+    reject(f.vm, fun, "constant index out of range")
+    let other = build(mut f, "fn f(x) {{ return x }}\nreturn f(1)\n")
+    let oi = fl.fl_obj_index(f.vm, other)
+    let local = find_op(f.vm, other, fl.FL_OP_GET_LOCAL)
+    if local < f.vm.gc.slots[oi].code.len {
+        f.vm.gc.slots[oi].code[local + 1] = 254 as byte
+        reject(f.vm, other, "local slot outside the frame")
+    }
+    let bad = build(mut f, "return 1\n")
+    f.vm.gc.slots[fl.fl_obj_index(f.vm, bad)].code[0] = fl.FL_OP_COUNT as byte
+    reject(f.vm, bad, "unknown opcode")
+    flfix.close(mut f)
+}
+
+fn fl_chunkcheck_rejects_an_understated_stack() {
+    var f = flfix.open()
+    let fun = build(mut f, "return 1 + 2 * 3 - 4\n")
+    f.vm.gc.slots[fl.fl_obj_index(f.vm, fun)].max_stack = 1
+    reject(f.vm, fun, "max_stack is smaller")
+    flfix.close(mut f)
+}
+
+fn fl_chunkcheck_rejects_a_missing_terminator() {
+    var f = flfix.open()
+    let fun = build(mut f, "return 1\n")
+    assert(fl.fl_chunk_check(f.vm, fun).len == 0)
+    let fi = fl.fl_obj_index(f.vm, fun)
+    let last = f.vm.gc.slots[fi].code.len - 1
+    f.vm.gc.slots[fi].code[last] = fl.FL_OP_POP as byte
+    reject(f.vm, fun, "does not end in a terminator")
+    let other = build(mut f, "return 1\n")
+    (mut f.vm.gc.slots[fl.fl_obj_index(f.vm, other)].code).reset()
+    reject(f.vm, other, "empty chunk")
+    flfix.close(mut f)
+}
+
+fn main() {
+    let which = (env_get("YEW_FL_CHUNKCHECK_CASE") else "-1").to_int() else -2
+    if which == -1 || which == 0 {
+        fl_chunkcheck_accepts_what_the_compiler_emits()
+        print("fl_chunkcheck_accepts_what_the_compiler_emits: PASS")
+    }
+    if which == -1 || which == 1 {
+        fl_chunkcheck_rejects_a_bad_jump()
+        print("fl_chunkcheck_rejects_a_bad_jump: PASS")
+    }
+    if which == -1 || which == 2 {
+        fl_chunkcheck_rejects_a_bad_index()
+        print("fl_chunkcheck_rejects_a_bad_index: PASS")
+    }
+    if which == -1 || which == 3 {
+        fl_chunkcheck_rejects_an_understated_stack()
+        print("fl_chunkcheck_rejects_an_understated_stack: PASS")
+    }
+    if which == -1 || which == 4 {
+        fl_chunkcheck_rejects_a_missing_terminator()
+        print("fl_chunkcheck_rejects_a_missing_terminator: PASS")
+    }
+    if which == -1 { print("PASS fl_chunkcheck 5") }
+}

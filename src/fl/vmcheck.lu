@@ -1,0 +1,169 @@
+//! Compiler assertion, not a bytecode loader or security boundary.
+//! Ports sagitta 9ace98c2 src/fl/vmcheck.c:1-350 and vm.h:329-355.
+//! Only our compiler produces chunks. A future foreign-bytecode loader
+//! must land with a real verifier, in the same change (s32 section 8).
+
+/// The pinned checker declines chunks larger than one MiB.
+pub const FL_MAX_CHUNK_CHECK: int = 1048576
+
+fn check_word(vm: FlVm, at: int, pc: int) -> int {
+    vm.gc.slots[at].code[pc] as int | vm.gc.slots[at].code[pc + 1] as int << 8
+}
+
+fn check_op_len(vm: FlVm, at: int, pc: int) -> (int, bool) {
+    let op = vm.gc.slots[at].code[pc] as int
+    if op >= FL_OP_COUNT { return (1, false) }
+    var n = 1
+    for shape in fl_op_operands(op).bytes() { n += if shape == 119 as byte then 2 else 1 }
+    if op == FL_OP_CLOSURE {
+        if pc + 3 > vm.gc.slots[at].code.len { return (n, false) }
+        let k = check_word(vm, at, pc + 1)
+        if k >= vm.gc.slots[at].vals.len || vm.gc.slots[at].vals[k].t != FL_FN { return (n, false) }
+        let fnval = copy vm.gc.slots[at].vals[k]
+        n += vm.gc.slots[fl_obj_index(vm, fnval)].nup * 2
+    }
+    (n, true)
+}
+
+fn check_depth(vm: FlVm, at: int) -> str {
+    let size = vm.gc.slots[at].code.len
+    var depth = List[int]()
+    var seen = List[bool]()
+    var work = List[int]()
+    (mut depth).reserve(size)
+    (mut seen).reserve(size)
+    (mut work).reserve(size)
+    for _ in 0..size { (mut depth).push(0); (mut seen).push(false) }
+    depth[0] = vm.gc.slots[at].arity + 1
+    seen[0] = true
+    (mut work).push(0)
+    var high = 0
+    while work.len != 0 {
+        let pc = (mut work).pop() else 0
+        var d = depth[pc]
+        let op = vm.gc.slots[at].code[pc] as int
+        let (n, ok) = check_op_len(vm, at, pc)
+        if !ok { return "" } // pass 1 already reported this
+        var after = pc + n
+        var target: int = -1
+        let effect = fl_op_effect(op)
+        match op {
+            36 => { d -= vm.gc.slots[at].code[pc + 1] as int }, // CALL
+            5 => { d += vm.gc.slots[at].code[pc + 1] as int }, // NIL_N
+            7 => { d -= vm.gc.slots[at].code[pc + 1] as int }, // POPN
+            13 => { d = vm.gc.slots[at].code[pc + 1] as int }, // CLOSE_UPVALS
+            40 => { d -= check_word(vm, at, pc + 1); d += 1 }, // LIST
+            41 => { d -= 2 * check_word(vm, at, pc + 1); d += 1 }, // MAP
+            37 | 38 | 56 => { continue }, // RETURN, RETURN_NIL, HALT
+            _ => {
+                if effect == FL_EFF_VAR {
+                    return "an FL_EFF_VAR opcode the depth pass does not model"
+                }
+                d += effect
+            },
+        }
+        if d < 0 { return "stack depth goes negative" }
+        if d > high { high = d }
+        match op {
+            30 => { after += check_word(vm, at, pc + 1) },
+            32 | 33 | 34 | 35 | 54 => { target = after + check_word(vm, at, pc + 1) },
+            31 => { after -= check_word(vm, at, pc + 1) },
+            _ => {},
+        }
+        if after >= 0 && after < size {
+            if !seen[after] {
+                seen[after] = true
+                depth[after] = d
+                (mut work).push(after)
+            } else if depth[after] != d {
+                return "two paths reach one instruction at different depths"
+            }
+        }
+        if target >= 0 && target < size {
+            let td = if op == 54 then d + 1 else d
+            if !seen[target] {
+                seen[target] = true
+                depth[target] = td
+                (mut work).push(target)
+            } else if depth[target] != td {
+                return "two paths reach one branch target at different depths"
+            }
+        }
+    }
+    if high > vm.gc.slots[at].max_stack {
+        return "max_stack is smaller than the depth the code reaches"
+    }
+    ""
+}
+
+/// Return the pinned rejection reason, or the empty string on success.
+/// Chunks over FL_MAX_CHUNK_CHECK are declined as C's debugging aid is.
+/// The function metadata is required for local/upvalue/stack bounds.
+pub fn fl_chunk_check(vm: FlVm, fun: FlValue) -> str {
+    let at = fl_obj_index(vm, fun)
+    let size = vm.gc.slots[at].code.len
+    if size == 0 { return "empty chunk" }
+    if size > FL_MAX_CHUNK_CHECK { return "" }
+    var starts = List[bool]()
+    (mut starts).reserve(size)
+    for _ in 0..size { (mut starts).push(false) }
+    var pc = 0
+    var last = 0
+    while pc < size {
+        starts[pc] = true
+        last = pc
+        let op = vm.gc.slots[at].code[pc] as int
+        let (n, ok) = check_op_len(vm, at, pc)
+        if !ok { return "unknown opcode or malformed CLOSURE operand" }
+        if pc + n > size { return "instruction runs past the end of the chunk" }
+        if op == FL_OP_CONST ||
+            op == FL_OP_DEF_GLOBAL ||
+            op == FL_OP_GET_GLOBAL ||
+            op == FL_OP_SET_GLOBAL ||
+            op == FL_OP_CLOSURE {
+            if check_word(vm, at, pc + 1) >= vm.gc.slots[at].vals.len {
+                return "constant index out of range"
+            }
+        } else if op == FL_OP_GET_LOCAL || op == FL_OP_SET_LOCAL {
+            if vm.gc.slots[at].code[pc + 1] as int >= vm.gc.slots[at].max_stack + 1 {
+                return "local slot outside the frame"
+            }
+        } else if op == FL_OP_GET_UPVAL || op == FL_OP_SET_UPVAL {
+            if vm.gc.slots[at].code[pc + 1] as int >= vm.gc.slots[at].nup {
+                return "upvalue index out of range"
+            }
+        }
+        pc += n
+    }
+    pc = 0
+    while pc < size {
+        let op = vm.gc.slots[at].code[pc] as int
+        let (n, _) = check_op_len(vm, at, pc)
+        let after = pc + n
+        var target: int = -1
+        if op == FL_OP_JUMP ||
+            op == FL_OP_JUMP_IF_FALSE ||
+            op == FL_OP_JUMP_IF_TRUE ||
+            op == FL_OP_OR_JUMP ||
+            op == FL_OP_AND_JUMP ||
+            op == FL_OP_TRY_PUSH {
+            target = after + check_word(vm, at, pc + 1)
+        } else if op == FL_OP_JUMP_BACK {
+            target = after - check_word(vm, at, pc + 1)
+        }
+        // C treats a negative target like the no-target sentinel and allows
+        // the one-past-end target. This is its compiler assertion, not a loader.
+        if target >= 0 {
+            if target > size { return "jump target outside the chunk" }
+            if target != size && !starts[target] {
+                return "jump target is not an instruction start"
+            }
+        }
+        pc = after
+    }
+    let op = vm.gc.slots[at].code[last] as int
+    if op != FL_OP_HALT && op != FL_OP_RETURN && op != FL_OP_RETURN_NIL {
+        return "chunk does not end in a terminator"
+    }
+    check_depth(vm, at)
+}
