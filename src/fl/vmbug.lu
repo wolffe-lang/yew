@@ -1,0 +1,144 @@
+//! Structured invariant diagnostics: sagitta 9ace98c2 vm.c:340-425.
+//! The 4096-byte report buffer is reserved once at VM initialization.
+//! Formatting only resets/refills that buffer: no value formatting and
+//! no allocation. Optional disassembly and util's ordinary logging happen
+//! AFTER the report is complete, as C's optional bad-chunk dump does.
+
+use term
+use util
+
+/// Reserved size of the invariant report, including C's terminator space.
+pub const FL_BUG_REPORT_CAP: int = 4096
+
+fn bug_byte(mut out: List[byte], b: byte) {
+    if out.len < FL_BUG_REPORT_CAP - 1 { (mut out).push(b) }
+}
+
+fn bug_text(mut out: List[byte], s: str) {
+    for b in s.bytes() { bug_byte(mut out, b) }
+}
+
+// Negative-domain digits also handle the minimum int without negating it.
+// At most 64 binary/19 decimal frames: depth is bounded by the scalar width.
+fn bug_digits(mut out: List[byte], negative: int, base: int) {
+    if negative <= -base { bug_digits(mut out, negative / base, base) }
+    let digit = -(negative % base)
+    bug_byte(mut out, "0123456789ABCDEF".bytes()[digit])
+}
+
+fn bug_number(mut out: List[byte], n: int, base: int, width: int) {
+    if n < 0 { bug_byte(mut out, 45 as byte) }
+    let neg = if n > 0 then -n else n
+    var digits = 1
+    var rest = neg
+    while rest <= -base { rest /= base; digits += 1 }
+    for _ in digits..width { bug_byte(mut out, 48 as byte) }
+    bug_digits(mut out, neg, base)
+}
+
+/// Build only the bounded report body, without allocating or walking values.
+/// fun_index is an already-resolved metadata slot, or -1 when unavailable.
+/// The caller may subsequently dump a chunk and terminate through util.bug.
+pub fn fl_bug_report(mut vm: FlVm, fun_index: int, pc: int, op: int, what: str, dumped: bool) {
+    (mut vm.bug_report).reset()
+    bug_text(mut vm.bug_report, what)
+    bug_text(mut vm.bug_report, "\n  opcode : ")
+    bug_text(mut vm.bug_report, fl_op_name(op))
+    bug_text(mut vm.bug_report, " (0x")
+    bug_number(mut vm.bug_report, op, 16, 2)
+    bug_text(mut vm.bug_report, ") at pc 0x")
+    bug_number(mut vm.bug_report, pc, 16, 4)
+    bug_text(mut vm.bug_report, "\n  fn     : ")
+    var arity = 0
+    var file_id = 0
+    var named = false
+    if fun_index >= 0 && fun_index < vm.gc.slots.len {
+        let id = vm.gc.slots[fun_index].name_id
+        arity = vm.gc.slots[fun_index].arity
+        file_id = vm.gc.slots[fun_index].file_id
+        if id > 0 && id < vm.strings.items.len {
+            for i in 0..vm.strings.items[id].len {
+                let b = vm.strings.items[id][i]
+                if b == 0 as byte { break }
+                bug_byte(mut vm.bug_report, b)
+            }
+            named = true
+        }
+    }
+    if !named { bug_text(mut vm.bug_report, "<fn>") }
+    bug_text(mut vm.bug_report, "/")
+    bug_number(mut vm.bug_report, arity, 10, 0)
+    bug_text(mut vm.bug_report, "  file_id ")
+    bug_number(mut vm.bug_report, file_id, 10, 0)
+    bug_text(mut vm.bug_report, "\n  frames : ")
+    bug_number(mut vm.bug_report, vm.frames.len, 10, 0)
+    bug_text(mut vm.bug_report, " (depth cap 256)   sp offset: ")
+    bug_number(mut vm.bug_report, vm.sp, 10, 0)
+    bug_text(mut vm.bug_report, "   handlers: ")
+    bug_number(mut vm.bug_report, vm.handlers.len, 10, 0)
+    bug_text(mut vm.bug_report, "\n  build  : ")
+    bug_text(mut vm.bug_report, util.VERSION)
+    bug_text(mut vm.bug_report, " cgoto=0 checks=")
+    bug_number(mut vm.bug_report, if vm.checks then 1 else 0, 10, 0)
+    bug_text(mut vm.bug_report, "\n  hint   : ")
+    bug_text(
+        mut vm.bug_report,
+        if dumped {
+            "disassembly written to YEW_FL_DUMP_BAD_CHUNK"
+        } else {
+            "YEW_FL_DUMP_BAD_CHUNK=<path> writes a disassembly"
+        },
+    )
+    bug_text(mut vm.bug_report, "\n")
+}
+
+fn fl_vm_bug(mut vm: FlVm, fun_index: int, pc: int, op: int, what: str) {
+    let dumped = vm.bug_dump_path.len != 0 && fun_index >= 0
+    fl_bug_report(mut vm, fun_index, pc, op, what, dumped)
+    if dumped {
+        // Explicit opt-in, after the allocation-free report has been built.
+        var out = List[byte]()
+        let fun = fl_reference(vm, fun_index)
+        fl_disasm_chunk(vm, fun, mut out)
+        fs_write_bytes(vm.bug_dump_path, out) else |_| {}
+    }
+    // One kind/match host hook, not a second mutable callback scheme.
+    match vm.bug_restore_kind {
+        1 => term.tty_restore_before_bug(vm.bug_saved_mode, vm.bug_guard_fd, vm.bug_guard_slot),
+        _ => {},
+    }
+    util.bug_bytes("src/fl/vm.lu", vm.bug_report)
+}
+
+fn fl_current_bug(mut vm: FlVm, what: str) {
+    var fun: int = -1
+    var pc = 0
+    var op = 0
+    if vm.frames.len != 0 {
+        let frame = vm.frames.len - 1
+        let cl = copy vm.frames[frame].cl
+        if cl.t == FL_CLOSURE && fl_valid(vm, cl) {
+            let ci = fl_obj_index(vm, cl)
+            let fnval = copy vm.gc.slots[ci].fn_value
+            if fnval.t == FL_FN && fl_valid(vm, fnval) {
+                fun = fl_obj_index(vm, fnval)
+                let ip = vm.frames[frame].ip
+                if ip > 0 && ip <= vm.gc.slots[fun].code.len {
+                    pc = ip - 1
+                    op = vm.gc.slots[fun].code[pc] as int
+                }
+            }
+        }
+    }
+    fl_vm_bug(mut vm, fun, pc, op, what)
+}
+
+/// Register the prompt's terminating restore hook; all fields are scalars.
+/// The prompt owns these handles until termination and does not use them
+/// after the bug path consumes its guard pipe and child.
+pub fn fl_vm_bug_terminal(mut vm: FlVm, saved_mode: int, guard_fd: int, guard_slot: int) {
+    vm.bug_restore_kind = 1
+    vm.bug_saved_mode = saved_mode
+    vm.bug_guard_fd = guard_fd
+    vm.bug_guard_slot = guard_slot
+}

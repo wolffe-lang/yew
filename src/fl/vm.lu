@@ -62,6 +62,13 @@ pub struct FlVm {
     // The host's command registry for ed.commands (fl.flapi); empty until
     // the host hands it over (fl_vm_set_commands). yw07b io's one field.
     host_cmds: List[FlHostCmd],
+    checks: bool,
+    bug_report: List[byte],
+    bug_dump_path: str,
+    bug_restore_kind: int,
+    bug_saved_mode: int,
+    bug_guard_fd: int,
+    bug_guard_slot: int,
 }
 
 /// Create a headless VM, consuming its identifier interner.
@@ -101,9 +108,17 @@ pub fn fl_vm_new(take strings: FlStrings) -> FlVm {
         mods: List[FlModule](),
         re_cache: fl_re_cache_new(),
         host_cmds: List[FlHostCmd](),
+        checks: (env_get("YEW_FL_VM_CHECKS") else "0") == "1",
+        bug_report: List[byte](),
+        bug_dump_path: env_get("YEW_FL_DUMP_BAD_CHUNK") else "",
+        bug_restore_kind: 0,
+        bug_saved_mode: 0,
+        bug_guard_fd: -1,
+        bug_guard_slot: -1,
     }
     vm.gc.stress = (env_get("YEW_FL_GC_STRESS") else "__unset") != "__unset" ||
         (env_get("FL_GC_STRESS") else "__unset") != "__unset"
+    (mut vm.bug_report).reserve(FL_BUG_REPORT_CAP)
     (mut vm.stack).reserve(16384)
     for _ in 0..16384 { (mut vm.stack).push(fl_nil()) }
     (mut vm.frames).reserve(256)
@@ -127,14 +142,16 @@ pub fn fl_raise_bytes(mut vm: FlVm, kind: str, msg: List[byte]) -> FlValue {
     let m = fl_map_new(mut vm)
     let k = fl_str_text(mut vm, "kind")
     let v = fl_str_text(mut vm, kind)
-    assert(fl_map_set(mut vm, m, k, v))
+    if !fl_map_set(mut vm, m, k, v) { fl_current_bug(mut vm, "fl vm: error kind insertion failed") }
     let mk = fl_str_text(mut vm, "msg")
     var length: int = 0
     while length < msg.len && length < 1023 && msg[length] != 0 as byte {
         length += 1
     }
     let mv = fl_str_range(mut vm, msg, 0, length)
-    assert(fl_map_set(mut vm, m, mk, mv))
+    if !fl_map_set(mut vm, m, mk, mv) {
+        fl_current_bug(mut vm, "fl vm: error message insertion failed")
+    }
     vm.err = m
     vm.raised = true
     fl_nil()
@@ -152,7 +169,7 @@ fn fl_push(mut vm: FlVm, v: FlValue) {
 }
 
 fn fl_pop(mut vm: FlVm) -> FlValue {
-    assert(vm.sp > 0)
+    if vm.sp <= 0 { fl_current_bug(mut vm, "fl vm: stack underflow") }
     vm.sp -= 1
     copy vm.stack[vm.sp]
 }
@@ -474,6 +491,7 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
     var ci: int = 0
     var fnidx: int = 0
     var framebase: int = 0
+    let checks = vm.checks
     while vm.frames.len > base {
         if vm.gc.pending { fl_gc_collect(mut vm) }
         if vm.step_limit != 0 {
@@ -492,7 +510,46 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                 cached_collection = vm.gc.collections
             }
             let pc = vm.frames[fi].ip
+            if checks && (pc < 0 || pc >= vm.gc.slots[fnidx].code.len) {
+                fl_vm_bug(mut vm, fnidx, pc, 0, "fl vm: instruction pointer outside the chunk")
+            }
             let op = fl_read8(mut vm, fi, fnidx)
+            if checks {
+                if op >= FL_OP_COUNT { fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: unknown opcode") }
+                let (width, valid) = check_op_len(vm, fnidx, pc)
+                if !valid || pc + width > vm.gc.slots[fnidx].code.len {
+                    fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: malformed instruction")
+                }
+                if op == 0 ||
+                    op == 14 ||
+                    op == 15 ||
+                    op == 16 ||
+                    op == 39 ||
+                    op == 44 ||
+                    op == 45 ||
+                    op == 50 {
+                    if check_word(vm, fnidx, pc + 1) >= vm.gc.slots[fnidx].vals.len {
+                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: constant index out of range")
+                    }
+                }
+                if op == 9 || op == 10 {
+                    if vm.gc.slots[fnidx].code[pc + 1] as int >= vm.gc.slots[fnidx].max_stack + 1 {
+                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: local slot outside the frame")
+                    }
+                }
+                if op == 11 || op == 12 {
+                    if vm.gc.slots[fnidx].code[pc + 1] as int >= vm.gc.slots[ci].vals.len {
+                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: upvalue index out of range")
+                    }
+                }
+                if vm.sp < framebase { fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: stack underflow") }
+                if vm.sp > vm.stack.len {
+                    fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: stack pointer past the top")
+                }
+                if vm.handlers.len > 64 {
+                    fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: handler stack overflow")
+                }
+            }
             if vm.tracing { (mut vm.trace).push(op as byte) }
             match op {
                 0 => { // CONST
@@ -571,7 +628,9 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                             let _ = fl_raise(mut vm, "name", message)
                         } else {
                             let v = fl_pop(mut vm)
-                            assert(fl_map_set(mut vm, globals, name, v))
+                            if !fl_map_set(mut vm, globals, name, v) {
+                                fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: global insertion failed")
+                            }
                         }
                     }
                 },
@@ -620,6 +679,9 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                     }
                 },
                 37 | 38 | 56 => { // RETURN / RETURN_NIL / HALT
+                    if vm.frames.len == 0 {
+                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: frame underflow on RETURN")
+                    }
                     let result = if op == 37 then fl_pop(mut vm) else fl_nil()
                     vm.edit_depth = vm.frames[fi].edit_depth
                     fl_close_upvals(mut vm, framebase)
@@ -700,8 +762,8 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                         } else if op == 42 {
                             let got = fl_list_get(vm, container, i.i) else fl_nil()
                             fl_push(mut vm, got)
-                        } else {
-                            assert(fl_list_set(mut vm, container, i.i, v))
+                        } else if !fl_list_set(mut vm, container, i.i, v) {
+                            fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: validated list index rejected")
                         }
                     } else if container.t == 6 {
                         if op == 42 {
@@ -756,7 +818,15 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                     } else {
                         let key = fl_str_text(mut vm, name)
                         if op == 45 {
-                            assert(fl_map_set(mut vm, container, key, value))
+                            if !fl_map_set(mut vm, container, key, value) {
+                                fl_vm_bug(
+                                    mut vm,
+                                    fnidx,
+                                    pc,
+                                    op,
+                                    "fl vm: validated map key rejected",
+                                )
+                            }
                         } else {
                             var found = container.t == 6
                             var got = fl_nil()
@@ -801,8 +871,18 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                     let result = fl_import(mut vm, id, path != 0)
                     if !vm.raised { fl_push(mut vm, result) }
                 },
-                51 => { vm.edit_depth += 1 }, // EDIT_BEGIN (null host)
-                52 => { assert(vm.edit_depth > 0); vm.edit_depth -= 1 }, // EDIT_END
+                51 => {
+                    if vm.edit_depth >= 4294967295 {
+                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: edit depth overflow")
+                    }
+                    vm.edit_depth += 1
+                }, // EDIT_BEGIN (null host)
+                52 => {
+                    if vm.edit_depth <= 0 {
+                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: edit depth underflow")
+                    }
+                    vm.edit_depth -= 1
+                }, // EDIT_END
                 53 => { vm.err = fl_pop(mut vm); vm.raised = true }, // THROW
                 54 => { // TRY_PUSH
                     let d = fl_read16(mut vm, fi, fnidx)
@@ -820,7 +900,7 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                 },
                 55 => {
                     let _ = (mut vm.handlers).pop() else {
-                        assert(false)
+                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: handler stack underflow")
                         FlHandler { pc: 0, sp: 0, frame: 0, edit_depth: 0 }
                     }
                 }, // TRY_POP
@@ -837,7 +917,7 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                     let observer = vm.line_observer
                     observer(line)
                 },
-                _ => assert(false),
+                _ => fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: unknown opcode"),
             }
         }
         if vm.raised {
