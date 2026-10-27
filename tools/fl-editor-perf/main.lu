@@ -1,0 +1,282 @@
+//! fl-editor-perf — the six editor rows of pinned sagitta perf_fletch.c
+//! (9ace98c2, tests/perf/perf_fletch.c:415-803, :1076-1131) for
+//! tools/fl-headless/compare.py's gate (R-yw09-3 A): one discarded warmup
+//! plus eleven samples, median and minimum, every raw value printed, in
+//! tools/fl-headless/main.lu's line shape so one parser reads both.
+//!
+//!   config_load        parse + compile + run of runtime/init.fl against a
+//!                      live scratch editor, in one bind batch (1 ms)
+//!   config_reload_500  one real reload of a 500-bind user config plus the
+//!                      shipped defaults (5 ms)
+//!   macrolib_scan_200  a rescan of 200 valid macro files (5 ms)
+//!   motion_editor      1e6 `@[ > ]` motion blocks against a live editor
+//!                      (1 us/op)
+//!   query_cur_pos      1e6 `cur.pos` calls on a live cursor (300 ms)
+//!   insert_100k        100k `buf.insert` calls in one run transaction:
+//!                      one undo node, bytes within budget; one sample,
+//!                      report-only as C's (`b->report_only`)
+//!
+//! C's EditorEnv is a VM of its own attached to a scratch editor
+//! (`editor_env_open`, :619-632); the port's is a fresh VM run with the
+//! `Ed` as its host (`fl.fl_vm_run_host`), the binding layer reached
+//! through `edit.fl_attached_api` as tests/unit's fixtures reach it.
+
+use edit
+use fl
+use text
+use util
+
+// perf_fletch.c:66-85.
+const GATE_CONFIG_NS: int = 1000000
+
+const GATE_CONFIG_RELOAD_NS: int = 5000000
+
+const GATE_MACROLIB_SCAN_NS: int = 5000000
+
+const CONFIG_RELOAD_BINDS: int = 500
+
+const MACROLIB_FILES: int = 200
+
+const MOTION_ITERS: int = 1000000
+
+const GATE_MOTION_NS_PER_OP: int = 1000
+
+const QUERY_ITERS: int = 1000000
+
+const GATE_QUERY_NS: int = 300000000
+
+const INSERT_ITERS: int = 100000
+
+// SRC_MOTION (perf_fletch.c:241-247).
+const SRC_MOTION: str = "let i = 0\nwhile i < 1000000 {{\n  try {{ let x = @[ > ] }} catch e {{ }}\n  i = i + 1\n}}\nreturn i\n"
+
+// make_reload_fixture's source (perf_fletch.c:460-472): 20 x 25 binds.
+const RELOAD_SOURCE: str = "let first = [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\", \"k\", \"l\", \"m\", \"n\", \"o\", \"p\", \"q\", \"r\", \"s\", \"t\"]\nlet second = [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\", \"k\", \"l\", \"m\", \"n\", \"o\", \"p\", \"q\", \"r\", \"s\", \"t\", \"u\", \"v\", \"w\", \"x\", \"y\"]\nfor a in first {{\n  for b in second {{\n    bind(\"L\", \"z \" + a + \" \" + b, \"ed.nop\")\n  }}\n}}\n"
+
+fn fail(msg: str) -> int {
+    eprint("perf_fletch: {msg}")
+    os_exit(1)
+    0
+}
+
+fn scratch() -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    ed
+}
+
+fn fresh_vm() -> fl.FlVm {
+    var strings = fl.fl_strings()
+    var vm = fl.fl_vm_new(take strings)
+    fl.fl_std_register(mut vm)
+    vm
+}
+
+// sample_config_program (perf_fletch.c:659-687): BUILTIN with every cap.
+fn sample_config_load(src: List[byte]) -> int {
+    var ed = scratch()
+    var vm = fresh_vm()
+    let label = copy "runtime/init.fl".bytes()
+    let path_id = fl.fl_intern(mut vm.strings, label, 0, label.len)
+    let origin = fl.FlOrigin { kind: fl.FL_ORIGIN_BUILTIN, path_id: path_id, caps: fl.FL_CAP_ALL, principal_id: 0 }
+    edit.bind_batch_begin(mut ed)
+    let t0 = os_clock_ns()
+    let id = fl.fl_diag_add_file(mut vm.dc, "runtime/init.fl", src)
+    let p = fl.fl_parse(src, id, mut vm.dc, mut vm.strings)
+    if p.had_error { return fail("runtime/init.fl failed at 0") }
+    let f = fl.fl_compile(mut vm, p, id, origin) else { return fail("runtime/init.fl failed at 0") }
+    let _ = fl.fl_vm_run_host(mut vm, mut ed, f)
+    if vm.raised { return fail("runtime/init.fl failed at 0") }
+    edit.bind_batch_end(mut ed)
+    os_clock_ns() - t0
+}
+
+// sample_config_reload (perf_fletch.c:426-458).
+fn sample_config_reload(path: str) -> int {
+    var s = edit.startup_default()
+    s.config_path = path
+    s.no_workspace_config = true
+    var ed = scratch()
+    edit.config_init(mut ed, s)
+    if edit.config_load_all(mut ed) != edit.CFG_OK || edit.bind_active_count(ed) < CONFIG_RELOAD_BINDS {
+        return fail("500-bind config did not load")
+    }
+    let t0 = os_clock_ns()
+    let status = edit.config_reload(mut ed)
+    let dt = os_clock_ns() - t0
+    if status != edit.CFG_OK { return fail("config reload failed") }
+    dt
+}
+
+// macrolib_fixture_open's tree (perf_fletch.c:542-603).
+fn macrolib_root() -> str {
+    let tmp = env_get("TMPDIR") else "/tmp"
+    let root = "{tmp}/yew-perf-macrolib.{os_pid()}"
+    fs_create_dir(root) else |_| {}
+    for i in 0..MACROLIB_FILES {
+        var n = "{i}"
+        while n.len < 3 { n = "0{n}" }
+        let body = copy "fn run() {{ return 1 }}\n".bytes()
+        fs_write_bytes("{root}/macro{n}.fl", body) else |_| { let _ = fail("cannot write macro-library fixture") }
+    }
+    root
+}
+
+fn macrolib_close(root: str) {
+    for i in 0..MACROLIB_FILES {
+        var n = "{i}"
+        while n.len < 3 { n = "0{n}" }
+        fs_remove("{root}/macro{n}.fl") else |_| {}
+    }
+    fs_remove_dir(root) else |_| {}
+}
+
+// sample_macrolib_scan (perf_fletch.c:605-620): one rescan, the editor
+// and its diagnostic sink held across samples as C's fixture holds them.
+fn sample_macrolib_scan(mut ed: edit.Ed, mut dc: fl.DiagCtx) -> int {
+    let t0 = os_clock_ns()
+    let loaded = edit.macrolib_scan_dc(mut ed, mut dc)
+    let dt = os_clock_ns() - t0
+    if loaded != MACROLIB_FILES { return fail("macro scan loaded {loaded} of {MACROLIB_FILES} files") }
+    dt
+}
+
+// time_editor_program (perf_fletch.c:772-802): compile untimed, run timed.
+fn sample_motion_editor() -> int {
+    var ed = scratch()
+    var vm = fresh_vm()
+    let src = copy SRC_MOTION.bytes()
+    let id = fl.fl_diag_add_file(mut vm.dc, "motion_editor", src)
+    let p = fl.fl_parse(src, id, mut vm.dc, mut vm.strings)
+    if p.had_error { return fail("motion_editor did not compile") }
+    let f = fl.fl_compile(mut vm, p, id, fl.fl_origin_new(fl.FL_ORIGIN_CLI, 0)) else { return fail("motion_editor did not compile") }
+    let t0 = os_clock_ns()
+    let _ = fl.fl_vm_run_host(mut vm, mut ed, f)
+    let dt = os_clock_ns() - t0
+    if vm.raised { return fail("motion_editor raised against editor") }
+    dt
+}
+
+// One binding called with its arguments on the stack from slot 1 (the
+// unit fixtures' api_invoke).
+fn api_call(mut vm: fl.FlVm, mut ed: edit.Ed, kind: int, name_id: int, args: List[fl.FlValue]) -> fl.FlValue {
+    vm.raised = false
+    vm.cur_native = name_id
+    for i in 0..args.len { vm.stack[1 + i] = copy args[i] }
+    vm.sp = 1 + args.len
+    let out = edit.fl_attached_api(mut vm, mut ed, kind, 1, args.len)
+    vm.sp = 0
+    out
+}
+
+// sample_query_cur_pos (perf_fletch.c:689-718).
+fn sample_query_cur_pos() -> int {
+    var ed = scratch()
+    var vm = fresh_vm()
+    let name = copy "cur.pos".bytes()
+    let d = fl.fl_api_find(name) else { return fail("cur.pos binding is missing") }
+    let name_id = fl.fl_intern(mut vm.strings, name, 0, name.len)
+    let w = ed.win
+    let cur = edit.fl_h_cur_make(mut ed, w, ed.wins[w].cs.primary)
+    let args = [cur]
+    let t0 = os_clock_ns()
+    for _ in 0..QUERY_ITERS {
+        let out = api_call(mut vm, mut ed, d.kind, name_id, args)
+        if vm.raised || out.t != fl.FL_INT { return fail("cur.pos query failed") }
+    }
+    os_clock_ns() - t0
+}
+
+// sample_insert_100k (perf_fletch.c:720-770): one run transaction.
+fn sample_insert_100k() -> int {
+    var ed = scratch()
+    var vm = fresh_vm()
+    let name = copy "buf.insert".bytes()
+    let d = fl.fl_api_find(name) else { return fail("buf.insert binding is missing") }
+    let name_id = fl.fl_intern(mut vm.strings, name, 0, name.len)
+    let b = edit.fl_h_buf_make(mut ed, edit.ed_doc(ed))
+    let x = fl.fl_str_text(mut vm, "x")
+    fl.fl_gc_protect(mut vm, x)
+    if !edit.fl_txn_run_begin(mut vm, mut ed) { return fail("insert transaction refused") }
+    let t0 = os_clock_ns()
+    for i in 0..INSERT_ITERS {
+        let args = [copy b, fl.fl_int(i), copy x]
+        let _ = api_call(mut vm, mut ed, d.kind, name_id, args)
+        if vm.raised { return fail("buf.insert failed at {i}") }
+    }
+    if !edit.fl_txn_run_end(mut ed, true) { return fail("insert transaction did not close") }
+    let dt = os_clock_ns() - t0
+    let bi = edit.ed_doc(ed)
+    if text.textbuf_len(ed.bufs[bi].ec.tb) != INSERT_ITERS || ed.bufs[bi].ec.undo.nodes.len != 2 {
+        return fail("100k inserts were not one undo node")
+    }
+    if ed.bufs[bi].ec.undo.bytes_live > ed.bufs[bi].ec.undo.bytes_max {
+        return fail("100k inserts exceeded undo.bytes_max")
+    }
+    dt
+}
+
+fn less(a: int, b: int) -> bool { a < b }
+
+fn print_row(row: str, raw: List[int], budget: int) {
+    var measured = List[int]()
+    for i in 1..raw.len { (mut measured).push(raw[i]) }
+    util.sort_stable(mut measured, less)
+    let median = if measured.len == 0 then raw[0] else measured[measured.len / 2]
+    let minimum = if measured.len == 0 then raw[0] else measured[0]
+    print_raw("{row} median_ns={median} min_ns={minimum} budget_ns={budget} raw=")
+    for i in 0..raw.len {
+        if i != 0 { print_raw(",") }
+        print_raw("{raw[i]}")
+    }
+    print("")
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len < 1 || args.len > 2 { return 2 }
+    let row = args[0]
+    if (env_get("YEW_FL_GC_STRESS") else "absent") != "absent" ||
+        (env_get("FL_GC_STRESS") else "absent") != "absent" {
+        eprint("perf_fletch: GC stress is set; timing is refused")
+        return 2
+    }
+    var raw = List[int]()
+    if row == "config_load" {
+        if args.len != 2 { return 2 }
+        let src = fs_read_bytes(args[1]) else { return 3 }
+        for _ in 0..12 { (mut raw).push(sample_config_load(src)) }
+        print_row(row, raw, GATE_CONFIG_NS)
+    } else if row == "config_reload_500" {
+        let tmp = env_get("TMPDIR") else "/tmp"
+        let path = "{tmp}/yew-perf-config.{os_pid()}"
+        let body = copy RELOAD_SOURCE.bytes()
+        fs_write_bytes(path, body) else |_| { return fail("cannot write reload fixture") }
+        for _ in 0..12 { (mut raw).push(sample_config_reload(path)) }
+        fs_remove(path) else |_| {}
+        print_row(row, raw, GATE_CONFIG_RELOAD_NS)
+    } else if row == "macrolib_scan_200" {
+        let root = macrolib_root()
+        var ed = scratch()
+        if edit.opt_set(mut ed, edit.OPT_GLOBAL, "macro.dir", edit.optv_str(root)).len != 0 {
+            macrolib_close(root)
+            return fail("cannot set macro.dir")
+        }
+        var dc = fl.fl_diag_init()
+        for _ in 0..12 { (mut raw).push(sample_macrolib_scan(mut ed, mut dc)) }
+        macrolib_close(root)
+        print_row(row, raw, GATE_MACROLIB_SCAN_NS)
+    } else if row == "motion_editor" {
+        for _ in 0..12 { (mut raw).push(sample_motion_editor()) }
+        print_row(row, raw, GATE_MOTION_NS_PER_OP * MOTION_ITERS)
+    } else if row == "query_cur_pos" {
+        for _ in 0..12 { (mut raw).push(sample_query_cur_pos()) }
+        print_row(row, raw, GATE_QUERY_NS)
+    } else if row == "insert_100k" {
+        (mut raw).push(sample_insert_100k())
+        print_row(row, raw, 0)
+    } else {
+        return 2
+    }
+    0
+}
