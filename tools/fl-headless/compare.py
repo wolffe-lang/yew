@@ -28,6 +28,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SMOKE = ('fib24', 'map10k', 'motion100k')
 HEADLESS = ('startup', 'parse_only', 'motion_dispatch', 'fib27', 'map_heavy', 'gc_pause',
             'strbuild_join', 'strbuild_concat', 'join5k', 'list_sort')
+# yw09 (R-yw09-3 A): perf_fletch.c's six editor rows (:1076-1131) through
+# tools/fl-editor-perf beside the same oracle; insert_100k is C's report-only
+# row, one sample, recorded.
+EDITOR = ('config_load', 'config_reload_500', 'macrolib_scan_200', 'motion_editor', 'query_cur_pos',
+          'insert_100k')
+REPORT_ONLY = ('gc_pause', 'insert_100k')
 SANITY_MULTIPLIER = 100  # perf_policy.h YEW_PERF_ADVISORY_SANITY_MULTIPLIER
 
 
@@ -134,9 +140,10 @@ def main():
                    help='also write this run as a baseline (one why for every row)')
     p.add_argument('--why', default='')
     a = p.parse_args()
-    selected = set(SMOKE + HEADLESS if a.rows == 'all' else a.rows.split(','))
-    if selected - set(SMOKE + HEADLESS):
-        p.error('unknown rows: ' + ','.join(sorted(selected - set(SMOKE + HEADLESS))))
+    known = SMOKE + HEADLESS + EDITOR
+    selected = set(known if a.rows == 'all' else a.rows.split(','))
+    if selected - set(known):
+        p.error('unknown rows: ' + ','.join(sorted(selected - set(known))))
     if a.emit_baseline and not a.why.strip():
         p.error('--emit-baseline needs a --why (the baseline why column is required)')
     baseline = read_baseline(a.baseline.read_text()) if a.baseline.exists() else None
@@ -233,13 +240,15 @@ def main():
             errors.append(str(e))
             print('ERROR ' + str(e), flush=True)
 
-    for name in HEADLESS:
+    for name in HEADLESS + EDITOR:
         if name not in selected:
             continue
         timings = {}
+        driver = 'fl-editor-perf' if name in EDITOR else 'fl-headless'
+        samples = 1 if name == 'insert_100k' else 12
         try:
             for who, bin in [('C', ROOT / 'target/tools/fl-headless-oracle'),
-                             ('port', ROOT / f'target/tools/fl-headless-{a.tier}')]:
+                             ('port', ROOT / f'target/tools/{driver}-{a.tier}')]:
                 text = run(f'{name}-{who}', [bin, name, a.oracle_tree / 'runtime/init.fl'])
                 m = re.search(r'^' + re.escape(name) +
                               r' median_ns=(\d+) min_ns=(\d+) budget_ns=(\d+)(?: gc=(\d+))? raw=([0-9,]+)$',
@@ -248,13 +257,15 @@ def main():
                     raise ValueError(f'{who}/{name}: malformed result')
                 median, minimum, budget = map(int, m.groups()[:3])
                 raw = list(map(int, m[5].split(',')))
-                if len(raw) != 12 or median != statistics.median(raw[1:]) or minimum != min(raw[1:]):
+                measured = raw[1:] if samples == 12 else raw
+                if len(raw) != samples or median != sorted(measured)[len(measured) // 2] or \
+                        minimum != min(measured):
                     raise ValueError(f'{who}/{name}: sample/median mismatch')
                 timings[who] = (median, budget, minimum)
             if timings['C'][1] != timings['port'][1]:
                 raise ValueError(f'{name}: budget mismatch')
             record(name, timings['C'][0], timings['port'][0], timings['port'][2], timings['C'][1],
-                   name == 'gc_pause')
+                   name in REPORT_ONLY)
         except (ValueError, subprocess.TimeoutExpired) as e:
             errors.append(str(e))
             print('ERROR ' + str(e), flush=True)
