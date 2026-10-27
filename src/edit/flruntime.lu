@@ -6,6 +6,7 @@
 //! The actual-VM/compacting-GC witness is src/fl_parking_test.lu.
 
 use fl
+use text
 use util
 
 /// Macro cache references are host-root indices, never stale heap references.
@@ -86,6 +87,8 @@ pub fn fl_runtime_init(mut ed: Ed) -> bool {
         }
     }
     vm.host_kind = 1
+    // fl_hook_table_init + the root-11 provider (flruntime.c:221-222).
+    fl.fl_gc_root_provider(mut vm, fl.FL_GC_PROVIDER_HOOKS, 0)
     for _ in 0..26 {
         let root = fl.fl_gc_host_root_add(mut vm, fl.fl_nil())
         (mut ed.flrt.macro_cache).push(FlMacroCache {
@@ -272,4 +275,271 @@ impl fl.FlHost for Ed {
         fl_txn_run_end(mut self, commit)
     }
     fn run_active(self) -> bool { self.fltxn.entry_active }
+    fn hook_call(mut self, mut vm: fl.FlVm, f: fl.FlValue, args: List[fl.FlValue]) -> (
+        bool,
+        fl.FlValue,
+    ) {
+        runtime_hook_call(mut vm, mut self, f, args)
+    }
+    fn hook_masked(self, origin: int) -> bool { fl.fl_origin_masked(self.origins, origin) }
+    fn hook_notice(
+        mut self,
+        mut vm: fl.FlVm,
+        what: int,
+        event: int,
+        ledger_id: int,
+        errs: int,
+        err: fl.FlValue,
+    ) {
+        runtime_hook_notice(mut vm, mut self, what, event, ledger_id, errs, err)
+    }
+}
+
+// ---- hooks (flruntime.c:55-184, 282-507) ------------------------------
+
+// hook_call (flruntime.c:55-87): an outer fire opens the editor's implicit
+// transaction, a nested one an edit boundary, so a failing hook rolls back
+// only its own edits. A retained closure runs as its defining principal
+// (builtin frames are transparent to capability checks).
+fn runtime_hook_call(mut vm: fl.FlVm, mut ed: Ed, f: fl.FlValue, args: List[fl.FlValue]) -> (
+    bool,
+    fl.FlValue,
+) {
+    let nested = ed.fltxn.entry_active
+    let opened = if nested then fl_txn_edit_begin(mut vm, mut ed) else fl_txn_run_begin(mut vm, mut ed)
+    if !opened {
+        // C returns false with *err untouched (its caller's FL_NIL_V).
+        vm.raised = false
+        return (false, fl.fl_nil())
+    }
+    let saved = copy vm.root_origin
+    if f.t == fl.FL_CLOSURE {
+        let fun = copy vm.gc.slots[fl.fl_obj_index(vm, f)].fn_value
+        vm.root_origin = copy vm.gc.slots[fl.fl_obj_index(vm, fun)].origin
+    }
+    let _ = fl.fl_vm_call_host(mut vm, mut ed, f, args)
+    let ok = !vm.raised
+    vm.root_origin = saved
+    let err = if ok then fl.fl_nil() else copy vm.err
+    vm.raised = false
+    if nested {
+        let _ = fl_txn_edit_end(mut vm, mut ed, ok)
+    } else {
+        let _ = fl_txn_run_end(mut ed, ok)
+    }
+    vm.raised = false
+    (ok, err)
+}
+
+// first_line (flruntime.c:94-106): up to the first newline, 255 bytes.
+fn runtime_first_line(text: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    for b in text {
+        if b == 10 as byte || out.len == 255 { break }
+        (mut out).push(b)
+    }
+    if out.len == 0 { util.buf_append_str(mut out, "hook error") }
+    out
+}
+
+// hook_notice (flruntime.c:116-184), less the plugin-origin rows: a plugin
+// origin exists only once yw14 loads plugins (`yew_plug_hook_error`, the
+// disabled-hook reprieve), so no origin reaches them before that lane.
+fn runtime_hook_notice(
+    mut vm: fl.FlVm,
+    mut ed: Ed,
+    what: int,
+    event: int,
+    ledger_id: int,
+    errs: int,
+    err: fl.FlValue,
+) {
+    let _ = ledger_id
+    let name = fl.fl_event_name(event) else "?"
+    let limit = vm.hooks.error_limit
+    if what == fl.FL_HOOK_NOTICE_REENTRANT {
+        util.log_at(util.LOG_WARN, "hook \"{name}\" reentrant fire dropped")
+        return
+    }
+    if what == fl.FL_HOOK_NOTICE_DEPTH {
+        util.log_at(util.LOG_ERROR, "hook \"{name}\" exceeded nesting depth")
+        ed_msg(mut ed, MSG_WARN, "hook \"{name}\" error ({errs}/{limit}): nesting depth exceeded")
+        return
+    }
+    if what == fl.FL_HOOK_NOTICE_DISABLED {
+        util.log_at(util.LOG_ERROR, "hook \"{name}\" disabled after {errs} errors")
+        ed_msg(mut ed, MSG_WARN, "hook \"{name}\" disabled after {errs} errors")
+        return
+    }
+    var trace = List[byte]()
+    fl.fl_trace_render(mut vm, err, mut trace)
+    var logged = List[byte]()
+    util.buf_append_str(mut logged, "hook \"{name}\" error ({errs}/{limit}): ")
+    util.buf_append(mut logged, trace)
+    util.log_at_bytes(util.LOG_ERROR, logged)
+    var shown = List[byte]()
+    util.buf_append_str(mut shown, "hook \"{name}\" error ({errs}/{limit}): ")
+    util.buf_append(mut shown, runtime_first_line(trace))
+    ed_msg_bytes(mut ed, MSG_WARN, shown)
+}
+
+// yew_fl_vm (flruntime.c:250-254): the runtime's VM is parked or idle.
+fn runtime_vm_available(ed: Ed) -> bool { ed.flrt.ready && ed.flrt.vms.len != 0 }
+
+/// `fl_runtime_on` (flruntime.c:282-314): `on(event, fn)`, the hook's
+/// stable ledger id. The plugin manifest rows are yw14's (no plugin origin
+/// exists before it).
+pub fn fl_runtime_on(mut vm: fl.FlVm, mut ed: Ed, base: int, argc: int) -> fl.FlValue {
+    let event = copy vm.stack[base]
+    let f = copy vm.stack[base + 1]
+    if argc != 2 || event.t != fl.FL_STR || f.t != fl.FL_CLOSURE && f.t != fl.FL_NATIVE {
+        return fl.fl_raise(mut vm, "type", "on expects (event string, function)")
+    }
+    let name = copy vm.gc.slots[fl.fl_obj_index(vm, event)].bytes
+    let id = fl.fl_event_parse(name) else {
+        var msg = List[byte]()
+        util.buf_append_str(mut msg, "unknown editor event '")
+        util.buf_append(mut msg, name)
+        util.buf_append_str(mut msg, "'")
+        return fl.fl_raise_bytes(mut vm, "name", msg)
+    }
+    let origin = fl.fl_origin_of_frame(mut ed.origins, vm)
+    if origin == fl.FL_ORIGIN_ID_NONE {
+        return fl.fl_raise(mut vm, "handle", "on: callback has no editor origin")
+    }
+    let callback = copy vm.stack[base + 1]
+    fl.fl_int(fl.fl_hook_add(mut vm.hooks, origin, id, callback))
+}
+
+/// Whether a live, enabled, unmasked hook would consume `event` (the
+/// listens checks in front of every yew_fl_hook_* payload).
+pub fn ed_hook_listens(ed: Ed, event: int) -> bool {
+    if !runtime_vm_available(ed) { return false }
+    fl.fl_hook_listens(ed.flrt.vms[0].hooks, ed, event)
+}
+
+/// `yew_fl_hook_fire` (flruntime.c:316-328): the runtime VM, parked or
+/// idle, runs the event's hooks; a command a hook runs parks it again.
+/// The plugin drain at depth 0 is yw14's.
+pub fn ed_hook_fire(mut ed: Ed, event: int, args: List[fl.FlValue]) {
+    if !runtime_vm_available(ed) { return }
+    var vm = runtime_take(mut ed)
+    fl.fl_hook_fire(mut vm, mut ed, event, args)
+    (mut ed.flrt.vms).push(vm)
+}
+
+/// `yew_fl_hook_buffer` (flruntime.c:330-339): one buffer handle.
+pub fn ed_hook_buffer(mut ed: Ed, event: int, bi: int) {
+    if bi < 0 || bi >= ed.bufs.len || !ed_hook_listens(ed, event) { return }
+    let arg = fl_h_buf_make(mut ed, bi)
+    ed_hook_fire(mut ed, event, [arg])
+}
+
+/// `yew_fl_hook_mode` (flruntime.c:341-351): the mode's name as a string.
+pub fn ed_hook_mode(mut ed: Ed, event: int, mode: str) {
+    if !ed_hook_listens(ed, event) { return }
+    var vm = runtime_take(mut ed)
+    let arg = fl.fl_str_text(mut vm, mode)
+    fl.fl_hook_fire(mut vm, mut ed, event, [arg])
+    (mut ed.flrt.vms).push(vm)
+}
+
+/// `yew_fl_hook_window` (flruntime.c:353-362): one window handle.
+pub fn ed_hook_window(mut ed: Ed, event: int, wi: int) {
+    if wi < 0 || wi >= ed.wins.len || !ed_hook_listens(ed, event) { return }
+    let arg = fl_h_win_make(mut ed, wi)
+    ed_hook_fire(mut ed, event, [arg])
+}
+
+fn cursor_hash_word(h0: wrapping[u64], word: int) -> wrapping[u64] {
+    var h = h0
+    var i: int = 0
+    while i < 8 {
+        let b = (word >> (i * 8)) & 255
+        h = h ^ b as wrapping[u64]
+        h = h * 1099511628211
+        i += 1
+    }
+    h
+}
+
+/// `yew_fl_cursor_burst_state` (flruntime.c:364-394): an FNV-1a digest of
+/// the window's identity, cursor count, primary and every cursor.
+pub fn ed_cursor_burst_state(ed: Ed, wi: int) -> wrapping[u64] {
+    var hash: wrapping[u64] = 14695981039346656037
+    if wi < 0 || wi >= ed.wins.len { return 0 }
+    hash = cursor_hash_word(hash, ed.wins[wi].id)
+    hash = cursor_hash_word(hash, ed.wins[wi].cs.curs.len)
+    hash = cursor_hash_word(hash, ed.wins[wi].cs.primary)
+    for i in 0..ed.wins[wi].cs.curs.len {
+        hash = cursor_hash_word(hash, ed.wins[wi].cs.stamps[i])
+        hash = cursor_hash_word(hash, ed.wins[wi].cs.curs[i].pos as int)
+        hash = cursor_hash_word(hash, ed.wins[wi].cs.curs[i].anchor as int)
+        hash = cursor_hash_word(hash, ed.wins[wi].cs.curs[i].goal_col as int)
+    }
+    hash
+}
+
+/// `yew_fl_hook_flush_cursor` (flruntime.c:396-401): the focused window's
+/// cursor.move when its burst state moved.
+pub fn ed_hook_flush_cursor(mut ed: Ed, wi: int, before: wrapping[u64]) {
+    if wi >= 0 && wi == ed.win && ed_cursor_burst_state(ed, wi) != before {
+        ed_hook_window(mut ed, fl.FL_EV_CURSOR_MOVE, wi)
+    }
+}
+
+/// `yew_fl_hook_workspace` (flruntime.c:403-414): the workspace root.
+pub fn ed_hook_workspace(mut ed: Ed, event: int) {
+    if !ed_hook_listens(ed, event) { return }
+    let root = ws_root(ed)
+    var vm = runtime_take(mut ed)
+    let arg = fl.fl_str_text(mut vm, root)
+    fl.fl_hook_fire(mut vm, mut ed, event, [arg])
+    (mut ed.flrt.vms).push(vm)
+}
+
+/// `yew_fl_hook_note_change` (flruntime.c:416-455): coalesce one buffer's
+/// change into [lo, hi), keyed by its stable identity.
+pub fn ed_hook_note_change(mut ed: Ed, bi: int, at_in: int) {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident || ed.flrt.flushing_change { return }
+    let len = text.textbuf_len(ed.bufs[bi].ec.tb)
+    let at = if at_in > len then len else at_in
+    let hi = if at < len then at + 1 else at
+    let id = ed.bufs[bi].id
+    for i in 0..ed.flrt.changes.len {
+        if ed.flrt.changes[i].buffer_id == id {
+            if at < ed.flrt.changes[i].lo { ed.flrt.changes[i].lo = at }
+            if hi > ed.flrt.changes[i].hi { ed.flrt.changes[i].hi = hi }
+            return
+        }
+    }
+    (mut ed.flrt.changes).push(FlPendingChange { buffer_id: id, lo: at, hi: hi })
+}
+
+/// `yew_fl_hook_flush_change` (flruntime.c:457-507): one buf.change per
+/// pending buffer, in workspace order, with a span of the coalesced range.
+/// Nobody listening clears the coalescer before any payload is built (a
+/// span handle retains two marks for the buffer's life).
+pub fn ed_hook_flush_change(mut ed: Ed) {
+    if ed.flrt.changes.len == 0 || ed.flrt.flushing_change { return }
+    if !runtime_vm_available(ed) || !ed_hook_listens(ed, fl.FL_EV_BUF_CHANGE) {
+        (mut ed.flrt.changes).reset()
+        return
+    }
+    let pending = copy ed.flrt.changes
+    (mut ed.flrt.changes).reset()
+    ed.flrt.flushing_change = true
+    for bi in 0..ed.bufs.len {
+        for p in pending {
+            if ed.bufs[bi].id != p.buffer_id || !ed.bufs[bi].resident { continue }
+            let len = text.textbuf_len(ed.bufs[bi].ec.tb)
+            let lo = if p.lo > len then len else p.lo
+            let hi = if p.hi > len then len else p.hi
+            let hb = fl_h_buf_make(mut ed, bi)
+            let hs = fl_h_span_make(mut ed, bi, lo, hi)
+            ed_hook_fire(mut ed, fl.FL_EV_BUF_CHANGE, [hb, hs])
+            break
+        }
+    }
+    ed.flrt.flushing_change = false
 }
