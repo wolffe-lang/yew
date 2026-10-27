@@ -145,6 +145,17 @@ pub struct Ed {
     fl_model_teardown: bool,
     // The macro recorder (`ed->rec`, record.h:41-52).
     rec: Rec,
+    // The option table and store (`opt_globals`, `opt_history`, option.c).
+    opt: OptState,
+    // The origin-owned bindings (`ed->bindings`, bind.c:39-49).
+    binds: Bindings,
+    // `ed->config` (flconf.c:59-76): empty, or the live state first and a
+    // reload's candidate second; `cfg_serial` names each state for the
+    // trust prompt's context.
+    cfg: List[ConfigState],
+    cfg_serial: int,
+    // `ed->trust_prompt` (trust_prompt.h:15-24).
+    trust_prompt: TrustPrompt,
     tty: term.Tty,
     input: term.In,
     grid: term.Grid,
@@ -250,7 +261,6 @@ pub struct Ed {
     theme: Theme,
     opts: Opts,
     config_error: str,
-    config_globals: Map[str, str],
     footer_rect: Rect,
     tab_strip_rect: Rect,
     headless: bool,
@@ -392,6 +402,11 @@ pub fn ed_new() -> Ed {
         fltxn: fl_txn_new(),
         fl_model_teardown: false,
         rec: rec_new(),
+        opt: opt_state_new(),
+        binds: bindings_new(),
+        cfg: List[ConfigState](),
+        cfg_serial: 0,
+        trust_prompt: trust_prompt_none(),
         tty: term.tty_new(),
         input: term.input_new(term.caps_new()),
         grid: term.grid_new(1, 1),
@@ -496,7 +511,6 @@ pub fn ed_new() -> Ed {
         theme: theme_none(),
         opts: opts_default(),
         config_error: "",
-        config_globals: Map[str, str](),
         footer_rect: rect(0, 0, 0, 0),
         tab_strip_rect: rect(0, 0, 0, 0),
         headless: false,
@@ -550,6 +564,8 @@ pub fn ed_new() -> Ed {
     }
     ed.chord_timeout_ms = dispatch_timeout_from_env()
     keys_highlight_install(mut ed, MODE_L)
+    // yew_opt_init (ed.c:802): every option at its default, with its effect.
+    opt_init(mut ed)
     ed
 }
 
@@ -665,36 +681,18 @@ pub fn ed_open_scratch(mut ed: Ed) {
 /// A headless editor for the unit tests (`yew_ed_init`, then
 /// `yew_ed_open_scratch` and `yew_test_load_runtime`, sagitta
 /// `tests/unit/harness.c:392-411`): `config` — the bytes of the repository's
-/// `runtime/init.fl` — run as the one configuration source and each mode's
-/// keymap rebuilt from its rows, as `ed_load_config` does without the
-/// user's file or the theme; then `seed` inserted into the scratch buffer
-/// as C's tests insert it (`yew_textbuf_insert`: no undo, no journal, the
-/// cursor left at 0).
+/// `runtime/init.fl` — evaluated in the persistent runtime inside one bind
+/// batch, as C's harness does (no config state, no user file, no theme);
+/// then `seed` inserted into the scratch buffer as C's tests insert it
+/// (`yew_textbuf_insert`: no undo, no journal, the cursor left at 0).
 pub fn ed_new_test(config: List[byte], seed: str) -> Ed {
     var ed = ed_new()
     ed_open_scratch(mut ed)
-    var c = config_new(opts_default())
-    config_apply(mut c, config)
-    if c.error.len != 0 {
-        bug("test runtime: {c.error}")
-    }
-    ed.opts = c.opts
-    var m = 0
-    while m < MODE_N {
-        let (ok, km, _, _) = keymap_build_diag(ed.reg, "config", c.binds[m])
-        if !ok {
-            bug("test runtime: the {mode_name(m)} bindings do not build")
-        }
-        ed.keymaps[km_bind(m)] = km
-        m += 1
-    }
-    ed.chord_timeout_ms = ed.opts.chord_timeout_ms
-    ed.undo_break_on_newline = ed.opts.undo_break_on_newline
-    ed.errorbells = ed.opts.errorbells
-    var i = 0
-    while i < ed.wins.len {
-        apply_win_opts(ed.opts, mut ed.wins[i])
-        i += 1
+    bind_batch_begin(mut ed)
+    let status = fl_runtime_eval(mut ed, config)
+    bind_batch_end(mut ed)
+    if status != CMD_OK {
+        bug("test runtime: runtime/init.fl did not evaluate: {ed.msg.text}")
     }
     if seed.len != 0 {
         let b = ed.wins[ed.win].buf
@@ -1441,6 +1439,17 @@ pub fn ed_prompt_key(mut ed: Ed, key: term.Key) -> bool {
     let code = key.code
     if key.ev == term.KEY_RELEASE {
         return true
+    }
+    // ed.c:2217-2222: the trust prompt takes one answer byte.
+    if ed.prompt == PROMPT_WORKSPACE_TRUST {
+        let answer = if code == term.KEY_ESCAPE {
+            27
+        } else if key.mods == 0 && code <= 127 {
+            code
+        } else {
+            0
+        }
+        return trust_prompt_key(mut ed, answer)
     }
     if ed.ws_prompt_active {
         return ws_prompt_key(mut ed, if key.mods == 0 then code else 0)

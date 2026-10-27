@@ -43,6 +43,14 @@ pub struct Startup {
     has_theme: bool,
     workspace: str,
     has_workspace: bool,
+    // Sprint 36's policy (`YewEdStartup`, ed.h:92-114): a shipped overlay
+    // after runtime/init.fl, a clean session that keeps the built-ins, a
+    // required built-in, and the workspace config's two gates.
+    builtin_overlay: str,
+    clean_builtins: bool,
+    require_config: bool,
+    no_workspace_config: bool,
+    trust_workspace: bool,
 }
 
 /// A default startup.
@@ -54,6 +62,11 @@ pub fn startup_default() -> Startup {
         has_theme: false,
         workspace: "",
         has_workspace: false,
+        builtin_overlay: "",
+        clean_builtins: false,
+        require_config: false,
+        no_workspace_config: false,
+        trust_workspace: false,
     }
 }
 
@@ -61,108 +74,48 @@ fn is_dir(path: str) -> bool {
     fs.is_dir(path)
 }
 
-// `user_path` (`flconf.c:146-159`): `--config PATH`, else
-// `$XDG_CONFIG_HOME/yew/init.fl`; "" when neither resolves.
-fn user_config_path(s: Startup) -> str {
-    if s.config_path.len != 0 {
-        return s.config_path
-    }
-    let dir = util.xdg_config_dir() else ""
-    if dir.len == 0 then "" else "{dir}/init.fl"
+/// Load the configuration (`yew_config_init` + `yew_config_load_all`,
+/// `flconf.c:245-265, 599-629`, as `ed.c:2944, 2989` run them): the
+/// built-in `runtime/init.fl`, the user's `init.fl` (`--config` names it)
+/// and the workspace's trust-gated `.yew.fl`, each in the VM under its
+/// origin. The default `theme` option's first apply is the port's here
+/// when no configuration named one (the store's init leaves it, see
+/// opt_init). Answers the load's CfgStatus.
+pub fn ed_load_config(mut ed: Ed, s: Startup) -> int {
+    config_init(mut ed, s)
+    let status = config_load_all(mut ed)
+    ed.config_error = if status == CFG_OK then "" else "configuration failed to load ({status})"
+    let want = opt_global_str(ed, "theme")
+    if ed.theme.name != want { ed_theme_set(mut ed, want) }
+    status
 }
 
-/// Load the configuration and its theme (`yew_config_load_all`,
-/// `flconf.c:599-627`, then the `theme` option's `yew_theme_apply`,
-/// `theme_cmds.c:227-245`): the built-in `runtime/init.fl` (required),
-/// the user's `init.fl` (optional; `--config` names it), one option
-/// store and one bind ledger across both, each mode's keymap rebuilt
-/// from the ledger. `--clean` loads none of them (`source_enabled`,
-/// `flconf.c:372-386`). The workspace's `.yew.fl` is trust-gated and
-/// campaign 06's (yw06, the trust database): never read here.
-pub fn ed_load_config(mut ed: Ed, s: Startup) {
-    var c = config_new(opts_default())
-    if !s.clean {
-        let (found, src, path) = runtime_read("init.fl")
-        if !found {
-            util.log_at(
-                util.LOG_ERROR,
-                "config missing: {path} (set YEW_RUNTIME_DIR to the shipped runtime directory)",
-            )
-        } else {
-            config_apply(mut c, src)
-            if c.error.len != 0 {
-                config_report(mut ed, path, c.error)
-            }
-        }
-        let user = user_config_path(s)
-        if user.len != 0 {
-            let bytes = fs_read_bytes(user) else |_| List[byte]()
-            if bytes.len == 0 {
-                util.log_at(util.LOG_INFO, "config missing: {user}")
-            } else {
-                config_apply(mut c, bytes)
-                if c.error.len != 0 {
-                    config_report(mut ed, user, c.error)
-                }
-            }
-        }
-    }
-    ed.config_globals = c.globals
-    ed.opts = c.opts
-    var m = 0
-    while m < MODE_N {
-        let (ok, km, row, err) = keymap_build_diag(ed.reg, "config", c.binds[m])
-        if ok {
-            ed.keymaps[km_bind(m)] = km
-        } else {
-            let rows = copy c.binds[m]
-            config_report(mut ed, "bind {mode_name(m)} {rows[row].seq}", keymap_error_string(err))
-        }
-        m += 1
-    }
-    ed.chord_timeout_ms = ed.opts.chord_timeout_ms
-    ed.undo_break_on_newline = ed.opts.undo_break_on_newline
-    ed.errorbells = ed.opts.errorbells
-    ed_theme_set(mut ed, ed.opts.theme)
-    var i = 0
-    while i < ed.wins.len {
-        apply_win_opts(ed.opts, mut ed.wins[i])
-        i += 1
-    }
-}
-
-// A configuration the reader refuses: C's VM would run it, so the port
-// names the gap (invariant 3) on the message line and in the log; the
-// statements before the refusal stand, as C's would have run.
-fn config_report(mut ed: Ed, where: str, what: str) {
-    ed.config_error = "not yet ported: {where}: {what}: sagitta Sprint 36 (yw09)"
-    util.log_at(util.LOG_ERROR, ed.config_error)
-    ed_msg(mut ed, MSG_ERROR, ed.config_error)
-}
-
-/// `yew_theme_set` (`theme_cmds.c:247-273`): select and compile `name`;
-/// on failure the message names why and the old theme stays.
+/// `yew_theme_set` (`theme_cmds.c:247-273`): `name` set through the
+/// `theme` option, whose setter applies it; a refusal names why on the
+/// message line and the old theme stays. Before the store exists the
+/// theme is applied directly, as C's NULL-store branch.
 pub fn ed_theme_set(mut ed: Ed, name: str) {
-    if !theme_valid_name(name) {
-        ed_msg(mut ed, MSG_ERROR, "invalid theme name '{name}'")
-        return
+    let why = if ed.opt.globals.len == 0 {
+        ed_theme_apply(mut ed, name)
+    } else {
+        opt_set(mut ed, OPT_SCOPE_DECLARED, "theme", optv_str(name))
     }
+    if why.len != 0 { ed_msg(mut ed, MSG_ERROR, why) }
+}
+
+/// `yew_theme_apply`'s shape (`theme_cmds.c`): select and compile `name`;
+/// "" on success, else why, with the old theme kept. The `theme`
+/// option's setter runs it (option.c:1246-1256).
+pub fn ed_theme_apply(mut ed: Ed, name: str) -> str {
+    if !theme_valid_name(name) { return "invalid theme name '{name}'" }
     let (found, src, path) = runtime_theme(name)
-    if !found {
-        ed_msg(mut ed, MSG_ERROR, "theme '{name}' was not found")
-        return
-    }
+    if !found { return "theme '{name}' was not found" }
     let (ok, t, err) = theme_compile(src)
-    if !ok {
-        ed_msg(mut ed, MSG_ERROR, "{path}: {err}")
-        return
-    }
-    if t.name != name {
-        ed_msg(mut ed, MSG_ERROR, "theme file '{name}' declares name '{t.name}'")
-        return
-    }
+    if !ok { return "{path}: {err}" }
+    if t.name != name { return "theme file '{name}' declares name '{t.name}'" }
     ed.theme = t
     theme_sync_surfaces(mut ed)
+    ""
 }
 
 /// `YewStartKind` (`ed.h:75-79`): `yew` with no target.
@@ -315,7 +268,13 @@ pub fn ed_run(paths: List[str], s: Startup) -> int {
     ed.grid_ready = true
     ed.render = term.render_new(term.tty_caps(ed.tty), term.env_process())
     ed.render_ready = true
-    ed_load_config(mut ed, s)
+    let config_status = ed_load_config(mut ed, s)
+    if s.require_config && config_status != CFG_OK {
+        state_dispose(mut ed)
+        term.tty_close(mut ed.tty)
+        eprint("yew: error: required built-in configuration failed")
+        return util.EXIT_ERR
+    }
     util.rss_checkpoint("config")
     if s.has_theme {
         ed_theme_set(mut ed, s.theme)
