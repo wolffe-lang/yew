@@ -1,0 +1,506 @@
+//! edit.bind — origin-owned key bindings (Sprint 36): sagitta 9ace98c2
+//! src/edit/bind.c:1-774 and bind.h:1-38.
+//!
+//! A binding is a row owned by the origin that made it and registered in
+//! the hook table's ledger (REG_BIND), so an origin's teardown removes
+//! exactly its rows. Each mode's config keymap (`ed.keymaps[km_bind(m)]`,
+//! C's `bind_keys`) is rebuilt from the active rows, newest first wins a
+//! sequence, oldest order kept. A closure target runs through
+//! `ed.fl.closure` with the row's ledger id as `iarg`; the closure is held
+//! by a VM host root (C marks rows from a root provider, bind.c:143-155).
+//!
+//! The ledger lives in the VM (`vm.hooks.ledger`, R-yw09-2): a caller that
+//! holds the running VM passes its ledger; one that does not reaches the
+//! runtime's parked or idle VM.
+
+use fl
+use util
+
+/// `YewBindRow` (bind.c:27-37); `root` is the closure's host root, -1 for
+/// a command binding.
+pub struct BindRec {
+    seq: str,
+    cmd: str,
+    sarg: str,
+    has_sarg: bool,
+    root: int,
+    iarg: int,
+    origin: int,
+    ledger_id: int,
+    mode: int,
+    active: bool,
+}
+
+/// `YewBindings` (bind.c:39-49).
+pub struct Bindings {
+    v: List[BindRec],
+    free_hint: int,
+    active_hi: int,
+    batch_depth: int,
+    rebuilds: int,
+    pending: bool,
+    error: str,
+}
+
+/// An empty binding set (`yew_bind_init`'s, bind.c:252-272; the empty
+/// config keymaps are ed_new's).
+pub fn bindings_new() -> Bindings {
+    Bindings {
+        v: List[BindRec](),
+        free_hint: 0,
+        active_hi: 0,
+        batch_depth: 0,
+        rebuilds: 0,
+        pending: false,
+        error: "",
+    }
+}
+
+// The runtime's VM, made when absent; for the ledger and host roots.
+fn bind_vm_take(mut ed: Ed) -> fl.FlVm {
+    let _ = fl_runtime_init(mut ed)
+    (mut ed.flrt.vms).pop() else {
+        util.bug("edit.bind", "bindings need the runtime's VM, which a running call holds")
+        fl.fl_vm_new(take fl.fl_strings())
+    }
+}
+
+// row_by_ledger (bind.c:72-89): -1 unless the ledger row is an active
+// REG_BIND naming an active row that names it back.
+fn bind_row_by_ledger(ed: Ed, ledger: fl.FlRegLedger, ledger_id: int) -> int {
+    if ledger_id <= 0 || ledger_id > ledger.rows.len { return -1 }
+    let r = ledger.rows[ledger_id - 1]
+    if !r.active || r.kind != fl.REG_BIND || r.handle_id == 0 { return -1 }
+    let row = r.handle_id - 1
+    if row >= ed.binds.v.len || !ed.binds.v[row].active || ed.binds.v[row].ledger_id != ledger_id {
+        return -1
+    }
+    row
+}
+
+// find_sequence (bind.c:157-169): the newest active row for (mode, seq).
+fn bind_find(ed: Ed, mode: int, seq: str) -> int {
+    var i = ed.binds.active_hi
+    while i != 0 {
+        let row = ed.binds.v[i - 1]
+        if row.active && row.mode == mode && row.seq == seq { return i - 1 }
+        i -= 1
+    }
+    -1
+}
+
+// rows_for_mode (bind.c:196-238): newest wins a sequence, rows in slot
+// order.
+fn bind_rows_for_mode(ed: Ed, mode: int) -> List[BindRow] {
+    var seen = Map[str, bool]()
+    var keep = List[bool]()
+    for _ in 0..ed.binds.active_hi { (mut keep).push(false) }
+    var i = ed.binds.active_hi
+    while i != 0 {
+        let row = ed.binds.v[i - 1]
+        if row.active && row.mode == mode && !(seen.get(row.seq) else false) {
+            (mut seen).set(row.seq, true)
+            keep[i - 1] = true
+        }
+        i -= 1
+    }
+    var out = List[BindRow]()
+    for j in 0..ed.binds.active_hi {
+        if !keep[j] { continue }
+        let row = ed.binds.v[j]
+        (mut out).push(BindRow {
+            seq: row.seq,
+            cmd: row.cmd,
+            iarg: row.iarg,
+            sarg: row.sarg,
+            has_sarg: row.has_sarg,
+        })
+    }
+    out
+}
+
+/// `yew_bind_rebuild` (bind.c:395-415): every mode's config keymap from
+/// the active rows, once per pending change.
+pub fn bind_rebuild(mut ed: Ed) {
+    if !ed.binds.pending { return }
+    for m in 0..MODE_N {
+        let rows = bind_rows_for_mode(ed, m)
+        let (ok, km) = keymap_build(ed.reg, "config", rows)
+        if !ok { util.bug("edit.bind", "validated config keymap no longer builds") }
+        ed.keymaps[km_bind(m)] = km
+    }
+    ed.binds.pending = false
+    ed.binds.rebuilds += 1
+    ed.keys[2] = km_bind(ed.mode)
+}
+
+/// `yew_bind_batch_begin` (bind.c:417-424).
+pub fn bind_batch_begin(mut ed: Ed) { ed.binds.batch_depth += 1 }
+
+/// `yew_bind_batch_end` (bind.c:426-434): the outermost end rebuilds.
+pub fn bind_batch_end(mut ed: Ed) {
+    if ed.binds.batch_depth == 0 { return }
+    ed.binds.batch_depth -= 1
+    if ed.binds.batch_depth == 0 { bind_rebuild(mut ed) }
+}
+
+/// `yew_bind_add` (bind.c:291-369), against the ledger `ledger`: one row
+/// for (mode, seq), refused when the same origin already binds it; a
+/// closure target becomes `ed.fl.closure` with the row's ledger id.
+/// Answers the ledger id, 0 with `ed.binds.error` set.
+pub fn bind_add_in(
+    mut ed: Ed,
+    mut vm: fl.FlVm,
+    origin: int,
+    mode: int,
+    seq: str,
+    cmd_in: int,
+    iarg_in: int,
+    sarg: str,
+    has_sarg: bool,
+    f: fl.FlValue,
+) -> int {
+    if mode < 0 || mode >= MODE_N {
+        ed.binds.error = "invalid bind arguments"
+        return 0
+    }
+    ed.binds.error = ""
+    let existing = bind_find(ed, mode, seq)
+    if existing >= 0 && ed.binds.v[existing].origin == origin {
+        ed.binds.error = "duplicate key sequence"
+        return 0
+    }
+    var cmd = cmd_in
+    var iarg = iarg_in
+    let callable = f.t == fl.FL_CLOSURE || f.t == fl.FL_NATIVE
+    if callable {
+        cmd = cmd_lookup(ed.reg, "ed.fl.closure")
+        if cmd == 0 { util.bug("edit.bind", "ed.fl.closure command is not registered") }
+        iarg = 1
+    } else if f.t != fl.FL_NIL {
+        ed.binds.error = "binding target is not callable"
+        return 0
+    }
+    if !cmd_active(ed.reg, cmd) {
+        ed.binds.error = "unknown command"
+        return 0
+    }
+    let name = ed.reg.entries[cmd - 1].name
+    let candidate = BindRow { seq: seq, cmd: name, iarg: iarg, sarg: sarg, has_sarg: has_sarg }
+    let (err, _) = keymap_validate_row(ed.reg, candidate)
+    if err != KEYMAP_ERR_NONE {
+        ed.binds.error = keymap_error_string(err)
+        return 0
+    }
+    var slot = ed.binds.free_hint
+    while slot < ed.binds.v.len && ed.binds.v[slot].active { slot += 1 }
+    if slot < ed.binds.v.len && ed.binds.v[slot].root >= 0 {
+        fl.fl_gc_host_root_remove(mut vm, ed.binds.v[slot].root)
+    }
+    let root = if callable then fl.fl_gc_host_root_add(mut vm, f) else -1
+    let ledger_id = fl.fl_reg_add(mut vm.hooks.ledger, origin, fl.REG_BIND, slot + 1)
+    let row = BindRec {
+        seq: seq,
+        cmd: name,
+        sarg: sarg,
+        has_sarg: has_sarg,
+        root: root,
+        iarg: if callable then ledger_id else iarg,
+        origin: origin,
+        ledger_id: ledger_id,
+        mode: mode,
+        active: true,
+    }
+    if slot == ed.binds.v.len {
+        (mut ed.binds.v).push(row)
+    } else {
+        ed.binds.v[slot] = row
+    }
+    if slot + 1 > ed.binds.active_hi { ed.binds.active_hi = slot + 1 }
+    ed.binds.free_hint = slot + 1
+    while ed.binds.free_hint < ed.binds.v.len && ed.binds.v[ed.binds.free_hint].active {
+        ed.binds.free_hint += 1
+    }
+    ed.binds.pending = true
+    if ed.binds.batch_depth == 0 { bind_rebuild(mut ed) }
+    ledger_id
+}
+
+/// `yew_bind_add` from outside a running call: the runtime's VM is taken
+/// for the ledger and the closure's root.
+pub fn bind_add(
+    mut ed: Ed,
+    origin: int,
+    mode: int,
+    seq: str,
+    cmd: int,
+    iarg: int,
+    sarg: str,
+    has_sarg: bool,
+    f: fl.FlValue,
+) -> int {
+    var vm = bind_vm_take(mut ed)
+    let id = bind_add_in(mut ed, mut vm, origin, mode, seq, cmd, iarg, sarg, has_sarg, f)
+    (mut ed.flrt.vms).push(vm)
+    id
+}
+
+/// `yew_bind_remove` (bind.c:371-393), against the ledger `vm` holds.
+pub fn bind_remove_in(mut ed: Ed, mut vm: fl.FlVm, ledger_id: int) -> bool {
+    let row = bind_row_by_ledger(ed, vm.hooks.ledger, ledger_id)
+    if row < 0 { return false }
+    ed.binds.v[row].active = false
+    if ed.binds.v[row].root >= 0 {
+        fl.fl_gc_host_root_remove(mut vm, ed.binds.v[row].root)
+        ed.binds.v[row].root = -1
+    }
+    let _ = fl.fl_reg_remove(mut vm.hooks.ledger, ledger_id)
+    if row < ed.binds.free_hint { ed.binds.free_hint = row }
+    while ed.binds.active_hi != 0 && !ed.binds.v[ed.binds.active_hi - 1].active {
+        ed.binds.active_hi -= 1
+    }
+    ed.binds.pending = true
+    if ed.binds.batch_depth == 0 { bind_rebuild(mut ed) }
+    true
+}
+
+/// `yew_bind_remove` from outside a running call.
+pub fn bind_remove(mut ed: Ed, ledger_id: int) -> bool {
+    var vm = bind_vm_take(mut ed)
+    let ok = bind_remove_in(mut ed, mut vm, ledger_id)
+    (mut ed.flrt.vms).push(vm)
+    ok
+}
+
+/// `yew_bind_error` (bind.c:436-440).
+pub fn bind_error(ed: Ed) -> str { ed.binds.error }
+
+/// `yew_bind_active_count` (bind.c:442-453).
+pub fn bind_active_count(ed: Ed) -> int {
+    var n = 0
+    for r in ed.binds.v { if r.active { n += 1 } }
+    n
+}
+
+/// `yew_bind_origin_count` (bind.c:455-467).
+pub fn bind_origin_count(ed: Ed, origin: int) -> int {
+    var n = 0
+    for r in ed.binds.v { if r.active && r.origin == origin { n += 1 } }
+    n
+}
+
+/// `yew_bind_rebuild_count` (bind.c:469-473).
+pub fn bind_rebuild_count(ed: Ed) -> int { ed.binds.rebuilds }
+
+/// `ed.fl.closure` (`yew_bind_closure_cmd`, bind.c:91-132): the bound
+/// closure of ledger row `iarg`, called with no arguments; a failure is
+/// logged with its trace and reported once.
+pub fn bind_closure_cmd(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.iarg <= 0 || cx.iarg > 4294967295 { return CMD_ERR_ARG }
+    if !ed.flrt.ready || ed.flrt.vms.len == 0 { return CMD_ERR_STATE }
+    var vm = (mut ed.flrt.vms).pop() else { return CMD_ERR_STATE }
+    let row = bind_row_by_ledger(ed, vm.hooks.ledger, cx.iarg)
+    if row < 0 || ed.binds.v[row].root < 0 {
+        (mut ed.flrt.vms).push(vm)
+        return CMD_ERR_STATE
+    }
+    let f = fl.fl_gc_host_root_get(vm, ed.binds.v[row].root)
+    let origin = ed.binds.v[row].origin
+    if f.t != fl.FL_CLOSURE && f.t != fl.FL_NATIVE || fl.fl_origin_masked(ed.origins, origin) {
+        (mut ed.flrt.vms).push(vm)
+        return CMD_ERR_STATE
+    }
+    let _ = fl.fl_vm_call_host(mut vm, mut ed, f, List[fl.FlValue]())
+    if !vm.raised {
+        (mut ed.flrt.vms).push(vm)
+        return CMD_OK
+    }
+    // The plugin-origin rows (bind.c:115-122) are yw14's.
+    var trace = List[byte]()
+    let err = copy vm.err
+    fl.fl_trace_render(mut vm, err, mut trace)
+    vm.raised = false
+    (mut ed.flrt.vms).push(vm)
+    var line = List[byte]()
+    util.buf_append_str(mut line, "bound Fletch closure failed: ")
+    util.buf_append(mut line, trace)
+    util.log_at_bytes(util.LOG_ERROR, line)
+    ed_msg(mut ed, MSG_ERROR, "bound Fletch closure failed")
+    CMD_ERR_STATE
+}
+
+/// `ed.map` (`yew_bind_cmd_map`, bind.c:475-522): the current mode's
+/// configured bindings, one `SEQ  COMMAND [IARG] [SARG]` line each.
+pub fn bind_cmd_map(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if ed.mode < 0 || ed.mode >= MODE_N { return CMD_ERR_ARG }
+    let (_, entries) = keymap_list(ed.keymaps[km_bind(ed.mode)])
+    var out = List[byte]()
+    for e in entries {
+        key_format_seq(e.seq, e.seq.len, mut out)
+        util.buf_append_str(mut out, "  ")
+        let b = e.bind
+        let name = if cmd_active(ed.reg, b.cmd) then ed.reg.entries[b.cmd - 1].name else "<unknown>"
+        util.buf_append_str(mut out, name)
+        if b.iarg != 0 { util.buf_append_str(mut out, " {b.iarg}") }
+        if b.has_sarg {
+            (mut out).push(' ' as byte)
+            util.buf_append_str(mut out, b.sarg)
+        }
+        (mut out).push(10 as byte)
+    }
+    if out.len == 0 {
+        let m = mode_name(ed.mode)
+        ed_msg(mut ed, MSG_INFO, "no configured bindings for mode {m}")
+    } else {
+        ed_msg_bytes(mut ed, MSG_INFO, out)
+    }
+    CMD_OK
+}
+
+// ---- the natives (bind.c:524-774) --------------------------------------
+
+// get_string (bind.c:524-533): a NUL-free string argument.
+fn bind_string(mut vm: fl.FlVm, v: fl.FlValue, what: str) -> str ! {raised} {
+    if v.t != fl.FL_STR {
+        let _ = fl.fl_raise(mut vm, "type", "{what} must be a string")
+        return raised
+    }
+    let b = copy vm.gc.slots[fl.fl_obj_index(vm, v)].bytes
+    for x in b {
+        if x == 0 as byte {
+            let _ = fl.fl_raise(mut vm, "type", "{what} may not contain NUL")
+            return raised
+        }
+    }
+    str_from_utf8(b) else {
+        let _ = fl.fl_raise(mut vm, "type", "not yet ported: non-UTF-8 {what} (G40)")
+        return raised
+    }
+}
+
+// The modes a mode argument names (`*` is L, W and B; bind.c:612-630).
+fn bind_modes(name: str) -> List[int] {
+    if name == "*" { return [MODE_L, MODE_W, MODE_B] }
+    for m in 0..MODE_N { if mode_name(m) == name { return [m] } }
+    List[int]()
+}
+
+// callable_takes_no_args (bind.c:600-610).
+fn bind_no_args(vm: fl.FlVm, f: fl.FlValue) -> bool {
+    let at = fl.fl_obj_index(vm, f)
+    if f.t == fl.FL_CLOSURE {
+        let fun = copy vm.gc.slots[at].fn_value
+        return vm.gc.slots[fl.fl_obj_index(vm, fun)].arity == 0
+    }
+    vm.gc.slots[at].min_ar == 0
+}
+
+/// `bind(mode, seq, target[, args])` (`fl_bind_native`, bind.c:647-715):
+/// a command name (with an optional `{iarg|count, sarg}` map) or a
+/// no-argument function, bound in one mode or `*` (L, W, B), owned by the
+/// calling origin; the first mode's ledger id.
+pub fn fl_bind_native(mut vm: fl.FlVm, mut ed: Ed, base: int, argc: int) -> fl.FlValue {
+    if argc != 3 && argc != 4 { return fl.fl_raise(mut vm, "arity", "bind takes 3 or 4 arguments") }
+    let mode = bind_string(mut vm, copy vm.stack[base], "bind mode") else { return fl.fl_nil() }
+    let seq = bind_string(mut vm, copy vm.stack[base + 1], "bind sequence") else { return fl.fl_nil() }
+    let target = copy vm.stack[base + 2]
+    var cmd = 0
+    var f = fl.fl_nil()
+    if target.t == fl.FL_STR {
+        let name = bind_string(mut vm, target, "bind command") else { return fl.fl_nil() }
+        cmd = cmd_lookup(ed.reg, name)
+        if cmd == 0 { return fl.fl_raise(mut vm, "name", "unknown command '{name}'") }
+    } else if target.t == fl.FL_CLOSURE || target.t == fl.FL_NATIVE {
+        f = target
+        if !bind_no_args(vm, f) {
+            return fl.fl_raise(mut vm, "arity", "bound closure must take no arguments")
+        }
+        if argc == 4 { return fl.fl_raise(mut vm, "type", "closure binds take no argument map") }
+    } else {
+        return fl.fl_raise(mut vm, "type", "bind target must be a command string or function")
+    }
+    var iarg = 0
+    var sarg = ""
+    var has_sarg = false
+    if argc == 4 {
+        let args = copy vm.stack[base + 3]
+        if args.t != fl.FL_MAP { return fl.fl_raise(mut vm, "type", "bind arguments must be a map") }
+        var cursor = 0
+        loop {
+            let (next, k, v) = fl.fl_map_iter(vm, args, cursor) else { break }
+            cursor = next
+            if k.t != fl.FL_STR {
+                return fl.fl_raise(mut vm, "type", "bind argument names must be strings")
+            }
+            let key = str_from_utf8(vm.gc.slots[fl.fl_obj_index(vm, k)].bytes) else "?"
+            if key == "iarg" || key == "count" {
+                if v.t != fl.FL_INT { return fl.fl_raise(mut vm, "type", "bind iarg must be an integer") }
+                iarg = v.i
+            } else if key == "sarg" {
+                sarg = bind_string(mut vm, v, "bind sarg") else { return fl.fl_nil() }
+                has_sarg = true
+            } else {
+                return fl.fl_raise(mut vm, "name", "unknown bind argument '{key}'")
+            }
+        }
+    }
+    let origin = fl.fl_origin_of_frame(mut ed.origins, vm)
+    if origin == fl.FL_ORIGIN_ID_NONE {
+        return fl.fl_raise(mut vm, "handle", "bind: callback has no editor origin")
+    }
+    // The plugin ctx.bind gate (bind.c:699-708) is yw14's.
+    let modes = bind_modes(mode)
+    if modes.len == 0 { return fl.fl_raise(mut vm, "name", "unknown editor mode '{mode}'") }
+    bind_batch_begin(mut ed)
+    var ids = List[int]()
+    for m in modes {
+        let id = bind_add_in(mut ed, mut vm, origin, m, seq, cmd, iarg, sarg, has_sarg, f)
+        if id == 0 {
+            while ids.len != 0 {
+                let back = (mut ids).pop() else 0
+                let _ = bind_remove_in(mut ed, mut vm, back)
+            }
+            bind_batch_end(mut ed)
+            let why = ed.binds.error
+            return fl.fl_raise(mut vm, "user", "bind: {why}")
+        }
+        (mut ids).push(id)
+    }
+    bind_batch_end(mut ed)
+    fl.fl_int(ids[0])
+}
+
+/// `unbind(mode, seq)` (`fl_unbind_native`, bind.c:717-774): the calling
+/// origin's own binding in each named mode, removed together.
+pub fn fl_unbind_native(mut vm: fl.FlVm, mut ed: Ed, base: int, argc: int) -> fl.FlValue {
+    if argc != 2 { return fl.fl_raise(mut vm, "arity", "unbind takes 2 arguments") }
+    let mode = bind_string(mut vm, copy vm.stack[base], "unbind mode") else { return fl.fl_nil() }
+    let seq = bind_string(mut vm, copy vm.stack[base + 1], "unbind sequence") else { return fl.fl_nil() }
+    let origin = fl.fl_origin_of_frame(mut ed.origins, vm)
+    if origin == fl.FL_ORIGIN_ID_NONE {
+        return fl.fl_raise(mut vm, "handle", "unbind: callback has no editor origin")
+    }
+    let modes = bind_modes(mode)
+    if modes.len == 0 { return fl.fl_raise(mut vm, "name", "unknown editor mode '{mode}'") }
+    var rows = List[int]()
+    for m in modes {
+        let row = bind_find(ed, m, seq)
+        if row < 0 {
+            let mn = mode_name(m)
+            return fl.fl_raise(mut vm, "name", "no binding for '{seq}' in mode {mn}")
+        }
+        if ed.binds.v[row].origin != origin {
+            let owner = str_from_utf8(fl.fl_origin_label(ed.origins, ed.binds.v[row].origin)) else "?"
+            return fl.fl_raise(mut vm, "user", "cannot unbind '{seq}': owned by {owner}")
+        }
+        (mut rows).push(row)
+    }
+    bind_batch_begin(mut ed)
+    for row in rows {
+        let id = ed.binds.v[row].ledger_id
+        let _ = bind_remove_in(mut ed, mut vm, id)
+    }
+    bind_batch_end(mut ed)
+    fl.fl_nil()
+}
