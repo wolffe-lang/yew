@@ -1,0 +1,1226 @@
+//! member: false
+//! The round-trip law's runner (Sprint 35, R-yw09-1 A): sagitta 9ace98c2
+//! tests/roundtrip/runner.c (1,235 lines) and gen.c (590) as one port-side
+//! driver. C's runner links the editor in-process and takes no binary, so
+//! the port runs C's generator — the same xorshift64 stream, command
+//! table, highlight scenarios, payloads and count rolls — at C's 2,000
+//! seeds over its six fixtures, its four fixed fixtures, the count-folding
+//! sentinel and the recorder corpus, and prints C's report line byte for
+//! byte. P1 replay reaches the recorded state, P2 one undo restores E0,
+//! P3 emission is deterministic, P4 the source parses to one AST twice,
+//! P5 S;S composes. Run from the pinned oracle tree, as C's `make
+//! test-roundtrip` runs from sagitta's: `runtime/init.fl` and
+//! `tests/corpus/recorder/*.rec` are read relative to it.
+//!
+//! The port's shapes. C's session storage is each event's own byte list;
+//! a prefix view is a copy truncated to the prefix. C's
+//! `yew_reg_bind_context` has no counterpart (the port binds `.` and `%`
+//! on the read, `text.reg_get_in`), and neither editor of a comparison
+//! reads them through a context, so the raw slots compare as C's.
+
+use edit
+use fl
+use term
+use text
+use util
+
+// gen.c:9-16.
+const RT_GEN_MOTION: int = 0
+
+const RT_GEN_INSERT: int = 1
+
+const RT_GEN_DELETE: int = 2
+
+const RT_GEN_MODE: int = 3
+
+const RT_GEN_SELECTION: int = 4
+
+const RT_GEN_YANK: int = 5
+
+struct RtGenCmd { name: str, kind: int }
+
+// gen.c:30-61: intentionally small, not silently permissive.
+fn gen_cmds() -> List[RtGenCmd] {
+    [
+        RtGenCmd { name: "ed.move.unit.next", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.unit.prev", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.unit.up", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.unit.down", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.unit.next_alt", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.unit.prev_alt", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.buf.end", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.line.home", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.line.home_toggle", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.word.prev", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.word.next", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.move.line.end", kind: RT_GEN_MOTION },
+        RtGenCmd { name: "ed.edit.insert.text", kind: RT_GEN_INSERT },
+        RtGenCmd { name: "ed.edit.insert.at", kind: RT_GEN_INSERT },
+        RtGenCmd { name: "ed.edit.delete.unit", kind: RT_GEN_DELETE },
+        RtGenCmd { name: "ed.edit.delete.span", kind: RT_GEN_DELETE },
+        RtGenCmd { name: "ed.edit.replace.span", kind: RT_GEN_INSERT },
+        RtGenCmd { name: "ed.mode.enter", kind: RT_GEN_MODE },
+        RtGenCmd { name: "ed.mode.escape", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.expand", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.left", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.right", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.up", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.down", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.word_prev", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.word_next", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.line_home", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.extend.line_end", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.all", kind: RT_GEN_SELECTION },
+        RtGenCmd { name: "ed.sel.yank", kind: RT_GEN_YANK },
+    ]
+}
+
+// RtEvent (gen.h:10-18): the string argument is the event's own bytes.
+struct RtEvent {
+    cmd: int,
+    count: int,
+    count_given: bool,
+    iarg: int,
+    range_given: bool,
+    sarg: List[byte],
+}
+
+// RtSession (gen.h:22-31).
+struct RtSession {
+    events: List[RtEvent],
+    seed: wrapping[u64],
+    fixture: int,
+    generated_len: int,
+    start_mode: int,
+}
+
+fn rt_session_new() -> RtSession {
+    RtSession { events: List[RtEvent](), seed: 0, fixture: 0, generated_len: 0, start_mode: edit.MODE_L }
+}
+
+// The registry the generator resolves names against: C's static one.
+// The last failure's property and detail are bytes the world owns, reset
+// and refilled, so a session's region can write them ([mem.region.outer-write]).
+struct RtWorld { reg: edit.CmdReg, quiet: bool, property: List[byte], detail: List[byte] }
+
+fn set_bytes(mut out: List[byte], s: str) {
+    (mut out).reset()
+    for b in s.bytes() { (mut out).push(b) }
+}
+
+// xorshift64 (gen.c:63-74).
+fn xorshift64(mut state: wrapping[u64]) -> wrapping[u64] {
+    var x = state
+    if x == 0 { x = 11400714819323198485 }
+    x = x ^ x << 13
+    x = x ^ x >> 7
+    x = x ^ x << 17
+    state = x
+    x
+}
+
+// rnd (gen.c:76-79).
+fn rnd(mut state: wrapping[u64], n: int) -> int {
+    if n == 0 { return 0 }
+    (xorshift64(mut state) % n as wrapping[u64]) as int
+}
+
+fn rt_event(cmd: int) -> RtEvent {
+    RtEvent { cmd: cmd, count: 1, count_given: false, iarg: 0, range_given: false, sarg: List[byte]() }
+}
+
+fn cmd_id(w: RtWorld, name: str) -> int { edit.cmd_lookup(w.reg, name) }
+
+// choose_cmd (gen.c:117-136).
+fn choose_cmd(mut state: wrapping[u64]) -> RtGenCmd {
+    let cmds = gen_cmds()
+    let roll = rnd(mut state, 100)
+    let want = if roll < 45 {
+        RT_GEN_MOTION
+    } else if roll < 65 {
+        RT_GEN_INSERT
+    } else if roll < 77 {
+        RT_GEN_DELETE
+    } else if roll < 87 {
+        RT_GEN_SELECTION
+    } else if roll < 95 {
+        RT_GEN_YANK
+    } else {
+        RT_GEN_MODE
+    }
+    let start = rnd(mut state, cmds.len)
+    for i in 0..cmds.len {
+        let c = copy cmds[(start + i) % cmds.len]
+        if c.kind == want { return c }
+    }
+    copy cmds[0]
+}
+
+// append_named (gen.c:138-155).
+fn append_named(w: RtWorld, mut s: RtSession, name: str, sarg: List[byte]) -> bool {
+    var ev = rt_event(cmd_id(w, name))
+    ev.sarg = copy sarg
+    if ev.cmd == 0 { return false }
+    (mut s.events).push(ev)
+    true
+}
+
+// rt_session_init_count_folding (gen.c:157-187).
+fn rt_session_count_folding(w: RtWorld, length: int) -> RtSession ! {none} {
+    var s = rt_session_new()
+    if length < 3 { return none }
+    s.seed = 5999154533053582932
+    s.fixture = 2
+    s.generated_len = length
+    s.start_mode = edit.MODE_L
+    let x = copy "x".bytes()
+    if !append_named(w, mut s, "ed.move.buf.end", List[byte]()) ||
+        !append_named(w, mut s, "ed.move.buf.end", List[byte]()) ||
+        !append_named(w, mut s, "ed.edit.insert.text", x) {
+        return none
+    }
+    for i in 3..length {
+        let name = if i & 1 == 0 then "ed.move.unit.next" else "ed.move.unit.prev"
+        if !append_named(w, mut s, name, List[byte]()) { return none }
+    }
+    s
+}
+
+// is_shift_extend (gen.c:189-195).
+fn is_shift_extend(gc: RtGenCmd) -> bool { gc.name.starts_with("ed.sel.extend.") }
+
+fn highlight_scenario_len(gc: RtGenCmd) -> int { if is_shift_extend(gc) then 2 else 4 }
+
+// append_highlight_scenario (gen.c:202-216).
+fn append_highlight_scenario(w: RtWorld, mut s: RtSession, gc: RtGenCmd) -> bool {
+    let none_arg = List[byte]()
+    if is_shift_extend(gc) {
+        return append_named(w, mut s, gc.name, none_arg) && append_named(w, mut s, "ed.mode.escape", none_arg)
+    }
+    let h = copy "H".bytes()
+    append_named(w, mut s, "ed.mode.enter", h) &&
+        append_named(w, mut s, "ed.move.unit.next", none_arg) &&
+        append_named(w, mut s, if gc.kind == RT_GEN_YANK then "ed.sel.yank" else gc.name, none_arg) &&
+        append_named(w, mut s, "ed.mode.escape", none_arg)
+}
+
+// gen.c:221-235: ASCII, CJK, a ZWJ sequence, a combining mark, invalid.
+fn payload(p: int) -> List[byte] {
+    match p {
+        0 => [120 as byte],
+        1 => [231 as byte, 140 as byte, 171 as byte],
+        2 => [240 as byte, 159 as byte, 145 as byte, 169 as byte, 226 as byte, 128 as byte, 141 as byte, 240 as byte, 159 as byte, 146 as byte, 187 as byte],
+        3 => [101 as byte, 204 as byte, 129 as byte],
+        _ => [128 as byte],
+    }
+}
+
+fn mode_letter(i: int) -> List[byte] {
+    match i {
+        0 => [76 as byte],
+        1 => [87 as byte],
+        _ => [66 as byte],
+    }
+}
+
+// append_generated (gen.c:218-282).
+fn append_generated(w: RtWorld, mut s: RtSession, mut state: wrapping[u64], gc: RtGenCmd) -> bool {
+    var ev = rt_event(cmd_id(w, gc.name))
+    if ev.cmd == 0 { return false }
+    let flags = w.reg.entries[ev.cmd - 1].flags
+    if gc.kind == RT_GEN_INSERT {
+        let p = rnd(mut state, 5)
+        ev.sarg = payload(p)
+        if gc.name == "ed.edit.insert.at" { ev.iarg = 0 }
+        if gc.name == "ed.edit.replace.span" { ev.range_given = true }
+    } else if gc.name == "ed.edit.delete.span" {
+        // The empty span is valid for every fixture (gen.c:258-263).
+        ev.range_given = true
+    } else if gc.kind == RT_GEN_MODE {
+        ev.sarg = mode_letter(rnd(mut state, 3))
+    } else if flags & (edit.CMD_REPEATABLE | edit.CMD_TAKES_COUNT) != 0 {
+        let count_roll = rnd(mut state, 100)
+        if count_roll >= 60 {
+            ev.count_given = true
+            ev.count = if count_roll < 90 then 2 + rnd(mut state, 8) else 10 + rnd(mut state, 90)
+        }
+    }
+    (mut s.events).push(ev)
+    true
+}
+
+// rt_session_generate (gen.c:284-348).
+fn rt_session_generate(w: RtWorld, seed: wrapping[u64], fixture: int, forced_len: int) -> RtSession ! {none} {
+    var s = rt_session_new()
+    let mult: wrapping[u64] = 15111065706836454659
+    var state: wrapping[u64] = seed ^ mult * (fixture + 1) as wrapping[u64]
+    let target = if forced_len == 0 then 1 + rnd(mut state, 200) else forced_len
+    var has_text_insert = false
+    s.seed = seed
+    s.fixture = fixture % 6
+    s.generated_len = target
+    s.start_mode = edit.MODE_L + rnd(mut state, 3)
+    let cmds = gen_cmds()
+    while s.events.len + (if has_text_insert then 1 else 2) < target {
+        let chosen = choose_cmd(mut state)
+        let reserve = if has_text_insert then 1 else 2
+        let available = target - s.events.len - reserve
+        let selecting = chosen.kind == RT_GEN_SELECTION || chosen.kind == RT_GEN_YANK
+        if selecting && available >= highlight_scenario_len(chosen) {
+            if !append_highlight_scenario(w, mut s, chosen) { return none }
+        } else {
+            let one = if selecting then copy cmds[0] else copy chosen
+            if !append_generated(w, mut s, mut state, one) { return none }
+            if one.name == "ed.edit.insert.text" { has_text_insert = true }
+        }
+    }
+    // P2 needs an actual edit even when the session chose motions.
+    if !has_text_insert {
+        let insert = RtGenCmd { name: "ed.edit.insert.text", kind: RT_GEN_INSERT }
+        if !append_generated(w, mut s, mut state, insert) { return none }
+    }
+    // P5 composes S with itself: restore the starting unit (gen.c:327-346).
+    if s.events.len < target {
+        var restore = rt_event(cmd_id(w, "ed.mode.enter"))
+        restore.sarg = mode_letter(s.start_mode - edit.MODE_L)
+        (mut s.events).push(restore)
+    }
+    if s.events.len != target { return none }
+    s
+}
+
+// gen.c:350-529: every recordable command not generated is denied with a
+// reason; the names are C's, the reasons C's.
+fn deny_reason(name: str) -> str {
+    match name {
+        "ed.move.unit.up_alt" => "redundant motion alias",
+        "ed.move.unit.down_alt" => "redundant motion alias",
+        "ed.move.buf.home" => "redundant motion alias",
+        "ed.move.line.up" => "redundant motion alias",
+        "ed.move.line.down" => "redundant motion alias",
+        "ed.move.line.first_nonblank" => "redundant motion alias",
+        "ed.move.line.last_nonblank" => "redundant motion alias",
+        "ed.move.line.half_page_up" => "viewport geometry is outside E0",
+        "ed.move.line.half_page_down" => "viewport geometry is outside E0",
+        "ed.move.unit.home" => "redundant motion alias",
+        "ed.move.unit.end" => "redundant motion alias",
+        "ed.move.unit.home_alt" => "redundant motion alias",
+        "ed.move.unit.end_alt" => "redundant motion alias",
+        "ed.move.block.match_prev" => "delimiter precondition is fixture-specific",
+        "ed.move.block.match_next" => "delimiter precondition is fixture-specific",
+        "ed.move.word.sub_prev" => "redundant motion alias",
+        "ed.move.word.sub_next" => "redundant motion alias",
+        "ed.move.char.prev" => "redundant motion alias",
+        "ed.move.char.next" => "redundant motion alias",
+        "ed.move.char.left" => "redundant motion alias",
+        "ed.move.char.right" => "redundant motion alias",
+        "ed.edit.insert.newline" => "native EOL metadata needs a dedicated pool",
+        "ed.edit.insert.tab" => "tab-width state is outside generated E0",
+        "ed.edit.insert.after" => "insert-mode transaction is not mode-closed",
+        "ed.edit.line.open_below" => "insert-mode transaction is not mode-closed",
+        "ed.edit.line.open_above" => "insert-mode transaction is not mode-closed",
+        "ed.edit.delete.grapheme_left" => "redundant delete alias",
+        "ed.edit.delete.grapheme" => "redundant delete alias",
+        "ed.edit.line.delete" => "line register semantics need a seeded paste command",
+        "ed.edit.delete.prev" => "redundant delete alias",
+        "ed.edit.delete.next" => "redundant delete alias",
+        "ed.edit.kill.word_prev" => "yank-stack state needs a seeded yank command",
+        "ed.edit.kill.word_next" => "yank-stack state needs a seeded yank command",
+        "ed.edit.kill.to_home" => "yank-stack state needs a seeded yank command",
+        "ed.edit.kill.to_end" => "yank-stack state needs a seeded yank command",
+        "ed.edit.kill.ws_word_prev" => "yank-stack state needs a seeded yank command",
+        "ed.edit.kill.yank" => "reads prior yank-stack state, which is outside E0",
+        "ed.edit.kill.yank_pop" => "valid only straight after a yank; reads yank-stack state",
+        "ed.edit.transpose.chars" => "adjacent-grapheme precondition is fixture-specific",
+        "ed.edit.transpose.words" => "adjacent-word precondition is fixture-specific",
+        "ed.edit.case.upper_word" => "locale/case fixture needs a dedicated pool",
+        "ed.edit.case.lower_word" => "locale/case fixture needs a dedicated pool",
+        "ed.edit.case.cap_word" => "locale/case fixture needs a dedicated pool",
+        "ed.edit.undo" => "history-dependent command",
+        "ed.edit.redo" => "history-dependent command",
+        "ed.shadow.accept_word" => "requires live suggestion state",
+        "ed.shadow.accept_word_alt" => "requires live suggestion state",
+        "ed.shadow.accept_line" => "requires live suggestion state",
+        "ed.shadow.accept_all" => "requires live suggestion state",
+        "ed.sel.contract" => "selection stack history is outside E0",
+        "ed.sel.unit.expand" => "alias of generated ed.sel.expand",
+        "ed.sel.unit.contract" => "selection stack history is outside E0",
+        "ed.sel.kind" => "argument-specific geometry needs a dedicated pool",
+        "ed.sel.swap_ends" => "redundant selection permutation",
+        "ed.clip.copy" => "system clipboard I/O is outside generated E0",
+        "ed.clip.cut" => "system clipboard I/O is outside generated E0",
+        "ed.clip.paste" => "system clipboard I/O is outside generated E0",
+        "ed.sel.delete" => "covered indirectly; register deletion needs seeded paste",
+        "ed.sel.change" => "enters insert mode and is not mode-closed",
+        "ed.sel.case_upper" => "locale/case fixture needs a dedicated pool",
+        "ed.sel.case_lower" => "locale/case fixture needs a dedicated pool",
+        "ed.sel.case_toggle" => "locale/case fixture needs a dedicated pool",
+        "ed.sel.indent" => "indent option is outside generated E0",
+        "ed.sel.dedent" => "indent option is outside generated E0",
+        "ed.sel.shift_left" => "indent option is outside generated E0",
+        "ed.sel.shift_right" => "indent option is outside generated E0",
+        "ed.sel.join" => "linewise selection precondition is fixture-specific",
+        "ed.sel.replace_char" => "argument-specific selection edit",
+        "ed.edit.rect.insert" => "rectangular geometry needs a dedicated fixture",
+        "ed.edit.rect.append" => "rectangular geometry needs a dedicated fixture",
+        "ed.cursor.lift.lines" => "multi-cursor topology is separately tested",
+        "ed.cursor.lift.matches" => "search and multi-cursor state are outside E0",
+        "ed.cursor.lift.ends" => "multi-cursor topology is separately tested",
+        "ed.cursor.add.above" => "multi-cursor topology is separately tested",
+        "ed.cursor.add.below" => "multi-cursor topology is separately tested",
+        "ed.cursor.drop" => "multi-cursor topology is separately tested",
+        "ed.cursor.collapse" => "multi-cursor topology is separately tested",
+        "ed.view.center" => "viewport geometry is outside compared E0",
+        "ed.view.top" => "viewport geometry is outside compared E0",
+        "ed.view.bottom" => "viewport geometry is outside compared E0",
+        "ed.view.scroll.up" => "viewport geometry is outside compared E0",
+        "ed.view.scroll.down" => "viewport geometry is outside compared E0",
+        "ed.view.up" => "viewport geometry is outside compared E0",
+        "ed.view.down" => "viewport geometry is outside compared E0",
+        "ed.view.page_up" => "viewport geometry is outside compared E0",
+        "ed.view.page_down" => "viewport geometry is outside compared E0",
+        "ed.view.half_page_up" => "viewport geometry is outside compared E0",
+        "ed.view.half_page_down" => "viewport geometry is outside compared E0",
+        "ed.view.goto_line" => "TAKES_COUNT is covered by emitter unit tests",
+        "ed.view.toggle_wrap" => "viewport option is outside compared E0",
+        "ed.view.number_style" => "viewport option is outside compared E0",
+        "ed.view.number_cycle" => "viewport option is outside compared E0",
+        "ed.search.next" => "search query state is outside E0",
+        "ed.search.prev" => "search query state is outside E0",
+        "ed.search.word_next" => "search query state is outside E0",
+        "ed.search.word_prev" => "search query state is outside E0",
+        "ed.macro.replay" => "macro recursion/cache is separately tested",
+        "ed.macro.replay_last" => "macro recursion/cache is separately tested",
+        "ed.shell.run" => "external process side effect",
+        "ed.shell.run_bg" => "external process side effect",
+        "ed.shell.term_run" => "interactive external process side effect",
+        "ed.shell.read" => "external process side effect",
+        "ed.shell.filter" => "external process side effect",
+        "ed.group.from_dir" => "requires a live workspace walk and layout state",
+        "ed.git.refresh" => "requires a live F-mode repository",
+        "ed.git.init" => "external Git side effect",
+        "ed.git.mode.leave" => "requires live F-mode layout state",
+        "ed.git.tree.all" => "requires a live F-mode tree",
+        "ed.git.tree.hidden" => "requires a live F-mode tree",
+        "ed.git.nav.prev" => "requires a live F-mode tree",
+        "ed.git.nav.next" => "requires a live F-mode tree",
+        "ed.git.nav.parent" => "requires a live F-mode tree",
+        "ed.git.nav.enter" => "requires a live F-mode tree",
+        "ed.git.nav.toggle" => "requires a live F-mode tree",
+        "ed.git.nav.row_prev" => "requires a live F-mode tree",
+        "ed.git.nav.row_next" => "requires a live F-mode tree",
+        "ed.git.jump.arm" => "requires a live F-mode tree",
+        "ed.git.stage" => "external Git side effect",
+        "ed.git.unstage" => "external Git side effect",
+        "ed.git.stage.all" => "external Git side effect",
+        "ed.git.unstage.all" => "external Git side effect",
+        "ed.git.commit" => "interactive Git side effect",
+        "ed.git.commit.amend" => "interactive Git side effect",
+        "ed.git.push" => "network Git side effect",
+        "ed.git.push.force" => "network Git side effect",
+        "ed.git.pull" => "network Git side effect",
+        "ed.git.fetch" => "network Git side effect",
+        "ed.git.diff" => "requires a live F-mode viewer",
+        "ed.git.status" => "requires a live F-mode viewer",
+        "ed.git.blame" => "requires a live F-mode viewer",
+        "ed.git.history" => "requires a live F-mode viewer",
+        "ed.git.reflog" => "requires a live F-mode viewer",
+        "ed.git.view" => "requires a live F-mode viewer",
+        "ed.git.branch.switch" => "interactive Git side effect",
+        "ed.git.branch.create" => "interactive Git side effect",
+        "ed.git.branch.delete" => "interactive Git side effect",
+        "ed.git.merge" => "interactive Git side effect",
+        "ed.git.reset" => "interactive Git side effect",
+        "ed.git.rebase.interactive" => "terminal handover side effect",
+        "ed.git.rebase.continue" => "external Git side effect",
+        "ed.git.rebase.abort" => "external Git side effect",
+        "ed.git.cherry_pick" => "interactive Git side effect",
+        "ed.git.revert" => "interactive Git side effect",
+        "ed.git.stash.push" => "interactive Git side effect",
+        "ed.git.stash.pop" => "interactive Git side effect",
+        "ed.git.tag" => "interactive Git side effect",
+        "ed.git.discard" => "destructive Git side effect",
+        "ed.git.file.delete" => "destructive file side effect",
+        "ed.git.file.rename" => "file-system side effect",
+        "ed.git.open" => "requires live F-mode layout state",
+        "ed.git.open_split_h" => "requires live F-mode layout state",
+        "ed.git.open_split_v" => "requires live F-mode layout state",
+        "ed.git.diff.view" => "requires live Git workspace and layout state",
+        "ed.tab.split_left" => "requires live tab and layout state",
+        "ed.tab.split_right" => "requires live tab and layout state",
+        "ed.tab.split_down" => "requires live tab and layout state",
+        _ => "",
+    }
+}
+
+fn is_generated(name: str) -> bool {
+    for c in gen_cmds() { if c.name == name { return true } }
+    false
+}
+
+// rt_generator_coverage (gen.c:553-590): the word bijection over every
+// recordable command, and each one generated or denied with a reason.
+fn rt_generator_coverage(reg: edit.CmdReg, verbose: bool) -> bool {
+    var ok = true
+    for i in 0..reg.entries.len {
+        if !reg.entries[i].active || reg.entries[i].flags & edit.CMD_RECORDABLE == 0 { continue }
+        let name = reg.entries[i].name
+        let id = edit.cmd_lookup(reg, name)
+        let back = if reg.entries[i].has_word then edit.cmd_by_word(reg, reg.entries[i].word) else 0
+        if id == 0 || back != id {
+            let word = if reg.entries[i].has_word then reg.entries[i].word else "<null>"
+            eprint("roundtrip: word bijection failed: {name} -> {word}")
+            ok = false
+        }
+        if is_generated(name) {
+            if verbose { print("generate {name}") }
+            continue
+        }
+        let reason = deny_reason(name)
+        if reason.len == 0 {
+            eprint("roundtrip: uncovered command: {name}")
+            ok = false
+        } else if verbose {
+            print("deny {name}: {reason}")
+        }
+    }
+    ok
+}
+
+// ---- the runner -------------------------------------------------------------
+
+fn fail_session(mut w: RtWorld, property: str, detail: str) -> bool {
+    set_bytes(mut w.property, property)
+    set_bytes(mut w.detail, detail)
+    false
+}
+
+fn bytes_equal(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len { if a[i] != b[i] { return false } }
+    true
+}
+
+// first_byte_difference (runner.c:101-110): -1 is C's SIZE_MAX.
+fn first_byte_difference(a: List[byte], b: List[byte]) -> int {
+    let n = if a.len < b.len then a.len else b.len
+    for i in 0..n { if a[i] != b[i] { return i } }
+    if a.len == b.len then -1 else n
+}
+
+// fixture_make (runner.c:112-146).
+fn fixture_make(fixture: int) -> List[byte] {
+    var out = List[byte]()
+    match fixture % 6 {
+        0 => {},
+        1 => util.buf_append_str(mut out, "alpha beta gamma\n"),
+        2 => {
+            for i in 0..10000 {
+                var digits = "{i}"
+                while digits.len < 5 { digits = "0{digits}" }
+                util.buf_append_str(mut out, "line-{digits} payload\n")
+            }
+        },
+        3 => util.buf_append_str(mut out, "one\r\ntwo\r\nthree\r\n"),
+        4 => util.buf_append_str(mut out, "no final newline"),
+        _ => {
+            for b in [0, 128, 97, 10, 255, 122, 13, 10] { (mut out).push(b as byte) }
+        },
+    }
+    out
+}
+
+// editor_open (runner.c:148-168): the fixture inserted outside the undo
+// tree, a fresh tree over it, the caret at 0, the starting unit entered.
+fn editor_open(fixture: List[byte], mode: int) -> edit.Ed ! {none} {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    if fixture.len != 0 { text.textbuf_insert(mut ed.bufs[0].ec.tb, text.byteoff(0), fixture) }
+    let fresh = text.undo_new(ed.bufs[0].ec.tb)
+    ed.bufs[0].ec.undo = fresh
+    let w = ed.win
+    if w < 0 || ed.wins[w].cs.curs.len == 0 { return none }
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p].pos = 0
+    ed.wins[w].cs.curs[p].anchor = 0
+    ed.wins[w].cs.curs[p].goal_col = 0
+    if edit.mode_enter(mut ed, mode) != edit.CMD_OK { return none }
+    ed
+}
+
+// load_runtime_keymap (runner.c:170-198): runtime/init.fl inside one bind
+// batch, relative to the working directory.
+fn load_runtime_keymap(mut ed: edit.Ed) -> bool {
+    let source = fs_read_bytes("runtime/init.fl") else { return false }
+    edit.bind_batch_begin(mut ed)
+    let ok = edit.fl_runtime_eval(mut ed, source) == edit.CMD_OK
+    edit.bind_batch_end(mut ed)
+    ok
+}
+
+fn rt_text_key(ch: int) -> term.Key {
+    var key = term.key_new()
+    key.code = ch
+    key.kind = term.EV_KEY
+    key.ev = term.KEY_PRESS
+    (mut key.text).push(ch as byte)
+    key
+}
+
+fn rt_named_key(code: int) -> term.Key {
+    var key = term.key_new()
+    key.code = code
+    key.kind = term.EV_KEY
+    key.ev = term.KEY_PRESS
+    key
+}
+
+fn dispatch_ok(mut ed: edit.Ed, key: term.Key, now_ms: int) -> bool {
+    edit.dispatch_key(mut ed, key, now_ms)
+    ed.last_status == edit.CMD_OK
+}
+
+// invoke_event (runner.c:228-242).
+fn invoke_event(mut ed: edit.Ed, ev: RtEvent) -> bool {
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = ev.count
+    cx.count_given = ev.count_given
+    cx.iarg = ev.iarg
+    cx.range.given = ev.range_given
+    cx.range.tok_lo = 0
+    cx.range.tok_hi = 0
+    if ev.sarg.len != 0 {
+        cx.has_sarg = true
+        cx.has_sbytes = true
+        cx.sbytes = copy ev.sarg
+        cx.sarg = str_from_utf8(ev.sarg) else ""
+    }
+    edit.ed_cmd_invoke(mut ed, ev.cmd, mut cx) == edit.CMD_OK
+}
+
+// run_events (runner.c:244-260).
+fn run_events(w: RtWorld, mut ed: edit.Ed, s: RtSession) -> bool {
+    for i in 0..s.events.len {
+        if !invoke_event(mut ed, s.events[i]) {
+            if !w.quiet {
+                let id = s.events[i].cmd
+                let name = if id > 0 && id <= w.reg.entries.len then w.reg.entries[id - 1].name else "<unknown>"
+                eprint("roundtrip: event {i} failed: {name}")
+            }
+            return false
+        }
+    }
+    true
+}
+
+// regval_equal (runner.c:262-276).
+fn regval_equal(a: text.RegVal, b: text.RegVal) -> bool {
+    if a.kind != b.kind || a.ragged != b.ragged || a.width != b.width || !bytes_equal(a.bytes, b.bytes) || a.rows.len != b.rows.len {
+        return false
+    }
+    for i in 0..a.rows.len { if a.rows[i].lo != b.rows[i].lo || a.rows[i].hi != b.rows[i].hi { return false } }
+    true
+}
+
+// registers_equal (runner.c:278-305): the raw slots, the ring's first
+// `ring_len` entries as C indexes them.
+fn registers_equal(a: text.Registers, b: text.Registers) -> bool {
+    for i in 0..26 { if !regval_equal(a.named[i], b.named[i]) { return false } }
+    for i in 0..10 { if !regval_equal(a.numbered[i], b.numbered[i]) { return false } }
+    if !regval_equal(a.unnamed, b.unnamed) ||
+        !regval_equal(a.small_del, b.small_del) ||
+        !regval_equal(a.last_insert, b.last_insert) ||
+        !regval_equal(a.search, b.search) ||
+        !regval_equal(a.cmdline, b.cmdline) ||
+        !regval_equal(a.file, b.file) ||
+        !regval_equal(a.alt_file, b.alt_file) ||
+        !regval_equal(a.system, b.system) ||
+        a.ring_len != b.ring_len {
+        return false
+    }
+    for i in 0..a.ring_len { if !regval_equal(a.ring[i], b.ring[i]) { return false } }
+    true
+}
+
+// cursors_equal (runner.c:307-322).
+fn cursors_equal(a: edit.Ed, b: edit.Ed) -> bool {
+    let ca = a.wins[a.win].cs
+    let cb = b.wins[b.win].cs
+    if ca.primary != cb.primary || ca.curs.len != cb.curs.len { return false }
+    for i in 0..ca.curs.len {
+        if ca.curs[i].pos != cb.curs[i].pos || ca.curs[i].anchor != cb.curs[i].anchor || ca.curs[i].goal_col != cb.curs[i].goal_col {
+            return false
+        }
+    }
+    true
+}
+
+// editors_equal (runner.c:324-353): "" when equal, else why.
+fn editors_differ(a: edit.Ed, b: edit.Ed) -> str {
+    let ab = text.textbuf_bytes(a.bufs[0].ec.tb)
+    let bb = text.textbuf_bytes(b.bufs[0].ec.tb)
+    if !bytes_equal(ab, bb) { return "buffer bytes differ" }
+    if !cursors_equal(a, b) { return "cursor set differs" }
+    if !registers_equal(a.regs, b.regs) { return "register file differs" }
+    if a.mode != b.mode || a.prev_unit != b.prev_unit { return "mode differs" }
+    ""
+}
+
+// install_macro (runner.c:355-365).
+fn install_macro(mut ed: edit.Ed, source: List[byte]) {
+    var value = text.regval_new()
+    value.kind = text.REG_CHARWISE
+    value.bytes = copy source
+    text.reg_set_macro(mut ed.regs, 'a' as int, value, false)
+}
+
+// parse_dump (runner.c:386-412): a clean parse's AST dump, none on any
+// diagnostic.
+fn parse_dump(w: RtWorld, source: List[byte]) -> List[byte] ! {none} {
+    var dc = fl.fl_diag_init()
+    var strings = fl.fl_strings()
+    let file = fl.fl_diag_add_file(mut dc, "roundtrip.fl", source)
+    let p = fl.fl_parse(source, file, mut dc, mut strings)
+    if p.had_error || dc.entries.len != 0 {
+        if !w.quiet {
+            let first = if dc.entries.len == 0 then "" else dc.entries[0].msg
+            eprint("roundtrip: parse diagnostic: {first}")
+        }
+        return none
+    }
+    var dump = List[byte]()
+    fl.fl_ast_dump(mut dump, p, strings)
+    dump
+}
+
+fn stored_macro(mut ed: edit.Ed) -> List[byte] ! {none} {
+    let v = text.reg_get(mut ed.regs, 'a' as int)?
+    copy v.bytes
+}
+
+fn one_undo(mut ed: edit.Ed) -> bool {
+    let w = ed.win
+    let b = ed.wins[w].buf
+    edit.edit_take(mut ed, w)
+    let ok = text.undo(mut ed.bufs[b].ec)
+    edit.edit_give(mut ed, w)
+    ok
+}
+
+fn stderr_bytes(b: List[byte]) {
+    fs_write_chunk(2, b) else |_| {}
+    fs_write_chunk(2, [10 as byte]) else |_| {}
+}
+
+// property_session (runner.c:414-549): P3, P4, P1, P2, P5 in C's order.
+fn property_session(mut w: RtWorld, s: RtSession) -> bool {
+    let fixture = fixture_make(s.fixture)
+    var why = "unknown divergence"
+    let ok = property_body(mut w, s, fixture, mut why)
+    if !w.quiet && !ok && why.len != 0 { eprint("roundtrip: context: {why}") }
+    ok
+}
+
+fn property_body(mut w: RtWorld, s: RtSession, fixture: List[byte], mut why: str) -> bool {
+    var recorded = editor_open(fixture, s.start_mode) else { return false }
+    if !edit.record_start(mut recorded, 'a' as int) || !run_events(w, mut recorded, s) || edit.record_stop(mut recorded) != edit.CMD_OK {
+        return false
+    }
+    let emitted_a = stored_macro(mut recorded) else { return false }
+    // P3: emission is a pure deterministic rendering of the retained Rec.
+    let emitted_b = edit.record_emit(recorded.reg, recorded.rec)
+    if !bytes_equal(emitted_a, emitted_b) { return fail_session(mut w, "P3", "second emission differs") }
+    // P4: the source parses cleanly and two independent AST dumps agree.
+    let dump_a = parse_dump(w, emitted_a) else {
+        let _ = fail_session(mut w, "P4", "emitted Fletch does not parse")
+        if !w.quiet { stderr_bytes(emitted_a) }
+        return false
+    }
+    let dump_b = parse_dump(w, emitted_a) else { return fail_session(mut w, "P4", "second parse does not parse") }
+    if !bytes_equal(dump_a, dump_b) { return fail_session(mut w, "P4", "AST dump is not deterministic") }
+    // P1: replay from the same E0 reaches the same observable state.
+    var replayed = editor_open(fixture, s.start_mode) else { return false }
+    install_macro(mut replayed, emitted_a)
+    if edit.macro_replay(mut replayed, 'a' as int, 1) != edit.CMD_OK { return false }
+    let d1 = editors_differ(recorded, replayed)
+    if d1.len != 0 {
+        why = d1
+        return fail_session(mut w, "P1", d1)
+    }
+    // P2: replay is one outer transaction, so one undo restores E0.
+    if !one_undo(mut replayed) || !bytes_equal(text.textbuf_bytes(replayed.bufs[0].ec.tb), fixture) {
+        let _ = fail_session(mut w, "P2", "one undo did not restore E0 bytes")
+        if !w.quiet { stderr_bytes(emitted_a) }
+        return false
+    }
+    // P5: no hidden state across a second mode-closed invocation.
+    var direct_twice = editor_open(fixture, s.start_mode) else { return false }
+    if !edit.record_start(mut direct_twice, 'a' as int) ||
+        !run_events(w, mut direct_twice, s) ||
+        edit.record_stop(mut direct_twice) != edit.CMD_OK ||
+        !run_events(w, mut direct_twice, s) {
+        return false
+    }
+    var replayed_twice = editor_open(fixture, s.start_mode) else { return false }
+    install_macro(mut replayed_twice, emitted_a)
+    if edit.macro_replay(mut replayed_twice, 'a' as int, 2) != edit.CMD_OK { return false }
+    let d5 = editors_differ(direct_twice, replayed_twice)
+    if d5.len != 0 {
+        why = d5
+        return fail_session(mut w, "P5", d5)
+    }
+    true
+}
+
+// run_edit_store_noop_fixture (runner.c:551-643): recorder output is
+// editable Fletch; two edits with no net effect leave the stored source
+// and its AST unchanged through the real edit/store path.
+fn run_edit_store_noop_fixture(w: RtWorld) -> bool {
+    let ok = edit_store_noop(w)
+    if !ok { eprint("roundtrip: record-edit-store no-op fixture failed") }
+    ok
+}
+
+fn edit_store_noop(w: RtWorld) -> bool {
+    let s = rt_session_generate(w, 5999154575767196239, 1, 32) else { return false }
+    let fixture = fixture_make(1)
+    var ed = editor_open(fixture, s.start_mode) else { return false }
+    if !edit.record_start(mut ed, 'a' as int) || !run_events(w, mut ed, s) || edit.record_stop(mut ed) != edit.CMD_OK {
+        return false
+    }
+    let before = stored_macro(mut ed) else { return false }
+    if before.len == 0 { return false }
+    let ast_before = parse_dump(w, before) else { return false }
+    if edit.macro_edit(mut ed, 'a' as int) != edit.CMD_OK { return false }
+    let wi = ed.win
+    if wi < 0 { return false }
+    let bi = ed.wins[wi].buf
+    if ed.bufs[bi].macro_reg != 'a' as int { return false }
+    let end = text.textbuf_len(ed.bufs[bi].ec.tb)
+    let probe = [35 as byte]
+    edit.ed_undo_begin(mut ed, wi, text.TXN_TYPE)
+    if !edit.ed_edit_insert(mut ed, wi, end, probe, 0, 1) {
+        edit.ed_undo_abort(mut ed, wi)
+        return false
+    }
+    edit.ed_undo_end(mut ed, wi)
+    edit.ed_finish_edit(mut ed, wi)
+    edit.ed_undo_begin(mut ed, wi, text.TXN_ERASE)
+    if !edit.ed_edit_delete(mut ed, wi, end, end + 1) {
+        edit.ed_undo_abort(mut ed, wi)
+        return false
+    }
+    edit.ed_undo_end(mut ed, wi)
+    edit.ed_finish_edit(mut ed, wi)
+    if text.undo_at_save_point(ed.bufs[bi].ec.undo) || edit.macro_store(mut ed, bi) != edit.CMD_OK { return false }
+    let after = stored_macro(mut ed) else { return false }
+    if !bytes_equal(before, after) { return false }
+    let ast_after = parse_dump(w, after) else { return false }
+    bytes_equal(ast_before, ast_after)
+}
+
+// run_cross_keymap_fixture (runner.c:645-718): recorded through the
+// shipped keymap, replayed after every key it used is rebound to ed.nop.
+fn run_cross_keymap_fixture(w: RtWorld) -> bool {
+    var why = "unknown divergence"
+    let ok = cross_keymap(w, mut why)
+    if !ok { eprint("roundtrip: cross-keymap fixture failed: {why}") }
+    ok
+}
+
+fn cross_keymap(w: RtWorld, mut why: str) -> bool {
+    let fixture = List[byte]()
+    var recorded = editor_open(fixture, edit.MODE_L) else { return false }
+    if !load_runtime_keymap(mut recorded) ||
+        !edit.record_start(mut recorded, 'a' as int) ||
+        !dispatch_ok(mut recorded, rt_text_key('i' as int), 1) ||
+        !dispatch_ok(mut recorded, rt_text_key('x' as int), 2) ||
+        !dispatch_ok(mut recorded, rt_named_key(term.KEY_ESCAPE), 3) ||
+        edit.record_stop(mut recorded) != edit.CMD_OK {
+        return false
+    }
+    let source = stored_macro(mut recorded) else { return false }
+    if source.len == 0 { return false }
+    var replayed = editor_open(fixture, edit.MODE_L) else { return false }
+    if !load_runtime_keymap(mut replayed) { return false }
+    let nop = edit.cmd_lookup(replayed.reg, "ed.nop")
+    let label = copy "audit:cross-keymap".bytes()
+    let rebound = fl.fl_origin_register(mut replayed.origins, fl.FL_ORIGIN_WORKSPACE, label, 0)
+    if nop == 0 || rebound == 0 { return false }
+    edit.bind_batch_begin(mut replayed)
+    if edit.bind_add(mut replayed, rebound, edit.MODE_L, "i", nop, 0, "", false, fl.fl_nil()) == 0 ||
+        edit.bind_add(mut replayed, rebound, edit.MODE_I, "x", nop, 0, "", false, fl.fl_nil()) == 0 ||
+        edit.bind_add(mut replayed, rebound, edit.MODE_I, "<esc>", nop, 0, "", false, fl.fl_nil()) == 0 {
+        edit.bind_batch_end(mut replayed)
+        return false
+    }
+    edit.bind_batch_end(mut replayed)
+    install_macro(mut replayed, source)
+    if edit.macro_replay(mut replayed, 'a' as int, 1) != edit.CMD_OK { return false }
+    let d = editors_differ(recorded, replayed)
+    if d.len != 0 {
+        why = d
+        return false
+    }
+    true
+}
+
+// run_third_command_rollback_fixture (runner.c:720-753): an unresolved
+// third call rolls the first two back.
+fn run_third_command_rollback_fixture() -> bool {
+    let ok = third_command_rollback()
+    if !ok { eprint("roundtrip: third-command rollback fixture failed") }
+    ok
+}
+
+fn third_command_rollback() -> bool {
+    let source = copy "@[ i\"first\" ]\n@[ i\"second\" ]\nmissing_function()\n".bytes()
+    var ed = editor_open(List[byte](), edit.MODE_L) else { return false }
+    if edit.flapi_reg_write(mut ed, 'a' as int, source, false) != edit.CMD_OK { return false }
+    if edit.macro_replay(mut ed, 'a' as int, 1) != edit.CMD_ERR_STATE { return false }
+    text.textbuf_len(ed.bufs[0].ec.tb) == 0
+}
+
+// corrupt_takes_count_fold (runner.c:755-774): the planted fault folds
+// `buf_end buf_end i"x"` into `2buf_end i"x"`.
+fn corrupt_takes_count_fold(source: List[byte]) -> List[byte] ! {none} {
+    let needle = "buf_end buf_end i\"x\"".bytes()
+    let pair_len = "buf_end buf_end".len
+    let folded = "2buf_end".bytes()
+    var i = 0
+    while i + needle.len <= source.len {
+        var hit = true
+        for j in 0..needle.len {
+            if source[i + j] != needle[j] {
+                hit = false
+                break
+            }
+        }
+        if hit {
+            var out = List[byte]()
+            for j in 0..i { (mut out).push(source[j]) }
+            for b in folded { (mut out).push(b) }
+            for j in i + pair_len..source.len { (mut out).push(source[j]) }
+            return out
+        }
+        i += 1
+    }
+    none
+}
+
+fn view_of(s: RtSession, prefix: int) -> RtSession {
+    var v = RtSession { events: List[RtEvent](), seed: s.seed, fixture: s.fixture, generated_len: s.generated_len, start_mode: s.start_mode }
+    for i in 0..prefix { (mut v.events).push(copy s.events[i]) }
+    v
+}
+
+// p1_diverges (runner.c:776-844): (differs, first byte, emitted source).
+fn p1_diverges(w: RtWorld, s: RtSession, prefix: int, corrupt: bool) -> (bool, int, List[byte]) {
+    var emitted = List[byte]()
+    if prefix > s.events.len { return (false, -1, emitted) }
+    let fixture = fixture_make(s.fixture)
+    let view = view_of(s, prefix)
+    var direct = editor_open(fixture, s.start_mode) else { return (false, -1, emitted) }
+    if !edit.record_start(mut direct, 'a' as int) || !run_events(w, mut direct, view) || edit.record_stop(mut direct) != edit.CMD_OK {
+        return (false, -1, emitted)
+    }
+    let source = stored_macro(mut direct) else { return (false, -1, emitted) }
+    var bad = copy source
+    if corrupt {
+        bad = corrupt_takes_count_fold(source) else { return (false, -1, emitted) }
+    }
+    emitted = copy bad
+    var replay = editor_open(fixture, s.start_mode) else { return (false, -1, emitted) }
+    install_macro(mut replay, bad)
+    if edit.macro_replay(mut replay, 'a' as int, 1) != edit.CMD_OK { return (false, -1, emitted) }
+    if corrupt { install_macro(mut direct, bad) }
+    let differs = editors_differ(direct, replay).len != 0
+    var at = -1
+    if differs { at = first_byte_difference(text.textbuf_bytes(direct.bufs[0].ec.tb), text.textbuf_bytes(replay.bufs[0].ec.tb)) }
+    (differs, at, emitted)
+}
+
+// property_prefix_fails (runner.c:846-872).
+fn property_prefix_fails(mut w: RtWorld, s: RtSession, prefix: int, property: str, corrupt: bool) -> (bool, int, List[byte]) {
+    if corrupt || property == "P1" { return p1_diverges(w, s, prefix, corrupt) }
+    if prefix > s.events.len { return (false, -1, List[byte]()) }
+    let view = view_of(s, prefix)
+    (mut w.property).reset()
+    (mut w.detail).reset()
+    w.quiet = true
+    let pb = copy property.bytes()
+    let failed = !property_session(mut w, view) && bytes_equal(w.property, pb)
+    w.quiet = false
+    if !failed { return (false, -1, List[byte]()) }
+    // P1 itself succeeded; the call renders the prefix's source.
+    let (_, at, src) = p1_diverges(w, s, prefix, false)
+    (true, at, src)
+}
+
+// write_failure_artifact (runner.c:874-897).
+fn write_failure_artifact(s: RtSession, prefix: int, fault: str) -> str {
+    var dir = env_get("YEW_RT_TMP") else ""
+    if dir.len == 0 { dir = "build/tmp" }
+    fs_create_dir(dir) else |_| {}
+    let path = "{dir}/fail-{s.seed}.rec"
+    var body = List[byte]()
+    util.buf_append_str(mut body, "seed={s.seed} fixture={s.fixture} length={s.generated_len} prefix={prefix} fault={fault}\n")
+    fs_write_bytes(path, body) else |_| { return "<artifact write failed>" }
+    path
+}
+
+// report_failure (runner.c:899-956): the shortest failing prefix, its
+// artifact and the source it emitted.
+fn report_failure(mut w: RtWorld, s: RtSession, corrupt: bool) {
+    let last_property = str_from_utf8(w.property) else ""
+    let last_detail = str_from_utf8(w.detail) else ""
+    let property = if corrupt then "SELFTEST/P1" else last_property
+    let detail = if corrupt then "TAKES_COUNT run was illegally folded" else last_detail
+    let want = if corrupt then "P1" else property
+    var prefix = 1
+    var byte_at = -1
+    var source = List[byte]()
+    var found = false
+    while prefix <= s.events.len {
+        let (failed, at, src) = property_prefix_fails(mut w, s, prefix, want, corrupt)
+        if failed {
+            byte_at = at
+            source = src
+            found = true
+            break
+        }
+        prefix += 1
+    }
+    if !found {
+        prefix = s.events.len
+        let (_, at, src) = property_prefix_fails(mut w, s, prefix, want, corrupt)
+        byte_at = at
+        source = src
+    }
+    let path = write_failure_artifact(s, prefix, if corrupt then "fold-takes-count" else "none")
+    let op_at = if corrupt then 0 else if prefix == 0 then 0 else prefix - 1
+    var op = "<unknown>"
+    if prefix != 0 {
+        let id = s.events[op_at].cmd
+        if id > 0 && id <= w.reg.entries.len { op = w.reg.entries[id - 1].name }
+    }
+    let first = if byte_at < 0 then "unavailable 0" else "{byte_at}"
+    eprint("roundtrip: FAIL seed={s.seed} fixture={s.fixture} property={property}")
+    eprint("  diverged at event {op_at} of {prefix}; shrunk from {s.events.len}")
+    eprint("  op: {op}")
+    eprint("  first differing byte: {first}")
+    eprint("  detail: {detail}")
+    eprint("  minimized session: {path}")
+    eprint("  emitted source:")
+    stderr_bytes(source)
+}
+
+// run_one (runner.c:958-970).
+fn run_one(mut w: RtWorld, seed: wrapping[u64], fixture: int, len: int) -> bool {
+    let s = rt_session_generate(w, seed, fixture, len) else { return false }
+    let ok = property_session(mut w, s)
+    if !ok && s.events.len != 0 { report_failure(mut w, s, false) }
+    ok
+}
+
+// run_count_folding_sentinel (runner.c:972-985): two uncounted TAKES_COUNT
+// operations stay two.
+fn run_count_folding_sentinel(mut w: RtWorld) -> bool {
+    let s = rt_session_count_folding(w, 3) else { return false }
+    property_session(mut w, s)
+}
+
+// The corpus line `seed=%llu fixture=%u length=%u prefix=%u` (runner.c:
+// 1062-1063): (fields parsed, seed, fixture, length, prefix).
+fn corpus_fields(src: List[byte]) -> (int, wrapping[u64], int, int, int) {
+    let keys = ["seed=", "fixture=", "length=", "prefix="]
+    var vals = List[wrapping[u64]]()
+    var at = 0
+    for k in keys {
+        let kb = k.bytes()
+        if at + kb.len > src.len { break }
+        var ok = true
+        for j in 0..kb.len {
+            if src[at + j] != kb[j] {
+                ok = false
+                break
+            }
+        }
+        if !ok { break }
+        at += kb.len
+        var v: wrapping[u64] = 0
+        var digits = 0
+        while at < src.len && src[at] >= 48 as byte && src[at] <= 57 as byte {
+            v = v * 10 + (src[at] as int - 48) as wrapping[u64]
+            at += 1
+            digits += 1
+        }
+        if digits == 0 { break }
+        (mut vals).push(v)
+        // fscanf's literal space matches any run of white space.
+        while at < src.len && (src[at] == 32 as byte || src[at] == 10 as byte || src[at] == 9 as byte || src[at] == 13 as byte) { at += 1 }
+    }
+    let n = vals.len
+    let seed = if n > 0 then vals[0] else 0
+    let fixture = if n > 1 then vals[1] as int else 0
+    let len = if n > 2 then vals[2] as int else 0
+    let prefix = if n > 3 then vals[3] as int else 0
+    (n, seed, fixture, len, prefix)
+}
+
+fn rt_name_less(a: str, b: str) -> bool {
+    let x = a.bytes()
+    let y = b.bytes()
+    let n = if x.len < y.len then x.len else y.len
+    for i in 0..n { if x[i] != y[i] { return x[i] < y[i] } }
+    x.len < y.len
+}
+
+// run_corpus (runner.c:1010-1099): every `*.rec` in name order, run whole
+// or at its prefix; 20 at least.
+fn run_corpus(mut w: RtWorld) -> (bool, int) {
+    let dir = "tests/corpus/recorder"
+    let entries = fs_read_dir(dir) else |_| {
+        eprint("roundtrip: open corpus {dir}: cannot read")
+        return (false, 0)
+    }
+    var names = List[str]()
+    for n in entries { if n.len > 4 && n.ends_with(".rec") { (mut names).push(n) } }
+    util.sort_stable(mut names, rt_name_less)
+    for name in names {
+        var ok = true
+        region file {
+            ok = run_corpus_file(mut w, dir, name)
+        }
+        if !ok { return (false, 0) }
+    }
+    if names.len < 20 {
+        eprint("roundtrip: corpus has {names.len} files; need >=20")
+        return (false, names.len)
+    }
+    (true, names.len)
+}
+
+// One corpus file (runner.c:1046-1088): run whole, or at its prefix.
+fn run_corpus_file(mut w: RtWorld, dir: str, name: str) -> bool {
+    {
+        let path = "{dir}/{name}"
+        let src = fs_read_bytes(path) else {
+            eprint("roundtrip: missing corpus {path}")
+            return false
+        }
+        let (parsed, seed, fixture, len, prefix) = corpus_fields(src)
+        if parsed < 3 {
+            eprint("roundtrip: invalid corpus {path}")
+            return false
+        }
+        if prefix == 0 { return run_one(mut w, seed, fixture, len) }
+        let s = rt_session_generate(w, seed, fixture, len) else { return false }
+        if prefix > s.events.len { return false }
+        let view = view_of(s, prefix)
+        property_session(mut w, view)
+    }
+}
+
+// strtoul/strtoull over the whole string: base 10, or C's base 0 (0x hex,
+// a leading 0 octal). (ok, value).
+fn parse_unsigned(s: str, base0: bool) -> (bool, wrapping[u64]) {
+    let b = s.bytes()
+    var at = 0
+    var base = 10
+    if base0 && b.len > 1 && b[0] == 48 as byte && (b[1] == 120 as byte || b[1] == 88 as byte) {
+        base = 16
+        at = 2
+    } else if base0 && b.len > 1 && b[0] == 48 as byte {
+        base = 8
+        at = 1
+    }
+    if at >= b.len { return (base == 8 || b.len == 1, 0) }
+    var v: wrapping[u64] = 0
+    while at < b.len {
+        let c = b[at] as int
+        var d = -1
+        if c >= 48 && c <= 57 { d = c - 48 } else if c >= 97 && c <= 102 { d = c - 87 } else if c >= 65 && c <= 70 { d = c - 55 }
+        if d < 0 || d >= base { return (false, 0) }
+        v = v * base as wrapping[u64] + d as wrapping[u64]
+        at += 1
+    }
+    (true, v)
+}
+
+// env_seeds (runner.c:1101-1116).
+fn env_seeds() -> int {
+    let s = env_get("YEW_RT_SEEDS") else ""
+    if s.len == 0 { return 2000 }
+    let (ok, n) = parse_unsigned(s, false)
+    if !ok || n > 4294967295 {
+        eprint("roundtrip: invalid YEW_RT_SEEDS={s}")
+        os_exit(2)
+    }
+    n as int
+}
+
+// env_base_seed (runner.c:1118-1133).
+fn env_base_seed() -> wrapping[u64] {
+    let s = env_get("YEW_RT_BASE_SEED") else ""
+    if s.len == 0 { return 0 }
+    let (ok, n) = parse_unsigned(s, true)
+    if !ok {
+        eprint("roundtrip: invalid YEW_RT_BASE_SEED={s}")
+        os_exit(2)
+    }
+    n
+}
+
+// has_count_folding_prefix (runner.c:1135-1155).
+fn has_count_folding_prefix(w: RtWorld, s: RtSession) -> bool {
+    if s.events.len < 3 { return false }
+    let end = edit.cmd_lookup(w.reg, "ed.move.buf.end")
+    let ins = edit.cmd_lookup(w.reg, "ed.edit.insert.text")
+    s.events[0].cmd == end && s.events[1].cmd == end && !s.events[0].count_given && !s.events[1].count_given &&
+        s.events[2].cmd == ins && !s.events[2].count_given && s.events[2].sarg.len == 1 && s.events[2].sarg[0] == 120 as byte
+}
+
+// run_selftest (runner.c:1157-1173): the planted fold must shrink to the
+// three-event prefix and name ed.move.buf.end.
+fn run_selftest(mut w: RtWorld) -> int {
+    let s = rt_session_count_folding(w, 96) else { return 2 }
+    if !has_count_folding_prefix(w, s) || s.events.len != 96 { return 2 }
+    report_failure(mut w, s, true)
+    1
+}
+
+fn main() -> int {
+    let args = env_args()
+    var coverage = (env_get("YEW_RT_COVERAGE") else "#unset") != "#unset"
+    if args.len == 1 && args[0] == "--coverage" {
+        coverage = true
+    } else if args.len != 0 {
+        eprint("usage: roundtrip_runner [--coverage]")
+        return 2
+    }
+    let probe = edit.ed_new()
+    var w = RtWorld { reg: copy probe.reg, quiet: false, property: List[byte](), detail: List[byte]() }
+    if !rt_generator_coverage(w.reg, coverage) { return 1 }
+    if (env_get("YEW_RT_SELFTEST") else "#unset") != "#unset" { return run_selftest(mut w) }
+    if !run_count_folding_sentinel(mut w) { return 1 }
+    if !run_edit_store_noop_fixture(w) { return 1 }
+    if !run_cross_keymap_fixture(w) { return 1 }
+    if !run_third_command_rollback_fixture() { return 1 }
+    let seeds = env_seeds()
+    let base = env_base_seed()
+    // One region per seed: four editors a session, the 10,000-line
+    // fixture among them, freed before the next (C frees each with
+    // yew_ed_free, runner.c:536-547).
+    for i in 0..seeds {
+        var ok = false
+        region seed {
+            ok = run_one(mut w, base + i as wrapping[u64], i % 6, 0)
+        }
+        if !ok { return 1 }
+    }
+    let (ok, corpus) = run_corpus(mut w)
+    if !ok { return 1 }
+    print("roundtrip: ok seeds={seeds} base={base} fixtures=6 corpus={corpus} count-sentinel=1 edit-store-noop=1 cross-keymap=1 third-command-rollback=1 P1-P5")
+    0
+}
