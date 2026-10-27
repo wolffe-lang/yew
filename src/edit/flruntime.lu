@@ -1,0 +1,275 @@
+//! edit.flruntime — persistent VM ownership and evaluation, sagitta 9ace98c2
+//! src/fl/flruntime.c:185-280, flruntime_int.h:15-39 and fleval.c:1-327.
+//! R-yw09-4: the real VM is held in a retained one-element list. A running
+//! call owns it locally; an editor command parks it so synchronous hooks can
+//! re-enter the SAME VM. No region is used (G50/G54), and no VM is copied.
+//! The actual-VM/compacting-GC witness is src/fl_parking_test.lu.
+
+use fl
+use util
+
+/// Macro cache references are host-root indices, never stale heap references.
+pub struct FlMacroCache {
+    root: int,
+    source: List[byte],
+    has_source: bool,
+    hash: int,
+    origin: fl.FlOrigin,
+}
+
+/// Coalesced buffer damage, keyed by stable buffer identity.
+pub struct FlPendingChange { buffer_id: int, lo: int, hi: int }
+
+/// Session-owned compiler/VM, diagnostic capture and replay provenance.
+pub struct FlRuntime {
+    vms: List[fl.FlVm],
+    ready: bool,
+    command_source: int,
+    macro_cache: List[FlMacroCache],
+    last_diag: List[byte],
+    last_span: fl.FlSpan,
+    has_last_diag: bool,
+    diag_error: bool,
+    diag_message: List[byte],
+    idle_since: int,
+    changes: List[FlPendingChange],
+    flushing_change: bool,
+}
+
+/// An uninitialized runtime, with no VM storage allocated yet.
+pub fn fl_runtime_new() -> FlRuntime {
+    FlRuntime {
+        vms: List[fl.FlVm](),
+        ready: false,
+        command_source: SRC_FLETCH,
+        macro_cache: List[FlMacroCache](),
+        last_diag: List[byte](),
+        last_span: fl.FlSpan { file_id: 0, line: 0, col: 0, len: 0 },
+        has_last_diag: false,
+        diag_error: false,
+        diag_message: List[byte](),
+        idle_since: -1,
+        changes: List[FlPendingChange](),
+        flushing_change: false,
+    }
+}
+
+/// Snapshot the command registry in C's declaration order for ed.commands.
+pub fn fl_command_rows(reg: CmdReg) -> List[fl.FlHostCmd] {
+    var rows = List[fl.FlHostCmd]()
+    for i in 0..cmd_count(reg) {
+        let e = cmd_entry(reg, i + 1)
+        (mut rows).push(fl.FlHostCmd {
+            name: copy e.name,
+            help: copy e.help,
+            flags: e.flags,
+            word: copy e.word,
+            has_word: e.has_word,
+        })
+    }
+    rows
+}
+
+/// Initialize once; callbacks may call this while the VM is already executing.
+pub fn fl_runtime_init(mut ed: Ed) -> bool {
+    if ed.flrt.ready { return true }
+    var strings = fl.fl_strings()
+    var vm = fl.fl_vm_new(take strings)
+    fl.fl_std_register(mut vm)
+    let rows = fl_command_rows(ed.reg)
+    fl.fl_vm_set_commands(mut vm, rows)
+    assert(fl.fl_api_check_table().len == 0)
+    for kind in fl.fl_api_kinds() {
+        let d = fl.fl_api_desc(kind) else { continue }
+        if d.cmd.len != 0 {
+            assert(cmd_lookup(ed.reg, d.cmd) != 0, "unknown Fletch command {d.cmd}")
+        }
+    }
+    vm.host_kind = 1
+    for _ in 0..26 {
+        let root = fl.fl_gc_host_root_add(mut vm, fl.fl_nil())
+        (mut ed.flrt.macro_cache).push(FlMacroCache {
+            root: root,
+            source: List[byte](),
+            has_source: false,
+            hash: 0,
+            origin: fl.fl_origin_new(fl.FL_ORIGIN_CONFIG, fl.FL_CAP_ALL),
+        })
+    }
+    (mut ed.flrt.vms).push(vm)
+    ed.flrt.ready = true
+    ed.flrt.idle_since = -1
+    true
+}
+
+fn runtime_missing_vm() -> fl.FlVm {
+    util.bug("edit.flruntime", "active Fletch VM was not restored")
+    var strings = fl.fl_strings()
+    fl.fl_vm_new(take strings)
+}
+
+fn runtime_take(mut ed: Ed) -> fl.FlVm {
+    (mut ed.flrt.vms).pop() else runtime_missing_vm()
+}
+
+fn runtime_cstr(mut out: List[byte], bytes: List[byte], cap: int) {
+    (mut out).reset()
+    for b in bytes { if b == 0 as byte || out.len >= cap { break }; (mut out).push(b) }
+}
+
+fn runtime_diag_capture(mut ed: Ed, vm: fl.FlVm, first: int) {
+    for i in first..vm.dc.entries.len {
+        let d = copy vm.dc.entries[i]
+        var rendered = List[byte]()
+        fl.fl_diag_render(mut rendered, vm.dc, d.level, d.sp, d.msg)
+        var logged = List[byte]()
+        util.buf_append_str(mut logged, "Fletch: ")
+        util.buf_append(mut logged, rendered)
+        let level = if d.level == fl.FL_DIAG_ERROR {
+            util.LOG_ERROR
+        } else if d.level == fl.FL_DIAG_WARNING {
+            util.LOG_WARN
+        } else {
+            util.LOG_INFO
+        }
+        util.log_at_bytes(level, logged)
+        ed.flrt.last_span = d.sp
+        ed.flrt.has_last_diag = true
+        runtime_cstr(mut ed.flrt.last_diag, rendered, rendered.len)
+        if d.level == fl.FL_DIAG_ERROR {
+            ed.flrt.diag_error = true
+            runtime_cstr(mut ed.flrt.diag_message, rendered, 255)
+        }
+    }
+}
+
+fn runtime_compile(
+    mut ed: Ed,
+    mut vm: fl.FlVm,
+    source: List[byte],
+    label: str,
+    origin: fl.FlOrigin,
+    repl: bool,
+) -> fl.FlValue ! {none} {
+    ed.flrt.diag_error = false
+    ed.flrt.has_last_diag = false
+    (mut ed.flrt.diag_message).reset()
+    (mut ed.flrt.last_diag).reset()
+    let first = vm.dc.entries.len
+    let file = fl.fl_diag_add_file(mut vm.dc, label, source)
+    let p = fl.fl_parse(source, file, mut vm.dc, mut vm.strings)
+    if p.had_error { runtime_diag_capture(mut ed, vm, first); return none }
+    let entry = (
+        if repl {
+            fl.fl_compile_repl(mut vm, p, file, origin)
+        } else {
+            fl.fl_compile(mut vm, p, file, origin)
+        }
+    ) else {
+        runtime_diag_capture(mut ed, vm, first)
+        return none
+    }
+    runtime_diag_capture(mut ed, vm, first)
+    entry
+}
+
+/// Compile and execute one editor source while retaining its VM and globals.
+/// A parse/compile error returns ERR_ARG; an uncaught VM error ERR_STATE.
+pub fn fl_eval_source(
+    mut ed: Ed,
+    source: List[byte],
+    label: str,
+    origin: fl.FlOrigin,
+    repl: bool,
+) -> (int, fl.FlValue) {
+    let _ = fl_runtime_init(mut ed)
+    var vm = runtime_take(mut ed)
+    let entry = runtime_compile(mut ed, mut vm, source, label, origin, repl) else {
+        (mut ed.flrt.vms).push(vm)
+        return (CMD_ERR_ARG, fl.fl_nil())
+    }
+    let result = if vm.frames.len == 0 {
+        fl.fl_vm_run_host(mut vm, mut ed, entry)
+    } else {
+        let closure = fl.fl_closure_new(mut vm, entry)
+        fl.fl_vm_call_host(mut vm, mut ed, closure, List[fl.FlValue]())
+    }
+    let status = if vm.raised then CMD_ERR_STATE else CMD_OK
+    (mut ed.flrt.vms).push(vm)
+    (status, result)
+}
+
+/// Ordinary E-mode evaluation, including the byte-preserving result/trace message.
+pub fn fl_runtime_eval(mut ed: Ed, source: List[byte]) -> int {
+    let origin = fl.fl_origin_new(fl.FL_ORIGIN_CONFIG, fl.FL_CAP_ALL)
+    let (status, result) = fl_eval_source(mut ed, source, "<E>", origin, true)
+    if status == CMD_ERR_ARG {
+        if ed.flrt.diag_message.len != 0 {
+            let msg = copy ed.flrt.diag_message
+            ed_msg_bytes(mut ed, MSG_ERROR, msg)
+        } else {
+            ed_msg(mut ed, MSG_ERROR, "Fletch parse failed")
+        }
+        return status
+    }
+    var rendered = List[byte]()
+    if status != CMD_OK {
+        fl.fl_trace_render(mut ed.flrt.vms[0], result, mut rendered)
+        var log = List[byte]()
+        util.buf_append_str(mut log, "Fletch E-mode error: ")
+        util.buf_append(mut log, rendered)
+        util.log_at_bytes(util.LOG_ERROR, log)
+        var first = List[byte]()
+        for b in rendered {
+            if b == 0 as byte || b == 10 as byte || first.len == 255 { break }
+            (mut first).push(b)
+        }
+        if first.len == 0 { util.buf_append_str(mut first, "Fletch error") }
+        ed_msg_bytes(mut ed, MSG_ERROR, first)
+        return status
+    }
+    if result.t != fl.FL_NIL {
+        if !fl.fl_fmt_repl(mut ed.flrt.vms[0], mut rendered, result, 8) {
+            ed_msg(mut ed, MSG_ERROR, "Fletch result could not be rendered")
+            return CMD_ERR_STATE
+        }
+        ed_msg_bytes(mut ed, MSG_INFO, rendered)
+    }
+    CMD_OK
+}
+
+/// The only point that parks the active VM while a resolved editor command runs.
+pub fn fl_invoke_command(mut vm: fl.FlVm, mut ed: Ed, id: int, mut cx: CmdCtx) -> int ! {raised} {
+    let changes = cmd_active(ed.reg, id) && ed.reg.entries[id - 1].flags & CMD_CHANGES_BUFFER != 0
+    if changes && ed.fl_model_teardown {
+        let _ = fl.fl_raise(mut vm, "user", "editor mutation during model teardown")
+        return raised
+    }
+    if changes && !fl_txn_enlist(mut vm, mut ed, cx.win) { return raised }
+    assert(ed.flrt.vms.len == 0, "Fletch command found a second active VM")
+    (mut ed.flrt.vms).push(vm)
+    let status = ed_dispatch_resolved(mut ed, id, mut cx)
+    vm = runtime_take(mut ed)
+    if changes && !fl_txn_enlist(mut vm, mut ed, cx.win) { return raised }
+    status
+}
+
+impl fl.FlHost for Ed {
+    fn api(mut self, mut vm: fl.FlVm, kind: int, base: int, argc: int) -> fl.FlValue {
+        fl_attached_api(mut vm, mut self, kind, base, argc)
+    }
+    fn motion(mut self, mut vm: fl.FlVm, program: fl.FlValue) -> bool {
+        fl_motion_host_dispatch(mut vm, mut self, program)
+    }
+    fn edit_begin(mut self, mut vm: fl.FlVm) -> bool { fl_txn_edit_begin(mut vm, mut self) }
+    fn edit_end(mut self, mut vm: fl.FlVm, commit: bool) -> bool {
+        fl_txn_edit_end(mut vm, mut self, commit)
+    }
+    fn run_begin(mut self, mut vm: fl.FlVm) -> bool { fl_txn_run_begin(mut vm, mut self) }
+    #[allow(w1002)] // The host ABI permits a VM error; C's run_end never raises.
+    fn run_end(mut self, mut vm: fl.FlVm, commit: bool) -> bool {
+        let _ = vm.sp
+        fl_txn_run_end(mut self, commit)
+    }
+    fn run_active(self) -> bool { self.fltxn.entry_active }
+}
