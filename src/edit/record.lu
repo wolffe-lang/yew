@@ -2,6 +2,30 @@
 //! src/fl/record.c:1-849 and record.h:1-84. Commands are recorded, not
 //! keys; a macro is terse Fletch source in a named register and replays
 //! through the VM only (the round-trip law, s35:55-78).
+//!
+//! The registry's record tap (cmd.c:2188-2195) is the recorder's when
+//! `CmdReg.record_tap` is TAP_RECORDER (ed_new installs it, as
+//! yew_ed_init does, ed.c:788): `cmd_prepare_ed` runs the preflight and
+//! then the tap, after the registry's own checks and before the handler.
+
+use fl
+use text
+use util
+
+/// `RecRangeKind` (record.h:15-21).
+pub const REC_RANGE_NONE: int = 0
+
+/// A line range (`:3,5`).
+pub const REC_RANGE_LINES: int = 1
+
+/// The whole buffer (`%`).
+pub const REC_RANGE_BUFFER: int = 2
+
+/// The selection (`'<,'>`).
+pub const REC_RANGE_SELECTION: int = 3
+
+/// A byte span (a resolved token range).
+pub const REC_RANGE_SPAN: int = 4
 
 /// `RecEvent` (record.h:23-37): one recorded command, resolved; a string
 /// argument is a slice of the recording's blob.
@@ -35,6 +59,14 @@ pub struct Rec {
     import_ed: bool,
 }
 
+/// `RecStatus` (record.h:54-59).
+pub struct RecStatus {
+    active: bool,
+    reg: int,
+    nevents: int,
+    last_reg: int,
+}
+
 /// `yew_record_init` (record.c:35-42): idle, importing `ed` on stop.
 pub fn rec_new() -> Rec {
     Rec {
@@ -49,6 +81,717 @@ pub fn rec_new() -> Rec {
         append: false,
         import_ed: true,
     }
+}
+
+// named_register / lower_register (record.c:15-26).
+fn rec_named(name: int) -> bool {
+    name >= 'a' as int && name <= 'z' as int || name >= 'A' as int && name <= 'Z' as int
+}
+
+fn rec_lower(name: int) -> int {
+    if name >= 'A' as int && name <= 'Z' as int then name - 'A' as int + 'a' as int else name
+}
+
+fn rec_char(name: int) -> str { str_from_utf8([name as byte]) else "?" }
+
+/// `yew_record_start` (record.c:53-86): an upper-case register appends,
+/// and a non-empty one keeps its `import ed` line.
+pub fn record_start(mut ed: Ed, reg: int) -> bool {
+    if !rec_named(reg) { return false }
+    if ed.fltxn.depth != 0 {
+        ed_msg(mut ed, MSG_ERROR, "cannot start recording inside an edit transaction")
+        return false
+    }
+    if ed.rec.active {
+        let cur = rec_char(ed.rec.reg)
+        ed_msg(mut ed, MSG_WARN, "already recording @{cur}")
+        return false
+    }
+    (mut ed.rec.ev).reset()
+    (mut ed.rec.blob).reset()
+    ed.rec.reg = rec_lower(reg)
+    ed.rec.append = reg >= 'A' as int && reg <= 'Z' as int
+    ed.rec.import_ed = true
+    if ed.rec.append {
+        let lower = ed.rec.reg
+        let current = text.reg_get(mut ed.regs, lower) else text.regval_new()
+        if current.bytes.len != 0 { ed.rec.import_ed = false }
+    }
+    ed.rec.mode_at_start = ed.mode
+    ed.rec.txn_depth_at_start = ed.fltxn.depth
+    ed.rec.in_prompt = false
+    ed.rec.active = true
+    let shown = rec_char(reg)
+    ed_msg(mut ed, MSG_INFO, "recording @{shown}")
+    true
+}
+
+/// `yew_record_active` (record.c:88-91).
+pub fn record_active(ed: Ed) -> bool { ed.rec.active }
+
+// portable_range (record.c:93-102).
+fn rec_portable_range(r: CmdRange) -> bool {
+    if r.kind > RANGE_SELECTION { return false }
+    if r.kind == RANGE_LINES { return r.lo <= r.hi }
+    if r.kind == RANGE_NONE && r.given { return r.tok_lo <= r.tok_hi }
+    true
+}
+
+/// `yew_record_preflight` (record.c:104-145): a command the recorder could
+/// not replay as recorded refuses while recording, before it runs.
+pub fn record_preflight(mut ed: Ed, id: int, cx: CmdCtx) -> int {
+    if !ed.rec.active || cx.source == SRC_REPLAY { return CMD_OK }
+    // Editing an open prompt uses the ordinary edit commands against the
+    // prompt's private window; the tap drops those, and the committed
+    // CMDLINE command is recorded once when the prompt is accepted.
+    if ed.rec.in_prompt && cx.source != SRC_CMDLINE && ed.cmdline.active &&
+        cx.win == cmdline_target(ed) {
+        return CMD_OK
+    }
+    let name = if cmd_active(ed.reg, id) then ed.reg.entries[id - 1].name else "command"
+    if cx.win >= 0 && cx.win != ed.win {
+        ed_msg(mut ed, MSG_ERROR, "cannot record {name} for a non-current window")
+        return CMD_ERR_STATE
+    }
+    if cx.cursor_given {
+        ed_msg(mut ed, MSG_ERROR, "cannot record {name} for an explicit cursor")
+        return CMD_ERR_STATE
+    }
+    if !rec_portable_range(cx.range) {
+        ed_msg(mut ed, MSG_ERROR, "cannot record {name} with a nonportable range")
+        return CMD_ERR_ARG
+    }
+    // s36-opt: the option command's opt_in/opt_out/opt_error join here.
+    if cx.cursor_args.len != 0 {
+        ed_msg(mut ed, MSG_ERROR, "cannot record {name} with internal resolved arguments")
+        return CMD_ERR_ARG
+    }
+    CMD_OK
+}
+
+// The context's string argument's bytes (C's sarg/sarg_len).
+fn rec_cx_sarg(cx: CmdCtx) -> List[byte] {
+    if cx.has_sbytes { return copy cx.sbytes }
+    var out = List[byte]()
+    if cx.has_sarg { for b in cx.sarg.bytes() { (mut out).push(b) } }
+    out
+}
+
+// capture_range (record.c:147-171).
+fn rec_capture_range(mut ev: RecEvent, r: CmdRange) {
+    ev.range_given = r.given
+    if r.kind == RANGE_LINES {
+        ev.range_kind = REC_RANGE_LINES
+        ev.range_lo = r.lo
+        ev.range_hi = r.hi
+    } else if r.kind == RANGE_BUFFER {
+        ev.range_kind = REC_RANGE_BUFFER
+    } else if r.kind == RANGE_SELECTION {
+        ev.range_kind = REC_RANGE_SELECTION
+    } else if r.given {
+        ev.range_kind = REC_RANGE_SPAN
+        ev.range_lo = r.tok_lo
+        ev.range_hi = r.tok_hi
+    }
+}
+
+/// `yew_record_tap` (record.c:173-248): one resolved command into the
+/// recording. A prompt-opening command is not recorded (its CMDLINE
+/// result is); `ed.macro.replay_last` is recorded as the replay of the
+/// register it means now.
+pub fn record_tap(mut ed: Ed, id_in: int, cx: CmdCtx) {
+    if cx.source == SRC_REPLAY || !ed.rec.active { return }
+    // Prompt teardown can be driven by mouse, Fletch or native code, so no
+    // later key need refresh this; self-heal before deciding (record.c:
+    // 187-193).
+    if ed.rec.in_prompt && ed.prompt == PROMPT_NONE && !ed.cmdline.active {
+        ed.rec.in_prompt = false
+    }
+    var id = id_in
+    var sarg = rec_cx_sarg(cx)
+    let original = copy sarg
+    if cmd_active(ed.reg, id) && ed.reg.entries[id - 1].name == "ed.macro.replay_last" {
+        if !rec_named(ed.rec.last_reg) { return }
+        let resolved = rec_lower(ed.rec.last_reg)
+        id = cmd_lookup(ed.reg, "ed.macro.replay")
+        if id == 0 { util.bug("edit.record", "macro replay command is missing from the registry") }
+        sarg = [resolved as byte]
+    }
+    let name = if cmd_active(ed.reg, id) then ed.reg.entries[id - 1].name else ""
+    let flags = if cmd_active(ed.reg, id) then ed.reg.entries[id - 1].flags else 0
+    if cx.source != SRC_CMDLINE &&
+        (
+            flags & CMD_PROMPTS != 0 ||
+                name == "ed.shell.open" ||
+                name == "ed.mode.enter" && original.len == 1 && original[0] == 'E' as byte
+        ) {
+        ed.rec.in_prompt = true
+        return
+    }
+    if ed.rec.in_prompt && cx.source != SRC_CMDLINE { return }
+    if cx.source == SRC_CMDLINE { ed.rec.in_prompt = false }
+    var ev = RecEvent {
+        cmd: id,
+        count: cx.count,
+        count_given: cx.count_given,
+        bang: cx.bang,
+        iarg: cx.iarg,
+        range_lo: 0,
+        range_hi: 0,
+        sarg_at: ed.rec.blob.len,
+        sarg_len: sarg.len,
+        mode: ed.mode,
+        src: cx.source,
+        range_kind: REC_RANGE_NONE,
+        range_given: false,
+    }
+    rec_capture_range(mut ev, cx.range)
+    for b in sarg { (mut ed.rec.blob).push(b) }
+    (mut ed.rec.ev).push(ev)
+    // Below ten events the indicator is unchanged (record.c:243-247).
+    if ed.rec.ev.len >= 10 { ed.footer_dirty = true }
+}
+
+/// `yew_record_key` (record.c:250-258): prompt keystrokes are not kept;
+/// the committed command is recorded once by the tap.
+pub fn record_key(mut ed: Ed) {
+    if !ed.rec.active { return }
+    ed.rec.in_prompt = ed.prompt != PROMPT_NONE || ed.cmdline.active
+}
+
+/// The registry's prepare with the record tap (`yew_cmd_prepare`,
+/// cmd.c:2171-2198): the registry's checks, then — any tap installed and
+/// the command recordable — the recorder's preflight, then the tap.
+pub fn cmd_prepare_ed(mut ed: Ed, id: int, cx: CmdCtx) -> int {
+    let prep = cmd_prepare(mut ed.reg, id, cx)
+    if prep != CMD_OK { return prep }
+    if ed.reg.record_tap != TAP_NONE && ed.reg.entries[id - 1].flags & CMD_RECORDABLE != 0 {
+        let ok = record_preflight(mut ed, id, cx)
+        if ok != CMD_OK { return ok }
+        if ed.reg.record_tap == TAP_RECORDER {
+            record_tap(mut ed, id, cx)
+        } else {
+            cmd_test_tap(mut ed.reg, id, cx)
+        }
+    }
+    CMD_OK
+}
+
+// ---- emission (record.c:260-600) --------------------------------------
+
+fn hex2(v: int) -> str {
+    let digits = "0123456789abcdef"
+    let hi = digits[v / 16..v / 16 + 1]
+    let lo = digits[v % 16..v % 16 + 1]
+    "{hi}{lo}"
+}
+
+// The escapes emit_escaped and the insert-text literal share
+// (record.c:264-283, 407-419): `"` and `\` (escaped as `\"`/`\\` by
+// emit_escaped, backslashed by the literal: the same bytes), n r t 0, and
+// \xNN for the other controls.
+fn rec_escape_byte(mut out: List[byte], ch: byte) {
+    let c = ch as int
+    if c == '"' as int {
+        util.buf_append_str(mut out, "\\\"")
+    } else if c == '\\' as int {
+        util.buf_append_str(mut out, "\\\\")
+    } else if c == 10 {
+        util.buf_append_str(mut out, "\\n")
+    } else if c == 13 {
+        util.buf_append_str(mut out, "\\r")
+    } else if c == 9 {
+        util.buf_append_str(mut out, "\\t")
+    } else if c == 0 {
+        util.buf_append_str(mut out, "\\0")
+    } else if c < 32 || c == 127 {
+        util.buf_append_str(mut out, "\\x{hex2(c)}")
+    } else {
+        (mut out).push(ch)
+    }
+}
+
+fn rec_emit_escaped(mut out: List[byte], s: List[byte]) {
+    (mut out).push('"' as byte)
+    for b in s { rec_escape_byte(mut out, b) }
+    (mut out).push('"' as byte)
+}
+
+fn rec_ev_name(reg: CmdReg, ev: RecEvent) -> str {
+    if cmd_active(reg, ev.cmd) then reg.entries[ev.cmd - 1].name else ""
+}
+
+// event_sarg / event_sarg_len (record.c:293-309): empty when out of range.
+fn rec_ev_sarg(rec: Rec, ev: RecEvent) -> List[byte] {
+    if ev.sarg_at > rec.blob.len || ev.sarg_len > rec.blob.len - ev.sarg_at {
+        return List[byte]()
+    }
+    rec.blob[ev.sarg_at..ev.sarg_at + ev.sarg_len]
+}
+
+fn rec_sarg_is(rec: Rec, ev: RecEvent, ch: int) -> bool {
+    let s = rec_ev_sarg(rec, ev)
+    s.len == 1 && s[0] as int == ch
+}
+
+// special_motion (record.c:318-335): the event has a motion word and no
+// argument the motion language cannot spell.
+fn rec_special_motion(reg: CmdReg, rec: Rec, ev: RecEvent) -> bool {
+    if !cmd_active(reg, ev.cmd) || !reg.entries[ev.cmd - 1].has_word { return false }
+    if ev.bang || ev.range_kind != REC_RANGE_NONE { return false }
+    let name = reg.entries[ev.cmd - 1].name
+    if name == "ed.edit.insert.text" { return true }
+    if ev.iarg != 0 { return false }
+    if name == "ed.mode.enter" {
+        return rec_sarg_is(rec, ev, 'L' as int) ||
+            rec_sarg_is(rec, ev, 'W' as int) ||
+            rec_sarg_is(rec, ev, 'B' as int) ||
+            rec_sarg_is(rec, ev, 'C' as int) ||
+            rec_sarg_is(rec, ev, 'H' as int)
+    }
+    rec_ev_sarg(rec, ev).len == 0
+}
+
+// unit_relative (record.c:337-348).
+fn rec_unit_relative(name: str) -> bool {
+    name == "ed.move.unit.next" ||
+        name == "ed.move.unit.prev" ||
+        name == "ed.move.unit.up" ||
+        name == "ed.move.unit.down" ||
+        name == "ed.move.unit.next_alt" ||
+        name == "ed.move.unit.prev_alt" ||
+        name == "ed.move.unit.up_alt" ||
+        name == "ed.move.unit.down_alt" ||
+        name == "ed.edit.delete.unit"
+}
+
+// fixed_token (record.c:350-370): "" for none.
+fn rec_fixed_token(reg: CmdReg, rec: Rec, ev: RecEvent) -> str {
+    let name = rec_ev_name(reg, ev)
+    if name == "ed.mode.enter" {
+        if rec_sarg_is(rec, ev, 'L' as int) { return "l" }
+        if rec_sarg_is(rec, ev, 'W' as int) { return "w" }
+        if rec_sarg_is(rec, ev, 'B' as int) { return "b" }
+        if rec_sarg_is(rec, ev, 'C' as int) { return "c" }
+        if rec_sarg_is(rec, ev, 'H' as int) { return "H(" }
+    }
+    match name {
+        "ed.move.unit.next" => ">",
+        "ed.move.unit.prev" => "<",
+        "ed.move.unit.up" => "^",
+        "ed.move.unit.down" => "v",
+        "ed.move.unit.next_alt" => "a>",
+        "ed.move.unit.prev_alt" => "a<",
+        "ed.move.unit.up_alt" => "a^",
+        "ed.move.unit.down_alt" => "av",
+        "ed.edit.delete.unit" => "del",
+        "ed.mode.escape" => "esc",
+        _ => "",
+    }
+}
+
+// emit_count (record.c:372-379).
+fn rec_emit_count(mut out: List[byte], ev: RecEvent, folded: int) {
+    if ev.count_given {
+        let n = if ev.count == 0 then 1 else ev.count
+        util.buf_append_str(mut out, "{n}")
+    } else if folded > 1 {
+        util.buf_append_str(mut out, "{folded}")
+    }
+}
+
+// same_foldable (record.c:381-388).
+fn rec_same_foldable(reg: CmdReg, a: RecEvent, b: RecEvent) -> bool {
+    cmd_active(reg, a.cmd) &&
+        reg.entries[a.cmd - 1].flags & CMD_REPEATABLE != 0 &&
+        !a.count_given &&
+        !b.count_given &&
+        a.cmd == b.cmd &&
+        a.iarg == b.iarg &&
+        a.sarg_len == 0 &&
+        b.sarg_len == 0
+}
+
+// emit_motion_event (record.c:390-467): one motion token (or a run of
+// folded ones, or a run of inserted text); answers the next event and
+// the H( nesting depth.
+fn rec_emit_motion_event(
+    reg: CmdReg,
+    rec: Rec,
+    at_in: int,
+    end: int,
+    mut out: List[byte],
+    depth_in: int,
+) -> (int, int) {
+    var at = at_in
+    var depth = depth_in
+    let ev = copy rec.ev[at]
+    let name = rec_ev_name(reg, ev)
+    if name == "ed.edit.insert.text" {
+        rec_emit_count(mut out, ev, 1)
+        (mut out).push('i' as byte)
+        (mut out).push('"' as byte)
+        if ev.count_given {
+            for b in rec_ev_sarg(rec, ev) { rec_escape_byte(mut out, b) }
+            (mut out).push('"' as byte)
+            return (at + 1, depth)
+        }
+        while at < end &&
+            rec_ev_name(reg, rec.ev[at]) == "ed.edit.insert.text" &&
+            !rec.ev[at].count_given {
+            for b in rec_ev_sarg(rec, rec.ev[at]) { rec_escape_byte(mut out, b) }
+            at += 1
+        }
+        (mut out).push('"' as byte)
+        return (at, depth)
+    }
+    let token = rec_fixed_token(reg, rec, ev)
+    var folded = 1
+    while at + folded < end && rec_same_foldable(reg, ev, rec.ev[at + folded]) { folded += 1 }
+    rec_emit_count(mut out, ev, folded)
+    if name == "ed.mode.enter" && rec_sarg_is(rec, ev, 'H' as int) {
+        util.buf_append_str(mut out, "H(")
+        depth += 1
+    } else if name == "ed.mode.escape" && depth != 0 {
+        (mut out).push(')' as byte)
+        depth -= 1
+    } else if token.len != 0 {
+        util.buf_append_str(mut out, token)
+    } else if cmd_active(reg, ev.cmd) && reg.entries[ev.cmd - 1].has_word {
+        util.buf_append_str(mut out, reg.entries[ev.cmd - 1].word)
+    } else {
+        util.bug("edit.record", "recordable command has no motion word")
+    }
+    (at + folded, depth)
+}
+
+// needs_annotation (record.c:469-477).
+fn rec_needs_annotation(reg: CmdReg, rec: Rec) -> bool {
+    for ev in rec.ev { if rec_unit_relative(rec_ev_name(reg, ev)) { return true } }
+    false
+}
+
+// emit_motion_segment (record.c:479-507).
+fn rec_emit_motion_segment(
+    reg: CmdReg,
+    rec: Rec,
+    lo: int,
+    hi: int,
+    mut out: List[byte],
+    segment: int,
+    annotate: bool,
+) {
+    let r = rec_char(rec.reg)
+    util.buf_append_str(mut out, "  macro rec_{r}")
+    if segment != 0 { util.buf_append_str(mut out, "_{segment}") }
+    util.buf_append_str(mut out, " = @[")
+    if annotate {
+        let unit = if rec.mode_at_start == MODE_W {
+            "w"
+        } else if rec.mode_at_start == MODE_B {
+            "b"
+        } else {
+            "l"
+        }
+        util.buf_append_str(mut out, " {unit}")
+    }
+    var i = lo
+    var depth = 0
+    while i < hi {
+        (mut out).push(' ' as byte)
+        let (next, d) = rec_emit_motion_event(reg, rec, i, hi, mut out, depth)
+        i = next
+        depth = d
+    }
+    while depth != 0 {
+        (mut out).push(')' as byte)
+        depth -= 1
+    }
+    util.buf_append_str(mut out, " ];\n  rec_{r}")
+    if segment != 0 { util.buf_append_str(mut out, "_{segment}") }
+    util.buf_append_str(mut out, "();\n")
+}
+
+// emit_run (record.c:509-562): one event as `ed.run(name, { ... })`.
+fn rec_emit_run(reg: CmdReg, rec: Rec, ev: RecEvent, mut out: List[byte]) {
+    if !cmd_active(reg, ev.cmd) {
+        util.bug("edit.record", "macro recorder contains an unknown command id")
+    }
+    util.buf_append_str(mut out, "  ed.run(")
+    rec_emit_escaped(mut out, reg.entries[ev.cmd - 1].name.bytes())
+    util.buf_append_str(mut out, ", {")
+    var comma = false
+    if ev.count_given {
+        let n = if ev.count == 0 then 1 else ev.count
+        util.buf_append_str(mut out, " count: {n}")
+        comma = true
+    }
+    if ev.iarg != 0 {
+        let sep = if comma then "," else ""
+        util.buf_append_str(mut out, "{sep} iarg: {ev.iarg}")
+        comma = true
+    }
+    if ev.bang {
+        let sep = if comma then "," else ""
+        util.buf_append_str(mut out, "{sep} bang: true")
+        comma = true
+    }
+    if ev.range_kind != REC_RANGE_NONE {
+        let kind = if ev.range_kind == REC_RANGE_LINES {
+            "lines"
+        } else if ev.range_kind == REC_RANGE_BUFFER {
+            "buffer"
+        } else if ev.range_kind == REC_RANGE_SELECTION {
+            "selection"
+        } else {
+            "span"
+        }
+        let sep = if comma then "," else ""
+        let given = if ev.range_given then "true" else "false"
+        util.buf_append_str(mut out, "{sep} range_kind: \"{kind}\", range_given: {given}")
+        if ev.range_kind == REC_RANGE_LINES || ev.range_kind == REC_RANGE_SPAN {
+            util.buf_append_str(mut out, ", range_lo: {ev.range_lo}, range_hi: {ev.range_hi}")
+        }
+        comma = true
+    }
+    let s = rec_ev_sarg(rec, ev)
+    if s.len != 0 {
+        util.buf_append_str(mut out, if comma then ", sarg: " else " sarg: ")
+        rec_emit_escaped(mut out, s)
+    }
+    util.buf_append_str(mut out, " });\n")
+}
+
+/// `yew_record_emit` (record.c:564-600): the recording as macro source —
+/// the four header lines, `import ed` unless appending to a non-empty
+/// register, and one immediately-called function of motion segments and
+/// `ed.run` calls.
+pub fn record_emit(reg: CmdReg, rec: Rec) -> List[byte] {
+    var out = List[byte]()
+    util.buf_append_str(mut out, "# yew-macro: 1\n")
+    util.buf_append_str(mut out, "# recorded-with: yew {util.VERSION}\n")
+    util.buf_append_str(mut out, "# keymap: default\n")
+    // Folding makes the emitted motion count differ from the commands
+    // recorded; the raw count is kept for the browser and :macros.
+    util.buf_append_str(mut out, "# events: {rec.ev.len}\n")
+    if rec.import_ed { util.buf_append_str(mut out, "import ed\n") }
+    util.buf_append_str(mut out, "(fn() {\n")
+    var annotate = rec_needs_annotation(reg, rec)
+    var segment = 0
+    var i = 0
+    while i < rec.ev.len {
+        if !rec_special_motion(reg, rec, rec.ev[i]) {
+            rec_emit_run(reg, rec, rec.ev[i], mut out)
+            i += 1
+            continue
+        }
+        let lo = i
+        while i < rec.ev.len && rec_special_motion(reg, rec, rec.ev[i]) { i += 1 }
+        rec_emit_motion_segment(reg, rec, lo, i, mut out, segment, annotate)
+        annotate = false
+        segment += 1
+    }
+    util.buf_append_str(mut out, "})();\n")
+    out
+}
+
+/// `yew_record_stop` (record.c:602-630): the recording emitted and written
+/// to its register as the `ed.reg.set` command (appending for an
+/// upper-case start), and reported.
+pub fn record_stop(mut ed: Ed) -> int {
+    if !ed.rec.active { return CMD_ERR_STATE }
+    if ed.fltxn.depth != 0 {
+        ed_msg(mut ed, MSG_ERROR, "cannot stop recording inside an edit transaction")
+        return CMD_ERR_STATE
+    }
+    ed.rec.active = false
+    ed.rec.in_prompt = false
+    let source = record_emit(ed.reg, ed.rec)
+    let reg = ed.rec.reg
+    let status = flapi_reg_write(mut ed, reg, source, ed.rec.append)
+    let n = ed.rec.ev.len
+    if status == CMD_OK {
+        ed.rec.last_reg = reg
+        let r = rec_char(reg)
+        ed_msg(mut ed, MSG_INFO, "recorded @{r} ({n} events, {source.len} bytes)")
+    }
+    status
+}
+
+// replay_one (record.c:632-655): inside a running Fletch call that is not
+// itself a replay, the macro is its own edit boundary.
+fn rec_replay_one(mut ed: Ed, fun: fl.FlValue) -> bool {
+    if !ed.flrt.ready || ed.flrt.vms.len == 0 { return false }
+    let split = ed.fltxn.entry_active && ed.flrt.command_source != SRC_REPLAY
+    if split {
+        if ed.fltxn.depth != 0 {
+            ed_msg(mut ed, MSG_ERROR, "cannot replay a macro inside an edit transaction")
+            return false
+        }
+        var vm = (mut ed.flrt.vms).pop() else { return false }
+        let began = fl_txn_edit_begin(mut vm, mut ed)
+        vm.raised = false
+        (mut ed.flrt.vms).push(vm)
+        if !began { return false }
+    }
+    var ok = fl_call_chunk(mut ed, fun, SRC_REPLAY)
+    if split {
+        var vm = (mut ed.flrt.vms).pop() else { return false }
+        if !fl_txn_edit_end(mut vm, mut ed, ok) { ok = false }
+        vm.raised = false
+        (mut ed.flrt.vms).push(vm)
+    }
+    ok
+}
+
+/// `yew_record_status` (record.c:657-666).
+pub fn record_status(ed: Ed) -> RecStatus {
+    RecStatus {
+        active: ed.rec.active,
+        reg: ed.rec.reg,
+        nevents: ed.rec.ev.len,
+        last_reg: ed.rec.last_reg,
+    }
+}
+
+/// `yew_macro_replay` (record.c:668-691): register `reg`'s macro, compiled
+/// once per text, run `count` times through the VM with SRC_REPLAY.
+pub fn macro_replay(mut ed: Ed, reg_in: int, count: int) -> int {
+    if !rec_named(reg_in) || count <= 0 { return CMD_ERR_ARG }
+    let reg = rec_lower(reg_in)
+    let value = text.reg_get(mut ed.regs, reg) else text.regval_new()
+    if value.bytes.len == 0 {
+        let r = rec_char(reg)
+        ed_msg(mut ed, MSG_ERROR, "macro @{r} is empty")
+        return CMD_ERR_ARG
+    }
+    let fun = fl_macro_compile_cached(mut ed, reg, value.bytes) else { return CMD_ERR_ARG }
+    for _ in 0..count {
+        if !rec_replay_one(mut ed, fun) { return CMD_ERR_STATE }
+    }
+    ed.rec.last_reg = reg
+    CMD_OK
+}
+
+/// `yew_macro_list` (record.c:693-716): the shape of every non-empty
+/// register a-z, in order.
+pub fn macro_list(mut ed: Ed) -> List[text.RegInfo] {
+    var out = List[text.RegInfo]()
+    for r in 'a' as int..'z' as int + 1 {
+        let value = text.reg_get(mut ed.regs, r) else { continue }
+        if value.bytes.len == 0 { continue }
+        (mut out).push(text.RegInfo {
+            kind: value.kind,
+            ragged: value.ragged,
+            width: value.width,
+            rows: value.rows.len,
+            bytes: value.bytes.len,
+            t_wall: value.t_wall,
+        })
+    }
+    out
+}
+
+/// `yew_macro_event_count` (record.c:718-750): the `# events: N` header,
+/// 0 when absent or malformed.
+pub fn macro_event_count(source: List[byte]) -> int {
+    let prefix = "# events: ".bytes()
+    var at = 0
+    while at < source.len {
+        let line = at
+        while at < source.len && source[at] != 10 as byte { at += 1 }
+        if at - line >= prefix.len && bytes_prefix(source, line, prefix) {
+            var p = line + prefix.len
+            var value = 0
+            var any = false
+            while p < at && source[p] >= '0' as byte && source[p] <= '9' as byte {
+                any = true
+                value = value * 10 + (source[p] as int - '0' as int)
+                if value > 4294967295 { return 0 }
+                p += 1
+            }
+            return if any && p == at then value else 0
+        }
+        if at < source.len { at += 1 }
+    }
+    0
+}
+
+fn bytes_prefix(s: List[byte], at: int, prefix: List[byte]) -> bool {
+    for i in 0..prefix.len { if s[at + i] != prefix[i] { return false } }
+    true
+}
+
+// command_register (record.c:752-759): -1 unless one named register.
+fn rec_command_register(cx: CmdCtx) -> int {
+    let s = rec_cx_sarg(cx)
+    if s.len != 1 || !rec_named(s[0] as int) { return -1 }
+    s[0] as int
+}
+
+/// `ed.macro.record` (`yew_record_cmd_record`, record.c:761-786): stops a
+/// running recording; with no register, captures the next key as one.
+pub fn record_cmd_record(mut ed: Ed, cx: CmdCtx) -> int {
+    let s = rec_cx_sarg(cx)
+    if ed.rec.active && s.len == 0 { return record_stop(mut ed) }
+    if s.len == 0 {
+        let id = cmd_lookup(ed.reg, "ed.macro.record")
+        if id == 0 { util.bug("edit.record", "record command is missing from the registry") }
+        ed.capture_cmd = id
+        ed.capture_count = if cx.count == 0 then 1 else cx.count
+        ed.capture_count_given = cx.count_given
+        ed_msg(mut ed, MSG_INFO, "record register: a-z/A-Z")
+        return CMD_OK
+    }
+    let reg = rec_command_register(cx)
+    if reg < 0 {
+        ed_msg(mut ed, MSG_ERROR, "record requires register a-z/A-Z")
+        return CMD_ERR_ARG
+    }
+    if record_start(mut ed, reg) then CMD_OK else CMD_ERR_STATE
+}
+
+/// `ed.macro.stop` (`yew_record_cmd_stop`, record.c:788-792).
+pub fn record_cmd_stop(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    record_stop(mut ed)
+}
+
+/// `ed.macro.replay` (`yew_record_cmd_replay`, record.c:794-818): one
+/// register's macro, or a library macro by name; the registry's repeat
+/// loop owns the count.
+pub fn record_cmd_replay(mut ed: Ed, cx: CmdCtx) -> int {
+    let s = rec_cx_sarg(cx)
+    if !cx.has_sarg || s.len == 0 { return CMD_ERR_ARG }
+    if s.len != 1 {
+        for b in s { if b == 0 as byte { return CMD_ERR_ARG } }
+        let name = str_from_utf8(s) else { return CMD_ERR_ARG }
+        return macrolib_call(mut ed, name)
+    }
+    let reg = rec_command_register(cx)
+    if reg < 0 { return CMD_ERR_ARG }
+    macro_replay(mut ed, reg, 1)
+}
+
+/// `ed.macro.replay_last` (`yew_record_cmd_replay_last`, record.c:820-828).
+pub fn record_cmd_replay_last(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if ed.rec.last_reg == 0 {
+        ed_msg(mut ed, MSG_ERROR, "no previous macro replay")
+        return CMD_ERR_STATE
+    }
+    let reg = ed.rec.last_reg
+    macro_replay(mut ed, reg, 1)
+}
+
+/// `yew_record_cmd_list` (record.c:830-840): the count of macro registers
+/// (the registry's `ed.macro.list` is the browser's, macrobrowse.c).
+pub fn record_cmd_list(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let n = macro_list(mut ed).len
+    let plural = if n == 1 then "" else "s"
+    ed_msg(mut ed, MSG_INFO, "{n} macro register{plural}")
+    CMD_OK
 }
 
 /// `yew_record_cmd_repeat` (record.c:842-849): `ed.repeat` is unavailable,
