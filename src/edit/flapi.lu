@@ -1,0 +1,503 @@
+//! edit.flapi — attached half of sagitta 9ace98c2 src/fl/flapi.c:
+//! descriptor validation 1778-1803; marshalling 1244-1493; invocation and
+//! status mapping 1211-1229,1496-1539,1804-1884; ed.run 1895-2060.
+//! No buffer, cursor, undo or register writer belongs here. All effects
+//! enter fl_invoke_command and the existing resolved command dispatcher.
+
+use fl
+use text
+use util
+
+fn api_name(vm: fl.FlVm) -> str {
+    let name = fl.fl_std_name(vm)
+    if name == "?" then "editor API" else name
+}
+
+fn api_type(mut vm: fl.FlVm, value: fl.FlValue, want: int, argument: int) -> bool {
+    if value.t == want { return true }
+    let _ = fl.fl_raise(
+        mut vm,
+        "type",
+        "{api_name(vm)}: argument {argument + 1} must be {fl.fl_type_name(want)}, found {fl.fl_type_name(value.t)}",
+    )
+    false
+}
+
+fn api_int(mut vm: fl.FlVm, value: fl.FlValue, argument: int) -> int ! {none} {
+    if !api_type(mut vm, value, fl.FL_INT, argument) { return none }
+    value.i
+}
+
+fn api_bytes(mut vm: fl.FlVm, value: fl.FlValue, argument: int) -> List[byte] ! {none} {
+    if !api_type(mut vm, value, fl.FL_STR, argument) { return none }
+    copy vm.gc.slots[fl.fl_obj_index(vm, value)].bytes
+}
+
+fn api_bool(mut vm: fl.FlVm, value: fl.FlValue, argument: int) -> bool ! {none} {
+    if !api_type(mut vm, value, fl.FL_BOOL, argument) { return none }
+    value.i != 0
+}
+
+fn api_string_arg(mut cx: CmdCtx, bytes: List[byte]) {
+    cx.has_sarg = true
+    cx.has_sbytes = true
+    cx.sbytes = copy bytes
+    cx.sarg = str_from_utf8(bytes) else ""
+}
+
+fn api_has_nul(bytes: List[byte]) -> bool {
+    for b in bytes { if b == 0 as byte { return true } }
+    false
+}
+
+fn api_buffer_window(ed: Ed, bi: int) -> int {
+    if ed.win >= 0 && ed.wins[ed.win].buf == bi { return ed.win }
+    for tab in ed.tabs {
+        let leaves = pane_collect_leaves(ed, tab.root, PANE_MAX_LEAVES)
+        for leaf in leaves {
+            let wi = ed.panes[leaf].win
+            if wi >= 0 && ed.wins[wi].buf == bi { return wi }
+        }
+    }
+    -1
+}
+
+fn api_status(mut vm: fl.FlVm, ed: Ed, status: int, name: str, id: int) -> fl.FlValue {
+    match status {
+        1 => fl.fl_raise(mut vm, "type", "{name} rejected its arguments"),
+        2 => fl.fl_raise(mut vm, "user", "{name} is not valid in the current state"),
+        3 => fl.fl_raise(mut vm, "io", "{name} failed"),
+        4 => {
+            let entry = cmd_entry(ed.reg, id)
+            fl.fl_raise(mut vm, "name", "{entry.name} is deferred: {entry.help}")
+        },
+        _ => fl.fl_raise(mut vm, "user", "{name} failed"),
+    }
+}
+
+fn api_command_caps(name: str) -> int {
+    if name == "ed.buf.open" ||
+        name == "ed.file.open" ||
+        name == "ed.file.new" ||
+        name == "ed.file.reload" ||
+        name == "ed.find.file" ||
+        name == "ed.ws.restore_state" {
+        return fl.FL_CAP_FS_READ
+    }
+    if name == "ed.file.save" ||
+        name == "ed.file.write" ||
+        name == "ed.file.write_quit" ||
+        name == "ed.ws.save_state" ||
+        name == "ed.ws.forget" ||
+        name == "ed.shell.complete_forget" {
+        return fl.FL_CAP_FS_WRITE
+    }
+    if name.starts_with("ed.shell.") || name == "ed.job.rerun" { return fl.FL_CAP_SHELL }
+    0
+}
+
+fn api_command_path(name: str) -> bool {
+    name == "ed.buf.open" ||
+        name == "ed.file.open" ||
+        name == "ed.file.new" ||
+        name == "ed.file.write" ||
+        name == "ed.file.write_quit"
+}
+
+fn api_path_check(mut vm: fl.FlVm, name: str, bytes: List[byte]) -> bool {
+    if api_has_nul(bytes) {
+        let _ = fl.fl_raise(mut vm, "type", "{name} path contains an embedded NUL")
+        return false
+    }
+    let _ = str_from_utf8(bytes) else {
+        // G40: the filesystem surface takes str, never silently replace bytes.
+        let _ = fl.fl_raise(mut vm, "type", "not yet ported: non-UTF-8 filesystem paths (G40)")
+        return false
+    }
+    true
+}
+
+fn api_ed_run(mut vm: fl.FlVm, mut ed: Ed, base: int) -> fl.FlValue {
+    let name_bytes = api_bytes(mut vm, copy vm.stack[base], 0) else { return fl.fl_nil() }
+    let map = copy vm.stack[base + 1]
+    if !api_type(mut vm, map, fl.FL_MAP, 1) { return fl.fl_nil() }
+    let name = str_from_utf8(name_bytes) else ""
+    let id = cmd_lookup(ed.reg, name)
+    if id == 0 {
+        var msg = List[byte]()
+        util.buf_append_str(mut msg, "unknown command ")
+        util.buf_append(mut msg, name_bytes)
+        return fl.fl_raise_bytes(mut vm, "name", msg)
+    }
+    let need = api_command_caps(name)
+    if need != 0 && !fl.fl_cap_check(mut vm, need) { return fl.fl_nil() }
+    var cx = cmdctx_new(ed.win, ed.flrt.command_source)
+    var cursor = 0
+    var range_kind = ""
+    var lo = 0
+    var hi = 0
+    var given = false
+    var has_kind = false
+    var has_lo = false
+    var has_hi = false
+    var has_given = false
+    loop {
+        let (next, key, value) = fl.fl_map_iter(vm, map, cursor) else { break }
+        cursor = next
+        let bytes = api_bytes(mut vm, key, 1) else { return fl.fl_nil() }
+        let k = str_from_utf8(bytes) else ""
+        if k == "count" {
+            let count = api_int(mut vm, value, 1) else { return fl.fl_nil() }
+            if count < 1 || count > 99999 {
+                return fl.fl_raise(mut vm, "type", "ed.run count must be 1..99999")
+            }
+            cx.count = count
+            cx.count_given = true
+        } else if k == "iarg" {
+            cx.iarg = api_int(mut vm, value, 1) else { return fl.fl_nil() }
+        } else if k == "sarg" {
+            let s = api_bytes(mut vm, value, 1) else { return fl.fl_nil() }
+            if api_command_path(name) && !api_path_check(mut vm, name, s) { return fl.fl_nil() }
+            api_string_arg(mut cx, s)
+        } else if k == "bang" {
+            cx.bang = api_bool(mut vm, value, 1) else { return fl.fl_nil() }
+        } else if k == "win" {
+            cx.win = fl_h_win(mut vm, ed, value) else { return fl.fl_nil() }
+        } else if k == "range_kind" {
+            let s = api_bytes(mut vm, value, 1) else { return fl.fl_nil() }
+            range_kind = str_from_utf8(s) else ""
+            has_kind = true
+        } else if k == "range_lo" {
+            lo = api_int(mut vm, value, 1) else { return fl.fl_nil() }
+            has_lo = true
+        } else if k == "range_hi" {
+            hi = api_int(mut vm, value, 1) else { return fl.fl_nil() }
+            has_hi = true
+        } else if k == "range_given" {
+            given = api_bool(mut vm, value, 1) else { return fl.fl_nil() }
+            has_given = true
+        } else {
+            var msg = List[byte]()
+            util.buf_append_str(mut msg, "ed.run: unknown key ")
+            util.buf_append(mut msg, bytes)
+            return fl.fl_raise_bytes(mut vm, "key", msg)
+        }
+    }
+    if has_kind || has_lo || has_hi || has_given {
+        if !has_kind || !has_given {
+            return fl.fl_raise(mut vm, "type", "ed.run range needs range_kind and range_given")
+        }
+        let endpoints = range_kind == "lines" || range_kind == "span"
+        if endpoints != (has_lo && has_hi) || lo < 0 || hi < lo {
+            return fl.fl_raise(mut vm, "range", "ed.run range is invalid")
+        }
+        cx.range.given = given
+        if range_kind == "lines" {
+            cx.range.kind = RANGE_LINES
+            cx.range.lo = lo
+            cx.range.hi = hi
+        } else if range_kind == "buffer" {
+            cx.range.kind = RANGE_BUFFER
+        } else if range_kind == "selection" {
+            cx.range.kind = RANGE_SELECTION
+        } else if range_kind == "span" {
+            if !given { return fl.fl_raise(mut vm, "range", "ed.run span range must be given") }
+            cx.range.tok_lo = lo
+            cx.range.tok_hi = hi
+        } else {
+            return fl.fl_raise(mut vm, "range", "ed.run range kind is invalid")
+        }
+    }
+    let status = fl_invoke_command(mut vm, mut ed, id, mut cx) else { return fl.fl_nil() }
+    if status != CMD_OK { return api_status(mut vm, ed, status, "ed.run", id) }
+    fl.fl_nil()
+}
+
+fn api_marshal(mut vm: fl.FlVm, mut ed: Ed, d: fl.FlBindDesc, base: int, argc: int) -> CmdCtx ! {
+    none,
+} {
+    var cx = cmdctx_new(ed.win, ed.flrt.command_source)
+    if d.kind == 12000 || d.kind == 12001 {
+        let _ = fl.fl_raise(
+            mut vm,
+            "name",
+            "not yet ported: sagitta Sprint 36 typed option provider (yw09)",
+        )
+        return none
+    }
+    if d.recv == fl.FL_H_BUF {
+        let bi = fl_h_buf(mut vm, ed, copy vm.stack[base])?
+        cx.win = api_buffer_window(ed, bi)
+        if cx.win < 0 { let _ = fl.fl_raise(mut vm, "user", "buffer has no window"); return none }
+    } else if d.recv == fl.FL_H_WIN {
+        cx.win = fl_h_win(mut vm, ed, copy vm.stack[base])?
+    } else if d.recv == fl.FL_H_CUR {
+        let (wi, ci) = fl_h_cur(mut vm, mut ed, copy vm.stack[base])?
+        cx.win = wi
+        cx.cursor_index = ci
+        cx.cursor_given = true
+    } else if d.recv == fl.FL_H_SPAN {
+        let (bi, lo, hi) = fl_h_span(mut vm, ed, copy vm.stack[base])?
+        cx.win = api_buffer_window(ed, bi)
+        if cx.win < 0 {
+            let _ = fl.fl_raise(mut vm, "user", "span buffer has no window")
+            return none
+        }
+        cx.range.given = true
+        cx.range.tok_lo = lo
+        cx.range.tok_hi = hi
+    }
+    if d.kind == 10006 {
+        let unit = api_bytes(mut vm, copy vm.stack[base + 1], 1)?
+        let dir = api_bytes(mut vm, copy vm.stack[base + 2], 2)?
+        var bytes = copy unit
+        (mut bytes).push(58 as byte)
+        util.buf_append(mut bytes, dir)
+        api_string_arg(mut cx, bytes)
+        if argc == 4 {
+            let n = api_int(mut vm, copy vm.stack[base + 3], 3)?
+            if n < 1 || n > 99999 {
+                let _ = fl.fl_raise(mut vm, "type", "cur.move count must be 1..99999")
+                return none
+            }
+            cx.count = n
+            cx.count_given = true
+        }
+        return cx
+    }
+    if d.kind == 9009 {
+        let list = copy vm.stack[base + 1]
+        if !api_type(mut vm, list, fl.FL_LIST, 1) { return none }
+        let n = fl.fl_list_len(vm, list)
+        if n == 0 || n > text.MC_MAX {
+            let _ = fl.fl_raise(mut vm, "range", "win.set_cursors needs 1..{text.MC_MAX} cursors")
+            return none
+        }
+        for i in 0..n {
+            let value = fl.fl_list_get(vm, list, i) else fl.fl_nil()
+            let (wi, ci) = fl_h_cur(mut vm, mut ed, value)?
+            if ed.wins[wi].buf != ed.wins[cx.win].buf {
+                let _ = fl.fl_raise(mut vm, "range", "cursor belongs to another buffer")
+                return none
+            }
+            let c = copy ed.wins[wi].cs.curs[ci]
+            (mut cx.cursor_args).push(CmdCursorArg {
+                pos: c.pos,
+                anchor: c.anchor,
+                goal_col: c.goal_col,
+            })
+        }
+        return cx
+    }
+    if d.kind == 11006 {
+        let list = copy vm.stack[base + 1]
+        if !api_type(mut vm, list, fl.FL_LIST, 1) { return none }
+        let bi = ed.wins[cx.win].buf
+        let eol = text.filemeta_eol_bytes(ed.bufs[bi].ec.meta)
+        var bytes = List[byte]()
+        for i in 0..fl.fl_list_len(vm, list) {
+            let value = fl.fl_list_get(vm, list, i) else fl.fl_nil()
+            let line = api_bytes(mut vm, value, 1)?
+            for b in line {
+                if b == 10 as byte || b == 13 as byte {
+                    let _ = fl.fl_raise(
+                        mut vm,
+                        "type",
+                        "span.replace_lines entries cannot contain EOL bytes",
+                    )
+                    return none
+                }
+            }
+            if i != 0 { util.buf_append(mut bytes, eol) }
+            util.buf_append(mut bytes, line)
+            if bytes.len > 4294967295 {
+                let _ = fl.fl_raise(mut vm, "limit", "span.replace_lines result is too large")
+                return none
+            }
+        }
+        api_string_arg(mut cx, bytes)
+        return cx
+    }
+    let first = if d.recv == fl.FL_H_NONE then 0 else 1
+    for i in first..argc {
+        let slot = if i - first == 0 then d.arg0 else if i - first == 1 then d.arg1 else d.arg2
+        let value = copy vm.stack[base + i]
+        match slot {
+            1 => { cx.bang = api_bool(mut vm, value, i)? },
+            2 => { cx.iarg = api_int(mut vm, value, i)? },
+            3 => { let bytes = api_bytes(mut vm, value, i)?; api_string_arg(mut cx, bytes) },
+            4 => {
+                let count = api_int(mut vm, value, i) else 0
+                if vm.raised || count < 1 || count > 99999 {
+                    let _ = fl.fl_raise(mut vm, "type", "count must be 1..99999")
+                    return none
+                }
+                cx.count = count
+                cx.count_given = true
+            },
+            5 => { cx.win = fl_h_win(mut vm, ed, value)? },
+            6 => {
+                let bi = fl_h_buf(mut vm, ed, value)?
+                cx.win = api_buffer_window(ed, bi)
+                if cx.win < 0 {
+                    let _ = fl.fl_raise(mut vm, "user", "buffer has no window")
+                    return none
+                }
+            },
+            7 => {
+                let (wi, ci) = fl_h_cur(mut vm, mut ed, value)?
+                cx.win = wi
+                cx.cursor_index = ci
+                cx.cursor_given = true
+            },
+            8 => {
+                let (_, lo, hi) = fl_h_span(mut vm, ed, value)?
+                cx.range.given = true
+                cx.range.tok_lo = lo
+                cx.range.tok_hi = hi
+            },
+            9 => { if !api_type(mut vm, value, fl.FL_LIST, i) { return none } },
+            10 => { if !api_type(mut vm, value, fl.FL_MAP, i) { return none } },
+            11 => {
+                if value.t == fl.FL_STR {
+                    let bytes = api_bytes(mut vm, value, i)?
+                    api_string_arg(mut cx, bytes)
+                } else if value.t == fl.FL_MAP {
+                    let key = fl.fl_str_text(mut vm, "force")
+                    let force = fl.fl_map_get(vm, value, key) else fl.fl_nil()
+                    if force.t != fl.FL_BOOL {
+                        let _ = fl.fl_raise(
+                            mut vm,
+                            "type",
+                            "buf.save options require boolean force",
+                        )
+                        return none
+                    }
+                    cx.bang = force.i != 0
+                } else {
+                    let _ = fl.fl_raise(
+                        mut vm,
+                        "type",
+                        "buf.save argument 2 must be path string or options map",
+                    )
+                    return none
+                }
+            },
+            _ => { assert(false, "Fletch descriptor lacks argument mapping") },
+        }
+    }
+    if d.kind == 8015 {
+        let bi = fl_h_buf(mut vm, ed, copy vm.stack[base])?
+        let (other, _, _) = fl_h_span(mut vm, ed, copy vm.stack[base + 1])?
+        if bi != other {
+            let _ = fl.fl_raise(mut vm, "range", "span belongs to another buffer")
+            return none
+        }
+    }
+    if d.kind == 11007 {
+        cx.iarg = cx.range.tok_lo
+    } else if d.kind == 11008 {
+        cx.iarg = cx.range.tok_hi
+    }
+    if (d.kind == 8002 || d.kind == 8004) &&
+        cx.has_sarg &&
+        !api_path_check(mut vm, d.fl_name, cx.sbytes) {
+        return none
+    }
+    cx
+}
+
+/// Attached native dispatch. Unported owning surfaces still fail by sprint;
+/// they are replaced by their implementation before yw09's closeout.
+pub fn fl_attached_api(mut vm: fl.FlVm, mut ed: Ed, kind: int, base: int, argc: int) -> fl.FlValue {
+    if kind == 13000 { return api_ed_run(mut vm, mut ed, base) }
+    if kind == 13001 {
+        let rows = fl_command_rows(ed.reg)
+        fl.fl_vm_set_commands(mut vm, rows)
+        return fl.fl_std_api_dispatch(mut vm, kind, base, argc)
+    }
+    if kind < 1000 || kind == 14000 {
+        let sprint = if kind == 2 || kind == 3 {
+            35
+        } else if kind == 1 {
+            34
+        } else if kind == 14000 {
+            48
+        } else {
+            36
+        }
+        return fl.fl_raise(
+            mut vm,
+            "name",
+            "not yet ported: sagitta Sprint {sprint} editor native {fl.fl_std_name(vm)} (yw09)",
+        )
+    }
+    let d = fl.fl_api_desc(kind) else {
+        return fl.fl_raise(mut vm, "name", "unknown editor binding {fl.fl_std_name(vm)}")
+    }
+    if argc < d.nmin || argc > d.nmax {
+        return fl.fl_raise(mut vm, "arity", "{d.fl_name} got {argc} arguments")
+    }
+    if d.recv != fl.FL_H_NONE && (argc == 0 || fl.fl_h_kind_of(vm.stack[base]) != d.recv) {
+        let word = if d.recv == fl.FL_H_BUF {
+            "buffer"
+        } else if d.recv == fl.FL_H_WIN {
+            "window"
+        } else if d.recv == fl.FL_H_CUR {
+            "cursor"
+        } else {
+            "span"
+        }
+        return fl.fl_raise(mut vm, "type", "{d.fl_name} requires a {word} receiver")
+    }
+    if d.cmd.len == 0 {
+        if kind == 13002 {
+            let msg = api_bytes(mut vm, copy vm.stack[base], 0) else { return fl.fl_nil() }
+            var level = "info"
+            if argc == 2 {
+                let b = api_bytes(mut vm, copy vm.stack[base + 1], 1) else { return fl.fl_nil() }
+                level = str_from_utf8(b) else ""
+            }
+            if api_has_nul(msg) {
+                return fl.fl_raise(mut vm, "type", "ed.msg: message contains a NUL byte")
+            }
+            if level != "info" && level != "warn" && level != "error" {
+                return fl.fl_raise(mut vm, "type", "ed.msg: level must be info, warn, or error")
+            }
+            ed_msg_bytes(
+                mut ed,
+                if level == "info" {
+                    MSG_INFO
+                } else if level == "warn" {
+                    MSG_WARN
+                } else {
+                    MSG_ERROR
+                },
+                msg,
+            )
+            return fl.fl_nil()
+        }
+        return fl_api_query(mut vm, mut ed, kind, base, argc) else fl.fl_raise(
+            mut vm,
+            "name",
+            "not yet ported: sagitta Sprint 34 query {d.fl_name} (yw09)",
+        )
+    }
+    if d.caps != 0 && !fl.fl_cap_check(mut vm, d.caps) { return fl.fl_nil() }
+    let id = cmd_lookup(ed.reg, d.cmd)
+    assert(id != 0, "Fletch binding names unknown command")
+    var cx = api_marshal(mut vm, mut ed, d, base, argc) else { return fl.fl_nil() }
+    let status = fl_invoke_command(mut vm, mut ed, id, mut cx) else { return fl.fl_nil() }
+    if status != CMD_OK { return api_status(mut vm, ed, status, d.fl_name, id) }
+    if kind == 8002 {
+        let bi = ed_doc(ed)
+        if bi < 0 { return fl.fl_raise(mut vm, "io", "buf.open did not produce a buffer") }
+        return fl_h_buf_make(mut ed, bi)
+    }
+    if kind == 9005 {
+        let wi = ed.win
+        if wi < 0 { return fl.fl_raise(mut vm, "handle", "win.split produced no window") }
+        return fl_h_win_make(mut ed, wi)
+    }
+    fl.fl_nil()
+}
