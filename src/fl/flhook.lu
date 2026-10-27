@@ -1,0 +1,393 @@
+//! fl.flhook — deterministic, contained Fletch hook dispatch: sagitta
+//! 9ace98c2 src/fl/flhook.c:1-329 and flhook.h:1-132 (Sprint 34 §6-§7).
+//!
+//! The table is the VM's (`vm.hooks`): C keeps `ed->hooks` beside the
+//! runtime's VM and registers the root-11 provider over it
+//! (flruntime.c:221-222); the port's collector compacts, so the rows'
+//! callbacks and the in-flight arguments must be values the VM remaps,
+//! and the hook provider (kind FL_GC_PROVIDER_HOOKS) does that once it is
+//! registered, as C's provider marks. FlHookOps' three callbacks
+//! (flhook.h:79-92) are the host's methods (FlHost.hook_call, hook_masked,
+//! hook_notice): one statically selected host, never a function value
+//! (R-yw09-4, R-yw09-2 A, G48). C's NULL call is fl_hook_default_call.
+
+use util
+
+/// `FlEvent` (flhook.h:13-30), in fl_event_name's frozen order.
+pub const FL_EV_BUF_OPEN: int = 0
+
+/// `buf.change`.
+pub const FL_EV_BUF_CHANGE: int = 1
+
+/// `buf.save`.
+pub const FL_EV_BUF_SAVE: int = 2
+
+/// `buf.saved`.
+pub const FL_EV_BUF_SAVED: int = 3
+
+/// `buf.close`.
+pub const FL_EV_BUF_CLOSE: int = 4
+
+/// `mode.enter`.
+pub const FL_EV_MODE_ENTER: int = 5
+
+/// `mode.leave`.
+pub const FL_EV_MODE_LEAVE: int = 6
+
+/// `win.focus`.
+pub const FL_EV_WIN_FOCUS: int = 7
+
+/// `cursor.move`.
+pub const FL_EV_CURSOR_MOVE: int = 8
+
+/// `ws.open`.
+pub const FL_EV_WS_OPEN: int = 9
+
+/// `ws.close`.
+pub const FL_EV_WS_CLOSE: int = 10
+
+/// `plug.enable`.
+pub const FL_EV_PLUG_ENABLE: int = 11
+
+/// `plug.disable`.
+pub const FL_EV_PLUG_DISABLE: int = 12
+
+/// `ed.idle`.
+pub const FL_EV_ED_IDLE: int = 13
+
+/// `FL_EV__N`: the inventory's size.
+pub const FL_EV_N: int = 14
+
+/// `YEW_HOOK_DEPTH_MAX` (flhook.h:32-35): cross-event nesting bound.
+pub const FL_HOOK_DEPTH_MAX: int = 8
+
+/// `YEW_HOOK_ERROR_LIMIT_DEFAULT`: failures before a hook is disabled.
+pub const FL_HOOK_ERROR_LIMIT_DEFAULT: int = 5
+
+/// `RegKind` (flhook.h:37-47): one origin-tagged ledger ABI.
+pub const REG_HOOK: int = 0
+
+/// A key binding (Sprint 36).
+pub const REG_BIND: int = 1
+
+/// An option layer (Sprint 36).
+pub const REG_OPTION: int = 2
+
+/// A command (Sprint 36).
+pub const REG_CMD: int = 3
+
+/// An attribute.
+pub const REG_ATTR: int = 4
+
+/// An overlay.
+pub const REG_OVERLAY: int = 5
+
+/// A timer.
+pub const REG_TIMER: int = 6
+
+/// `FlHookNotice` (flhook.h:72-77): a failure.
+pub const FL_HOOK_NOTICE_ERROR: int = 0
+
+/// The hook reached the error limit.
+pub const FL_HOOK_NOTICE_DISABLED: int = 1
+
+/// A same-event fire was dropped.
+pub const FL_HOOK_NOTICE_REENTRANT: int = 2
+
+/// The cross-event depth bound was hit.
+pub const FL_HOOK_NOTICE_DEPTH: int = 3
+
+/// `FlRegistration` (flhook.h:49-54).
+pub struct FlRegistration { origin_id: int, kind: int, handle: int, active: bool }
+
+/// `FlRegLedger` (flhook.h:56-60): `rows.len` is C's `n`.
+pub struct FlRegLedger { rows: List[FlRegistration] }
+
+/// `FlHook` (flhook.h:62-70): `f` is C's `fn`.
+pub struct FlHook {
+    event: int,
+    origin: int,
+    f: FlValue,
+    errs: int,
+    disabled: bool,
+    ledger_id: int,
+    active: bool,
+}
+
+/// `FlHookTable` (flhook.h:94-106) less its ops and ctx (the host's):
+/// `rows.len` is C's `n`. `args` holds each in-flight fire's arguments so
+/// the hook provider roots them across callbacks (C passes a caller array
+/// its non-moving collector never moves).
+pub struct FlHookTable {
+    rows: List[FlHook],
+    ledger: FlRegLedger,
+    in_flight: List[int],
+    warned_reentrant: List[bool],
+    depth: int,
+    active_ledger: List[int],
+    error_limit: int,
+    args: List[FlValue],
+}
+
+fn event_names() -> List[str] {
+    [
+        "buf.open",
+        "buf.change",
+        "buf.save",
+        "buf.saved",
+        "buf.close",
+        "mode.enter",
+        "mode.leave",
+        "win.focus",
+        "cursor.move",
+        "ws.open",
+        "ws.close",
+        "plug.enable",
+        "plug.disable",
+        "ed.idle",
+    ]
+}
+
+/// `fl_event_name` (flhook.c:18-21): none past the inventory.
+pub fn fl_event_name(event: int) -> str ! {none} {
+    if event < 0 || event >= FL_EV_N { return none }
+    let names = event_names()
+    copy names[event]
+}
+
+/// `fl_event_parse` (flhook.c:23-39): the event a name's bytes spell.
+pub fn fl_event_parse(name: List[byte]) -> int ! {none} {
+    let names = event_names()
+    for i in 0..FL_EV_N {
+        let n = names[i].bytes()
+        if n.len != name.len { continue }
+        var same = true
+        for j in 0..n.len { if n[j] != name[j] { same = false; break } }
+        if same { return i }
+    }
+    none
+}
+
+/// `fl_hook_table_init` (flhook.c:41-50): empty, the default error limit.
+pub fn fl_hook_table_new() -> FlHookTable {
+    var in_flight = List[int]()
+    var warned = List[bool]()
+    for _ in 0..FL_EV_N { (mut in_flight).push(0); (mut warned).push(false) }
+    var active = List[int]()
+    for _ in 0..FL_HOOK_DEPTH_MAX { (mut active).push(0) }
+    FlHookTable {
+        rows: List[FlHook](),
+        ledger: FlRegLedger { rows: List[FlRegistration]() },
+        in_flight: in_flight,
+        warned_reentrant: warned,
+        depth: 0,
+        active_ledger: active,
+        error_limit: FL_HOOK_ERROR_LIMIT_DEFAULT,
+        args: List[FlValue](),
+    }
+}
+
+/// `fl_hook_table_free` (flhook.c:52-59): every row and registration gone.
+/// The lists keep their storage (G33): the table is reset, not replaced.
+pub fn fl_hook_table_reset(mut t: FlHookTable) {
+    (mut t.rows).reset()
+    (mut t.ledger.rows).reset()
+    for i in 0..FL_EV_N { t.in_flight[i] = 0; t.warned_reentrant[i] = false }
+    for i in 0..FL_HOOK_DEPTH_MAX { t.active_ledger[i] = 0 }
+    t.depth = 0
+    t.error_limit = FL_HOOK_ERROR_LIMIT_DEFAULT
+    (mut t.args).reset()
+}
+
+/// `fl_hook_error_limit` (flhook.c:61-66): zero means one.
+pub fn fl_hook_error_limit(mut t: FlHookTable, limit: int) {
+    t.error_limit = if limit == 0 then 1 else limit
+}
+
+/// `fl_reg_add` (flhook.c:68-99): the first tombstone is reused, else a row
+/// is appended; the stable id is the index plus one (zero is "none").
+pub fn fl_reg_add(mut l: FlRegLedger, origin_id: int, kind: int, handle: int) -> int {
+    for i in 0..l.rows.len {
+        if !l.rows[i].active {
+            l.rows[i] = FlRegistration { origin_id: origin_id, kind: kind, handle: handle, active: true }
+            return i + 1
+        }
+    }
+    (mut l.rows).push(FlRegistration { origin_id: origin_id, kind: kind, handle: handle, active: true })
+    l.rows.len
+}
+
+/// `fl_reg_remove` (flhook.c:101-116): interior tombstones keep later ids
+/// stable (YEW-F-021); the inactive suffix is released.
+pub fn fl_reg_remove(mut l: FlRegLedger, ledger_id: int) -> bool {
+    if ledger_id <= 0 || ledger_id > l.rows.len { return false }
+    if !l.rows[ledger_id - 1].active { return false }
+    l.rows[ledger_id - 1] = FlRegistration { origin_id: 0, kind: 0, handle: 0, active: false }
+    while l.rows.len != 0 && !l.rows[l.rows.len - 1].active {
+        let _ = (mut l.rows).pop() else FlRegistration { origin_id: 0, kind: 0, handle: 0, active: false }
+    }
+    true
+}
+
+fn hook_none() -> FlHook {
+    FlHook { event: 0, origin: 0, f: fl_nil(), errs: 0, disabled: false, ledger_id: 0, active: false }
+}
+
+/// `fl_hook_add` (flhook.c:118-151): a stable, nonzero ledger id. The slot
+/// is the first tombstone below `n` (hook slots are never compacted during
+/// dispatch, so a handle stays valid).
+pub fn fl_hook_add(mut t: FlHookTable, origin: int, event: int, f: FlValue) -> int {
+    if event < 0 || event >= FL_EV_N { util.bug("fl.flhook", "fletch hooks: invalid add") }
+    if f.t != FL_CLOSURE && f.t != FL_NATIVE {
+        util.bug("fl.flhook", "fletch hooks: callback is not callable")
+    }
+    var slot = 0
+    while slot < t.rows.len && t.rows[slot].active { slot += 1 }
+    let ledger_id = fl_reg_add(mut t.ledger, origin, REG_HOOK, slot + 1)
+    let h = FlHook {
+        event: event,
+        origin: origin,
+        f: copy f,
+        errs: 0,
+        disabled: false,
+        ledger_id: ledger_id,
+        active: true,
+    }
+    if slot == t.rows.len { (mut t.rows).push(h) } else { t.rows[slot] = h }
+    ledger_id
+}
+
+// hook_by_ledger (flhook.c:153-168): the row's index, or -1.
+fn hook_by_ledger(t: FlHookTable, ledger_id: int) -> int {
+    if ledger_id <= 0 || ledger_id > t.ledger.rows.len { return -1 }
+    let r = copy t.ledger.rows[ledger_id - 1]
+    if !r.active || r.kind != REG_HOOK || r.handle == 0 { return -1 }
+    let i = r.handle - 1
+    if i >= t.rows.len || !t.rows[i].active || t.rows[i].ledger_id != ledger_id { return -1 }
+    i
+}
+
+/// `fl_hook_index` : the row a live ledger id names, or -1 (a test reads
+/// C's `t->v[t->ledger.v[id - 1].handle - 1]` through it).
+pub fn fl_hook_index(t: FlHookTable, ledger_id: int) -> int { hook_by_ledger(t, ledger_id) }
+
+/// `fl_hook_origin` (flhook.c:170-185): FL_ORIGIN_ID_NONE when not live.
+pub fn fl_hook_origin(t: FlHookTable, ledger_id: int) -> int {
+    let i = hook_by_ledger(t, ledger_id)
+    if i < 0 then FL_ORIGIN_ID_NONE else t.rows[i].origin
+}
+
+/// `fl_hook_listens` (flhook.c:187-201): an active, enabled, unmasked row
+/// would consume `event`.
+pub fn fl_hook_listens[H: FlHost](t: FlHookTable, host: H, event: int) -> bool {
+    if event < 0 || event >= FL_EV_N { return false }
+    for h in t.rows {
+        if h.active && !h.disabled && h.event == event && !host.hook_masked(h.origin) { return true }
+    }
+    false
+}
+
+/// `fl_hook_remove` (flhook.c:203-217): the row and its registration go;
+/// the inactive suffix is released.
+pub fn fl_hook_remove(mut t: FlHookTable, ledger_id: int) -> bool {
+    let i = hook_by_ledger(t, ledger_id)
+    if i < 0 { return false }
+    t.rows[i] = hook_none()
+    let _ = fl_reg_remove(mut t.ledger, ledger_id)
+    while t.rows.len != 0 && !t.rows[t.rows.len - 1].active {
+        let _ = (mut t.rows).pop() else hook_none()
+    }
+    true
+}
+
+// fault (flhook.c:226-236): count, notice, disable at the limit. The error
+// value is rooted across the host's notice (which may render a trace).
+fn hook_fault[H: FlHost](mut vm: FlVm, mut host: H, i: int, why: int, err: FlValue) {
+    let id = vm.hooks.rows[i].ledger_id
+    let event = vm.hooks.rows[i].event
+    vm.hooks.rows[i].errs += 1
+    let errs = vm.hooks.rows[i].errs
+    let root = fl_temp_push(mut vm, err)
+    (mut host).hook_notice(mut vm, why, event, id, errs, fl_temp_get(vm, root))
+    let again = hook_by_ledger(vm.hooks, id)
+    if again >= 0 && errs >= vm.hooks.error_limit {
+        vm.hooks.rows[again].disabled = true
+        (mut host).hook_notice(mut vm, FL_HOOK_NOTICE_DISABLED, event, id, errs, fl_temp_get(vm, root))
+    }
+    fl_temp_pop(mut vm, 1)
+}
+
+/// C's `default_call` (flhook.c:238-251), the NULL `call` op: fl_call
+/// through the same host. A failure answers the VM's error and leaves the
+/// VM unraised: C's fl_call reports failure by its result, and the error
+/// is contained here.
+pub fn fl_hook_default_call[H: FlHost](mut vm: FlVm, mut host: H, f: FlValue, args: List[FlValue]) -> (
+    bool,
+    FlValue,
+) {
+    let _ = fl_vm_call_host(mut vm, mut host, f, args)
+    if !vm.raised { return (true, fl_nil()) }
+    vm.raised = false
+    (false, copy vm.err)
+}
+
+// fire_pass (flhook.c:258-285): one ordering pass over the snapshot. The
+// callback may append (reallocating the table) or remove this hook, so
+// the row is found again by its ledger id after it.
+fn hook_fire_pass[H: FlHost](
+    mut vm: FlVm,
+    mut host: H,
+    event: int,
+    args_at: int,
+    nargs: int,
+    config: bool,
+    snapshot: int,
+) {
+    for i in 0..snapshot {
+        if i >= vm.hooks.rows.len { break }
+        let h = copy vm.hooks.rows[i]
+        if !h.active || h.disabled || h.event != event || (h.origin == 0) != config ||
+            host.hook_masked(h.origin) {
+            continue
+        }
+        let id = h.ledger_id
+        let depth = vm.hooks.depth
+        vm.hooks.active_ledger[depth - 1] = id
+        var args = List[FlValue]()
+        for k in 0..nargs { (mut args).push(copy vm.hooks.args[args_at + k]) }
+        let (ok, err) = (mut host).hook_call(mut vm, copy vm.hooks.rows[i].f, args)
+        let again = hook_by_ledger(vm.hooks, id)
+        if !ok && again >= 0 { hook_fault(mut vm, mut host, again, FL_HOOK_NOTICE_ERROR, err) }
+        vm.hooks.active_ledger[depth - 1] = 0
+    }
+}
+
+/// `fl_hook_fire` (flhook.c:287-316): a nested same-event fire is dropped
+/// (and noticed once); cross-event recursion is bounded at depth 8, the
+/// fault charged to the calling hook. Config rows (origin 0) run first:
+/// privileged only in ordering, never by a second table.
+pub fn fl_hook_fire[H: FlHost](mut vm: FlVm, mut host: H, event: int, args: List[FlValue]) {
+    if event < 0 || event >= FL_EV_N { return }
+    if vm.hooks.in_flight[event] != 0 {
+        if !vm.hooks.warned_reentrant[event] {
+            vm.hooks.warned_reentrant[event] = true
+            (mut host).hook_notice(mut vm, FL_HOOK_NOTICE_REENTRANT, event, 0, 0, fl_nil())
+        }
+        return
+    }
+    if vm.hooks.depth >= FL_HOOK_DEPTH_MAX {
+        let caller = hook_by_ledger(vm.hooks, vm.hooks.active_ledger[vm.hooks.depth - 1])
+        if caller >= 0 { hook_fault(mut vm, mut host, caller, FL_HOOK_NOTICE_DEPTH, fl_nil()) }
+        return
+    }
+    vm.hooks.depth += 1
+    vm.hooks.in_flight[event] += 1
+    let snapshot = vm.hooks.rows.len
+    let args_at = vm.hooks.args.len
+    for a in args { (mut vm.hooks.args).push(copy a) }
+    hook_fire_pass(mut vm, mut host, event, args_at, args.len, true, snapshot)
+    hook_fire_pass(mut vm, mut host, event, args_at, args.len, false, snapshot)
+    while vm.hooks.args.len > args_at { let _ = (mut vm.hooks.args).pop() else fl_nil() }
+    vm.hooks.in_flight[event] -= 1
+    vm.hooks.depth -= 1
+}
