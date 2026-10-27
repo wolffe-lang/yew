@@ -356,7 +356,14 @@ fn fl_cmp(mut vm: FlVm, a: FlValue, b: FlValue, op: int) -> FlValue {
     fl_raise(mut vm, "type", "cannot compare {fl_type_name(a.t)} and {fl_type_name(b.t)}")
 }
 
-fn fl_native_invoke(mut vm: FlVm, callee: FlValue, base: int, argc: int, direct: bool) -> FlValue {
+fn fl_native_invoke[H: FlHost](
+    mut vm: FlVm,
+    mut host: H,
+    callee: FlValue,
+    base: int,
+    argc: int,
+    direct: bool,
+) -> FlValue {
     let at = fl_obj_index(vm, callee)
     let min_ar = vm.gc.slots[at].min_ar
     let max_ar = vm.gc.slots[at].max_ar
@@ -386,7 +393,7 @@ fn fl_native_invoke(mut vm: FlVm, callee: FlValue, base: int, argc: int, direct:
         vm.stack[call_base] = copy vm.gc.slots[at].recv
         call_n += 1
     }
-    fl_native_dispatch(mut vm, kind, call_base, call_n)
+    fl_native_dispatch_host(mut vm, mut host, kind, call_base, call_n)
 }
 
 fn fl_frame_push(
@@ -489,7 +496,7 @@ fn fl_iter_next(mut vm: FlVm, fi: int, base: int, dist: int, two: bool) {
     }
 }
 
-fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
+fn fl_vm_exec[H: FlHost](mut vm: FlVm, mut host: H, base: int) -> FlValue {
     // Physical coordinates stay valid until collection, even when the slot
     // vector grows. Refresh on frame changes OR a collection in a reentrant
     // native; retaining only the frame index misses the latter case.
@@ -679,7 +686,14 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                     let callee = copy vm.stack[vm.sp - n - 1]
                     let callbase = vm.sp - n - 1
                     if callee.t == 9 {
-                        let result = fl_native_invoke(mut vm, callee, callbase + 1, n, false)
+                        let result = fl_native_invoke(
+                            mut vm,
+                            mut host,
+                            callee,
+                            callbase + 1,
+                            n,
+                            false,
+                        )
                         if !vm.raised { vm.sp = callbase; fl_push(mut vm, result) }
                     } else {
                         let _ = fl_frame_push(mut vm, callee, n, callbase, pc, 0)
@@ -689,13 +703,21 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                     if vm.frames.len == 0 {
                         fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: frame underflow on RETURN")
                     }
-                    let result = if op == 37 then fl_pop(mut vm) else fl_nil()
-                    vm.edit_depth = vm.frames[fi].edit_depth
-                    fl_close_upvals(mut vm, framebase)
-                    let _ = fl_return_frame(mut vm)
-                    if vm.frames.len == base { return result }
-                    vm.sp = framebase
-                    fl_push(mut vm, result)
+                    // Keep the return value rooted on the stack while a host
+                    // transaction callback may re-enter or collect (R3).
+                    let target = vm.frames[fi].edit_depth
+                    while vm.edit_depth > target {
+                        if !(mut host).edit_end(mut vm, true) { break }
+                        vm.edit_depth -= 1
+                    }
+                    if !vm.raised {
+                        let result = if op == 37 then fl_pop(mut vm) else fl_nil()
+                        fl_close_upvals(mut vm, framebase)
+                        let _ = fl_return_frame(mut vm)
+                        if vm.frames.len == base { return result }
+                        vm.sp = framebase
+                        fl_push(mut vm, result)
+                    }
                 },
                 39 => { // CLOSURE
                     let k = fl_read16(mut vm, fi, fnidx)
@@ -860,28 +882,31 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
                     let d = fl_read16(mut vm, fi, fnidx)
                     fl_iter_next(mut vm, fi, framebase + slot, d, op == 48)
                 },
-                49 => { // MOTION (null host)
-                    let _ = fl_read16(mut vm, fi, fnidx)
-                    let _ = fl_raise(mut vm, "motion", "no editor host")
+                49 => { // MOTION (vm.c:1397-1405)
+                    let k = fl_read16(mut vm, fi, fnidx)
+                    let program = copy vm.gc.slots[fnidx].vals[k]
+                    if (mut host).motion(mut vm, program) { fl_push(mut vm, fl_nil()) }
                 },
                 50 => { // IMPORT
                     let k = fl_read16(mut vm, fi, fnidx)
                     let path = fl_read8(mut vm, fi, fnidx)
                     let id = vm.gc.slots[fnidx].vals[k].i
-                    let result = fl_import(mut vm, id, path != 0)
+                    let result = fl_import_host(mut vm, mut host, id, path != 0)
                     if !vm.raised { fl_push(mut vm, result) }
                 },
-                51 => {
-                    if vm.edit_depth >= 4294967295 {
-                        fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: edit depth overflow")
+                51 => { // EDIT_BEGIN (vm.c:1426-1433)
+                    if (mut host).edit_begin(mut vm) {
+                        if vm.edit_depth >= 4294967295 {
+                            fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: edit depth overflow")
+                        }
+                        vm.edit_depth += 1
                     }
-                    vm.edit_depth += 1
-                }, // EDIT_BEGIN (null host)
+                },
                 52 => {
                     if vm.edit_depth <= 0 {
                         fl_vm_bug(mut vm, fnidx, pc, op, "fl vm: edit depth underflow")
                     }
-                    vm.edit_depth -= 1
+                    if (mut host).edit_end(mut vm, true) { vm.edit_depth -= 1 }
                 }, // EDIT_END
                 53 => { vm.err = fl_pop(mut vm); vm.raised = true }, // THROW
                 54 => { // TRY_PUSH
@@ -926,7 +951,10 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
             if nh != 0 && vm.handlers[nh - 1].frame > base {
                 target = vm.handlers[nh - 1].edit_depth
             }
-            vm.edit_depth = target
+            while vm.edit_depth > target {
+                let _ = (mut host).edit_end(mut vm, false)
+                vm.edit_depth -= 1
+            }
             if nh == 0 { fl_trace_attach(mut vm) }
             if nh == 0 || vm.handlers[nh - 1].frame <= base { return copy vm.err }
             let h = (mut vm.handlers).pop() else FlHandler { pc: 0, sp: 0, frame: 0, edit_depth: 0 }
@@ -952,8 +980,15 @@ fn fl_vm_exec(mut vm: FlVm, base: int) -> FlValue {
     fl_nil()
 }
 
-/// Execute a compiled top-level chunk, resetting transient VM state on exit.
+/// Execute a compiled top-level chunk with the standalone null host.
 pub fn fl_vm_run(mut vm: FlVm, entry: FlValue) -> FlValue {
+    var host = fl_null_host()
+    fl_vm_run_host(mut vm, mut host, entry)
+}
+
+/// Execute one top-level chunk through the selected host and reset transient
+/// VM state on every exit. run_end observes the execution's success.
+pub fn fl_vm_run_host[H: FlHost](mut vm: FlVm, mut host: H, entry: FlValue) -> FlValue {
     let cl = fl_closure_new(mut vm, entry)
     (mut vm.frames).reset()
     (mut vm.handlers).reset()
@@ -964,7 +999,17 @@ pub fn fl_vm_run(mut vm: FlVm, entry: FlValue) -> FlValue {
     vm.err = fl_nil()
     fl_push(mut vm, cl)
     let _ = fl_frame_push(mut vm, cl, 0, 0, 0, 0)
-    let result = if vm.raised then copy vm.err else fl_vm_exec(mut vm, 0)
+    var result = fl_nil()
+    if !vm.raised && (mut host).run_begin(mut vm) {
+        result = fl_vm_exec(mut vm, mut host, 0)
+        // The compacting collector may run inside the host's end callback.
+        let root = fl_temp_push(mut vm, result)
+        let commit = !vm.raised
+        let _ = (mut host).run_end(mut vm, commit)
+        result = fl_temp_get(vm, root)
+        fl_temp_pop(mut vm, 1)
+    }
+    if vm.raised { result = copy vm.err }
     // Close captured slots before making a failed run's stack reusable.
     fl_close_upvals(mut vm, 0)
     (mut vm.frames).reset()
@@ -975,17 +1020,32 @@ pub fn fl_vm_run(mut vm: FlVm, entry: FlValue) -> FlValue {
     result
 }
 
-/// Reentrant call; arguments are rooted in VM slots for the whole callback.
+/// Reentrant call using the standalone null host.
 pub fn fl_vm_call(mut vm: FlVm, callee: FlValue, args: List[FlValue]) -> FlValue {
+    var host = fl_null_host()
+    fl_vm_call_host(mut vm, mut host, callee, args)
+}
+
+/// Reentrant call retaining the host through native callbacks and imports.
+/// Arguments are VM roots for the whole call; only an outer call opens an
+/// implicit run transaction (vm.c:1674-1777).
+pub fn fl_vm_call_host[H: FlHost](
+    mut vm: FlVm,
+    mut host: H,
+    callee: FlValue,
+    args: List[FlValue],
+) -> FlValue {
     let base = vm.frames.len
+    let outer = base == 0 && !host.run_active()
+    if outer && !(mut host).run_begin(mut vm) { return copy vm.err }
     let slots = vm.sp
     fl_push(mut vm, callee)
     for v in args { fl_push(mut vm, v) }
     var result = fl_nil()
     if callee.t == 9 {
-        result = fl_native_invoke(mut vm, callee, slots + 1, args.len, true)
+        result = fl_native_invoke(mut vm, mut host, callee, slots + 1, args.len, true)
     } else if fl_frame_push(mut vm, callee, args.len, slots, 0, vm.cur_native) {
-        result = fl_vm_exec(mut vm, base)
+        result = fl_vm_exec(mut vm, mut host, base)
     }
     if vm.raised {
         fl_close_upvals(mut vm, slots)
@@ -1001,6 +1061,14 @@ pub fn fl_vm_call(mut vm: FlVm, callee: FlValue, args: List[FlValue]) -> FlValue
         }
     }
     vm.sp = slots
+    if outer {
+        let root = fl_temp_push(mut vm, result)
+        let commit = !vm.raised
+        let _ = (mut host).run_end(mut vm, commit)
+        result = fl_temp_get(vm, root)
+        fl_temp_pop(mut vm, 1)
+    }
+    if vm.raised { return copy vm.err }
     result
 }
 

@@ -1,0 +1,205 @@
+//! member: false
+//! yw09's host-bridge regression tests, not a replacement for the pinned
+//! s34 editor cases. Exercise vm.c:1026-1068, 1397-1439, 1539-1552,
+//! 1600-1777 through a host in a different module, including GC reentry.
+
+use fl
+
+struct Probe {
+    calls: int,
+    motion_count: int,
+    begins: int,
+    commits: int,
+    aborts: int,
+    run_begins: int,
+    run_ends: int,
+    active: bool,
+    fail_begin: bool,
+    fail_end: bool,
+    collect: bool,
+}
+
+fn probe() -> Probe {
+    Probe {
+        calls: 0,
+        motion_count: 0,
+        begins: 0,
+        commits: 0,
+        aborts: 0,
+        run_begins: 0,
+        run_ends: 0,
+        active: false,
+        fail_begin: false,
+        fail_end: false,
+        collect: false,
+    }
+}
+
+impl fl.FlHost for Probe {
+    fn api(mut self, mut vm: fl.FlVm, kind: int, base: int, argc: int) -> fl.FlValue {
+        let _ = argc
+        self.calls += 1
+        match kind {
+            13003 => fl.fl_int(self.calls),
+            13002 => {
+                let callback = copy vm.stack[base]
+                fl.fl_vm_call_host(mut vm, mut self, callback, List[fl.FlValue]())
+            },
+            _ => fl.fl_raise(mut vm, "name", "unexpected probe native {kind}"),
+        }
+    }
+    fn motion(mut self, mut vm: fl.FlVm, program: fl.FlValue) -> bool {
+        assert(program.t == fl.FL_MOTION_PROG)
+        let _ = fl.fl_obj_index(vm, program)
+        self.motion_count += 1
+        if self.collect { fl.fl_gc_collect(mut vm) }
+        true
+    }
+    fn edit_begin(mut self, mut vm: fl.FlVm) -> bool {
+        self.begins += 1
+        if self.fail_begin { let _ = fl.fl_raise(mut vm, "user", "begin refused"); return false }
+        true
+    }
+    fn edit_end(mut self, mut vm: fl.FlVm, commit: bool) -> bool {
+        if commit { self.commits += 1 } else { self.aborts += 1 }
+        if self.collect { fl.fl_gc_collect(mut vm) }
+        if commit && self.fail_end {
+            self.fail_end = false
+            let _ = fl.fl_raise(mut vm, "user", "end refused")
+            return false
+        }
+        true
+    }
+    #[allow(w1002)] // The trait permits a VM raise; this probe only records entry.
+    fn run_begin(mut self, mut vm: fl.FlVm) -> bool {
+        let _ = vm.sp
+        assert(!self.active)
+        self.active = true
+        self.run_begins += 1
+        true
+    }
+    fn run_end(mut self, mut vm: fl.FlVm, commit: bool) -> bool {
+        let _ = commit
+        assert(self.active)
+        self.active = false
+        self.run_ends += 1
+        if self.collect { fl.fl_gc_collect(mut vm) }
+        true
+    }
+    fn run_active(self) -> bool { self.active }
+}
+
+fn vm_new() -> fl.FlVm {
+    var strings = fl.fl_strings()
+    var vm = fl.fl_vm_new(take strings)
+    fl.fl_std_register(mut vm)
+    vm.root_origin = fl.fl_origin_new(fl.FL_ORIGIN_CLI, fl.FL_CAP_ALL)
+    vm
+}
+
+fn compile(mut vm: fl.FlVm, src: str) -> fl.FlValue {
+    let file = fl.fl_diag_add_file(mut vm.dc, "host-test.fl", src.bytes())
+    let p = fl.fl_parse(src.bytes(), file, mut vm.dc, mut vm.strings)
+    assert(!p.had_error, "host test parse")
+    let origin = copy vm.root_origin
+    fl.fl_compile(mut vm, p, file, origin) else { assert(false, "host test compile"); fl.fl_nil() }
+}
+
+fn run(mut vm: fl.FlVm, mut h: Probe, src: str) -> fl.FlValue {
+    let entry = compile(mut vm, src)
+    fl.fl_vm_run_host(mut vm, mut h, entry)
+}
+
+fn t_native_reentry_and_motion() {
+    var vm = vm_new()
+    var h = probe()
+    h.collect = true
+    let v = run(mut vm, mut h, "import ed; return ed.msg(fn() {{ @[ l> ]; return ed.mode() }})")
+    assert(!vm.raised && v.t == fl.FL_INT && v.i == 2)
+    assert(h.calls == 2 && h.motion_count == 1)
+    assert(h.run_begins == 1 && h.run_ends == 1 && !h.active)
+    assert(vm.sp == 0 && vm.frames.len == 0 && vm.handlers.len == 0)
+}
+
+fn t_list_and_regex_callbacks_keep_host() {
+    var vm = vm_new()
+    var h = probe()
+    h.collect = true
+    let v = run(
+        mut vm,
+        mut h,
+        "import ed; import list; import re; let xs = list.map([1,2], fn(x) ed.mode()); list.sort(xs, fn(a,b) {{ ed.mode(); return a-b }}); let s = re.replace_fn(\"aa\", \"a\", fn(m) {{ ed.mode(); return \"b\" }}); return s",
+    )
+    assert(!vm.raised && v.t == fl.FL_STR)
+    assert((str_from_utf8(vm.gc.slots[fl.fl_obj_index(vm, v)].bytes) else "") == "bb")
+    assert(h.calls == 5 && h.run_begins == 1 && h.run_ends == 1)
+}
+
+fn t_edit_return_and_unwind() {
+    var vm = vm_new()
+    var h = probe()
+    h.collect = true
+    let v = run(mut vm, mut h, "edit {{ edit {{ return \"ke\" + \"pt\" }} }}")
+    assert(!vm.raised && v.t == fl.FL_STR)
+    assert((str_from_utf8(vm.gc.slots[fl.fl_obj_index(vm, v)].bytes) else "") == "kept")
+    assert(h.begins == 2 && h.commits == 2 && h.aborts == 0 && vm.edit_depth == 0)
+    let w = run(
+        mut vm,
+        mut h,
+        "try {{ edit {{ edit {{ error(\"bad\") }} }} }} catch e {{ return 42 }}",
+    )
+    assert(!vm.raised && w.i == 42)
+    assert(h.begins == 4 && h.commits == 2 && h.aborts == 2 && vm.edit_depth == 0)
+    let x = run(mut vm, mut h, "edit {{ try {{ error(\"inside\") }} catch e {{ }} }}; return 9")
+    assert(!vm.raised && x.i == 9 && h.commits == 3 && h.aborts == 2)
+}
+
+fn t_host_failures_are_catchable() {
+    var vm = vm_new()
+    var h = probe()
+    h.fail_begin = true
+    let v = run(mut vm, mut h, "try {{ edit {{ return 99 }} }} catch e {{ return 1 }}")
+    assert(!vm.raised && v.i == 1 && h.commits == 0 && h.aborts == 0)
+    h.fail_begin = false
+    h.fail_end = true
+    let w = run(mut vm, mut h, "try {{ edit {{ return 99 }} }} catch e {{ return 2 }}")
+    assert(!vm.raised && w.i == 2 && h.commits == 1 && h.aborts == 1)
+    assert(vm.edit_depth == 0 && vm.frames.len == 0 && vm.sp == 0)
+}
+
+fn t_import_keeps_host() {
+    var vm = vm_new()
+    var h = probe()
+    h.collect = true
+    let dir = env_get("TMPDIR") else { assert(false, "scratch TMPDIR required"); return }
+    var suffix = ""
+    for b in os_random(6) { suffix += "{b}" }
+    let filename = "yw09-host-{suffix}.fl"
+    let path = "{dir}/{filename}"
+    let importer = "{dir}/init.fl"
+    vm.root_origin.path_id = fl.fl_intern(mut vm.strings, importer.bytes(), 0, importer.len)
+    fs_write_text(
+        path,
+        "import ed; let seen = ed.mode(); fn again() {{ return ed.mode() }}",
+    ) else |_| { assert(false) }
+    defer fs_remove(path) else |_| {}
+    let v = run(mut vm, mut h, "import \"{filename}\" as m; return m.seen + m.again()")
+    if vm.raised {
+        let key = fl.fl_str_text(mut vm, "msg")
+        let msg = fl.fl_map_get(vm, vm.err, key) else fl.fl_nil()
+        if msg.t == fl.FL_STR {
+            print(str_from_utf8(vm.gc.slots[fl.fl_obj_index(vm, msg)].bytes) else "")
+        }
+    }
+    assert(!vm.raised && v.i == 3 && h.calls == 2)
+    assert(h.run_begins == 1 && h.run_ends == 1)
+}
+
+fn main() {
+    t_native_reentry_and_motion()
+    t_list_and_regex_callbacks_keep_host()
+    t_edit_return_and_unwind()
+    t_host_failures_are_catchable()
+    t_import_keeps_host()
+    print("Fletch host bridge: 5 cases PASS")
+}
