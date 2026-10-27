@@ -1,22 +1,609 @@
-//! edit.macrolib — the macro library (Sprint 38): sagitta 9ace98c2
-//! src/fl/macrolib.c:1-936 and macrolib.h:1-72.
-//!
-//! s38-macrolib: until the library lands in this lane, a named replay
-//! refuses by name.
+//! edit.macrolib — the deterministic, reloadable macro library (Sprint
+//! 38): sagitta 9ace98c2 src/fl/macrolib.c:1-936 and macrolib.h:1-72.
+//! Every `*.fl` of `macro.dir` (else `$XDG_CONFIG_HOME/yew/macros`), in
+//! bytewise name order, is header-checked, preflight-parsed for its public
+//! functions and macros, loaded as a module under a config origin, and
+//! its zero-argument exports become `<stem>.<binding>` macros (the bare
+//! stem an alias when a binding repeats it). A scan builds a candidate
+//! and swaps it in whole; registrations a file made are removed with the
+//! library. C's entries hold callable values; the port's collector
+//! compacts, so an entry names its export map's slot in the library's one
+//! rooted list and its binding, and the callable is read at call time.
 
-/// `yew_macrolib_enable` (macrolib.h): the library armed after the first
-/// configuration load (flconf.c:627).
-pub fn macrolib_enable(mut ed: Ed) { ed.footer_dirty = ed.footer_dirty }
+use fl
+use util
 
-/// `yew_macrolib_scan` (macrolib.h): the library rescanned after a reload
-/// (flconf.c:672).
-pub fn macrolib_scan(mut ed: Ed) { ed.footer_dirty = ed.footer_dirty }
+const MACROLIB_MAX_BYTES: int = 8388608
 
-/// `yew_macrolib_option_changed` (macrolib.h): `macro.dir` moved.
-pub fn macrolib_option_changed(mut ed: Ed) { ed.footer_dirty = ed.footer_dirty }
+/// YewMacroText (macrolib.h:16-20).
+pub struct MacroText { s: List[byte], present: bool }
 
-/// `yew_macrolib_call` (macrolib.h): a library macro replayed by name.
+/// YewMacroHeader (macrolib.h:22-29).
+pub struct MacroHeader {
+    schema: int,
+    has_schema: bool,
+    recorded_with: MacroText,
+    keymap: MacroText,
+    recorded: MacroText,
+    describe: MacroText,
+}
+
+/// YEW_MACRO_HEADER_OK (macrolib.h:31-34).
+pub const MACRO_HEADER_OK: int = 0
+
+/// A present schema other than 1.
+pub const MACRO_HEADER_UNSUPPORTED: int = 1
+
+// MacroFile (macrolib.c:35-43): `slot` is its exports' place in the
+// library's rooted list, -1 before it loads.
+struct MacroFile {
+    path: str,
+    stem: str,
+    source: List[byte],
+    header: MacroHeader,
+    slot: int,
+    rejected: bool,
+}
+
+// MacroEntry (macrolib.c:45-53).
+struct MacroEntry {
+    name: str,
+    alias: str,
+    has_alias: bool,
+    binding: str,
+    file: int,
+    arity: int,
+    replayable: bool,
+}
+
+/// MacroLib (macrolib.c:55-69); `root` is the host root of the list of
+/// export maps, -1 until the runtime exists.
+pub struct MacroLib {
+    files: List[MacroFile],
+    entries: List[MacroEntry],
+    dir: str,
+    root: int,
+    ledger_ids: List[int],
+    enabled: bool,
+    scanning: bool,
+}
+
+/// YewMacroEntryView (macrolib.h:40-52).
+pub struct MacroEntryView {
+    name: str,
+    alias: str,
+    has_alias: bool,
+    binding: str,
+    stem: str,
+    path: str,
+    source: List[byte],
+    header: MacroHeader,
+    events: int,
+    arity: int,
+    replayable: bool,
+}
+
+fn mtext_none() -> MacroText { MacroText { s: List[byte](), present: false } }
+
+fn mheader_none() -> MacroHeader {
+    MacroHeader {
+        schema: 0,
+        has_schema: false,
+        recorded_with: mtext_none(),
+        keymap: mtext_none(),
+        recorded: mtext_none(),
+        describe: mtext_none(),
+    }
+}
+
+/// `yew_macrolib_new` (macrolib.c:258-270): enabled, empty.
+pub fn macrolib_new() -> MacroLib {
+    MacroLib {
+        files: List[MacroFile](),
+        entries: List[MacroEntry](),
+        dir: "",
+        root: -1,
+        ledger_ids: List[int](),
+        enabled: true,
+        scanning: false,
+    }
+}
+
+fn ml_is_blank(b: byte) -> bool { b == 32 as byte || b == 9 as byte }
+
+// header_field (macrolib.c:79-91): the value trimmed of blanks and a CR.
+fn ml_field(src: List[byte], lo_in: int, hi_in: int) -> MacroText {
+    var lo = lo_in
+    var hi = hi_in
+    while lo < hi && ml_is_blank(src[lo]) { lo += 1 }
+    while hi > lo && (ml_is_blank(src[hi - 1]) || src[hi - 1] == 13 as byte) { hi -= 1 }
+    MacroText { s: src[lo..hi], present: true }
+}
+
+fn ml_has_key(src: List[byte], lo: int, hi: int, key: str) -> bool {
+    let k = key.bytes()
+    if hi - lo < k.len { return false }
+    for i in 0..k.len { if src[lo + i] != k[i] { return false } }
+    true
+}
+
+/// `yew_macro_header_parse` (macrolib.c:105-167): the leading comment
+/// block's five fields; no header is valid, a schema other than 1 not.
+pub fn macro_header_parse(src: List[byte]) -> (int, MacroHeader) {
+    var out = mheader_none()
+    var at = 0
+    while at < src.len {
+        var end = at
+        while end < src.len && src[end] != 10 as byte { end += 1 }
+        var lo = at
+        let hi = end
+        at = if end < src.len then end + 1 else end
+        while lo < hi && ml_is_blank(src[lo]) { lo += 1 }
+        if lo == hi { continue }
+        if src[lo] != '#' as int as byte { break }
+        lo += 1
+        while lo < hi && ml_is_blank(src[lo]) { lo += 1 }
+        if ml_has_key(src, lo, hi, "yew-macro:") {
+            let schema = ml_field(src, lo + 10, hi)
+            out.has_schema = true
+            out.schema = if schema.s.len == 1 && schema.s[0] >= '0' as int as byte && schema.s[0] <= '9' as int as byte {
+                schema.s[0] as int - '0' as int
+            } else {
+                4294967295
+            }
+        } else if ml_has_key(src, lo, hi, "recorded-with:") {
+            out.recorded_with = ml_field(src, lo + 14, hi)
+        } else if ml_has_key(src, lo, hi, "keymap:") {
+            out.keymap = ml_field(src, lo + 7, hi)
+        } else if ml_has_key(src, lo, hi, "recorded:") {
+            out.recorded = ml_field(src, lo + 9, hi)
+        } else if ml_has_key(src, lo, hi, "describe:") {
+            out.describe = ml_field(src, lo + 9, hi)
+        }
+    }
+    let status = if out.has_schema && out.schema != 1 then MACRO_HEADER_UNSUPPORTED else MACRO_HEADER_OK
+    (status, out)
+}
+
+// default_dir and effective_dir (macrolib.c:196-216).
+fn ml_effective_dir(ed: Ed) -> str {
+    let v = opt_global_str(ed, "macro.dir")
+    if v.len != 0 { return v }
+    let cfg = util.xdg_config_dir() else { return "" }
+    "{cfg}/macros"
+}
+
+fn ml_join(dir: str, name: str) -> str {
+    if dir.len != 0 && !dir.ends_with("/") then "{dir}/{name}" else "{dir}{name}"
+}
+
+fn ml_name_less(a: str, b: str) -> bool {
+    let x = a.bytes()
+    let y = b.bytes()
+    let n = if x.len < y.len then x.len else y.len
+    for i in 0..n { if x[i] != y[i] { return x[i] < y[i] } }
+    x.len < y.len
+}
+
+// names_read (macrolib.c:313-338): the `*.fl` names, bytewise; a missing
+// directory is empty, any other failure none.
+fn ml_names(dir: str) -> List[str] ! {failed} {
+    let entries = fs_read_dir(dir) else |e| match e {
+        not_found => { return List[str]() },
+        _ => { return failed },
+    }
+    var out = List[str]()
+    for n in entries { if n.len > 3 && n.ends_with(".fl") { (mut out).push(n) } }
+    util.sort_stable(mut out, ml_name_less)
+    out
+}
+
+// report (macrolib.c:378-396): into the caller's diagnostics, else the log.
+fn ml_report(mut dc: fl.DiagCtx, has_dc: bool, file_id: int, level: int, msg: str) {
+    if has_dc {
+        fl.fl_diag_emit(mut dc, level, fl.FlSpan { file_id: file_id, line: 1, col: 1, len: 1 }, msg)
+    } else {
+        util.log_at(if level == fl.FL_DIAG_ERROR then util.LOG_ERROR else util.LOG_WARN, msg)
+    }
+}
+
+// preflight_exports (macrolib.c:444-505): the public `fn` and `macro`
+// statements of the file, parsed apart from the runtime.
+fn ml_preflight(mut cand: MacroLib, fi: int) -> bool {
+    var strings = fl.fl_strings()
+    var dc = fl.fl_diag_init()
+    let src = copy cand.files[fi].source
+    let file_id = fl.fl_diag_add_file(mut dc, cand.files[fi].path, src)
+    let p = fl.fl_parse(src, file_id, mut dc, mut strings)
+    if p.had_error || p.incomplete { return false }
+    let stem = copy cand.files[fi].stem
+    for st in p.stmts {
+        let node = copy p.nodes[st]
+        var arity = 0
+        if node.kind == fl.FL_A_FN {
+            arity = node.c
+        } else if node.kind != fl.FL_A_MACRO {
+            continue
+        }
+        if node.a <= 0 || node.a >= strings.items.len { continue }
+        let nb = copy strings.items[node.a]
+        if nb.len == 0 || nb[0] == '_' as int as byte { continue }
+        let binding = str_from_utf8(nb) else { continue }
+        (mut cand.entries).push(MacroEntry {
+            name: "{stem}.{binding}",
+            alias: if binding == stem then copy stem else "",
+            has_alias: binding == stem,
+            binding: binding,
+            file: fi,
+            arity: if arity > 255 then 255 else arity,
+            replayable: arity == 0,
+        })
+    }
+    true
+}
+
+// callable_info (macrolib.c:427-442).
+fn ml_callable_arity(vm: fl.FlVm, v: fl.FlValue) -> int ! {none} {
+    if v.t == fl.FL_CLOSURE {
+        let fun = copy vm.gc.slots[fl.fl_obj_index(vm, v)].fn_value
+        return vm.gc.slots[fl.fl_obj_index(vm, fun)].arity
+    }
+    if v.t == fl.FL_NATIVE {
+        let at = fl.fl_obj_index(vm, v)
+        if vm.gc.slots[at].min_ar != vm.gc.slots[at].max_ar { return none }
+        return vm.gc.slots[at].min_ar
+    }
+    none
+}
+
+// bind_exports (macrolib.c:507-543): every preflighted name found as a
+// callable export, with its real arity.
+fn ml_bind_exports(mut cand: MacroLib, fi: int, vm: fl.FlVm, exports: fl.FlValue) -> bool {
+    var expected = 0
+    for e in cand.entries { if e.file == fi { expected += 1 } }
+    var matched = 0
+    var cursor = 0
+    loop {
+        let (next, k, v) = fl.fl_map_iter(vm, exports, cursor) else { break }
+        cursor = next
+        if k.t != fl.FL_STR { continue }
+        let arity = ml_callable_arity(vm, v) else { continue }
+        let kb = copy vm.gc.slots[fl.fl_obj_index(vm, k)].bytes
+        let key = str_from_utf8(kb) else { continue }
+        for i in 0..cand.entries.len {
+            if cand.entries[i].file == fi && cand.entries[i].binding == key {
+                cand.entries[i].arity = arity
+                cand.entries[i].replayable = arity == 0
+                matched += 1
+                break
+            }
+        }
+    }
+    matched == expected
+}
+
+// recorded_major_mismatch (macrolib.c:545-567).
+fn ml_major_mismatch(h: MacroHeader) -> bool {
+    if !h.recorded_with.present { return false }
+    let s = h.recorded_with.s
+    var i = 0
+    if s.len >= 4 && s[0] == 'y' as int as byte && s[1] == 'e' as int as byte && s[2] == 'w' as int as byte && s[3] == 32 as byte { i = 4 }
+    var major = 0
+    var digit = false
+    while i < s.len && s[i] >= '0' as int as byte && s[i] <= '9' as int as byte {
+        digit = true
+        major = major * 10 + (s[i] as int - '0' as int)
+        i += 1
+    }
+    digit && major != 1
+}
+
+// same_public_name (macrolib.c:569-579).
+fn ml_same_name(a: MacroEntry, b: MacroEntry) -> bool {
+    if a.name == b.name { return true }
+    if a.has_alias && a.alias == b.name { return true }
+    if b.has_alias && a.name == b.alias { return true }
+    a.has_alias && b.has_alias && a.alias == b.alias
+}
+
+// reject_collisions (macrolib.c:581-607).
+fn ml_reject_collisions(mut cand: MacroLib, mut dc: fl.DiagCtx, has_dc: bool, diag_file: int) {
+    for i in 0..cand.entries.len {
+        for k in i + 1..cand.entries.len {
+            let a = copy cand.entries[i]
+            let b = copy cand.entries[k]
+            if a.file == b.file || !ml_same_name(a, b) { continue }
+            if !cand.files[a.file].rejected || !cand.files[b.file].rejected {
+                let shown = if a.name == b.name then a.name else if a.has_alias then a.alias else b.alias
+                ml_report(
+                    mut dc,
+                    has_dc,
+                    diag_file,
+                    fl.FL_DIAG_ERROR,
+                    "macro collision '{shown}': {cand.files[a.file].path} and {cand.files[b.file].path}; neither loaded",
+                )
+            }
+            cand.files[a.file].rejected = true
+            cand.files[b.file].rejected = true
+        }
+    }
+}
+
+// compact_entries (macrolib.c:609-628).
+fn ml_compact(mut cand: MacroLib) {
+    var kept = List[MacroEntry]()
+    for e in cand.entries { if !cand.files[e.file].rejected { (mut kept).push(copy e) } }
+    cand.entries = kept
+}
+
+// registrations_remove (macrolib.c:657-684): newest first.
+fn ml_registrations_remove(mut ed: Ed, mut vm: fl.FlVm) {
+    var i = ed.mlib.ledger_ids.len
+    while i != 0 {
+        i -= 1
+        let id = ed.mlib.ledger_ids[i]
+        registration_remove_in(mut ed, mut vm, id)
+    }
+    (mut ed.mlib.ledger_ids).reset()
+}
+
+/// `yew_macrolib_scan` (macrolib.c:705-826) with the caller's diagnostics:
+/// the candidate built from the directory and swapped in; the count of
+/// macros.
+pub fn macrolib_scan_dc(mut ed: Ed, mut dc: fl.DiagCtx) -> int { ml_scan(mut ed, mut dc, true) }
+
+/// `yew_macrolib_scan(ed, NULL)`: the reports go to the log.
+pub fn macrolib_scan(mut ed: Ed) -> int {
+    var dc = fl.fl_diag_init()
+    ml_scan(mut ed, mut dc, false)
+}
+
+fn ml_scan(mut ed: Ed, mut dc: fl.DiagCtx, has_dc: bool) -> int {
+    if ed.mlib.scanning { return 0 }
+    var cand = macrolib_new()
+    cand.dir = ml_effective_dir(ed)
+    let diag_file = if has_dc then fl.fl_diag_add_file(mut dc, "<macro-library>", List[byte]()) else 0
+    let names = ml_names(cand.dir) else {
+        ml_report(mut dc, has_dc, diag_file, fl.FL_DIAG_ERROR, "cannot scan macro directory {cand.dir}")
+        return ed.mlib.entries.len
+    }
+    // An empty directory over an empty library swaps nothing in and has
+    // nothing to remove: C's scan of it is unobservable, so the runtime
+    // a headless editor may never need is not made for it.
+    if names.len == 0 && ed.mlib.files.len == 0 && ed.mlib.ledger_ids.len == 0 {
+        ed.mlib.dir = cand.dir
+        return 0
+    }
+    let _ = fl_runtime_init(mut ed)
+    if ed.flrt.vms.len == 0 { return 0 }
+    ed.mlib.scanning = true
+    for n in names {
+        let stem_len = n.len - 3
+        let stem = n[0..stem_len]
+        if stem_len < 2 {
+            ml_report(mut dc, has_dc, diag_file, fl.FL_DIAG_ERROR, "macro file stem '{stem}' must contain at least 2 bytes")
+            continue
+        }
+        let path = ml_join(cand.dir, n)
+        (mut cand.files).push(MacroFile {
+            path: copy path,
+            stem: stem,
+            source: List[byte](),
+            header: mheader_none(),
+            slot: -1,
+            rejected: false,
+        })
+        let fi = cand.files.len - 1
+        let src = fs_read_bytes(path) else {
+            ml_report(mut dc, has_dc, diag_file, fl.FL_DIAG_ERROR, "cannot read macro file {path}")
+            cand.files[fi].rejected = true
+            continue
+        }
+        if src.len > MACROLIB_MAX_BYTES {
+            ml_report(mut dc, has_dc, diag_file, fl.FL_DIAG_ERROR, "cannot read macro file {path}")
+            cand.files[fi].rejected = true
+            continue
+        }
+        cand.files[fi].source = src
+        let (status, header) = macro_header_parse(cand.files[fi].source)
+        cand.files[fi].header = header
+        if status == MACRO_HEADER_UNSUPPORTED {
+            ml_report(
+                mut dc,
+                has_dc,
+                diag_file,
+                fl.FL_DIAG_WARNING,
+                "{path}: unsupported yew-macro schema {cand.files[fi].header.schema}; skipped",
+            )
+            cand.files[fi].rejected = true
+            continue
+        }
+        if ml_major_mismatch(cand.files[fi].header) {
+            let rw = str_from_utf8(cand.files[fi].header.recorded_with.s) else "?"
+            ml_report(
+                mut dc,
+                has_dc,
+                diag_file,
+                fl.FL_DIAG_WARNING,
+                "{path}: recorded-with {rw} has a different major version from yew {util.VERSION}; loading anyway",
+            )
+        }
+        if !ml_preflight(mut cand, fi) {
+            ml_report(mut dc, has_dc, diag_file, fl.FL_DIAG_ERROR, "{path}: macro file did not parse; skipped")
+            cand.files[fi].rejected = true
+        }
+    }
+    ml_reject_collisions(mut cand, mut dc, has_dc, diag_file)
+    ml_compact(mut cand)
+    var vm = runtime_take(mut ed)
+    ml_registrations_remove(mut ed, mut vm)
+    let all = fl.fl_list_new(mut vm)
+    let all_root = fl.fl_temp_push(mut vm, all)
+    for fi in 0..cand.files.len {
+        if cand.files[fi].rejected { continue }
+        let path = copy cand.files[fi].path
+        let pb = copy path.bytes()
+        let path_id = fl.fl_intern(mut vm.strings, pb, 0, pb.len)
+        let origin = fl.FlOrigin { kind: fl.FL_ORIGIN_CONFIG, path_id: path_id, caps: fl.FL_CAP_ALL, principal_id: 0 }
+        let before = vm.hooks.ledger.rows.len
+        let src = copy cand.files[fi].source
+        let exports = fl.fl_module_eval_source(mut vm, mut ed, path, src, origin) else {
+            vm.raised = false
+            ml_report(mut dc, has_dc, diag_file, fl.FL_DIAG_ERROR, "{path}: macro file did not load; skipped")
+            cand.files[fi].rejected = true
+            // The registrations the failed body made (macrolib.c:794-799).
+            while vm.hooks.ledger.rows.len > before {
+                let last = vm.hooks.ledger.rows.len
+                registration_remove_in(mut ed, mut vm, last)
+                if vm.hooks.ledger.rows.len == last { break }
+            }
+            vm.err = fl.fl_nil()
+            continue
+        }
+        for r in before..vm.hooks.ledger.rows.len {
+            if vm.hooks.ledger.rows[r].active { (mut cand.ledger_ids).push(r + 1) }
+        }
+        let held = fl.fl_temp_get(vm, all_root)
+        let er = fl.fl_temp_push(mut vm, exports)
+        let exv = fl.fl_temp_get(vm, er)
+        fl.fl_list_push(mut vm, held, exv)
+        cand.files[fi].slot = fl.fl_list_len(vm, held) - 1
+        let ex = fl.fl_temp_get(vm, er)
+        fl.fl_temp_pop(mut vm, 1)
+        if !ml_bind_exports(mut cand, fi, vm, ex) {
+            ml_report(mut dc, has_dc, diag_file, fl.FL_DIAG_ERROR, "{path}: exported functions changed during load; skipped")
+            cand.files[fi].rejected = true
+        }
+    }
+    ml_compact(mut cand)
+    // The final list holds only the kept files' maps, re-slotted.
+    let final_list = fl.fl_list_new(mut vm)
+    let final_root = fl.fl_temp_push(mut vm, final_list)
+    for fi in 0..cand.files.len {
+        if cand.files[fi].rejected || cand.files[fi].slot < 0 { continue }
+        let held = fl.fl_temp_get(vm, all_root)
+        let ex = fl.fl_list_get(vm, held, cand.files[fi].slot) else { continue }
+        if ex.t != fl.FL_MAP { continue }
+        let fl_now = fl.fl_temp_get(vm, final_root)
+        fl.fl_list_push(mut vm, fl_now, ex)
+        cand.files[fi].slot = fl.fl_list_len(vm, fl_now) - 1
+    }
+    let final_value = fl.fl_temp_get(vm, final_root)
+    if ed.mlib.root < 0 {
+        ed.mlib.root = fl.fl_gc_host_root_add(mut vm, final_value)
+    } else {
+        fl.fl_gc_host_root_set(mut vm, ed.mlib.root, final_value)
+    }
+    fl.fl_temp_pop(mut vm, 2)
+    // candidate_swap (macrolib.c:630-655): the enabled flag stays.
+    ed.mlib.files = cand.files
+    ed.mlib.entries = cand.entries
+    ed.mlib.dir = cand.dir
+    ed.mlib.ledger_ids = cand.ledger_ids
+    fl.fl_gc_collect(mut vm)
+    (mut ed.flrt.vms).push(vm)
+    ed.mlib.scanning = false
+    ed.mlib.entries.len
+}
+
+/// `yew_macrolib_count` (macrolib.c:828-832).
+pub fn macrolib_count(ed: Ed) -> int { ed.mlib.entries.len }
+
+// entry_view (macrolib.c:834-842).
+fn ml_view(ed: Ed, i: int) -> MacroEntryView {
+    let e = copy ed.mlib.entries[i]
+    let f = copy ed.mlib.files[e.file]
+    MacroEntryView {
+        name: e.name,
+        alias: e.alias,
+        has_alias: e.has_alias,
+        binding: e.binding,
+        stem: f.stem,
+        path: f.path,
+        source: f.source,
+        header: f.header,
+        events: 0,
+        arity: e.arity,
+        replayable: e.replayable,
+    }
+}
+
+/// `yew_macrolib_at` (macrolib.c:844-851).
+pub fn macrolib_at(ed: Ed, index: int) -> MacroEntryView ! {none} {
+    if index < 0 || index >= ed.mlib.entries.len { return none }
+    ml_view(ed, index)
+}
+
+// find_entry (macrolib.c:853-867).
+fn ml_find(ed: Ed, name: str) -> int {
+    for i in 0..ed.mlib.entries.len {
+        if ed.mlib.entries[i].name == name || ed.mlib.entries[i].has_alias && ed.mlib.entries[i].alias == name { return i }
+    }
+    -1
+}
+
+/// `yew_macrolib_find` (macrolib.c:869-879).
+pub fn macrolib_find(ed: Ed, name: str) -> MacroEntryView ! {none} {
+    let i = ml_find(ed, name)
+    if i < 0 { return none }
+    ml_view(ed, i)
+}
+
+/// `yew_macrolib_call` (macrolib.c:881-917): a zero-argument library macro
+/// called through the ordinary Fletch entry, as a replay; inside a running
+/// call that is not itself a replay it is its own edit boundary.
 pub fn macrolib_call(mut ed: Ed, name: str) -> int {
-    ed_msg(mut ed, MSG_ERROR, "not yet ported: macro library call {name}: sagitta Sprint 38 (yw09)")
-    CMD_ERR_DEFERRED
+    let i = ml_find(ed, name)
+    if i < 0 {
+        ed_msg(mut ed, MSG_ERROR, "no macro named {name}")
+        return CMD_ERR_ARG
+    }
+    let e = copy ed.mlib.entries[i]
+    if !e.replayable {
+        let s = if e.arity == 1 then "" else "s"
+        ed_msg(mut ed, MSG_ERROR, "{e.name} takes {e.arity} argument{s}")
+        return CMD_ERR_ARG
+    }
+    if !ed.flrt.ready || ed.flrt.vms.len == 0 || ed.mlib.root < 0 { return CMD_ERR_STATE }
+    let slot = ed.mlib.files[e.file].slot
+    let list = fl.fl_gc_host_root_get(ed.flrt.vms[0], ed.mlib.root)
+    let exports = fl.fl_list_get(ed.flrt.vms[0], list, slot) else { return CMD_ERR_STATE }
+    let kb = copy e.binding.bytes()
+    let key = fl.fl_str_new(mut ed.flrt.vms[0], kb)
+    let callable = fl.fl_map_get(ed.flrt.vms[0], exports, key) else { return CMD_ERR_STATE }
+    let split_run = ed.fltxn.entry_active && ed.flrt.command_source != SRC_REPLAY
+    if split_run {
+        if ed.fltxn.depth != 0 {
+            ed_msg(mut ed, MSG_ERROR, "cannot replay a macro inside an edit transaction")
+            return CMD_ERR_STATE
+        }
+        var vm = runtime_take(mut ed)
+        let began = fl_txn_edit_begin(mut vm, mut ed)
+        (mut ed.flrt.vms).push(vm)
+        if !began { return CMD_ERR_STATE }
+    }
+    let root = fl.fl_temp_push(mut ed.flrt.vms[0], callable)
+    let held = fl.fl_temp_get(ed.flrt.vms[0], root)
+    fl.fl_temp_pop(mut ed.flrt.vms[0], 1)
+    var ok = fl_call_value(mut ed, held, SRC_REPLAY)
+    if split_run {
+        var vm = runtime_take(mut ed)
+        if !fl_txn_edit_end(mut vm, mut ed, ok) { ok = false }
+        (mut ed.flrt.vms).push(vm)
+    }
+    if ok then CMD_OK else CMD_ERR_STATE
+}
+
+/// `yew_macrolib_dir` (macrolib.c:919-922).
+pub fn macrolib_dir(ed: Ed) -> str { ed.mlib.dir }
+
+/// `yew_macrolib_enable` (macrolib.c:924-930): armed, then scanned.
+pub fn macrolib_enable(mut ed: Ed) {
+    ed.mlib.enabled = true
+    let _ = macrolib_scan(mut ed)
+}
+
+/// `yew_macrolib_option_changed` (macrolib.c:932-936): `macro.dir` moved.
+pub fn macrolib_option_changed(mut ed: Ed) {
+    if ed.mlib.enabled { let _ = macrolib_scan(mut ed) }
 }
