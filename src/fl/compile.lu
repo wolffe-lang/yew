@@ -12,6 +12,10 @@ struct FlUpDesc { index: int, is_local: bool }
 
 struct FlCompLoop { start: int, breaks: List[int], conts: List[int], floor: int, try_depth: int }
 
+// `FlGlobalUse` (compile.c:23-26): a global read or written, kept by the
+// top-level frame when the compile validates names (YEW-F-010).
+struct FlGlobalUse { name: int, sp: FlSpan }
+
 struct FlCompiler {
     code: List[byte],
     consts: List[FlValue],
@@ -30,6 +34,8 @@ struct FlCompiler {
     origin: FlOrigin,
     failed: bool,
     trace_mode: int,
+    validate_globals: bool,
+    global_uses: List[FlGlobalUse],
 }
 
 struct FlCompState { frames: List[FlCompiler] }
@@ -53,6 +59,8 @@ fn fl_comp_new(file: int, origin: FlOrigin) -> FlCompiler {
         origin: copy origin,
         failed: false,
         trace_mode: 0,
+        validate_globals: false,
+        global_uses: List[FlGlobalUse](),
     }
 }
 
@@ -246,6 +254,35 @@ fn fl_cupresolve(mut cs: FlCompState, c: int, mut vm: FlVm, name: int, sp: FlSpa
     -1
 }
 
+// `note_global_use` (compile.c:419-431): the top-level frame records the
+// use when the compile validates names.
+fn fl_cnote_global(mut cs: FlCompState, name: int, sp: FlSpan) {
+    if !cs.frames[0].validate_globals { return }
+    (mut cs.frames[0].global_uses).push(FlGlobalUse { name: name, sp: copy sp })
+}
+
+// `known_global` (compile.c:1114-1124): declared in this module, or a
+// runtime global or prelude name already bound.
+fn fl_cknown_global(cs: FlCompState, vm: FlVm, name: int) -> bool {
+    for g in cs.frames[0].globals { if g == name { return true } }
+    let _ = fl_map_get(vm, vm.globals, fl_int(name)) else {
+        let _ = fl_map_get(vm, vm.prelude, fl_int(name)) else { return false }
+        return true
+    }
+    true
+}
+
+// `validate_global_uses` (compile.c:1126-1139): the first unresolved use
+// is the error.
+fn fl_cvalidate_globals(mut cs: FlCompState, mut vm: FlVm) {
+    for i in 0..cs.frames[0].global_uses.len {
+        let u = copy cs.frames[0].global_uses[i]
+        if fl_cknown_global(cs, vm, u.name) { continue }
+        fl_cerror(mut cs, 0, mut vm, u.sp, "undefined name '{fl_cspelling(vm, u.name)}'")
+        return
+    }
+}
+
 fn fl_cglobal(mut cs: FlCompState, c: int, mut vm: FlVm, name: int, sp: FlSpan) {
     for j in 0..cs.frames[c].globals.len {
         if cs.frames[c].globals[j] == name {
@@ -395,6 +432,7 @@ fn fl_cexpr(mut cs: FlCompState, c: int, mut vm: FlVm, p: FlProgram, id: int) {
                     fl_emit(mut cs, c, 11, n.sp)
                     fl_emit8(mut cs, c, slot)
                 } else {
+                    fl_cnote_global(mut cs, n.a, n.sp)
                     fl_emit(mut cs, c, 14, n.sp)
                     let k = fl_cname(mut cs, c, mut vm, n.a, n.sp)
                     fl_emit16(mut cs, c, k)
@@ -516,6 +554,7 @@ fn fl_cstmt(mut cs: FlCompState, c: int, mut vm: FlVm, p: FlProgram, id: int) {
                         fl_emit(mut cs, c, 12, tgt.sp)
                         fl_emit8(mut cs, c, slot)
                     } else {
+                        fl_cnote_global(mut cs, tgt.a, tgt.sp)
                         fl_emit(mut cs, c, 15, tgt.sp)
                         let k = fl_cname(mut cs, c, mut vm, tgt.a, tgt.sp)
                         fl_emit16(mut cs, c, k)
@@ -731,14 +770,22 @@ fn fl_cloop(mut cs: FlCompState, c: int, mut vm: FlVm, p: FlProgram, n: FlNode) 
 
 /// Compile a clean parsed script; none means a diagnostic was appended to vm.dc.
 pub fn fl_compile(mut vm: FlVm, p: FlProgram, file_id: int, origin: FlOrigin) -> FlValue ! {none} {
-    fl_compile_entry(mut vm, p, file_id, origin, false, 0)?
+    fl_compile_entry(mut vm, p, file_id, origin, false, 0, false)?
+}
+
+/// `fl_compile_macro` (compile.c:1511-1516): a script whose every global
+/// name must resolve at compile time — declared in it, or already bound in
+/// the runtime's globals or prelude (YEW-F-010) — so an unresolved name is
+/// refused before a register holds it, with nothing run.
+pub fn fl_compile_macro(mut vm: FlVm, p: FlProgram, file_id: int, origin: FlOrigin) -> FlValue ! {none} {
+    fl_compile_entry(mut vm, p, file_id, origin, false, 0, true)?
 }
 
 /// Compile the expression-returning entry used by CLI -e (interactive REPL is yw08).
 pub fn fl_compile_repl(mut vm: FlVm, p: FlProgram, file_id: int, origin: FlOrigin) -> FlValue ! {
     none,
 } {
-    fl_compile_entry(mut vm, p, file_id, origin, true, 0)?
+    fl_compile_entry(mut vm, p, file_id, origin, true, 0, false)?
 }
 
 fn fl_compile_entry(
@@ -748,12 +795,14 @@ fn fl_compile_entry(
     origin: FlOrigin,
     repl: bool,
     trace_mode: int,
+    validate: bool,
 ) -> FlValue ! {none} {
     if p.had_error { return none }
     let root_base = vm.compiling.len
     var cs = FlCompState { frames: List[FlCompiler]() }
     (mut cs.frames).push(fl_comp_new(file_id, origin))
     cs.frames[0].trace_mode = trace_mode
+    cs.frames[0].validate_globals = validate
     var end = FlSpan { file_id: file_id, line: 0, col: 0, len: 0 }
     fl_chidden(mut cs, 0, mut vm, end)
     fl_cdepth(mut cs, 0, 1)
@@ -777,6 +826,7 @@ fn fl_compile_entry(
         end.col = 1
     }
     fl_emit(mut cs, 0, 56, end)
+    if !cs.frames[0].failed && validate { fl_cvalidate_globals(mut cs, mut vm) }
     while vm.compiling.len > root_base { let _ = (mut vm.compiling).pop() else fl_nil() }
     if cs.frames[0].failed { return none }
     let f = fl_cfinish(cs, 0, mut vm)
@@ -798,12 +848,12 @@ pub fn fl_compile_profiled(
     file_id: int,
     origin: FlOrigin,
 ) -> FlValue ! {none} {
-    fl_compile_entry(mut vm, p, file_id, origin, false, 1)?
+    fl_compile_entry(mut vm, p, file_id, origin, false, 1, false)?
 }
 
 /// Compile statement coverage markers, including nested function bodies.
 pub fn fl_compile_covered(mut vm: FlVm, p: FlProgram, file_id: int, origin: FlOrigin) -> FlValue ! {
     none,
 } {
-    fl_compile_entry(mut vm, p, file_id, origin, false, 2)?
+    fl_compile_entry(mut vm, p, file_id, origin, false, 2, false)?
 }
