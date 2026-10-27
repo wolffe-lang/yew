@@ -1,0 +1,519 @@
+//! edit.macrobrowse — the macro browser and the macro editor (Sprint 38).
+//!
+//! Ports sagitta `src/ui/macrobrowse.c` (762 lines) and `macrobrowse.h`
+//! at 9ace98c2. `ed.macro.list` from a key or the mouse opens THE picker
+//! over the non-empty registers a-z and the replayable library entries;
+//! from anywhere else it is porcelain (one tab-separated row per macro,
+//! to stdout when headless). `ed.macro.edit r` opens register `r` as an
+//! ordinary `*macro r*` scratch tab whose save stores it back
+//! (`file_cmds.c:36-38`, `:54-56`, `:78-80`); `ed.macro.name r NAME`
+//! lifts it into the library's `user.fl`; `ed.macro.reload` rescans.
+//!
+//! The port's shapes. C's module-static `MacroBrowse mb`
+//! (`macrobrowse.c:32-40`) is the rows the picker copies at open plus
+//! `PickerState.macro_confirm_delete`; its callbacks are the picker's
+//! PICK_HOST_MACRO kind (`macrobrowse_host`). A register's body is a
+//! search part as text, so a register holding invalid UTF-8 matches by
+//! its name alone (the part is ""). The scratch carries no syntax
+//! engine before yw10: C attaches `fletch` highlighting to it
+//! (`macrobrowse.c:109-120`) and refuses the edit when the engine is
+//! missing; the port names the language (`ed.buf_languages`, what
+//! `buf.lang` reads) and attaches nothing, so that refusal has no
+//! instance.
+
+use term
+use text
+use unicode
+use util
+
+// `MACRO_ROWS_MAX`, `MACRO_LABEL_MAX` (`macrobrowse.c:27-30`).
+const MACRO_ROWS_MAX: int = 256
+
+const MACRO_LABEL_MAX: int = 256
+
+fn mb_named_reg(reg: int) -> bool { reg >= 'a' as int && reg <= 'z' as int }
+
+fn mb_char(reg: int) -> str { str_from_utf8([reg as byte]) else "?" }
+
+// `source_lines` (`macrobrowse.c:75-84`): a trailing newline ends the
+// last line rather than starting one.
+fn mb_source_lines(source: List[byte]) -> int {
+    var lines = 1
+    for i in 0..source.len {
+        if source[i] == 10 as byte && i + 1 < source.len { lines += 1 }
+    }
+    lines
+}
+
+/// `yew_macro_edit` (`macrobrowse.c:86-134`): register `reg` opened as a
+/// `*macro r*` scratch in its own tab, at its save point.
+pub fn macro_edit(mut ed: Ed, reg: int) -> int {
+    if !mb_named_reg(reg) { return CMD_ERR_ARG }
+    let value = text.reg_get(mut ed.regs, reg) else text.regval_new()
+    if value.bytes.len == 0 {
+        ed_msg(mut ed, MSG_ERROR, "macro @{mb_char(reg)} is empty")
+        return CMD_ERR_ARG
+    }
+    let bi = ws_scratch_new(mut ed, "*macro {mb_char(reg)}*", 0)
+    if bi < 0 { return CMD_ERR_IO }
+    // Outside the edit choke point: opening a macro is not an undoable
+    // user edit (`macrobrowse.c:106-112`).
+    text.textbuf_insert(mut ed.bufs[bi].ec.tb, text.byteoff(0), value.bytes)
+    text.undo_mark_saved(mut ed.bufs[bi].ec.undo, ed.bufs[bi].ec.tb)
+    // C's `scratch->lang` is the port's `ed.buf_languages`, keyed by id.
+    ed.buf_languages[ed.bufs[bi].id] = "fletch"
+    ed.bufs[bi].macro_reg = reg
+    // An ordinary untitled tab: tab navigation and close give the same
+    // way back as every other buffer (`macrobrowse.c:124-131`).
+    let tab = tab_open_buffer(mut ed, bi)
+    if tab < 0 {
+        ws_scratch_drop(mut ed, bi)
+        return CMD_ERR_STATE
+    }
+    tab_switch(mut ed, tab)
+    CMD_OK
+}
+
+/// `yew_macro_store` (`macrobrowse.c:136-192`): the scratch's text
+/// written to its register only if it compiles with every name resolved
+/// (YEW-F-010) — nothing of it runs — and then marked clean behind an
+/// undo boundary. A refusal leaves the register as it was and puts the
+/// caret on the diagnostic's position.
+pub fn macro_store(mut ed: Ed, bi: int) -> int {
+    if bi < 0 || bi >= ed.bufs.len || !mb_named_reg(ed.bufs[bi].macro_reg) || !ed.bufs[bi].resident {
+        return CMD_ERR_ARG
+    }
+    let reg = ed.bufs[bi].macro_reg
+    let source = text.textbuf_bytes(ed.bufs[bi].ec.tb)
+    let label = buf_label(ed.bufs[bi])
+    let _ = fl_compile_macro_str(mut ed, source, label) else {
+        let sp = copy ed.flrt.last_span
+        let has = ed.flrt.has_last_diag
+        let w = ed.win
+        if has &&
+            w >= 0 &&
+            ed.wins[w].buf == bi &&
+            ed.wins[w].cs.curs.len != 0 &&
+            sp.line != 0 &&
+            sp.line <= text.textbuf_line_count(ed.bufs[bi].ec.tb) {
+            let ls = text.textbuf_line_span(ed.bufs[bi].ec.tb, text.lineno(sp.line - 1))
+            var col = if sp.col == 0 then 0 else sp.col - 1
+            if col > ls.hi - ls.lo { col = ls.hi - ls.lo }
+            let pos = ls.lo + col
+            let p = ed.wins[w].cs.primary
+            ed.wins[w].cs.curs[p].pos = pos
+            ed.wins[w].cs.curs[p].anchor = pos
+            vp_follow(mut ed.wins[w], ed.bufs[bi].ec.tb)
+        }
+        if has {
+            let diag = copy ed.flrt.last_diag
+            ed_msg_bytes(mut ed, MSG_ERROR, diag)
+        } else {
+            ed_msg(mut ed, MSG_ERROR, "macro does not compile")
+        }
+        return CMD_ERR_ARG
+    }
+    let status = flapi_reg_write(mut ed, reg, source, false)
+    if status != CMD_OK { return status }
+    text.undo_boundary(mut ed.bufs[bi].ec.undo)
+    text.undo_mark_saved(mut ed.bufs[bi].ec.undo, ed.bufs[bi].ec.tb)
+    ed_msg(mut ed, MSG_INFO, "stored macro @{mb_char(reg)} ({mb_source_lines(source)} lines)")
+    CMD_OK
+}
+
+// `payload_library` (`macrobrowse.c:209-217`): a negative payload is
+// library entry -payload-1.
+fn mb_payload_library(ed: Ed, payload: int) -> MacroEntryView ! {none} {
+    if payload >= 0 { return none }
+    macrolib_at(ed, -payload - 1)?
+}
+
+fn mb_events_text(events: int) -> str { if events == 0 then "\u{2014}" else "{events} ev" }
+
+// snprintf into `labels[i][MACRO_LABEL_MAX]` keeps 255 bytes.
+fn mb_clip_label(s: str) -> str {
+    if s.len < MACRO_LABEL_MAX { return s }
+    var cut = MACRO_LABEL_MAX - 1
+    let b = s.bytes()
+    while cut > 0 && (b[cut] as int & 192) == 128 { cut -= 1 }
+    str_from_utf8(b[0..cut]) else ""
+}
+
+// `build_register_rows` (`macrobrowse.c:375-440`): the registers a-z
+// that hold text, the recording one marked, then the replayable
+// library entries with their paths as the detail.
+fn mb_rows(mut ed: Ed) -> List[PickItem] {
+    var rows = List[PickItem]()
+    let status = record_status(ed)
+    for reg in 'a' as int..'z' as int + 1 {
+        let value = text.reg_get(mut ed.regs, reg) else { continue }
+        if value.bytes.len == 0 || rows.len >= MACRO_ROWS_MAX { continue }
+        let events = macro_event_count(value.bytes)
+        let mark = if status.active && status.reg == reg then "\u{25CF}" else " "
+        let label = mb_clip_label("{mark} {mb_char(reg)}   {mb_events_text(events)}   {value.bytes.len} B")
+        (mut rows).push(pick_item(label, reg, 0))
+    }
+    let count = macrolib_count(ed)
+    var i = 0
+    while i < count && rows.len < MACRO_ROWS_MAX {
+        let entry = macrolib_at(ed, i) else {
+            i += 1
+            continue
+        }
+        if entry.replayable {
+            let label = mb_clip_label("  {entry.name}   {mb_events_text(entry.events)}   {entry.source.len} B")
+            (mut rows).push(PickItem { label: label, detail: copy entry.path, has_detail: true, payload: -i - 1, flags: 0 })
+        }
+        i += 1
+    }
+    rows
+}
+
+// `browser_search_part` (`macrobrowse.c:219-251`): part 0 is the name,
+// part 1 the source.
+fn mb_part(mut ed: Ed, payload: int, part: int) -> PkAnswer {
+    if part > 1 { return pk_no() }
+    if mb_named_reg(payload) {
+        let value = text.reg_get(mut ed.regs, payload) else { return pk_no() }
+        if part == 0 { return PkAnswer { ok: true, text: mb_char(payload) } }
+        return PkAnswer { ok: true, text: str_from_utf8(value.bytes) else "" }
+    }
+    let library = mb_payload_library(ed, payload) else { return pk_no() }
+    if part == 0 { return PkAnswer { ok: true, text: copy library.name } }
+    PkAnswer { ok: true, text: str_from_utf8(library.source) else "" }
+}
+
+// `browser_preview` (`macrobrowse.c:253-288`): the source's lines, each
+// clipped to the slot's width.
+fn mb_preview(mut ed: Ed, payload: int, r: Rect) {
+    var source = List[byte]()
+    if mb_named_reg(payload) {
+        let value = text.reg_get(mut ed.regs, payload) else { return }
+        source = copy value.bytes
+    } else {
+        let library = mb_payload_library(ed, payload) else { return }
+        source = copy library.source
+    }
+    let fg = term.color_default()
+    let bg = term.color_default()
+    var at = 0
+    var row = 0
+    while at < source.len && row < r.h {
+        var end = at
+        while end < source.len && source[end] != 10 as byte { end += 1 }
+        let (fit, _) = unicode.str_clip(source, at, end, r.w)
+        let _ = term.grid_puts(mut ed.grid, r.y + row, r.x, source, at, at + fit, copy fg, copy bg, 0)
+        row += 1
+        at = if end < source.len then end + 1 else end
+    }
+}
+
+// `browser_accept` (`macrobrowse.c:290-302`): a register replays once; a
+// library entry is called when replayable.
+fn mb_accept(mut ed: Ed, payload: int) -> bool {
+    if mb_named_reg(payload) { return macro_replay(mut ed, payload, 1) == CMD_OK }
+    let entry = mb_payload_library(ed, payload) else { return false }
+    entry.replayable && macrolib_call(mut ed, entry.name) == CMD_OK
+}
+
+// The yank of `bytes` into the unnamed register as charwise text.
+fn mb_yank(mut ed: Ed, bytes: List[byte]) {
+    var v = text.regval_new()
+    v.kind = text.REG_CHARWISE
+    v.bytes = copy bytes
+    text.reg_yank(mut ed.regs, 0, v)
+}
+
+// `browser_action` (`macrobrowse.c:304-373`): e edits, y yanks, d (twice)
+// clears a register, n seeds `:macro name r `; a library entry takes e
+// (its file in a tab) and y, and swallows d and n. `kch` is the key's one
+// text byte, -1 for any other key.
+fn mb_action(mut ed: Ed, payload: int, kch: int) -> bool {
+    if kch < 0 { return false }
+    // C's `payload_reg` is NULL for a library payload alone: every named
+    // register reads, empty or not (`register.c:185-220`).
+    if !mb_named_reg(payload) {
+        let library = mb_payload_library(ed, payload) else { return false }
+        if kch == 'e' as int {
+            picker_close(mut ed, false)
+            return tab_open(mut ed, library.path) >= 0
+        }
+        if kch == 'y' as int {
+            mb_yank(mut ed, library.source)
+            ed_msg(mut ed, MSG_INFO, "yanked macro {library.name}")
+            return true
+        }
+        return kch == 'd' as int || kch == 'n' as int
+    }
+    let reg = payload
+    if kch == 'e' as int {
+        picker_close(mut ed, false)
+        let _ = macro_edit(mut ed, reg)
+        return true
+    }
+    if kch == 'y' as int {
+        let value = text.reg_get(mut ed.regs, reg) else text.regval_new()
+        text.reg_yank(mut ed.regs, 0, value)
+        ed_msg(mut ed, MSG_INFO, "yanked macro @{mb_char(reg)}")
+        return true
+    }
+    if kch == 'd' as int {
+        if ed.picker.macro_confirm_delete != reg {
+            ed.picker.macro_confirm_delete = reg
+            ed_msg(mut ed, MSG_WARN, "press d again to clear macro @{mb_char(reg)}")
+            return true
+        }
+        let _ = flapi_reg_write(mut ed, reg, List[byte](), false)
+        ed.picker.macro_confirm_delete = 0
+        picker_close(mut ed, true)
+        ed_msg(mut ed, MSG_INFO, "cleared macro @{mb_char(reg)}")
+        return true
+    }
+    if kch == 'n' as int {
+        picker_close(mut ed, false)
+        cmdline_open(mut ed, PROMPT_CMD, "macro name {mb_char(reg)} ")
+        return true
+    }
+    ed.picker.macro_confirm_delete = 0
+    false
+}
+
+/// The macro browser's picker calls (C's `PickerSpec` callbacks,
+/// `macrobrowse.c:194-373`), PICK_HOST_MACRO's arm of `pk_host`.
+pub fn macrobrowse_host(mut ed: Ed, call: int, payload: int, how: int, r: Rect, part: int, kch: int) -> PkAnswer {
+    let _ = how
+    if call == PK_ACCEPT { return PkAnswer { ok: mb_accept(mut ed, payload), text: "" } }
+    if call == PK_PREVIEW {
+        mb_preview(mut ed, payload, r)
+        return pk_no()
+    }
+    if call == PK_PART { return mb_part(mut ed, payload, part) }
+    if call == PK_ACTION { return PkAnswer { ok: mb_action(mut ed, payload, kch), text: "" } }
+    pk_no()
+}
+
+// `append_first_line` (`macrobrowse.c:442-451`): up to the first line
+// end, tabs as spaces.
+fn mb_first_line(mut out: List[byte], source: List[byte]) {
+    var i = 0
+    while i < source.len && source[i] != 10 as byte && source[i] != 13 as byte {
+        (mut out).push(if source[i] == 9 as byte then 32 as byte else source[i])
+        i += 1
+    }
+}
+
+fn mb_porcelain_row(mut out: List[byte], name: str, events: int, bytes: List[byte]) {
+    let ev = if events == 0 then "-" else "{events}"
+    util.buf_append_str(mut out, "{name}\t{ev}\t{bytes.len}\t")
+    mb_first_line(mut out, bytes)
+    (mut out).push(10 as byte)
+}
+
+// `macro_porcelain` (`macrobrowse.c:453-511`): NAME, EVENTS (`-` for
+// none), BYTES and the first line, tab-separated; to stdout when
+// headless, else the message (its last newline dropped).
+fn mb_porcelain(mut ed: Ed) -> int {
+    var out = List[byte]()
+    for reg in 'a' as int..'z' as int + 1 {
+        let value = text.reg_get(mut ed.regs, reg) else { continue }
+        if value.bytes.len == 0 { continue }
+        mb_porcelain_row(mut out, mb_char(reg), macro_event_count(value.bytes), value.bytes)
+    }
+    for i in 0..macrolib_count(ed) {
+        let entry = macrolib_at(ed, i) else { continue }
+        if !entry.replayable { continue }
+        mb_porcelain_row(mut out, entry.name, entry.events, entry.source)
+    }
+    if ed.headless {
+        var ok = true
+        if out.len != 0 { fs_write_chunk(1, out) else |_| { ok = false } }
+        if !ok {
+            ed_msg(mut ed, MSG_ERROR, "cannot write macro list")
+            return CMD_ERR_IO
+        }
+        return CMD_OK
+    }
+    if out.len != 0 { let _ = (mut out).pop() else 0 as byte }
+    ed_msg_bytes(mut ed, MSG_INFO, out)
+    CMD_OK
+}
+
+/// `ed.macro.list` (`yew_macro_cmd_list`, `macrobrowse.c:513-534`): the
+/// browser from a key or the mouse, the porcelain from anything else.
+pub fn macro_cmd_list(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.source != SRC_KEY && cx.source != SRC_MOUSE { return mb_porcelain(mut ed) }
+    let rows = mb_rows(mut ed)
+    ed.picker.macro_confirm_delete = 0
+    var spec = picker_spec(PICK_HOST_MACRO, "Macros", take rows)
+    spec.has_preview = true
+    spec.has_action = true
+    spec.has_search_part = true
+    spec.footer = "enter replay . e edit . y yank . d clear . n name . / filter . esc"
+    spec.has_footer = true
+    spec.filter_requires_slash = true
+    picker_open(mut ed, spec)
+    if picker_active(ed) then CMD_OK else CMD_ERR_STATE
+}
+
+/// `ed.macro.edit r` (`yew_macro_cmd_edit`, `macrobrowse.c:536-541`).
+pub fn macro_cmd_edit(mut ed: Ed, cx: CmdCtx) -> int {
+    if !cx.has_sarg || cx.sarg.len != 1 { return CMD_ERR_ARG }
+    macro_edit(mut ed, cx.sarg.bytes()[0] as int)
+}
+
+// `macro_name_valid` (`macrobrowse.c:543-557`): a Fletch identifier.
+fn mb_name_valid(name: List[byte]) -> bool {
+    if name.len == 0 { return false }
+    for i in 0..name.len {
+        let c = name[i] as int
+        let alpha = c >= 'a' as int && c <= 'z' as int || c >= 'A' as int && c <= 'Z' as int || c == '_' as int
+        let digit = c >= '0' as int && c <= '9' as int
+        if !alpha && !(i > 0 && digit) { return false }
+    }
+    true
+}
+
+// `line_is_import_ed` (`macrobrowse.c:580-590`): `import ed` with blanks
+// around it.
+fn mb_line_is_import_ed(source: List[byte], lo_in: int, hi_in: int) -> bool {
+    var lo = lo_in
+    var hi = hi_in
+    while hi > lo && (source[hi - 1] == 13 as byte || source[hi - 1] == 32 as byte || source[hi - 1] == 9 as byte) { hi -= 1 }
+    while lo < hi && (source[lo] == 32 as byte || source[lo] == 9 as byte) { lo += 1 }
+    let want = copy "import ed".bytes()
+    if hi - lo != want.len { return false }
+    for i in 0..want.len { if source[lo + i] != want[i] { return false } }
+    true
+}
+
+// `source_has_import_ed` (`macrobrowse.c:592-606`).
+fn mb_has_import_ed(source: List[byte]) -> bool {
+    var at = 0
+    while at < source.len {
+        var end = at
+        while end < source.len && source[end] != 10 as byte { end += 1 }
+        if mb_line_is_import_ed(source, at, end) { return true }
+        at = if end < source.len then end + 1 else end
+    }
+    false
+}
+
+// `append_lifted` (`macrobrowse.c:608-627`): the macro as `fn NAME()`,
+// each line indented two spaces, its own `import ed` lines dropped.
+fn mb_append_lifted(mut out: List[byte], source: List[byte], name: str) {
+    util.buf_append_str(mut out, "\nfn {name}() {{\n")
+    var at = 0
+    while at < source.len {
+        var end = at
+        while end < source.len && source[end] != 10 as byte { end += 1 }
+        if !mb_line_is_import_ed(source, at, end) {
+            util.buf_append_str(mut out, "  ")
+            for i in at..end { (mut out).push(source[i]) }
+            (mut out).push(10 as byte)
+        }
+        at = if end < source.len then end + 1 else end
+    }
+    util.buf_append_str(mut out, "}}\n")
+}
+
+// `promote_macro` (`macrobrowse.c:629-721`): register `reg` lifted into
+// the library's `user.fl` as `fn NAME()`, the candidate file compiled
+// before it is written atomically, then rescanned and required to load
+// as `user.NAME`.
+fn mb_promote(mut ed: Ed, reg: int, name: str) -> int {
+    let name_bytes = copy name.bytes()
+    if !mb_named_reg(reg) || !mb_name_valid(name_bytes) {
+        ed_msg(mut ed, MSG_ERROR, "macro name must be a Fletch identifier")
+        return CMD_ERR_ARG
+    }
+    let value = text.reg_get(mut ed.regs, reg) else { return CMD_ERR_ARG }
+    if value.bytes.len == 0 { return CMD_ERR_ARG }
+    let dir = macrolib_dir(ed)
+    if dir.len == 0 || !util.mkdirs(dir, 448) {
+        ed_msg(mut ed, MSG_ERROR, "cannot create macro library directory")
+        return CMD_ERR_IO
+    }
+    let path = "{dir}/user.fl"
+    // A file that cannot be read but exists is refused; an absent one
+    // starts the library (`macrobrowse.c:660-665`).
+    let file = fs_read_bytes(path) else |e| match e {
+        not_found => List[byte](),
+        _ => {
+            ed_msg(mut ed, MSG_ERROR, "cannot read existing {path}")
+            return CMD_ERR_IO
+        },
+    }
+    var candidate = List[byte]()
+    if file.len == 0 {
+        util.buf_append_str(mut candidate, "# yew-macro: 1\n# recorded-with: yew {util.VERSION}\n# keymap: default\nimport ed\n")
+    } else {
+        util.buf_append(mut candidate, file)
+        if candidate[candidate.len - 1] != 10 as byte { (mut candidate).push(10 as byte) }
+        if !mb_has_import_ed(candidate) { util.buf_append_str(mut candidate, "import ed\n") }
+    }
+    mb_append_lifted(mut candidate, value.bytes, name)
+    let _ = fl_compile_str(mut ed, candidate, path) else {
+        if ed.flrt.has_last_diag {
+            let diag = copy ed.flrt.last_diag
+            ed_msg_bytes(mut ed, MSG_ERROR, diag)
+        } else {
+            ed_msg(mut ed, MSG_ERROR, "named macro does not compile")
+        }
+        return CMD_ERR_ARG
+    }
+    if text.file_write_atomic(path, candidate, 384) != text.SAVE_OK {
+        ed_msg(mut ed, MSG_ERROR, "cannot write {path}")
+        return CMD_ERR_IO
+    }
+    let _ = macrolib_scan(mut ed)
+    let canonical = "user.{name}"
+    let loaded = macrolib_find(ed, canonical) else {
+        ed_msg(mut ed, MSG_ERROR, "wrote {path} but macro {canonical} did not load")
+        return CMD_ERR_STATE
+    }
+    if !loaded.replayable {
+        ed_msg(mut ed, MSG_ERROR, "wrote {path} but macro {canonical} did not load")
+        return CMD_ERR_STATE
+    }
+    ed_msg(mut ed, MSG_INFO, "named macro @{mb_char(reg)} as {name}")
+    CMD_OK
+}
+
+/// `ed.macro.name r NAME` (`yew_macro_cmd_name`, `macrobrowse.c:723-750`):
+/// two words, or one string argument `r NAME`.
+pub fn macro_cmd_name(mut ed: Ed, cx: CmdCtx) -> int {
+    var reg_text = ""
+    var name = ""
+    if cx.argv.len == 3 {
+        reg_text = copy cx.argv[1]
+        name = copy cx.argv[2]
+        if reg_text.len != 1 { return CMD_ERR_ARG }
+    } else if cx.has_sarg && cx.sarg.len >= 3 {
+        let b = copy cx.sarg.bytes()
+        var sep = -1
+        for i in 0..b.len {
+            if b[i] == 32 as byte {
+                sep = i
+                break
+            }
+        }
+        if sep < 0 { return CMD_ERR_ARG }
+        if sep != 1 { return CMD_ERR_ARG }
+        reg_text = str_from_utf8(b[0..1]) else { return CMD_ERR_ARG }
+        name = str_from_utf8(b[sep + 1..b.len]) else { return CMD_ERR_ARG }
+    } else {
+        return CMD_ERR_ARG
+    }
+    let r = reg_text.bytes()[0] as int
+    if !mb_named_reg(r) { return CMD_ERR_ARG }
+    mb_promote(mut ed, r, name)
+}
+
+/// `ed.macro.reload` (`yew_macro_cmd_reload`, `macrobrowse.c:752-762`).
+pub fn macro_cmd_reload(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    let loaded = macrolib_scan(mut ed)
+    let s = if loaded == 1 then "" else "s"
+    ed_msg(mut ed, MSG_INFO, "reloaded {loaded} macro{s}")
+    CMD_OK
+}
