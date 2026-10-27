@@ -1,0 +1,405 @@
+//! edit.batch — `yew --batch SCRIPT`, sagitta 9ace98c2 src/edit/batch.c:
+//! 1-759 and batch.h:1-41 (Sprint 37): a headless editor that never
+//! touches the terminal (the tty is poisoned before anything can open
+//! it), the configuration loaded as an interactive start loads it, the
+//! files opened, the script compiled as the CLI principal over its
+//! realpath and run once, then the optional `--replay` and the batch
+//! epilogue (the dirty-buffer warning, the journals discarded, stdout
+//! flushed). Logs at WARN and above mirror to stderr as `yew: MESSAGE`;
+//! Fletch diagnostics print rendered. Exit codes: 0 done, 1 refused or a
+//! script's own `ed.ai.enable` refusal, 2 a script failure, 3 I/O. The
+//! profiler dump (`YEW_PROF`, batch.c:66-116) has no port before the
+//! profiler does (yw15's); plugins and their `--grant` rows are module-
+//! gated as C's module-less build is.
+
+use fl
+use term
+use text
+use util
+
+/// BatchOpts (batch.h:13-28).
+pub struct BatchOpts {
+    script: str,
+    files: List[str],
+    args: List[str],
+    replay_reg: int,
+    config_path: str,
+    ngrants: int,
+    clean: bool,
+    no_workspace_config: bool,
+    trust_workspace: bool,
+    test: bool,
+    quiet: bool,
+}
+
+const AI_ENABLE_NO_TTY: str = "AI cannot be enabled non-interactively; set ai.enable in init.fl if you have read :ai privacy"
+
+struct InteractiveRow { name: str, alt: str }
+
+fn ir(name: str, alt: str) -> InteractiveRow { InteractiveRow { name: name, alt: alt } }
+
+// interactive_rows (batch.c:122-192): the commands a script may not run,
+// each with what to use instead.
+fn batch_interactive_rows() -> List[InteractiveRow] {
+    [
+        ir("ed.ui.message_expand", "no batch alternative"),
+        ir("ed.cmdline.accept", "use ed.run(name, args)"),
+        ir("ed.cmdline.cancel", "use ed.run(name, args)"),
+        ir("ed.cmdline.copy_or_cancel", "use ed.run(name, args)"),
+        ir("ed.file.open", "use buf.open(path)"),
+        ir("ed.file.save_as", "use buf.save(b, path)"),
+        ir("ed.group.rename", "pass a name to a non-interactive group command"),
+        ir("ed.group.new", "construct the group with explicit arguments"),
+        ir("ed.group.edit", "no batch alternative"),
+        ir("ed.group.from_dir", "construct the group with explicit arguments"),
+        ir("ed.find.file", "use io.glob(pattern)"),
+        ir("ed.find.buffer", "use buf.list()"),
+        ir("ed.find.symbol", "no batch alternative"),
+        ir("ed.find.command", "no batch alternative"),
+        ir("ed.undo.branches", "use ed.run(\"ed.edit.undo\") or redo"),
+        ir("ed.search.open", "use b.find(re)"),
+        ir("ed.search.open_back", "use b.find(re)"),
+        ir("ed.compl.open", "no batch alternative"),
+        ir("ed.compl.complete", "no batch alternative"),
+        ir("ed.lsp.complete", "no batch alternative"),
+        ir("ed.lsp.hover", "no batch alternative"),
+        ir("ed.lsp.references", "no batch alternative"),
+        ir("ed.lsp.rename", "no batch alternative"),
+        ir("ed.lsp.symbols", "no batch alternative"),
+        ir("ed.lsp.signature", "no batch alternative"),
+        ir("ed.macro.record", "recording needs keys; none exist"),
+        ir("ed.ai.enable", AI_ENABLE_NO_TTY),
+        ir("ed.ai.open", "no batch alternative"),
+        ir("ed.plug.list", "use `yew plug list`"),
+        ir("ed.git.actions", "no batch alternative"),
+        ir("ed.git.commit", "no batch alternative"),
+        ir("ed.git.commit.amend", "no batch alternative"),
+        ir("ed.git.push", "no batch alternative"),
+        ir("ed.git.push.force", "no batch alternative"),
+        ir("ed.git.branch.switch", "no batch alternative"),
+        ir("ed.git.branch.create", "no batch alternative"),
+        ir("ed.git.branch.delete", "no batch alternative"),
+        ir("ed.git.merge", "no batch alternative"),
+        ir("ed.git.reset", "no batch alternative"),
+        ir("ed.git.rebase.interactive", "no batch alternative"),
+        ir("ed.git.cherry_pick", "no batch alternative"),
+        ir("ed.git.revert", "no batch alternative"),
+        ir("ed.git.stash.push", "no batch alternative"),
+        ir("ed.git.stash.pop", "no batch alternative"),
+        ir("ed.git.tag", "no batch alternative"),
+        ir("ed.git.discard", "no batch alternative"),
+        ir("ed.git.file.delete", "no batch alternative"),
+        ir("ed.git.file.rename", "no batch alternative"),
+        ir("ed.git.hunk.discard", "no batch alternative"),
+        ir("ed.mode.enter", "use ed.run(name, args)"),
+        ir("ed.shell.term_run", "use ed.shell.run; --batch has no terminal"),
+        ir("ed.cmdline.edit_in_buffer", "no batch alternative"),
+        ir("ed.cmdline.man_page", "run man through ed.shell.run; --batch has no terminal"),
+    ]
+}
+
+/// `yew_batch_command_alternative` (batch.c:333-349): what a script uses
+/// instead of `name`, "" for a batch-safe command; `ed.mode.enter` is
+/// refused only for E mode.
+pub fn batch_command_alternative(name: str, cx: CmdCtx) -> str {
+    if name == "ed.mode.enter" {
+        if !cx.has_sarg || cx.sarg != "E" { return "" }
+    }
+    for r in batch_interactive_rows() { if r.name == name { return r.alt } }
+    ""
+}
+
+/// `yew_batch_selfcheck_ok` (batch.c:284-323): no grid, no input, the
+/// terminal poisoned, no timer, and no interactive command bound in any
+/// active keymap; "" when sound, else why.
+pub fn batch_selfcheck_why(ed: Ed) -> str {
+    if ed.grid_ready { return "grid initialized" }
+    if ed.input_ready { return "input initialized" }
+    if !ed.tty.poisoned { return "terminal not poisoned" }
+    for k in ed.keys {
+        let (_, entries) = keymap_list(ed.keymaps[k])
+        for e in entries {
+            if cmd_active(ed.reg, e.bind.cmd) && ed.reg.entries[e.bind.cmd - 1].flags & CMD_INTERACTIVE != 0 {
+                return "interactive command bound"
+            }
+        }
+    }
+    ""
+}
+
+/// `yew_batch_selfcheck` (batch.c:325-331): a failed check is a bug.
+pub fn batch_selfcheck(ed: Ed) {
+    let why = batch_selfcheck_why(ed)
+    if why.len != 0 { util.bug("edit.batch", "batch startup self-check failed: {why}") }
+}
+
+// read_all_fd (batch.c:228-249) for standard input.
+fn batch_read_stdin() -> List[byte] ! {failed} {
+    var out = List[byte]()
+    loop {
+        let chunk = fs_read_chunk(0, 65536) else |e| match e {
+            eof => { break },
+            io => { return failed },
+        }
+        util.buf_append(mut out, chunk)
+    }
+    out
+}
+
+// append_stdin_buffer (batch.c:394-409).
+fn batch_stdin_buffer(mut ed: Ed, bytes: List[byte], first: bool) {
+    if first {
+        ed_open_memory(mut ed, bytes, "[stdin]")
+        return
+    }
+    let bi = ws_scratch_new(mut ed, "[stdin]", 0)
+    if bytes.len != 0 { text.textbuf_insert(mut ed.bufs[bi].ec.tb, 0 as text.ByteOff, bytes) }
+    text.undo_mark_saved(mut ed.bufs[bi].ec.undo, ed.bufs[bi].ec.tb)
+    ed_hook_buffer(mut ed, fl.FL_EV_BUF_OPEN, bi)
+}
+
+// load_error_text (batch.c:411-422): C's ENOENT is not a success here.
+fn batch_load_error(status: int) -> str {
+    if status == text.LOAD_EACCES { return "permission denied" }
+    if status == text.LOAD_EISDIR { return "is a directory" }
+    if status == text.LOAD_TOO_LARGE { return "file is too large" }
+    if status == text.LOAD_IO { return "input/output error" }
+    "unknown load error"
+}
+
+// yew_ed_open (ed.c:929-955) for the first batch file: the file read into
+// a buffer the window shows, a missing one new and empty, buf.open fired;
+// the load status answered.
+fn batch_open_first(mut ed: Ed, path: str) -> int {
+    if ed.fl_model_teardown { return text.LOAD_IO }
+    let canonical = canonical_path(path)
+    let (status, tb, meta) = text.file_load(canonical)
+    if status != text.LOAD_OK && status != text.LOAD_ENOENT { return status }
+    var b = buffer_around(mut ed, take tb, meta, canonical, true)
+    b.tabwidth = ed.opts.tabwidth
+    (mut ed.bufs).push(b)
+    let bi = ed.bufs.len - 1
+    ed_show_buffer(mut ed, bi)
+    if ed.tab_active >= 0 && ed.tab_active < ed.tabs.len { ed.tabs[ed.tab_active].buffer_id = ed.bufs[bi].id }
+    ed_hook_buffer(mut ed, fl.FL_EV_BUF_OPEN, bi)
+    status
+}
+
+// open_batch_files (batch.c:424-474).
+fn batch_open_files(mut ed: Ed, opts: BatchOpts) -> bool {
+    for i in 0..opts.files.len {
+        let path = copy opts.files[i]
+        if path == "-" {
+            if ed.batch_stdin_claimed {
+                eprint("yew: error: stdin may be opened only once")
+                return false
+            }
+            ed.batch_stdin_claimed = true
+            if ed.flrt.ready && ed.flrt.vms.len != 0 { ed.flrt.vms[0].batch_stdin_claimed = true }
+            let bytes = batch_read_stdin() else {
+                eprint("yew: error: cannot read stdin: {batch_strerror(os_error())}")
+                return false
+            }
+            batch_stdin_buffer(mut ed, bytes, i == 0)
+        } else if i == 0 {
+            let load = batch_open_first(mut ed, path)
+            if load != text.LOAD_OK {
+                eprint("yew: error: cannot open {path}: {batch_load_error(load)}")
+                return false
+            }
+        } else {
+            let bi = ws_file_buf(mut ed, path)
+            if bi < 0 || buf_hydrate(mut ed, bi) != 0 {
+                eprint("yew: error: cannot open {path}: input/output error")
+                return false
+            }
+            ed_hook_buffer(mut ed, fl.FL_EV_BUF_OPEN, bi)
+        }
+    }
+    true
+}
+
+fn batch_strerror(e: int) -> str {
+    if e == 2 { return "No such file or directory" }
+    if e == 13 { return "Permission denied" }
+    if e == 21 { return "Is a directory" }
+    if e == 5 { return "Input/output error" }
+    "Unknown error {e}"
+}
+
+// install_globals (batch.c:381-392): args, script_path, files and batch
+// in the runtime's globals.
+fn batch_install_globals(mut ed: Ed, opts: BatchOpts, script_path: str) {
+    var vm = runtime_take(mut ed)
+    batch_set_global_list(mut vm, "args", opts.args)
+    let sp = fl.fl_str_text(mut vm, script_path)
+    batch_set_global(mut vm, "script_path", sp)
+    batch_set_global_list(mut vm, "files", opts.files)
+    batch_set_global(mut vm, "batch", fl.fl_bool(true))
+    (mut ed.flrt.vms).push(vm)
+}
+
+fn batch_set_global(mut vm: fl.FlVm, name: str, v: fl.FlValue) {
+    let root = fl.fl_temp_push(mut vm, v)
+    let nb = copy name.bytes()
+    let id = fl.fl_intern(mut vm.strings, nb, 0, nb.len)
+    let globals = copy vm.globals
+    let value = fl.fl_temp_get(vm, root)
+    let _ = fl.fl_map_set(mut vm, globals, fl.fl_int(id), value)
+    fl.fl_temp_pop(mut vm, 1)
+}
+
+fn batch_set_global_list(mut vm: fl.FlVm, name: str, items: List[str]) {
+    let list = fl.fl_list_new(mut vm)
+    let root = fl.fl_temp_push(mut vm, list)
+    for s in items {
+        let v = fl.fl_str_text(mut vm, s)
+        let held = fl.fl_temp_get(vm, root)
+        fl.fl_list_push(mut vm, held, v)
+    }
+    let l = fl.fl_temp_get(vm, root)
+    fl.fl_temp_pop(mut vm, 1)
+    batch_set_global(mut vm, name, l)
+}
+
+// batch_error_field (batch.c:476-495).
+fn batch_error_field(vm: fl.FlVm, name: str) -> List[byte] ! {none} {
+    if vm.err.t != fl.FL_MAP { return none }
+    var cursor = 0
+    loop {
+        let (next, k, v) = fl.fl_map_iter(vm, vm.err, cursor) else { break }
+        cursor = next
+        if k.t != fl.FL_STR || v.t != fl.FL_STR { continue }
+        let kb = copy vm.gc.slots[fl.fl_obj_index(vm, k)].bytes
+        if kb.len == name.len && (str_from_utf8(kb) else "") == name {
+            return copy vm.gc.slots[fl.fl_obj_index(vm, v)].bytes
+        }
+    }
+    none
+}
+
+// batch_ai_enable_refused (batch.c:497-512).
+fn batch_ai_enable_refused(vm: fl.FlVm) -> bool {
+    let kind = batch_error_field(vm, "kind") else { return false }
+    let msg = batch_error_field(vm, "msg") else { return false }
+    let want = "\"ed.ai.enable\" requires a terminal and is not available under --batch; {AI_ENABLE_NO_TTY}"
+    (str_from_utf8(kind) else "") == "capability" && (str_from_utf8(msg) else "") == want
+}
+
+// render_script_error (batch.c:514-534): true when it was the AI refusal
+// (exit 1), false for an ordinary script failure (exit 2).
+fn batch_render_error(mut ed: Ed) -> bool {
+    var vm = runtime_take(mut ed)
+    if batch_ai_enable_refused(vm) {
+        (mut ed.flrt.vms).push(vm)
+        eprint(AI_ENABLE_NO_TTY)
+        return true
+    }
+    var trace = List[byte]()
+    let err = copy vm.err
+    fl.fl_trace_render(mut vm, err, mut trace)
+    (mut ed.flrt.vms).push(vm)
+    var first = 0
+    if trace.len >= 7 && (str_from_utf8(trace[0..7]) else "") == "error: " { first = 7 }
+    var out = List[byte]()
+    util.buf_append_str(mut out, "yew: script failed: ")
+    util.buf_append(mut out, trace[first..trace.len])
+    if trace.len == first || trace[trace.len - 1] != 10 as byte { (mut out).push(10 as byte) }
+    fs_write_chunk(2, out) else {}
+    false
+}
+
+// warn_dirty (batch.c:536-557).
+fn batch_warn_dirty(ed: Ed, quiet: bool) {
+    var dirty = List[int]()
+    for i in 0..ed.bufs.len { if ed.bufs[i].id != 0 && buf_dirty(ed.bufs[i]) { (mut dirty).push(i) } }
+    if dirty.len == 0 || quiet { return }
+    let s = if dirty.len == 1 then "" else "s"
+    var line = "warning: {dirty.len} buffer{s} modified and not saved: "
+    for k in 0..dirty.len {
+        if k != 0 { line = "{line}, " }
+        line = "{line}{buf_label(ed.bufs[dirty[k]])}"
+    }
+    eprint(line)
+}
+
+// discard_journals (batch.c:559-571).
+fn batch_discard_journals(mut ed: Ed) {
+    for i in 0..ed.bufs.len {
+        if ed.bufs[i].ec.has_jrnl {
+            let _ = text.journal_discard(mut ed.journals, mut ed.bufs[i].ec.jrnl)
+            ed.bufs[i].ec.has_jrnl = false
+        }
+    }
+}
+
+/// `yew_batch_run` (batch.c:599-759): the exit status.
+pub fn batch_run(opts: BatchOpts) -> int {
+    let source = fs_read_bytes(opts.script) else {
+        eprint("yew: error: cannot read script {opts.script}: {batch_strerror(os_error())}")
+        return util.EXIT_ERR
+    }
+    let script_path = fs_realpath(opts.script) else copy opts.script
+    util.log_set_batch_mirror(true, opts.quiet)
+    var ed = ed_new()
+    ed.headless = true
+    term.tty_poison(mut ed.tty)
+    batch_selfcheck(ed)
+    let _ = fl_runtime_init(mut ed)
+    ed.flrt.diag_batch = if opts.quiet then 2 else 1
+    var s = startup_default()
+    s.config_path = opts.config_path
+    s.clean = opts.clean
+    s.no_workspace_config = opts.no_workspace_config
+    s.trust_workspace = opts.trust_workspace
+    config_init(mut ed, s)
+    // Match interactive startup: configuration may set buffer- and
+    // window-scoped options, so it needs the initial scratch model.
+    ed_open_scratch(mut ed)
+    let _ = config_load_all(mut ed)
+    var result = util.EXIT_ERR
+    var workspace_hook = false
+    if opts.files.len != 0 && !batch_open_files(mut ed, opts) {
+        result = util.EXIT_IO
+    } else if opts.ngrants != 0 {
+        eprint(mod_require(MOD_PLUGINS))
+        result = util.EXIT_ERR
+    } else {
+        ed_hook_workspace(mut ed, fl.FL_EV_WS_OPEN)
+        workspace_hook = true
+        batch_install_globals(mut ed, opts, script_path)
+        if opts.test {
+            ed.btest = batch_test_new()
+            if !batch_test_install(mut ed) { util.bug("edit.batch", "cannot install batch assertion host") }
+        }
+        result = batch_run_script(mut ed, opts, source, script_path)
+    }
+    if ed.btest.installed && !batch_test_finish(mut ed) { result = util.EXIT_BATCH }
+    if workspace_hook { ed_hook_workspace(mut ed, fl.FL_EV_WS_CLOSE) }
+    batch_warn_dirty(ed, opts.quiet)
+    batch_discard_journals(mut ed)
+    util.log_set_batch_mirror(false, false)
+    result
+}
+
+// The script's compile, run and replay (batch.c:695-738).
+fn batch_run_script(mut ed: Ed, opts: BatchOpts, source: List[byte], script_path: str) -> int {
+    let script = fl_compile_script(mut ed, source, script_path) else { return util.EXIT_BATCH }
+    if !fl_call_chunk(mut ed, script, SRC_FLETCH) {
+        return if batch_render_error(mut ed) then util.EXIT_ERR else util.EXIT_BATCH
+    }
+    if opts.replay_reg != 0 && macro_replay(mut ed, opts.replay_reg, 1) != CMD_OK {
+        if ed.flrt.vms[0].err.t != fl.FL_NIL {
+            let _ = batch_render_error(mut ed)
+        } else {
+            let r = str_from_utf8([opts.replay_reg as byte]) else "?"
+            eprint("yew: replay @{r} failed")
+        }
+        return util.EXIT_BATCH
+    }
+    // The smoke lane's guard drill (batch.c:732-737): the forbidden call
+    // made only after script output exists, proving exit 4 and the flush.
+    let _ = env_get("YEW_BATCH_SELFTEST_TTY") else { return util.EXIT_OK }
+    let _ = term.tty_signal_fd(ed.tty)
+    util.EXIT_OK
+}
