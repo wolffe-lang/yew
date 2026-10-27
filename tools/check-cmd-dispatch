@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""check-cmd-dispatch: named-command integrity, the port's form of sagitta
+9ace98c2 scripts/check-cmd-dispatch.sh (42 lines, Sprint 34 §3).
+
+C counts each static `cmd_*` handler symbol: defined once and named once in
+the descriptor table, so no second call site can reach a command around
+the registry. The port's commands reach their code through ONE match
+(src/edit/impl.lu, R-yw07-10): `impl_of_handler` maps a C handler name to
+an implementation id and `run_impl` dispatches the id. The same claim here:
+
+  1. every handler name is mapped once, every id from one handler;
+  2. every mapped id has exactly one `run_impl` arm and every arm's id is
+     mapped (no dead arm, no mapped id that falls to the refusal);
+  3. every arm calls its own function (one arm per implementation);
+  4. every mapped handler names a row of src/edit/cmdtab.lu (the pin's
+     registry), so no map entry outlives its command;
+  5. src/edit/keys.lu (keys_default.c's port) is data: each function
+     answers rows and none runs a command (C's "data plus one install
+     function", keys_default.c:89-112).
+
+--selftest plants a second arm, a mapped id without an arm, and a key
+function that runs a command, and must see each refused."""
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+MAP_RE = re.compile(r'^\s*"([a-z0-9_]+)" => ([A-Z0-9_]+|[0-9]+),')
+ARM_RE = re.compile(r'^\s*([0-9]+) => ([a-z0-9_]+)\(')
+CONST_RE = re.compile(r'^(?:pub )?const (IMPL_[A-Z0-9_]+): int = ([0-9]+)')
+FN_RE = re.compile(r'^(?:pub )?fn ([a-z0-9_]+)\(.*\)\s*(->\s*(.+?))?\s*\{\s*$')
+
+
+def section(text, start):
+    """The lines of the function beginning at `start` (a `fn` line prefix)."""
+    lines = text.splitlines()
+    out = []
+    inside = False
+    for line in lines:
+        if not inside and line.startswith(start):
+            inside = True
+            continue
+        if inside:
+            if line == '}':
+                break
+            out.append(line)
+    return out
+
+
+def check(impl, cmdtab, keys):
+    errs = []
+    consts = {}
+    for line in impl.splitlines():
+        m = CONST_RE.match(line)
+        if m:
+            consts[m.group(1)] = int(m.group(2))
+    unported = consts.get('IMPL_UNPORTED')
+    if unported is None:
+        errs.append('impl.lu: no IMPL_UNPORTED')
+    names = {}
+    ids = {}
+    for line in section(impl, 'pub fn impl_of_handler('):
+        m = MAP_RE.match(line)
+        if not m:
+            continue
+        name, val = m.group(1), m.group(2)
+        num = int(val) if val.isdigit() else consts.get(val)
+        if num is None:
+            errs.append(f'map: {name} names an unknown constant {val}')
+            continue
+        if num == unported:
+            errs.append(f'map: {name} maps to IMPL_UNPORTED')
+        if name in names:
+            errs.append(f'map: handler {name} mapped twice')
+        names[name] = num
+        ids.setdefault(num, []).append(name)
+    for num, hs in sorted(ids.items()):
+        if len(hs) != 1:
+            errs.append(f'map: id {num} from {len(hs)} handlers: {" ".join(hs)}')
+    arms = {}
+    calls = {}
+    for line in section(impl, 'pub fn run_impl('):
+        m = ARM_RE.match(line)
+        if not m:
+            continue
+        num, fn = int(m.group(1)), m.group(2)
+        arms.setdefault(num, []).append(fn)
+        calls.setdefault(fn, []).append(num)
+    for num, fns in sorted(arms.items()):
+        if len(fns) != 1:
+            errs.append(f'dispatch: id {num} has {len(fns)} arms')
+        if num not in ids:
+            errs.append(f'dispatch: arm {num} ({fns[0]}) is mapped by no handler')
+    for num, hs in sorted(ids.items()):
+        if num not in arms:
+            errs.append(f'dispatch: id {num} ({hs[0]}) has no arm')
+    for fn, nums in sorted(calls.items()):
+        if len(nums) != 1:
+            errs.append(f'dispatch: {fn} reached from {len(nums)} arms')
+    handlers = set()
+    for line in cmdtab.splitlines():
+        if '\\x1f' not in line:
+            continue
+        fields = line.split('\\x1f')
+        if len(fields) > 1:
+            handlers.add(fields[1])
+    for name in sorted(names):
+        if name not in handlers:
+            errs.append(f'map: {name} names no row of cmdtab.lu')
+    for line in keys.splitlines():
+        m = FN_RE.match(line)
+        if m and (m.group(3) or '').strip() != 'List[BindRow]':
+            errs.append(f'keys.lu: {m.group(1)} is not row data')
+    if re.search(r'\b(cmd_invoke|ed_dispatch|run_impl)\(', keys):
+        errs.append('keys.lu: a key table runs a command')
+    return errs, len(names), len(arms)
+
+
+def read(rel):
+    return (ROOT / rel).read_text()
+
+
+def selftest():
+    impl, cmdtab, keys = read('src/edit/impl.lu'), read('src/edit/cmdtab.lu'), read('src/edit/keys.lu')
+    errs, _, _ = check(impl, cmdtab, keys)
+    if errs:
+        print('check-cmd-dispatch: selftest base is not clean', file=sys.stderr)
+        return 1
+    arm = re.search(r'^(\s*)([0-9]+) => ([a-z0-9_]+)\(mut ed, cx\)', impl, re.M)
+    plants = {
+        'a second arm': impl.replace(arm.group(0), arm.group(0) + ',\n' + arm.group(0), 1),
+        'a mapped id without an arm': impl.replace(arm.group(0) + ',', '', 1),
+        'a dead arm': impl.replace(arm.group(0), f'{arm.group(1)}99999 => planted_cmd(mut ed, cx),\n' + arm.group(0), 1),
+    }
+    bad = 0
+    for what, text in plants.items():
+        errs, _, _ = check(text, cmdtab, keys)
+        if not errs:
+            print(f'check-cmd-dispatch: selftest: {what} was accepted', file=sys.stderr)
+            bad = 1
+    planted_keys = keys + '\npub fn keys_planted(mut ed: Ed) -> int {\n    cmd_invoke(mut ed, 1, mut cx)\n}\n'
+    if not check(impl, cmdtab, planted_keys)[0]:
+        print('check-cmd-dispatch: selftest: a key function running a command was accepted', file=sys.stderr)
+        bad = 1
+    if not bad:
+        print('check-cmd-dispatch: selftest: 4 plants refused')
+    return bad
+
+
+def main():
+    if '--selftest' in sys.argv[1:]:
+        return selftest()
+    errs, nmap, narms = check(read('src/edit/impl.lu'), read('src/edit/cmdtab.lu'), read('src/edit/keys.lu'))
+    for e in errs:
+        print(f'dispatch: {e}', file=sys.stderr)
+    if errs:
+        return 1
+    print(f'dispatch: named-command integrity ok ({nmap} handlers, {narms} arms)')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
