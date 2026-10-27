@@ -1,0 +1,379 @@
+//! fuzz-flapi — Sprint 34 §8's editor-API fuzzer, sagitta 9ace98c2
+//! tests/fuzz/fuzz_flapi.c:1-367 over fuzzlib.c's generator (tools/fuzzgen).
+//!
+//! Both host boundaries s34 owns: generational handles and `ed.run`'s
+//! generic marshalling. Each input byte drives one handle-table operation
+//! (take a real handle, release one, resolve a held one, resolve a CRAFTED
+//! {kind, slot, gen}, drop the document's handles, resolve nil) followed by
+//! one `ed.run` of a command, map keys and values chosen from the same
+//! bytes (fuzz_flapi.c:170-243), against a real scratch editor; at most
+//! 4096 bytes and 4096 operations, 64 live handles (fuzz_flapi.c:60-69).
+//!
+//! THE PROPERTY (fuzz_flapi.c:245-352): a held handle resolves or raises
+//! `handle`/`type`; a crafted one may resolve only while its slot is alive,
+//! and a refusal raises `handle` or `type`, never another kind or none; nil
+//! is a `type` error; `ed.run` keeps its transaction envelope (run_begin
+//! accepted, run_end closed) and a failed run raises one of §9.1's thirteen
+//! kinds (tests/fuzz/fl_kinds.h:19-33). C's sanitizer lanes hold the half
+//! no assertion can see (no resolve dereferences a dead slot); the port's
+//! bounds are the language's, so an out-of-range slot traps rather than
+//! reads.
+//!
+//! The VM is the runtime's own, taken from the editor as
+//! tests/unit/test_fl_cmds.c's fixture does in src/fl_cmds_test.lu, so the
+//! commands dispatch through the one invoke and its parking (C's
+//! fl_ed_attach + fl_host_editor). The report line's `hash=` covers the
+//! generated stream, so equality with C's driver at the same seed and
+//! iterations is the witness that both fed their check the same inputs;
+//! the tally on stderr shows the check executed them. No watchdog: an
+//! input is at most 4096 bounded operations (C's ITIMER_PROF guard,
+//! fuzzlib.c:1125-1209, never fires on this target).
+
+use edit
+use fl
+use fuzzgen
+
+// fuzz_flapi.c:60-69.
+const MAX_INPUT: int = 4096
+
+const MAX_OPS: int = 4096
+
+const MAX_LIVE: int = 64
+
+// FLAPI_KINDS (fuzz_flapi.c:71-72), in C's order.
+fn kind_at(i: int) -> int {
+    match i {
+        0 => fl.FL_H_BUF,
+        1 => fl.FL_H_CUR,
+        2 => fl.FL_H_SPAN,
+        3 => fl.FL_H_WIN,
+        _ => fl.FL_H_RE,
+    }
+}
+
+// allowed_kind (fuzz_flapi.c:75-78).
+fn allowed_kind(k: str) -> bool { k == "handle" || k == "type" }
+
+// fl_kinds.h:19-33's closed set (yew_fl_fuzz_spec_kind).
+fn spec_kind(kind: str) -> bool {
+    for k in "type|arity|name|index|key|div|capability|io|import|motion|user|limit|handle".split(
+        "|",
+    ) {
+        if k == kind { return true }
+    }
+    false
+}
+
+// raised_kind (fuzz_flapi.c:80-95): the raised error's kind, "" when none.
+fn raised_kind(mut vm: fl.FlVm) -> str {
+    if vm.err.t != fl.FL_MAP { return "" }
+    let key = fl.fl_str_text(mut vm, "kind")
+    let got = fl.fl_map_get(vm, vm.err, key) else { return "" }
+    if got.t != fl.FL_STR { return "" }
+    var out = List[byte]()
+    for b in vm.gc.slots[fl.fl_obj_index(vm, got)].bytes {
+        if b as int == 0 || out.len >= 31 { break }
+        (mut out).push(b)
+    }
+    str_from_utf8(out) else "?"
+}
+
+fn clear(mut vm: fl.FlVm) {
+    vm.raised = false
+    vm.err = fl.fl_nil()
+}
+
+// try_resolve (fuzz_flapi.c:97-130): (resolved, the raise's kind).
+fn try_resolve(mut vm: fl.FlVm, mut ed: edit.Ed, want: int, v: fl.FlValue) -> (bool, str) {
+    clear(mut vm)
+    var ok = true
+    if want == fl.FL_H_BUF {
+        let _ = edit.fl_h_buf(mut vm, ed, v) else { ok = false }
+    } else if want == fl.FL_H_WIN {
+        let _ = edit.fl_h_win(mut vm, ed, v) else { ok = false }
+    } else if want == fl.FL_H_CUR {
+        let _ = edit.fl_h_cur(mut vm, mut ed, v) else { ok = false }
+    } else if want == fl.FL_H_SPAN {
+        let _ = edit.fl_h_span(mut vm, ed, v) else { ok = false }
+    } else {
+        let _ = edit.fl_h_re(mut vm, ed, v) else { ok = false }
+    }
+    let kind = raised_kind(mut vm)
+    clear(mut vm)
+    (ok, kind)
+}
+
+// crafted (fuzz_flapi.c:138-151): a real handle made and released (the
+// table's free list moves as C's does), then its slot and generation
+// overwritten.
+fn crafted(mut ed: edit.Ed, k: int, slot: int, gen: int) -> fl.FlValue {
+    let v = fl.fl_h_make(mut ed.handles, k, fl.fl_h_payload_new())
+    let _ = edit.fl_h_free(mut ed, v)
+    fl.fl_h_encode(k, slot, gen)
+}
+
+// fuzz_str (fuzz_flapi.c:153-168).
+fn fuzz_str(mut vm: fl.FlVm, data: List[byte], at: int, max_in: int) -> fl.FlValue {
+    let len = data.len
+    if len == 0 { return fl.fl_str_new(mut vm, List[byte]()) }
+    let max = if max_in > 16 then 16 else max_in
+    let n = data[at % len] as int % (max + 1)
+    var bytes = List[byte]()
+    for i in 0..n { (mut bytes).push(data[(at + 1 + i) % len]) }
+    fl.fl_str_new(mut vm, bytes)
+}
+
+fn text_value(mut vm: fl.FlVm, s: str) -> fl.FlValue { fl.fl_str_text(mut vm, s) }
+
+// (i64)(i8)byte.
+fn signed_byte(b: byte) -> int {
+    let v = b as int
+    if v >= 128 then v - 256 else v
+}
+
+/// What the campaign did, for its stderr summary (never the report line).
+struct Tally {
+    ops: int,
+    resolved: int,
+    refused: int,
+    crafted_alive: int,
+    runs: int,
+    run_raised: int,
+}
+
+// fuzz_ed_run (fuzz_flapi.c:170-243): "" when the run held.
+fn fuzz_ed_run(mut vm: fl.FlVm, mut ed: edit.Ed, data: List[byte], at: int, mut t: Tally) -> str {
+    let len = data.len
+    let m0 = fl.fl_map_new(mut vm)
+    let root = fl.fl_temp_push(mut vm, m0)
+    let entries = if len == 0 then 0 else data[at % len] as int % 5
+    for i in 0..entries {
+        let selector = data[(at + 1 + i * 3) % len] as int
+        let key = if selector & 4 != 0 {
+            fuzz_str(mut vm, data, at + 2 + i * 3, 8)
+        } else {
+            match selector & 3 {
+                0 => text_value(mut vm, "count"),
+                1 => text_value(mut vm, "iarg"),
+                2 => text_value(mut vm, "sarg"),
+                _ => text_value(mut vm, "win"),
+            }
+        }
+        let kslot = fl.fl_temp_push(mut vm, key)
+        let value = match (selector >> 3) & 3 {
+            0 => fl.fl_int(signed_byte(data[(at + 2 + i * 3) % len])),
+            1 => fuzz_str(mut vm, data, at + 2 + i * 3, 12),
+            2 => {
+                let w = ed.win
+                edit.fl_h_win_make(mut ed, w)
+            },
+            _ => fl.fl_nil(),
+        }
+        let vslot = fl.fl_temp_push(mut vm, value)
+        let _ = fl.fl_map_set(
+            mut vm,
+            fl.fl_temp_get(vm, root),
+            fl.fl_temp_get(vm, kslot),
+            fl.fl_temp_get(vm, vslot),
+        )
+        fl.fl_temp_pop(mut vm, 2)
+    }
+    let command = match data[at % len] as int & 3 {
+        0 => "ed.nop",
+        1 => "ed.edit.insert.at",
+        2 => "ed.repeat",
+        _ => "no.such.command",
+    }
+    let name = fl.fl_str_text(mut vm, command)
+    let nslot = fl.fl_temp_push(mut vm, name)
+    clear(mut vm)
+    if !edit.fl_txn_run_begin(mut vm, mut ed) {
+        fl.fl_temp_pop(mut vm, 2)
+        return "ed.run envelope refused"
+    }
+    vm.cur_native = fl.fl_intern(mut vm.strings, "ed.run".bytes(), 0, 6)
+    vm.stack[1] = fl.fl_temp_get(vm, nslot)
+    vm.stack[2] = fl.fl_temp_get(vm, root)
+    vm.sp = 3
+    let _ = edit.fl_attached_api(mut vm, mut ed, 13000, 1, 2)
+    vm.sp = 0
+    let invoked = !vm.raised
+    let ended = edit.fl_txn_run_end(mut ed, invoked)
+    t.runs += 1
+    if !ended {
+        fl.fl_temp_pop(mut vm, 2)
+        return "ed.run envelope did not close"
+    }
+    if !invoked {
+        t.run_raised += 1
+        let kind = raised_kind(mut vm)
+        if !spec_kind(kind) {
+            fl.fl_temp_pop(mut vm, 2)
+            let shown = if kind == "" then "(none)" else kind
+            return "ed.run failed with '{shown}'"
+        }
+    }
+    clear(mut vm)
+    fl.fl_temp_pop(mut vm, 2)
+    ""
+}
+
+// check_flapi (fuzz_flapi.c:245-361): one input; "" when it held.
+fn check_flapi(input: List[byte], mut t: Tally) -> str {
+    let len = if input.len > MAX_INPUT then MAX_INPUT else input.len
+    var data = List[byte]()
+    (mut data).reserve(len)
+    for i in 0..len { (mut data).push(input[i]) }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    if !edit.fl_runtime_init(mut ed) { return "fixture: no runtime" }
+    var vm = (mut ed.flrt.vms).pop() else { return "fixture: no runtime VM" }
+    var live = List[fl.FlValue]()
+    var i = 0
+    var why = ""
+    while i < len && i < MAX_OPS && why == "" {
+        let op = data[i] as int
+        let k = kind_at((op >> 3) % 5)
+        t.ops += 1
+        let d = edit.ed_doc(ed)
+        match op & 7 {
+            0 => {
+                if live.len < MAX_LIVE { (mut live).push(edit.fl_h_buf_make(mut ed, d)) }
+            },
+            1 => {
+                let w = ed.win
+                if live.len < MAX_LIVE { (mut live).push(edit.fl_h_win_make(mut ed, w)) }
+            },
+            2 => {
+                if live.len < MAX_LIVE { (mut live).push(edit.fl_h_span_make(mut ed, d, 0, 0)) }
+            },
+            3 => {
+                if live.len != 0 {
+                    let v = (mut live).pop() else fl.fl_nil()
+                    let _ = edit.fl_h_free(mut ed, v)
+                }
+            },
+            4 => {
+                if live.len != 0 {
+                    let v = copy live[(op >> 3) % live.len]
+                    let (ok, kind) = try_resolve(mut vm, mut ed, fl.fl_h_kind_of(v), v)
+                    if ok { t.resolved += 1 } else { t.refused += 1 }
+                    if kind != "" && !allowed_kind(kind) { why = "live handle raised '{kind}'" }
+                }
+            },
+            5 => {
+                let slot = data[(i + 1) % len] as int
+                let gen = data[(i + 2) % len] as int | (data[(i + 3) % len] as int << 16)
+                let v = crafted(mut ed, k, slot, gen)
+                let (got, kind) = try_resolve(mut vm, mut ed, k, v)
+                if got { t.crafted_alive += 1 } else { t.refused += 1 }
+                if !got && !allowed_kind(kind) {
+                    let shown = if kind == "" then "(none)" else kind
+                    why = "crafted {{{slot},{gen}}} refused with '{shown}'"
+                }
+                if got && !fl.fl_h_alive(ed.handles, v) {
+                    why = "crafted {{{slot},{gen}}} resolved while dead"
+                }
+            },
+            6 => {
+                let id = ed.bufs[d].id
+                edit.fl_h_drop_buffer(mut ed, id)
+            },
+            _ => {
+                let (_, kind) = try_resolve(mut vm, mut ed, k, fl.fl_nil())
+                if kind != "type" { why = "nil resolved as '{kind}'" }
+            },
+        }
+        if why == "" { why = fuzz_ed_run(mut vm, mut ed, data, i, mut t) }
+        i += 1
+    }
+    (mut ed.flrt.vms).push(vm)
+    why
+}
+
+// The driver's own controls: each of the property's refusals fires on a
+// planted input, the kind sets are C's, and the corpus files run clean.
+fn selftest() -> int {
+    assert(allowed_kind("handle") && allowed_kind("type") && !allowed_kind("") && !allowed_kind("name"))
+    assert(spec_kind("handle") && spec_kind("capability") && !spec_kind("") && !spec_kind("bug"))
+    assert(kind_at(0) == fl.FL_H_BUF && kind_at(3) == fl.FL_H_WIN && kind_at(4) == fl.FL_H_RE)
+    assert(signed_byte(255 as byte) == -1 && signed_byte(127 as byte) == 127)
+    var t = Tally { ops: 0, resolved: 0, refused: 0, crafted_alive: 0, runs: 0, run_raised: 0 }
+    // Every operation once (0..7), each followed by an ed.run of each
+    // command and map shape the bytes choose.
+    for src in [
+        [0 as byte, 1 as byte, 2 as byte, 3 as byte, 4 as byte, 5 as byte, 6 as byte, 7 as byte],
+        [0 as byte, 4 as byte, 12 as byte, 3 as byte, 4 as byte, 5 as byte, 0 as byte, 0 as byte],
+        [5 as byte, 0 as byte, 0 as byte, 0 as byte, 5 as byte, 255 as byte, 255 as byte, 255 as byte],
+        [1 as byte, 9 as byte, 17 as byte, 25 as byte, 33 as byte, 2 as byte, 10 as byte, 6 as byte],
+    ] {
+        let why = check_flapi(src, mut t)
+        if why != "" { eprint("fuzz_flapi: selftest input failed: {why}"); return 1 }
+    }
+    assert(t.ops == 32 && t.runs == 32 && t.run_raised > 0 && t.refused > 0 && t.resolved > 0)
+    print("fuzz_flapi: kind-set, operation and envelope controls PASS")
+    0
+}
+
+fn main() -> int {
+    let args = env_args()
+    if args.len == 1 && args[0] == "--selftest" { return selftest() }
+    let (ok, seed, iters) = fuzzgen.parse_args(args)
+    if !ok || iters < 1 {
+        eprint("usage: fuzz-flapi [--iters=N] [--seed=N] | --selftest")
+        return 2
+    }
+    let target = "fuzz_flapi"
+    // yew_fuzz_main(..., "fuzz_flapi", "tests/fuzz/corpus/flapi", ...).
+    let (cok, corpus, dict) = fuzzgen.corpus_dict_from(target, "tests/fuzz/corpus/flapi")
+    if !cok { return 2 }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    var tally = Tally { ops: 0, resolved: 0, refused: 0, crafted_alive: 0, runs: 0, run_raised: 0 }
+    while done < iters && !failed {
+        let n = if iters - done > 64 then 64 else iters - done
+        region epoch {
+            var rng = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut rng, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut rng, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, operation) = fuzzgen.mutate_dict(mut rng, input, corpus, dict)
+                    input = next
+                    op = operation
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut rng, input)
+                var why = ""
+                region trial {
+                    why = copy check_flapi(input, mut tally)
+                }
+                if why != "" {
+                    eprint(
+                        "{target}: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}",
+                    )
+                    eprint("{target}: input={fuzzgen.hex_of(input)}")
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = rng.state
+            hash = rng.hash
+        }
+        done += n
+    }
+    if failed { return 1 }
+    eprint(
+        "{target}: ops={tally.ops} resolved={tally.resolved} refused={tally.refused} crafted_alive={tally.crafted_alive} runs={tally.runs} run_raised={tally.run_raised}",
+    )
+    print("{target}: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok")
+    0
+}
