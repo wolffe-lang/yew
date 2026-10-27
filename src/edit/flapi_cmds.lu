@@ -1,0 +1,259 @@
+//! edit.flapi_cmds — the registry commands the Fletch rows name that no
+//! other module owns: sagitta 9ace98c2 src/edit/flapi_cmds.c:1-269 and
+//! flapi_cmds.h (Sprint 34 §4). Each mutates only through the editor's own
+//! seams (the pane split, the tab switch, the cursor set, the registers).
+
+use fl
+use text
+
+// The context's string argument's bytes (C's `sarg`/`sarg_len`).
+fn fa_sarg(cx: CmdCtx) -> List[byte] {
+    if cx.has_sbytes { return copy cx.sbytes }
+    var out = List[byte]()
+    if cx.has_sarg { for b in cx.sarg.bytes() { (mut out).push(b) } }
+    out
+}
+
+// `arg_is` (flapi_cmds.c:15-21).
+fn fa_arg_is(cx: CmdCtx, want: str) -> bool {
+    if !cx.has_sarg { return false }
+    let s = fa_sarg(cx)
+    if s.len != want.len { return false }
+    for i in 0..s.len { if s[i] != want.bytes()[i] { return false } }
+    true
+}
+
+/// `ed.win.split` (`yew_flapi_cmd_win_split`, flapi_cmds.c:23-42): only
+/// the focused window splits, `h` or `v`; a split that left focus where it
+/// was did not happen.
+pub fn flapi_cmd_win_split(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.win != cx.win {
+        return CMD_ERR_STATE
+    }
+    let before = ed.focus
+    var status = CMD_OK
+    if fa_arg_is(cx, "h") {
+        status = pane_cmd_split_h(mut ed, cx)
+    } else if fa_arg_is(cx, "v") {
+        status = pane_cmd_split_v(mut ed, cx)
+    } else {
+        return CMD_ERR_ARG
+    }
+    if status == CMD_OK && ed.focus == before {
+        return CMD_ERR_STATE
+    }
+    status
+}
+
+// `find_window` (flapi_cmds.c:44-67): the leaf showing `want` and its tab.
+fn fa_find_window(ed: Ed, want: int) -> (int, int) {
+    var t = 0
+    while t < ed.tabs.len {
+        for leaf in pane_collect_leaves(ed, ed.tabs[t].root, PANE_MAX_LEAVES) {
+            if ed.panes[leaf].win == want { return (leaf, t) }
+        }
+        t += 1
+    }
+    if pane_live(ed, ed.focus) && ed.panes[ed.focus].win == want {
+        return (ed.focus, ed.tab_active)
+    }
+    (-1, -1)
+}
+
+/// `ed.win.focus` (`yew_flapi_cmd_win_focus`, flapi_cmds.c:69-101): focus
+/// the context's window, switching to its tab when it is another's.
+pub fn flapi_cmd_win_focus(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 {
+        return CMD_ERR_STATE
+    }
+    let (leaf, tab_index) = fa_find_window(ed, cx.win)
+    if leaf < 0 {
+        return CMD_ERR_STATE
+    }
+    let before = ed.win
+    if tab_index >= 0 && tab_index < ed.tabs.len {
+        ed.tabs[tab_index].focus = leaf
+    }
+    if tab_index >= 0 && tab_index != ed.tab_active {
+        tab_switch(mut ed, tab_index)
+    } else {
+        // yew_shadow_dismiss is yw11's (no shadow is live before it).
+        ed.focus = leaf
+        ed.win = ed.panes[leaf].win
+        ed.layout_dirty = true
+        ed.full_damage = true
+        state_mark_dirty(mut ed)
+        if ed.win != before {
+            let w = ed.win
+            ed_hook_window(mut ed, fl.FL_EV_WIN_FOCUS, w)
+        }
+    }
+    CMD_OK
+}
+
+fn fa_cursor(a: CmdCursorArg) -> text.Cursor {
+    var c = text.cursor_at(a.pos as text.ByteOff)
+    c.anchor = a.anchor
+    c.goal_col = a.goal_col
+    c
+}
+
+/// `ed.cursor.set_many` (`yew_flapi_cmd_cursor_set_many`, flapi_cmds.c:
+/// 103-140): the window's cursor set replaced, normalized once.
+pub fn flapi_cmd_cursor_set_many(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].buf < 0 {
+        return CMD_ERR_ARG
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident || cx.cursor_args.len == 0 || cx.cursor_args.len > text.MC_MAX {
+        return CMD_ERR_ARG
+    }
+    var replacement = text.cset_init(fa_cursor(cx.cursor_args[0]))
+    if cx.cursor_args.len > 1 {
+        var rest = List[text.Cursor]()
+        for i in 1..cx.cursor_args.len { (mut rest).push(fa_cursor(cx.cursor_args[i])) }
+        if !text.cset_add_many(mut replacement, rest) {
+            return CMD_ERR_ARG
+        }
+    }
+    text.cset_normalize(ed.bufs[b].ec.tb, mut replacement)
+    ed.wins[w].cs = replacement
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+    ed.full_damage = true
+    CMD_OK
+}
+
+// `named_unit` (flapi_cmds.c:142-153).
+fn fa_named_unit(name: List[byte]) -> int {
+    let s = str_from_utf8(name) else { return UNIT_NONE }
+    match s {
+        "char" => UNIT_CHAR,
+        "line" => UNIT_LINE,
+        "word" => UNIT_WORD,
+        "block" => UNIT_BLOCK,
+        _ => UNIT_NONE,
+    }
+}
+
+/// `ed.cursor.move` (`yew_flapi_cmd_cursor_move`, flapi_cmds.c:155-195):
+/// one given cursor by `unit:dir` (next, prev, home, end); the registry's
+/// REPEATABLE flag applies the count.
+pub fn flapi_cmd_cursor_move(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].buf < 0 {
+        return CMD_ERR_STATE
+    }
+    let w = cx.win
+    let b = ed.wins[w].buf
+    if !ed.bufs[b].resident || !cx.cursor_given || cx.cursor_index >= ed.wins[w].cs.curs.len ||
+        !cx.has_sarg {
+        return CMD_ERR_STATE
+    }
+    let s = fa_sarg(cx)
+    var sep = -1
+    for i in 0..s.len { if s[i] == 58 as byte { sep = i; break } }
+    if sep < 0 {
+        return CMD_ERR_ARG
+    }
+    let kind = fa_named_unit(s[0..sep])
+    if kind == UNIT_NONE {
+        return CMD_ERR_ARG
+    }
+    let dir = str_from_utf8(s[sep + 1..s.len]) else ""
+    let u = unitctx_of(ed, b)
+    let ci = cx.cursor_index
+    let p = ed.wins[w].cs.curs[ci].pos
+    var next = 0
+    if dir == "next" {
+        next = unit_next(kind, mut ed.bufs[b].ec.tb, u, ed.wins[w], p, false)
+    } else if dir == "prev" {
+        next = unit_prev(kind, mut ed.bufs[b].ec.tb, u, ed.wins[w], p, false)
+    } else if dir == "home" {
+        next = unit_home(kind, mut ed.bufs[b].ec.tb, u, p, false)
+    } else if dir == "end" {
+        next = unit_end(kind, mut ed.bufs[b].ec.tb, u, p, false)
+    } else {
+        return CMD_ERR_ARG
+    }
+    ed.wins[w].cs.curs[ci].pos = next
+    ed.wins[w].cs.curs[ci].anchor = next
+    ed.wins[w].cs.curs[ci].goal_col = text.CCOL_HERE
+    vp_follow(mut ed.wins[w], ed.bufs[b].ec.tb)
+    CMD_OK
+}
+
+fn fa_letter(name: int) -> bool {
+    name >= 'a' as int && name <= 'z' as int || name >= 'A' as int && name <= 'Z' as int
+}
+
+/// `ed.edit.yank` (`yew_flapi_cmd_span_yank`, flapi_cmds.c:197-229): the
+/// given span, charwise, into the named register (or the unnamed one); a
+/// letter register's macro source changed.
+pub fn flapi_cmd_span_yank(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || ed.wins[cx.win].buf < 0 {
+        return CMD_ERR_ARG
+    }
+    let b = ed.wins[cx.win].buf
+    if !ed.bufs[b].resident || !cx.range.given || cx.range.tok_lo > cx.range.tok_hi ||
+        cx.range.tok_hi > text.textbuf_len(ed.bufs[b].ec.tb) {
+        return CMD_ERR_ARG
+    }
+    var name = 0
+    let s = fa_sarg(cx)
+    if s.len != 0 {
+        if s.len != 1 {
+            return CMD_ERR_ARG
+        }
+        name = s[0] as int
+        if !(fa_letter(name) || name == '"' as int || name == '+' as int || name == '*' as int ||
+            name == '_' as int) {
+            return CMD_ERR_ARG
+        }
+    }
+    let value = text.regval_from_span(
+        ed.bufs[b].ec.tb,
+        text.span(cx.range.tok_lo, cx.range.tok_hi),
+        text.REG_CHARWISE,
+        ed.bufs[b].ec.meta,
+        ed.bufs[b].ec.has_meta,
+    )
+    text.reg_yank(mut ed.regs, name, value)
+    if fa_letter(name) {
+        let lower = if name <= 'Z' as int then name - 'A' as int + 'a' as int else name
+        fl_macro_source_written(mut ed, lower)
+    }
+    CMD_OK
+}
+
+/// `ed.reg.set` (`yew_flapi_cmd_reg_set`, flapi_cmds.c:231-247): a macro
+/// register `a`-`z` set (or appended, `!`) to the string argument's bytes.
+pub fn flapi_cmd_reg_set(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.iarg < 'a' as int || cx.iarg > 'z' as int {
+        return CMD_ERR_ARG
+    }
+    let name = cx.iarg
+    var value = text.regval_new()
+    value.kind = text.REG_CHARWISE
+    value.bytes = fa_sarg(cx)
+    text.reg_set_macro(mut ed.regs, name, value, cx.bang)
+    fl_macro_source_written(mut ed, name)
+    CMD_OK
+}
+
+/// `yew_flapi_reg_write` (flapi_cmds.c:249-269): a register write as the
+/// `ed.reg.set` command, from Fletch.
+pub fn flapi_reg_write(mut ed: Ed, name: int, bytes: List[byte], append: bool) -> int {
+    if name < 'a' as int || name > 'z' as int {
+        return CMD_ERR_ARG
+    }
+    let id = cmd_lookup(ed.reg, "ed.reg.set")
+    var cx = cmdctx_new(ed.win, SRC_FLETCH)
+    cx.count = 1
+    cx.iarg = name
+    cx.has_sarg = true
+    cx.has_sbytes = true
+    cx.sbytes = copy bytes
+    cx.sarg = str_from_utf8(bytes) else ""
+    cx.bang = append
+    cmd_invoke(mut ed, id, mut cx)
+}
