@@ -1,0 +1,758 @@
+//! edit.trust — the workspace trust database, sagitta 9ace98c2
+//! src/ws/trust.c:1-1099 and trust.h:1-152. A private value-only VM holds
+//! `$XDG_STATE_HOME/yew/trust.fl` (schema 3) read through fl.data and
+//! written back sorted with C's header line. Workspace trust is keyed by
+//! the directory's realpath and bound to its dev/ino; the config's grant
+//! to the FNV-1a hash of its exact bytes. The private VM never runs code,
+//! so nothing collects under the handles this module holds. It lives in
+//! edit (not ws) because the port's ws modules carry their own literal
+//! codec and do not import fl.
+
+use fl
+use text
+use util
+use ws
+
+/// Days a missing directory's entry survives a write (YEW_TRUST_PRUNE_DAYS_DEFAULT).
+pub const TRUST_PRUNE_DAYS_DEFAULT: int = 365
+
+/// AiWsGrant (trust.h:24-28).
+pub const AI_WS_UNSET: int = 0
+
+/// The workspace allows AI disclosure.
+pub const AI_WS_ALLOW: int = 1
+
+/// The workspace denies AI disclosure.
+pub const AI_WS_DENY: int = 2
+
+/// YewPluginDesired (trust.h:30-34): absent.
+pub const PLUGIN_DESIRED_DEFAULT: int = 0
+
+/// The plugin is wanted.
+pub const PLUGIN_DESIRED_ENABLED: int = 1
+
+/// The plugin is not wanted.
+pub const PLUGIN_DESIRED_DISABLED: int = 2
+
+/// YewPluginCapability (trust.h:36-41).
+pub const PLUGIN_CAP_FS: int = 0
+
+/// The shell capability.
+pub const PLUGIN_CAP_SHELL: int = 1
+
+/// The network capability.
+pub const PLUGIN_CAP_NET: int = 2
+
+/// The clipboard capability.
+pub const PLUGIN_CAP_CLIPBOARD: int = 3
+
+/// YewPluginGrant (trust.h:43-47): absent.
+pub const PLUGIN_GRANT_UNSET: int = 0
+
+/// The capability is granted.
+pub const PLUGIN_GRANT_ALLOW: int = 1
+
+/// The capability is refused.
+pub const PLUGIN_GRANT_DENY: int = 2
+
+/// YewTrustDecision (trust.h:49-58): no `.yew.fl` in the workspace.
+pub const TRUST_NO_CONFIG: int = 0
+
+/// The config may run.
+pub const TRUST_GRANTED: int = 1
+
+/// The user said never.
+pub const TRUST_DENIED: int = 2
+
+/// Ask: the directory has not been trusted.
+pub const TRUST_PROMPT_NEW: int = 3
+
+/// Ask: the config's bytes changed since the grant.
+pub const TRUST_PROMPT_CHANGED: int = 4
+
+/// Ask: the path names a different filesystem object.
+pub const TRUST_PROMPT_REPLACED: int = 5
+
+/// No terminal to ask on.
+pub const TRUST_SKIP_NO_TTY: int = 6
+
+/// The workspace or its config could not be verified.
+pub const TRUST_ERROR: int = 7
+
+/// YewTrustAnswer (trust.h:60-66).
+pub const TRUST_ALWAYS: int = 0
+
+/// Run it this session only.
+pub const TRUST_ONCE: int = 1
+
+/// Never run it.
+pub const TRUST_NEVER: int = 2
+
+/// Show the config first.
+pub const TRUST_VIEW: int = 3
+
+/// Not now.
+pub const TRUST_SKIP: int = 4
+
+// PATH_MAX (trust.h:18-20): the probe's fixed path buffers.
+const TRUST_PATH_MAX: int = 4096
+
+/// YewTrustProbe (trust.h:68-76): what one check read.
+pub struct TrustProbe {
+    workspace: str,
+    config_path: str,
+    bytes: List[byte],
+    hash: wrapping[u64],
+    dev: int,
+    ino: int,
+    has_config: bool,
+}
+
+/// YewTrustDb (trust.h:78-80): the private VM and its root map.
+pub struct TrustDb { vm: fl.FlVm, root: fl.FlValue }
+
+/// YewTrustWriteResult (trust.h:82-86).
+pub struct TrustWriteResult { ok: bool, committed: bool }
+
+// TrustEntry (trust.c:33-45): one dirs row decoded.
+struct TrustEntry {
+    state: List[byte],
+    has_state: bool,
+    ai: int,
+    hash: List[byte],
+    has_hash: bool,
+    dev: int,
+    ino: int,
+    at: int,
+    identity: bool,
+    fingerprint: bool,
+}
+
+// TrustRow (trust.c:47-50), with the key's bytes for the comparator.
+struct TrustRow { kb: List[byte], k: fl.FlValue, v: fl.FlValue }
+
+/// `yew_trust_probe_init` (trust.c:323-329).
+pub fn trust_probe_new() -> TrustProbe {
+    TrustProbe {
+        workspace: "",
+        config_path: "",
+        bytes: List[byte](),
+        hash: 0,
+        dev: 0,
+        ino: 0,
+        has_config: false,
+    }
+}
+
+fn tr_str(db: TrustDb, v: fl.FlValue) -> List[byte] ! {none} {
+    if v.t != fl.FL_STR { return none }
+    copy db.vm.gc.slots[fl.fl_obj_index(db.vm, v)].bytes
+}
+
+fn tr_bytes_eq(a: List[byte], b: str) -> bool {
+    let bb = b.bytes()
+    if a.len != bb.len { return false }
+    for i in 0..a.len { if a[i] != bb[i] { return false } }
+    true
+}
+
+// trust_map_get (trust.c:77-91): the value under string key `name`.
+fn tr_get(db: TrustDb, map: fl.FlValue, name: str) -> fl.FlValue ! {none} {
+    var cursor = 0
+    while true {
+        let (next, k, v) = fl.fl_map_iter(db.vm, map, cursor) else { return none }
+        cursor = next
+        if k.t == fl.FL_STR {
+            let kb = db.vm.gc.slots[fl.fl_obj_index(db.vm, k)].bytes
+            if tr_bytes_eq(kb, name) { return v }
+        }
+    }
+    none
+}
+
+// trust_map_set (trust.c:93-99).
+fn tr_set(mut db: TrustDb, map: fl.FlValue, key: str, v: fl.FlValue) {
+    let k = fl.fl_str_new(mut db.vm, key.bytes())
+    let _ = fl.fl_map_set(mut db.vm, map, k, v)
+}
+
+// trust_map_del (trust.c:101-106).
+fn tr_del(mut db: TrustDb, map: fl.FlValue, key: str) -> bool {
+    let k = fl.fl_str_new(mut db.vm, key.bytes())
+    fl.fl_map_del(mut db.vm, map, k)
+}
+
+fn tr_new_str(mut db: TrustDb, s: str) -> fl.FlValue { fl.fl_str_new(mut db.vm, s.bytes()) }
+
+// trust_plugins (trust.c:108-121).
+fn tr_plugins(mut db: TrustDb, create: bool) -> fl.FlValue ! {none} {
+    let root = copy db.root
+    let found = tr_get(db, root, "plugins") else {
+        if !create { return none }
+        let plugins = fl.fl_map_new(mut db.vm)
+        tr_set(mut db, root, "plugins", copy plugins)
+        return plugins
+    }
+    if found.t != fl.FL_MAP { return none }
+    found
+}
+
+// trust_plugin_map (trust.c:123-157).
+fn tr_plugin_map(mut db: TrustDb, plugin: str, create: bool) -> fl.FlValue ! {none} {
+    if plugin.len == 0 { return none }
+    let plugins = tr_plugins(mut db, create)?
+    var cursor = 0
+    while true {
+        let (next, k, v) = fl.fl_map_iter(db.vm, plugins, cursor) else { break }
+        cursor = next
+        if k.t != fl.FL_STR { continue }
+        let kb = db.vm.gc.slots[fl.fl_obj_index(db.vm, k)].bytes
+        if tr_bytes_eq(kb, plugin) {
+            if v.t != fl.FL_MAP { return none }
+            return v
+        }
+    }
+    if !create { return none }
+    let entry = fl.fl_map_new(mut db.vm)
+    let name = tr_new_str(mut db, plugin)
+    let _ = fl.fl_map_set(mut db.vm, plugins, name, copy entry)
+    entry
+}
+
+// trust_impl_new (trust.c:159-175): {schema: 3, dirs: {}}.
+fn tr_impl_new() -> TrustDb {
+    var vm = fl.fl_vm_new(take fl.fl_strings())
+    let root = fl.fl_map_new(mut vm)
+    let dirs = fl.fl_map_new(mut vm)
+    var db = TrustDb { vm: vm, root: copy root }
+    tr_set(mut db, root, "schema", fl.fl_int(3))
+    tr_set(mut db, root, "dirs", dirs)
+    db
+}
+
+/// `yew_trust_db_init` (trust.c:187-191): an empty schema-3 database.
+pub fn trust_db_new() -> TrustDb { tr_impl_new() }
+
+// trust_read_file (trust.c:201-231): (bytes, read, missing).
+fn tr_read_file(path: str) -> (List[byte], bool, bool) {
+    let bytes = fs_read_bytes(path) else |e| match e {
+        not_found => { return (List[byte](), false, true) },
+        denied => { return (List[byte](), false, false) },
+        io => { return (List[byte](), false, false) },
+    }
+    if bytes.len > fl.FL_DATA_MAX_BYTES { return (List[byte](), false, false) }
+    (bytes, true, false)
+}
+
+// trust_valid_root (trust.c:233-256).
+fn tr_valid_root(db: TrustDb) -> bool {
+    let root = copy db.root
+    if root.t != fl.FL_MAP { return false }
+    let schema = tr_get(db, root, "schema") else { return false }
+    if schema.t != fl.FL_INT || schema.i < 1 { return false }
+    let dirs = tr_get(db, root, "dirs") else { return false }
+    if dirs.t != fl.FL_MAP { return false }
+    var cursor = 0
+    while true {
+        let (next, k, v) = fl.fl_map_iter(db.vm, dirs, cursor) else { break }
+        cursor = next
+        if k.t != fl.FL_STR || v.t != fl.FL_STR && v.t != fl.FL_MAP { return false }
+    }
+    true
+}
+
+/// `yew_trust_db_load_path` (trust.c:258-290): a missing file is an empty
+/// database; a failed read or an invalid document leaves `db` untouched.
+pub fn trust_db_load_path(mut db: TrustDb, path: str) -> bool {
+    if path.len == 0 { return false }
+    let (bytes, read, missing) = tr_read_file(path)
+    if !read {
+        if !missing { return false }
+        db = tr_impl_new()
+        return true
+    }
+    var fresh = tr_impl_new()
+    var dc = fl.fl_diag_init()
+    fresh.root = fl.fl_data_read(mut fresh.vm, bytes, mut dc)
+    if fl.fl_diag_errors(dc) != 0 || !tr_valid_root(fresh) { return false }
+    db = fresh
+    true
+}
+
+// trust_xdg_path (trust.c:292-309).
+fn tr_xdg_path(ensure: bool) -> str ! {none} {
+    let dir = util.xdg_state_dir()?
+    if ensure && !util.mkdirs(dir, 448) { return none }
+    "{dir}/trust.fl"
+}
+
+/// `yew_trust_db_load` (trust.c:311-321): the XDG database.
+pub fn trust_db_load(mut db: TrustDb) -> bool {
+    let path = tr_xdg_path(false) else { return false }
+    trust_db_load_path(mut db, path)
+}
+
+// trust_find_dir (trust.c:339-360).
+fn tr_find_dir(db: TrustDb, path: str) -> fl.FlValue ! {none} {
+    let root = copy db.root
+    let dirs = tr_get(db, root, "dirs")?
+    tr_get(db, dirs, path)
+}
+
+// trust_dir_map (trust.c:362-392): the row as a map (a bare-string row
+// upgraded), created when asked.
+fn tr_dir_map(mut db: TrustDb, path: str, create: bool) -> fl.FlValue ! {none} {
+    var entry = fl.fl_nil()
+    let found = tr_find_dir(db, path) else fl.fl_nil()
+    let had = found.t != fl.FL_NIL
+    if had {
+        if found.t == fl.FL_MAP { return found }
+        let state = tr_str(db, found)?
+        entry = fl.fl_map_new(mut db.vm)
+        let s = fl.fl_str_new(mut db.vm, state)
+        tr_set(mut db, copy entry, "state", s)
+    } else {
+        if !create { return none }
+        entry = fl.fl_map_new(mut db.vm)
+    }
+    let root = copy db.root
+    let dirs = tr_get(db, root, "dirs")?
+    let key = tr_new_str(mut db, path)
+    if !fl.fl_map_set(mut db.vm, dirs, key, copy entry) { return none }
+    entry
+}
+
+// trust_ai_value (trust.c:394-406).
+fn tr_ai_value(db: TrustDb, v: fl.FlValue) -> int {
+    let s = tr_str(db, v) else { return AI_WS_UNSET }
+    if tr_bytes_eq(s, "allow") { return AI_WS_ALLOW }
+    if tr_bytes_eq(s, "deny") { return AI_WS_DENY }
+    AI_WS_UNSET
+}
+
+// trust_entry (trust.c:408-444): a bare string is a state; a map's fields
+// decode independently.
+fn tr_entry(db: TrustDb, v: fl.FlValue) -> TrustEntry ! {none} {
+    var e = TrustEntry {
+        state: List[byte](),
+        has_state: false,
+        ai: AI_WS_UNSET,
+        hash: List[byte](),
+        has_hash: false,
+        dev: 0,
+        ino: 0,
+        at: 0,
+        identity: false,
+        fingerprint: false,
+    }
+    if v.t == fl.FL_STR {
+        e.state = tr_str(db, v)?
+        e.has_state = true
+        return e
+    }
+    if v.t != fl.FL_MAP { return none }
+    let st = tr_get(db, v, "state") else fl.fl_nil()
+    if st.t != fl.FL_NIL {
+        e.state = tr_str(db, st)?
+        e.has_state = true
+    }
+    let ai = tr_get(db, v, "ai") else fl.fl_nil()
+    if ai.t != fl.FL_NIL { e.ai = tr_ai_value(db, ai) }
+    let h = tr_get(db, v, "hash") else fl.fl_nil()
+    if h.t == fl.FL_STR {
+        e.hash = tr_str(db, h) else List[byte]()
+        e.has_hash = true
+    }
+    // Hash and filesystem identity are independent: AI-only entries have
+    // no config hash but still bind their grant to dev/ino.
+    let dev = tr_get(db, v, "dev") else fl.fl_nil()
+    if dev.t == fl.FL_INT {
+        e.dev = dev.i
+        let ino = tr_get(db, v, "ino") else fl.fl_nil()
+        if ino.t == fl.FL_INT {
+            e.ino = ino.i
+            e.identity = true
+        }
+    }
+    e.fingerprint = e.has_hash && e.identity
+    let at = tr_get(db, v, "at") else fl.fl_nil()
+    if at.t == fl.FL_INT { e.at = at.i }
+    e
+}
+
+fn tr_state_is(e: TrustEntry, want: str) -> bool { e.has_state && tr_bytes_eq(e.state, want) }
+
+// trust_store (trust.c:459-482).
+fn tr_store(mut db: TrustDb, probe: TrustProbe, state: str, now: int, fingerprint: bool) -> bool {
+    let entry = tr_dir_map(mut db, probe.workspace, true) else { return false }
+    let s = tr_new_str(mut db, state)
+    tr_set(mut db, copy entry, "state", s)
+    if fingerprint {
+        let h = tr_new_str(mut db, text.hex16(probe.hash))
+        tr_set(mut db, copy entry, "hash", h)
+        tr_set(mut db, copy entry, "dev", fl.fl_int(probe.dev))
+        tr_set(mut db, copy entry, "ino", fl.fl_int(probe.ino))
+    } else {
+        let _ = tr_del(mut db, copy entry, "hash")
+    }
+    tr_set(mut db, entry, "at", fl.fl_int(now))
+    true
+}
+
+// trust_resolve_workspace (trust.c:484-504): (realpath, dev, ino) of a
+// directory, none otherwise.
+fn tr_resolve_workspace(workspace: str) -> (str, int, int) ! {none} {
+    if workspace.len == 0 { return none }
+    let real = text.file_realpath(workspace) else { return none }
+    if real.len >= TRUST_PATH_MAX { return none }
+    let w = fs_stat(real) else { return none }
+    if w[0] != 1 { return none }
+    (real, w[9], w[10])
+}
+
+// trust_clear_replaced (trust.c:506-513).
+fn tr_clear_replaced(mut db: TrustDb, entry: fl.FlValue) {
+    for k in ["state", "ai", "hash", "dev", "ino"] { let _ = tr_del(mut db, copy entry, k) }
+}
+
+/// `yew_trust_ai_grant` (trust.c:515-547): a grant whose directory was
+/// replaced is cleared; an identity-less grant is bound now.
+pub fn trust_ai_grant(mut db: TrustDb, workspace: str) -> int {
+    let (resolved, dev, ino) = tr_resolve_workspace(workspace) else { return AI_WS_UNSET }
+    let v = tr_find_dir(db, resolved) else { return AI_WS_UNSET }
+    let e = tr_entry(db, v) else { return AI_WS_UNSET }
+    if e.identity && (e.dev != dev || e.ino != ino) {
+        let m = tr_dir_map(mut db, resolved, false) else { return AI_WS_UNSET }
+        tr_clear_replaced(mut db, m)
+        return AI_WS_UNSET
+    }
+    if e.ai != AI_WS_UNSET && !e.identity {
+        let m = tr_dir_map(mut db, resolved, false) else { return e.ai }
+        tr_set(mut db, copy m, "dev", fl.fl_int(dev))
+        tr_set(mut db, m, "ino", fl.fl_int(ino))
+    }
+    e.ai
+}
+
+/// `yew_trust_ai_set` (trust.c:549-579).
+pub fn trust_ai_set(mut db: TrustDb, workspace: str, grant: int, now: int) -> bool {
+    if grant != AI_WS_UNSET && grant != AI_WS_ALLOW && grant != AI_WS_DENY { return false }
+    let (resolved, dev, ino) = tr_resolve_workspace(workspace) else { return false }
+    let entry = tr_dir_map(mut db, resolved, grant != AI_WS_UNSET) else { return grant == AI_WS_UNSET }
+    if grant == AI_WS_UNSET {
+        let _ = tr_del(mut db, entry, "ai")
+        return true
+    }
+    let name = tr_new_str(mut db, if grant == AI_WS_ALLOW then "allow" else "deny")
+    tr_set(mut db, copy entry, "ai", name)
+    tr_set(mut db, copy entry, "dev", fl.fl_int(dev))
+    tr_set(mut db, copy entry, "ino", fl.fl_int(ino))
+    tr_set(mut db, entry, "at", fl.fl_int(now))
+    true
+}
+
+/// `yew_trust_ai_forget` (trust.c:581-584).
+pub fn trust_ai_forget(mut db: TrustDb, workspace: str) -> bool {
+    trust_ai_set(mut db, workspace, AI_WS_UNSET, 0)
+}
+
+/// `yew_trust_plugin_desired` (trust.c:586-602).
+pub fn trust_plugin_desired(mut db: TrustDb, plugin: str) -> int {
+    let entry = tr_plugin_map(mut db, plugin, false) else { return PLUGIN_DESIRED_DEFAULT }
+    let v = tr_get(db, entry, "enabled") else { return PLUGIN_DESIRED_DEFAULT }
+    if v.t != fl.FL_BOOL { return PLUGIN_DESIRED_DEFAULT }
+    if v.i != 0 then PLUGIN_DESIRED_ENABLED else PLUGIN_DESIRED_DISABLED
+}
+
+/// `yew_trust_plugin_set_desired` (trust.c:604-628).
+pub fn trust_plugin_set_desired(mut db: TrustDb, plugin: str, desired: int) -> bool {
+    if plugin.len == 0 || desired < PLUGIN_DESIRED_DEFAULT || desired > PLUGIN_DESIRED_DISABLED {
+        return false
+    }
+    let entry = tr_plugin_map(mut db, plugin, desired != PLUGIN_DESIRED_DEFAULT) else {
+        return desired == PLUGIN_DESIRED_DEFAULT
+    }
+    if desired == PLUGIN_DESIRED_DEFAULT {
+        let _ = tr_del(mut db, entry, "enabled")
+        return true
+    }
+    tr_set(mut db, entry, "enabled", fl.fl_bool(desired == PLUGIN_DESIRED_ENABLED))
+    true
+}
+
+// trust_plugin_capability_name (trust.c:630-640).
+fn tr_cap_name(cap: int) -> str {
+    if cap == PLUGIN_CAP_FS { return "fs" }
+    if cap == PLUGIN_CAP_SHELL { return "shell" }
+    if cap == PLUGIN_CAP_NET { return "net" }
+    if cap == PLUGIN_CAP_CLIPBOARD { return "clipboard" }
+    ""
+}
+
+/// `yew_trust_plugin_capability` (trust.c:642-662).
+pub fn trust_plugin_capability(mut db: TrustDb, plugin: str, cap: int) -> int {
+    let field = tr_cap_name(cap)
+    if field.len == 0 { return PLUGIN_GRANT_UNSET }
+    let entry = tr_plugin_map(mut db, plugin, false) else { return PLUGIN_GRANT_UNSET }
+    let v = tr_get(db, entry, field) else { return PLUGIN_GRANT_UNSET }
+    let ai = tr_ai_value(db, v)
+    if ai == AI_WS_ALLOW { return PLUGIN_GRANT_ALLOW }
+    if ai == AI_WS_DENY { return PLUGIN_GRANT_DENY }
+    PLUGIN_GRANT_UNSET
+}
+
+/// `yew_trust_plugin_set_capability` (trust.c:664-693).
+pub fn trust_plugin_set_capability(mut db: TrustDb, plugin: str, cap: int, grant: int) -> bool {
+    let field = tr_cap_name(cap)
+    if plugin.len == 0 || field.len == 0 || grant < PLUGIN_GRANT_UNSET || grant > PLUGIN_GRANT_DENY {
+        return false
+    }
+    let entry = tr_plugin_map(mut db, plugin, grant != PLUGIN_GRANT_UNSET) else {
+        return grant == PLUGIN_GRANT_UNSET
+    }
+    if grant == PLUGIN_GRANT_UNSET {
+        let _ = tr_del(mut db, entry, field)
+        return true
+    }
+    let v = tr_new_str(mut db, if grant == PLUGIN_GRANT_ALLOW then "allow" else "deny")
+    tr_set(mut db, entry, field, v)
+    true
+}
+
+/// `yew_trust_plugin_grant_count` (trust.c:695-707).
+pub fn trust_plugin_grant_count(mut db: TrustDb, plugin: str) -> int {
+    var n = 0
+    for cap in 0..PLUGIN_CAP_CLIPBOARD + 1 {
+        if trust_plugin_capability(mut db, plugin, cap) != PLUGIN_GRANT_UNSET { n += 1 }
+    }
+    n
+}
+
+// trust_plugin_prune_empty (trust.c:709-722).
+fn tr_plugin_prune_empty(mut db: TrustDb, plugin: str, entry: fl.FlValue) {
+    if fl.fl_map_count(db.vm, entry) != 0 { return }
+    let plugins = tr_plugins(mut db, false) else { return }
+    let _ = tr_del(mut db, copy plugins, plugin)
+    if fl.fl_map_count(db.vm, plugins) == 0 {
+        let root = copy db.root
+        let _ = tr_del(mut db, root, "plugins")
+    }
+}
+
+/// `yew_trust_plugin_drop_grants` (trust.c:724-747).
+pub fn trust_plugin_drop_grants(mut db: TrustDb, plugin: str) -> int {
+    if plugin.len == 0 { return 0 }
+    let entry = tr_plugin_map(mut db, plugin, false) else { return 0 }
+    var dropped = 0
+    for cap in 0..PLUGIN_CAP_CLIPBOARD + 1 {
+        if tr_del(mut db, copy entry, tr_cap_name(cap)) { dropped += 1 }
+    }
+    tr_plugin_prune_empty(mut db, plugin, entry)
+    dropped
+}
+
+/// `yew_trust_plugin_drop_policy` (trust.c:749-768).
+pub fn trust_plugin_drop_policy(mut db: TrustDb, plugin: str) -> bool {
+    if plugin.len == 0 { return false }
+    let _ = tr_plugin_map(mut db, plugin, false) else { return true }
+    let _ = trust_plugin_drop_grants(mut db, plugin)
+    let entry = tr_plugin_map(mut db, plugin, false) else { return true }
+    let _ = tr_del(mut db, copy entry, "enabled")
+    tr_plugin_prune_empty(mut db, plugin, entry)
+    true
+}
+
+/// `yew_trust_plugin_revoke_persisted` (trust.c:770-798): load, drop the
+/// plugin's grants, write back; (ok, dropped).
+pub fn trust_plugin_revoke_persisted(plugin: str) -> (bool, int) {
+    if plugin.len == 0 { return (false, 0) }
+    var db = trust_db_new()
+    if !trust_db_load(mut db) { return (false, 0) }
+    let count = trust_plugin_drop_grants(mut db, plugin)
+    if count == 0 { return (true, 0) }
+    let now = time_unix_ms() / 1000
+    let ok = trust_db_write(mut db, now, TRUST_PRUNE_DAYS_DEFAULT)
+    (ok, if ok then count else 0)
+}
+
+/// `yew_trust_check` (trust.c:800-869): read `workspace/.yew.fl` into
+/// `probe` and decide whether it may run, would be asked about, or is
+/// skipped. A replaced directory's stale grant is cleared on the way.
+pub fn trust_check(mut db: TrustDb, workspace: str, has_tty: bool, pregrant: bool, mut probe: TrustProbe) -> int {
+    (mut probe.bytes).reset()
+    probe.has_config = false
+    if workspace.len == 0 { return TRUST_ERROR }
+    let resolved = text.file_realpath(workspace) else { return TRUST_ERROR }
+    if resolved.len >= TRUST_PATH_MAX { return TRUST_ERROR }
+    probe.workspace = resolved
+    let w = fs_stat(probe.workspace) else { return TRUST_ERROR }
+    if w[0] != 1 { return TRUST_ERROR }
+    probe.dev = w[9]
+    probe.ino = w[10]
+    probe.config_path = "{probe.workspace}/.yew.fl"
+    if probe.config_path.len >= TRUST_PATH_MAX { return TRUST_ERROR }
+    let (bytes, read, missing) = tr_read_file(probe.config_path)
+    if !read { return if missing then TRUST_NO_CONFIG else TRUST_ERROR }
+    probe.bytes = bytes
+    probe.has_config = true
+    probe.hash = ws.fnv1a64(probe.bytes)
+    if pregrant { return TRUST_GRANTED }
+    var prompt = TRUST_PROMPT_NEW
+    let v = tr_find_dir(db, probe.workspace) else fl.fl_nil()
+    if v.t != fl.FL_NIL {
+        let e = tr_entry(db, v) else { return if has_tty then prompt else TRUST_SKIP_NO_TTY }
+        if e.identity && (e.dev != probe.dev || e.ino != probe.ino) {
+            let ws_path = probe.workspace
+            let m = tr_dir_map(mut db, ws_path, false) else fl.fl_nil()
+            if m.t == fl.FL_MAP { tr_clear_replaced(mut db, m) }
+            prompt = TRUST_PROMPT_REPLACED
+        } else if tr_state_is(e, "denied") {
+            return TRUST_DENIED
+        } else if tr_state_is(e, "trusted") {
+            if !e.fingerprint {
+                let _ = tr_store(mut db, probe, "trusted", time_unix_ms() / 1000, true)
+                return TRUST_GRANTED
+            }
+            if !tr_bytes_eq(e.hash, text.hex16(probe.hash)) {
+                prompt = TRUST_PROMPT_CHANGED
+            } else {
+                return TRUST_GRANTED
+            }
+        }
+    }
+    if has_tty then prompt else TRUST_SKIP_NO_TTY
+}
+
+/// `yew_trust_answer` (trust.c:871-891): always and never are stored;
+/// once, view and skip change nothing.
+pub fn trust_answer(mut db: TrustDb, probe: TrustProbe, answer: int, now: int) -> bool {
+    if !probe.has_config { return false }
+    if answer == TRUST_ALWAYS { return tr_store(mut db, probe, "trusted", now, true) }
+    if answer == TRUST_NEVER { return tr_store(mut db, probe, "denied", now, false) }
+    answer == TRUST_ONCE || answer == TRUST_VIEW || answer == TRUST_SKIP
+}
+
+/// `yew_trust_decision_reason` (trust.c:893-907).
+pub fn trust_decision_reason(decision: int) -> str {
+    if decision == TRUST_PROMPT_CHANGED { return "the config changed since you trusted it" }
+    if decision == TRUST_PROMPT_REPLACED { return "the workspace is a different filesystem object" }
+    if decision == TRUST_PROMPT_NEW { return "this directory has not been trusted" }
+    if decision == TRUST_SKIP_NO_TTY { return "workspace config skipped because no terminal is available" }
+    ""
+}
+
+// trust_row_cmp (trust.c:909-922): bytewise, a prefix first.
+fn tr_row_less(a: TrustRow, b: TrustRow) -> bool {
+    let n = if a.kb.len < b.kb.len then a.kb.len else b.kb.len
+    for i in 0..n {
+        if a.kb[i] != b.kb[i] { return a.kb[i] < b.kb[i] }
+    }
+    a.kb.len < b.kb.len
+}
+
+// The live rows of `m` with their key bytes; none for a non-string key.
+fn tr_rows(db: TrustDb, m: fl.FlValue) -> List[TrustRow] ! {none} {
+    var rows = List[TrustRow]()
+    var cursor = 0
+    while true {
+        let (next, k, v) = fl.fl_map_iter(db.vm, m, cursor) else { break }
+        cursor = next
+        let kb = tr_str(db, k)?
+        (mut rows).push(TrustRow { kb: kb, k: k, v: v })
+    }
+    rows
+}
+
+// trust_sorted_map (trust.c:924-950).
+fn tr_sorted_map(mut db: TrustDb, old: fl.FlValue) -> fl.FlValue ! {none} {
+    var rows = tr_rows(db, old)?
+    util.sort_stable(mut rows, tr_row_less)
+    let sorted = fl.fl_map_new(mut db.vm)
+    for r in rows { let _ = fl.fl_map_set(mut db.vm, copy sorted, r.k, r.v) }
+    sorted
+}
+
+// trust_rebuild_plugins (trust.c:952-983).
+fn tr_rebuild_plugins(mut db: TrustDb) -> bool {
+    let root = copy db.root
+    let plugins = tr_get(db, root, "plugins") else { return true }
+    if plugins.t != fl.FL_MAP { return false }
+    var cursor = 0
+    while true {
+        let (next, k, v) = fl.fl_map_iter(db.vm, plugins, cursor) else { break }
+        cursor = next
+        if k.t != fl.FL_STR || v.t != fl.FL_MAP { return false }
+        let sorted = tr_sorted_map(mut db, v) else { return false }
+        let _ = fl.fl_map_set(mut db.vm, copy plugins, k, sorted)
+    }
+    let sorted_plugins = tr_sorted_map(mut db, plugins) else { return false }
+    tr_set(mut db, root, "plugins", sorted_plugins)
+    true
+}
+
+// trust_prune (trust.c:985-1002): a row whose directory is gone and whose
+// stamp is older than the window.
+fn tr_prune(db: TrustDb, r: TrustRow, now: int, prune_days: int) -> bool {
+    if r.kb.len >= TRUST_PATH_MAX { return false }
+    let e = tr_entry(db, r.v) else { return false }
+    if e.at <= 0 { return false }
+    let path = str_from_utf8(r.kb) else { return false }
+    let _ = fs_stat(path) else {
+        return e.at < now - prune_days * 86400
+    }
+    false
+}
+
+// trust_rebuild_sorted (trust.c:1004-1034).
+fn tr_rebuild_sorted(mut db: TrustDb, now: int, prune_days: int) -> bool {
+    let root = copy db.root
+    let old = tr_get(db, root, "dirs") else { return false }
+    let all = tr_rows(db, old) else { return false }
+    var rows = List[TrustRow]()
+    for r in all { if !tr_prune(db, r, now, prune_days) { (mut rows).push(r) } }
+    util.sort_stable(mut rows, tr_row_less)
+    let dirs = fl.fl_map_new(mut db.vm)
+    for r in rows { let _ = fl.fl_map_set(mut db.vm, copy dirs, r.k, r.v) }
+    tr_set(mut db, root, "dirs", dirs)
+    tr_rebuild_plugins(mut db)
+}
+
+// trust_schema_current (trust.c:1036-1047): an older schema is raised to 3.
+fn tr_schema_current(mut db: TrustDb) -> bool {
+    let root = copy db.root
+    let schema = tr_get(db, root, "schema") else { return false }
+    if schema.t != fl.FL_INT || schema.i < 1 { return false }
+    if schema.i < 3 { tr_set(mut db, root, "schema", fl.fl_int(3)) }
+    true
+}
+
+/// `yew_trust_db_write_path_result` (trust.c:1049-1075): pruned, sorted,
+/// C's header line, written atomically at mode 0600.
+pub fn trust_db_write_path_result(mut db: TrustDb, path: str, now: int, prune_days: int) -> TrustWriteResult {
+    if path.len == 0 { return TrustWriteResult { ok: false, committed: false } }
+    if !tr_schema_current(mut db) || !tr_rebuild_sorted(mut db, now, prune_days) {
+        return TrustWriteResult { ok: false, committed: false }
+    }
+    var out = List[byte]()
+    util.buf_append_str(mut out, "# yew trust database — hand-editable; delete a line to be asked again.\n")
+    let root = copy db.root
+    fl.fl_data_write(db.vm, mut out, root, 0)
+    let r = text.file_write_atomic_result(path, out, 384)
+    TrustWriteResult { ok: r.error == text.SAVE_OK, committed: r.committed }
+}
+
+/// `yew_trust_db_write_path` (trust.c:1077-1081).
+pub fn trust_db_write_path(mut db: TrustDb, path: str, now: int, prune_days: int) -> bool {
+    trust_db_write_path_result(mut db, path, now, prune_days).ok
+}
+
+/// `yew_trust_db_write_result` (trust.c:1083-1094): the XDG database.
+pub fn trust_db_write_result(mut db: TrustDb, now: int, prune_days: int) -> TrustWriteResult {
+    let path = tr_xdg_path(true) else { return TrustWriteResult { ok: false, committed: false } }
+    trust_db_write_path_result(mut db, path, now, prune_days)
+}
+
+/// `yew_trust_db_write` (trust.c:1096-1099).
+pub fn trust_db_write(mut db: TrustDb, now: int, prune_days: int) -> bool {
+    trust_db_write_result(mut db, now, prune_days).ok
+}
