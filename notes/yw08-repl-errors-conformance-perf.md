@@ -172,7 +172,7 @@ diagnostic), the yew#12 commits `2a290fc`..`cda7f43` and `d703f73`, and
 ### The closeout at the final code head (`778976a`)
 
 kasumi CPUs 12–15 in the lane container, a frozen `git archive` tree, started
-2026-10-26T22:46:53Z (`notes/yw08-evidence/closeout/`). Every step green but the three unit lanes still running at hand-back:
+2026-10-26T22:46:53Z (`notes/yw08-evidence/closeout/`). Every step green; the three unit lanes, still running at hand-back, finished green (the orchestrator, 2026-10-27, from the job markers: check-test-cases 820 cases over 37 files, 0 red; check-test checked 171 passed, 81 by native fallback, 0 failed; check-test --native 171 ok; the job's overall exit 1 is the perf-regression-plant control, red by design). As written at hand-back:
 `fmt`, `registry` (213 rows over 19 files), `release` and `native` (the whole
 editor), `fuzz-vm` and `fuzz-vm-stress` (both report lines C's), `coverage`,
 `conformance` (39/39 normal, stressed, again; byte-identical), the three PTY
