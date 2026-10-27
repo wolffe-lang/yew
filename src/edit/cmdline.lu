@@ -66,6 +66,9 @@ pub struct CmdLine {
     err_lo: int,
     err_hi: int,
     err_msg: str,
+    // CmdErr.msg[128] can end inside UTF-8; raw bytes are authoritative then.
+    err_raw: List[byte],
+    err_has_raw: bool,
     hint: str,
     scroll: int,
     click_row: int,
@@ -118,6 +121,8 @@ pub fn cmdline_new() -> CmdLine {
         err_lo: 0,
         err_hi: 0,
         err_msg: "",
+        err_raw: List[byte](),
+        err_has_raw: false,
         hint: "",
         scroll: 0,
         click_row: -1,
@@ -380,8 +385,10 @@ fn replace_all(mut ed: Ed, bytes: List[byte], reset_history: bool) -> bool {
 
 // `clear_error` (`cmdline.c:191-199`).
 fn cl_clear_error(mut ed: Ed) {
-    if ed.cmdline.err_msg.len != 0 {
+    if ed.cmdline.err_msg.len != 0 || ed.cmdline.err_has_raw {
         ed.cmdline.err_msg = ""
+        (mut ed.cmdline.err_raw).reset()
+        ed.cmdline.err_has_raw = false
         ed.cmdline.err_lo = 0
         ed.cmdline.err_hi = 0
         ed.full_damage = true
@@ -395,6 +402,12 @@ fn cl_clear_error(mut ed: Ed) {
 /// message and the offending token, the caret at its start; a live menu
 /// goes (the menu and the message share the rows above the prompt).
 pub fn cmdline_set_error(mut ed: Ed, lo_in: int, hi_in: int, msg: str) {
+    cmdline_set_error_bytes(mut ed, lo_in, hi_in, msg.bytes())
+}
+
+/// Preserve CmdErr.msg's byte contract: first NUL or 127 bytes, including a
+/// cap that bisects UTF-8 (sagitta cmdline.c:201-237,3523-3529).
+pub fn cmdline_set_error_bytes(mut ed: Ed, lo_in: int, hi_in: int, msg: List[byte]) {
     cl_menu_dismiss(mut ed)
     let len = cmdline_len(ed)
     var lo = lo_in
@@ -412,9 +425,16 @@ pub fn cmdline_set_error(mut ed: Ed, lo_in: int, hi_in: int, msg: str) {
     }
     ed.cmdline.err_lo = lo
     ed.cmdline.err_hi = hi
-    ed.cmdline.err_msg = msg
+    var raw = List[byte]()
+    for b in msg { if raw.len == 127 || b == 0 as byte { break }; (mut raw).push(b) }
+    ed.cmdline.err_msg = str_from_utf8(raw) else ""
+    ed.cmdline.err_has_raw = ed.cmdline.err_msg.len == 0 && raw.len != 0
+    (mut ed.cmdline.err_raw).reset()
+    if ed.cmdline.err_has_raw { for b in raw { (mut ed.cmdline.err_raw).push(b) } }
     cl_set_caret(mut ed, if len == 0 then 0 else lo)
-    ed_msg(mut ed, MSG_ERROR, "E: {msg}")
+    var shown = bytes_of("E: ")
+    for b in raw { (mut shown).push(b) }
+    ed_msg_bytes(mut ed, MSG_ERROR, shown)
     ed.full_damage = true
     ed.footer_dirty = true
 }
@@ -463,6 +483,8 @@ fn cl_target_reset(mut ed: Ed, seed: List[byte]) {
 
 fn cl_forget_state(mut ed: Ed) {
     ed.cmdline.err_msg = ""
+    (mut ed.cmdline.err_raw).reset()
+    ed.cmdline.err_has_raw = false
     ed.cmdline.err_lo = 0
     ed.cmdline.err_hi = 0
     // C's open and close leave `hint` as the last refilter left it
@@ -602,6 +624,8 @@ pub fn cmdline_close(mut ed: Ed, accepted: bool) {
     cl_tok_forget(mut ed)
     ed.cmdline.active = false
     ed.cmdline.err_msg = ""
+    (mut ed.cmdline.err_raw).reset()
+    ed.cmdline.err_has_raw = false
     ed.cmdline.err_lo = 0
     ed.cmdline.err_hi = 0
     ed.cmdline.scroll = 0
@@ -1021,7 +1045,7 @@ fn deferred_dispatch_error(mut ed: Ed, id: int, lo: int, hi: int) {
         name
     }
     let help = if known then ed.reg.entries[id - 1].help else ""
-    let preserve = name.starts_with("ed.ai.") && ed.msg.active && ed.msg.text.len != 0
+    let preserve = name.starts_with("ed.ai.") && ed.msg.active && msg_byte_len(ed.msg) != 0
     var msg = ":{label} failed"
     let at = help.find("Sprint ") else -1
     if at >= 0 {
@@ -1034,7 +1058,12 @@ fn deferred_dispatch_error(mut ed: Ed, id: int, lo: int, hi: int) {
         }
         let number = help[at + 7..n]
         if preserve {
-            msg = "{clip_bytes(ed.msg.text, 64)}; :{clip_bytes(label, 24)} lands in Sprint {number}"
+            var kept = List[byte]()
+            msg_append_prefix(mut kept, ed.msg, 64)
+            let tail = "; :{clip_bytes(label, 24)} lands in Sprint {number}"
+            for b in tail.bytes() { (mut kept).push(b) }
+            cmdline_set_error_bytes(mut ed, lo, hi, kept)
+            return
         } else {
             msg = ":{label} lands in Sprint {number}"
         }
@@ -1055,11 +1084,13 @@ pub fn cmdline_failed(mut ed: Ed, status: int, id: int, lo: int, hi: int, kind: 
         deferred_dispatch_error(mut ed, id, lo, hi)
         return
     }
-    var msg = "command failed"
-    if ed.msg.active && ed.msg.text.len != 0 {
-        msg = clip_bytes(ed.msg.text, 127)
+    if ed.msg.active && msg_byte_len(ed.msg) != 0 {
+        var kept = List[byte]()
+        msg_append_prefix(mut kept, ed.msg, 127)
+        cmdline_set_error_bytes(mut ed, lo, hi, kept)
+        return
     }
-    cmdline_set_error(mut ed, lo, hi, msg)
+    cmdline_set_error(mut ed, lo, hi, "command failed")
 }
 
 // ---- drawing ----------------------------------------------------------
@@ -1183,21 +1214,27 @@ fn draw_prompt_message(mut ed: Ed, footer: int, style: UiStyle) {
     // stack buffer): the hint or error shows on every prompt frame
     // (deliverable 6).
     clear_bytes(mut ed.dbuf.msg)
-    if ed.cmdline.err_msg.len != 0 {
+    if ed.cmdline.err_msg.len != 0 || ed.cmdline.err_has_raw {
         mstyle.row_fg = term.color_indexed(196)
         mstyle.attrs = mstyle.attrs | term.ATTR_BOLD
         push_str(mut ed.dbuf.msg, "E: ")
-        push_str(mut ed.dbuf.msg, ed.cmdline.err_msg)
+        if ed.cmdline.err_has_raw {
+            for b in ed.cmdline.err_raw { (mut ed.dbuf.msg).push(b) }
+        } else {
+            push_str(mut ed.dbuf.msg, ed.cmdline.err_msg)
+        }
     } else if ed.msg.active {
         mstyle = message_style(ed)
-        if ed.cmdline.kind == PROMPT_INPUT && ed.msg.text.contains("\n") {
-            draw_prompt_message_full(mut ed, footer, mstyle, bytes_of(ed.msg.text))
+        if ed.cmdline.kind == PROMPT_INPUT &&
+            (msg_byte_len(ed.msg) >= 512 || msg_has_byte(ed.msg, 10 as byte)) {
+            let bytes = msg_bytes(ed.msg)
+            draw_prompt_message_full(mut ed, footer, mstyle, bytes)
             return
         }
         if ed.msg.sev == MSG_ERROR {
             push_str(mut ed.dbuf.msg, "E: ")
         }
-        push_str(mut ed.dbuf.msg, ed.msg.text)
+        msg_append_bytes(mut ed.dbuf.msg, ed.msg)
     } else if ed.cmdline.hint.len != 0 {
         mstyle.attrs = mstyle.attrs | term.ATTR_DIM
         push_str(mut ed.dbuf.msg, ed.cmdline.hint)
