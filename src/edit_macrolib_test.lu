@@ -1,0 +1,254 @@
+//! member: false
+//! The eight tests/unit/test_macrolib.c cases at sagitta 9ace98c2, in
+//! registry order (Sprint 38: deterministic macro-library discovery and
+//! reload). C's fixture (mlf_open, test_macrolib.c:47-66) is a mkdtemp
+//! tree under /tmp named by `macro.dir` and a diagnostic sink counting
+//! errors and warnings; the port's sink is the DiagCtx the scan writes.
+
+use edit
+use fl
+use std.fs
+
+struct MacroLibFix { root: str }
+
+var fix_counter: int = 0
+
+fn mlf_open() -> (MacroLibFix, edit.Ed) {
+    var n = 0
+    // # Safety: the test is one thread; the counter names fresh trees.
+    unsafe {
+        fix_counter += 1
+        n = fix_counter
+    }
+    let root = "/tmp/yew-macrolib-{os_pid()}-{n}"
+    fs.remove_dir_all(root) else |_| {}
+    fs.create_dir_all(root) else |_| { assert(false, "mkdir {root}") }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    assert(edit.opt_set(mut ed, edit.OPT_GLOBAL, "macro.dir", edit.optv_str(root)).len == 0)
+    (MacroLibFix { root: root }, ed)
+}
+
+fn mlf_write(f: MacroLibFix, name: str, source: str) {
+    fs.write_text("{f.root}/{name}", source) else |_| { assert(false, "write {name}") }
+}
+
+// mlf_scan (test_macrolib.c:89-97): (count, errors, warnings, messages).
+fn mlf_scan(mut ed: edit.Ed) -> (int, int, int, str) {
+    var dc = fl.fl_diag_init()
+    let n = edit.macrolib_scan_dc(mut ed, mut dc)
+    var errors = 0
+    var warnings = 0
+    var messages = ""
+    for d in dc.entries {
+        if d.level == fl.FL_DIAG_ERROR { errors += 1 } else if d.level == fl.FL_DIAG_WARNING { warnings += 1 }
+        messages = if messages.len == 0 then d.msg else "{messages}\n{d.msg}"
+    }
+    (n, errors, warnings, messages)
+}
+
+fn mlf_close(f: MacroLibFix) {
+    assert(f.root.starts_with("/tmp/yew-macrolib-"), "only a /tmp/yew-macrolib-* tree is removed")
+    fs.remove_dir_all(f.root) else |_| {}
+}
+
+fn find(ed: edit.Ed, name: str) -> edit.MacroEntryView ! {none} { edit.macrolib_find(ed, name)? }
+
+fn has(ed: edit.Ed, name: str) -> bool {
+    let _ = edit.macrolib_find(ed, name) else { return false }
+    true
+}
+
+fn macrolib_exports_dotted_names_and_matching_stem_alias() {
+    let edit_src = "fn dup_line() {{ return 1 }}\n"
+    var (f, ed) = mlf_open()
+    mlf_write(f, "surround.fl", "fn surround() {{ return 2 }}\n")
+    mlf_write(f, "edit.fl", edit_src)
+    let (n, errors, warnings, _) = mlf_scan(mut ed)
+    assert(n == 2)
+    assert(errors == 0)
+    assert(warnings == 0)
+    assert(edit.macrolib_count(ed) == 2)
+    let v = find(ed, "edit.dup_line") else {
+        assert(false, "edit.dup_line")
+        return
+    }
+    assert(v.name == "edit.dup_line")
+    assert(!v.has_alias)
+    assert(v.binding == "dup_line")
+    assert(v.stem == "edit")
+    assert(v.source.len == edit_src.len)
+    let eb = edit_src.bytes()
+    for i in 0..eb.len { assert(v.source[i] == eb[i]) }
+    assert(v.arity == 0)
+    assert(v.replayable)
+    let s = find(ed, "surround") else {
+        assert(false, "surround")
+        return
+    }
+    assert(s.name == "surround.surround")
+    assert(s.has_alias && s.alias == "surround")
+    assert(s.binding == "surround")
+    assert(s.stem == "surround")
+    assert(has(ed, "surround.surround"))
+    mlf_close(f)
+}
+
+fn macrolib_excludes_private_and_nonzero_arity_from_macros() {
+    var (f, ed) = mlf_open()
+    mlf_write(f, "mixed.fl", "fn _hidden() {{ return 1 }}\nfn takes(value) {{ return value }}\nfn zero() {{ return 0 }}\n")
+    let (n, errors, _, _) = mlf_scan(mut ed)
+    assert(n == 2)
+    assert(errors == 0)
+    assert(!has(ed, "mixed._hidden"))
+    let t = find(ed, "mixed.takes") else {
+        assert(false, "mixed.takes")
+        return
+    }
+    assert(t.arity == 1)
+    assert(!t.replayable)
+    assert(edit.macrolib_call(mut ed, "mixed.takes") == edit.CMD_ERR_ARG)
+    let z = find(ed, "mixed.zero") else {
+        assert(false, "mixed.zero")
+        return
+    }
+    assert(z.arity == 0)
+    assert(z.replayable)
+    assert(edit.macrolib_call(mut ed, "mixed.zero") == edit.CMD_OK)
+    mlf_close(f)
+}
+
+fn macrolib_broken_file_is_skipped_without_hiding_valid_files() {
+    var (f, ed) = mlf_open()
+    mlf_write(f, "bad.fl", "fn broken(\n")
+    mlf_write(f, "good.fl", "fn good() {{ return 3 }}\n")
+    let (n, errors, _, messages) = mlf_scan(mut ed)
+    assert(n == 1)
+    assert(errors >= 1)
+    assert(messages.contains("bad.fl"))
+    assert(messages.contains("skipped"))
+    assert(edit.macrolib_count(ed) == 1)
+    assert(!has(ed, "bad.broken"))
+    let g = find(ed, "good.good") else {
+        assert(false, "good.good")
+        return
+    }
+    assert(g.binding == "good")
+    assert(g.replayable)
+    mlf_close(f)
+}
+
+fn macrolib_rejects_one_character_stem() {
+    var (f, ed) = mlf_open()
+    mlf_write(f, "a.fl", "fn a() {{ return 1 }}\n")
+    mlf_write(f, "valid.fl", "fn valid() {{ return 2 }}\n")
+    let (n, errors, _, messages) = mlf_scan(mut ed)
+    assert(n == 1)
+    assert(errors == 1)
+    assert(messages.contains("stem 'a'"))
+    assert(messages.contains("at least 2 bytes"))
+    assert(!has(ed, "a"))
+    assert(!has(ed, "a.a"))
+    assert(has(ed, "valid"))
+    mlf_close(f)
+}
+
+fn macrolib_unknown_schema_skips_only_that_file() {
+    var (f, ed) = mlf_open()
+    mlf_write(f, "legacy.fl", "# yew-macro: 7\nfn legacy() {{ return 7 }}\n")
+    mlf_write(f, "modern.fl", "# yew-macro: 1\nfn modern() {{ return 1 }}\n")
+    let (n, errors, warnings, messages) = mlf_scan(mut ed)
+    assert(n == 1)
+    assert(errors == 0)
+    assert(warnings == 1)
+    assert(messages.contains("unsupported yew-macro schema 7"))
+    assert(messages.contains("skipped"))
+    assert(!has(ed, "legacy"))
+    assert(!has(ed, "legacy.legacy"))
+    let m = find(ed, "modern") else {
+        assert(false, "modern")
+        return
+    }
+    assert(m.name == "modern.modern")
+    assert(m.header.schema == 1)
+    mlf_close(f)
+}
+
+fn macrolib_scan_order_is_bytewise_and_stable() {
+    let want = ["Alpha.first", "Zed.second", "beta.third"]
+    var (f, ed) = mlf_open()
+    mlf_write(f, "beta.fl", "fn third() {{ return 3 }}\n")
+    mlf_write(f, "Zed.fl", "fn second() {{ return 2 }}\n")
+    mlf_write(f, "Alpha.fl", "fn first() {{ return 1 }}\n")
+    for _ in 0..2 {
+        let (n, _, _, _) = mlf_scan(mut ed)
+        assert(n == want.len)
+        for i in 0..want.len {
+            let v = edit.macrolib_at(ed, i) else {
+                assert(false, "entry {i}")
+                return
+            }
+            assert(v.name == want[i])
+        }
+        let _ = edit.macrolib_at(ed, want.len) else { continue }
+        assert(false, "no entry past the end")
+    }
+    mlf_close(f)
+}
+
+fn macrolib_reload_replaces_entries_and_survives_gc() {
+    var (f, ed) = mlf_open()
+    mlf_write(f, "reload.fl", "fn before() {{ return 1 }}\n")
+    let (n1, _, _, _) = mlf_scan(mut ed)
+    assert(n1 == 1)
+    assert(has(ed, "reload.before"))
+    assert(edit.macrolib_call(mut ed, "reload.before") == edit.CMD_OK)
+    mlf_write(f, "reload.fl", "fn after() {{ return 2 }}\n")
+    let (n2, _, _, _) = mlf_scan(mut ed)
+    assert(n2 == 1)
+    assert(!has(ed, "reload.before"))
+    let a = find(ed, "reload.after") else {
+        assert(false, "reload.after")
+        return
+    }
+    assert(a.binding == "after")
+    fl.fl_gc_collect(mut ed.flrt.vms[0])
+    let b = find(ed, "reload.after") else {
+        assert(false, "reload.after after a collection")
+        return
+    }
+    assert(b.replayable)
+    assert(edit.macrolib_call(mut ed, "reload.after") == edit.CMD_OK)
+    mlf_close(f)
+}
+
+fn macro_header_major_mismatch_warns_but_still_loads() {
+    var (f, ed) = mlf_open()
+    mlf_write(f, "compat.fl", "# yew-macro: 1\n# recorded-with: yew 9.4.0\nfn compat() {{ return 9 }}\n")
+    let (n, errors, warnings, messages) = mlf_scan(mut ed)
+    assert(n == 1)
+    assert(errors == 0)
+    assert(warnings == 1)
+    assert(messages.contains("recorded-with"))
+    assert(messages.contains("9.4.0"))
+    let v = find(ed, "compat") else {
+        assert(false, "compat")
+        return
+    }
+    assert(v.header.recorded_with.present)
+    assert((str_from_utf8(v.header.recorded_with.s) else "") == "yew 9.4.0")
+    assert(edit.macrolib_call(mut ed, "compat") == edit.CMD_OK)
+    mlf_close(f)
+}
+
+fn main() {
+    macrolib_exports_dotted_names_and_matching_stem_alias()
+    macrolib_excludes_private_and_nonzero_arity_from_macros()
+    macrolib_broken_file_is_skipped_without_hiding_valid_files()
+    macrolib_rejects_one_character_stem()
+    macrolib_unknown_schema_skips_only_that_file()
+    macrolib_scan_order_is_bytewise_and_stable()
+    macrolib_reload_replaces_entries_and_survives_gc()
+    macro_header_major_mismatch_warns_but_still_loads()
+    print("edit_macrolib: 8 cases pass")
+}
