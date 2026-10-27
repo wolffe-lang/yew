@@ -1,0 +1,452 @@
+//! member: false
+//! The eleven tests/unit/test_fl_txn.c cases at sagitta 9ace98c2, in
+//! registry order. C's TxnBuf (test_fl_txn.c:13-51) is a raw EditCtx over
+//! its own TextBuf, undo tree and cursor set; the port enlists BUFFER
+//! IDENTITIES (edit/fltxn.lu), so a TxnBuf is an editor buffer with a view
+//! of its own, and C's `yew_edit_insert(&b.ec, ...)` is an insert through
+//! that view's edit seam (edit_take, the text layer, edit_give). C's script
+//! fixture (test_fl_txn.c:108-153) installs a `mutate` native; the port's
+//! natives are kinds (R-yw07-10), so `TxnHost` serves a test kind and hands
+//! every other kind, the motion block and the transaction callbacks to the
+//! editor host's own functions (R-yw09-4).
+//!
+//! One adaptation, named: the second half of
+//! fl_txn_multi_buffer_commit_and_abort builds two undo trees over ONE
+//! TextBuf to make the rollback order observable (test_fl_txn.c:292-308).
+//! A port buffer owns exactly one undo tree and the transaction is keyed by
+//! buffer identity, so that pair cannot be constructed; the reverse order
+//! of fltxn.c:33-35 is ported as written (txn_finish) and this file runs
+//! the first half whole.
+
+use edit
+use fl
+use text
+
+// The test's `mutate` native, a kind the host api range dispatches
+// (std.lu's fl_native_dispatch_host: 8000..14999 reach the host).
+const MUTATE: int = 14999
+
+// C's TxnBuf: the buffer's index and the window the test edits through.
+struct TxnBuf { bi: int, wi: int }
+
+// txn_fix_open's VM (test_fl_txn.c:53-58): the editor host selected.
+fn txn_vm() -> fl.FlVm {
+    var strings = fl.fl_strings()
+    var vm = fl.fl_vm_new(take strings)
+    vm.host_kind = 1
+    vm
+}
+
+// txn_buf_open (test_fl_txn.c:33-43): a buffer over `s` and its own view,
+// so a later buffer shown in the focused window leaves this one shown.
+fn txn_buf_open(mut ed: edit.Ed, s: str) -> TxnBuf {
+    edit.ed_open_memory(mut ed, s.bytes(), "txn")
+    let bi = ed.wins[ed.win].buf
+    let w = edit.win_new(ed.next_win_id, bi)
+    ed.next_win_id += 1
+    (mut ed.wins).push(w)
+    TxnBuf { bi: bi, wi: ed.wins.len - 1 }
+}
+
+fn tb_len(ed: edit.Ed, b: TxnBuf) -> int { text.textbuf_len(ed.bufs[b.bi].ec.tb) }
+
+// yew_edit_insert(&b.ec, at, s): through the view, no command and no undo
+// grouping of its own (an open transaction records the operation).
+fn ins(mut ed: edit.Ed, b: TxnBuf, at: int, s: str) -> bool {
+    edit.edit_take(mut ed, b.wi)
+    let ok = text.edit_insert(mut ed.bufs[b.bi].ec, at as text.ByteOff, s.bytes())
+    edit.edit_give(mut ed, b.wi)
+    ok
+}
+
+// yew_undo(&b.ec).
+fn undo1(mut ed: edit.Ed, b: TxnBuf) -> bool {
+    edit.edit_take(mut ed, b.wi)
+    let ok = text.undo(mut ed.bufs[b.bi].ec)
+    edit.edit_give(mut ed, b.wi)
+    ok
+}
+
+// txn_dump_node_count (test_fl_txn.c:68-84): `node ` lines of the dump.
+fn nodes(ed: edit.Ed, b: TxnBuf) -> int {
+    var n = 0
+    for line in text.undo_dump(ed.bufs[b.bi].ec.undo).split("\n") {
+        if line.starts_with("node ") { n += 1 }
+    }
+    n
+}
+
+fn enlist(mut vm: fl.FlVm, mut ed: edit.Ed, b: TxnBuf) -> bool {
+    edit.fl_txn_enlist(mut vm, mut ed, b.wi)
+}
+
+// txn_script_open's host: C's `vm.ed` and `script_buf` (test_fl_txn.c:66,
+// 124-146). `mutate` enlists the script buffer and appends one byte.
+struct TxnHost { ed: edit.Ed, b: TxnBuf }
+
+impl fl.FlHost for TxnHost {
+    fn api(mut self, mut vm: fl.FlVm, kind: int, base: int, argc: int) -> fl.FlValue {
+        if kind != MUTATE { return edit.fl_attached_api(mut vm, mut self.ed, kind, base, argc) }
+        let b = copy self.b
+        if !edit.fl_txn_enlist(mut vm, mut self.ed, b.wi) { return fl.fl_nil() }
+        let at = text.textbuf_len(self.ed.bufs[b.bi].ec.tb)
+        if !ins(mut self.ed, b, at, "x") { return fl.fl_raise(mut vm, "io", "test mutation failed") }
+        fl.fl_nil()
+    }
+    fn motion(mut self, mut vm: fl.FlVm, program: fl.FlValue) -> bool {
+        edit.fl_motion_host_dispatch(mut vm, mut self.ed, program)
+    }
+    fn edit_begin(mut self, mut vm: fl.FlVm) -> bool { edit.fl_txn_edit_begin(mut vm, mut self.ed) }
+    fn edit_end(mut self, mut vm: fl.FlVm, commit: bool) -> bool {
+        edit.fl_txn_edit_end(mut vm, mut self.ed, commit)
+    }
+    fn run_begin(mut self, mut vm: fl.FlVm) -> bool { edit.fl_txn_run_begin(mut vm, mut self.ed) }
+    #[allow(w1002)] // The host ABI passes the VM; C's run_end never raises.
+    fn run_end(mut self, mut vm: fl.FlVm, commit: bool) -> bool {
+        let _ = vm.sp
+        edit.fl_txn_run_end(mut self.ed, commit)
+    }
+    fn run_active(self) -> bool { self.ed.fltxn.entry_active }
+    fn hook_call(mut self, mut vm: fl.FlVm, f: fl.FlValue, args: List[fl.FlValue]) -> (
+        bool,
+        fl.FlValue,
+    ) {
+        (mut self.ed).hook_call(mut vm, f, args)
+    }
+    fn hook_masked(self, origin: int) -> bool { self.ed.hook_masked(origin) }
+    fn hook_notice(
+        mut self,
+        mut vm: fl.FlVm,
+        what: int,
+        event: int,
+        ledger_id: int,
+        errs: int,
+        err: fl.FlValue,
+    ) {
+        (mut self.ed).hook_notice(mut vm, what, event, ledger_id, errs, err)
+    }
+}
+
+// txn_script_open (test_fl_txn.c:124-146): flfix's VM (CLI origin, no
+// grants, the builtins) on the editor host, `mutate` bound as a global.
+fn script_vm() -> fl.FlVm {
+    var vm = txn_vm()
+    fl.fl_std_register(mut vm)
+    let name = fl.fl_intern(mut vm.strings, "mutate".bytes(), 0, 6)
+    let native = fl.fl_native_new(mut vm, name, MUTATE, 0, 0, 0)
+    let root = fl.fl_temp_push(mut vm, native)
+    let globals = copy vm.globals
+    let nat = fl.fl_temp_get(vm, root)
+    assert(fl.fl_map_set(mut vm, globals, fl.fl_int(name), nat))
+    fl.fl_temp_pop(mut vm, 1)
+    vm
+}
+
+fn script_host() -> TxnHost {
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "")
+    TxnHost { ed: ed, b: b }
+}
+
+fn err_field(mut vm: fl.FlVm, err: fl.FlValue, key: str) -> str {
+    if err.t != fl.FL_MAP { return "" }
+    let k = fl.fl_str_text(mut vm, key)
+    let got = fl.fl_map_get(vm, err, k) else { return "" }
+    if got.t != fl.FL_STR { return "" }
+    str_from_utf8(vm.gc.slots[fl.fl_obj_index(vm, got)].bytes) else ""
+}
+
+// FL_EQ (flfix.c:137-200) on the editor host: `nil`, a scalar, or
+// `!kind: msg` for a raise.
+fn run(mut vm: fl.FlVm, mut host: TxnHost, src: str) -> str {
+    let bytes = src.bytes()
+    vm.dc = fl.fl_diag_init()
+    let file = fl.fl_diag_add_file(mut vm.dc, "t.fl", bytes)
+    let p = fl.fl_parse(bytes, file, mut vm.dc, mut vm.strings)
+    if p.had_error { return "!parse" }
+    let origin = fl.fl_origin_new(fl.FL_ORIGIN_CLI, 0)
+    let entry = fl.fl_compile(mut vm, p, file, origin) else { return "!compile" }
+    let res = fl.fl_vm_run_host(mut vm, mut host, entry)
+    if vm.raised {
+        vm.raised = false
+        return "!{err_field(mut vm, res, "kind")}: {err_field(mut vm, res, "msg")}"
+    }
+    if res.t == fl.FL_NIL { return "nil" }
+    if res.t == fl.FL_INT { return "{res.i}" }
+    "<{fl.fl_type_name(res.t)}>"
+}
+
+fn fl_txn_implicit_entry_enlists_once() {
+    var vm = txn_vm()
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "a")
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, b))
+    assert(enlist(mut vm, mut ed, b))
+    assert(ed.fltxn.entries.len == 1)
+    assert(ins(mut ed, b, 1, "bc"))
+    assert(edit.fl_txn_run_end(mut ed, true))
+    assert(tb_len(ed, b) == 3)
+    assert(undo1(mut ed, b))
+    assert(tb_len(ed, b) == 1)
+}
+
+fn fl_txn_nested_edit_flattens_to_one_undo() {
+    var vm = txn_vm()
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "")
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(edit.fl_txn_edit_begin(mut vm, mut ed))
+    assert(edit.fl_txn_edit_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, b))
+    assert(ins(mut ed, b, 0, "a"))
+    assert(edit.fl_txn_edit_end(mut vm, mut ed, true))
+    assert(ins(mut ed, b, 1, "b"))
+    assert(edit.fl_txn_edit_end(mut vm, mut ed, true))
+    assert(edit.fl_txn_run_end(mut ed, true))
+    assert(tb_len(ed, b) == 2)
+    // Root plus exactly one script edit node.
+    assert(nodes(ed, b) == 2, "two nodes, got {nodes(ed, b)}")
+    assert(undo1(mut ed, b))
+    assert(tb_len(ed, b) == 0)
+    assert(!undo1(mut ed, b))
+}
+
+// F08 audit control (test_fl_txn.c:201-234): real text edits inside two
+// nested edit boundaries; one undo restores all 100,000 bytes in one step.
+fn fl_txn_audit_100k_nested_mutations_make_one_undo() {
+    var vm = txn_vm()
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "")
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(edit.fl_txn_edit_begin(mut vm, mut ed))
+    assert(edit.fl_txn_edit_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, b))
+    let x = "x".bytes()
+    edit.edit_take(mut ed, b.wi)
+    for _ in 0..100000 {
+        let at = text.textbuf_len(ed.bufs[b.bi].ec.tb)
+        assert(text.edit_insert(mut ed.bufs[b.bi].ec, at as text.ByteOff, x))
+    }
+    edit.edit_give(mut ed, b.wi)
+    assert(edit.fl_txn_edit_end(mut vm, mut ed, true))
+    assert(edit.fl_txn_edit_end(mut vm, mut ed, true))
+    assert(edit.fl_txn_run_end(mut ed, true))
+    assert(tb_len(ed, b) == 100000)
+    assert(nodes(ed, b) == 2)
+    assert(undo1(mut ed, b))
+    assert(tb_len(ed, b) == 0)
+    assert(!undo1(mut ed, b))
+}
+
+fn fl_txn_error_crossing_outer_edit_rolls_back() {
+    var vm = txn_vm()
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "old")
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(edit.fl_txn_edit_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, b))
+    assert(ins(mut ed, b, 3, "new"))
+    assert(edit.fl_txn_edit_end(mut vm, mut ed, false))
+    assert(tb_len(ed, b) == 3)
+    assert(edit.fl_txn_run_end(mut ed, false))
+    assert(ed.fltxn.entries.len == 0)
+    assert(ed.fltxn.depth == 0)
+    assert(!ed.fltxn.entry_active)
+}
+
+fn fl_txn_multi_buffer_commit_and_abort() {
+    var vm = txn_vm()
+    var ed = edit.ed_new()
+    let a = txn_buf_open(mut ed, "a")
+    let b = txn_buf_open(mut ed, "b")
+    assert(a.bi != b.bi && ed.wins[a.wi].buf == a.bi && ed.wins[b.wi].buf == b.bi)
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, a))
+    assert(enlist(mut vm, mut ed, b))
+    assert(ins(mut ed, a, 1, "1"))
+    assert(ins(mut ed, b, 1, "2"))
+    assert(edit.fl_txn_run_end(mut ed, true))
+    assert(tb_len(ed, a) == 2)
+    assert(tb_len(ed, b) == 2)
+
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, a))
+    assert(enlist(mut vm, mut ed, b))
+    assert(ins(mut ed, a, 2, "x"))
+    assert(ins(mut ed, b, 2, "y"))
+    assert(edit.fl_txn_run_end(mut ed, false))
+    assert(tb_len(ed, a) == 2)
+    assert(tb_len(ed, b) == 2)
+    assert(undo1(mut ed, a))
+    assert(undo1(mut ed, b))
+    assert(tb_len(ed, a) == 1)
+    assert(tb_len(ed, b) == 1)
+    // test_fl_txn.c:292-308 (two undo trees over one TextBuf) is not
+    // constructible in the port: see this file's header.
+}
+
+fn fl_txn_headless_enlist_is_noop() {
+    var strings = fl.fl_strings()
+    var vm = fl.fl_vm_new(take strings)
+    var host = fl.fl_null_host()
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "x")
+    assert(enlist(mut vm, mut ed, b))
+    assert(ed.fltxn.entries.len == 0)
+    assert((mut host).edit_begin(mut vm))
+    assert((mut host).edit_end(mut vm, false))
+}
+
+fn fl_txn_try_boundary_controls_rollback() {
+    var vm = script_vm()
+    var host = script_host()
+    let b = copy host.b
+    assert(
+        run(
+            mut vm,
+            mut host,
+            "edit {{ mutate(); try {{ error(\"caught\") }} catch e {{ mutate() }} }}",
+        ) ==
+            "nil",
+    )
+    assert(tb_len(host.ed, b) == 2)
+    assert(nodes(host.ed, b) == 2)
+    assert(undo1(mut host.ed, b))
+    assert(tb_len(host.ed, b) == 0)
+
+    assert(
+        run(mut vm, mut host, "try {{ edit {{ mutate(); error(\"escape\") }} }} catch e {{ nil }}") ==
+            "nil",
+    )
+    assert(tb_len(host.ed, b) == 0)
+
+    var vm2 = script_vm()
+    var host2 = script_host()
+    let b2 = copy host2.b
+    assert(run(mut vm2, mut host2, "fn helper() {{ mutate() }}\nedit {{ helper(); helper() }}") == "nil")
+    assert(tb_len(host2.ed, b2) == 2)
+    // Moving the same edits behind a helper cannot split the boundary.
+    assert(nodes(host2.ed, b2) == 2)
+}
+
+fn fl_txn_vm_is_reusable_after_rollback() {
+    var vm = script_vm()
+    var host = script_host()
+    let b = copy host.b
+    assert(run(mut vm, mut host, "edit {{ mutate(); error(\"escape\") }}") == "!user: escape")
+    assert(tb_len(host.ed, b) == 0)
+    assert(vm.frames.len == 0)
+    assert(vm.handlers.len == 0)
+    assert(vm.edit_depth == 0)
+    assert(host.ed.fltxn.depth == 0)
+    assert(!host.ed.fltxn.entry_active)
+    assert(run(mut vm, mut host, "edit {{ mutate() }}") == "nil")
+    assert(tb_len(host.ed, b) == 1)
+}
+
+// An escaping error keeps its original value when it crosses two edit
+// boundaries, while both boundaries abort their staged text.
+fn fl_txn_audit_nested_escape_rolls_back_and_reraises() {
+    var vm = script_vm()
+    var host = script_host()
+    let b = copy host.b
+    assert(
+        run(mut vm, mut host, "edit {{ edit {{ mutate(); error(\"audit escape\") }} }}") ==
+            "!user: audit escape",
+    )
+    assert(tb_len(host.ed, b) == 0)
+    assert(nodes(host.ed, b) == 1)
+    assert(vm.edit_depth == 0)
+    assert(host.ed.fltxn.depth == 0)
+    assert(!host.ed.fltxn.entry_active)
+}
+
+// C re-enlists an EditCtx whose cursor set is another (test_fl_txn.c:
+// 325-349): the port's is a second view of the same buffer, and the abort
+// restores THAT view's cursor.
+fn fl_txn_reenlist_refreshes_abort_context() {
+    var vm = txn_vm()
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "a")
+    var w = edit.win_new(ed.next_win_id, b.bi)
+    ed.next_win_id += 1
+    w.cs = text.cset_init(text.cursor_at(1 as text.ByteOff))
+    (mut ed.wins).push(w)
+    let current = TxnBuf { bi: b.bi, wi: ed.wins.len - 1 }
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, b))
+    assert(ins(mut ed, current, 0, "x"))
+    assert(ed.wins[current.wi].cs.curs[0].pos as int == 2)
+    assert(enlist(mut vm, mut ed, current))
+    assert(edit.fl_txn_run_end(mut ed, false))
+    assert(ed.wins[current.wi].cs.curs[0].pos as int == 1)
+    assert(tb_len(ed, b) == 1)
+}
+
+fn fl_txn_save_flushes_implicit_and_refuses_explicit() {
+    var vm = txn_vm()
+    var ed = edit.ed_new()
+    let b = txn_buf_open(mut ed, "a")
+    let id = ed.bufs[b.bi].id
+    assert(edit.fl_txn_run_begin(mut vm, mut ed))
+    assert(enlist(mut vm, mut ed, b))
+    assert(ins(mut ed, b, 1, "b"))
+    assert(edit.fl_txn_enlisted(ed, id))
+    assert(edit.fl_txn_prepare_save(mut vm, mut ed, id))
+    assert(!edit.fl_txn_enlisted(ed, id))
+    assert(ed.bufs[b.bi].ec.undo.depth == 0)
+    assert(edit.fl_txn_edit_begin(mut vm, mut ed))
+    assert(!edit.fl_txn_prepare_save(mut vm, mut ed, id))
+    assert(edit.fl_txn_edit_end(mut vm, mut ed, false))
+    assert(edit.fl_txn_run_end(mut ed, false))
+}
+
+fn main() {
+    let chosen = (env_get("YEW_FL_TXN_CASE") else "-1").to_int() else -1
+    if chosen < 0 || chosen == 0 {
+        fl_txn_implicit_entry_enlists_once()
+        print("fl_txn_implicit_entry_enlists_once: PASS")
+    }
+    if chosen < 0 || chosen == 1 {
+        fl_txn_nested_edit_flattens_to_one_undo()
+        print("fl_txn_nested_edit_flattens_to_one_undo: PASS")
+    }
+    if chosen < 0 || chosen == 2 {
+        fl_txn_audit_100k_nested_mutations_make_one_undo()
+        print("fl_txn_audit_100k_nested_mutations_make_one_undo: PASS")
+    }
+    if chosen < 0 || chosen == 3 {
+        fl_txn_error_crossing_outer_edit_rolls_back()
+        print("fl_txn_error_crossing_outer_edit_rolls_back: PASS")
+    }
+    if chosen < 0 || chosen == 4 {
+        fl_txn_multi_buffer_commit_and_abort()
+        print("fl_txn_multi_buffer_commit_and_abort: PASS")
+    }
+    if chosen < 0 || chosen == 5 {
+        fl_txn_headless_enlist_is_noop()
+        print("fl_txn_headless_enlist_is_noop: PASS")
+    }
+    if chosen < 0 || chosen == 6 {
+        fl_txn_try_boundary_controls_rollback()
+        print("fl_txn_try_boundary_controls_rollback: PASS")
+    }
+    if chosen < 0 || chosen == 7 {
+        fl_txn_vm_is_reusable_after_rollback()
+        print("fl_txn_vm_is_reusable_after_rollback: PASS")
+    }
+    if chosen < 0 || chosen == 8 {
+        fl_txn_audit_nested_escape_rolls_back_and_reraises()
+        print("fl_txn_audit_nested_escape_rolls_back_and_reraises: PASS")
+    }
+    if chosen < 0 || chosen == 9 {
+        fl_txn_reenlist_refreshes_abort_context()
+        print("fl_txn_reenlist_refreshes_abort_context: PASS")
+    }
+    if chosen < 0 || chosen == 10 {
+        fl_txn_save_flushes_implicit_and_refuses_explicit()
+        print("fl_txn_save_flushes_implicit_and_refuses_explicit: PASS")
+    }
+    if chosen < 0 { print("fl_txn: 11 pinned cases PASS") }
+}
