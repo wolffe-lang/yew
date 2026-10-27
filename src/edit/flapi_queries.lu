@@ -1,0 +1,429 @@
+//! edit.flapi_queries — sagitta 9ace98c2 src/fl/flapi.c:145-175,
+//! 198-995. Pure editor queries; descriptor checks and mutating commands
+//! remain in the binding/invocation layer. Only query caches, handle/mark
+//! identity tables change here, never editable text, cursor positions or
+//! register contents. VM-held map/list results are rooted.
+//! Caller-owned temporary bytes, search scratch and pane-leaf lists remain
+//! allocation-pending under G33/G54 (wolf-lang#948), as fl.stdre does;
+//! no scratch region may outlive its allocations through the compacting VM.
+
+use fl
+use search
+use text
+
+fn fq_text(mut vm: fl.FlVm, ed: Ed, bi: int, lo: int, hi: int) -> fl.FlValue {
+    if bi < 0 ||
+        bi >= ed.bufs.len ||
+        !ed.bufs[bi].resident ||
+        lo > hi ||
+        hi > text.textbuf_len(ed.bufs[bi].ec.tb) {
+        return fl.fl_raise(mut vm, "range", "buffer span is outside the text")
+    }
+    if hi - lo > 4294967295 {
+        return fl.fl_raise(mut vm, "limit", "buffer text exceeds string limit")
+    }
+    let bytes = text.textbuf_copy_range(ed.bufs[bi].ec.tb, lo, hi)
+    fl.fl_str_new(mut vm, bytes)
+}
+
+fn fq_put(mut vm: fl.FlVm, root: int, key: str, value: fl.FlValue) {
+    let k = fl.fl_str_text(mut vm, key)
+    let m = fl.fl_temp_get(vm, root)
+    assert(fl.fl_map_set(mut vm, m, k, value))
+}
+
+fn fq_text_put(mut vm: fl.FlVm, root: int, key: str, value: str) {
+    let v = fl.fl_str_text(mut vm, value)
+    fq_put(mut vm, root, key, v)
+}
+
+fn fq_list_push(mut vm: fl.FlVm, root: int, value: fl.FlValue) {
+    let list = fl.fl_temp_get(vm, root)
+    fl.fl_list_push(mut vm, list, value)
+}
+
+fn fq_done(mut vm: fl.FlVm, root: int) -> fl.FlValue {
+    let out = fl.fl_temp_get(vm, root)
+    fl.fl_temp_pop(mut vm, 1)
+    out
+}
+
+fn fq_buffer(mut vm: fl.FlVm, mut ed: Ed, kind: int, base: int, argc: int) -> fl.FlValue {
+    if kind == 8000 {
+        let bi = ed_doc(ed)
+        let h = fl_h_buf_make(mut ed, bi)
+        if h.t == fl.FL_NIL { return fl.fl_raise(mut vm, "handle", "no current buffer") }
+        return h
+    }
+    if kind == 8001 {
+        let list = fl.fl_list_new(mut vm)
+        let root = fl.fl_temp_push(mut vm, list)
+        for bi in 0..ed.bufs.len {
+            if ed.bufs[bi].id == 0 { continue }
+            let h = fl_h_buf_make(mut ed, bi)
+            fq_list_push(mut vm, root, h)
+        }
+        return fq_done(mut vm, root)
+    }
+    let h = copy vm.stack[base]
+    let bi = fl_h_buf(mut vm, ed, h) else { return fl.fl_nil() }
+    if kind == 8005 {
+        return if ed.bufs[bi].has_path {
+            fl.fl_str_text(mut vm, ed.bufs[bi].path)
+        } else {
+            fl.fl_nil()
+        }
+    }
+    if kind == 8006 { return fl.fl_str_text(mut vm, buf_label(ed.bufs[bi])) }
+    if kind == 8007 {
+        let lang = ed.buf_languages[ed.bufs[bi].id] else { return fl.fl_nil() }
+        return fl.fl_str_text(mut vm, lang)
+    }
+    let len = if ed.bufs[bi].resident then text.textbuf_len(ed.bufs[bi].ec.tb) else 0
+    let nlines = if ed.bufs[bi].resident then text.textbuf_line_count(ed.bufs[bi].ec.tb) else 0
+    if kind == 8008 { return fl.fl_int(len) }
+    if kind == 8009 { return fl.fl_int(nlines) }
+    if kind == 8018 { return fl.fl_bool(buf_dirty(ed.bufs[bi])) }
+    if kind == 8019 { return fl.fl_bool(buf_readonly(ed.bufs[bi])) }
+    if kind == 8020 {
+        if !ed.bufs[bi].ec.has_undo || ed.bufs[bi].ec.undo.nodes.len == 0 { return fl.fl_int(0) }
+        let cur = ed.bufs[bi].ec.undo.cur
+        if cur == 0 || cur > ed.bufs[bi].ec.undo.nodes.len {
+            return fl.fl_raise(mut vm, "handle", "buffer undo tree is invalid")
+        }
+        return fl.fl_int(ed.bufs[bi].ec.undo.nodes[cur - 1].depth)
+    }
+    if kind == 8010 {
+        var lo = 0
+        var hi = len
+        if argc != 1 {
+            let span = copy vm.stack[base + 1]
+            let (sb, a, z) = fl_h_span(mut vm, ed, span) else { return fl.fl_nil() }
+            if sb != bi { return fl.fl_raise(mut vm, "range", "span belongs to another buffer") }
+            lo = a
+            hi = z
+        }
+        return fq_text(mut vm, ed, bi, lo, hi)
+    }
+    if kind == 8011 || kind == 8013 {
+        let line = fl.fl_arg_int(mut vm, base, 1) else { return fl.fl_nil() }
+        if line < 1 || line > nlines {
+            return fl.fl_raise(
+                mut vm,
+                "range",
+                if kind == 8011 {
+                    "line {line} is outside the buffer"
+                } else {
+                    "line is outside the buffer"
+                },
+            )
+        }
+        let range = text.textbuf_line_span(ed.bufs[bi].ec.tb, (line - 1) as text.LineNo)
+        if kind == 8013 { return fl_h_span_make(mut ed, bi, range.lo, range.hi) }
+        var hi = range.hi
+        if hi > range.lo && hi <= len && text.textbuf_byte_at(ed.bufs[bi].ec.tb, hi - 1) == 10 {
+            hi -= 1
+            if hi > range.lo && text.textbuf_byte_at(ed.bufs[bi].ec.tb, hi - 1) == 13 { hi -= 1 }
+        }
+        return fq_text(mut vm, ed, bi, range.lo, hi)
+    }
+    if kind == 8012 {
+        let lo = fl.fl_arg_int(mut vm, base, 1) else { return fl.fl_nil() }
+        let hi = fl.fl_arg_int(mut vm, base, 2) else { return fl.fl_nil() }
+        if lo < 0 || hi < lo || hi > len {
+            return fl.fl_raise(mut vm, "range", "invalid byte span")
+        }
+        return fl_h_span_make(mut ed, bi, lo, hi)
+    }
+    if kind == 8023 {
+        let at = fl.fl_arg_int(mut vm, base, 1) else { return fl.fl_nil() }
+        if at < 0 || at > len {
+            return fl.fl_raise(mut vm, "range", "mark offset is outside the buffer")
+        }
+        return fl_h_span_make(mut ed, bi, at, at)
+    }
+    // q_buf_find/find_all, flapi.c:668-727; bytewise progress after an
+    // empty match is deliberately C's API rule, not stdre's scalar rule.
+    let rh = copy vm.stack[base + 1]
+    let ri = fl_h_re(mut vm, ed, rh) else { return fl.fl_nil() }
+    var from = 0
+    if kind == 8016 && argc == 3 {
+        from = fl.fl_arg_int(mut vm, base, 2) else { return fl.fl_nil() }
+    }
+    if from < 0 || from > len {
+        return fl.fl_raise(mut vm, "range", "find offset is outside the buffer")
+    }
+    let input = search.re_input_textbuf(ed.bufs[bi].ec.tb)
+    var scratch = search.re_scratch_new()
+    var found = search.re_match_new()
+    let empty = List[byte]()
+    if kind == 8016 {
+        if !search.re_search_ws(
+            mut scratch,
+            ed.handle_regex[ri].re,
+            ed.bufs[bi].ec.tb,
+            empty,
+            input,
+            from as text.ByteOff,
+            mut found,
+        ) {
+            return fl.fl_nil()
+        }
+        return fl_h_span_make(mut ed, bi, found.lo[0], found.hi[0])
+    }
+    let list = fl.fl_list_new(mut vm)
+    let root = fl.fl_temp_push(mut vm, list)
+    var at = 0
+    while at <= len &&
+        search.re_search_ws(
+            mut scratch,
+            ed.handle_regex[ri].re,
+            ed.bufs[bi].ec.tb,
+            empty,
+            input,
+            at as text.ByteOff,
+            mut found,
+        ) {
+        let span = fl_h_span_make(mut ed, bi, found.lo[0], found.hi[0])
+        fq_list_push(mut vm, root, span)
+        if found.hi[0] > at { at = found.hi[0] } else if at < len { at += 1 } else { break }
+    }
+    fq_done(mut vm, root)
+}
+
+fn fq_window(mut vm: fl.FlVm, mut ed: Ed, kind: int, base: int) -> fl.FlValue {
+    if kind == 9000 {
+        if ed.win < 0 { return fl.fl_raise(mut vm, "handle", "no current window") }
+        let wi = ed.win
+        return fl_h_win_make(mut ed, wi)
+    }
+    if kind == 9001 {
+        let list = fl.fl_list_new(mut vm)
+        let root = fl.fl_temp_push(mut vm, list)
+        if ed.tabs.len == 0 {
+            if ed.win >= 0 {
+                let wi = ed.win
+                let h = fl_h_win_make(mut ed, wi)
+                fq_list_push(mut vm, root, h)
+            }
+        } else {
+            for ti in 0..ed.tabs.len {
+                let leaves = pane_collect_leaves(ed, ed.tabs[ti].root, PANE_MAX_LEAVES)
+                for leaf in leaves {
+                    let wi = ed.panes[leaf].win
+                    let h = fl_h_win_make(mut ed, wi)
+                    fq_list_push(mut vm, root, h)
+                }
+            }
+        }
+        return fq_done(mut vm, root)
+    }
+    let h = copy vm.stack[base]
+    let wi = fl_h_win(mut vm, ed, h) else { return fl.fl_nil() }
+    let bi = ed.wins[wi].buf
+    if kind == 9002 { return fl_h_buf_make(mut ed, bi) }
+    if kind == 9003 {
+        let list = fl.fl_list_new(mut vm)
+        let root = fl.fl_temp_push(mut vm, list)
+        for i in 0..ed.wins[wi].cs.curs.len {
+            let cur = fl_h_cur_make(mut ed, wi, i)
+            fq_list_push(mut vm, root, cur)
+        }
+        return fq_done(mut vm, root)
+    }
+    if kind == 9004 {
+        let c = ed.wins[wi].cs.primary
+        let a = ed.wins[wi].cs.curs[c].anchor
+        let p = ed.wins[wi].cs.curs[c].pos
+        if a == p { return fl.fl_nil() }
+        return fl_h_span_make(mut ed, bi, if a < p then a else p, if a < p then p else a)
+    }
+    let map = fl.fl_map_new(mut vm)
+    let root = fl.fl_temp_push(mut vm, map)
+    fq_put(mut vm, root, "top", fl.fl_int(ed.wins[wi].vp.top + 1))
+    fq_put(mut vm, root, "rows", fl.fl_int(ed.wins[wi].vp.rows))
+    fq_put(mut vm, root, "cols", fl.fl_int(ed.wins[wi].vp.cols))
+    fq_done(mut vm, root)
+}
+
+fn fq_cursor(mut vm: fl.FlVm, mut ed: Ed, kind: int, base: int) -> fl.FlValue {
+    let h = copy vm.stack[base]
+    if kind == 10011 {
+        let saved = copy vm.err
+        let raised = vm.raised
+        let (_, _) = fl_h_cur(mut vm, mut ed, h) else {
+            vm.err = saved
+            vm.raised = raised
+            return fl.fl_bool(false)
+        }
+        return fl.fl_bool(true)
+    }
+    let (wi, ci) = fl_h_cur(mut vm, mut ed, h) else { return fl.fl_nil() }
+    let bi = ed.wins[wi].buf
+    let pos = ed.wins[wi].cs.curs[ci].pos
+    let anchor = ed.wins[wi].cs.curs[ci].anchor
+    if kind == 10000 { return fl.fl_int(pos) }
+    if kind == 10003 { return fl.fl_int(anchor) }
+    if kind == 10010 { return fl.fl_bool(ci == ed.wins[wi].cs.primary) }
+    if kind == 10004 {
+        if pos == anchor { return fl.fl_nil() }
+        return fl_h_span_make(
+            mut ed,
+            bi,
+            if pos < anchor then pos else anchor,
+            if pos < anchor then anchor else pos,
+        )
+    }
+    let line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff)
+    if kind == 10001 { return fl.fl_int(line as int + 1) }
+    let span = text.textbuf_line_span(ed.bufs[bi].ec.tb, line)
+    if kind == 10002 {
+        return fl.fl_int(text.off_to_gcol(mut ed.bufs[bi].ec.tb, span, pos as text.ByteOff) as int)
+    }
+    if kind == 10008 { return fl_h_span_make(mut ed, bi, span.lo, span.hi) }
+    var u = unitctx_buf(ed.bufs[bi].tabwidth, false)
+    u.has_win = true
+    let word = unit_span(UNIT_WORD, mut ed.bufs[bi].ec.tb, u, pos, false)
+    fl_h_span_make(mut ed, bi, word.lo, word.hi)
+}
+
+fn fq_span(mut vm: fl.FlVm, ed: Ed, kind: int, base: int) -> fl.FlValue {
+    let h = copy vm.stack[base]
+    if kind == 11011 {
+        let i = fl.fl_h_slot(ed.handles, h) else { return fl.fl_bool(false) }
+        let p = copy ed.handles.slots[i].payload
+        let bi = ed_buf_index(ed, p.buf)
+        if ed.handles.slots[i].kind != fl.FL_H_SPAN || bi < 0 || !ed.bufs[bi].ec.has_marks {
+            return fl.fl_bool(false)
+        }
+        return fl.fl_bool(text.mark_alive(ed.bufs[bi].ec.marks, text.MarkId { id: p.lo_id, gen: p.lo_gen }) && text.mark_alive(ed.bufs[bi].ec.marks, text.MarkId { id: p.hi_id, gen: p.hi_gen }))
+    }
+    let (bi, lo, hi) = fl_h_span(mut vm, ed, h) else { return fl.fl_nil() }
+    if kind == 11000 { return fl.fl_int(lo) }
+    if kind == 11001 { return fl.fl_int(hi) }
+    if kind == 11002 { return fl.fl_int(hi - lo) }
+    let value = fq_text(mut vm, ed, bi, lo, hi)
+    if vm.raised || kind == 11003 { return value }
+    let root = fl.fl_temp_push(mut vm, value)
+    let bytes = copy vm.gc.slots[fl.fl_obj_index(vm, value)].bytes
+    let lines = fl.fl_split_lines(mut vm, bytes)
+    let _ = root
+    fl.fl_temp_pop(mut vm, 1)
+    lines
+}
+
+fn fq_workspace(mut vm: fl.FlVm, ed: Ed) -> fl.FlValue {
+    let map = fl.fl_map_new(mut vm)
+    let root = fl.fl_temp_push(mut vm, map)
+    let tabs = fl.fl_list_new(mut vm)
+    let troot = fl.fl_temp_push(mut vm, tabs)
+    let groups = fl.fl_list_new(mut vm)
+    let groot = fl.fl_temp_push(mut vm, groups)
+    for ti in 0..ed.tabs.len {
+        let item = fl.fl_map_new(mut vm)
+        let iroot = fl.fl_temp_push(mut vm, item)
+        let group = group_find(ed, ed.tabs[ti].group_id)
+        fq_put(mut vm, iroot, "id", fl.fl_int(ed.tabs[ti].tab_id))
+        let path = if ed.tabs[ti].has_path {
+            fl.fl_str_text(mut vm, ed.tabs[ti].path)
+        } else {
+            fl.fl_nil()
+        }
+        fq_put(mut vm, iroot, "path", path)
+        fq_put(mut vm, iroot, "active", fl.fl_bool(ti == ed.tab_active))
+        fq_put(mut vm, iroot, "group_id", fl.fl_int(ed.tabs[ti].group_id))
+        let label = if group >= 0 {
+            fl.fl_str_text(mut vm, ed.groups[group].label)
+        } else {
+            fl.fl_nil()
+        }
+        fq_put(mut vm, iroot, "group", label)
+        fq_put(mut vm, iroot, "ordinal", fl.fl_int(ed.tabs[ti].group_ordinal))
+        let panes = fl.fl_list_new(mut vm)
+        let proot = fl.fl_temp_push(mut vm, panes)
+        let leaves = pane_collect_leaves(ed, ed.tabs[ti].root, PANE_MAX_LEAVES)
+        for leaf in leaves {
+            let pane = fl.fl_map_new(mut vm)
+            let one = fl.fl_temp_push(mut vm, pane)
+            fq_put(mut vm, one, "x", fl.fl_int(ed.panes[leaf].rect.x))
+            fq_put(mut vm, one, "y", fl.fl_int(ed.panes[leaf].rect.y))
+            fq_put(mut vm, one, "w", fl.fl_int(ed.panes[leaf].rect.w))
+            fq_put(mut vm, one, "h", fl.fl_int(ed.panes[leaf].rect.h))
+            fq_list_push(mut vm, proot, fl.fl_temp_get(vm, one))
+            fl.fl_temp_pop(mut vm, 1)
+        }
+        fq_put(mut vm, iroot, "panes", fl.fl_temp_get(vm, proot))
+        fl.fl_temp_pop(mut vm, 1)
+        fq_list_push(mut vm, troot, fl.fl_temp_get(vm, iroot))
+        fl.fl_temp_pop(mut vm, 1)
+    }
+    for gi in 0..ed.groups.len {
+        let item = fl.fl_map_new(mut vm)
+        let iroot = fl.fl_temp_push(mut vm, item)
+        fq_put(mut vm, iroot, "id", fl.fl_int(ed.groups[gi].id))
+        fq_text_put(mut vm, iroot, "name", ed.groups[gi].label)
+        let dir = if ed.groups[gi].dir_path.len != 0 {
+            fl.fl_str_text(mut vm, ed.groups[gi].dir_path)
+        } else {
+            fl.fl_nil()
+        }
+        fq_put(mut vm, iroot, "dir", dir)
+        fq_put(mut vm, iroot, "members", fl.fl_int(group_member_count(ed, ed.groups[gi].id)))
+        fq_list_push(mut vm, groot, fl.fl_temp_get(vm, iroot))
+        fl.fl_temp_pop(mut vm, 1)
+    }
+    fq_put(
+        mut vm,
+        root,
+        "active_tab",
+        if ed.tab_active < 0 then fl.fl_nil() else fl.fl_int(ed.tabs[ed.tab_active].tab_id),
+    )
+    fq_put(mut vm, root, "tabs", fl.fl_temp_get(vm, troot))
+    fq_put(mut vm, root, "groups", fl.fl_temp_get(vm, groot))
+    let out = fl.fl_temp_get(vm, root)
+    fl.fl_temp_pop(mut vm, 3)
+    out
+}
+
+fn fq_register(mut vm: fl.FlVm, ed: Ed, base: int) -> fl.FlValue {
+    let value = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+    let at = fl.fl_obj_index(vm, value)
+    if vm.gc.slots[at].bytes.len != 1 {
+        return fl.fl_raise(mut vm, "type", "ed.register expects one letter a-z/A-Z")
+    }
+    let name = vm.gc.slots[at].bytes[0] as int
+    if !(name >= 97 && name <= 122 || name >= 65 && name <= 90) {
+        return fl.fl_raise(mut vm, "type", "ed.register expects one letter a-z/A-Z")
+    }
+    let index = (if name >= 65 && name <= 90 then name + 32 else name) - 97
+    let n = ed.regs.named[index].bytes.len
+    if n == 0 { return fl.fl_nil() }
+    if n > 4294967295 {
+        return fl.fl_raise(mut vm, "limit", "ed.register value exceeds string limit")
+    }
+    fl.fl_str_new(mut vm, ed.regs.named[index].bytes)
+}
+
+/// Query-only half of the editor API. Descriptor arity/receiver checks are
+/// the caller's. `none` means this row belongs to another owner; a query
+/// failure returns nil with the pinned VM raise, never `none`.
+pub fn fl_api_query(mut vm: fl.FlVm, mut ed: Ed, kind: int, base: int, argc: int) -> fl.FlValue ! {
+    none,
+} {
+    match kind {
+        8000 | 8001 | 8005..=8013 | 8016..=8020 | 8023 =>
+            fq_buffer(mut vm, mut ed, kind, base, argc),
+        9000..=9004 | 9008 => fq_window(mut vm, mut ed, kind, base),
+        10000..=10004 | 10007 | 10008 | 10010 | 10011 => fq_cursor(mut vm, mut ed, kind, base),
+        11000..=11004 | 11011 => fq_span(mut vm, ed, kind, base),
+        13003 => {
+            if ed.mode < 0 || ed.mode >= MODE_N {
+                return fl.fl_raise(mut vm, "handle", "editor mode is invalid")
+            }
+            fl.fl_str_text(mut vm, mode_name(ed.mode))
+        },
+        13005 => fq_register(mut vm, ed, base),
+        13007 => fq_workspace(mut vm, ed),
+        _ => { return none },
+    }
+}
