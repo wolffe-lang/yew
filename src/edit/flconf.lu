@@ -1,0 +1,655 @@
+//! edit.flconf — ordered, origin-owned editor configuration, sagitta
+//! 9ace98c2 src/fl/flconf.c:1-858 and flconf.h:1-69. Four units run in
+//! order, each compiled into its own closure over a private globals map
+//! and rooted in the runtime's VM: the built-in `runtime/init.fl`, an
+//! optional shipped overlay, the user's `init.fl` (`--config` names it)
+//! and the workspace's trust-gated `.yew.fl`. Everything a unit registers
+//! is in the ledger under its origin, so a failed unit and a reload tear
+//! exactly that down. C's `ed->config` pointer is `ed.cfg`: empty, or the
+//! live state at index 0 (a reload builds its candidate at index 1). The
+//! module-less build has no AI config validation (YEW_WITH_AI).
+
+use fl
+use term
+use util
+
+/// CfgStatus (flconf.h:17-23), in merge order.
+pub const CFG_OK: int = 0
+
+/// A source was absent.
+pub const CFG_MISSING: int = 1
+
+/// A source did not parse or compile.
+pub const CFG_PARSE: int = 2
+
+/// A source raised, or could not be read.
+pub const CFG_RUN: int = 3
+
+/// The workspace config is waiting on (or refused) trust.
+pub const CFG_UNTRUSTED: int = 4
+
+const CFG_BUILTIN: int = 0
+
+const CFG_OVERLAY: int = 1
+
+const CFG_USER: int = 2
+
+const CFG_WORKSPACE: int = 3
+
+const CFG_SOURCE_N: int = 4
+
+const CFG_MAX_BYTES: int = 8388608
+
+/// CfgUnit (flconf.c:49-57): `root` is the closure's host root.
+pub struct CfgUnit {
+    path: str,
+    root: int,
+    origin: int,
+    file_id: int,
+    kind: int,
+    rooted: bool,
+    ran: bool,
+}
+
+/// YewConfigState (flconf.c:59-76).
+pub struct ConfigState {
+    serial: int,
+    units: List[CfgUnit],
+    config_path: str,
+    builtin_overlay: str,
+    trust_db: TrustDb,
+    trust_probe: TrustProbe,
+    spare_file_id: List[int],
+    once_workspace: str,
+    once_hash: wrapping[u64],
+    once_dev: int,
+    once_ino: int,
+    workspace_once: bool,
+    trust_probe_ready: bool,
+    clean: bool,
+    clean_builtins: bool,
+    no_workspace_config: bool,
+    trust_workspace: bool,
+}
+
+// The CLI policy a state copies (yew_config_init's `policy`).
+struct CfgPolicy {
+    config_path: str,
+    builtin_overlay: str,
+    clean: bool,
+    clean_builtins: bool,
+    no_workspace_config: bool,
+    trust_workspace: bool,
+    once_workspace: str,
+    once_hash: wrapping[u64],
+    once_dev: int,
+    once_ino: int,
+    workspace_once: bool,
+    spare_file_id: List[int],
+}
+
+fn cfg_unit_new(kind: int) -> CfgUnit {
+    CfgUnit { path: "", root: -1, origin: 0, file_id: -1, kind: kind, rooted: false, ran: false }
+}
+
+// user_path (flconf.c:146-159).
+fn cfg_user_path(config_path: str) -> str {
+    if config_path.len != 0 { return config_path }
+    let dir = util.xdg_config_dir() else { return "" }
+    "{dir}/init.fl"
+}
+
+// state_new (flconf.c:178-212) with state_paths (166-176). The built-in
+// unit's path is the one runtime_read resolves, decided at read time.
+fn cfg_state_new(mut ed: Ed, p: CfgPolicy) -> ConfigState {
+    var units = List[CfgUnit]()
+    (mut units).push(cfg_unit_new(fl.FL_ORIGIN_BUILTIN))
+    (mut units).push(cfg_unit_new(fl.FL_ORIGIN_BUILTIN))
+    (mut units).push(cfg_unit_new(fl.FL_ORIGIN_CONFIG))
+    (mut units).push(cfg_unit_new(fl.FL_ORIGIN_WORKSPACE))
+    for i in 0..CFG_SOURCE_N { units[i].file_id = p.spare_file_id[i] }
+    units[CFG_OVERLAY].path = p.builtin_overlay
+    units[CFG_USER].path = cfg_user_path(p.config_path)
+    units[CFG_WORKSPACE].path = "{ws_root(ed)}/.yew.fl"
+    ed.cfg_serial += 1
+    var st = ConfigState {
+        serial: ed.cfg_serial,
+        units: units,
+        config_path: p.config_path,
+        builtin_overlay: p.builtin_overlay,
+        trust_db: trust_db_new(),
+        trust_probe: trust_probe_new(),
+        spare_file_id: [-1, -1, -1, -1],
+        once_workspace: p.once_workspace,
+        once_hash: p.once_hash,
+        once_dev: p.once_dev,
+        once_ino: p.once_ino,
+        workspace_once: p.workspace_once,
+        trust_probe_ready: false,
+        clean: p.clean,
+        clean_builtins: p.clean_builtins,
+        no_workspace_config: p.no_workspace_config,
+        trust_workspace: p.trust_workspace,
+    }
+    if !trust_db_load(mut st.trust_db) {
+        util.log_at(util.LOG_WARN, "workspace trust database could not be loaded; refusing saved grants")
+    }
+    st
+}
+
+fn cfg_policy_of(st: ConfigState) -> CfgPolicy {
+    CfgPolicy {
+        config_path: st.config_path,
+        builtin_overlay: st.builtin_overlay,
+        clean: st.clean,
+        clean_builtins: st.clean_builtins,
+        no_workspace_config: st.no_workspace_config,
+        trust_workspace: st.trust_workspace,
+        once_workspace: st.once_workspace,
+        once_hash: st.once_hash,
+        once_dev: st.once_dev,
+        once_ino: st.once_ino,
+        workspace_once: st.workspace_once,
+        spare_file_id: copy st.spare_file_id,
+    }
+}
+
+// unit_unroot (flconf.c:214-223).
+fn cfg_unit_unroot(mut ed: Ed, si: int, ui: int) {
+    if ed.cfg[si].units[ui].rooted && ed.flrt.ready && ed.flrt.vms.len != 0 {
+        fl.fl_gc_host_root_remove(mut ed.flrt.vms[0], ed.cfg[si].units[ui].root)
+    }
+    ed.cfg[si].units[ui].rooted = false
+    ed.cfg[si].units[ui].ran = false
+    ed.cfg[si].units[ui].root = -1
+}
+
+// state_dispose (flconf.c:225-243): the state at `si` released and removed.
+fn cfg_state_dispose(mut ed: Ed, si: int) {
+    if ed.trust_prompt.active && ed.trust_prompt.ctx == ed.cfg[si].serial { trust_prompt_cancel(mut ed) }
+    for ui in 0..CFG_SOURCE_N { cfg_unit_unroot(mut ed, si, ui) }
+    // At most the live state and a reload's candidate exist.
+    if si == ed.cfg.len - 1 {
+        let _ = (mut ed.cfg).pop() else { return }
+        return
+    }
+    let keep = (mut ed.cfg).pop() else { return }
+    let _ = (mut ed.cfg).pop() else { return }
+    (mut ed.cfg).push(keep)
+}
+
+/// `yew_config_init` (flconf.c:245-265): the CLI policy copied; every
+/// later reload uses the same paths and gates.
+pub fn config_init(mut ed: Ed, s: Startup) {
+    config_free(mut ed)
+    let p = CfgPolicy {
+        config_path: s.config_path,
+        builtin_overlay: s.builtin_overlay,
+        clean: s.clean,
+        clean_builtins: s.clean_builtins,
+        no_workspace_config: s.no_workspace_config,
+        trust_workspace: s.trust_workspace,
+        once_workspace: "",
+        once_hash: 0,
+        once_dev: 0,
+        once_ino: 0,
+        workspace_once: false,
+        spare_file_id: [-1, -1, -1, -1],
+    }
+    ed.clean = p.clean
+    let st = cfg_state_new(mut ed, p)
+    (mut ed.cfg).push(st)
+}
+
+/// `yew_config_free` (flconf.c:267-273).
+pub fn config_free(mut ed: Ed) {
+    while ed.cfg.len != 0 { cfg_state_dispose(mut ed, ed.cfg.len - 1) }
+}
+
+// read_file (flconf.c:275-311): (bytes, status).
+fn cfg_read_file(path: str) -> (List[byte], int) {
+    if path.len == 0 { return (List[byte](), CFG_MISSING) }
+    let bytes = fs_read_bytes(path) else |e| match e {
+        not_found => { return (List[byte](), CFG_MISSING) },
+        denied => { return (List[byte](), CFG_RUN) },
+        io => { return (List[byte](), CFG_RUN) },
+    }
+    if bytes.len > CFG_MAX_BYTES { return (List[byte](), CFG_RUN) }
+    (bytes, CFG_OK)
+}
+
+// compile_unit (flconf.c:313-373): one source compiled under its origin,
+// wrapped in a closure over a fresh globals map, and rooted. Its
+// diagnostic file slot is reused across reloads.
+fn cfg_compile_unit(mut ed: Ed, si: int, ui: int, source: List[byte]) -> bool {
+    var unit = copy ed.cfg[si].units[ui]
+    if unit.path.len == 0 { return false }
+    let _ = fl_runtime_init(mut ed)
+    var vm = runtime_take(mut ed)
+    if unit.file_id < 0 {
+        unit.file_id = fl.fl_diag_add_file(mut vm.dc, unit.path, source)
+    } else {
+        if unit.file_id >= vm.dc.files.len { util.bug("edit.flconf", "config diagnostic slot is outside the file table") }
+        vm.dc.files[unit.file_id] = fl.FlDiagFile { path: copy unit.path, src: copy source }
+    }
+    let file_id = unit.file_id
+    let path_bytes = copy unit.path.bytes()
+    let path_id = fl.fl_intern(mut vm.strings, path_bytes, 0, path_bytes.len)
+    let origin = fl.FlOrigin { kind: unit.kind, path_id: path_id, caps: fl.FL_CAP_ALL, principal_id: 0 }
+    unit.origin = if unit.kind == fl.FL_ORIGIN_CONFIG {
+        fl.FL_ORIGIN_ID_CONFIG
+    } else {
+        fl.fl_origin_register(mut ed.origins, unit.kind, path_bytes, fl.FL_CAP_ALL)
+    }
+    ed.cfg[si].units[ui] = copy unit
+    ed.flrt.diag_error = false
+    ed.flrt.has_last_diag = false
+    (mut ed.flrt.diag_message).reset()
+    (mut ed.flrt.last_diag).reset()
+    let first = vm.dc.entries.len
+    let p = fl.fl_parse(source, file_id, mut vm.dc, mut vm.strings)
+    if p.had_error || p.incomplete {
+        runtime_diag_capture(mut ed, vm, first)
+        (mut ed.flrt.vms).push(vm)
+        return false
+    }
+    let fun = fl.fl_compile(mut vm, p, file_id, origin) else {
+        runtime_diag_capture(mut ed, vm, first)
+        (mut ed.flrt.vms).push(vm)
+        return false
+    }
+    runtime_diag_capture(mut ed, vm, first)
+    // Allocation only schedules a collection (gc.lu fl_gc_alloc), so the
+    // function survives until the closure holding it is rooted.
+    let globals = fl.fl_map_new(mut vm)
+    let closure = fl.fl_closure_new(mut vm, fun)
+    let at = fl.fl_obj_index(vm, closure)
+    vm.gc.slots[at].globals = globals
+    unit.root = fl.fl_gc_host_root_add(mut vm, closure)
+    unit.rooted = true
+    (mut ed.flrt.vms).push(vm)
+    ed.cfg[si].units[ui] = unit
+    true
+}
+
+// source_enabled (flconf.c:375-386).
+fn cfg_source_enabled(st: ConfigState, i: int) -> bool {
+    if i == CFG_OVERLAY && st.units[CFG_OVERLAY].path.len == 0 { return false }
+    if st.clean { return st.clean_builtins && (i == CFG_BUILTIN || i == CFG_OVERLAY) }
+    if i == CFG_WORKSPACE && st.no_workspace_config { return false }
+    true
+}
+
+// The workspace unit's trust gate (compile_one, flconf.c:396-450): the
+// source when granted, else the status, with the prompt begun.
+fn cfg_workspace_source(mut ed: Ed, si: int) -> (List[byte], int) {
+    var probe = trust_probe_new()
+    let root = ws_root(ed)
+    let has_tty = ed.tty_ready && term.tty_is_raw(ed.tty)
+    let pregrant = ed.cfg[si].trust_workspace
+    var decision = trust_check(mut ed.cfg[si].trust_db, root, has_tty, pregrant, mut probe)
+    let st = ed.cfg[si]
+    if st.workspace_once && probe.has_config && st.once_workspace == probe.workspace &&
+        st.once_hash == probe.hash && st.once_dev == probe.dev && st.once_ino == probe.ino {
+        decision = TRUST_GRANTED
+    }
+    if decision == TRUST_GRANTED {
+        ed.cfg[si].units[CFG_WORKSPACE].path = probe.config_path
+        return (probe.bytes, CFG_OK)
+    }
+    let path = ed.cfg[si].units[CFG_WORKSPACE].path
+    if decision == TRUST_NO_CONFIG {
+        util.log_at(util.LOG_INFO, "config missing: {path}")
+    } else if decision == TRUST_SKIP_NO_TTY {
+        let why = trust_decision_reason(decision)
+        util.log_at(util.LOG_WARN, "{path}: {why}")
+        eprint("yew: warning: {path}: {why}")
+    } else if decision == TRUST_ERROR {
+        util.log_at(util.LOG_ERROR, "cannot verify workspace config: {path}")
+    } else if decision == TRUST_PROMPT_NEW || decision == TRUST_PROMPT_CHANGED || decision == TRUST_PROMPT_REPLACED {
+        ed.cfg[si].trust_probe = copy probe
+        ed.cfg[si].trust_probe_ready = true
+        let ctx = ed.cfg[si].serial
+        if !trust_prompt_begin(mut ed, probe, decision, ctx) {
+            util.log_at(util.LOG_WARN, "workspace config trust prompt could not be opened: {path}")
+        }
+    }
+    if decision == TRUST_NO_CONFIG { return (List[byte](), CFG_MISSING) }
+    (List[byte](), if decision == TRUST_ERROR then CFG_RUN else CFG_UNTRUSTED)
+}
+
+// normalize_key (runtime_asset.c): a shipped asset by its runtime-relative
+// name.
+fn cfg_asset_key(path: str) -> str {
+    if !path.starts_with("runtime/") { return path }
+    var tail = List[byte]()
+    let b = path.bytes()
+    for k in 8..b.len { (mut tail).push(b[k]) }
+    str_from_utf8(tail) else path
+}
+
+// compile_one (flconf.c:388-488).
+fn cfg_compile_one(mut ed: Ed, si: int, i: int) -> int {
+    if !cfg_source_enabled(ed.cfg[si], i) { return CFG_OK }
+    var source = List[byte]()
+    if i == CFG_WORKSPACE {
+        let (bytes, status) = cfg_workspace_source(mut ed, si)
+        if status != CFG_OK { return status }
+        source = bytes
+    } else if i == CFG_BUILTIN {
+        let (found, bytes, path) = runtime_read("init.fl")
+        ed.cfg[si].units[i].path = path
+        if !found {
+            util.log_at(util.LOG_ERROR, "config missing: {path} (set YEW_RUNTIME_DIR to the shipped runtime directory)")
+            return CFG_MISSING
+        }
+        source = bytes
+    } else {
+        let path = ed.cfg[si].units[i].path
+        let (read, read_status) = cfg_read_file(path)
+        var bytes = read
+        var status = read_status
+        let runtime = env_get("YEW_RUNTIME_DIR") else ""
+        if status == CFG_MISSING && ed.cfg[si].units[i].kind == fl.FL_ORIGIN_BUILTIN && runtime.len == 0 {
+            let (ok, text) = runtime_embedded(cfg_asset_key(path))
+            if ok {
+                bytes = copy text.bytes()
+                status = CFG_OK
+            }
+        }
+        if status == CFG_MISSING {
+            let required = i == CFG_OVERLAY
+            let shown = if path.len == 0 then "<unresolved>" else path
+            if required {
+                util.log_at(util.LOG_ERROR, "config missing: {shown} (set YEW_RUNTIME_DIR to the shipped runtime directory)")
+            } else {
+                util.log_at(util.LOG_INFO, "config missing: {shown}")
+            }
+            return CFG_MISSING
+        }
+        if status != CFG_OK {
+            util.log_at(util.LOG_ERROR, "cannot read config: {if path.len == 0 then "<unresolved>" else path}")
+            return CFG_RUN
+        }
+        source = bytes
+    }
+    if !cfg_compile_unit(mut ed, si, i, source) { return CFG_PARSE }
+    CFG_OK
+}
+
+// run_one (flconf.c:490-503): a raise tears the unit's origin down.
+fn cfg_run_one(mut ed: Ed, si: int, ui: int) -> int {
+    if !ed.cfg[si].units[ui].rooted { return CFG_OK }
+    let closure = fl.fl_gc_host_root_get(ed.flrt.vms[0], ed.cfg[si].units[ui].root)
+    if fl_call_value(mut ed, closure, SRC_FLETCH) {
+        ed.cfg[si].units[ui].ran = true
+        return CFG_OK
+    }
+    let path = ed.cfg[si].units[ui].path
+    util.log_at(util.LOG_ERROR, "config runtime error: {path}")
+    ed_msg(mut ed, MSG_ERROR, "config runtime error: {path}")
+    origin_teardown(mut ed, ed.cfg[si].units[ui].origin)
+    cfg_unit_unroot(mut ed, si, ui)
+    CFG_RUN
+}
+
+/// trust_prompt_done (flconf.c:505-542): `always` and `once` compile and
+/// run the probed bytes now; a prompt that outlived its state answers
+/// nothing.
+pub fn config_trust_prompt_done(mut ed: Ed, answer: int, ctx: int) {
+    if ed.cfg.len == 0 || ed.cfg[0].serial != ctx || !ed.cfg[0].trust_probe_ready { return }
+    if answer == TRUST_ALWAYS || answer == TRUST_ONCE {
+        let probe = copy ed.cfg[0].trust_probe
+        if answer == TRUST_ONCE {
+            ed.cfg[0].workspace_once = true
+            ed.cfg[0].once_hash = probe.hash
+            ed.cfg[0].once_dev = probe.dev
+            ed.cfg[0].once_ino = probe.ino
+            ed.cfg[0].once_workspace = probe.workspace
+        }
+        ed.cfg[0].units[CFG_WORKSPACE].path = probe.config_path
+        bind_batch_begin(mut ed)
+        let status = if cfg_compile_unit(mut ed, 0, CFG_WORKSPACE, probe.bytes) {
+            cfg_run_one(mut ed, 0, CFG_WORKSPACE)
+        } else {
+            CFG_PARSE
+        }
+        bind_batch_end(mut ed)
+        if status == CFG_OK {
+            ed_msg(mut ed, MSG_INFO, "workspace configuration loaded")
+        } else {
+            ed_msg(mut ed, MSG_ERROR, "workspace configuration failed to load")
+        }
+    }
+    if ed.cfg.len == 0 { return }
+    ed.cfg[0].trust_probe = trust_probe_new()
+    ed.cfg[0].trust_probe_ready = false
+}
+
+/// `yew_origin_teardown` (flconf.c:544-568): every live registration of
+/// `origin`, newest first, removed through its owner, with the origin
+/// masked so nothing it owns re-registers meanwhile.
+pub fn origin_teardown(mut ed: Ed, origin: int) {
+    let _ = fl_runtime_init(mut ed)
+    var vm = runtime_take(mut ed)
+    fl.fl_origin_mask(mut ed.origins, origin)
+    var i = vm.hooks.ledger.rows.len
+    while i != 0 {
+        if i > vm.hooks.ledger.rows.len { i = vm.hooks.ledger.rows.len; continue }
+        let r = copy vm.hooks.ledger.rows[i - 1]
+        if r.active && r.origin_id == origin {
+            if r.kind == fl.REG_HOOK {
+                let _ = fl.fl_hook_remove(mut vm.hooks, i)
+            } else if r.kind == fl.REG_BIND {
+                let _ = bind_remove_in(mut ed, mut vm, i)
+            } else if r.kind == fl.REG_OPTION {
+                let _ = opt_remove(mut ed, mut vm.hooks.ledger, i)
+            } else {
+                let _ = fl.fl_reg_remove(mut vm.hooks.ledger, i)
+            }
+        }
+        i -= 1
+    }
+    fl.fl_origin_unmask(mut ed.origins, origin)
+    (mut ed.flrt.vms).push(vm)
+}
+
+// teardown_state (flconf.c:570-582).
+fn cfg_teardown_state(mut ed: Ed, si: int) {
+    var i = CFG_SOURCE_N
+    while i != 0 {
+        i -= 1
+        if ed.cfg[si].units[i].rooted { origin_teardown(mut ed, ed.cfg[si].units[i].origin) }
+    }
+}
+
+// reset_modules (flconf.c:584-592).
+fn cfg_reset_modules(mut ed: Ed) {
+    if !ed.flrt.ready || ed.flrt.vms.len == 0 { return }
+    (mut ed.flrt.vms[0].mods).reset()
+    let modules = copy ed.flrt.vms[0].modules
+    if modules.t == fl.FL_MAP { fl.fl_map_clear(mut ed.flrt.vms[0], modules) }
+}
+
+fn cfg_merge(current: int, next: int) -> int { if next > current then next else current }
+
+/// `yew_config_load_all` (flconf.c:599-629): each enabled source compiled
+/// and run in order, one bind batch around all four; an absent user or
+/// workspace config and an untrusted workspace config are not failures.
+pub fn config_load_all(mut ed: Ed) -> int {
+    if ed.cfg.len == 0 { config_init(mut ed, startup_default()) }
+    let _ = fl_runtime_init(mut ed)
+    if ed.cfg[0].clean && !ed.cfg[0].clean_builtins { return CFG_OK }
+    var overall = CFG_OK
+    bind_batch_begin(mut ed)
+    for i in 0..CFG_SOURCE_N {
+        let status = cfg_compile_one(mut ed, 0, i)
+        if status == CFG_MISSING && i != CFG_BUILTIN && i != CFG_OVERLAY { continue }
+        if status == CFG_UNTRUSTED && i == CFG_WORKSPACE { continue }
+        overall = cfg_merge(overall, status)
+        if status == CFG_OK { overall = cfg_merge(overall, cfg_run_one(mut ed, 0, i)) }
+    }
+    bind_batch_end(mut ed)
+    macrolib_enable(mut ed)
+    overall
+}
+
+/// `yew_config_reload` (flconf.c:631-677): a candidate compiled whole
+/// first (any failure keeps the old configuration untouched), then the
+/// old origins torn down, the options reset, the modules forgotten, and
+/// the candidate run.
+pub fn config_reload(mut ed: Ed) -> int {
+    if ed.cfg.len == 0 { config_init(mut ed, startup_default()) }
+    let _ = fl_runtime_init(mut ed)
+    if ed.cfg[0].clean && !ed.cfg[0].clean_builtins { return CFG_OK }
+    var policy = cfg_policy_of(ed.cfg[0])
+    for i in 0..CFG_SOURCE_N { policy.spare_file_id[i] = ed.cfg[0].spare_file_id[i] }
+    let cand = cfg_state_new(mut ed, policy)
+    (mut ed.cfg).push(cand)
+    for i in 0..CFG_SOURCE_N {
+        let status = cfg_compile_one(mut ed, 1, i)
+        if status == CFG_MISSING && i != CFG_BUILTIN && i != CFG_OVERLAY { continue }
+        if status == CFG_UNTRUSTED && i == CFG_WORKSPACE { continue }
+        if status != CFG_OK {
+            cfg_state_dispose(mut ed, 1)
+            return status
+        }
+    }
+    bind_batch_begin(mut ed)
+    cfg_teardown_state(mut ed, 0)
+    opt_reset(mut ed)
+    cfg_reset_modules(mut ed)
+    for i in 0..CFG_SOURCE_N { ed.cfg[1].spare_file_id[i] = ed.cfg[0].units[i].file_id }
+    cfg_state_dispose(mut ed, 0)
+    fl.fl_gc_collect(mut ed.flrt.vms[0])
+    var overall = CFG_OK
+    for i in 0..CFG_SOURCE_N { overall = cfg_merge(overall, cfg_run_one(mut ed, 0, i)) }
+    bind_batch_end(mut ed)
+    macrolib_scan(mut ed)
+    ed.layout_dirty = true
+    ed.full_damage = true
+    ed.footer_dirty = true
+    overall
+}
+
+/// `yew_config_get_global` (flconf.c:679-709): a top-level binding of the
+/// active units, workspace first; none when no unit binds it. The value
+/// is borrowed until the next reload.
+pub fn config_get_global(mut ed: Ed, name: str) -> fl.FlValue ! {none} {
+    if ed.cfg.len == 0 || !ed.flrt.ready || ed.flrt.vms.len == 0 { return none }
+    let bytes = copy name.bytes()
+    let id = fl.fl_intern(mut ed.flrt.vms[0].strings, bytes, 0, bytes.len)
+    var i = CFG_SOURCE_N
+    while i != 0 {
+        i -= 1
+        let u = ed.cfg[0].units[i]
+        if !u.rooted || !u.ran { continue }
+        let closure = fl.fl_gc_host_root_get(ed.flrt.vms[0], u.root)
+        if closure.t != fl.FL_CLOSURE { continue }
+        let globals = copy ed.flrt.vms[0].gc.slots[fl.fl_obj_index(ed.flrt.vms[0], closure)].globals
+        let v = fl.fl_map_get(ed.flrt.vms[0], globals, fl.fl_int(id)) else { continue }
+        return v
+    }
+    none
+}
+
+/// `yew_config_ai_workspace_grant` (flconf.c:711-716).
+pub fn config_ai_workspace_grant(mut ed: Ed) -> int {
+    if ed.cfg.len == 0 { return AI_WS_UNSET }
+    let root = ws_root(ed)
+    trust_ai_grant(mut ed.cfg[0].trust_db, root)
+}
+
+/// `yew_config_ai_workspace_set` (flconf.c:718-731).
+pub fn config_ai_workspace_set(mut ed: Ed, grant: int) -> bool {
+    if ed.cfg.len == 0 { return false }
+    let now = time_unix_ms() / 1000
+    let root = ws_root(ed)
+    if !trust_ai_set(mut ed.cfg[0].trust_db, root, grant, now) { return false }
+    trust_db_write(mut ed.cfg[0].trust_db, now, TRUST_PRUNE_DAYS_DEFAULT)
+}
+
+/// `yew_config_ai_workspace_forget` (flconf.c:733-745).
+pub fn config_ai_workspace_forget(mut ed: Ed) -> bool {
+    if ed.cfg.len == 0 { return false }
+    let now = time_unix_ms() / 1000
+    let root = ws_root(ed)
+    if !trust_ai_forget(mut ed.cfg[0].trust_db, root) { return false }
+    trust_db_write(mut ed.cfg[0].trust_db, now, TRUST_PRUNE_DAYS_DEFAULT)
+}
+
+/// `yew_config_plugin_desired` (flconf.c:747-753).
+pub fn config_plugin_desired(mut ed: Ed, plugin: str) -> int {
+    if ed.cfg.len == 0 { return PLUGIN_DESIRED_DEFAULT }
+    trust_plugin_desired(mut ed.cfg[0].trust_db, plugin)
+}
+
+/// `yew_config_plugin_set_desired` (flconf.c:755-768).
+pub fn config_plugin_set_desired(mut ed: Ed, plugin: str, desired: int) -> bool {
+    if ed.cfg.len == 0 { return false }
+    let now = time_unix_ms() / 1000
+    trust_plugin_set_desired(mut ed.cfg[0].trust_db, plugin, desired) &&
+        trust_db_write(mut ed.cfg[0].trust_db, now, TRUST_PRUNE_DAYS_DEFAULT)
+}
+
+/// `yew_config_plugin_capability` (flconf.c:770-777).
+pub fn config_plugin_capability(mut ed: Ed, plugin: str, cap: int) -> int {
+    if ed.cfg.len == 0 { return PLUGIN_GRANT_UNSET }
+    trust_plugin_capability(mut ed.cfg[0].trust_db, plugin, cap)
+}
+
+/// `yew_config_plugin_set_capability` (flconf.c:779-793).
+pub fn config_plugin_set_capability(mut ed: Ed, plugin: str, cap: int, grant: int) -> bool {
+    if ed.cfg.len == 0 { return false }
+    let now = time_unix_ms() / 1000
+    trust_plugin_set_capability(mut ed.cfg[0].trust_db, plugin, cap, grant) &&
+        trust_db_write(mut ed.cfg[0].trust_db, now, TRUST_PRUNE_DAYS_DEFAULT)
+}
+
+/// `yew_config_plugin_drop_grants` (flconf.c:795-810): (ok, dropped).
+pub fn config_plugin_drop_grants(mut ed: Ed, plugin: str) -> (bool, int) {
+    if ed.cfg.len == 0 { return (false, 0) }
+    let (ok, count) = trust_plugin_revoke_persisted(plugin)
+    if !ok { return (false, 0) }
+    if !trust_db_load(mut ed.cfg[0].trust_db) { return (false, 0) }
+    (true, count)
+}
+
+/// `yew_config_workspace_plugins_trusted` (flconf.c:812-821).
+pub fn config_workspace_plugins_trusted(ed: Ed) -> bool {
+    if ed.cfg.len == 0 { return false }
+    let st = ed.cfg[0]
+    st.trust_workspace || st.workspace_once || st.units[CFG_WORKSPACE].ran
+}
+
+/// `yew_config_user_path` (flconf.c:823-828): "" when unresolved.
+pub fn config_user_path(ed: Ed) -> str {
+    if ed.cfg.len == 0 { return "" }
+    ed.cfg[0].units[CFG_USER].path
+}
+
+/// `ed.config.reload` (`yew_config_cmd_reload`, flconf.c:830-843).
+pub fn config_cmd_reload(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx
+    let status = config_reload(mut ed)
+    if status != CFG_OK {
+        ed_msg(mut ed, MSG_ERROR, "configuration reload failed")
+        return CMD_ERR_STATE
+    }
+    ed_msg(mut ed, MSG_INFO, "configuration reloaded")
+    CMD_OK
+}
+
+/// `ed.config.edit` (`yew_config_cmd_edit`, flconf.c:845-858): the user's
+/// init.fl opened, a missing one as a new buffer.
+pub fn config_cmd_edit(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx
+    let path = config_user_path(ed)
+    if path.len == 0 { return CMD_ERR_IO }
+    let status = fc_open_path(mut ed, path)
+    if status != CMD_OK { return CMD_ERR_IO }
+    // `yew_ed_open` fires buf.open for the buffer it read (ed.c:953).
+    let d = ed_doc(ed)
+    ed_hook_buffer(mut ed, fl.FL_EV_BUF_OPEN, d)
+    CMD_OK
+}
