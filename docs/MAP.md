@@ -691,6 +691,49 @@ maintainer.
   This is a tested foundation at yw09's checkpoint, not an attached-editor
   or M-YW7 completion claim.
 
+- **R-yw09-5 — the script-suite boundary, accepted A** (coordinator,
+  2026-10-27). All 94 pinned oracle files remain untouched. The 69 scripts
+  owned by this boundary (`00`–`47` and 21 `macroux_*`) are gated by name;
+  the other 25 remain inventoried under their later AI/LSP/plugins/embedded
+  owners, without a pass claim. M-YW7's script portion means those 69,
+  following M-YW3's explicit deferral of the batch rows. The dependency is
+  executable, not inferred from a filename: `tests/script/lsp_sync.fl:1-26`
+  drives the real LSP initialize/open/change/save/close protocol;
+  `tests/script/plug_examples_matrix.fl:87-96` requires loaded plugin options,
+  command registration and teardown. Porting those owners early is not the
+  recommendation.
+  The later-owner inventory follows; no script gate is claimed at the
+  foundation checkpoint. Every path below is under the pinned
+  `tests/script/`; the line range names its dependency, not a port verdict.
+
+  | Deferred script | Owner | Pinned dependency |
+  |---|---|---|
+  | `55_cloud_preset.fl` | yw14, s55 | :8,16–18 imports and runs `preset.cloud.fl` |
+  | `55_runtime_import_shadow.fl` | yw14, s55 A3 | :1,4–8 user/runtime preset import precedence |
+  | `57_ai_embedded_runtime.fl` | yw15, s57 (depends on yw10/yw12/yw14) | :2–3,13–18 embedded theme and AI preset runtime |
+  | `57_embedded_gate.fl` | yw15, s57 | :1–3,13–16 constrained-target fixture and 4 MiB buffer |
+  | `ai_defaults_off.fl` | yw12, s50 | :1–3 AI enable default |
+  | `ai_defaults_privacy.fl` | yw12, s50 | :1–9 privacy option defaults |
+  | `ai_disable_inverse.fl` | yw12, s50 | :4–10 AI preset and disable commands |
+  | `ai_enable_registry.fl` | yw12, s50 | :5–9 live AI opt-in command flags/help |
+  | `ai_exclude_paths.fl` | yw12, s50 | :2,5–8 AI string-list option |
+  | `ai_forget_unset.fl` | yw12, s50 | :4–6 workspace grant removal |
+  | `ai_preset_cloud.fl` | yw12, s50 | :4–11 cloud preset and limits |
+  | `ai_preset_local.fl` | yw12, s50 | :4–10 local preset and limits |
+  | `ai_preset_switch.fl` | yw12, s50 | :4–9 backend preset replacement |
+  | `ai_preset_unknown.fl` | yw12, s50 | :5–13 rejected preset preserves state |
+  | `ai_privacy_page.fl` | yw12, s50 | :5–13 shipped disclosure buffer |
+  | `ai_redact_enum_guard.fl` | yw12, s50 | :3–4 redaction validator |
+  | `ai_remote_backend_guard.fl` | yw12, s50 | :4–13 backend registration and badge guard |
+  | `ai_remote_badge_guard.fl` | yw12, s50 | :4–7 selected backend disclosure |
+  | `ai_status_cloud.fl` | yw12, s50 | :4–8 cloud status command |
+  | `ai_status_default.fl` | yw12, s50 | :4–7 default status command |
+  | `ai_workspace_enum_guard.fl` | yw12, s50 | :3–4 workspace-policy validator |
+  | `lsp_sync.fl` | yw11, s46 | :9–26 framed LSP lifecycle |
+  | `plug_examples_matrix.fl` | yw14, s55.5 | :87–96 plugin options, registrations and teardown |
+  | `plug_examples_notes.fl` | yw14, s55.5 | :9–18 installed plugin assets and registered option |
+  | `plug_examples_ws.fl` | yw14, s55.5 | :15–18 installed trailing-ws command/options |
+
 ## 7. The next contracts
 
 One paragraph each; yw01's is drafted in full
