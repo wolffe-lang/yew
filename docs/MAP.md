@@ -248,6 +248,8 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 | G57 | **Release codegen of the 4,747-instruction dispatch loop is fragile, and its per-instruction helpers never inline at WIR level.** `fl_read8`/`fl_push`/`fl_pop`/`fl_read16` carry effect-token parameters and several blocks, so `wolf_wir`'s inliner skips them (`inline.rs:22-27`, `decide()`); the summary keeps them as call edges of `fl_vm_exec`. In a small loop the call costs 2-4% on release (15% native); in the VM, writing the 43 call sites inline by hand makes fib24/fib27 1.8x SLOWER, and moving the cold arms out moves no row beyond host drift. | yw08 (yew#77, R-yw08-3) | none adopted; the rows stay named MISS (`tools/perf-fletch-misses.txt`) | `notes/yw08-evidence/perf/witness-inline/` (reduced: the small-loop half); `notes/yw08-evidence/perf/experiments/` (the VM half, not reduced: `inline-exec.py` regenerates the variant from `src/fl/vm.lu`, `summary.txt`, the logs); `perf/profile/named.txt` (counts by name) | **wolf-lang, to file by the orchestrator** (release codegen: why the inline variant of one large function doubles its cost; whether the token-parameter rule should admit small multi-block leaves) |
 
 
+| G58 | **The checked machine loses a generic receiver's concrete type when a later argument calls another function.** `call_free` sets `pending_rigids` before evaluating its arguments; the nested ordinary call consumes the pending map (`wolf_mem/src/ubcheck.rs:12364-12401` at v0.2.35). | yw09's static host bridge: `re.replace_fn` calls `fl_vm_call_host` with `[fl_temp_get(vm, root)]` | bind the rooted argument before entering the generic call; named in `src/fl/stdre.lu`. Native/release pass either spelling; checked refuses the nested-call spelling with `trait dispatch on a non-nominal receiver` and passes the bound control. No checked waiver. | `notes/yw09-evidence/host-seam/main.lu` (nested argument) and `control.lu` (bound argument); five real host-bridge cases in `src/fl_host_test.lu` pass all three tiers after the change | **wolf-lang#981** (checked generic frame binding must survive argument evaluation) |
+
 **yw07b float-host rulings (R-yw07b-2 and R-yw07b-3, coordinator under
 ruling #118, subject to override):** Linux glibc C is the float-seam oracle.
 The actual Linux/macOS answer streams of run `40166616917` contain 1,081
@@ -673,6 +675,21 @@ maintainer.
   Backspace row, yew#53, also passes there at 1.11, and at 0.78 in the
   earlier rerun: for yw15 or the orchestrator to retire.) It reverses yw07's disposition on
   measurement, so it is the orchestrator's to accept or revert.
+
+- **R-yw09-4 — the mutable editor host below `edit`, recommended A.**
+  Keep `FlVm` and its data nongeneric; statically thread a `FlHost` parameter
+  through the one execution body and its native reentry paths (list
+  callbacks/comparators, regex replacements and imported module bodies).
+  The editor implementation keeps the one kind-id/match command registry;
+  standalone wrappers select `FlNullHost`. This avoids G48's mutable
+  function-value restriction without a module cycle, global editor state,
+  or a second interpreter. The pinned C host's motion/edit/run callbacks
+  keep their order, including commit on return and rollback before catch.
+  Five bridge integration cases force compacting GC at callbacks and pass
+  checked/native/release, with G58 named and its bound-argument control.
+  Alternative B, duplicate the VM inside `edit`, is not recommended.
+  This is a tested foundation at yw09's checkpoint, not an attached-editor
+  or M-YW7 completion claim.
 
 ## 7. The next contracts
 
