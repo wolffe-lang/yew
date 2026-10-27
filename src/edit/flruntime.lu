@@ -39,6 +39,9 @@ pub struct FlRuntime {
     changes: List[FlPendingChange],
     flushing_change: bool,
     compile_stage: int,
+    // batch's diagnostic sink (batch_diag, batch.c:212-226): 0 the
+    // runtime's own, 1 rendered to stderr, 2 (`--quiet`) errors only.
+    diag_batch: int,
 }
 
 /// An uninitialized runtime, with no VM storage allocated yet.
@@ -59,6 +62,7 @@ pub fn fl_runtime_new() -> FlRuntime {
         changes: List[FlPendingChange](),
         flushing_change: false,
         compile_stage: 0,
+        diag_batch: 0,
     }
 }
 
@@ -132,6 +136,13 @@ fn runtime_diag_capture(mut ed: Ed, vm: fl.FlVm, first: int) {
         let d = copy vm.dc.entries[i]
         var rendered = List[byte]()
         fl.fl_diag_render(mut rendered, vm.dc, d.level, d.sp, d.msg)
+        if ed.flrt.diag_batch != 0 {
+            // batch_diag (batch.c:212-226) replaces the runtime's sink.
+            if d.level != fl.FL_DIAG_ERROR && ed.flrt.diag_batch == 2 { continue }
+            if rendered.len != 0 && rendered[rendered.len - 1] != 10 as byte { (mut rendered).push(10 as byte) }
+            fs_write_chunk(2, rendered) else {}
+            continue
+        }
         var logged = List[byte]()
         util.buf_append_str(mut logged, "Fletch: ")
         util.buf_append(mut logged, rendered)
@@ -264,6 +275,24 @@ pub fn fl_call_chunk(mut ed: Ed, entry: fl.FlValue, source: int) -> bool {
     vm.raised = false
     (mut ed.flrt.vms).push(vm)
     ok
+}
+
+/// `fl_compile_script` (fleval.c:94-108): a batch script compiled as the
+/// CLI principal over its realpath, the VM's root origin set to it; none
+/// on a diagnostic (already reported).
+pub fn fl_compile_script(mut ed: Ed, source: List[byte], realpath: str) -> fl.FlValue ! {none} {
+    let _ = fl_runtime_init(mut ed)
+    var vm = runtime_take(mut ed)
+    let label = copy realpath.bytes()
+    let path_id = fl.fl_intern(mut vm.strings, label, 0, label.len)
+    let origin = fl.FlOrigin { kind: fl.FL_ORIGIN_CLI, path_id: path_id, caps: fl.FL_CAP_ALL, principal_id: 0 }
+    vm.root_origin = copy origin
+    let fun = runtime_compile(mut ed, mut vm, source, realpath, origin, false) else {
+        (mut ed.flrt.vms).push(vm)
+        return none
+    }
+    (mut ed.flrt.vms).push(vm)
+    fun
 }
 
 /// `fl_call_value` (fleval.c:176-204): `callable` called with no
@@ -420,6 +449,21 @@ pub fn fl_prelude_macro_run(mut vm: fl.FlVm, mut ed: Ed, base: int, argc: int, r
 
 /// The only point that parks the active VM while a resolved editor command runs.
 pub fn fl_invoke_command(mut vm: fl.FlVm, mut ed: Ed, id: int, mut cx: CmdCtx) -> int ! {raised} {
+    // invoke_command (flapi.c:1496-1513): under --batch an interactive
+    // command is refused by name with what to use instead.
+    if ed.headless && cmd_active(ed.reg, id) {
+        let name = ed.reg.entries[id - 1].name
+        let alternative = batch_command_alternative(name, cx)
+        if ed.reg.entries[id - 1].flags & CMD_INTERACTIVE != 0 || alternative.len != 0 {
+            if alternative.len == 0 { util.bug("edit.flruntime", "interactive command lacks a batch refusal: {name}") }
+            let _ = fl.fl_raise(
+                mut vm,
+                "capability",
+                "\"{name}\" requires a terminal and is not available under --batch; {alternative}",
+            )
+            return raised
+        }
+    }
     let changes = cmd_active(ed.reg, id) && ed.reg.entries[id - 1].flags & CMD_CHANGES_BUFFER != 0
     if changes && ed.fl_model_teardown {
         let _ = fl.fl_raise(mut vm, "user", "editor mutation during model teardown")
