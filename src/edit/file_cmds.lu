@@ -13,6 +13,7 @@
 //! (`retarget_buffer`, `close_primary`); the port's single window shows a
 //! fresh untitled buffer instead, which is the same picture.
 
+use fl
 use term
 use text
 
@@ -107,31 +108,196 @@ fn fc_open_path(mut ed: Ed, path: str) -> int {
     CMD_OK
 }
 
-/// `ed.buf.open` (`file_cmds.c:154-184`).
-pub fn fc_buf_open(mut ed: Ed, cx: CmdCtx) -> int {
-    if !cx.has_sarg || cx.sarg.len == 0 || !ed.model_ready {
-        return CMD_ERR_ARG
-    }
-    fc_open_path(mut ed, cx.sarg)
+fn fc_has_nul(cx: CmdCtx) -> bool {
+    if !cx.has_sbytes { return false }
+    for b in cx.sbytes { if b == 0 as byte { return true } }
+    false
 }
 
-/// `ed.buf.close` (`file_cmds.c:285-345`): a dirty buffer needs `!`.
-pub fn fc_buf_close(mut ed: Ed, cx: CmdCtx) -> int {
-    if !ed.model_ready {
+/// `ed.buf.open` (`yew_file_cmd_buf_open`, `file_cmds.c:157-192`): the
+/// workspace's one buffer for the path, read on its first open, shown;
+/// buf.open fires only for a buffer this open loaded.
+pub fn fc_buf_open(mut ed: Ed, cx: CmdCtx) -> int {
+    if !cx.has_sarg || cx.sarg.len == 0 || !ed.model_ready || ed.fl_model_teardown {
         return CMD_ERR_ARG
     }
-    let w = if cx.win >= 0 then cx.win else ed.win
-    let b = ed.wins[w].buf
+    if fc_has_nul(cx) {
+        return CMD_ERR_ARG
+    }
+    let before = ed.bufs.len
+    let status = fc_open_path(mut ed, cx.sarg)
+    if status != CMD_OK {
+        return status
+    }
+    if ed.bufs.len != before {
+        ed_hook_buffer(mut ed, fl.FL_EV_BUF_OPEN, ed_doc(ed))
+    }
+    CMD_OK
+}
+
+// `retarget_tree` + `retarget_buffer` (`file_cmds.c:207-250`): every view
+// of `from`, in every tab's tree, shows `to`; a tab named for `from` is
+// renamed for `to`.
+fn fc_retarget_buffer(mut ed: Ed, from: int, to: int) {
+    if ed.win >= 0 && ed.wins[ed.win].buf == from {
+        ed_show_buffer(mut ed, to)
+    }
+    let from_id = ed.bufs[from].id
+    var t = 0
+    while t < ed.tabs.len {
+        let root = ed.tabs[t].root
+        fc_retarget_tree(mut ed, root, from, to)
+        if ed.tabs[t].buffer_id == from_id {
+            ed.tabs[t].buffer_id = ed.bufs[to].id
+            ed.tabs[t].path = if ed.bufs[to].has_path then ed.bufs[to].path else ""
+        }
+        t += 1
+    }
+    let root = ed.pane_root
+    fc_retarget_tree(mut ed, root, from, to)
+}
+
+fn fc_retarget_tree(mut ed: Ed, root: int, from: int, to: int) {
+    if root < 0 {
+        return
+    }
+    for leaf in pane_collect_leaves(ed, root, PANE_MAX_LEAVES) {
+        let w = ed.panes[leaf].win
+        if w >= 0 && ed.wins[w].buf == from {
+            ed_win_set_buffer(mut ed, w, to)
+        }
+    }
+}
+
+// `reset_primary_tree` (`file_cmds.c:252-279`): a view of the primary
+// buffer starts over at offset 0 with a fresh viewport.
+fn fc_reset_primary_tree(mut ed: Ed, root: int) {
+    if root < 0 {
+        return
+    }
+    for leaf in pane_collect_leaves(ed, root, PANE_MAX_LEAVES) {
+        let w = ed.panes[leaf].win
+        if w >= 0 && ed.wins[w].buf == 0 {
+            ed.wins[w].cs = text.cset_init(text.cursor_at(0 as text.ByteOff))
+            vp_init(mut ed.wins[w])
+        }
+    }
+}
+
+// `ed_buffer_dispose`'s journal row (`ed.c:239-242`).
+fn fc_journal_close(mut ed: Ed, bi: int) {
+    if ed.bufs[bi].ec.has_jrnl {
+        text.journal_close(mut ed.journals, mut ed.bufs[bi].ec.jrnl)
+        ed.bufs[bi].ec.has_jrnl = false
+    }
+}
+
+// `close_primary` (`file_cmds.c:281-327`): the primary buffer (index 0,
+// C's embedded `ed->buffer`) is never freed; it is emptied under a NEW id,
+// so no handle or tab aliases the closed one.
+fn fc_close_primary(mut ed: Ed) {
+    let old_id = ed.bufs[0].id
+    fl_h_drop_buffer(mut ed, old_id)
+    fc_journal_close(mut ed, 0)
+    ed.bufs[0] = buffer_around(mut ed, take text.textbuf_new(), text.filemeta_new(), "", false)
+    let id = ed.bufs[0].id
+    var t = 0
+    while t < ed.tabs.len {
+        let root = ed.tabs[t].root
+        fc_reset_primary_tree(mut ed, root)
+        if ed.tabs[t].buffer_id == old_id {
+            ed.tabs[t].buffer_id = id
+            ed.tabs[t].path = ""
+        }
+        t += 1
+    }
+    let root = ed.pane_root
+    fc_reset_primary_tree(mut ed, root)
+    ed.layout_dirty = true
+    ed.full_damage = true
+    ed.footer_dirty = true
+    ed.drawn_cursor_line_valid = false
+    ed.drawn_top_valid = false
+    state_mark_dirty(mut ed)
+}
+
+// `yew_ws_scratch_drop` (`ed.c:577-602`) for a closed buffer: C frees it
+// and removes it from the workspace list; the port addresses buffers by
+// index, so the slot is RETIRED in place: no identity (id 0), no text, no
+// path or name, and no enumeration of the workspace sees it.
+fn fc_buf_drop(mut ed: Ed, bi: int) {
+    if bi <= 0 || bi >= ed.bufs.len {
+        return
+    }
+    fc_journal_close(mut ed, bi)
+    if ed.win >= 0 && ed.wins[ed.win].buf == bi {
+        ed_show_buffer(mut ed, 0)
+    }
+    ws_scratch_drop(mut ed, bi)
+    ed.bufs[bi].ec = text.editctx_new(take text.textbuf_new())
+    ed.bufs[bi].resident = false
+    ed.bufs[bi].id = 0
+    ed.bufs[bi].path = ""
+    ed.bufs[bi].has_path = false
+    ed.bufs[bi].name = ""
+    ed.bufs[bi].has_name = false
+    ed.bufs[bi].flags = 0
+}
+
+// `job_uses_buffer` (`file_cmds.c:194-205`): a job's output buffer. The
+// port copies a job's input bytes (`Job.in_bytes`), so no job reads a
+// buffer's text in place (C's `in_buf`).
+fn fc_job_uses_buffer(ed: Ed, bi: int) -> bool {
+    for j in ed.jobs.v { if j.buf == bi { return true } }
+    false
+}
+
+/// `ed.buf.close` (`yew_file_cmd_buf_close`, `file_cmds.c:329-384`): a
+/// dirty buffer needs `!`; a buffer a job or a Fletch transaction holds is
+/// refused; buf.close fires under the model-teardown guard, and every view
+/// falls back to the primary buffer (closing the primary empties it).
+pub fn fc_buf_close(mut ed: Ed, cx: CmdCtx) -> int {
+    if !ed.model_ready || ed.fl_model_teardown {
+        return CMD_ERR_ARG
+    }
+    let b = if cx.win >= 0 then ed.wins[cx.win].buf else ed_doc(ed)
+    if b < 0 {
+        return CMD_ERR_STATE
+    }
     // s57.31 §2: A-e's buffer returns its line on the way out; `!` the
-    // original (`file_cmds.c:341-344`).
+    // original (`file_cmds.c:341-344`). FUSS's commit buffer is yw13's.
     if cmdedit_owns(ed, b) {
         return cmdedit_close(mut ed, cx.bang)
     }
     if buf_dirty(ed.bufs[b]) && !cx.bang {
         return CMD_ERR_IO
     }
-    let fresh = buffer_untitled(mut ed)
-    ed_show_buffer(mut ed, fresh)
+    if fc_job_uses_buffer(ed, b) || fl_txn_enlisted(ed, ed.bufs[b].id) {
+        return CMD_ERR_STATE
+    }
+    ed.fl_model_teardown = true
+    ed_hook_buffer(mut ed, fl.FL_EV_BUF_CLOSE, b)
+    if buf_dirty(ed.bufs[b]) && !cx.bang {
+        ed.fl_model_teardown = false
+        return CMD_ERR_IO
+    }
+    if fl_txn_enlisted(ed, ed.bufs[b].id) {
+        ed.fl_model_teardown = false
+        return CMD_ERR_STATE
+    }
+    // yew_lsp_buffer_close is yw11's (no client before it).
+    if b == 0 {
+        fc_close_primary(mut ed)
+        ed.fl_model_teardown = false
+        return CMD_OK
+    }
+    fc_retarget_buffer(mut ed, b, 0)
+    let id = ed.bufs[b].id
+    fl_h_drop_buffer(mut ed, id)
+    fc_buf_drop(mut ed, b)
+    // yew_trust_prompt_buffer_closed is Sprint 36's trust prompt.
+    state_mark_dirty(mut ed)
+    ed.fl_model_teardown = false
     CMD_OK
 }
 
