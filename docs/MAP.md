@@ -710,7 +710,9 @@ maintainer.
   Alternative B, duplicate the VM inside `edit`, is not recommended.
   The attached editor of s34–s38 (the recorder, `init.fl`, `--batch`, the
   macro UX) is built on it: one VM in `ed.flrt.vms`, parked while a
-  command it called runs.
+  command it called runs. The park is a move (`push(take vm)`, `5a10363`):
+  a plain push copied the VM, 974 KB a command in the ambient region,
+  which the editor perf rows found as an OOM at 100k `buf.insert`s.
 
 - **R-yw09-5 — the script-suite boundary, accepted A** (coordinator,
   2026-10-27). All 94 pinned oracle files remain untouched. The 69 scripts
