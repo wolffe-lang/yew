@@ -1,0 +1,283 @@
+//! edit.flhandle — sagitta 9ace98c2 src/fl/handle.c:209-594.
+//! Editor identities and mark ownership live above fl, avoiding a module cycle.
+//! Resolvers return indices into Ed, never copies of editor objects. `none`
+//! follows C's NULL return and sets the VM error except for an empty synthetic
+//! regex payload (which real constructors never produce).
+//! Regex slots are reused, but replaced compiled programs remain in their
+//! owner's region (G33/G54, wolf-lang#948), like fl.stdre's cache. This is
+//! allocation-pending, not a bounded-RSS claim.
+
+use fl
+use search
+use text
+
+/// One retained physical regex slot. Only a live regex handle may read it.
+pub struct FlHandleRegex { live: bool, re: search.Re }
+
+fn handle_word(kind: int) -> str {
+    match kind {
+        1 => "buffer",
+        2 => "cursor",
+        3 => "span",
+        4 => "window",
+        5 => "regex",
+        _ => "handle",
+    }
+}
+
+fn handle_mark_lo(p: fl.FlHandlePayload) -> text.MarkId {
+    text.MarkId { id: p.lo_id, gen: p.lo_gen }
+}
+
+fn handle_mark_hi(p: fl.FlHandlePayload) -> text.MarkId {
+    text.MarkId { id: p.hi_id, gen: p.hi_gen }
+}
+
+fn handle_win_index(ed: Ed, id: int) -> int {
+    if id == 0 { return -1 }
+    for i in 0..ed.wins.len { if ed.wins[i].id == id { return i } }
+    -1
+}
+
+fn handle_need(mut vm: fl.FlVm, ed: Ed, v: fl.FlValue, want: int) -> int ! {none} {
+    if fl.fl_h_kind_of(v) != want {
+        let _ = fl.fl_raise(
+            mut vm,
+            "type",
+            "expected a {handle_word(want)} handle, found {fl.fl_type_name(v.t)}",
+        )
+        return none
+    }
+    let slot = fl.fl_h_slot(ed.handles, v) else {
+        let _ = fl.fl_raise(mut vm, "handle", "this {handle_word(want)} handle is closed")
+        return none
+    }
+    slot
+}
+
+fn handle_gone(mut vm: fl.FlVm, kind: int, id: int) {
+    let _ = fl.fl_raise(mut vm, "handle", "{handle_word(kind)} {id} is closed")
+}
+
+/// Canonical buffer handle by stable id; nil for an absent buffer.
+pub fn fl_h_buf_make(mut ed: Ed, bi: int) -> fl.FlValue {
+    if bi < 0 || bi >= ed.bufs.len || ed.bufs[bi].id == 0 { return fl.fl_nil() }
+    let id = ed.bufs[bi].id
+    for i in 0..ed.handles.slots.len {
+        if ed.handles.slots[i].kind == fl.FL_H_BUF && ed.handles.slots[i].payload.buf == id {
+            return fl.fl_h_encode(fl.FL_H_BUF, i, ed.handles.slots[i].gen)
+        }
+    }
+    var p = fl.fl_h_payload_new()
+    p.buf = id
+    fl.fl_h_make(mut ed.handles, fl.FL_H_BUF, p)
+}
+
+/// Canonical window handle by stable id; nil for an absent view.
+pub fn fl_h_win_make(mut ed: Ed, wi: int) -> fl.FlValue {
+    if wi < 0 || wi >= ed.wins.len || ed.wins[wi].id == 0 { return fl.fl_nil() }
+    let id = ed.wins[wi].id
+    for i in 0..ed.handles.slots.len {
+        if ed.handles.slots[i].kind == fl.FL_H_WIN && ed.handles.slots[i].payload.win == id {
+            return fl.fl_h_encode(fl.FL_H_WIN, i, ed.handles.slots[i].gen)
+        }
+    }
+    var p = fl.fl_h_payload_new()
+    p.win = id
+    fl.fl_h_make(mut ed.handles, fl.FL_H_WIN, p)
+}
+
+/// Canonical cursor handle keyed by the window id and stable cursor stamp.
+pub fn fl_h_cur_make(mut ed: Ed, wi: int, index: int) -> fl.FlValue {
+    if wi < 0 ||
+        wi >= ed.wins.len ||
+        ed.wins[wi].id == 0 ||
+        index < 0 ||
+        index >= ed.wins[wi].cs.curs.len ||
+        index >= ed.wins[wi].cs.stamps.len {
+        return fl.fl_nil()
+    }
+    let id = ed.wins[wi].id
+    let stamp = ed.wins[wi].cs.stamps[index]
+    for i in 0..ed.handles.slots.len {
+        if ed.handles.slots[i].kind == fl.FL_H_CUR &&
+            ed.handles.slots[i].payload.win == id &&
+            ed.handles.slots[i].payload.stamp == stamp {
+            return fl.fl_h_encode(fl.FL_H_CUR, i, ed.handles.slots[i].gen)
+        }
+    }
+    var p = fl.fl_h_payload_new()
+    p.win = id
+    p.index = index
+    p.stamp = stamp
+    fl.fl_h_make(mut ed.handles, fl.FL_H_CUR, p)
+}
+
+/// Equal live spans share a handle. Distinct spans own left/right-biased marks.
+pub fn fl_h_span_make(mut ed: Ed, bi: int, a: int, b: int) -> fl.FlValue {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].ec.has_marks { return fl.fl_nil() }
+    let lo = if a < b then a else b
+    let hi = if a < b then b else a
+    let id = ed.bufs[bi].id
+    for i in 0..ed.handles.slots.len {
+        let p = copy ed.handles.slots[i].payload
+        if ed.handles.slots[i].kind != fl.FL_H_SPAN || p.buf != id { continue }
+        let ml = handle_mark_lo(p)
+        let mh = handle_mark_hi(p)
+        if !text.mark_alive(ed.bufs[bi].ec.marks, ml) ||
+            !text.mark_alive(ed.bufs[bi].ec.marks, mh) {
+            continue
+        }
+        if text.mark_pos(ed.bufs[bi].ec.marks, ml) as int == lo &&
+            text.mark_pos(ed.bufs[bi].ec.marks, mh) as int == hi {
+            return fl.fl_h_encode(fl.FL_H_SPAN, i, ed.handles.slots[i].gen)
+        }
+    }
+    let ml = text.mark_add(mut ed.bufs[bi].ec.marks, lo as text.ByteOff, text.BIAS_LEFT)
+    let mh = text.mark_add(mut ed.bufs[bi].ec.marks, hi as text.ByteOff, text.BIAS_RIGHT)
+    var p = fl.fl_h_payload_new()
+    p.buf = id
+    p.lo_id = ml.id
+    p.lo_gen = ml.gen
+    p.hi_id = mh.id
+    p.hi_gen = mh.gen
+    fl.fl_h_make(mut ed.handles, fl.FL_H_SPAN, p)
+}
+
+/// Consume a compiled program into the first inactive owning regex slot.
+pub fn fl_h_re_make(mut ed: Ed, take re: search.Re) -> fl.FlValue {
+    var at = -1
+    for i in 0..ed.handle_regex.len { if !ed.handle_regex[i].live { at = i; break } }
+    let row = FlHandleRegex { live: true, re: re }
+    if at < 0 {
+        at = ed.handle_regex.len
+        (mut ed.handle_regex).push(row)
+    } else {
+        ed.handle_regex[at] = row
+    }
+    var p = fl.fl_h_payload_new()
+    p.regex_slot = at
+    fl.fl_h_make(mut ed.handles, fl.FL_H_RE, p)
+}
+
+/// Release owned marks/regex before making the scalar slot reusable.
+pub fn fl_h_free(mut ed: Ed, v: fl.FlValue) -> bool {
+    let slot = fl.fl_h_slot(ed.handles, v) else { return false }
+    let p = copy ed.handles.slots[slot].payload
+    if ed.handles.slots[slot].kind == fl.FL_H_SPAN {
+        let bi = ed_buf_index(ed, p.buf)
+        if bi >= 0 && ed.bufs[bi].ec.has_marks {
+            let lo = handle_mark_lo(p)
+            let hi = handle_mark_hi(p)
+            if text.mark_alive(ed.bufs[bi].ec.marks, lo) {
+                text.mark_del(mut ed.bufs[bi].ec.marks, lo)
+            }
+            if text.mark_alive(ed.bufs[bi].ec.marks, hi) {
+                text.mark_del(mut ed.bufs[bi].ec.marks, hi)
+            }
+        }
+    } else if ed.handles.slots[slot].kind == fl.FL_H_RE {
+        let at = p.regex_slot
+        if at >= 0 && at < ed.handle_regex.len {
+            ed.handle_regex[at].live = false
+            (mut ed.handle_regex[at].re.prog).reset()
+            (mut ed.handle_regex[at].re.rprog).reset()
+            (mut ed.handle_regex[at].re.cls_lo).reset()
+            (mut ed.handle_regex[at].re.cls_hi).reset()
+            (mut ed.handle_regex[at].re.cls_start).reset()
+            (mut ed.handle_regex[at].re.cls_n).reset()
+            (mut ed.handle_regex[at].re.lit.s).reset()
+            (mut ed.handle_regex[at].re.lit.kmp).reset()
+            (mut ed.handle_regex[at].re.lit.skip).reset()
+            (mut ed.handle_regex[at].re.lit.has).reset()
+        }
+        ed.handles.slots[slot].payload.regex_slot = -1
+    }
+    fl.fl_h_slot_free(mut ed.handles, v)
+}
+
+/// Before buffer teardown, release every buffer/span handle naming its id.
+pub fn fl_h_drop_buffer(mut ed: Ed, id: int) {
+    for i in 0..ed.handles.slots.len {
+        let kind = ed.handles.slots[i].kind
+        if (kind == fl.FL_H_BUF || kind == fl.FL_H_SPAN) && ed.handles.slots[i].payload.buf == id {
+            let v = fl.fl_h_encode(kind, i, ed.handles.slots[i].gen)
+            let _ = fl_h_free(mut ed, v)
+        }
+    }
+}
+
+/// Before view teardown, release its window and cursor handles.
+pub fn fl_h_drop_window(mut ed: Ed, id: int) {
+    for i in 0..ed.handles.slots.len {
+        let kind = ed.handles.slots[i].kind
+        if (kind == fl.FL_H_WIN || kind == fl.FL_H_CUR) && ed.handles.slots[i].payload.win == id {
+            let v = fl.fl_h_encode(kind, i, ed.handles.slots[i].gen)
+            let _ = fl_h_free(mut ed, v)
+        }
+    }
+}
+
+/// Resolve a buffer with both independent guards: slot generation, then object id.
+pub fn fl_h_buf(mut vm: fl.FlVm, ed: Ed, v: fl.FlValue) -> int ! {none} {
+    let slot = handle_need(mut vm, ed, v, fl.FL_H_BUF)?
+    let id = ed.handles.slots[slot].payload.buf
+    let bi = ed_buf_index(ed, id)
+    if id == 0 || bi < 0 { handle_gone(mut vm, fl.FL_H_BUF, id); return none }
+    bi
+}
+
+/// Resolve a live window id after validating the handle slot.
+pub fn fl_h_win(mut vm: fl.FlVm, ed: Ed, v: fl.FlValue) -> int ! {none} {
+    let slot = handle_need(mut vm, ed, v, fl.FL_H_WIN)?
+    let id = ed.handles.slots[slot].payload.win
+    let wi = handle_win_index(ed, id)
+    if wi < 0 { handle_gone(mut vm, fl.FL_H_WIN, id); return none }
+    wi
+}
+
+/// Resolve (window index, cursor index), refreshing the hint after normalization.
+pub fn fl_h_cur(mut vm: fl.FlVm, mut ed: Ed, v: fl.FlValue) -> (int, int) ! {none} {
+    let slot = handle_need(mut vm, ed, v, fl.FL_H_CUR)?
+    let p = copy ed.handles.slots[slot].payload
+    let wi = handle_win_index(ed, p.win)
+    if wi < 0 { handle_gone(mut vm, fl.FL_H_WIN, p.win); return none }
+    var index = p.index
+    if index >= ed.wins[wi].cs.stamps.len || ed.wins[wi].cs.stamps[index] != p.stamp {
+        index = 0
+        while index < ed.wins[wi].cs.stamps.len && ed.wins[wi].cs.stamps[index] != p.stamp {
+            index += 1
+        }
+    }
+    if index >= ed.wins[wi].cs.curs.len || index >= ed.wins[wi].cs.stamps.len {
+        let _ = fl.fl_raise(mut vm, "handle", "this cursor was merged away")
+        return none
+    }
+    ed.handles.slots[slot].payload.index = index
+    (wi, index)
+}
+
+/// Resolve (buffer index, low offset, high offset) through live biased marks.
+pub fn fl_h_span(mut vm: fl.FlVm, ed: Ed, v: fl.FlValue) -> (int, int, int) ! {none} {
+    let slot = handle_need(mut vm, ed, v, fl.FL_H_SPAN)?
+    let p = copy ed.handles.slots[slot].payload
+    let bi = ed_buf_index(ed, p.buf)
+    if bi < 0 || !ed.bufs[bi].ec.has_marks { handle_gone(mut vm, fl.FL_H_BUF, p.buf); return none }
+    let ml = handle_mark_lo(p)
+    let mh = handle_mark_hi(p)
+    if !text.mark_alive(ed.bufs[bi].ec.marks, ml) || !text.mark_alive(ed.bufs[bi].ec.marks, mh) {
+        let _ = fl.fl_raise(mut vm, "handle", "this span's text was deleted")
+        return none
+    }
+    let lo = text.mark_pos(ed.bufs[bi].ec.marks, ml) as int
+    let hi = text.mark_pos(ed.bufs[bi].ec.marks, mh) as int
+    (bi, if lo > hi then hi else lo, hi)
+}
+
+/// Resolve the owning regex slot; a synthetic empty payload answers none as C.
+pub fn fl_h_re(mut vm: fl.FlVm, ed: Ed, v: fl.FlValue) -> int ! {none} {
+    let slot = handle_need(mut vm, ed, v, fl.FL_H_RE)?
+    let at = ed.handles.slots[slot].payload.regex_slot
+    if at < 0 || at >= ed.handle_regex.len || !ed.handle_regex[at].live { return none }
+    at
+}
