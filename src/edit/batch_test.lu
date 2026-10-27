@@ -1,0 +1,670 @@
+//! edit.batch_test — the `t` assertion module of `--batch --test`, sagitta
+//! 9ace98c2 src/edit/batch_test.c:1-822 and batch_test.h:1-47. One state
+//! per editor (C's `active_test`, one VM per process): the assertion and
+//! failure counts, the failure records, the coverage table, and the log
+//! records `t.log` reads (util.log's batch capture). The natives are the
+//! kind-id family 15 (R10's one representation); `t` is a frozen global
+//! map of them, as C installs it. `t.pump` drives the job and LSP part of
+//! the loop; the port has no LSP client before yw11, so it pumps jobs.
+
+use fl
+use std.fs
+use std.signal
+use text
+use util
+
+/// YewBatchTestState (batch_test.h:20-40).
+pub struct BatchTest {
+    installed: bool,
+    finished: bool,
+    skipped: bool,
+    assertions: int,
+    failures: int,
+    records: List[byte],
+    coverage: bool,
+    coverage_statements: int,
+    coverage_calls: List[int],
+}
+
+// TestNativeId (batch_test.c:44-49), in TEST_NATIVES' order.
+const T_EQ: int = 0
+
+const T_NE: int = 1
+
+const T_TEXT: int = 2
+
+const T_LINE: int = 3
+
+const T_CURSOR: int = 4
+
+const T_CURSORS: int = 5
+
+const T_SEL: int = 6
+
+const T_REG: int = 7
+
+const T_UNDO: int = 8
+
+const T_FILE: int = 9
+
+const T_RAISES: int = 10
+
+const T_LOG: int = 11
+
+const T_FIXTURE: int = 12
+
+const T_TMPDIR: int = 13
+
+const T_PUMP: int = 14
+
+const T_JOB_STDERR: int = 15
+
+const T_SKIP: int = 16
+
+const T_NATIVE_COUNT: int = 17
+
+/// The `t` natives' kind family (fl.std routes 15xxx to the host).
+pub const BATCH_TEST_FAMILY: int = 15
+
+// TEST_NATIVES (batch_test.c:674-684): name, min and max arity.
+fn bt_defs() -> List[fl.FlNativeDef] {
+    let f = BATCH_TEST_FAMILY * 1000
+    [
+        fl.fl_native_def("eq", f + T_EQ, 2, 3, 0, ""),
+        fl.fl_native_def("ne", f + T_NE, 2, 2, 0, ""),
+        fl.fl_native_def("text", f + T_TEXT, 2, 2, 0, ""),
+        fl.fl_native_def("line", f + T_LINE, 3, 3, 0, ""),
+        fl.fl_native_def("cursor", f + T_CURSOR, 3, 3, 0, ""),
+        fl.fl_native_def("cursors", f + T_CURSORS, 2, 2, 0, ""),
+        fl.fl_native_def("sel", f + T_SEL, 2, 2, 0, ""),
+        fl.fl_native_def("reg", f + T_REG, 2, 3, 0, ""),
+        fl.fl_native_def("undo", f + T_UNDO, 2, 2, 0, ""),
+        fl.fl_native_def("file", f + T_FILE, 2, 2, 0, ""),
+        fl.fl_native_def("raises", f + T_RAISES, 2, 2, 0, ""),
+        fl.fl_native_def("log", f + T_LOG, 2, 2, 0, ""),
+        fl.fl_native_def("fixture", f + T_FIXTURE, 1, 1, 0, ""),
+        fl.fl_native_def("tmpdir", f + T_TMPDIR, 0, 0, 0, ""),
+        fl.fl_native_def("pump", f + T_PUMP, 1, 1, 0, ""),
+        fl.fl_native_def("job_stderr", f + T_JOB_STDERR, 1, 1, 0, ""),
+        fl.fl_native_def("skip", f + T_SKIP, 1, 1, 0, ""),
+    ]
+}
+
+/// `yew_batch_test_init` (batch_test.c:689-697).
+pub fn batch_test_new() -> BatchTest {
+    let cov = env_get("YEW_FL_COVERAGE_OUT") else ""
+    var calls = List[int]()
+    for _ in 0..T_NATIVE_COUNT { (mut calls).push(0) }
+    BatchTest {
+        installed: false,
+        finished: false,
+        skipped: false,
+        assertions: 0,
+        failures: 0,
+        records: List[byte](),
+        coverage: cov.len != 0,
+        coverage_statements: 0,
+        coverage_calls: calls,
+    }
+}
+
+/// `yew_batch_test_coverage_statement` (batch_test.c:704-709).
+pub fn batch_test_coverage_statement(mut ed: Ed) {
+    if ed.btest.coverage { ed.btest.coverage_statements += 1 }
+}
+
+/// `yew_batch_test_install` (batch_test.c:711-737): the frozen `t` map of
+/// the natives as a VM global.
+pub fn batch_test_install(mut ed: Ed) -> bool {
+    if ed.btest.installed || !ed.flrt.ready || ed.flrt.vms.len == 0 { return false }
+    var vm = runtime_take(mut ed)
+    let m = fl.fl_map_new(mut vm)
+    let root = fl.fl_temp_push(mut vm, m)
+    for d in bt_defs() {
+        let qual = "t.{d.name}"
+        let qb = copy qual.bytes()
+        let id = fl.fl_intern(mut vm.strings, qb, 0, qb.len)
+        let nat = fl.fl_native_new(mut vm, id, d.kind, d.min_ar, d.max_ar, 0)
+        let key = fl.fl_str_text(mut vm, d.name)
+        let module = fl.fl_temp_get(vm, root)
+        assert(fl.fl_map_set(mut vm, module, key, nat))
+    }
+    let frozen = fl.fl_temp_get(vm, root)
+    fl.fl_freeze(mut vm, frozen)
+    let tb = copy "t".bytes()
+    let tid = fl.fl_intern(mut vm.strings, tb, 0, 1)
+    let globals = copy vm.globals
+    let module = fl.fl_temp_get(vm, root)
+    assert(fl.fl_map_set(mut vm, globals, fl.fl_int(tid), module))
+    fl.fl_temp_pop(mut vm, 1)
+    (mut ed.flrt.vms).push(vm)
+    ed.btest.installed = true
+    true
+}
+
+// escaped (batch_test.c:68-80).
+fn bt_escaped(mut out: List[byte], s: List[byte]) {
+    for b in s {
+        let c = b as int
+        if c == 92 {
+            util.buf_append_str(mut out, "\\\\")
+        } else if c == 9 {
+            util.buf_append_str(mut out, "\\t")
+        } else if c == 13 {
+            util.buf_append_str(mut out, "\\r")
+        } else if c == 10 {
+            util.buf_append_str(mut out, "\\n")
+        } else {
+            (mut out).push(b)
+        }
+    }
+}
+
+// fail_n (batch_test.c:82-92).
+fn bt_fail_bytes(mut ed: Ed, vm: fl.FlVm, text: List[byte]) {
+    let name = fl.fl_std_name(vm)
+    ed.btest.failures += 1
+    util.buf_append_str(mut ed.btest.records, "FAIL\t")
+    let nb = copy (if name == "?" then "t.?" else name).bytes()
+    bt_escaped(mut ed.btest.records, nb)
+    (mut ed.btest.records).push(9 as byte)
+    bt_escaped(mut ed.btest.records, text)
+    (mut ed.btest.records).push(10 as byte)
+}
+
+fn bt_fail(mut ed: Ed, vm: fl.FlVm, text: str) {
+    let b = copy text.bytes()
+    bt_fail_bytes(mut ed, vm, b)
+}
+
+fn bt_used(mut ed: Ed, id: int) { ed.btest.coverage_calls[id] += 1 }
+
+fn bt_assertion(mut ed: Ed, id: int) {
+    bt_used(mut ed, id)
+    ed.btest.assertions += 1
+}
+
+// repr (batch_test.c:110-117): the value's literal, else `<type>`.
+fn bt_repr(mut vm: fl.FlVm, v: fl.FlValue, mut out: List[byte]) {
+    let saved = copy vm.err
+    if fl.fl_fmt_repr(mut vm, mut out, v) { return }
+    vm.raised = false
+    vm.err = saved
+    util.buf_append_str(mut out, "<{fl.fl_type_name(v.t)}>")
+}
+
+fn bt_str_bytes(vm: fl.FlVm, v: fl.FlValue) -> List[byte] { copy vm.gc.slots[fl.fl_obj_index(vm, v)].bytes }
+
+// fail_values (batch_test.c:119-132).
+fn bt_fail_values(mut ed: Ed, mut vm: fl.FlVm, want: fl.FlValue, got: fl.FlValue, note: List[byte]) {
+    var b = List[byte]()
+    if note.len != 0 {
+        util.buf_append(mut b, note)
+        util.buf_append_str(mut b, ": ")
+    }
+    util.buf_append_str(mut b, "want ")
+    bt_repr(mut vm, want, mut b)
+    util.buf_append_str(mut b, "; got ")
+    bt_repr(mut vm, got, mut b)
+    bt_fail_bytes(mut ed, vm, b)
+}
+
+fn bt_bytes_eq(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len { if a[i] != b[i] { return false } }
+    true
+}
+
+// fail_bytes (batch_test.c:178-193).
+fn bt_fail_text(mut ed: Ed, mut vm: fl.FlVm, want: fl.FlValue, got: List[byte]) {
+    let wb = bt_str_bytes(vm, want)
+    var diff = if wb.len < got.len then wb.len else got.len
+    for i in 0..diff {
+        if wb[i] != got[i] {
+            diff = i
+            break
+        }
+    }
+    var b = List[byte]()
+    util.buf_append_str(mut b, "want ")
+    bt_repr(mut vm, want, mut b)
+    util.buf_append_str(mut b, "; got ")
+    let actual = fl.fl_str_new(mut vm, got)
+    let root = fl.fl_temp_push(mut vm, actual)
+    let held = fl.fl_temp_get(vm, root)
+    bt_repr(mut vm, held, mut b)
+    fl.fl_temp_pop(mut vm, 1)
+    util.buf_append_str(mut b, "; first difference at byte {diff}")
+    bt_fail_bytes(mut ed, vm, b)
+}
+
+fn bt_check_text(mut ed: Ed, mut vm: fl.FlVm, bi: int, lo: int, hi: int, want: fl.FlValue) -> fl.FlValue {
+    if !ed.bufs[bi].resident {
+        bt_fail(mut ed, vm, "buffer is not resident")
+        return fl.fl_nil()
+    }
+    let got = text.textbuf_copy_range(ed.bufs[bi].ec.tb, lo, hi)
+    if !bt_bytes_eq(got, bt_str_bytes(vm, want)) { bt_fail_text(mut ed, mut vm, want, got) }
+    fl.fl_nil()
+}
+
+// cursor_pos (batch_test.c:244-250): 1-based line, grapheme column.
+fn bt_cursor_pos(mut ed: Ed, wi: int, c: text.Cursor) -> (int, int) {
+    let bi = ed.wins[wi].buf
+    let ln = text.textbuf_line_of(ed.bufs[bi].ec.tb, c.pos as text.ByteOff)
+    let s = text.textbuf_line_span(ed.bufs[bi].ec.tb, ln)
+    let col = text.off_to_gcol(mut ed.bufs[bi].ec.tb, s, c.pos as text.ByteOff)
+    (ln as int + 1, col as int)
+}
+
+fn bt_pair(vm: fl.FlVm, v: fl.FlValue) -> (int, int) ! {none} {
+    if v.t != fl.FL_LIST { return none }
+    let l = fl.fl_obj_index(vm, v)
+    if vm.gc.slots[l].vals.len != 2 { return none }
+    let a = copy vm.gc.slots[l].vals[0]
+    let b = copy vm.gc.slots[l].vals[1]
+    if a.t != fl.FL_INT || b.t != fl.FL_INT { return none }
+    (a.i, b.i)
+}
+
+// reg_type_is (batch_test.c:321-335).
+fn bt_reg_type_is(vm: fl.FlVm, v: fl.FlValue, actual: int) -> bool {
+    if v.t == fl.FL_INT { return v.i == actual }
+    if v.t != fl.FL_STR { return false }
+    let s = str_from_utf8(bt_str_bytes(vm, v)) else { return false }
+    if actual == text.REG_CHARWISE { return s == "char" || s == "charwise" }
+    if actual == text.REG_LINEWISE { return s == "line" || s == "linewise" }
+    s == "block" || s == "blockwise"
+}
+
+fn bt_read_path(path: str) -> List[byte] ! {failed} {
+    let b = fs_read_bytes(path) else { return failed }
+    b
+}
+
+fn bt_has_nul(b: List[byte]) -> bool {
+    for x in b { if x == 0 as byte { return true } }
+    false
+}
+
+fn bt_has_kind(mut vm: fl.FlVm, err: fl.FlValue) -> bool {
+    let _ = bt_error_kind(mut vm, err) else { return false }
+    true
+}
+
+// strerror for the reasons a read or a copy fails here.
+fn bt_strerror(e: int) -> str {
+    if e == 2 { return "No such file or directory" }
+    if e == 13 { return "Permission denied" }
+    if e == 21 { return "Is a directory" }
+    if e == 20 { return "Not a directory" }
+    if e == 17 { return "File exists" }
+    if e == 5 { return "Input/output error" }
+    if e == 28 { return "No space left on device" }
+    if e == 30 { return "Read-only file system" }
+    "Unknown error {e}"
+}
+
+fn bt_write_all(fd: int, bytes: List[byte]) -> bool {
+    if bytes.len == 0 { return true }
+    fs_write_chunk(fd, bytes) else { return false }
+    true
+}
+
+fn bt_env_set(name: str) -> bool {
+    let _ = env_get(name) else { return false }
+    true
+}
+
+// t.pump's slice (batch_test.c:597-634): wait on the job descriptors for
+// at most `slice` ms, then pump, reap, tick and settle as a loop turn.
+fn bt_pump_jobs(mut ed: Ed, slice: int) {
+    var timeout = slice
+    let now = now_ms()
+    let jw = job_deadline(ed, now)
+    if jw >= 0 && jw < timeout { timeout = jw }
+    let fds = job_wait_fds(ed)
+    if fds.len != 0 {
+        let (_, meaning) = os_signal_wait_fds(fds, signal.child(), timeout) else |_| { (0, 0) }
+        if meaning == signal.child() { ed.jobs.child_seen = true }
+    } else if timeout > 0 {
+        time_sleep_ms(timeout)
+    }
+    let n = now_ms()
+    ed.now_ms = n
+    job_pump(mut ed)
+    job_reap(mut ed)
+    job_tick(mut ed, n)
+    let _ = job_settle(mut ed)
+    shsession_settle(mut ed)
+}
+
+// error_kind (batch_test.c:420-429).
+fn bt_error_kind(mut vm: fl.FlVm, err: fl.FlValue) -> List[byte] ! {none} {
+    if err.t != fl.FL_MAP { return none }
+    let kb = copy "kind".bytes()
+    let key = fl.fl_str_new(mut vm, kb)
+    let got = fl.fl_map_get(vm, err, key) else { return none }
+    if got.t != fl.FL_STR { return none }
+    bt_str_bytes(vm, got)
+}
+
+fn bt_level(s: str) -> int {
+    if s == "debug" { return util.LOG_DEBUG }
+    if s == "info" { return util.LOG_INFO }
+    if s == "warn" { return util.LOG_WARN }
+    if s == "error" { return util.LOG_ERROR }
+    -1
+}
+
+// fixture_name_ok (batch_test.c:522-528).
+fn bt_fixture_name_ok(b: List[byte]) -> bool {
+    if b.len == 0 || bt_has_nul(b) { return false }
+    for x in b { if x == '/' as int as byte { return false } }
+    if b.len == 1 && b[0] == '.' as int as byte { return false }
+    !(b.len == 2 && b[0] == '.' as int as byte && b[1] == '.' as int as byte)
+}
+
+/// The `t` natives (batch_test.c:134-672), `local` the TestNativeId.
+pub fn batch_test_native(mut vm: fl.FlVm, mut ed: Ed, local: int, base: int, argc: int) -> fl.FlValue {
+    if !ed.btest.installed { util.bug("edit.batch_test", "batch assertion has no installed state") }
+    if local == T_EQ {
+        bt_assertion(mut ed, T_EQ)
+        var note = List[byte]()
+        if argc == 3 {
+            let n = fl.fl_arg_str(mut vm, base, 2) else { return fl.fl_nil() }
+            note = bt_str_bytes(vm, n)
+        }
+        let a = copy vm.stack[base]
+        let b = copy vm.stack[base + 1]
+        if !fl.fl_equal(vm, a, b) { bt_fail_values(mut ed, mut vm, b, a, note) }
+        return fl.fl_nil()
+    }
+    if local == T_NE {
+        bt_assertion(mut ed, T_NE)
+        let a = copy vm.stack[base]
+        let b = copy vm.stack[base + 1]
+        if fl.fl_equal(vm, a, b) { bt_fail_values(mut ed, mut vm, b, a, List[byte]()) }
+        return fl.fl_nil()
+    }
+    if local == T_TEXT {
+        bt_assertion(mut ed, T_TEXT)
+        let bi = fl_h_buf(mut vm, ed, copy vm.stack[base]) else { return fl.fl_nil() }
+        let want = fl.fl_arg_str(mut vm, base, 1) else { return fl.fl_nil() }
+        let len = if ed.bufs[bi].resident then text.textbuf_len(ed.bufs[bi].ec.tb) else 0
+        return bt_check_text(mut ed, mut vm, bi, 0, len, want)
+    }
+    if local == T_LINE {
+        bt_assertion(mut ed, T_LINE)
+        let bi = fl_h_buf(mut vm, ed, copy vm.stack[base]) else { return fl.fl_nil() }
+        let line = fl.fl_arg_int(mut vm, base, 1) else { return fl.fl_nil() }
+        let want = fl.fl_arg_str(mut vm, base, 2) else { return fl.fl_nil() }
+        if !ed.bufs[bi].resident || line < 1 || line > text.textbuf_line_count(ed.bufs[bi].ec.tb) {
+            bt_fail(mut ed, vm, "requested line is outside the buffer")
+            return fl.fl_nil()
+        }
+        let s = text.textbuf_line_span(ed.bufs[bi].ec.tb, (line - 1) as text.LineNo)
+        var hi = s.hi
+        if hi > s.lo && text.textbuf_byte_at(ed.bufs[bi].ec.tb, hi - 1) == 10 {
+            hi -= 1
+            if hi > s.lo && text.textbuf_byte_at(ed.bufs[bi].ec.tb, hi - 1) == 13 { hi -= 1 }
+        }
+        return bt_check_text(mut ed, mut vm, bi, s.lo, hi, want)
+    }
+    if local == T_CURSOR {
+        bt_assertion(mut ed, T_CURSOR)
+        let wi = fl_h_win(mut vm, ed, copy vm.stack[base]) else { return fl.fl_nil() }
+        let wl = fl.fl_arg_int(mut vm, base, 1) else { return fl.fl_nil() }
+        let wc = fl.fl_arg_int(mut vm, base, 2) else { return fl.fl_nil() }
+        let c = copy ed.wins[wi].cs.curs[ed.wins[wi].cs.primary]
+        let (gl, gc) = bt_cursor_pos(mut ed, wi, c)
+        if wl < 1 || wc < 0 || gl != wl || gc != wc {
+            bt_fail(mut ed, vm, "want [{wl},{wc}]; got [{gl},{gc}]")
+        }
+        return fl.fl_nil()
+    }
+    if local == T_CURSORS {
+        bt_assertion(mut ed, T_CURSORS)
+        let wi = fl_h_win(mut vm, ed, copy vm.stack[base]) else { return fl.fl_nil() }
+        let want = fl.fl_arg_list(mut vm, base, 1) else { return fl.fl_nil() }
+        let items = copy vm.gc.slots[fl.fl_obj_index(vm, want)].vals
+        var same = items.len == ed.wins[wi].cs.curs.len
+        var i = 0
+        while same && i < items.len {
+            let (wl, wc) = bt_pair(vm, items[i]) else {
+                same = false
+                break
+            }
+            let c = copy ed.wins[wi].cs.curs[i]
+            let (gl, gc) = bt_cursor_pos(mut ed, wi, c)
+            if wl < 1 || wc < 0 || gl != wl || gc != wc { same = false }
+            i += 1
+        }
+        if !same {
+            bt_fail(mut ed, vm, "cursor set differs (want {items.len} cursors; got {ed.wins[wi].cs.curs.len})")
+        }
+        return fl.fl_nil()
+    }
+    if local == T_SEL {
+        bt_assertion(mut ed, T_SEL)
+        let wi = fl_h_win(mut vm, ed, copy vm.stack[base]) else { return fl.fl_nil() }
+        let want = fl.fl_arg_str(mut vm, base, 1) else { return fl.fl_nil() }
+        let c = copy ed.wins[wi].cs.curs[ed.wins[wi].cs.primary]
+        let bi = ed.wins[wi].buf
+        var got = List[byte]()
+        if c.pos != c.anchor {
+            let kind = ed.wins[wi].h.kind
+            if kind == SEL_RECT {
+                let tabw = sel_tabwidth(ed.bufs[bi].tabwidth)
+                for s in sel_rect_spans(ed.bufs[bi].ec.tb, kind, tabw, c) {
+                    util.buf_append(mut got, text.textbuf_copy_range(ed.bufs[bi].ec.tb, s.lo, s.hi))
+                }
+            } else {
+                let s = sel_span(ed.bufs[bi].ec.tb, kind, c)
+                got = text.textbuf_copy_range(ed.bufs[bi].ec.tb, s.lo, s.hi)
+            }
+        }
+        if !bt_bytes_eq(got, bt_str_bytes(vm, want)) { bt_fail_text(mut ed, mut vm, want, got) }
+        return fl.fl_nil()
+    }
+    if local == T_REG {
+        bt_assertion(mut ed, T_REG)
+        let name = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+        let want = fl.fl_arg_str(mut vm, base, 1) else { return fl.fl_nil() }
+        let nb = bt_str_bytes(vm, name)
+        if nb.len != 1 {
+            bt_fail(mut ed, vm, "register name is not readable")
+            return fl.fl_nil()
+        }
+        let r = text.reg_get(mut ed.regs, nb[0] as int) else {
+            bt_fail(mut ed, vm, "register name is not readable")
+            return fl.fl_nil()
+        }
+        if !bt_bytes_eq(r.bytes, bt_str_bytes(vm, want)) { bt_fail_text(mut ed, mut vm, want, copy r.bytes) }
+        if argc == 3 && !bt_reg_type_is(vm, copy vm.stack[base + 2], r.kind) {
+            bt_fail(mut ed, vm, "register type differs")
+        }
+        return fl.fl_nil()
+    }
+    if local == T_UNDO {
+        bt_assertion(mut ed, T_UNDO)
+        let bi = fl_h_buf(mut vm, ed, copy vm.stack[base]) else { return fl.fl_nil() }
+        let want = fl.fl_arg_int(mut vm, base, 1) else { return fl.fl_nil() }
+        var live = 0
+        // The same count yew_undo_dump prints: every non-DEAD node, root included.
+        if ed.bufs[bi].ec.has_undo {
+            for n in ed.bufs[bi].ec.undo.nodes { if n.flags & text.TXN_DEAD == 0 { live += 1 } }
+        }
+        if want < 0 || live != want { bt_fail(mut ed, vm, "want {want} undo nodes; got {live}") }
+        return fl.fl_nil()
+    }
+    if local == T_FILE {
+        bt_assertion(mut ed, T_FILE)
+        let path = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+        let want = fl.fl_arg_str(mut vm, base, 1) else { return fl.fl_nil() }
+        let pb = bt_str_bytes(vm, path)
+        if bt_has_nul(pb) {
+            bt_fail(mut ed, vm, "file path contains NUL")
+            return fl.fl_nil()
+        }
+        let p = str_from_utf8(pb) else {
+            bt_fail(mut ed, vm, "not yet ported: non-UTF-8 t.file paths (G40)")
+            return fl.fl_nil()
+        }
+        let got = bt_read_path(p) else {
+            bt_fail(mut ed, vm, "cannot read {p}: {bt_strerror(os_error())}")
+            return fl.fl_nil()
+        }
+        if !bt_bytes_eq(got, bt_str_bytes(vm, want)) { bt_fail_text(mut ed, mut vm, want, got) }
+        return fl.fl_nil()
+    }
+    if local == T_RAISES {
+        bt_assertion(mut ed, T_RAISES)
+        let want = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+        let f = fl.fl_arg_fn(mut vm, base, 1) else { return fl.fl_nil() }
+        let saved = copy vm.err
+        let saved_caret = copy vm.err_caret
+        let saved_native = vm.cur_native
+        let want_root = fl.fl_temp_push(mut vm, want)
+        let _ = fl.fl_vm_call_host(mut vm, mut ed, f, List[fl.FlValue]())
+        let raised = vm.raised
+        vm.raised = false
+        let err = copy vm.err
+        var known = false
+        var got = List[byte]()
+        if raised {
+            let k = bt_error_kind(mut vm, err) else List[byte]()
+            known = err.t == fl.FL_MAP && bt_has_kind(mut vm, err)
+            got = k
+        }
+        vm.err = saved
+        vm.err_caret = saved_caret
+        vm.cur_native = saved_native
+        let w = fl.fl_temp_get(vm, want_root)
+        fl.fl_temp_pop(mut vm, 1)
+        let wb = bt_str_bytes(vm, w)
+        if !raised {
+            bt_fail(mut ed, vm, "expected function to raise; it returned")
+        } else if !known || !bt_bytes_eq(got, wb) {
+            var b = List[byte]()
+            util.buf_append_str(mut b, "want error kind ")
+            util.buf_append(mut b, wb)
+            util.buf_append_str(mut b, "; got ")
+            if known { util.buf_append(mut b, got) } else { util.buf_append_str(mut b, "?") }
+            bt_fail_bytes(mut ed, vm, b)
+        }
+        return fl.fl_nil()
+    }
+    if local == T_LOG {
+        bt_assertion(mut ed, T_LOG)
+        let level = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+        let sub = fl.fl_arg_str(mut vm, base, 1) else { return fl.fl_nil() }
+        let lv = bt_level(str_from_utf8(bt_str_bytes(vm, level)) else "")
+        if lv < 0 {
+            bt_fail(mut ed, vm, "unknown log level")
+        } else if !util.log_capture_has(lv, bt_str_bytes(vm, sub)) {
+            bt_fail(mut ed, vm, "matching log line was not emitted")
+        }
+        return fl.fl_nil()
+    }
+    if local == T_FIXTURE {
+        bt_used(mut ed, T_FIXTURE)
+        let name = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+        let nb = bt_str_bytes(vm, name)
+        if !bt_fixture_name_ok(nb) { return fl.fl_raise(mut vm, "io", "t.fixture: name must be one path component") }
+        let n = str_from_utf8(nb) else { return fl.fl_raise(mut vm, "io", "t.fixture: name must be one path component") }
+        let cwd = os_cwd() else { return fl.fl_raise(mut vm, "io", "t.fixture: cannot read cwd: {bt_strerror(os_error())}") }
+        let src = "{cwd}/fixtures/{n}"
+        let dest = "{cwd}/{n}"
+        let bytes = fs_read_bytes(src) else {
+            return fl.fl_raise(mut vm, "io", "t.fixture: copy failed: {bt_strerror(os_error())}")
+        }
+        fs.write_bytes(dest, bytes) else |_| {
+            return fl.fl_raise(mut vm, "io", "t.fixture: copy failed: {bt_strerror(os_error())}")
+        }
+        fs.set_mode(dest, 384) else |_| {}
+        return fl.fl_str_text(mut vm, dest)
+    }
+    if local == T_TMPDIR {
+        bt_used(mut ed, T_TMPDIR)
+        var path = env_get("YEW_SCRIPT_TMPDIR") else ""
+        if path.len == 0 { path = env_get("TMPDIR") else "" }
+        if path.len == 0 { path = "/tmp" }
+        return fl.fl_str_text(mut vm, path)
+    }
+    if local == T_PUMP {
+        bt_used(mut ed, T_PUMP)
+        let ms = fl.fl_arg_int(mut vm, base, 0) else { return fl.fl_nil() }
+        if ms < 0 || ms > 5000 { return fl.fl_raise(mut vm, "range", "t.pump: milliseconds must be 0..5000") }
+        let scale = if bt_env_set("YEW_TEST_INSTRUMENTED") then 8 else 1
+        let deadline = now_ms() + ms * scale
+        var first = true
+        loop {
+            let now = now_ms()
+            if !first && now >= deadline { break }
+            first = false
+            let remain = deadline - now
+            let slice = if remain <= 0 then 0 else if remain < 10 then remain else 10
+            bt_pump_jobs(mut ed, slice)
+        }
+        return fl.fl_nil()
+    }
+    if local == T_JOB_STDERR {
+        bt_assertion(mut ed, T_JOB_STDERR)
+        let want = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+        var got = List[byte]()
+        for j in ed.jobs.v { util.buf_append(mut got, j.framed_err) }
+        if !bt_bytes_eq(got, bt_str_bytes(vm, want)) { bt_fail_text(mut ed, mut vm, want, got) }
+        return fl.fl_nil()
+    }
+    // T_SKIP
+    bt_used(mut ed, T_SKIP)
+    let _ = fl.fl_arg_str(mut vm, base, 0) else { return fl.fl_nil() }
+    ed.btest.skipped = true
+    fl.fl_nil()
+}
+
+// write_coverage (batch_test.c:766-786).
+fn bt_write_coverage(ed: Ed) -> bool {
+    if !ed.btest.coverage { return true }
+    let path = env_get("YEW_FL_COVERAGE_OUT") else ""
+    if path.len == 0 { return false }
+    var out = List[byte]()
+    util.buf_append_str(mut out, "statements\t{ed.btest.coverage_statements}\n")
+    let defs = bt_defs()
+    for i in 0..defs.len { util.buf_append_str(mut out, "t.{defs[i].name}\t{ed.btest.coverage_calls[i]}\n") }
+    text.file_write_atomic(path, out, 384) == text.SAVE_OK
+}
+
+// result_fd (batch_test.c:754-764).
+fn bt_result_fd() -> int {
+    let v = env_get("YEW_SCRIPT_RESULT_FD") else ""
+    if v.len == 0 { return 2 }
+    for b in v.bytes() { if b < '0' as int as byte || b > '9' as int as byte { return 2 } }
+    let n = v.to_int() else { return 2 }
+    if n < 0 || n > 2147483647 then 2 else n
+}
+
+/// `yew_batch_test_finish` (batch_test.c:788-812): the failure records and
+/// the `YEWTEST` summary written to the result descriptor; true when the
+/// file passed (or skipped).
+pub fn batch_test_finish(mut ed: Ed) -> bool {
+    if !ed.btest.installed { return false }
+    if !ed.btest.finished && !ed.btest.skipped && ed.btest.assertions == 0 {
+        ed.btest.failures += 1
+        util.buf_append_str(mut ed.btest.records, "FAIL\tt.?\tno assertions\n")
+    }
+    ed.btest.finished = true
+    let failures = if ed.btest.skipped then 0 else ed.btest.failures
+    var io_ok = bt_write_coverage(ed)
+    let fd = bt_result_fd()
+    if !ed.btest.skipped {
+        let recs = copy ed.btest.records
+        io_ok = bt_write_all(fd, recs)
+    }
+    var summary = List[byte]()
+    util.buf_append_str(mut summary, "YEWTEST\t{ed.btest.assertions}\t{failures}\t{if ed.btest.skipped then 1 else 0}\n")
+    if !bt_write_all(fd, summary) { io_ok = false }
+    if fd > 2 { fs_close(fd) else { io_ok = false } }
+    io_ok && (ed.btest.skipped || failures == 0)
+}
