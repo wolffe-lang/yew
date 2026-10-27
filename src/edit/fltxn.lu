@@ -1,0 +1,155 @@
+//! edit.fltxn — sagitta 9ace98c2 src/fl/fltxn.c:14-160.
+//! Enlist buffer identities, not borrowed EditCtx pointers. The current
+//! window identity is refreshed after dispatch, matching C's context refresh.
+//! All undo/journal work uses the existing ownership swap, never raw edits.
+
+use fl
+use text
+
+/// One enlisted undo tree and the view whose cursor set accompanies it.
+pub struct FlTxnEntry { buffer_id: int, window_id: int }
+
+/// Implicit entry and flattened explicit edit boundaries, in enlistment order.
+pub struct FlTxnState { entry_active: bool, depth: int, entries: List[FlTxnEntry] }
+
+/// An idle transaction retains no editor objects or VM values.
+pub fn fl_txn_new() -> FlTxnState {
+    FlTxnState { entry_active: false, depth: 0, entries: List[FlTxnEntry]() }
+}
+
+fn txn_finish_one(mut ed: Ed, entry: FlTxnEntry, commit: bool) {
+    let bi = ed_buf_index(ed, entry.buffer_id)
+    assert(bi >= 0, "Fletch transaction lost its enlisted buffer")
+    let wi = handle_win_index(ed, entry.window_id)
+    if wi >= 0 && ed.wins[wi].buf == bi {
+        if commit { ed_undo_end(mut ed, wi) } else { ed_undo_abort(mut ed, wi) }
+        return
+    }
+    // A view may close without destroying its buffer. No cursor set may be
+    // restored into another buffer's view; the journal still follows the undo.
+    let journals = ed.journals
+    ed.journals = ed.bufs[bi].ec.journals
+    ed.bufs[bi].ec.journals = journals
+    let had_cset = ed.bufs[bi].ec.has_cset
+    ed.bufs[bi].ec.has_cset = false
+    if commit { text.undo_end(mut ed.bufs[bi].ec) } else { text.undo_abort(mut ed.bufs[bi].ec) }
+    ed.bufs[bi].ec.has_cset = had_cset
+    let restored = ed.journals
+    ed.journals = ed.bufs[bi].ec.journals
+    ed.bufs[bi].ec.journals = restored
+}
+
+fn txn_finish(mut ed: Ed, commit: bool) {
+    let n = ed.fltxn.entries.len
+    if commit {
+        for i in 0..n { let entry = copy ed.fltxn.entries[i]; txn_finish_one(mut ed, entry, true) }
+    } else {
+        var i = n
+        while i > 0 {
+            i -= 1
+            let entry = copy ed.fltxn.entries[i]
+            txn_finish_one(mut ed, entry, false)
+        }
+    }
+    (mut ed.fltxn.entries).reset()
+}
+
+/// Open the implicit transaction of an outer Fletch entry.
+pub fn fl_txn_run_begin(mut vm: fl.FlVm, mut ed: Ed) -> bool {
+    if ed.fltxn.entry_active {
+        let _ = fl.fl_raise(mut vm, "user", "nested editor entry transaction")
+        return false
+    }
+    if ed.fltxn.entries.len != 0 || ed.fltxn.depth != 0 {
+        let _ = fl.fl_raise(mut vm, "user", "stale editor transaction state")
+        return false
+    }
+    ed.fltxn.entry_active = true
+    true
+}
+
+/// Finish the outer entry; an unclosed explicit boundary forces rollback.
+pub fn fl_txn_run_end(mut ed: Ed, commit: bool) -> bool {
+    if !ed.fltxn.entry_active { return true }
+    txn_finish(mut ed, commit && ed.fltxn.depth == 0)
+    ed.fltxn.depth = 0
+    ed.fltxn.entry_active = false
+    true
+}
+
+/// Start an explicit boundary after committing any preceding implicit edits.
+pub fn fl_txn_edit_begin(mut vm: fl.FlVm, mut ed: Ed) -> bool {
+    if !ed.fltxn.entry_active {
+        let _ = fl.fl_raise(mut vm, "user", "edit block outside Fletch entry")
+        return false
+    }
+    if ed.fltxn.depth == 0 && ed.fltxn.entries.len != 0 { txn_finish(mut ed, true) }
+    if ed.fltxn.depth == 4294967295 {
+        let _ = fl.fl_raise(mut vm, "limit", "edit nesting exceeded")
+        return false
+    }
+    ed.fltxn.depth += 1
+    true
+}
+
+/// Flatten nested edits; only the outer explicit exit commits or rolls back.
+pub fn fl_txn_edit_end(mut vm: fl.FlVm, mut ed: Ed, commit: bool) -> bool {
+    if ed.fltxn.depth == 0 {
+        let _ = fl.fl_raise(mut vm, "user", "unbalanced edit block")
+        return false
+    }
+    ed.fltxn.depth -= 1
+    if ed.fltxn.depth == 0 { txn_finish(mut ed, commit) }
+    true
+}
+
+/// Enlist before mutation and refresh the view identity after mutation. A
+/// null-host VM performs no Fletch enlistment, as C's direct motion tests do.
+pub fn fl_txn_enlist(mut vm: fl.FlVm, mut ed: Ed, wi: int) -> bool {
+    if vm.host_kind != 1 { return true }
+    if !ed.fltxn.entry_active {
+        let _ = fl.fl_raise(mut vm, "user", "editor mutation outside Fletch entry")
+        return false
+    }
+    if wi < 0 || wi >= ed.wins.len || ed.wins[wi].buf < 0 {
+        let _ = fl.fl_raise(mut vm, "user", "editor mutation has no undo context")
+        return false
+    }
+    let bi = ed.wins[wi].buf
+    if !ed.bufs[bi].ec.has_undo {
+        let _ = fl.fl_raise(mut vm, "user", "editor mutation has no undo context")
+        return false
+    }
+    let bid = ed.bufs[bi].id
+    let wid = ed.wins[wi].id
+    for i in 0..ed.fltxn.entries.len {
+        if ed.fltxn.entries[i].buffer_id == bid { ed.fltxn.entries[i].window_id = wid; return true }
+    }
+    edit_take(mut ed, wi)
+    let had_cset = ed.bufs[bi].ec.has_cset
+    if ed.bufs[bi].ec.undo.depth == 0 && ed.bufs[bi].ec.cset.curs.len > 1 {
+        ed.bufs[bi].ec.has_cset = false
+    }
+    text.undo_begin(mut ed.bufs[bi].ec, text.TXN_MACRO)
+    ed.bufs[bi].ec.has_cset = had_cset
+    edit_give(mut ed, wi)
+    (mut ed.fltxn.entries).push(FlTxnEntry { buffer_id: bid, window_id: wid })
+    true
+}
+
+/// A buffer cannot close while its undo tree is enlisted.
+pub fn fl_txn_enlisted(ed: Ed, buffer_id: int) -> bool {
+    for entry in ed.fltxn.entries { if entry.buffer_id == buffer_id { return true } }
+    false
+}
+
+/// A save flushes all implicit edits, but never commits inside explicit edit{}.
+pub fn fl_txn_prepare_save(mut vm: fl.FlVm, mut ed: Ed, buffer_id: int) -> bool {
+    if vm.host_kind != 1 || !ed.fltxn.entry_active { return true }
+    if ed.fltxn.depth != 0 {
+        let _ = fl.fl_raise(mut vm, "user", "cannot save inside edit block")
+        return false
+    }
+    if fl_txn_enlisted(ed, buffer_id) { txn_finish(mut ed, true) }
+    true
+}
