@@ -1,0 +1,1328 @@
+//! edit.option — the one typed option table Fletch and E mode share
+//! (Sprint 36): sagitta 9ace98c2 src/edit/option.c:1-1907 and option.h.
+//!
+//! The descriptor table is C's, row for row and in its order (option.c:
+//! 213-479). A value lives in the global store, or for a buffer- or
+//! window-scoped option in that buffer's or window's override map; a read
+//! falls from window to buffer to global. Every write runs one setter that
+//! validates (type, range, enum, the per-option validators, the module
+//! gate) and then applies the option's editor effect (option_changed_
+//! target, option.c:805-934).
+//!
+//! `set({...})` from Fletch is a registration: each name is checkpointed,
+//! set, and committed to the hook table's ledger as REG_OPTION under the
+//! calling origin, so removing a registration (an origin's teardown, or a
+//! reload) restores the value beneath it, splicing around newer layers
+//! (option.c:1301-1593).
+//!
+//! The port is module-less (edit.mods): every module-owned option keeps
+//! its descriptor and refuses a write with C's words. Plugin-declared
+//! options (`ctx.set`, option.c:1595-1803) are yw14's; the effects that
+//! reach unported surfaces say whose they are where they would run.
+
+use fl
+use text
+use unicode
+use util
+
+/// `OptValType` (option.h:18-24).
+pub const OPT_BOOL: int = 0
+
+/// An integer.
+pub const OPT_INT: int = 1
+
+/// A string.
+pub const OPT_STR: int = 2
+
+/// One of the descriptor's names.
+pub const OPT_ENUM: int = 3
+
+/// A list of strings.
+pub const OPT_STRLIST: int = 4
+
+/// `OptScope` (option.h:26-31).
+pub const OPT_GLOBAL: int = 0
+
+/// Per buffer.
+pub const OPT_BUFFER: int = 1
+
+/// Per window.
+pub const OPT_WINDOW: int = 2
+
+/// The descriptor's own scope.
+pub const OPT_SCOPE_DECLARED: int = 255
+
+/// `OptModule` (option.h:33-41): zero is core; the rest are YewMod + 1.
+pub const OPT_MODULE_CORE: int = 0
+
+/// LSP's.
+pub const OPT_MODULE_LSP: int = 1
+
+/// The AI module's.
+pub const OPT_MODULE_AI: int = 2
+
+/// FUSS's.
+pub const OPT_MODULE_FUSS: int = 3
+
+/// Plugins'.
+pub const OPT_MODULE_PLUGINS: int = 4
+
+/// No validator beyond type, range and enum.
+const VALIDATE_NONE: int = 0
+
+/// `shadow_providers_validate` (option.c:135-173).
+const VALIDATE_SHADOW_PROVIDERS: int = 1
+
+/// `ai_exclude_paths_validate` (option.c:175-199).
+const VALIDATE_AI_EXCLUDE: int = 2
+
+const I64_MIN: int = -9223372036854775807 - 1
+
+const I64_MAX: int = 9223372036854775807
+
+/// `OptVal` (option.h:48-59): the field the type names holds the value.
+pub struct OptVal {
+    t: int,
+    b: bool,
+    i: int,
+    s: str,
+    list: List[str],
+}
+
+/// `OptDesc` (option.h:61-74); C's validate pointer is a validator id,
+/// and every row's on_change is option_changed.
+pub struct OptDesc {
+    name: str,
+    t: int,
+    scope: int,
+    dflt: OptVal,
+    enums: List[str],
+    imin: int,
+    imax: int,
+    validator: int,
+    help: str,
+    module: int,
+}
+
+/// `YewOptUndo` (option.c:48-57): one checkpoint, pending until committed
+/// as a ledger registration, active until removed.
+pub struct OptUndo {
+    previous: OptVal,
+    order: int,
+    target_id: int,
+    ledger_id: int,
+    desc_index: int,
+    scope: int,
+    pending: bool,
+    active: bool,
+}
+
+/// The editor's option state: the table, the global store, the in-flight
+/// guard and the registration history (C's opt_globals, opt_inflight and
+/// opt_history).
+pub struct OptState {
+    descs: List[OptDesc],
+    globals: List[OptVal],
+    // C's Buffer.opt_overrides and Win.opt_overrides, keyed by the stable
+    // buffer and window ids (an id is never reused).
+    buf_over: Map[int, Map[str, OptVal]],
+    win_over: Map[int, Map[str, OptVal]],
+    inflight: List[bool],
+    undo: List[OptUndo],
+    next_order: int,
+    theme_inflight: bool,
+}
+
+/// A boolean value.
+pub fn optv_bool(b: bool) -> OptVal { OptVal { t: OPT_BOOL, b: b, i: 0, s: "", list: List[str]() } }
+
+/// An integer value.
+pub fn optv_int(i: int) -> OptVal { OptVal { t: OPT_INT, b: false, i: i, s: "", list: List[str]() } }
+
+/// A string value.
+pub fn optv_str(s: str) -> OptVal { OptVal { t: OPT_STR, b: false, i: 0, s: s, list: List[str]() } }
+
+/// An enum value.
+pub fn optv_enum(s: str) -> OptVal { OptVal { t: OPT_ENUM, b: false, i: 0, s: s, list: List[str]() } }
+
+/// An empty string list.
+pub fn optv_list(list: List[str]) -> OptVal {
+    OptVal { t: OPT_STRLIST, b: false, i: 0, s: "", list: list }
+}
+
+fn od(
+    name: str,
+    t: int,
+    scope: int,
+    dflt: OptVal,
+    enums: List[str],
+    imin: int,
+    imax: int,
+    help: str,
+    module: int,
+) -> OptDesc {
+    OptDesc {
+        name: name,
+        t: t,
+        scope: scope,
+        dflt: dflt,
+        enums: enums,
+        imin: imin,
+        imax: imax,
+        validator: VALIDATE_NONE,
+        help: help,
+        module: module,
+    }
+}
+
+fn odb(name: str, scope: int, d: bool, help: str, module: int) -> OptDesc {
+    od(name, OPT_BOOL, scope, optv_bool(d), List[str](), 0, 0, help, module)
+}
+
+fn odi(name: str, scope: int, d: int, lo: int, hi: int, help: str, module: int) -> OptDesc {
+    od(name, OPT_INT, scope, optv_int(d), List[str](), lo, hi, help, module)
+}
+
+fn ods(name: str, d: str, help: str, module: int) -> OptDesc {
+    od(name, OPT_STR, OPT_GLOBAL, optv_str(d), List[str](), 0, 0, help, module)
+}
+
+fn ode(name: str, scope: int, d: str, enums: List[str], help: str, module: int) -> OptDesc {
+    od(name, OPT_ENUM, scope, optv_enum(d), enums, 0, 0, help, module)
+}
+
+/// `yew_opts` (option.c:213-479), in C's order.
+pub fn opt_table() -> List[OptDesc] {
+    let core = OPT_MODULE_CORE
+    let ai = OPT_MODULE_AI
+    var t = List[OptDesc]()
+    (mut t).push(odi("tabwidth", OPT_BUFFER, 4, 1, 16, "Indent and tab display width (1..16)", core))
+    (mut t).push(odb("expandtab", OPT_BUFFER, false, "Insert spaces when indentation emits a tab", core))
+    (mut t).push(odb("autoindent", OPT_BUFFER, true, "Carry indentation onto the line Enter opens", core))
+    (mut t).push(odb("autopair", OPT_BUFFER, true, "Close brackets and quotes as they are typed", core))
+    (mut t).push(odb("wrap", OPT_WINDOW, false, "Wrap long lines in this window", core))
+    (mut t).push(odi("scrolloff", OPT_WINDOW, 3, 0, 99, "Minimum screen rows around the cursor", core))
+    (mut t).push(ode(
+        "number",
+        OPT_WINDOW,
+        "both",
+        ["off", "abs", "rel", "both"],
+        "Line numbers: off, abs, rel, or both",
+        core,
+    ))
+    (mut t).push(ode(
+        "statusline.column",
+        OPT_GLOBAL,
+        "gcol",
+        ["gcol", "gcol_ccol"],
+        "Show grapheme column or grapheme and cell columns",
+        core,
+    ))
+    (mut t).push(odb("errorbells", OPT_GLOBAL, false, "Ring the terminal bell for editor errors", core))
+    (mut t).push(odb(
+        "ambiguous_wide",
+        OPT_GLOBAL,
+        false,
+        "Render document East Asian ambiguous characters as two cells",
+        core,
+    ))
+    (mut t).push(odb("subword", OPT_BUFFER, false, "Use subword boundaries for word navigation", core))
+    (mut t).push(ode(
+        "fortran_form",
+        OPT_BUFFER,
+        "auto",
+        ["auto", "free", "fixed"],
+        "Fortran source form: auto, free, or fixed",
+        core,
+    ))
+    (mut t).push(odi("chord_timeout_ms", OPT_GLOBAL, 500, 0, 5000, "Milliseconds to wait for a key chord", core))
+    (mut t).push(odb("undo.break_on_newline", OPT_BUFFER, true, "End an insert undo group at a newline", core))
+    (mut t).push(odi(
+        "undo.bytes_max",
+        OPT_BUFFER,
+        67108864,
+        1,
+        I64_MAX,
+        "Maximum in-memory undo bytes per buffer",
+        core,
+    ))
+    (mut t).push(odi("undo.min_nodes", OPT_BUFFER, 200, 0, I64_MAX, "Minimum undo nodes retained per buffer", core))
+    (mut t).push(odi(
+        "undo.persist_bytes_max",
+        OPT_GLOBAL,
+        16777216,
+        1,
+        I64_MAX,
+        "Maximum persisted undo bytes",
+        core,
+    ))
+    (mut t).push(odi(
+        "registers.ring_depth",
+        OPT_GLOBAL,
+        32,
+        0,
+        256,
+        "Number of entries retained in the kill ring",
+        core,
+    ))
+    (mut t).push(odi(
+        "registers.ring_bytes_max",
+        OPT_GLOBAL,
+        8388608,
+        1,
+        I64_MAX,
+        "Maximum bytes retained in the kill ring",
+        core,
+    ))
+    (mut t).push(odi(
+        "registers.clip_read_max",
+        OPT_GLOBAL,
+        67108864,
+        1,
+        I64_MAX,
+        "Maximum bytes read from the system clipboard",
+        core,
+    ))
+    (mut t).push(ode(
+        "clipboard.sync",
+        OPT_GLOBAL,
+        "yank",
+        ["off", "yank", "all", "unnamed"],
+        "System clipboard synchronization policy",
+        core,
+    ))
+    (mut t).push(odb("search.ignorecase", OPT_GLOBAL, false, "Ignore case in searches", core))
+    (mut t).push(odb(
+        "search.smartcase",
+        OPT_GLOBAL,
+        true,
+        "Restore case sensitivity when a pattern has uppercase literals",
+        core,
+    ))
+    (mut t).push(odi(
+        "hooks.error_limit",
+        OPT_GLOBAL,
+        5,
+        1,
+        100,
+        "Disable a failing hook after this many errors",
+        core,
+    ))
+    (mut t).push(ode(
+        "save.strategy",
+        OPT_BUFFER,
+        "auto",
+        ["auto", "atomic", "inplace"],
+        "Save using auto, atomic, or in-place strategy",
+        core,
+    ))
+    (mut t).push(ode(
+        "save.check_disk",
+        OPT_BUFFER,
+        "mtime",
+        ["off", "mtime", "content"],
+        "External-change check: off, metadata, or exact content",
+        core,
+    ))
+    (mut t).push(odi(
+        "save.check_disk_max",
+        OPT_GLOBAL,
+        8388608,
+        0,
+        4294967296,
+        "Maximum bytes compared by save.check_disk=content",
+        core,
+    ))
+    (mut t).push(odi("save.backup_keep", OPT_GLOBAL, 1, 0, 64, "In-place save backups retained per file", core))
+    (mut t).push(ods("save.backup_dir", "", "Directory for in-place save backups", core))
+    (mut t).push(odi(
+        "plug.error_limit",
+        OPT_GLOBAL,
+        5,
+        1,
+        100,
+        "Disable a failing plugin after this many errors",
+        OPT_MODULE_PLUGINS,
+    ))
+    (mut t).push(odb(
+        "plug.verify_on_load",
+        OPT_GLOBAL,
+        true,
+        "Verify installed plugin content before loading",
+        OPT_MODULE_PLUGINS,
+    ))
+    (mut t).push(ods("theme", "quiver-dark", "Active theme name", core))
+    (mut t).push(odb(
+        "theme_auto",
+        OPT_GLOBAL,
+        false,
+        "Select a dark or light theme from the terminal background",
+        core,
+    ))
+    (mut t).push(ods("macro.dir", "", "Macro library directory", core))
+    (mut t).push(ode(
+        "shell.complete_help",
+        OPT_GLOBAL,
+        "native",
+        ["native", "all", "off"],
+        "Learn :! completions from --help: native, all, or off",
+        core,
+    ))
+    (mut t).push(ode(
+        "shell.complete_fish",
+        OPT_GLOBAL,
+        "auto",
+        ["auto", "off"],
+        "Ask fish for :! completions when it is installed: auto or off",
+        core,
+    ))
+    (mut t).push(ode(
+        "shell.suggest_history",
+        OPT_GLOBAL,
+        "all",
+        ["all", "yew"],
+        "History ghosts for :! from all shells' history, or yew's only",
+        core,
+    ))
+    (mut t).push(ode(
+        "shell.session",
+        OPT_GLOBAL,
+        "persistent",
+        ["persistent", "fresh"],
+        "Run :! in one persistent shell session, or each in a fresh shell",
+        core,
+    ))
+    (mut t).push(odb("shadow.enable", OPT_GLOBAL, true, "Enable passive shadow suggestions", core))
+    var providers = ods("shadow.providers", "index lsp ai", "Ordered passive suggestion providers", core)
+    providers.validator = VALIDATE_SHADOW_PROVIDERS
+    (mut t).push(providers)
+    (mut t).push(odi("shadow.max_lines", OPT_GLOBAL, 8, 1, 8, "Maximum overlaid suggestion lines", core))
+    (mut t).push(odb("shadow.midline", OPT_GLOBAL, false, "Allow suggestions inside non-space text", core))
+    (mut t).push(odi("shadow.lsp_debounce_ms", OPT_GLOBAL, 120, 0, 5000, "LSP suggestion idle delay", core))
+    (mut t).push(odi("shadow.ai_debounce_ms", OPT_GLOBAL, 350, 0, 5000, "AI suggestion idle delay", core))
+    (mut t).push(odb(
+        "compl.auto_trigger",
+        OPT_GLOBAL,
+        false,
+        "Open completion after configured trigger text",
+        core,
+    ))
+    (mut t).push(ods("compl.trigger_chars", ". -> ::", "Whitespace-separated completion trigger text", core))
+    (mut t).push(ode(
+        "lsp.open_in",
+        OPT_GLOBAL,
+        "here",
+        ["here", "split", "tab"],
+        "Open LSP navigation targets here, in a split, or in a tab",
+        OPT_MODULE_LSP,
+    ))
+    (mut t).push(odb(
+        "git.ascii_glyphs",
+        OPT_GLOBAL,
+        false,
+        "Use ASCII-only FUSS tree and status glyphs",
+        OPT_MODULE_FUSS,
+    ))
+    (mut t).push(odb("ai.enable", OPT_GLOBAL, false, "Enable AI features after disclosure", ai))
+    (mut t).push(ods("ai.backend", "", "Selected AI backend name", ai))
+    (mut t).push(ode(
+        "ai.default_workspace",
+        OPT_GLOBAL,
+        "ask",
+        ["ask", "allow", "deny"],
+        "Policy for workspaces without an explicit AI grant",
+        ai,
+    ))
+    (mut t).push(odi("ai.context_bytes", OPT_GLOBAL, 4096, 256, 65536, "Maximum prefix and suffix context bytes", ai))
+    (mut t).push(odi(
+        "ai.context_prefix_pct",
+        OPT_GLOBAL,
+        75,
+        10,
+        95,
+        "Percentage of AI context reserved for the prefix",
+        ai,
+    ))
+    (mut t).push(odi("ai.max_tokens", OPT_GLOBAL, 256, 16, 4096, "Maximum AI completion tokens", ai))
+    (mut t).push(odi("ai.max_lines", OPT_GLOBAL, 8, 1, 8, "Maximum AI ghost lines", ai))
+    (mut t).push(odi(
+        "ai.temperature",
+        OPT_GLOBAL,
+        10,
+        0,
+        100,
+        "AI temperature in thousandths (10 means 0.010)",
+        ai,
+    ))
+    (mut t).push(odi(
+        "ai.frame_ms",
+        OPT_GLOBAL,
+        33,
+        0,
+        200,
+        "Minimum milliseconds between AI ghost deliveries",
+        ai,
+    ))
+    (mut t).push(ode(
+        "ai.fim",
+        OPT_GLOBAL,
+        "auto",
+        ["auto", "on", "off"],
+        "Fill-in-the-middle policy: auto, on, or off",
+        ai,
+    ))
+    (mut t).push(ode(
+        "ai.on_redact",
+        OPT_GLOBAL,
+        "block",
+        ["block", "elide", "off"],
+        "Action when AI context matches a secret deny rule",
+        ai,
+    ))
+    (mut t).push(odb(
+        "ai.deny_replace",
+        OPT_GLOBAL,
+        false,
+        "Replace shipped AI deny rules instead of appending user rules",
+        ai,
+    ))
+    (mut t).push(odb(
+        "ai.exclude_replace",
+        OPT_GLOBAL,
+        false,
+        "Replace shipped AI path exclusions instead of appending user rows",
+        ai,
+    ))
+    var exclude = od(
+        "ai.exclude_paths",
+        OPT_STRLIST,
+        OPT_GLOBAL,
+        optv_list(List[str]()),
+        List[str](),
+        0,
+        0,
+        "Additional workspace-relative paths excluded from AI context",
+        ai,
+    )
+    exclude.validator = VALIDATE_AI_EXCLUDE
+    (mut t).push(exclude)
+    (mut t).push(ode("ai.badge", OPT_GLOBAL, "on", ["on", "off"], "Show the AI statusline badge for local backends", ai))
+    (mut t).push(odi(
+        "ai.badge_host_max",
+        OPT_GLOBAL,
+        20,
+        1,
+        255,
+        "Maximum remote AI hostname cells shown in the statusline badge",
+        ai,
+    ))
+    (mut t).push(odb(
+        "ai.debug_bodies",
+        OPT_GLOBAL,
+        false,
+        "Allow AI prompt and completion logging with YEW_AI_DEBUG=1",
+        ai,
+    ))
+    (mut t).push(odb(
+        "ai.allow_plain_remote",
+        OPT_GLOBAL,
+        false,
+        "Allow plain HTTP AI endpoints outside the local host",
+        ai,
+    ))
+    (mut t).push(odb("ai.key_cache", OPT_GLOBAL, true, "Cache resolved AI keys for this session", ai))
+    (mut t).push(odi(
+        "ai.connect_timeout_ms",
+        OPT_GLOBAL,
+        2000,
+        1,
+        600000,
+        "AI connection timeout in milliseconds",
+        ai,
+    ))
+    (mut t).push(odi(
+        "ai.first_byte_timeout_ms",
+        OPT_GLOBAL,
+        10000,
+        1,
+        600000,
+        "AI first-response-byte timeout in milliseconds",
+        ai,
+    ))
+    (mut t).push(odi(
+        "ai.stream_idle_timeout_ms",
+        OPT_GLOBAL,
+        20000,
+        1,
+        600000,
+        "AI streaming idle timeout in milliseconds",
+        ai,
+    ))
+    (mut t).push(odi(
+        "ai.total_timeout_ms",
+        OPT_GLOBAL,
+        120000,
+        1,
+        3600000,
+        "AI request wall-clock timeout in milliseconds",
+        ai,
+    ))
+    (mut t).push(odi(
+        "ai.keepalive_ms",
+        OPT_GLOBAL,
+        30000,
+        0,
+        600000,
+        "AI idle connection lifetime in milliseconds",
+        ai,
+    ))
+    (mut t).push(odi(
+        "ai.backoff_max_ms",
+        OPT_GLOBAL,
+        60000,
+        1000,
+        3600000,
+        "Maximum AI backend cooldown in milliseconds",
+        ai,
+    ))
+    t
+}
+
+// `macro.dir`'s default (option.c:956-965): $XDG_CONFIG_HOME/yew/macros
+// when a config directory resolves, else the descriptor's "".
+fn opt_default_of(d: OptDesc) -> OptVal {
+    if d.name == "macro.dir" {
+        let cfg = util.xdg_config_dir() else { return copy d.dflt }
+        return optv_str("{cfg}/macros")
+    }
+    copy d.dflt
+}
+
+/// An empty state over the table, before `opt_init`.
+pub fn opt_state_new() -> OptState {
+    OptState {
+        descs: opt_table(),
+        globals: List[OptVal](),
+        buf_over: Map[int, Map[str, OptVal]](),
+        win_over: Map[int, Map[str, OptVal]](),
+        inflight: List[bool](),
+        undo: List[OptUndo](),
+        next_order: 0,
+        theme_inflight: false,
+    }
+}
+
+/// `yew_opt_desc` (option.c:501-511): the row's index, -1 for an unknown
+/// name.
+pub fn opt_desc_index(st: OptState, name: str) -> int {
+    for i in 0..st.descs.len { if st.descs[i].name == name { return i } }
+    -1
+}
+
+/// `yew_opt_list` (option.c:1805-1817): the names in declaration order.
+pub fn opt_list(st: OptState) -> List[str] {
+    var out = List[str]()
+    for d in st.descs { (mut out).push(d.name) }
+    out
+}
+
+// option_module_available (option.c:550-566): "" or the refusal.
+fn opt_module_error(d: OptDesc) -> str {
+    if d.module == OPT_MODULE_CORE { return "" }
+    if d.module > OPT_MODULE_PLUGINS {
+        util.bug("edit.option", "option '{d.name}' has an invalid module owner")
+    }
+    mod_require(d.module - 1)
+}
+
+fn opt_is(v: OptVal, want: str) -> bool { (v.t == OPT_STR || v.t == OPT_ENUM) && v.s == want }
+
+fn opt_enum_has(d: OptDesc, v: OptVal) -> bool {
+    for e in d.enums { if opt_is(v, e) { return true } }
+    false
+}
+
+// shadow_providers_validate (option.c:135-173).
+fn opt_shadow_providers(v: OptVal) -> str {
+    var seen = List[str]()
+    for word in v.s.split(" ") {
+        for part in word.split("\t") {
+            if part.len == 0 { continue }
+            if part != "index" && part != "lsp" && part != "ai" {
+                return "shadow.providers accepts only index, lsp, and ai"
+            }
+            for s in seen { if s == part { return "shadow.providers contains a duplicate provider" } }
+            (mut seen).push(part)
+        }
+    }
+    ""
+}
+
+// ai_exclude_paths_validate (option.c:175-199).
+fn opt_ai_exclude(v: OptVal) -> str {
+    for item in v.list {
+        if item.len == 0 { return "ai.exclude_paths entries must be non-empty strings" }
+        for b in item.bytes() {
+            if b == 0 as byte { return "ai.exclude_paths entries may not contain NUL bytes" }
+        }
+        if (item.find("**") else -1) >= 0 { return "ai.exclude_paths does not support '**'" }
+    }
+    ""
+}
+
+// value_validate (option.c:701-763): "" with `v` normalized (a string for
+// an enum becomes the enum), else the refusal. The ai.badge/ai.backend
+// pair (option.c:738-761) needs the AI module, whose options refuse first.
+fn opt_value_validate(d: OptDesc, mut v: OptVal) -> str {
+    if d.t == OPT_ENUM && v.t == OPT_STR { v.t = OPT_ENUM }
+    if v.t != d.t {
+        return if d.t == OPT_BOOL {
+            "option requires a bool"
+        } else if d.t == OPT_INT {
+            "option requires an int"
+        } else if d.t == OPT_STR {
+            "option requires a string"
+        } else if d.t == OPT_ENUM {
+            "option requires an enum value"
+        } else {
+            "option requires a string list"
+        }
+    }
+    if d.t == OPT_INT && (v.i < d.imin || v.i > d.imax) {
+        return "option value is outside its allowed range"
+    }
+    if d.t == OPT_ENUM && !opt_enum_has(d, v) {
+        return "option value is not one of its allowed enum values"
+    }
+    if d.validator == VALIDATE_SHADOW_PROVIDERS { return opt_shadow_providers(v) }
+    if d.validator == VALIDATE_AI_EXCLUDE { return opt_ai_exclude(v) }
+    ""
+}
+
+// The window and buffer a scoped read or write goes to (C's current_buffer
+// and ed->win).
+fn opt_cur_buf(ed: Ed) -> int { ed_doc(ed) }
+
+/// `yew_opt_init` (option.c:943-975): every global at its default, then
+/// each default's effect applied once.
+pub fn opt_init(mut ed: Ed) {
+    (mut ed.opt.globals).reset()
+    (mut ed.opt.inflight).reset()
+    for d in ed.opt.descs {
+        (mut ed.opt.globals).push(opt_default_of(d))
+        (mut ed.opt.inflight).push(false)
+    }
+    // The theme's first apply is the startup's (ed_load_config, after the
+    // configuration names one), so a headless editor keeps no compiled
+    // theme until it asks; every other default's effect runs here.
+    ed.opt.theme_inflight = true
+    for i in 0..ed.opt.descs.len {
+        let d = copy ed.opt.descs[i]
+        let v = copy ed.opt.globals[i]
+        let b = opt_cur_buf(ed)
+        let w = ed.win
+        opt_changed_target(mut ed, d, v, b, w)
+    }
+    ed.opt.theme_inflight = false
+}
+
+/// `yew_opt_get` (option.c:1072-1096): the window's override, else the
+/// buffer's, else the global value; none for an unknown name.
+pub fn opt_get(ed: Ed, bi: int, wi: int, name: str) -> OptVal ! {none} {
+    let i = opt_desc_index(ed.opt, name)
+    if i < 0 || ed.opt.globals.len == 0 { return none }
+    if wi >= 0 && wi < ed.wins.len {
+        let v = opt_over_get(ed.opt.win_over, ed.wins[wi].id, name) else {
+            return opt_get_buf(ed, bi, i, name)
+        }
+        return v
+    }
+    opt_get_buf(ed, bi, i, name)
+}
+
+fn opt_over_get(over: Map[int, Map[str, OptVal]], id: int, name: str) -> OptVal ! {none} {
+    let m = over.get(id) else { return none }
+    let v = m.get(name) else { return none }
+    v
+}
+
+fn opt_over_set(mut over: Map[int, Map[str, OptVal]], id: int, name: str, v: OptVal) {
+    var m = over.get(id) else Map[str, OptVal]()
+    (mut m).set(name, v)
+    (mut over).set(id, m)
+}
+
+fn opt_get_buf(ed: Ed, bi: int, i: int, name: str) -> OptVal {
+    if bi >= 0 && bi < ed.bufs.len {
+        let v = opt_over_get(ed.opt.buf_over, ed.bufs[bi].id, name) else { return copy ed.opt.globals[i] }
+        return v
+    }
+    copy ed.opt.globals[i]
+}
+
+/// A global string or enum option's value ("" for an unknown name).
+pub fn opt_global_str(ed: Ed, name: str) -> str {
+    let v = opt_get(ed, -1, -1, name) else { return "" }
+    v.s
+}
+
+/// The current window's and buffer's view of `name` (C's builtin_get).
+pub fn opt_get_current(ed: Ed, name: str) -> OptVal ! {none} {
+    let b = opt_cur_buf(ed)
+    opt_get(ed, b, ed.win, name)
+}
+
+/// `yew_opt_buffer_bool` (option.c:1168-1181): buffer override, global,
+/// table default; false for an absent or non-bool name.
+pub fn opt_buffer_bool(ed: Ed, bi: int, name: str) -> bool {
+    let i = opt_desc_index(ed.opt, name)
+    if i < 0 || ed.opt.descs[i].t != OPT_BOOL { return false }
+    if bi >= 0 && bi < ed.bufs.len {
+        let v = opt_over_get(ed.opt.buf_over, ed.bufs[bi].id, name) else {
+            return if ed.opt.globals.len != 0 then ed.opt.globals[i].b else ed.opt.descs[i].dflt.b
+        }
+        return v.b
+    }
+    if ed.opt.globals.len != 0 then ed.opt.globals[i].b else ed.opt.descs[i].dflt.b
+}
+
+// The scope checks yew_opt_validate and yew_opt_set_for share
+// (option.c:1150-1164, 1207-1221).
+fn opt_scope_error(d: OptDesc, hint: int, bi: int, wi: int) -> str {
+    if hint != OPT_SCOPE_DECLARED && hint != d.scope {
+        return if d.scope == OPT_GLOBAL {
+            "global option refuses a buffer or window scope"
+        } else {
+            "option refuses the requested scope"
+        }
+    }
+    if d.scope == OPT_BUFFER && bi < 0 { return "no current buffer" }
+    if d.scope == OPT_WINDOW && wi < 0 { return "no current window" }
+    ""
+}
+
+/// `yew_opt_validate` (option.c:1132-1166): "" when a set would be
+/// accepted, else the refusal; nothing changes.
+pub fn opt_validate(ed: Ed, hint: int, name: str, v: OptVal) -> str {
+    let i = opt_desc_index(ed.opt, name)
+    if i < 0 { return "unknown option" }
+    let d = ed.opt.descs[i]
+    let m = opt_module_error(d)
+    if m.len != 0 { return m }
+    let s = opt_scope_error(d, hint, opt_cur_buf(ed), ed.win)
+    if s.len != 0 { return s }
+    var norm = copy v
+    opt_value_validate(d, mut norm)
+}
+
+/// `yew_opt_set_for` (option.c:1183-1274): validated, stored in the
+/// option's scope for buffer `bi` and window `wi`, then its effect.
+/// "" on success, else the refusal (and nothing changed).
+pub fn opt_set_for(mut ed: Ed, bi: int, wi: int, hint: int, name: str, v: OptVal) -> str {
+    let i = opt_desc_index(ed.opt, name)
+    if i < 0 { return "unknown option" }
+    let d = copy ed.opt.descs[i]
+    let m = opt_module_error(d)
+    if m.len != 0 { return m }
+    let s = opt_scope_error(d, hint, bi, wi)
+    if s.len != 0 { return s }
+    var norm = copy v
+    let bad = opt_value_validate(d, mut norm)
+    if bad.len != 0 { return bad }
+    if ed.opt.inflight[i] { return "option is already being changed" }
+    let old = opt_get(ed, bi, wi, name) else { return "could not retain the old option value" }
+    opt_store(mut ed, d, i, bi, wi, copy norm)
+    if d.name == "theme" && !ed.opt.theme_inflight {
+        let why = ed_theme_apply(mut ed, norm.s)
+        if why.len != 0 {
+            opt_store(mut ed, d, i, bi, wi, old)
+            return why
+        }
+        ed.opts.theme = norm.s
+    }
+    ed.opt.inflight[i] = true
+    if d.name == "theme" { ed.opt.theme_inflight = true }
+    opt_changed_target(mut ed, d, norm, bi, wi)
+    if d.name == "theme" { ed.opt.theme_inflight = false }
+    ed.opt.inflight[i] = false
+    ""
+}
+
+// set_target's store (option.c:1098-1130).
+fn opt_store(mut ed: Ed, d: OptDesc, i: int, bi: int, wi: int, v: OptVal) {
+    if d.scope == OPT_GLOBAL {
+        ed.opt.globals[i] = v
+    } else if d.scope == OPT_BUFFER {
+        let id = ed.bufs[bi].id
+        opt_over_set(mut ed.opt.buf_over, id, d.name, v)
+    } else {
+        let id = ed.wins[wi].id
+        opt_over_set(mut ed.opt.win_over, id, d.name, v)
+    }
+}
+
+/// `yew_opt_set` (option.c:1276-1282): for the current buffer and window.
+pub fn opt_set(mut ed: Ed, hint: int, name: str, v: OptVal) -> str {
+    let b = opt_cur_buf(ed)
+    let w = ed.win
+    opt_set_for(mut ed, b, w, hint, name, v)
+}
+
+// The views showing buffer `bi` re-laid (invalidate_buffer_views,
+// option.c:770-790).
+fn opt_invalidate_buffer_views(mut ed: Ed, bi: int) {
+    for t in 0..ed.tabs.len {
+        for leaf in pane_collect_leaves(ed, ed.tabs[t].root, PANE_MAX_LEAVES) {
+            let w = ed.panes[leaf].win
+            if w >= 0 && ed.wins[w].buf == bi { vp_invalidate(mut ed.wins[w]) }
+        }
+    }
+}
+
+// option_changed_target (option.c:805-934): the editor state an option's
+// value drives. Rows for unported surfaces name their lane.
+fn opt_changed_target(mut ed: Ed, d: OptDesc, nu: OptVal, bi: int, wi: int) {
+    let n = d.name
+    let has_buf = bi >= 0 && bi < ed.bufs.len
+    let has_win = wi >= 0 && wi < ed.wins.len
+    if n == "shell.session" {
+        // §5: `fresh` ends a running session, quietly.
+        if opt_is(nu, "fresh") { shsession_end(mut ed) }
+    } else if n == "tabwidth" && has_buf {
+        ed.bufs[bi].tabwidth = nu.i
+        ed.opts.tabwidth = nu.i
+        opt_invalidate_buffer_views(mut ed, bi)
+    } else if n == "wrap" && has_win {
+        ed.wins[wi].vp.wrap = nu.b
+        ed.opts.wrap = nu.b
+        ed.wins[wi].wrap_goal_valid = false
+        vp_invalidate(mut ed.wins[wi])
+    } else if n == "scrolloff" && has_win {
+        ed.wins[wi].vp.scrolloff = nu.i
+        ed.opts.scrolloff = nu.i
+        let b = ed.wins[wi].buf
+        if b >= 0 && ed.bufs[b].resident { vp_follow(mut ed.wins[wi], ed.bufs[b].ec.tb) }
+    } else if n == "number" && has_win {
+        ed.wins[wi].number_style = if opt_is(nu, "off") {
+            NUM_NONE
+        } else if opt_is(nu, "rel") {
+            NUM_REL
+        } else if opt_is(nu, "both") {
+            NUM_HYBRID
+        } else {
+            NUM_ABS
+        }
+        ed.opts.number_style = ed.wins[wi].number_style
+    } else if n == "errorbells" {
+        ed.errorbells = nu.b
+    } else if n == "ambiguous_wide" {
+        ed.opts.ambiguous_wide = nu.b
+        unicode.width_set_ambiguous_wide(nu.b)
+    } else if n == "chord_timeout_ms" {
+        ed.chord_timeout_ms = nu.i
+        if ed.chord.n != 0 { ed.chord.deadline = ed.now_ms + nu.i }
+    } else if n == "undo.break_on_newline" {
+        ed.undo_break_on_newline = nu.b
+    } else if n == "undo.bytes_max" && has_buf && ed.bufs[bi].ec.has_undo {
+        let u = ed.bufs[bi].ec.undo
+        text.undo_set_limits(mut ed.bufs[bi].ec.undo, nu.i, u.min_nodes, u.persist_bytes_max)
+    } else if n == "undo.min_nodes" && has_buf && ed.bufs[bi].ec.has_undo {
+        let u = ed.bufs[bi].ec.undo
+        text.undo_set_limits(mut ed.bufs[bi].ec.undo, u.bytes_max, nu.i, u.persist_bytes_max)
+    } else if n == "undo.persist_bytes_max" {
+        for k in 0..ed.bufs.len {
+            if ed.bufs[k].id != 0 && ed.bufs[k].ec.has_undo {
+                let u = ed.bufs[k].ec.undo
+                text.undo_set_limits(mut ed.bufs[k].ec.undo, u.bytes_max, u.min_nodes, nu.i)
+            }
+        }
+    } else if n == "registers.ring_depth" {
+        text.reg_ring_set_depth(mut ed.regs, nu.i)
+    } else if n == "registers.ring_bytes_max" {
+        ed.regs.ring_bytes_max = nu.i
+    } else if n == "registers.clip_read_max" {
+        ed.regs.clip_read_max = nu.i
+    } else if n == "clipboard.sync" {
+        ed.regs.clipboard_sync = if opt_is(nu, "off") {
+            text.CLIP_SYNC_OFF
+        } else if opt_is(nu, "all") {
+            text.CLIP_SYNC_ALL
+        } else if opt_is(nu, "unnamed") {
+            text.CLIP_SYNC_UNNAMED
+        } else {
+            text.CLIP_SYNC_YANK
+        }
+    } else if n == "search.ignorecase" {
+        ed.search_opts.ignorecase = nu.b
+    } else if n == "search.smartcase" {
+        ed.search_opts.smartcase = nu.b
+    } else if n == "hooks.error_limit" {
+        // A runtime made later reads the option (fl_runtime_init).
+        if ed.flrt.vms.len != 0 { fl.fl_hook_error_limit(mut ed.flrt.vms[0].hooks, nu.i) }
+    } else if n == "theme" && !ed.opt.theme_inflight {
+        let why = ed_theme_apply(mut ed, nu.s)
+        if why.len != 0 && ed.model_ready { ed_msg(mut ed, MSG_ERROR, why) }
+        if why.len == 0 { ed.opts.theme = nu.s }
+    } else if n == "macro.dir" {
+        macrolib_option_changed(mut ed)
+    }
+    // fortran_form re-binds the buffer's syntax (option.c:883-885), yw10's;
+    // shadow.* reaches the shadow (option.c:901-930), yw11's; the AI and
+    // plugin rows are behind their module gates.
+    ed.layout_dirty = true
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+/// `yew_opt_reset` (option.c:1024-1070): every override map cleared and
+/// every global back at its default, each with its effect.
+pub fn opt_reset(mut ed: Ed) {
+    if ed.opt.globals.len == 0 { return }
+    ed.opt.buf_over = Map[int, Map[str, OptVal]]()
+    ed.opt.win_over = Map[int, Map[str, OptVal]]()
+    for i in 0..ed.opt.descs.len {
+        let d = copy ed.opt.descs[i]
+        ed.opt.globals[i] = opt_default_of(d)
+        let v = copy ed.opt.globals[i]
+        let b = opt_cur_buf(ed)
+        let w = ed.win
+        opt_changed_target(mut ed, d, v, b, w)
+    }
+}
+
+// ---- registration layers (option.c:1284-1593) --------------------------
+
+fn opt_buf_by_id(ed: Ed, id: int) -> int {
+    if id == 0 { return -1 }
+    ed_buf_index(ed, id)
+}
+
+/// `yew_opt_checkpoint` (option.c:1301-1369): the current value of `name`
+/// in its scope kept as a pending layer; 0 with the refusal.
+pub fn opt_checkpoint(mut ed: Ed, name: str) -> (int, str) {
+    let i = opt_desc_index(ed.opt, name)
+    if i < 0 { return (0, "unknown option") }
+    let d = copy ed.opt.descs[i]
+    let m = opt_module_error(d)
+    if m.len != 0 { return (0, m) }
+    let b = opt_cur_buf(ed)
+    let w = ed.win
+    if d.scope == OPT_BUFFER && b < 0 { return (0, "no current buffer") }
+    if d.scope == OPT_WINDOW && w < 0 { return (0, "no current window") }
+    let previous = opt_get(ed, b, w, name) else { return (0, "could not retain the old option value") }
+    var slot = 0
+    while slot < ed.opt.undo.len && (ed.opt.undo[slot].pending || ed.opt.undo[slot].active) { slot += 1 }
+    let target = if d.scope == OPT_BUFFER {
+        ed.bufs[b].id
+    } else if d.scope == OPT_WINDOW {
+        ed.wins[w].id
+    } else {
+        0
+    }
+    let u = OptUndo {
+        previous: previous,
+        order: 0,
+        target_id: target,
+        ledger_id: 0,
+        desc_index: i,
+        scope: d.scope,
+        pending: true,
+        active: false,
+    }
+    if slot == ed.opt.undo.len { (mut ed.opt.undo).push(u) } else { ed.opt.undo[slot] = u }
+    (slot + 1, "")
+}
+
+// matching_registration (option.c:1371-1401).
+fn opt_matching(ed: Ed, ledger: fl.FlRegLedger, origin: int, want: OptUndo) -> int {
+    var newest = -1
+    for i in 0..ed.opt.undo.len {
+        let u = ed.opt.undo[i]
+        if !u.active ||
+            u.desc_index != want.desc_index ||
+            u.scope != want.scope ||
+            u.target_id != want.target_id ||
+            newest >= 0 && u.order <= ed.opt.undo[newest].order {
+            continue
+        }
+        newest = i
+    }
+    if newest < 0 { return 0 }
+    let id = ed.opt.undo[newest].ledger_id
+    if id != 0 && id <= ledger.rows.len {
+        let r = ledger.rows[id - 1]
+        if r.active && r.kind == fl.REG_OPTION && r.origin_id == origin { return id }
+    }
+    0
+}
+
+/// `yew_opt_commit` (option.c:1403-1435): the pending layer registered
+/// under `origin` in `ledger`; inside a hook (`hook_depth` > 0) the origin's
+/// own newest matching layer is reused so a hook that sets every event
+/// stays bounded. Answers (ledger id, created).
+pub fn opt_commit(mut ed: Ed, mut ledger: fl.FlRegLedger, hook_depth: int, origin: int, checkpoint: int) -> (
+    int,
+    bool,
+) {
+    if checkpoint <= 0 || checkpoint > ed.opt.undo.len { return (0, false) }
+    let c = checkpoint - 1
+    if !ed.opt.undo[c].pending || ed.opt.undo[c].active || origin == fl.FL_ORIGIN_ID_NONE {
+        return (0, false)
+    }
+    let existing = if hook_depth == 0 then 0 else opt_matching(ed, ledger, origin, ed.opt.undo[c])
+    if existing != 0 {
+        ed.opt.undo[c].ledger_id = existing
+        return (existing, false)
+    }
+    let id = fl.fl_reg_add(mut ledger, origin, fl.REG_OPTION, checkpoint)
+    ed.opt.next_order += 1
+    ed.opt.undo[c].ledger_id = id
+    ed.opt.undo[c].order = ed.opt.next_order
+    ed.opt.undo[c].pending = false
+    ed.opt.undo[c].active = true
+    (id, true)
+}
+
+/// `yew_opt_discard` (option.c:1437-1445): a pending layer dropped.
+pub fn opt_discard(mut ed: Ed, checkpoint: int) {
+    if checkpoint <= 0 || checkpoint > ed.opt.undo.len { return }
+    let c = checkpoint - 1
+    if !ed.opt.undo[c].pending || ed.opt.undo[c].active { return }
+    ed.opt.undo[c].pending = false
+}
+
+// undo_target + undo_restore (option.c:1447-1512): the layer's previous
+// value written back to where it was taken, with its effect.
+fn opt_undo_restore(mut ed: Ed, c: int) {
+    let u = copy ed.opt.undo[c]
+    let d = copy ed.opt.descs[u.desc_index]
+    var b = -1
+    var w = -1
+    if u.scope == OPT_BUFFER {
+        b = opt_buf_by_id(ed, u.target_id)
+        if b < 0 { return }
+    } else if u.scope == OPT_WINDOW {
+        w = ed_win_by_id(ed, u.target_id)
+        if w < 0 { return }
+        b = ed.wins[w].buf
+    }
+    opt_store(mut ed, d, u.desc_index, b, w, copy u.previous)
+    opt_changed_target(mut ed, d, u.previous, b, w)
+}
+
+/// `yew_opt_rollback` (option.c:1514-1523): a pending layer undone.
+pub fn opt_rollback(mut ed: Ed, checkpoint: int) -> bool {
+    if checkpoint <= 0 || checkpoint > ed.opt.undo.len { return false }
+    let c = checkpoint - 1
+    if !ed.opt.undo[c].pending || ed.opt.undo[c].active { return false }
+    opt_undo_restore(mut ed, c)
+    opt_discard(mut ed, checkpoint)
+    true
+}
+
+/// `yew_opt_remove` (option.c:1525-1593): registration `ledger_id` undone.
+/// The newest layer restores its previous value; an older one hands its
+/// previous value to the next newer layer, so the visible value stands.
+pub fn opt_remove(mut ed: Ed, mut ledger: fl.FlRegLedger, ledger_id: int) -> bool {
+    if ledger_id <= 0 || ledger_id > ledger.rows.len { return false }
+    let r = ledger.rows[ledger_id - 1]
+    if !r.active || r.kind != fl.REG_OPTION { return false }
+    let checkpoint = r.handle_id
+    if checkpoint <= 0 || checkpoint > ed.opt.undo.len { return false }
+    let c = checkpoint - 1
+    let u = copy ed.opt.undo[c]
+    if !u.active || u.ledger_id != ledger_id { return false }
+    var newer = -1
+    for i in 0..ed.opt.undo.len {
+        let k = ed.opt.undo[i]
+        if !k.active ||
+            k.order <= u.order ||
+            k.desc_index != u.desc_index ||
+            k.scope != u.scope ||
+            k.target_id != u.target_id {
+            continue
+        }
+        if newer < 0 || k.order < ed.opt.undo[newer].order { newer = i }
+    }
+    if newer < 0 {
+        opt_undo_restore(mut ed, c)
+    } else {
+        ed.opt.undo[newer].previous = copy u.previous
+    }
+    ed.opt.undo[c].active = false
+    let _ = fl.fl_reg_remove(mut ledger, ledger_id)
+    true
+}
+
+/// `yew_opt_remove` from outside a running call: the runtime's ledger.
+pub fn opt_remove_ed(mut ed: Ed, ledger_id: int) -> bool {
+    if !ed.flrt.ready || ed.flrt.vms.len == 0 { return false }
+    var vm = (mut ed.flrt.vms).pop() else { return false }
+    let ok = opt_remove(mut ed, mut vm.hooks.ledger, ledger_id)
+    (mut ed.flrt.vms).push(vm)
+    ok
+}
+
+// ---- the commands and the natives -------------------------------------
+
+/// The option value a Fletch value is (option_from_fl, flapi.c:1638-1678);
+/// false with the raise made.
+pub fn opt_from_fl(mut vm: fl.FlVm, v: fl.FlValue, native: str) -> OptVal ! {raised} {
+    if v.t == fl.FL_BOOL { return optv_bool(v.i != 0) }
+    if v.t == fl.FL_INT { return optv_int(v.i) }
+    if v.t == fl.FL_STR {
+        let b = copy vm.gc.slots[fl.fl_obj_index(vm, v)].bytes
+        let s = str_from_utf8(b) else {
+            let _ = fl.fl_raise(mut vm, "type", "not yet ported: non-UTF-8 option strings (G40)")
+            return raised
+        }
+        return optv_str(s)
+    }
+    if v.t == fl.FL_LIST {
+        var items = List[str]()
+        let elems = copy vm.gc.slots[fl.fl_obj_index(vm, v)].vals
+        for e in elems {
+            if e.t != fl.FL_STR {
+                let _ = fl.fl_raise(mut vm, "type", "{native}: string-list options require only strings")
+                return raised
+            }
+            let b = copy vm.gc.slots[fl.fl_obj_index(vm, e)].bytes
+            let s = str_from_utf8(b) else {
+                let _ = fl.fl_raise(mut vm, "type", "not yet ported: non-UTF-8 option strings (G40)")
+                return raised
+            }
+            (mut items).push(s)
+        }
+        return optv_list(items)
+    }
+    let _ = fl.fl_raise(
+        mut vm,
+        "type",
+        "{native}: option values must be bool, int, string, or string list",
+    )
+    raised
+}
+
+/// `option_map_error` (flapi.c:1574-1612): an unknown name is a `name`
+/// raise with the did-you-mean of the table's first 64 names (C's
+/// `names[64]`); "already being changed" a `user` raise; every other
+/// refusal a `type` raise.
+pub fn opt_raise(mut vm: fl.FlVm, ed: Ed, name: str, err: str) -> fl.FlValue {
+    if err == "unknown option" {
+        var s = fl.fl_suggest_new()
+        var k = 0
+        for d in ed.opt.descs {
+            if k == 64 { break }
+            fl.fl_suggest_add(mut s, d.name.bytes(), fl.FL_SCOPE_GLOBAL)
+            k += 1
+        }
+        var msg = List[byte]()
+        let _ = fl.fl_suggest_render(mut s, name.bytes(), mut msg)
+        if msg.len == 0 { return fl.fl_raise(mut vm, "name", "unknown option '{name}'") }
+        var full = List[byte]()
+        util.buf_append_str(mut full, "unknown option '{name}'; ")
+        util.buf_append(mut full, msg)
+        return fl.fl_raise_bytes(mut vm, "name", full)
+    }
+    let kind = if (err.find("already being changed") else -1) >= 0 then "user" else "type"
+    fl.fl_raise(mut vm, kind, if err.len == 0 then "invalid option value" else err)
+}
+
+/// `option_to_fl` (flapi.c:78-107): an option value as a Fletch value.
+pub fn opt_to_fl(mut vm: fl.FlVm, v: OptVal) -> fl.FlValue {
+    if v.t == OPT_BOOL { return fl.fl_bool(v.b) }
+    if v.t == OPT_INT { return fl.fl_int(v.i) }
+    if v.t == OPT_STR || v.t == OPT_ENUM { return fl.fl_str_text(mut vm, v.s) }
+    let list = fl.fl_list_new(mut vm)
+    let root = fl.fl_temp_push(mut vm, list)
+    for item in v.list {
+        let s = fl.fl_str_text(mut vm, item)
+        fl.fl_list_push(mut vm, fl.fl_temp_get(vm, root), s)
+    }
+    let out = fl.fl_temp_get(vm, root)
+    fl.fl_temp_pop(mut vm, 1)
+    out
+}
+
+/// `set({...})` (`fl_api_set_options`, flapi.c:1680-1789): every name is
+/// validated first, then each is checkpointed, set and committed under the
+/// calling origin; any refusal rolls back the names already set, so the
+/// map applies whole or not at all.
+pub fn fl_set_options(mut vm: fl.FlVm, mut ed: Ed, base: int, argc: int) -> fl.FlValue {
+    let map = copy vm.stack[base]
+    if argc != 1 || map.t != fl.FL_MAP { return fl.fl_raise(mut vm, "type", "set expects one map argument") }
+    let origin = fl.fl_origin_of_frame(mut ed.origins, vm)
+    if origin == fl.FL_ORIGIN_ID_NONE {
+        return fl.fl_raise(mut vm, "handle", "set: callback has no editor origin")
+    }
+    // The plugin ctx.set gate (flapi.c:1702-1708) is yw14's.
+    let caller = fl.fl_cap_origin(vm)
+    var names = List[str]()
+    var values = List[OptVal]()
+    var cursor = 0
+    loop {
+        let (next, k, v) = fl.fl_map_iter(vm, map, cursor) else { break }
+        cursor = next
+        if k.t != fl.FL_STR { return fl.fl_raise(mut vm, "type", "set: option names must be strings") }
+        let name = str_from_utf8(vm.gc.slots[fl.fl_obj_index(vm, k)].bytes) else {
+            return fl.fl_raise(mut vm, "type", "not yet ported: non-UTF-8 option names (G40)")
+        }
+        if caller.kind == fl.FL_ORIGIN_WORKSPACE && name == "ai.on_redact" {
+            return fl.fl_raise(
+                mut vm,
+                "capability",
+                "set: ai.on_redact may not be set from FL_ORIGIN_WORKSPACE (the workspace config)",
+            )
+        }
+        let value = opt_from_fl(mut vm, v, "set") else { return fl.fl_nil() }
+        let why = opt_validate(ed, OPT_SCOPE_DECLARED, name, value)
+        if why.len != 0 { return opt_raise(mut vm, ed, name, why) }
+        (mut names).push(name)
+        (mut values).push(value)
+    }
+    var checkpoints = List[int]()
+    var created = List[bool]()
+    var ledgers = List[int]()
+    for i in 0..names.len {
+        let (cp, why) = opt_checkpoint(mut ed, names[i])
+        if cp == 0 {
+            opt_stage_rollback(mut ed, mut vm, checkpoints, created, ledgers)
+            return opt_raise(mut vm, ed, names[i], why)
+        }
+        let set_why = opt_set(mut ed, OPT_SCOPE_DECLARED, names[i], copy values[i])
+        if set_why.len != 0 {
+            opt_discard(mut ed, cp)
+            opt_stage_rollback(mut ed, mut vm, checkpoints, created, ledgers)
+            return opt_raise(mut vm, ed, names[i], set_why)
+        }
+        let depth = vm.hooks.depth
+        let (id, made) = opt_commit(mut ed, mut vm.hooks.ledger, depth, origin, cp)
+        if id == 0 { util.bug("edit.option", "validated option registration could not commit") }
+        (mut checkpoints).push(cp)
+        (mut created).push(made)
+        (mut ledgers).push(id)
+    }
+    for i in 0..checkpoints.len { if !created[i] { opt_discard(mut ed, checkpoints[i]) } }
+    opt_sync_hook_limit(ed, mut vm)
+    fl.fl_nil()
+}
+
+/// `hooks.error_limit`'s effect on a VM a running call holds (C's hook
+/// table is the editor's; the port's is the VM's, R-yw09-2).
+pub fn opt_sync_hook_limit(ed: Ed, mut vm: fl.FlVm) {
+    let v = opt_get(ed, -1, -1, "hooks.error_limit") else { return }
+    fl.fl_hook_error_limit(mut vm.hooks, v.i)
+}
+
+// option_stage_rollback (flapi.c:1626-1636): newest first.
+fn opt_stage_rollback(mut ed: Ed, mut vm: fl.FlVm, cps: List[int], created: List[bool], ids: List[int]) {
+    var n = cps.len
+    while n != 0 {
+        n -= 1
+        if created[n] {
+            let _ = opt_remove(mut ed, mut vm.hooks.ledger, ids[n])
+        } else {
+            let _ = opt_rollback(mut ed, cps[n])
+        }
+    }
+}
