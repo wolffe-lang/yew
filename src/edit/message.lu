@@ -35,19 +35,91 @@ pub fn msg_visible(ed: Ed) -> bool {
     ed.msg.active || ed.msg_hint.active
 }
 
-// `message_damage` (`message.c:51-64`).
+// `message_damage` (`message.c:51-64`): full input disclosures borrow
+// several rows; ordinary prompt messages borrow only the immediately prior row.
 fn message_damage(mut ed: Ed) {
     ed.footer_dirty = true
-    if ed.msg.expanded {
+    let many = ed.cmdline.active &&
+        ed.msg.active &&
+        ed.cmdline.kind == PROMPT_INPUT &&
+        (msg_byte_len(ed.msg) >= 512 || msg_has_byte(ed.msg, 10 as byte))
+    if ed.msg.expanded || many {
         ed.full_damage = true
+    } else if ed.cmdline.active && ed.msg.active && ed.win >= 0 && ed.wins[ed.win].rect.h != 0 {
+        let height = ed.wins[ed.win].rect.h
+        ed_damage_rows(mut ed, height - 1, height)
     }
+}
+
+/// Byte length of the authoritative message payload (message.c:204-207).
+pub fn msg_byte_len(msg: Msg) -> int { if msg.has_raw then msg.raw.len else msg.text.len }
+
+/// Byte search used by the input-prompt multiline rule, without UTF-8 conversion.
+pub fn msg_has_byte(msg: Msg, wanted: byte) -> bool {
+    if msg.has_raw {
+        for b in msg.raw { if b == wanted { return true } }
+    } else {
+        for b in msg.text.bytes() { if b == wanted { return true } }
+    }
+    false
+}
+
+/// Append at most max_bytes verbatim; C's %.Ns cuts bytes, even inside UTF-8.
+pub fn msg_append_prefix(mut out: List[byte], msg: Msg, max_bytes: int) {
+    let len = msg_byte_len(msg)
+    let n = if max_bytes < len then max_bytes else len
+    if msg.has_raw {
+        for i in 0..n { (mut out).push(msg.raw[i]) }
+    } else {
+        for i in 0..n { (mut out).push(msg.text.bytes()[i]) }
+    }
+}
+
+/// Append the current message to retained drawing storage without a copy buffer.
+pub fn msg_append_bytes(mut out: List[byte], msg: Msg) {
+    msg_append_prefix(mut out, msg, msg_byte_len(msg))
+}
+
+/// An owned byte snapshot for slow paths that must pass the message into a mut Ed call.
+pub fn msg_bytes(msg: Msg) -> List[byte] {
+    var out = List[byte]()
+    msg_append_bytes(mut out, msg)
+    out
+}
+
+/// Compare the authoritative bytes to text, including when raw bytes are active.
+pub fn msg_equals_text(msg: Msg, text: str) -> bool {
+    if msg_byte_len(msg) != text.len { return false }
+    if !msg.has_raw { return msg.text == text }
+    for i in 0..msg.raw.len { if msg.raw[i] != text.bytes()[i] { return false } }
+    true
+}
+
+fn message_may_replace(ed: Ed, sev: int) -> bool {
+    let prompt = ed.prompt != PROMPT_NONE
+    !(ed.msg.active && ed.msg.prompt && !prompt) &&
+        !(ed.msg.active && ed.msg.sev == MSG_ERROR && sev == MSG_INFO && !prompt)
+}
+
+// C frees its `full` and clears metadata. Retain the raw buffer's capacity
+// instead of replacing it on every message (G33); reset makes no bytes visible.
+fn message_reset(mut msg: Msg) {
+    msg.text = ""
+    (mut msg.raw).reset()
+    msg.has_raw = false
+    msg.sev = MSG_INFO
+    msg.expiry = TIMER_NONE
+    msg.active = false
+    msg.prompt = false
+    msg.truncated = false
+    msg.expanded = false
 }
 
 /// The expiry timer's firing (`message_expire`, `message.c:66-80`).
 pub fn msg_expire(mut ed: Ed) {
     let expanded = ed.msg.expanded
     message_damage(mut ed)
-    ed.msg = msg_none()
+    message_reset(mut ed.msg)
     ed.footer_dirty = true
     if expanded {
         ed.full_damage = true
@@ -61,7 +133,7 @@ pub fn ed_msg_clear(mut ed: Ed) {
     if ed.msg.expiry != TIMER_NONE {
         let _ = timer_cancel(mut ed.timers, ed.msg.expiry)
     }
-    ed.msg = msg_none()
+    message_reset(mut ed.msg)
     ed.footer_dirty = true
     if expanded {
         ed.full_damage = true
@@ -70,7 +142,7 @@ pub fn ed_msg_clear(mut ed: Ed) {
 
 /// `yew_msg_hint_clear` (`message.c:99-106`).
 pub fn ed_msg_hint_clear(mut ed: Ed) {
-    ed.msg_hint = msg_none()
+    message_reset(mut ed.msg_hint)
     ed.footer_dirty = true
 }
 
@@ -78,37 +150,23 @@ pub fn ed_msg_hint_clear(mut ed: Ed) {
 /// real message displaces for a while.
 pub fn ed_msg_hint(mut ed: Ed, sev: int, text: str) {
     ed_msg_hint_clear(mut ed)
-    ed.msg_hint = Msg {
-        text: text,
-        sev: sev,
-        expiry: TIMER_NONE,
-        active: true,
-        prompt: false,
-        truncated: false,
-        expanded: false,
-    }
+    let end = text.find("\0") else text.len
+    ed.msg_hint.text = text[0..end]
+    ed.msg_hint.sev = sev
+    ed.msg_hint.active = true
     ed.footer_dirty = true
 }
 
 /// `yew_msg_at` (`message_vset`, `message.c:154-201`) at clock `now`.
 pub fn ed_msg_at(mut ed: Ed, sev: int, now: int, text: str) {
     let prompt = ed.prompt != PROMPT_NONE
-    if ed.msg.active && ed.msg.prompt && !prompt {
-        return
-    }
-    if ed.msg.active && ed.msg.sev == MSG_ERROR && sev == MSG_INFO && !prompt {
-        return
-    }
+    if !message_may_replace(ed, sev) { return }
     ed_msg_clear(mut ed)
-    ed.msg = Msg {
-        text: text,
-        sev: sev,
-        expiry: TIMER_NONE,
-        active: true,
-        prompt: prompt,
-        truncated: false,
-        expanded: false,
-    }
+    let end = text.find("\0") else text.len
+    ed.msg.text = text[0..end]
+    ed.msg.sev = sev
+    ed.msg.active = true
+    ed.msg.prompt = prompt
     if sev == MSG_ERROR && ed.errorbells && ed.tty_ready {
         term.tty_write_str("\x07") else |_| {}
     }
@@ -120,7 +178,12 @@ pub fn ed_msg_at(mut ed: Ed, sev: int, now: int, text: str) {
         MESSAGE_WARN_MS
     }
     if duration >= 0 {
-        ed.msg.expiry = timer_add(mut ed.timers, now + duration, TIMER_MSG_EXPIRE, 0)
+        let deadline = if now > 9223372036854775807 - duration {
+            9223372036854775807
+        } else {
+            now + duration
+        }
+        ed.msg.expiry = timer_add(mut ed.timers, deadline, TIMER_MSG_EXPIRE, 0)
     }
     message_damage(mut ed)
 }
@@ -128,6 +191,34 @@ pub fn ed_msg_at(mut ed: Ed, sev: int, now: int, text: str) {
 /// `yew_msg` (`message.c:219-228`): at the loop's clock.
 pub fn ed_msg(mut ed: Ed, sev: int, text: str) {
     ed_msg_at(mut ed, sev, now_ms(), text)
+}
+
+/// Store preformatted message bytes at a supplied clock. C's %.*s stops at
+/// NUL, but does not validate UTF-8 or truncate to its 512-byte inline array:
+/// message_vset allocates `full` when needed (message.c:154-201).
+pub fn ed_msg_bytes_at(mut ed: Ed, sev: int, now: int, bytes: List[byte]) {
+    if !message_may_replace(ed, sev) { return }
+    var n: int = 0
+    while n < bytes.len && bytes[n] != 0 as byte { n += 1 }
+    if n < bytes.len {
+        let prefix = bytes[0..n]
+        ed_msg_bytes_at(mut ed, sev, now, prefix)
+        return
+    }
+    let decoded = str_from_utf8(bytes) else {
+        ed_msg_at(mut ed, sev, now, "")
+        ed.msg.has_raw = true
+        (mut ed.msg.raw).reserve(n)
+        for i in 0..n { (mut ed.msg.raw).push(bytes[i]) }
+        message_damage(mut ed)
+        return
+    }
+    ed_msg_at(mut ed, sev, now, decoded)
+}
+
+/// Byte-preserving `yew_msg` for Fletch strings and rendered diagnostics.
+pub fn ed_msg_bytes(mut ed: Ed, sev: int, bytes: List[byte]) {
+    ed_msg_bytes_at(mut ed, sev, now_ms(), bytes)
 }
 
 /// `yew_msg_expand` (`message.c:230-238`).
@@ -271,7 +362,11 @@ pub fn message_draw(mut ed: Ed, w: int) {
     // The message's bytes in the editor's buffer (`ed.dbuf.msg`), reused
     // frame after frame while it shows (deliverable 6).
     clear_bytes(mut ed.dbuf.msg)
-    push_str(mut ed.dbuf.msg, if ed.msg.active then ed.msg.text else ed.msg_hint.text)
+    if ed.msg.active {
+        msg_append_bytes(mut ed.dbuf.msg, ed.msg)
+    } else {
+        msg_append_bytes(mut ed.dbuf.msg, ed.msg_hint)
+    }
     let truncated = row_take(ed.dbuf.msg, 0, available) < ed.dbuf.msg.len
     if ed.msg.active {
         ed.msg.truncated = truncated
