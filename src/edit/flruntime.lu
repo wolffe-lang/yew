@@ -38,6 +38,7 @@ pub struct FlRuntime {
     idle_pending: bool,
     changes: List[FlPendingChange],
     flushing_change: bool,
+    compile_stage: int,
 }
 
 /// An uninitialized runtime, with no VM storage allocated yet.
@@ -57,6 +58,7 @@ pub fn fl_runtime_new() -> FlRuntime {
         idle_pending: false,
         changes: List[FlPendingChange](),
         flushing_change: false,
+        compile_stage: 0,
     }
 }
 
@@ -163,10 +165,17 @@ fn runtime_compile(
     ed.flrt.has_last_diag = false
     (mut ed.flrt.diag_message).reset()
     (mut ed.flrt.last_diag).reset()
+    ed.flrt.compile_stage = STAGE_PARSE
     let first = vm.dc.entries.len
     let file = fl.fl_diag_add_file(mut vm.dc, label, source)
     let p = fl.fl_parse(source, file, mut vm.dc, mut vm.strings)
-    if p.had_error { runtime_diag_capture(mut ed, vm, first); return none }
+    // The REPL takes an incomplete program as a parse error's report;
+    // compile_owned refuses it outright (fleval.c:65-66, 284-290).
+    if p.had_error || !repl && p.incomplete {
+        runtime_diag_capture(mut ed, vm, first)
+        return none
+    }
+    ed.flrt.compile_stage = STAGE_COMPILE
     let entry = (
         if repl {
             fl.fl_compile_repl(mut vm, p, file, origin)
@@ -178,11 +187,38 @@ fn runtime_compile(
         return none
     }
     runtime_diag_capture(mut ed, vm, first)
+    ed.flrt.compile_stage = STAGE_DONE
     entry
+}
+
+// Where runtime_compile stopped: fl_runtime_eval's two messages
+// (fleval.c:286-299) tell a parse failure from a compile one.
+const STAGE_DONE: int = 0
+
+const STAGE_PARSE: int = 1
+
+const STAGE_COMPILE: int = 2
+
+// call_chunk_result (fleval.c:142-166): the chunk runs at top level, or as
+// a closure over the globals inside a running call, with the command
+// source every command it runs carries saved and restored around it.
+fn runtime_call_chunk(mut ed: Ed, mut vm: fl.FlVm, entry: fl.FlValue, source: int) -> fl.FlValue {
+    let saved = ed.flrt.command_source
+    ed.flrt.command_source = source
+    let result = if vm.frames.len == 0 {
+        fl.fl_vm_run_host(mut vm, mut ed, entry)
+    } else {
+        let closure = fl.fl_closure_new(mut vm, entry)
+        fl.fl_vm_call_host(mut vm, mut ed, closure, List[fl.FlValue]())
+    }
+    ed.flrt.command_source = saved
+    result
 }
 
 /// Compile and execute one editor source while retaining its VM and globals.
 /// A parse/compile error returns ERR_ARG; an uncaught VM error ERR_STATE.
+/// The commands it runs carry SRC_FLETCH at top level and the running
+/// call's source when nested (fleval.c:300).
 pub fn fl_eval_source(
     mut ed: Ed,
     source: List[byte],
@@ -196,15 +232,76 @@ pub fn fl_eval_source(
         (mut ed.flrt.vms).push(vm)
         return (CMD_ERR_ARG, fl.fl_nil())
     }
-    let result = if vm.frames.len == 0 {
-        fl.fl_vm_run_host(mut vm, mut ed, entry)
-    } else {
-        let closure = fl.fl_closure_new(mut vm, entry)
-        fl.fl_vm_call_host(mut vm, mut ed, closure, List[fl.FlValue]())
-    }
+    let kind = if vm.frames.len == 0 then SRC_FLETCH else ed.flrt.command_source
+    let result = runtime_call_chunk(mut ed, mut vm, entry, kind)
     let status = if vm.raised then CMD_ERR_STATE else CMD_OK
     (mut ed.flrt.vms).push(vm)
     (status, result)
+}
+
+/// `fl_compile_str` (fleval.c:80-85): `source` compiled as the user
+/// config (CONFIG, every capability), not run; the function is unrooted,
+/// so the caller runs it before anything can collect.
+pub fn fl_compile_str(mut ed: Ed, source: List[byte], label: str) -> fl.FlValue ! {none} {
+    let _ = fl_runtime_init(mut ed)
+    let origin = fl.fl_origin_new(fl.FL_ORIGIN_CONFIG, fl.FL_CAP_ALL)
+    var vm = runtime_take(mut ed)
+    let fun = runtime_compile(mut ed, mut vm, source, label, origin, false) else {
+        (mut ed.flrt.vms).push(vm)
+        return none
+    }
+    (mut ed.flrt.vms).push(vm)
+    fun
+}
+
+/// `fl_call_chunk` (fleval.c:169-174): a compiled chunk run with `source`
+/// as every command's source (a replay's SRC_REPLAY); false on a raise.
+pub fn fl_call_chunk(mut ed: Ed, entry: fl.FlValue, source: int) -> bool {
+    if !ed.flrt.ready || ed.flrt.vms.len == 0 { return false }
+    var vm = runtime_take(mut ed)
+    let _ = runtime_call_chunk(mut ed, mut vm, entry, source)
+    let ok = !vm.raised
+    vm.raised = false
+    (mut ed.flrt.vms).push(vm)
+    ok
+}
+
+/// `fl_macro_compile_cached` (fleval.c:234-262): register `reg`'s source
+/// compiled once per exact text, as its writer's principal; the function
+/// is held by the register's host root, so a collection keeps it.
+pub fn fl_macro_compile_cached(mut ed: Ed, reg: int, source: List[byte]) -> fl.FlValue ! {none} {
+    if reg < 'a' as int || reg > 'z' as int { return none }
+    let _ = fl_runtime_init(mut ed)
+    let i = reg - 'a' as int
+    let hash = fl.fl_hash_bytes(source)
+    let root = ed.flrt.macro_cache[i].root
+    let held = fl.fl_gc_host_root_get(ed.flrt.vms[0], root)
+    if held.t == fl.FL_FN &&
+        ed.flrt.macro_cache[i].has_source &&
+        ed.flrt.macro_cache[i].hash == hash &&
+        bytes_same(ed.flrt.macro_cache[i].source, source) {
+        return held
+    }
+    let origin = copy ed.flrt.macro_cache[i].origin
+    let letter = str_from_utf8([reg as byte]) else "?"
+    let label = "<macro:{letter}>"
+    var vm = runtime_take(mut ed)
+    let fun = runtime_compile(mut ed, mut vm, source, label, origin, false) else {
+        (mut ed.flrt.vms).push(vm)
+        return none
+    }
+    fl.fl_gc_host_root_set(mut vm, root, fun)
+    (mut ed.flrt.vms).push(vm)
+    ed.flrt.macro_cache[i].source = copy source
+    ed.flrt.macro_cache[i].has_source = true
+    ed.flrt.macro_cache[i].hash = hash
+    fun
+}
+
+fn bytes_same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len { if a[i] != b[i] { return false } }
+    true
 }
 
 /// Ordinary E-mode evaluation, including the byte-preserving result/trace message.
@@ -215,6 +312,8 @@ pub fn fl_runtime_eval(mut ed: Ed, source: List[byte]) -> int {
         if ed.flrt.diag_message.len != 0 {
             let msg = copy ed.flrt.diag_message
             ed_msg_bytes(mut ed, MSG_ERROR, msg)
+        } else if ed.flrt.compile_stage == STAGE_COMPILE {
+            ed_msg(mut ed, MSG_ERROR, "Fletch compile failed")
         } else {
             ed_msg(mut ed, MSG_ERROR, "Fletch parse failed")
         }
