@@ -1,0 +1,177 @@
+//! fuzz-record — Sprint 35's recorder fuzzer, sagitta 9ace98c2
+//! tests/fuzz/fuzz_record.c:1-133 over fuzzlib.c's generator
+//! (tools/fuzzgen).
+//!
+//! THE PROPERTY (fuzz_record.c:39-127): arbitrary recorder events always
+//! emit parseable Fletch. Each 24 input bytes are one `RecEvent` — a
+//! command id over the registry, a count, the flags, a range, a mode, a
+//! source and a slice of the input as its string argument — at most 256
+//! of them, the input itself the recording's blob; `edit.record_emit`'s
+//! source must parse with no error diagnostic and neither `had_error` nor
+//! `incomplete`.
+//!
+//! `--corpus-only` (fuzzlib.c:1744-1752, `make test-record-corpus`,
+//! Makefile:2401) replays the corpus exactly once, the port's
+//! `corpus=N exact replay ok` line C's. The report line's `hash=` covers
+//! the generated stream, so equality with C's driver at the same seed and
+//! iterations is the witness that both fed their check the same inputs;
+//! the tally on stderr shows the check executed them. No watchdog: an
+//! input is at most 256 events (C's ITIMER_PROF guard never fires here).
+
+use edit
+use fl
+use fuzzgen
+
+// fuzz_record.c:44.
+const EVENT_BYTES: int = 24
+
+const EVENT_MAX: int = 256
+
+// The modes (YEW_MODE__N) and sources (YEW_SRC_TEST + 1) C draws from.
+const MODES: int = 7
+
+const SOURCES: int = 6
+
+struct Tally { inputs: int, events: int, source_bytes: int }
+
+// read_u32 (fuzz_record.c:30-37): little-endian, short reads zero-filled.
+fn read_u32(data: List[byte], at: int) -> int {
+    var value = 0
+    var i = 0
+    while i < 4 && at + i < data.len {
+        value = value | data[at + i] as int << (i * 8)
+        i += 1
+    }
+    value
+}
+
+// (i64)(i32)x.
+fn sign32(x: int) -> int { if x >= 2147483648 then x - 4294967296 else x }
+
+// check_record (fuzz_record.c:39-127): "" when the emitted source parses.
+fn check_record(data: List[byte], reg: edit.CmdReg, mut tally: Tally) -> str {
+    let len = data.len
+    var rec = edit.rec_new()
+    rec.reg = 'a' as int
+    rec.mode_at_start = if len == 0 then edit.MODE_L else data[0] as int % MODES
+    rec.blob = copy data
+    var nevents = (len + EVENT_BYTES - 1) / EVENT_BYTES
+    if nevents > EVENT_MAX { nevents = EVENT_MAX }
+    let ncmds = reg.entries.len
+    for i in 0..nevents {
+        let at = i * EVENT_BYTES
+        let raw_cmd = read_u32(data, at)
+        let raw_slice = read_u32(data, at + 8)
+        let lo = read_u32(data, at + 16)
+        var event = edit.RecEvent {
+            cmd: if ncmds == 0 then 0 else 1 + raw_cmd % ncmds,
+            count: 1 + read_u32(data, at + 4) % 100,
+            count_given: at + 1 < len && data[at + 1] as int & 1 != 0,
+            bang: at + 4 < len && data[at + 4] as int & 1 != 0,
+            iarg: sign32(read_u32(data, at + 12)),
+            range_lo: lo,
+            range_hi: lo + read_u32(data, at + 20),
+            sarg_at: 0,
+            sarg_len: 0,
+            mode: if at + 2 < len then data[at + 2] as int % MODES else 0,
+            src: if at + 3 < len then data[at + 3] as int % SOURCES else edit.SRC_KEY,
+            range_kind: if at + 5 < len then data[at + 5] as int % (edit.REC_RANGE_SPAN + 1) else edit.REC_RANGE_NONE,
+            range_given: at + 6 < len && data[at + 6] as int & 1 != 0,
+        }
+        if len != 0 {
+            event.sarg_at = raw_slice % (len + 1)
+            event.sarg_len = read_u32(data, at + 12) % (len - event.sarg_at + 1)
+        }
+        (mut rec.ev).push(event)
+    }
+    let source = edit.record_emit(reg, rec)
+    tally.inputs += 1
+    tally.events += nevents
+    tally.source_bytes += source.len
+    var dc = fl.fl_diag_init()
+    var strings = fl.fl_strings()
+    let file = fl.fl_diag_add_file(mut dc, "fuzz-record.fl", source)
+    let program = fl.fl_parse(source, file, mut dc, mut strings)
+    var errors = 0
+    for d in dc.entries { if d.level == fl.FL_DIAG_ERROR { errors += 1 } }
+    if errors != 0 || program.had_error || program.incomplete {
+        return "emitter produced unparseable source ({errors} diagnostics)"
+    }
+    ""
+}
+
+fn main() -> int {
+    let args = env_args()
+    var rest = List[str]()
+    var corpus_only = false
+    for a in args { if a == "--corpus-only" { corpus_only = true } else { (mut rest).push(a) } }
+    let (ok, seed, iters) = fuzzgen.parse_args(rest)
+    if !ok || iters < 1 {
+        eprint("usage: fuzz-record [--iters=N] [--seed=N] [--corpus-only]")
+        return 2
+    }
+    let target = "fuzz_record"
+    // yew_fuzz_main(..., "fuzz_record", "tests/fuzz/corpus/record", ...).
+    let (cok, corpus, dict) = fuzzgen.corpus_dict_from(target, "tests/fuzz/corpus/record")
+    if !cok { return 2 }
+    let ed = edit.ed_new()
+    let reg = copy ed.reg
+    var tally = Tally { inputs: 0, events: 0, source_bytes: 0 }
+    if corpus_only {
+        // replay_corpus (fuzzlib.c:1540-1562).
+        for c in corpus {
+            let why = check_record(c.bytes, reg, mut tally)
+            if why != "" {
+                eprint("{target}: FAIL corpus={c.name}: {why}")
+                return 1
+            }
+        }
+        eprint("{target}: inputs={tally.inputs} events={tally.events} source_bytes={tally.source_bytes}")
+        print("{target}: corpus={corpus.len} exact replay ok")
+        return 0
+    }
+    let start = fuzzgen.run_new(seed)
+    var state = start.state
+    var hash = start.hash
+    var done = 0
+    var failed = false
+    while done < iters && !failed {
+        let n = if iters - done > 64 then 64 else iters - done
+        region epoch {
+            var rng = fuzzgen.Run { state: state, hash: hash }
+            var k = 0
+            while k < n {
+                let which = fuzzgen.choose(mut rng, corpus.len)
+                var input = copy corpus[which].bytes
+                let mutations = 1 + fuzzgen.choose(mut rng, 4)
+                var op = 0
+                var m = 0
+                while m < mutations {
+                    let (next, operation) = fuzzgen.mutate_dict(mut rng, input, corpus, dict)
+                    input = next
+                    op = operation
+                    m += 1
+                }
+                fuzzgen.hash_bytes(mut rng, input)
+                var why = ""
+                region trial {
+                    why = copy check_record(input, reg, mut tally)
+                }
+                if why != "" {
+                    eprint("{target}: FAIL seed={seed} iter={done + k} corpus={corpus[which].name} op={fuzzgen.op_name(op)}: {why}")
+                    eprint("{target}: input={fuzzgen.hex_of(input)}")
+                    failed = true
+                    break
+                }
+                k += 1
+            }
+            state = rng.state
+            hash = rng.hash
+        }
+        done += n
+    }
+    if failed { return 1 }
+    eprint("{target}: inputs={tally.inputs} events={tally.events} source_bytes={tally.source_bytes}")
+    print("{target}: seed={seed} iters={iters} corpus={corpus.len} hash={fuzzgen.hex16(hash)} ok")
+    0
+}
