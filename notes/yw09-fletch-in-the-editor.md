@@ -331,6 +331,35 @@ All runs were on kasumi. The curated logs are `notes/yw09-evidence/final/`
 - yew#90 (trunk's scheduled macOS port job, `edit_comphelp_test.lu:692`,
   red since 2026-10-26) is not this lane's. If this PR's macOS leg shows
   it, it is that issue, cited by name, not retried.
+- **The PR's first run, 40637594043 at `1495ebe`, went red.** The fixes
+  were proved on kasumi first (`notes/yw09-evidence/final/proof.txt`),
+  then pushed once:
+  - `fl_host_test`'s import case required a scratch `TMPDIR`, and CI's legs
+    set none (unit shard 1/3, checked-cases shard 1/4). With `TMPDIR` unset
+    it now makes its directory under `target/` (`a51fc81`). Proved natively
+    and with `wolf test --no-native-fallback`.
+  - `check-perf-cmdcomp-build`'s fixture tree lacked the `fl` module that
+    `4068553` added to the driver's staging (`441873a`).
+  - `fl-invariant-check` still called `fl_vm_exec` without R-yw09-4's host
+    (`e2155de`); its 13 rows are green.
+  - The timeouts. Campaign 07 doubled each editor-linked release build
+    against trunk's run 40531743272 (fuzz_tabs went from 21 to 42 minutes,
+    40 of them the build) and added 30 test files. Unit shards 2/3 and 3/3,
+    the fuzz families port and against-c-2, and the ubuntu oracle job all
+    ran past their limits. `3b1769f` rebalances:
+    - six unit shards;
+    - five fuzz families: port-2 takes the search fuzz, against-c-3 takes
+      campaign 07's three on the native tier;
+    - the editor perf rows on the native tier on the hosted runner. They
+      are advisory there; the release record stays kasumi's.
+
+    `ci/legs-test.py` holds the new shape. On kasumi the editor rows
+    native give `failures=0 errors=0`, with every sanity bound at least 5×
+    clear. `fuzz_flapi` native at 200,000 inputs equals C's line (11
+    minutes).
+  - The macOS `text_save_paths_test.lu:434` assert is not this lane's. It
+    sits in the recorded (`continue-on-error`) kill9 step and is identical
+    in trunk's run 40531743272.
 
 ## Done-when
 
