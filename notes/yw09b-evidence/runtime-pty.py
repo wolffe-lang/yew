@@ -86,25 +86,25 @@ try:
     plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", startup)
     (root / "wire.bin").write_bytes(wire)
     (root / "startup.txt").write_bytes(plain)
-    print(f"runtime_locked_mode: exited={exited} motion_and_insert={moved}", flush=True)
+    row = "runtime_prefix_skew" if a.prefix else "runtime_locked_mode"
+    print(f"{row}: exited={exited} motion_and_insert={moved}", flush=True)
     print(plain.decode("utf-8", "replace"), flush=True)
     if a.expect_locked:
         assert not exited and not moved, "baseline did not reproduce the locked mode"
         assert b"config runtime error:" in plain, "baseline did not report config failure"
         print("runtime_locked_mode: reproduced at 3133476", flush=True)
     else:
-        assert exited and os.waitstatus_to_exitcode(status) == 0, "quit binding did not answer"
-        assert moved, "motion, Insert and save did not answer"
         if a.prefix:
             assert b"runtime at /usr/local/share/yew/runtime is not this build's" in plain, "runtime_prefix_skew: no warning"
             assert b"using the built-in runtime" in plain, "runtime_prefix_skew: no fallback notice"
             assert b"unknown command" not in plain, "runtime_prefix_skew: mismatched runtime was executed"
             assert log.read_text().count("is not this build's") == 1, "runtime_prefix_warn_once: warning repeated on reload"
-            print("runtime_prefix_skew: ok; runtime_prefix_warn_once: ok", flush=True)
         else:
             assert b"unknown command 'ed.theme.pick'" in plain, "refused command not named"
             assert b"init.fl:" in plain, "refused file/line not named"
-            print("runtime_locked_mode: ok", flush=True)
+        assert exited and os.waitstatus_to_exitcode(status) == 0, f"{row}: quit binding did not answer"
+        assert moved, f"{row}: motion, Insert and save did not answer"
+        print("runtime_prefix_skew: ok; runtime_prefix_warn_once: ok" if a.prefix else "runtime_locked_mode: ok", flush=True)
 finally:
     os.close(fd)
     if not locals().get("exited", False):
