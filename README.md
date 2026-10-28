@@ -17,7 +17,10 @@ suites. `tools/oracle` fetches and builds it; `tools/goldens --yew
 <binary>` runs its suites against any binary and prints one
 `pass/fail/skip` line per suite with a diff per failure. A golden that
 disagrees with the port is a STOP and a ruling, never a golden edit; no
-sagitta change is made here. Fletch stays Fletch: its scripts, data
+sagitta change is made here. Explicitly approved differences are listed in
+`tools/goldens-divergences.txt`: each names the port's expected snapshot and
+pins the unchanged C golden's SHA-256. The harness prints each divergence
+by name; a changed C golden requires re-evaluation. Fletch stays Fletch: its scripts, data
 files and recorder output run on both editors.
 
 C yew's numeric quality gates (keypress to paint p99 <= 5 ms, cold start
@@ -28,7 +31,7 @@ number from the same run, and a 2x gate holds from the first paint.
 
 ## Status
 
-Campaigns 00 to 06 of sagitta's fifteen (yw00 to yw08), at wolf
+Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), at wolf
 0.2.35 (lupin 0.1.56): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
 identical to sagitta's); the terminal (raw mode, the input decoder, the
 cell grid and damage renderer, the restore on every exit path); the text
@@ -47,8 +50,10 @@ the editor's scripting language, as `yew fl`: the lexer, parser,
 compiler and VM with its collector and standard modules, the
 interactive prompt, and the structured report a broken VM invariant
 exits with (campaign 06's 39 conformance units, its coverage ledger and
-three fuzzers against C's drivers). Fletch inside the running editor
-(bindings, the recorder, `init.fl`, `--batch`) is campaign 07's, yw09.
+three fuzzers against C's drivers). Fletch also runs inside the editor:
+origin-owned bindings and hooks, live `init.fl`, recording and replay with
+the recorder/Fletch round-trip, the macro browser and library, workspace
+config trust, and headless `--batch` editing (campaign 07).
 Each campaign's reachable PTY goldens are gated by name against C yew's
 (campaign 05's eleven that need FUSS or syntax
 highlighting are recorded under the lane that lands them); every path
@@ -85,6 +90,24 @@ tools/check-fletch-coverage target/release/yew  # the coverage gate and its ledg
 Builds and tests run on linux x86-64 and macOS arm64; on linux aarch64
 wolf builds no tier at the pin (wolf-lang#614) and CI asserts the refusal
 by name, as pelt does. The oracle builds everywhere.
+
+## Runtime and completion
+
+`YEW_RUNTIME_DIR` explicitly selects a runtime directory. Otherwise the
+install prefix `/usr/local/share/yew/runtime` is used only when its
+`init.fl` is byte-identical to this build's embedded copy. A mismatched
+install warns once and uses the built-in runtime, not the current
+working directory. With no installed runtime, `./runtime` precedes the
+embedded fallback.
+
+A refused built-in binding reports the command and its source location,
+skips that row, and keeps the other bindings. A failing user or workspace
+config stops at its raise and removes that source's registrations; the
+built-in bindings remain. Once Tab enters a completion table, Up moves to
+the row above and wraps at the top to the true last row, beyond the visible
+page if necessary. Up before entering the table still walks history.
+Down at the bottom still returns focus to the command line, keeping the
+last candidate.
 
 ## The rules in brief
 
