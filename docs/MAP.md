@@ -94,7 +94,7 @@ Other trees:
 | sagitta | port |
 |---|---|
 | `ucd/16.0.0/` (10 files), `ucd/LICENSE`, `ucd/MANIFEST` | copied verbatim (yw00); the generator reads them; `ucd/MANIFEST` is checked by `shasum -c` |
-| `runtime/` (`init.fl`, 48 `syntax/*.fl`, 2 themes, tutor, presets, completions) | Fletch stays Fletch: the files are copied verbatim by the lane that first needs them and never edited. **yw03** needed `init.fl` and the two themes first (every editor frame paints in `quiver-dark` with `init.fl`'s keys and options): copied verbatim, embedded by `tools/gen-runtime` as `edit.runtime_blob` (the last resort after `$YEW_RUNTIME_DIR`, the install prefix and `./runtime`), checked against the pin by `tools/check-runtime`, and read by `edit.fldata`'s literal reader until Fletch (R-yw03-2); yw10 syntax; yw16 tutor |
+| `runtime/` (`init.fl`, 48 `syntax/*.fl`, 2 themes, tutor, presets, completions) | Fletch stays Fletch: the files are copied verbatim by the lane that first needs them and never edited. **yw03** needed `init.fl` and the two themes first (every editor frame paints in `quiver-dark` with `init.fl`'s keys and options): copied verbatim, embedded by `tools/gen-runtime` as `edit.runtime_blob` (the last resort after `$YEW_RUNTIME_DIR`, an identical install prefix and `./runtime`; since yw09b a readable prefix with different `init.fl` bytes selects only the embedded runtime, R-yw09b-1 A), checked against the pin by `tools/check-runtime`, and read by `edit.fldata`'s literal reader until Fletch (R-yw03-2); yw10 syntax; yw16 tutor |
 | `tests/unit/` (319 files) | ported one for one, per directory, by the lane that ports the directory (`src/<dir>/<unit>_test.lu`) |
 | `tests/pty/` (552 goldens, the runner, the VT, `demo_paint`) | the runner and goldens are the oracle's, run by `tools/goldens`; `demo_paint` is ported by yw01 (M-YW1) |
 | `tests/script/` (94 `.fl`), `tests/fletch/` (20 `.fl`), `tests/syn/` (432 `.spans`), `tests/roundtrip/`, `tests/torture/` | the oracle's, run by `tools/goldens`; the script suite's 69 owned files are yw09's gate by name (R-yw09-5, `tools/scripts-yw09.txt`); roundtrip is in-process in sagitta, so the port's own runner is `src/edit_record_roundtrip.lu` (yw09, R-yw09-1 A), its report held to C's runner by `tools/run-roundtrip` |
@@ -781,6 +781,32 @@ maintainer.
   reaches a nested eval from a non-config frame (the one pinned nested
   eval, `test_fl_replay_runtime.c:43`, runs from the user config).
   B, keep C's grant, was not recommended.
+
+- **R-yw09b-1 — installed runtime identity, implemented A.** C's
+  `runtime_asset.c:283-310` selects a readable prefix; the port shares that
+  prefix with newer C installations. It therefore requires byte identity
+  of prefix `init.fl` with the embedded copy. A mismatch warns once per
+  editor and selects embedded assets, not cwd assets; an explicit
+  `YEW_RUNTIME_DIR` still wins. `tools/check-runtime` holds the warning's
+  revision to `sagitta.pin`.
+- **yw09b's built-in bind recovery.** The pinned C witness is
+  `notes/yw09b-evidence/c-measurement.txt`: a raising user/workspace unit
+  stops at the raise and tears down its own bindings, leaving built-ins.
+  That behavior stays. The lane contract separately requires a refused
+  built-in bind to report and skip just that row; the later statements
+  run and the other built-in rows remain. Both report the command and the
+  VM's source location, not an invented fixed owner.
+- **Ruling #135 — entered completion Up.** Up wraps above the top of an
+  entered table to its true last reachable row. Tab's unbudgeted filter
+  and generator arrivals install the ranked rows before navigation;
+  `n_items`, not visible page height, is the boundary Down also uses.
+  Unentered Up remains history. The old C PTY snapshot is unchanged;
+  `tools/goldens-divergences.txt` names the port snapshot and pins the C
+  SHA-256. The harness announces the divergence by name.
+- **R-yw09b-2 — Down at bottom, recommendation only.** Keep Down unchanged
+  in this lane unless the maintainer rules otherwise. It blurs the table
+  and keeps the candidate; it does not wrap. The Tab/Up/Down row asserts
+  that existing behavior.
 
 ## 7. The next contracts
 
