@@ -360,6 +360,31 @@ All runs were on kasumi. The curated logs are `notes/yw09-evidence/final/`
   - The macOS `text_save_paths_test.lu:434` assert is not this lane's. It
     sits in the recorded (`continue-on-error`) kill9 step and is identical
     in trunk's run 40531743272.
+- **The second run, 40692505908 at `6b1164a`, went red too.** The fixes
+  were proved on kasumi first (`final/proof.txt`, second half):
+  - checked-cases shard 1/4 failed with `YEW_REUSE_CASE=1` past the step
+    budget. `edit_reuse_test`'s strip case built its editor from all of
+    `init.fl`, which since campaign 07 runs in the Fletch VM, and
+    `tools/check-test-cases` runs every case with `YEW_FL_VM_CHECKS=1`.
+    The case now sets the one option the strip draws with, the theme
+    (`4363edc`); it is a port-only test of the strip's frame reuse.
+    Through `tools/check-test-cases` in CI's environment shape, 2 cases,
+    0 red; natively whole, retained ledger 0.
+  - Both oracle jobs hit their job time limits: macOS at 120 minutes 40
+    seconds, ubuntu at 150 minutes 36 seconds. In that run the release
+    builds of the editor took 41 minutes for the port, 39 for demo_paint,
+    and more than 30 for perf_cmdcomp, which hit its own 30-minute step
+    cap. The job is one build-and-goldens slice whose hard compile gates
+    `ci/macos-split-test.py` pins in place, so `8c9d265` raises the caps
+    instead of splitting the gates out: oracle 180/210, perf_cmdcomp's
+    step 60. `macos-split-test` holds the new pair.
+  - The fuzz families were close to their limits (against-c-1 at 109 and
+    against-c-2 at 103 of 120 minutes). `8c9d265` moves fuzz_state and
+    fuzz_mouse from c-1, and fuzz_gitignore and the four fl drivers from
+    c-2, to against-c-3, which had run in 17 minutes.
+  - Not this lane's: the job-stream gate's `key 418 never reached a
+    frame`. It is an advisory, `continue-on-error` step, and trunk's run
+    40531743272 shows the same (`key 422`).
 
 ## Done-when
 
