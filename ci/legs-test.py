@@ -16,8 +16,8 @@
   L4  the wiring of .github/workflows/ci.yml: `legs` is the first job and
       runs this file before ci/legs.py; `port` and `oracle` need it and
       take their hosts from it, read with a default, with no host list of
-      their own; `unit` (the Linux unit lanes in three shards) and `fuzz`
-      (the Linux fuzzers in three families) need it and run on ubuntu, and
+      their own; `unit` (the Linux unit lanes in six shards, yw09) and `fuzz`
+      (the Linux fuzzers in five families, yw09) need it and run on ubuntu, and
       the port leaves those steps on Linux and macos-fuzz carries the seven
       oracle campaigns on macOS with their original commands; macos-perf
       carries the six oracle measurements, with no new host exclusion;
@@ -131,13 +131,14 @@ for j in ("port", "oracle"):
         "L4 %s needs the legs and takes its hosts from them, with a default, and no host list of its own" % j)
 un = blocks["unit"]
 say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-latest$", un, re.M) is not None
-    and "        shard: [1, 2, 3]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/3\n" in un
-    and "run: tools/check-test --native --shard ${{ matrix.shard }}/3\n" in un,
-    "L4 unit needs the legs and runs both unit lanes in three shards on ubuntu")
+    and "        shard: [1, 2, 3, 4, 5, 6]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/6\n" in un
+    and "run: tools/check-test --native --shard ${{ matrix.shard }}/6\n" in un,
+    "L4 unit needs the legs and runs both unit lanes in six shards on ubuntu")
 fz = blocks["fuzz"]
 say("    needs: legs\n" in fz and re.search(r"^    runs-on: ubuntu-latest$", fz, re.M) is not None
-    and "        family: [port, against-c-1, against-c-2]\n" in fz and "run: tools/oracle --cc gcc --build-only\n" in fz,
-    "L4 fuzz needs the legs and runs three fuzzer families on ubuntu, C's drivers built for two")
+    and "        family: [port, port-2, against-c-1, against-c-2, against-c-3]\n" in fz
+    and "        if: matrix.family != 'port' && matrix.family != 'port-2'\n        run: tools/oracle --cc gcc --build-only\n" in fz,
+    "L4 fuzz needs the legs and runs five fuzzer families on ubuntu, C's drivers built for three")
 # Every macOS campaign is still a Linux fuzz step. The oracle campaigns now
 # live in macos-fuzz; the nightly port-only fuzzers and unit steps stay put.
 moved = [m.group(1) for j in ("port", "oracle") for m in re.finditer(
