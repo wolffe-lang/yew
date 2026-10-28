@@ -52,7 +52,7 @@ def validate(text):
         assert "      fail-fast: false\n" in block
         assert len(re.findall(r"^        family:", block, re.M)) == 1
         assert "include:" not in block and "exclude:" not in block
-    assert "matrix.os == 'macos-latest' && 120 || 150" in oracle
+    assert "matrix.os == 'macos-latest' && 180 || 210" in oracle
     fs = [(n, b) for n, b in steps(fuzz) if n.startswith("fuzz_")]
     assert len(fs) == len(FUZZ) == 7
     assert not any(n.startswith("fuzz_") for n, _ in steps(oracle))
