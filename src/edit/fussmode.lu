@@ -1,0 +1,1499 @@
+//! edit.fussmode — F mode: the FUSS drawer over the live editor.
+//!
+//! Ports sagitta `src/mod/git/fussmode.c` (5,082 lines) and
+//! `fussmode.h` (212) at 9ace98c2 under `s52-fuss-mode.md`, with the
+//! drawer repairs of s56.5 §2–§4/§7 and s57.5–s57.7 and the FUSS menus'
+//! seams of s57.13 (R-yw06-4 = A). The pure tree, navigation and
+//! expansion are the `git` module's (`src/git/fusstree.lu`); this file is
+//! the mode's state and lifecycle, its jump, its viewer and its
+//! observers. The drawing is `fussdraw.lu`; the commands, prompts,
+//! pickers and the commit flow are `fusscmds.lu`.
+//!
+//! C's shape and the port's:
+//! - `ed->fuss` (a `FussMode *`) → `Ed.fuss`, a value built at `ed_new`.
+//! - `Win *`/`Buffer *` held across calls (the viewer's, the commit
+//!   view's) → window and buffer IDS, looked up when used.
+//! - `ed->interner` path ids in `YEW_REGION_FUSS_ROW` payloads → F mode's
+//!   own interner, `FussMode.paths` (only FUSS rows carry path ids).
+//! - C's `FussPathRef` scratch of the open tabs' paths → `open_scratch`,
+//!   a `git.GitPaths` reset and refilled per refresh (G33).
+//! - C's `PickerSpec` callbacks → the picker's `PICK_HOST_FUSS` kind.
+
+use git
+use std.signal
+use term
+use text
+use util
+use ws
+
+/// `YEW_FUSS_INDENT_CELLS` (`fussmode.h:22-28`).
+pub const FUSS_INDENT_CELLS: int = 2
+
+/// `YEW_FUSS_DRAWER_MIN_CELLS`.
+pub const FUSS_DRAWER_MIN_CELLS: int = 24
+
+/// `YEW_FUSS_DRAWER_BASE_MAX_CELLS`.
+pub const FUSS_DRAWER_BASE_MAX_CELLS: int = 64
+
+/// `YEW_FUSS_EDITOR_RETAIN_CELLS`.
+pub const FUSS_EDITOR_RETAIN_CELLS: int = 40
+
+/// `YEW_FUSS_DRAWER_EDGE_CELLS`.
+pub const FUSS_DRAWER_EDGE_CELLS: int = 1
+
+// `FUSS_OPENING_FRAME_MS` (`fussmode.c:85`).
+const FUSS_OPENING_FRAME_MS: int = 16
+
+/// `FussPromptAction` (`fussmode.c:47-60`).
+pub const FUSS_PROMPT_NONE: int = 0
+
+/// `FUSS_PROMPT_BRANCH_CREATE`.
+pub const FUSS_PROMPT_BRANCH_CREATE: int = 1
+
+/// `FUSS_PROMPT_BRANCH_DELETE`.
+pub const FUSS_PROMPT_BRANCH_DELETE: int = 2
+
+/// `FUSS_PROMPT_STASH_PUSH`.
+pub const FUSS_PROMPT_STASH_PUSH: int = 3
+
+/// `FUSS_PROMPT_TAG`.
+pub const FUSS_PROMPT_TAG: int = 4
+
+/// `FUSS_PROMPT_DISCARD`.
+pub const FUSS_PROMPT_DISCARD: int = 5
+
+/// `FUSS_PROMPT_DELETE`.
+pub const FUSS_PROMPT_DELETE: int = 6
+
+/// `FUSS_PROMPT_RENAME`.
+pub const FUSS_PROMPT_RENAME: int = 7
+
+/// `FUSS_PROMPT_PUSH_FORCE`.
+pub const FUSS_PROMPT_PUSH_FORCE: int = 8
+
+/// `FUSS_PROMPT_REBASE`.
+pub const FUSS_PROMPT_REBASE: int = 9
+
+/// `FUSS_PROMPT_COMMIT`.
+pub const FUSS_PROMPT_COMMIT: int = 10
+
+/// `FUSS_PROMPT_COMMIT_AMEND`.
+pub const FUSS_PROMPT_COMMIT_AMEND: int = 11
+
+/// `FussPickAction` (`fussmode.c:62-79`).
+pub const FUSS_PICK_NONE: int = 0
+
+/// The action palette.
+pub const FUSS_PICK_ACTIONS: int = 1
+
+/// `FUSS_PICK_BRANCH_SWITCH`.
+pub const FUSS_PICK_BRANCH_SWITCH: int = 2
+
+/// `FUSS_PICK_BRANCH_DELETE`.
+pub const FUSS_PICK_BRANCH_DELETE: int = 3
+
+/// `FUSS_PICK_MERGE`.
+pub const FUSS_PICK_MERGE: int = 4
+
+/// `FUSS_PICK_RESET_COMMIT`.
+pub const FUSS_PICK_RESET_COMMIT: int = 5
+
+/// `FUSS_PICK_RESET_MODE`.
+pub const FUSS_PICK_RESET_MODE: int = 6
+
+/// `FUSS_PICK_REBASE`.
+pub const FUSS_PICK_REBASE: int = 7
+
+/// `FUSS_PICK_CHERRY_BRANCH`.
+pub const FUSS_PICK_CHERRY_BRANCH: int = 8
+
+/// `FUSS_PICK_CHERRY_COMMIT`.
+pub const FUSS_PICK_CHERRY_COMMIT: int = 9
+
+/// `FUSS_PICK_REVERT`.
+pub const FUSS_PICK_REVERT: int = 10
+
+/// `FUSS_PICK_STASH`.
+pub const FUSS_PICK_STASH: int = 11
+
+/// `FUSS_PICK_REMOTE`.
+pub const FUSS_PICK_REMOTE: int = 12
+
+/// `FUSS_PICK_REMOTE_CHECK`.
+pub const FUSS_PICK_REMOTE_CHECK: int = 13
+
+/// `FUSS_PICK_REBASE_CONFIRM`.
+pub const FUSS_PICK_REBASE_CONFIRM: int = 14
+
+/// `FUSS_PICK_COMMIT_AMEND`.
+pub const FUSS_PICK_COMMIT_AMEND: int = 15
+
+/// `FussDrawerLayout` (`fussmode.h:30-35`); `edge_col` -1 is C's
+/// `UINT16_MAX` (no edge).
+pub struct FussDrawerLayout {
+    width: int,
+    tree_width: int,
+    edge_col: int,
+    fullscreen: bool,
+}
+
+/// `FussTarget` (`fussmode.h:85-97`): everything a FUSS row's menu turns
+/// on, in one answer.
+pub struct FussTarget {
+    known: bool,
+    status_known: bool,
+    is_file: bool,
+    staged: bool,
+    unstaged: bool,
+    untracked: bool,
+    incoming: bool,
+    conflicted: bool,
+    expanded: bool,
+}
+
+/// No target (`memset(out, 0, …)`).
+pub fn fuss_target_none() -> FussTarget {
+    FussTarget {
+        known: false,
+        status_known: false,
+        is_file: false,
+        staged: false,
+        unstaged: false,
+        untracked: false,
+        incoming: false,
+        conflicted: false,
+        expanded: false,
+    }
+}
+
+/// `YewFussState` (`fussmode.h:101-114`): the read-only public state
+/// (the path copied, C's borrow).
+pub struct FussState {
+    path: List[byte],
+    active: bool,
+    known: bool,
+    is_file: bool,
+    staged: bool,
+    unstaged: bool,
+    untracked: bool,
+    expanded: bool,
+    actions_open: bool,
+    clean: bool,
+}
+
+/// `struct FussMode` (`fussmode.c:87-149`).
+pub struct FussMode {
+    tree: git.FussTree,
+    manual_open: git.FussOpenMemory,
+    open_files: git.FussOpenMemory,
+    open_scratch: git.GitPaths,
+    natural_cols: int,
+    opts: git.FussOpts,
+    sel: git.FussSel,
+    jump: TypeJump,
+    jump_armed: bool,
+    jump_deadline_ms: int,
+    active: bool,
+    opening: bool,
+    opening_until_ms: int,
+    ascii_glyphs: bool,
+    viewer: bool,
+    viewer_win_id: int,
+    draw_dirty: bool,
+    backdrop_dirty: bool,
+    seen_detect_state: int,
+    seen_detect_result: int,
+    scroll: int,
+    saved_buffer_id: int,
+    viewer_buffer_id: int,
+    commit_buffer_id: int,
+    pending_job: int,
+    seen_result_job: int,
+    mutation_snapshot_gen: int,
+    pending_view: bool,
+    mutation_snapshot_pending: bool,
+    commit_editing: bool,
+    commit_amend: bool,
+    commit_cancel_pending: bool,
+    commit_comment: int,
+    commit_win_id: int,
+    commit_saved_win_id: int,
+    prompt_action: int,
+    prompt_path: str,
+    has_prompt_path: bool,
+    prompt_untracked: bool,
+    pending_pick: int,
+    picker_action: int,
+    picker_items: List[PickItem],
+    picker_values: List[str],
+    picker_aux: str,
+    has_picker_aux: bool,
+    picker_aux2: str,
+    has_picker_aux2: bool,
+    picker_alt: bool,
+    preview_job: int,
+    preview_value: str,
+    has_preview_value: bool,
+    preview_bytes: List[byte],
+    preview_ready: bool,
+    files: ws.FileList,
+    walk: ws.WalkState,
+    has_walk: bool,
+    expand_walk: ws.WalkState,
+    has_expand_walk: bool,
+    expand_path: List[byte],
+    has_expand_path: bool,
+    rebase_step: int,
+    rebase_total: int,
+    paths: util.Interner,
+}
+
+/// `yew_fuss_state_init` (`fussmode.c:967-982`).
+pub fn fuss_state_new() -> FussMode {
+    let (_, w0) = ws.walk_begin("", ws.walk_opts())
+    let (_, w1) = ws.walk_begin("", ws.walk_opts())
+    FussMode {
+        tree: git.fuss_tree_new(),
+        manual_open: git.fuss_open_memory_new(),
+        open_files: git.fuss_open_memory_new(),
+        open_scratch: git.git_paths_new(),
+        natural_cols: 0,
+        opts: git.FussOpts { all_files: false, show_hidden: false },
+        sel: git.fuss_sel_new(),
+        jump: typejump_new(),
+        jump_armed: false,
+        jump_deadline_ms: 0,
+        active: false,
+        opening: false,
+        opening_until_ms: 0,
+        ascii_glyphs: false,
+        viewer: false,
+        viewer_win_id: 0,
+        draw_dirty: false,
+        backdrop_dirty: false,
+        seen_detect_state: GIT_ASYNC_UNTRIED,
+        seen_detect_result: git.GIT_OK,
+        scroll: 0,
+        saved_buffer_id: 0,
+        viewer_buffer_id: 0,
+        commit_buffer_id: 0,
+        pending_job: 0,
+        seen_result_job: 0,
+        mutation_snapshot_gen: 0,
+        pending_view: false,
+        mutation_snapshot_pending: false,
+        commit_editing: false,
+        commit_amend: false,
+        commit_cancel_pending: false,
+        commit_comment: 0,
+        commit_win_id: 0,
+        commit_saved_win_id: 0,
+        prompt_action: FUSS_PROMPT_NONE,
+        prompt_path: "",
+        has_prompt_path: false,
+        prompt_untracked: false,
+        pending_pick: FUSS_PICK_NONE,
+        picker_action: FUSS_PICK_NONE,
+        picker_items: List[PickItem](),
+        picker_values: List[str](),
+        picker_aux: "",
+        has_picker_aux: false,
+        picker_aux2: "",
+        has_picker_aux2: false,
+        picker_alt: false,
+        preview_job: 0,
+        preview_value: "",
+        has_preview_value: false,
+        preview_bytes: List[byte](),
+        preview_ready: false,
+        files: ws.filelist_new(),
+        walk: w0,
+        has_walk: false,
+        expand_walk: w1,
+        has_expand_walk: false,
+        expand_path: List[byte](),
+        has_expand_path: false,
+        rebase_step: 0,
+        rebase_total: 0,
+        paths: util.interner_new(),
+    }
+}
+
+// ------------------------------------------------------------------
+// The jump (`fussmode.c:300-418`)
+// ------------------------------------------------------------------
+
+/// `yew_fuss_jump_init` (`fussmode.c:311-317`).
+pub fn fuss_jump_init(mut f: FussMode) {
+    typejump_clear(mut f.jump)
+    f.jump_armed = false
+    f.jump_deadline_ms = 0
+}
+
+/// `yew_fuss_jump_arm` (`fussmode.c:319-326`): an empty 500 ms window.
+pub fn fuss_jump_arm(mut f: FussMode, now: int) {
+    typejump_clear(mut f.jump)
+    f.jump_armed = true
+    f.jump_deadline_ms = now + TYPEJUMP_RESET_MS
+}
+
+// `fuss_jump_printable` (`fussmode.c:328-338`): Space expands or
+// collapses the selected directory; every other ordinary printable byte
+// can occur in a filename and belongs to type-to-jump.
+fn fuss_jump_printable(key: term.Key) -> bool {
+    if key.text.len != 1 {
+        return false
+    }
+    let mods = term.MOD_CTRL | term.MOD_ALT | term.MOD_SUPER | term.MOD_HYPER | term.MOD_META
+    if key.mods & mods != 0 {
+        return false
+    }
+    key.text[0] as int > 32 && key.text[0] as int != 127
+}
+
+/// `yew_fuss_jump_key` (`fussmode.c:340-398`): the jump's own engine over
+/// `labels` (the visible rows' paths), path-mode ranked; answers
+/// (consumed, the new selection).
+pub fn fuss_jump_key(
+    mut f: FussMode,
+    key: term.Key,
+    now: int,
+    labels: List[List[byte]],
+    sel_in: int,
+) -> (bool, int) {
+    var sel = sel_in
+    var printable = fuss_jump_printable(key)
+    let n = labels.len
+    if key.code == term.KEY_BACKSPACE {
+        if !f.jump_armed {
+            return (false, sel)
+        }
+        if f.jump.len != 0 {
+            f.jump.len -= 1
+        }
+        f.jump.pat[f.jump.len] = 0 as byte
+        f.jump_deadline_ms = now + TYPEJUMP_RESET_MS
+        f.jump.deadline_ms = f.jump_deadline_ms
+        if f.jump.len == 0 || n == 0 || sel < 0 {
+            return (true, sel)
+        }
+        printable = false
+    }
+    if !printable {
+        if key.code != term.KEY_BACKSPACE {
+            fuss_jump_init(mut f)
+            return (false, sel)
+        }
+    } else {
+        if !f.jump_armed {
+            fuss_jump_arm(mut f, now)
+        }
+        if f.jump.len == 0 || now >= f.jump_deadline_ms {
+            f.jump.len = 0
+        }
+        if f.jump.len + 1 < TYPEJUMP_PAT_MAX {
+            f.jump.pat[f.jump.len] = key.text[0]
+            f.jump.len += 1
+            f.jump.pat[f.jump.len] = 0 as byte
+        }
+        f.jump_deadline_ms = now + TYPEJUMP_RESET_MS
+        f.jump.deadline_ms = f.jump_deadline_ms
+    }
+    if n == 0 || sel < 0 {
+        return (true, sel)
+    }
+    if sel < n {
+        let here = ws.fz_score(f.jump.pat, 0, f.jump.len, labels[sel], 0, labels[sel].len)
+        if here >= 10000 {
+            return (true, sel)
+        }
+    }
+    let ranked = ws.fz_rank(f.jump.pat, 0, f.jump.len, labels, true)
+    if ranked.len != 0 {
+        sel = ranked[0].idx
+    }
+    (true, sel)
+}
+
+/// `yew_fuss_jump_tick` (`fussmode.c:400-406`): the window self-clears.
+pub fn fuss_jump_tick(mut f: FussMode, now: int) -> bool {
+    if !f.jump_armed || now < f.jump_deadline_ms {
+        return false
+    }
+    fuss_jump_init(mut f)
+    true
+}
+
+// ------------------------------------------------------------------
+// Damage, rows, the selection
+// ------------------------------------------------------------------
+
+// `fuss_damage` (`fussmode.c:420-426`).
+fn fuss_damage(mut ed: Ed) {
+    ed.fuss.draw_dirty = true
+    ed.footer_dirty = true
+}
+
+/// `yew_fuss_active` (`fussmode.c:1046-1049`).
+pub fn fuss_active(ed: Ed) -> bool {
+    ed.fuss.active
+}
+
+// `fuss_row` (`fussmode.c:721-724`).
+fn fuss_row(ed: Ed) -> int {
+    git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+}
+
+fn fuss_item_ok(ed: Ed, row: int) -> bool {
+    row >= 0 &&
+        row < ed.fuss.tree.items.len &&
+        ed.fuss.tree.items[row].node < ed.fuss.tree.nodes.len
+}
+
+// `fuss_select_row` (`fussmode.c:740-745`).
+fn fuss_select_row(mut ed: Ed, row: int) {
+    git.fuss_sel_from_row(mut ed.fuss.sel, ed.fuss.tree, row)
+}
+
+/// Row `row`'s path bytes (C's `item->path`).
+pub fn fuss_row_path(ed: Ed, row: int) -> List[byte] {
+    git.fuss_item_path(ed.fuss.tree, row)
+}
+
+// ------------------------------------------------------------------
+// The open files and the effective expansion (`fussmode.c:747-935`)
+// ------------------------------------------------------------------
+
+// `fuss_relative_path_valid` (`fussmode.c:760-781`).
+fn fuss_relative_path_valid(p: List[byte], at: int, len: int) -> bool {
+    if len == 0 || p[at] as int == 47 {
+        return false
+    }
+    var i = at
+    let end = at + len
+    while i < end {
+        let start = i
+        while i < end && p[i] as int != 47 {
+            i += 1
+        }
+        let part = i - start
+        if part == 0 ||
+            part == 1 && p[start] as int == 46 ||
+            part == 2 && p[start] as int == 46 && p[start + 1] as int == 46 {
+            return false
+        }
+        i += 1
+    }
+    p[end - 1] as int != 47
+}
+
+// `fuss_open_scratch_push` (`fussmode.c:783-830`): `path` made
+// workspace-relative under `root` and recorded.
+fn fuss_open_scratch_push(mut s: git.GitPaths, path: str, root: str) {
+    if path.len == 0 {
+        return
+    }
+    let pb = path.bytes()
+    let rb = root.bytes()
+    var at = 0
+    var len = pb.len
+    var ok = false
+    if pb[0] as int != 47 {
+        while len >= 2 && pb[at] as int == 46 && pb[at + 1] as int == 47 {
+            at += 2
+            len -= 2
+        }
+        ok = true
+    } else if rb.len == 1 && rb[0] as int == 47 && pb.len > 1 {
+        at = 1
+        len = pb.len - 1
+        ok = true
+    } else if rb.len != 0 && pb.len > rb.len + 1 && pb[rb.len] as int == 47 {
+        var same = true
+        var i = 0
+        while i < rb.len {
+            if pb[i] != rb[i] {
+                same = false
+                break
+            }
+            i += 1
+        }
+        if same {
+            at = rb.len + 1
+            len = pb.len - rb.len - 1
+            ok = true
+        }
+    }
+    if !ok || !fuss_relative_path_valid(pb, at, len) {
+        return
+    }
+    let start = git.git_pool_add(mut s.pool, pb, at, at + len)
+    (mut s.tmp).push(git.GitPathRow { at: start, len: len, is_dir: false })
+}
+
+// `fuss_collect_pane_paths` (`fussmode.c:832-850`).
+fn fuss_collect_pane_paths(mut ed: Ed, root: int, workspace: str) {
+    if !pane_live(ed, root) {
+        return
+    }
+    let leaves = pane_collect_leaves(ed, root, PANE_MAX_LEAVES)
+    for l in leaves {
+        let w = ed.panes[l].win
+        if w < 0 || w >= ed.wins.len {
+            continue
+        }
+        let b = ed.wins[w].buf
+        if b >= 0 && b < ed.bufs.len && ed.bufs[b].flags & BUF_SCRATCH == 0 && ed.bufs[b].has_path {
+            let p = copy ed.bufs[b].path
+            fuss_open_scratch_push(mut ed.fuss.open_scratch, p, workspace)
+        }
+    }
+}
+
+// `fuss_open_files_refresh` (`fussmode.c:852-906`): every tab's path and
+// every pane's file, workspace-relative, sorted and unique; true when
+// the set changed (the memory rebuilt from it).
+fn fuss_open_files_refresh(mut ed: Ed) -> bool {
+    let workspace = shell_ws_root(ed)
+    git.git_paths_reset(mut ed.fuss.open_scratch)
+    var t = 0
+    while t < ed.tabs.len {
+        if ed.tabs[t].has_path {
+            let p = copy ed.tabs[t].path
+            fuss_open_scratch_push(mut ed.fuss.open_scratch, p, workspace)
+        }
+        let root = ed.tabs[t].root
+        fuss_collect_pane_paths(mut ed, root, workspace)
+        t += 1
+    }
+    let pr = ed.pane_root
+    fuss_collect_pane_paths(mut ed, pr, workspace)
+    git.git_paths_sort(mut ed.fuss.open_scratch)
+    // Unique, in place.
+    var unique = 0
+    var i = 0
+    let n = ed.fuss.open_scratch.rows.len
+    while i < n {
+        let r = copy ed.fuss.open_scratch.rows[i]
+        if unique != 0 {
+            let u = copy ed.fuss.open_scratch.rows[unique - 1]
+            if git.git_span_cmp(
+                ed.fuss.open_scratch.pool,
+                u.at,
+                u.len,
+                ed.fuss.open_scratch.pool,
+                r.at,
+                r.len,
+            ) ==
+                0 {
+                i += 1
+                continue
+            }
+        }
+        ed.fuss.open_scratch.rows[unique] = r
+        unique += 1
+        i += 1
+    }
+    while ed.fuss.open_scratch.rows.len > unique {
+        let _ = (mut ed.fuss.open_scratch.rows).pop() else git.GitPathRow {
+            at: 0,
+            len: 0,
+            is_dir: false,
+        }
+    }
+    var changed = ed.fuss.open_files.rows.len != unique
+    i = 0
+    while !changed && i < unique {
+        let old = copy ed.fuss.open_files.rows[i]
+        let now = copy ed.fuss.open_scratch.rows[i]
+        changed = git.git_span_cmp(
+            ed.fuss.open_files.pool,
+            old.at,
+            old.len,
+            ed.fuss.open_scratch.pool,
+            now.at,
+            now.len,
+        ) !=
+            0
+        i += 1
+    }
+    if !changed {
+        return false
+    }
+    git.fuss_open_memory_clear(mut ed.fuss.open_files)
+    i = 0
+    while i < unique {
+        let r = copy ed.fuss.open_scratch.rows[i]
+        let _ = git.fuss_open_memory_set(
+            mut ed.fuss.open_files,
+            ed.fuss.open_scratch.pool,
+            r.at,
+            r.len,
+            true,
+        )
+        i += 1
+    }
+    true
+}
+
+// `fuss_apply_effective` (`fussmode.c:908-935`): the manual memory and
+// the open files' ancestry applied; a changed natural width relayouts.
+fn fuss_apply_effective(mut ed: Ed) {
+    let old = ed.fuss.natural_cols
+    let manual = copy ed.fuss.manual_open
+    let open = copy ed.fuss.open_files
+    git.fuss_apply_expansion(mut ed.fuss.tree, manual, open)
+    ed.fuss.natural_cols = fuss_tree_natural_width(ed.fuss.tree)
+    if ed.fuss.natural_cols != old {
+        ed.fuss.backdrop_dirty = true
+        ed.layout_dirty = true
+        ed.full_damage = true
+    }
+}
+
+// `fuss_build` (`fussmode.c:937-960`): the tree from snapshot `live`
+// (unless `force` is off and it was built from this generation), the
+// walk's files merged, the expansion applied, the selection kept.
+fn fuss_build(mut ed: Ed, live: int, force: bool) {
+    if git_repo_ready(ed) && ed.git.repo.has_top {
+        let top = ed.git.repo.top_level
+        let _ = git.fuss_tree_scope_roots(mut ed.fuss.tree, top, shell_ws_root(ed))
+    }
+    if !force && ed.fuss.tree.snap_gen == ed.git.snap[live].gen {
+        return
+    }
+    let o = copy ed.fuss.opts
+    git.fuss_build(mut ed.fuss.tree, ed.git.snap[live], o)
+    fuss_rebase_progress_update(mut ed, live)
+    if ed.fuss.opts.all_files && !ed.fuss.has_walk && ed.fuss.files.paths.len != 0 {
+        let files = copy ed.fuss.files
+        let _ = git.fuss_merge_files(mut ed.fuss.tree, files, ed.git.snap[live], o)
+    }
+    let _ = fuss_open_files_refresh(mut ed)
+    fuss_apply_effective(mut ed)
+    if fuss_row(ed) < 0 && ed.fuss.tree.items.len != 0 {
+        fuss_select_row(mut ed, 0)
+    }
+    ed.fuss.scroll = 0
+    fuss_damage(mut ed)
+}
+
+/// `yew_fuss_workspace_changed` (`fussmode.c:1027-1044`): a new
+/// workspace forgets both memories.
+pub fn fuss_workspace_changed(mut ed: Ed) {
+    git.fuss_open_memory_clear(mut ed.fuss.manual_open)
+    git.fuss_open_memory_clear(mut ed.fuss.open_files)
+    git.git_paths_reset(mut ed.fuss.open_scratch)
+    if ed.fuss.active {
+        let _ = fuss_open_files_refresh(mut ed)
+        fuss_apply_effective(mut ed)
+        fuss_damage(mut ed)
+    }
+}
+
+// The walk's end: its files merged into the tree (`fussmode.c:1088-1100`,
+// `:1171-1185`).
+fn fuss_walk_finish(mut ed: Ed, live: int) {
+    ws.walk_end(mut ed.fuss.walk)
+    ed.fuss.has_walk = false
+    ed.fuss.files = copy ed.fuss.walk.out
+    let o = copy ed.fuss.opts
+    let files = copy ed.fuss.files
+    if git.fuss_merge_files(mut ed.fuss.tree, files, ed.git.snap[live], o) {
+        let _ = fuss_open_files_refresh(mut ed)
+        fuss_apply_effective(mut ed)
+        if fuss_row(ed) < 0 && ed.fuss.tree.items.len != 0 {
+            fuss_select_row(mut ed, 0)
+        }
+        fuss_damage(mut ed)
+    }
+}
+
+/// `yew_fuss_mode_enter` (`fussmode.c:1051-1104`): the glyph option read,
+/// a first entry's options, the deterministic loading frame, the saved
+/// buffer, the walk restarted; the tree built from what is published; a
+/// refresh requested.
+pub fn fuss_mode_enter(mut ed: Ed) -> int {
+    let ov = opt_get(ed, -1, -1, "git.ascii_glyphs") else optv_bool(false)
+    if ov.t == OPT_BOOL {
+        ed.fuss.ascii_glyphs = ov.b
+    }
+    if !ed.fuss.active {
+        ed.fuss.opts.all_files = state_option_bool(ed, "git.tree.all_files", true)
+        ed.fuss.opts.show_hidden = state_option_bool(ed, "git.tree.show_hidden", false)
+        ed.fuss.active = true
+        // F mode owns a deterministic loading frame even when s53's
+        // consumers have already warmed the cache (`fussmode.c:1066-1070`).
+        ed.fuss.opening = true
+        ed.fuss.opening_until_ms = if ed.now_ms > I64_MAX - FUSS_OPENING_FRAME_MS {
+            I64_MAX
+        } else {
+            ed.now_ms + FUSS_OPENING_FRAME_MS
+        }
+        ed.fuss.saved_buffer_id = if ed.win >= 0 && ed.wins[ed.win].buf >= 0 {
+            ed.bufs[ed.wins[ed.win].buf].id
+        } else {
+            0
+        }
+        ed.fuss.backdrop_dirty = true
+        ed.fuss.seen_detect_state = git_detect_state(ed)
+        ed.fuss.seen_detect_result = git_detect_result(ed)
+        ed.layout_dirty = true
+        ed.full_damage = true
+        fuss_walk_restart(mut ed)
+    }
+    let live = git_snapshot(mut ed)
+    fuss_build(mut ed, live, false)
+    if ed.fuss.has_walk && !ws.walk_step(mut ed.fuss.walk, 2000) {
+        fuss_walk_finish(mut ed, live)
+    }
+    let _ = git_refresh(mut ed, false)
+    fuss_damage(mut ed)
+    CMD_OK
+}
+
+/// `yew_fuss_mode_leave` (`fussmode.c:1106-1122`): not while the commit
+/// scratch owns focus.
+pub fn fuss_mode_leave(mut ed: Ed) {
+    if ed.fuss.commit_editing {
+        return
+    }
+    ed.fuss.active = false
+    fuss_expand_clear(mut ed)
+    fuss_jump_init(mut ed.fuss)
+    fuss_viewer_close(mut ed)
+    ed.layout_dirty = true
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+/// `yew_fuss_footer_rows` (`fussmode.c:1124-1127`).
+pub fn fuss_footer_rows(ed: Ed) -> int {
+    if fuss_active(ed) then 2 else 0
+}
+
+/// `yew_fuss_tick` (`fussmode.c:1129-1189`): a result delivered, the
+/// opening frame expired, detection changes repainted, the tree rebuilt
+/// from a new generation, the idle hook rearmed after a mutation's final
+/// refresh, the walk and the untracked scan stepped, the jump expired.
+pub fn fuss_tick(mut ed: Ed, now: int) {
+    fuss_result_tick(mut ed)
+    if !fuss_active(ed) {
+        return
+    }
+    if ed.fuss.opening && now >= ed.fuss.opening_until_ms {
+        ed.fuss.opening = false
+        fuss_damage(mut ed)
+    }
+    let ds = git_detect_state(ed)
+    let dr = git_detect_result(ed)
+    if ds != ed.fuss.seen_detect_state || dr != ed.fuss.seen_detect_result {
+        // Detection owns the header and the footer; a completion after the
+        // opening frame must repaint the header's `loading` suffix.
+        ed.fuss.seen_detect_state = ds
+        ed.fuss.seen_detect_result = dr
+        fuss_damage(mut ed)
+    }
+    let live = git_snapshot(mut ed)
+    fuss_build(mut ed, live, false)
+    if ed.fuss.mutation_snapshot_pending &&
+        ed.git.snap[live].gen != ed.fuss.mutation_snapshot_gen &&
+        !git_refresh_busy(ed) {
+        // The idle hook is the public observation point for asynchronous
+        // FUSS state, rearmed only after the mutation's final refresh.
+        ed.fuss.mutation_snapshot_pending = false
+        ed.flrt.idle_pending = true
+        ed.flrt.idle_fired = false
+    }
+    if ed.fuss.has_walk && !ws.walk_step(mut ed.fuss.walk, 2000) {
+        fuss_walk_finish(mut ed, live)
+    }
+    fuss_expand_tick(mut ed)
+    if fuss_jump_tick(mut ed.fuss, now) {
+        ed.footer_dirty = true
+    }
+}
+
+/// `yew_fuss_deadline` (`fussmode.c:1191-1214`): the opening frame, a
+/// walk or scan to step (0), the jump's expiry; -1 for none.
+pub fn fuss_deadline(ed: Ed, now: int) -> int {
+    if !ed.fuss.active {
+        return -1
+    }
+    if ed.fuss.opening {
+        if ed.fuss.opening_until_ms <= now {
+            return 0
+        }
+        return ed.fuss.opening_until_ms - now
+    }
+    if ed.fuss.has_walk || ed.fuss.has_expand_walk {
+        return 0
+    }
+    if !ed.fuss.jump_armed {
+        return -1
+    }
+    if ed.fuss.jump_deadline_ms <= now {
+        return 0
+    }
+    ed.fuss.jump_deadline_ms - now
+}
+
+/// `yew_fuss_key` (`fussmode.c:1236-1278`): type-to-jump in F mode only
+/// (the commit scratch's Insert input is not FUSS's), never inside a
+/// structural chord (`C-w s`'s tail reaches the keymap); a non-printable
+/// key disarms and falls through to dispatch.
+pub fn fuss_key(mut ed: Ed, key: term.Key, now: int) -> bool {
+    if !fuss_active(ed) || ed.mode != MODE_F {
+        return false
+    }
+    if ed.chord.n != 0 {
+        return false
+    }
+    if !fuss_jump_printable(key) && key.code != term.KEY_BACKSPACE {
+        if ed.fuss.jump_armed {
+            fuss_jump_init(mut ed.fuss)
+            ed.footer_dirty = true
+        }
+        return false
+    }
+    if !ed.fuss.jump_armed && key.code == term.KEY_BACKSPACE {
+        return false
+    }
+    var labels = List[List[byte]]()
+    var i = 0
+    while i < ed.fuss.tree.items.len {
+        (mut labels).push(git.fuss_item_path(ed.fuss.tree, i))
+        i += 1
+    }
+    if labels.len == 0 {
+        let (consumed, _) = fuss_jump_key(mut ed.fuss, key, now, labels, -1)
+        if consumed {
+            fuss_damage(mut ed)
+        }
+        return consumed
+    }
+    let r = fuss_row(ed)
+    let row = if r < 0 then 0 else r
+    let (consumed, got) = fuss_jump_key(mut ed.fuss, key, now, labels, row)
+    if consumed && got >= 0 && got < labels.len {
+        fuss_select_row(mut ed, got)
+        fuss_damage(mut ed)
+    }
+    consumed
+}
+
+// ------------------------------------------------------------------
+// The viewer and the commit view (`fussmode.c:177-298`, `:428-565`)
+// ------------------------------------------------------------------
+
+// `fuss_viewer_close` (`fussmode.c:177-194`).
+fn fuss_viewer_close(mut ed: Ed) {
+    if ed.fuss.viewer {
+        let owner = ed_win_by_id(ed, ed.fuss.viewer_win_id)
+        if owner >= 0 {
+            panel_close(mut ed, owner)
+        }
+    }
+    ed.fuss.viewer = false
+    ed.fuss.viewer_win_id = 0
+    ed.fuss.viewer_buffer_id = 0
+    fuss_damage(mut ed)
+}
+
+/// Buffer `bi`'s bytes (`fuss_buffer_bytes`, `fussmode.c:2657-2684`).
+pub fn fuss_buffer_bytes(ed: Ed, bi: int) -> List[byte] {
+    text.textbuf_bytes(ed.bufs[bi].ec.tb)
+}
+
+// `fuss_viewer_open` (`fussmode.c:196-298`): buffer `bi` in the floating
+// panel — centred in the content area for a fullscreen drawer, else
+// anchored beside the drawer at the editor's top; a viewer with no room
+// is recorded open with nothing drawn.
+fn fuss_viewer_open(mut ed: Ed, bi: int) -> bool {
+    if bi < 0 || !ed.fuss.active || ed.win < 0 {
+        return false
+    }
+    let body = fuss_buffer_bytes(ed, bi)
+    var spec = panel_spec_new()
+    spec.title = if ed.bufs[bi].has_name then ed.bufs[bi].name else "preview"
+    spec.body = body
+    let content = fuss_backdrop_rect(ed)
+    let drawer = fuss_drawer_rect(ed)
+    let layout = fuss_drawer_layout(ed.grid.cols, ed.fuss.natural_cols)
+    let w = ed.win
+    if layout.fullscreen {
+        var area = copy content
+        if content.w < 3 || content.h < 3 {
+            ed.fuss.viewer = true
+            ed.fuss.viewer_win_id = ed.wins[w].id
+            ed.fuss.viewer_buffer_id = ed.bufs[bi].id
+            return true
+        }
+        if area.w > 4 {
+            area.x = area.x + 2
+            area.w = area.w - 4
+        }
+        if area.h > 4 {
+            area.y = area.y + 2
+            area.h = area.h - 4
+        }
+        spec.place = PANEL_CENTER
+        spec.area = copy area
+        spec.has_area = true
+        spec.max_w = if area.w > PANEL_MAX_W then PANEL_MAX_W else area.w
+        spec.max_h = if area.h > PANEL_MAX_H then PANEL_MAX_H else area.h
+        spec.role = "git.ignored"
+        if !panel_open(mut ed, w, spec) {
+            return false
+        }
+        ed.fuss.viewer = true
+        ed.fuss.viewer_win_id = ed.wins[w].id
+        ed.fuss.viewer_buffer_id = ed.bufs[bi].id
+        ed.full_damage = true
+        fuss_damage(mut ed)
+        return true
+    }
+    let area_right = ed.wins[w].rect.x + ed.wins[w].rect.w
+    let drawer_right = drawer.x + drawer.w
+    var anchor_x = ed.wins[w].rect.x
+    if drawer_right > anchor_x && drawer_right <= 65535 {
+        anchor_x = drawer_right
+    }
+    spec.x = anchor_x
+    spec.y = ed.wins[w].rect.y
+    spec.place = PANEL_CURSOR
+    let room = if area_right > anchor_x + 2 then area_right - anchor_x - 2 else 0
+    spec.max_w = if room < PANEL_MAX_W then room else PANEL_MAX_W
+    spec.max_h = PANEL_MAX_H
+    spec.role = "git.ignored"
+    if room == 0 {
+        ed.fuss.viewer = true
+        ed.fuss.viewer_win_id = ed.wins[w].id
+        ed.fuss.viewer_buffer_id = ed.bufs[bi].id
+        return true
+    }
+    if !panel_open(mut ed, w, spec) {
+        return false
+    }
+    ed.fuss.viewer = true
+    ed.fuss.viewer_win_id = ed.wins[w].id
+    ed.fuss.viewer_buffer_id = ed.bufs[bi].id
+    ed.full_damage = true
+    fuss_damage(mut ed)
+    true
+}
+
+/// `fuss_show_buffer` (`fussmode.c:428-431`).
+pub fn fuss_show_buffer(mut ed: Ed, bi: int) -> bool {
+    fuss_viewer_open(mut ed, bi)
+}
+
+// The leaf showing window id `want` in any tab (`fuss_leaf_for_win_id`,
+// `fussmode.c:459-477`), -1 for none.
+fn fuss_leaf_for_win_id(ed: Ed, want: int) -> int {
+    if want == 0 {
+        return -1
+    }
+    var t = 0
+    while t < ed.tabs.len {
+        let root = if t == ed.tab_active && pane_live(ed, ed.pane_root) {
+            ed.pane_root
+        } else {
+            ed.tabs[t].root
+        }
+        if pane_live(ed, root) {
+            for l in pane_collect_leaves(ed, root, PANE_MAX_LEAVES) {
+                let w = ed.panes[l].win
+                if w >= 0 && w < ed.wins.len && ed.wins[w].id == want {
+                    return l
+                }
+            }
+        }
+        t += 1
+    }
+    -1
+}
+
+// `fuss_commit_view_open` (`fussmode.c:433-457`): the focused leaf shows
+// a clone of the live window over the commit buffer; the live window is
+// kept to come back to.
+fn fuss_commit_view_open(mut ed: Ed, bi: int) -> bool {
+    if bi < 0 ||
+        !pane_live(ed, ed.focus) ||
+        !ed.panes[ed.focus].is_leaf ||
+        ed.win < 0 ||
+        ed.panes[ed.focus].win != ed.win {
+        return false
+    }
+    if ed.fuss.commit_win_id != 0 {
+        return false
+    }
+    fuss_viewer_close(mut ed)
+    let w = ed_win_clone(mut ed, ed.win)
+    if w < 0 {
+        return false
+    }
+    ed_win_set_buffer(mut ed, w, bi)
+    ed.fuss.commit_saved_win_id = ed.wins[ed.win].id
+    ed.fuss.commit_win_id = ed.wins[w].id
+    let f = ed.focus
+    ed.panes[f].win = w
+    ed.win = w
+    ed.full_damage = true
+    true
+}
+
+/// `fuss_commit_view_close` (`fussmode.c:479-507`): the saved window put
+/// back in the commit view's leaf, the clone released.
+pub fn fuss_commit_view_close(mut ed: Ed) {
+    let w = ed_win_by_id(ed, ed.fuss.commit_win_id)
+    if w < 0 {
+        return
+    }
+    let saved = ed_win_by_id(ed, ed.fuss.commit_saved_win_id)
+    if saved < 0 {
+        return
+    }
+    let leaf = fuss_leaf_for_win_id(ed, ed.fuss.commit_win_id)
+    if leaf >= 0 {
+        ed.panes[leaf].win = saved
+        if ed.win == w {
+            ed.win = saved
+        }
+    }
+    ed.fuss.commit_win_id = 0
+    ed.fuss.commit_saved_win_id = 0
+    if leaf >= 0 {
+        ed_win_release(mut ed, w)
+    }
+    ed.full_damage = true
+}
+
+/// `yew_fuss_win_releasing` (`fussmode.c:509-535`): a released window the
+/// viewer or the commit view held; the commit's saved window is released
+/// with it and the commit cancelled at the next structural settle.
+pub fn fuss_win_releasing(mut ed: Ed, win_id: int) {
+    if win_id == 0 {
+        return
+    }
+    if ed.fuss.viewer_win_id == win_id {
+        ed.fuss.viewer = false
+        ed.fuss.viewer_win_id = 0
+        ed.fuss.viewer_buffer_id = 0
+    }
+    if ed.fuss.commit_win_id == win_id {
+        let saved = ed_win_by_id(ed, ed.fuss.commit_saved_win_id)
+        ed.fuss.commit_win_id = 0
+        ed.fuss.commit_saved_win_id = 0
+        ed.fuss.commit_editing = false
+        ed.fuss.commit_amend = false
+        ed.fuss.commit_comment = 0
+        ed.fuss.commit_cancel_pending = true
+        if saved >= 0 {
+            ed_win_release(mut ed, saved)
+        }
+    }
+}
+
+/// `yew_fuss_windows_changed` (`fussmode.c:537-565`): the open-file set
+/// and its ancestry re-derived; a commit whose view closed is aborted and
+/// F mode re-entered.
+pub fn fuss_windows_changed(mut ed: Ed) {
+    if ed.fuss.active && fuss_open_files_refresh(mut ed) {
+        fuss_apply_effective(mut ed)
+        let row = fuss_row(ed)
+        if row >= 0 {
+            fuss_select_row(mut ed, row)
+        }
+        fuss_damage(mut ed)
+    }
+    if !ed.fuss.commit_cancel_pending {
+        return
+    }
+    ed.fuss.commit_cancel_pending = false
+    let commit = buf_index_of_id(ed, ed.fuss.commit_buffer_id)
+    ed.fuss.commit_buffer_id = 0
+    if commit >= 0 {
+        ws_scratch_drop(mut ed, commit)
+    }
+    ed_msg(mut ed, MSG_INFO, "commit aborted because its editor view closed")
+    if mode_enter(mut ed, MODE_F) != CMD_OK {
+        let _ = mode_enter(mut ed, MODE_L)
+    }
+}
+
+/// The buffer index of id `id`, -1 for none (C's `yew_ws_buf_by_id`).
+pub fn buf_index_of_id(ed: Ed, id: int) -> int {
+    if id == 0 {
+        return -1
+    }
+    var i = 0
+    while i < ed.bufs.len {
+        if ed.bufs[i].id == id && ed.bufs[i].resident {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `fuss_replace_buffer` (`fussmode.c:567-587`): buffer `bi`'s text
+/// replaced by `bytes` through the edit chokepoint (outside undo for a
+/// `BUF_NOUNDO` buffer).
+pub fn fuss_replace_buffer(mut ed: Ed, bi: int, bytes: List[byte]) -> bool {
+    if bi < 0 || bi >= ed.bufs.len {
+        return false
+    }
+    let had_undo = ed.bufs[bi].ec.has_undo
+    if ed.bufs[bi].flags & BUF_NOUNDO != 0 {
+        ed.bufs[bi].ec.has_undo = false
+    }
+    let shown = ed.win >= 0 && ed.wins[ed.win].buf == bi
+    let w = ed.win
+    if shown {
+        edit_take(mut ed, w)
+    }
+    var ok = true
+    let old = text.textbuf_len(ed.bufs[bi].ec.tb)
+    if old != 0 {
+        ok = text.edit_delete(mut ed.bufs[bi].ec, text.span(0, old))
+    }
+    if ok && bytes.len != 0 {
+        ok = text.edit_insert_part(mut ed.bufs[bi].ec, 0 as text.ByteOff, bytes, 0, bytes.len)
+    }
+    if shown {
+        edit_give(mut ed, w)
+    }
+    ed.bufs[bi].ec.has_undo = had_undo
+    ed.full_damage = true
+    ok
+}
+
+/// `fuss_show_result` (`fussmode.c:589-607`): the result's stdout in
+/// `*git-view*`, shown in the viewer.
+pub fn fuss_show_result(mut ed: Ed) {
+    var bi = ws_scratch_find(ed, "*git-view*")
+    if bi < 0 {
+        bi = ws_scratch_new(mut ed, "*git-view*", BUF_NOUNDO | BUF_READONLY)
+    }
+    if bi < 0 {
+        return
+    }
+    let out = copy ed.git.result.out
+    if !fuss_replace_buffer(mut ed, bi, out) {
+        ed_msg(mut ed, MSG_ERROR, "could not update Git viewer buffer")
+        return
+    }
+    text.undo_mark_saved(mut ed.bufs[bi].ec.undo, ed.bufs[bi].ec.tb)
+    let _ = fuss_show_buffer(mut ed, bi)
+}
+
+fn fuss_bytes_has(bytes: List[byte], needle: str) -> bool {
+    let nb = needle.bytes()
+    if nb.len == 0 || bytes.len < nb.len {
+        return false
+    }
+    var at = 0
+    while at + nb.len <= bytes.len {
+        var k = 0
+        while k < nb.len && bytes[at + k] == nb[k] {
+            k += 1
+        }
+        if k == nb.len {
+            return true
+        }
+        at += 1
+    }
+    false
+}
+
+// `fuss_result_tick` (`fussmode.c:624-719`): the pending verb's result,
+// once: a mutation records the generation the idle hook waits past; a
+// pick continues its picker; a view shows its output; otherwise the
+// verb's completion or its stderr on the message line.
+fn fuss_result_tick(mut ed: Ed) {
+    if ed.fuss.pending_job == 0 {
+        return
+    }
+    if ed.git.result.job_id != ed.fuss.pending_job ||
+        ed.git.result.job_id == ed.fuss.seen_result_job {
+        return
+    }
+    ed.fuss.seen_result_job = ed.git.result.job_id
+    ed.fuss.pending_job = 0
+    let pick = ed.fuss.pending_pick
+    ed.fuss.pending_pick = FUSS_PICK_NONE
+    let verb = ed.git.result.verb
+    let state = ed.git.result.state
+    if state == git.GIT_OK {
+        let v = git_verb(ed, verb)
+        if v >= 0 && ed.git.verbs[v].kind != GV_READ {
+            ed.fuss.mutation_snapshot_gen = if git_snapshot_cached(ed) {
+                ed.git.snap[ed.git.live].gen
+            } else {
+                0
+            }
+            ed.fuss.mutation_snapshot_pending = true
+        }
+        if pick == FUSS_PICK_COMMIT_AMEND {
+            let out = copy ed.git.result.out
+            let _ = fuss_commit_begin(mut ed, true, out)
+        } else if pick == FUSS_PICK_REBASE_CONFIRM {
+            fuss_show_result(mut ed)
+            ed.fuss.prompt_action = FUSS_PROMPT_REBASE
+            cmdline_open_input(mut ed, "", INPUT_DONE_FUSS, 0)
+            if ed.cmdline.active {
+                ed_msg(mut ed, MSG_WARN, "review the rebase range, then type 'rebase' to continue")
+            } else {
+                fuss_prompt_clear(mut ed)
+            }
+        } else if pick != FUSS_PICK_NONE {
+            let _ = fuss_picker_result(mut ed, pick)
+        } else if ed.fuss.pending_view {
+            fuss_show_result(mut ed)
+        } else {
+            ed_msg(mut ed, MSG_INFO, "{if verb.len == 0 then "git" else verb} complete")
+        }
+        if verb == "branch-delete" && ed.fuss.prompt_action == FUSS_PROMPT_NONE {
+            ed.fuss.prompt_path = ""
+            ed.fuss.has_prompt_path = false
+        }
+    } else if verb == "branch-delete" &&
+        ed.fuss.has_prompt_path &&
+        ed.fuss.prompt_action == FUSS_PROMPT_NONE &&
+        fuss_bytes_has(ed.git.result.err, "not fully merged") {
+        ed.fuss.prompt_action = FUSS_PROMPT_BRANCH_DELETE
+        cmdline_open_input(mut ed, "", INPUT_DONE_FUSS, 0)
+        if ed.cmdline.active {
+            ed_msg(
+                mut ed,
+                MSG_WARN,
+                "force-delete branch {ed.fuss.prompt_path} — type 'delete' to confirm",
+            )
+        } else {
+            fuss_prompt_clear(mut ed)
+        }
+    } else if ed.git.result.err.len != 0 {
+        let err = copy ed.git.result.err
+        ed_msg_bytes(mut ed, MSG_ERROR, err)
+    } else {
+        ed_msg(mut ed, MSG_ERROR, git.git_state_str(state))
+    }
+    if state != git.GIT_OK && verb == "branch-delete" && ed.fuss.prompt_action == FUSS_PROMPT_NONE {
+        ed.fuss.prompt_path = ""
+        ed.fuss.has_prompt_path = false
+    }
+    if state != git.GIT_OK && pick == FUSS_PICK_REBASE_CONFIRM {
+        fuss_prompt_clear(mut ed)
+    }
+    if state != git.GIT_OK && pick == FUSS_PICK_REMOTE_CHECK {
+        fuss_picker_open(mut ed, FUSS_PICK_REMOTE, "remote")
+    }
+    ed.fuss.pending_view = false
+    fuss_damage(mut ed)
+}
+
+// ------------------------------------------------------------------
+// The observers (`fussmode.c:1733-1917`, s57.13 §3–§4)
+// ------------------------------------------------------------------
+
+/// The interned id of `path` (C's `yew_intern(&ed->interner, …)`), 0 when
+/// it cannot be a payload.
+pub fn fuss_path_id(mut ed: Ed, path: List[byte]) -> int {
+    let id = util.intern_bytes(mut ed.fuss.paths, path, 0, path.len)
+    if id <= 0 || id > 2147483647 then 0 else id
+}
+
+/// The path interned as `id` (C's `yew_intern_str`).
+pub fn fuss_path_of_id(ed: Ed, id: int) -> (bool, List[byte]) {
+    if id <= 0 {
+        return (false, List[byte]())
+    }
+    let s = util.intern_str(ed.fuss.paths, id) else { return (false, List[byte]()) }
+    var out = List[byte]()
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+    (true, out)
+}
+
+// `fuss_item_by_path_id` (`fussmode.c:1733-1755`): the row a region
+// payload names (an interned PATH, not a row index: the tree rebuilds
+// under the pointer), -1 for none.
+fn fuss_item_by_path_id(ed: Ed, id: int) -> int {
+    if !fuss_active(ed) || id == 0 {
+        return -1
+    }
+    let (ok, path) = fuss_path_of_id(ed, id)
+    if !ok || path.len == 0 {
+        return -1
+    }
+    var i = 0
+    while i < ed.fuss.tree.items.len {
+        if git.fuss_item_path_eq(ed.fuss.tree, i, path, 0, path.len) {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_fuss_path_is_dir` (`fussmode.c:1757-1765`): (known, is_dir), from
+/// the tree, never from the path text.
+pub fn fuss_path_is_dir(ed: Ed, id: int) -> (bool, bool) {
+    let row = fuss_item_by_path_id(ed, id)
+    if row < 0 {
+        return (false, false)
+    }
+    (true, !ed.fuss.tree.items[row].is_file)
+}
+
+fn fuss_node_target(ed: Ed, row: int) -> FussTarget {
+    var out = fuss_target_none()
+    let n = copy ed.fuss.tree.nodes[ed.fuss.tree.items[row].node]
+    out.known = true
+    // Status is known because the node is in the tree, not because
+    // anything below it is dirty (`fussmode.c:1781-1787`).
+    out.status_known = true
+    out.is_file = n.is_file
+    out.staged = n.staged
+    out.unstaged = n.unstaged
+    out.untracked = n.untracked
+    out.incoming = n.incoming
+    out.conflicted = n.conflicted
+    out.expanded = !n.is_file && n.expanded
+    out
+}
+
+/// `yew_fuss_path_target` (`fussmode.c:1767-1796`).
+pub fn fuss_path_target(ed: Ed, id: int) -> (bool, FussTarget) {
+    let row = fuss_item_by_path_id(ed, id)
+    if row < 0 || !fuss_item_ok(ed, row) {
+        return (false, fuss_target_none())
+    }
+    (true, fuss_node_target(ed, row))
+}
+
+/// `yew_fuss_state` (`fussmode.c:1798-1833`).
+pub fn fuss_state(ed: Ed) -> (bool, FussState) {
+    var out = FussState {
+        path: List[byte](),
+        active: false,
+        known: false,
+        is_file: false,
+        staged: false,
+        unstaged: false,
+        untracked: false,
+        expanded: false,
+        actions_open: false,
+        clean: false,
+    }
+    if !fuss_active(ed) {
+        return (false, out)
+    }
+    out.active = true
+    let row = fuss_row(ed)
+    if fuss_item_ok(ed, row) {
+        let n = copy ed.fuss.tree.nodes[ed.fuss.tree.items[row].node]
+        out.path = git.fuss_item_path(ed.fuss.tree, row)
+        out.known = true
+        out.is_file = n.is_file
+        out.staged = n.staged
+        out.unstaged = n.unstaged
+        out.untracked = n.untracked
+        out.expanded = !n.is_file && n.expanded
+    }
+    out.actions_open = ed.fuss.picker_action == FUSS_PICK_ACTIONS && picker_active(ed)
+    let s = ed.git.live
+    let st = ed.git.snap[s].state
+    out.clean = git_snapshot_cached(ed) &&
+        ed.git.snap[s].entries.len == 0 &&
+        (
+            st == git.GIT_OK ||
+                st == git.GIT_NO_HEAD ||
+                st == git.GIT_DETACHED ||
+                st == git.GIT_NO_UPSTREAM
+        )
+    (true, out)
+}
+
+/// `yew_fuss_selected_anchor` (`fussmode.c:1835-1869`): the selected row's
+/// path id and its cell (the drawer's header row is the +1, the same
+/// arithmetic the draw places regions with); (false, …) when scrolled out.
+pub fn fuss_selected_anchor(mut ed: Ed) -> (bool, int, int, int) {
+    if !fuss_active(ed) {
+        return (false, 0, 0, 0)
+    }
+    let tree = fuss_drawer_rect(ed)
+    if tree.w == 0 || tree.h == 0 {
+        return (false, 0, 0, 0)
+    }
+    let row = fuss_row(ed)
+    if !fuss_item_ok(ed, row) || row < ed.fuss.scroll {
+        return (false, 0, 0, 0)
+    }
+    let offset = row - ed.fuss.scroll
+    if offset + 1 >= tree.h {
+        return (false, 0, 0, 0)
+    }
+    let path = git.fuss_item_path(ed.fuss.tree, row)
+    let id = fuss_path_id(mut ed, path)
+    if id == 0 {
+        return (false, 0, 0, 0)
+    }
+    (true, id, tree.x, tree.y + 1 + offset)
+}
+
+/// `yew_fuss_select_path` (`fussmode.c:1871-1885`): selecting is not
+/// opening.
+pub fn fuss_select_path(mut ed: Ed, id: int) {
+    let row = fuss_item_by_path_id(ed, id)
+    if row < 0 {
+        return
+    }
+    let path = git.fuss_item_path(ed.fuss.tree, row)
+    git.fuss_sel_set(mut ed.fuss.sel, path, 0, path.len)
+    fuss_damage(mut ed)
+}
+
+/// `yew_fuss_scroll` (`fussmode.c:1887-1916`): the wheel moves THROUGH
+/// the selection (the scroll offset is derived from it every draw).
+pub fn fuss_scroll(mut ed: Ed, rows: int) {
+    if !fuss_active(ed) || rows == 0 || ed.fuss.tree.items.len == 0 {
+        return
+    }
+    let last = ed.fuss.tree.items.len - 1
+    var row = fuss_row(ed)
+    if row < 0 {
+        row = 0
+    }
+    row += rows
+    if row < 0 {
+        row = 0
+    }
+    if row > last {
+        row = last
+    }
+    fuss_select_row(mut ed, row)
+    fuss_damage(mut ed)
+}
+
+/// `yew_fuss_draw_dirty` (`fussmode.c:1918-1921`).
+pub fn fuss_draw_dirty(ed: Ed) -> bool {
+    fuss_active(ed) && ed.fuss.draw_dirty
+}
+
+/// `yew_fuss_state_free` (`fussmode.c:984-1025`).
+pub fn fuss_state_free(mut ed: Ed) {
+    fuss_commit_view_close(mut ed)
+    ed.fuss.commit_editing = false
+    ed.fuss.active = false
+    if ed.fuss.preview_job != 0 {
+        let _ = job_signal(mut ed, ed.fuss.preview_job, signal.terminate())
+    }
+    if ed.fuss.has_walk {
+        ws.walk_end(mut ed.fuss.walk)
+        ed.fuss.has_walk = false
+    }
+    fuss_expand_clear(mut ed)
+}
