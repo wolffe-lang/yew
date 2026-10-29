@@ -1,0 +1,759 @@
+//! edit.fussdraw — the FUSS drawer's geometry and drawing.
+//!
+//! Ports `fussmode.c:1280-2092` at 9ace98c2 (s52 §§ the drawer, the glyph
+//! table, the legend; s57.5–s57.7's locked layout table): the drawer's
+//! width from the tree's natural width, its edge, the dimmed backdrop,
+//! the header (title · branch, divergence, rebase progress), one row per
+//! visible item with its markers and its region, and the two-row FUSS
+//! footer.
+
+use git
+use term
+use unicode
+
+// `fuss_put_bytes` (`fussmode.c:1280-1293`): bytes clipped to the cells
+// left before `right`; answers the next column.
+fn fd_put(
+    mut g: term.Grid,
+    row: int,
+    col: int,
+    right: int,
+    b: List[byte],
+    at: int,
+    end: int,
+    fg: term.Color,
+    bg: term.Color,
+    attrs: int,
+) -> int {
+    if col >= right || end <= at {
+        return col
+    }
+    let (clipped, cells) = unicode.str_clip(b, at, end, right - col)
+    if clipped == 0 || cells <= 0 {
+        return col
+    }
+    term.grid_puts(mut g, row, col, b, at, at + clipped, fg, bg, attrs)
+}
+
+fn fd_lit(
+    mut g: term.Grid,
+    row: int,
+    col: int,
+    right: int,
+    s: str,
+    fg: term.Color,
+    bg: term.Color,
+    attrs: int,
+) -> int {
+    let b = s.bytes()
+    fd_put(mut g, row, col, right, b, 0, b.len, fg, bg, attrs)
+}
+
+// `fuss_base_style` (`fussmode.c:1303-1322`).
+fn fd_base_style(ed: Ed) -> ThemeEnt {
+    let r = theme_rendition_of(ed.render)
+    var style = ThemeEnt { fg: term.color_rgb(218, 229, 240), bg: term.color_default(), attrs: 0 }
+    let (hf, fg) = theme_ui(ed.theme, "fg", r)
+    if hf {
+        style.fg = copy fg.fg
+        style.attrs = fg.attrs
+    }
+    let (hb, bg) = theme_ui(ed.theme, "bg", r)
+    if hb {
+        style.bg = copy bg.bg
+        style.attrs = style.attrs | bg.attrs
+    }
+    style
+}
+
+// `fuss_surface_style` (`fussmode.c:1324-1329`).
+fn fd_surface_style(ed: Ed) -> ThemeEnt {
+    let (has, t) = theme_ui(ed.theme, "git.drawer", theme_rendition_of(ed.render))
+    if has then t else fd_base_style(ed)
+}
+
+// `fuss_role_style` (`fussmode.c:1331-1341`): the role's fg and attrs
+// over the fallback's bg.
+fn fd_role_style(ed: Ed, role: str, fallback: ThemeEnt) -> ThemeEnt {
+    var out = copy fallback
+    let (has, t) = theme_ui(ed.theme, role, theme_rendition_of(ed.render))
+    if has {
+        out.fg = copy t.fg
+        out.attrs = out.attrs | t.attrs
+    }
+    out
+}
+
+/// `yew_fuss_tree_natural_width` (`fussmode.c:1624-1654`): the widest
+/// visible row: the lead cell, the indent, the disclosure, the name, two
+/// cells a marker, the trailing cell and the edge.
+pub fn fuss_tree_natural_width(t: git.FussTree) -> int {
+    var widest = 0
+    var i = 0
+    while i < t.items.len {
+        let it = copy t.items[i]
+        if it.node >= t.nodes.len {
+            i += 1
+            continue
+        }
+        let n = copy t.nodes[it.node]
+        var measured = unicode.str_width(t.pool, n.name_at, n.name_at + n.name_len, VP_TABWIDTH)
+        if measured < 0 {
+            measured = 0
+        }
+        let cells = 1 +
+            it.depth * FUSS_INDENT_CELLS +
+            2 +
+            measured +
+            git.fuss_marker_count(n) * 2 +
+            1 +
+            FUSS_DRAWER_EDGE_CELLS
+        if cells > widest {
+            widest = cells
+        }
+        i += 1
+    }
+    if widest > 65535 then 65535 else widest
+}
+
+/// `yew_fuss_drawer_layout` (`fussmode.c:1656-1683`): the locked table —
+/// a quarter of the content (24..64 cells) or the natural width when
+/// wider, fullscreen once that would leave the editor under 40 cells.
+pub fn fuss_drawer_layout(content_cols: int, natural_cols: int) -> FussDrawerLayout {
+    var layout = FussDrawerLayout { width: 0, tree_width: 0, edge_col: -1, fullscreen: true }
+    var base = (content_cols + 3) / 4
+    if base < FUSS_DRAWER_MIN_CELLS {
+        base = FUSS_DRAWER_MIN_CELLS
+    }
+    if base > FUSS_DRAWER_BASE_MAX_CELLS {
+        base = FUSS_DRAWER_BASE_MAX_CELLS
+    }
+    if base > content_cols {
+        base = content_cols
+    }
+    let want = if natural_cols > base then natural_cols else base
+    let overlay_cap = if content_cols > FUSS_EDITOR_RETAIN_CELLS {
+        content_cols - FUSS_EDITOR_RETAIN_CELLS
+    } else {
+        0
+    }
+    if content_cols < FUSS_DRAWER_MIN_CELLS || want > overlay_cap {
+        layout.width = content_cols
+        layout.tree_width = content_cols
+        return layout
+    }
+    layout.width = want
+    layout.tree_width = layout.width - FUSS_DRAWER_EDGE_CELLS
+    layout.edge_col = layout.tree_width
+    layout.fullscreen = false
+    layout
+}
+
+/// `yew_fuss_backdrop_rect` (`fussmode.c:1685-1706`): what the drawer
+/// dims — the editor's area right of it, below the strip, above the
+/// footer (the whole grid above the footer when fullscreen).
+pub fn fuss_backdrop_rect(ed: Ed) -> Rect {
+    let layout = fuss_drawer_layout(ed.grid.cols, ed.fuss.natural_cols)
+    let bottom = if ed.footer_rect.h == 0 then ed.grid.rows else ed.footer_rect.y
+    if layout.fullscreen {
+        return rect(0, 0, ed.grid.cols, bottom)
+    }
+    let drawer = fuss_drawer_rect(ed)
+    let top = ed.tab_strip_rect.y + ed.tab_strip_rect.h
+    rect(
+        drawer.w,
+        top,
+        if ed.grid.cols > drawer.w then ed.grid.cols - drawer.w else 0,
+        if bottom > top then bottom - top else 0,
+    )
+}
+
+/// `yew_fuss_drawer_rect` (`fussmode.c:1708-1718`).
+pub fn fuss_drawer_rect(ed: Ed) -> Rect {
+    let layout = fuss_drawer_layout(ed.grid.cols, ed.fuss.natural_cols)
+    rect(0, 0, layout.width, ed.grid.rows)
+}
+
+// `fuss_edge` (`fussmode.c:1343-1369`): the bright one-cell edge.
+fn fd_edge(mut ed: Ed, drawer: Rect, layout: FussDrawerLayout, rows_in: int) {
+    if layout.fullscreen || layout.edge_col < 0 || rows_in == 0 || layout.edge_col >= drawer.w {
+        return
+    }
+    var fallback = fd_surface_style(ed)
+    fallback.fg = term.color_rgb(255, 255, 255)
+    fallback.attrs = fallback.attrs | term.ATTR_BOLD
+    let style = fd_role_style(ed, "git.drawer.edge", fallback)
+    let g = if ed.fuss.ascii_glyphs then "|" else "\u{2502}"
+    let rows = if rows_in > drawer.h then drawer.h else rows_in
+    var row = 0
+    while row < rows {
+        let col = drawer.x + layout.edge_col
+        let _ = fd_lit(
+            mut ed.grid,
+            drawer.y + row,
+            col,
+            col + 1,
+            g,
+            style.fg,
+            style.bg,
+            style.attrs,
+        )
+        row += 1
+    }
+}
+
+fn fd_push(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+// `fuss_header` (`fussmode.c:1371-1478`): the workspace's basename in
+// bold; ` · loading` while opening or before a snapshot; otherwise the
+// branch (`(detached)`), the divergence and the rebase progress on the
+// right, the title and branch clipped to what is left.
+fn fd_header(mut ed: Ed, row: int, left: int, right: int) {
+    let style = fd_surface_style(ed)
+    let root = shell_ws_root(ed)
+    var title = root
+    let rb = root.bytes()
+    var slash = -1
+    var i = rb.len
+    while i > 0 {
+        if rb[i - 1] as int == 47 {
+            slash = i - 1
+            break
+        }
+        i -= 1
+    }
+    if slash >= 0 && slash + 1 < rb.len {
+        title = root[slash + 1..rb.len]
+    }
+    if title.len == 0 {
+        title = "/"
+    }
+    var col = left
+    if ed.fuss.opening {
+        col = fd_lit(
+            mut ed.grid,
+            row,
+            col,
+            right,
+            title,
+            style.fg,
+            style.bg,
+            style.attrs | term.ATTR_BOLD,
+        )
+        let _ = fd_lit(
+            mut ed.grid,
+            row,
+            col,
+            right,
+            " \u{b7} loading",
+            style.fg,
+            style.bg,
+            style.attrs | term.ATTR_DIM,
+        )
+        return
+    }
+    if git_detect_state(ed) == GIT_ASYNC_FAILED {
+        let _ = fd_lit(
+            mut ed.grid,
+            row,
+            col,
+            right,
+            title,
+            style.fg,
+            style.bg,
+            style.attrs | term.ATTR_BOLD,
+        )
+        return
+    }
+    let live = git_snapshot(mut ed)
+    if ed.git.snap[live].gen == 0 {
+        col = fd_lit(
+            mut ed.grid,
+            row,
+            col,
+            right,
+            title,
+            style.fg,
+            style.bg,
+            style.attrs | term.ATTR_BOLD,
+        )
+        let _ = fd_lit(
+            mut ed.grid,
+            row,
+            col,
+            right,
+            " \u{b7} loading",
+            style.fg,
+            style.bg,
+            style.attrs | term.ATTR_DIM,
+        )
+        return
+    }
+    let ahead = ed.git.snap[live].ahead
+    let behind = ed.git.snap[live].behind
+    var suffix = List[byte]()
+    if ahead > 0 && behind > 0 {
+        fd_push(mut suffix, " \u{2191}{ahead} \u{2193}{behind}")
+    } else if ahead > 0 {
+        fd_push(mut suffix, " \u{2191}{ahead}")
+    } else if behind > 0 {
+        fd_push(mut suffix, " \u{2193}{behind}")
+    }
+    if ed.git.snap[live].state == git.GIT_MID_REBASE {
+        if ed.fuss.rebase_step > 0 && ed.fuss.rebase_total > 0 {
+            fd_push(mut suffix, " REBASING {ed.fuss.rebase_step}/{ed.fuss.rebase_total}")
+        } else {
+            fd_push(mut suffix, " REBASING")
+        }
+    }
+    var suffix_cells = unicode.str_width(suffix, 0, suffix.len, 1)
+    if suffix_cells < 0 {
+        suffix_cells = 0
+    }
+    var prefix_right = right
+    if suffix_cells < right - left {
+        prefix_right = right - suffix_cells
+    } else if suffix_cells != 0 {
+        prefix_right = left
+    }
+    var branch = List[byte]()
+    if ed.git.snap[live].has_branch {
+        branch = git.git_snap_branch(ed.git.snap[live])
+    } else {
+        fd_push(mut branch, "(detached)")
+    }
+    var branch_cells = unicode.str_width(branch, 0, branch.len, 1)
+    if branch_cells < 0 {
+        branch_cells = 0
+    }
+    let prefix_cells = prefix_right - left
+    var title_right = prefix_right
+    if prefix_cells > 4 {
+        var budget = branch_cells
+        if budget > prefix_cells - 4 {
+            budget = prefix_cells - 4
+        }
+        title_right = prefix_right - budget - 3
+    }
+    col = fd_lit(
+        mut ed.grid,
+        row,
+        left,
+        title_right,
+        title,
+        style.fg,
+        style.bg,
+        style.attrs | term.ATTR_BOLD,
+    )
+    if title_right < prefix_right {
+        col = fd_lit(
+            mut ed.grid,
+            row,
+            col,
+            prefix_right,
+            " \u{b7} ",
+            style.fg,
+            style.bg,
+            style.attrs,
+        )
+        col = fd_put(
+            mut ed.grid,
+            row,
+            col,
+            prefix_right,
+            branch,
+            0,
+            branch.len,
+            style.fg,
+            style.bg,
+            style.attrs | term.ATTR_BOLD,
+        )
+    }
+    let _ = fd_put(
+        mut ed.grid,
+        row,
+        prefix_right,
+        right,
+        suffix,
+        0,
+        suffix.len,
+        style.fg,
+        style.bg,
+        style.attrs,
+    )
+}
+
+// `fuss_tail_fit` (`fussmode.c:1492-1505`): the first byte whose tail
+// fits `cells`.
+fn fd_tail_fit(b: List[byte], at: int, end: int, cells: int) -> int {
+    var pos = at
+    while pos < end && unicode.str_width(b, pos, end, VP_TABWIDTH) > cells {
+        let next = unicode.gb_next_bytes(b, end, pos)
+        if next <= pos || next > end {
+            return end
+        }
+        pos = next
+    }
+    pos
+}
+
+// `fuss_marker` (`fussmode.c:1480-1490`).
+fn fd_marker(
+    mut ed: Ed,
+    row: int,
+    col: int,
+    right: int,
+    g: str,
+    style: ThemeEnt,
+    selected_attrs: int,
+) -> int {
+    let attrs = style.attrs | selected_attrs
+    let c = fd_lit(mut ed.grid, row, col, right, " ", style.fg, style.bg, attrs)
+    fd_lit(mut ed.grid, row, c, right, g, style.fg, style.bg, attrs)
+}
+
+// `fuss_tree_row` (`fussmode.c:1507-1622`): one item — the lead cell,
+// the indent (trimmed on the selected row so its final path component
+// stays visible), `- `/`+ `/two spaces, the name (ignored styled), the
+// markers in their order.
+fn fd_tree_row(mut ed: Ed, row: int, left: int, right: int, item: int, selected: bool) {
+    let it = copy ed.fuss.tree.items[item]
+    if it.node >= ed.fuss.tree.nodes.len {
+        return
+    }
+    let n = copy ed.fuss.tree.nodes[it.node]
+    let normal = fd_surface_style(ed)
+    let ignored = fd_role_style(ed, "git.ignored", normal)
+    let staged = fd_role_style(ed, "git.staged", normal)
+    let modified = fd_role_style(ed, "git.modified", normal)
+    let untracked = fd_role_style(ed, "git.untracked", normal)
+    let incoming = fd_role_style(ed, "git.incoming", normal)
+    let conflict = fd_role_style(ed, "git.conflict", normal)
+    let selected_attrs = if selected then term.ATTR_REVERSE else 0
+    var col = left
+    let count = git.fuss_marker_count(n)
+    var content_right = right
+    let indent_cells = it.depth * FUSS_INDENT_CELLS
+    var indent_skip = 0
+    var name_at = n.name_at
+    let name_end = n.name_at + n.name_len
+    if selected {
+        let marker_cells = count * 2
+        let row_cells = if right > left then right - left else 0
+        content_right = if marker_cells < row_cells then right - marker_cells else left
+        let name_budget = if content_right > left + 3 then content_right - left - 3 else 0
+        let measured = unicode.str_width(ed.fuss.tree.pool, n.name_at, name_end, VP_TABWIDTH)
+        let name_cells = if measured <= 0 then 0 else if measured > 65535 then 65535 else measured
+        if name_cells > name_budget {
+            name_at = fd_tail_fit(ed.fuss.tree.pool, n.name_at, name_end, name_budget)
+            indent_skip = indent_cells
+        } else {
+            let prefix_budget = name_budget - name_cells
+            let keep = if prefix_budget < indent_cells then prefix_budget else indent_cells
+            indent_skip = indent_cells - keep
+        }
+    }
+    var blank = copy ed.grid.blank
+    blank.fg = copy normal.fg
+    blank.bg = copy normal.bg
+    blank.attrs = normal.attrs | selected_attrs
+    term.grid_fill(mut ed.grid, row, left, right, blank)
+    col = fd_lit(
+        mut ed.grid,
+        row,
+        col,
+        content_right,
+        " ",
+        normal.fg,
+        normal.bg,
+        normal.attrs | selected_attrs,
+    )
+    while indent_skip < indent_cells && col < content_right {
+        col = fd_lit(
+            mut ed.grid,
+            row,
+            col,
+            content_right,
+            " ",
+            normal.fg,
+            normal.bg,
+            normal.attrs | selected_attrs,
+        )
+        indent_skip += 1
+    }
+    let disclosure = if n.is_file then "  " else if n.expanded then "- " else "+ "
+    col = fd_lit(
+        mut ed.grid,
+        row,
+        col,
+        content_right,
+        disclosure,
+        normal.fg,
+        normal.bg,
+        normal.attrs | selected_attrs,
+    )
+    let name_fg = if n.ignored then ignored.fg else normal.fg
+    let name_attrs = (if n.ignored then ignored.attrs else normal.attrs) | selected_attrs
+    let pool = copy ed.fuss.tree.pool
+    col = fd_put(
+        mut ed.grid,
+        row,
+        col,
+        content_right,
+        pool,
+        name_at,
+        name_end,
+        name_fg,
+        normal.bg,
+        name_attrs,
+    )
+    let ascii = ed.fuss.ascii_glyphs
+    var m = 0
+    while m < count {
+        let kind = git.fuss_marker_at(n, m)
+        var attrs = selected_attrs
+        if kind == git.FUSS_MARK_STAGED {
+            col = fd_marker(
+                mut ed,
+                row,
+                col,
+                right,
+                if ascii then "^" else "\u{2191}",
+                staged,
+                attrs,
+            )
+        } else if kind == git.FUSS_MARK_UNSTAGED {
+            col = fd_marker(
+                mut ed,
+                row,
+                col,
+                right,
+                if ascii then "x" else "\u{2717}",
+                modified,
+                attrs,
+            )
+        } else if kind == git.FUSS_MARK_UNTRACKED {
+            col = fd_marker(
+                mut ed,
+                row,
+                col,
+                right,
+                if ascii then "x" else "\u{2717}",
+                untracked,
+                attrs,
+            )
+        } else if kind == git.FUSS_MARK_INCOMING {
+            col = fd_marker(
+                mut ed,
+                row,
+                col,
+                right,
+                if ascii then "v" else "\u{2193}",
+                incoming,
+                attrs,
+            )
+        } else if kind == git.FUSS_MARK_CONFLICT {
+            attrs = attrs | term.ATTR_BOLD
+            col = fd_marker(mut ed, row, col, right, "!", conflict, attrs)
+        }
+        m += 1
+    }
+}
+
+/// `yew_fuss_draw` (`fussmode.c:1923-2005`): the backdrop dimmed on a
+/// full repaint, the drawer filled, the header, the rows from the scroll
+/// the selection derives (each a `REGION_FUSS_ROW` named by its interned
+/// path), the edge.
+pub fn fuss_draw(mut ed: Ed) {
+    if !fuss_active(ed) {
+        return
+    }
+    region_remove_kind(mut ed.regions, REGION_FUSS_ROW)
+    let content = fuss_backdrop_rect(ed)
+    if ed.fuss.backdrop_dirty || ed.full_damage {
+        var dim = copy ed.grid.blank
+        dim.attrs = term.ATTR_DIM
+        var i = content.y
+        while i < content.y + content.h {
+            term.grid_overlay(
+                mut ed.grid,
+                i,
+                content.x,
+                content.x + content.w,
+                dim,
+                term.OVERLAY_ATTRS,
+            )
+            i += 1
+        }
+        ed.fuss.backdrop_dirty = false
+    }
+    let tree = fuss_drawer_rect(ed)
+    if tree.w == 0 || tree.h == 0 {
+        ed.fuss.draw_dirty = false
+        return
+    }
+    let layout = fuss_drawer_layout(ed.grid.cols, ed.fuss.natural_cols)
+    let tree_right = tree.x + layout.tree_width
+    let surface = fd_surface_style(ed)
+    var blank = copy ed.grid.blank
+    blank.fg = copy surface.fg
+    blank.bg = copy surface.bg
+    blank.attrs = surface.attrs
+    var r = tree.y
+    while r < tree.y + tree.h {
+        term.grid_fill(mut ed.grid, r, tree.x, tree.x + tree.w, blank)
+        r += 1
+    }
+    fd_header(mut ed, tree.y, tree.x, tree_right)
+    var tree_bottom = tree.y + tree.h
+    if layout.fullscreen && ed.footer_rect.h != 0 && ed.footer_rect.y < tree_bottom {
+        tree_bottom = ed.footer_rect.y
+    }
+    let visible = if tree_bottom > tree.y + 1 then tree_bottom - tree.y - 1 else 0
+    if ed.fuss.opening {
+        fd_edge(mut ed, tree, layout, tree.h)
+        ed.fuss.draw_dirty = false
+        return
+    }
+    let selected = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+    if selected >= 0 && visible != 0 {
+        if selected < ed.fuss.scroll {
+            ed.fuss.scroll = selected
+        } else if selected >= ed.fuss.scroll + visible {
+            ed.fuss.scroll = selected - visible + 1
+        }
+    }
+    let first = ed.fuss.scroll
+    var i = 0
+    while i < visible && first + i < ed.fuss.tree.items.len {
+        let row = tree.y + 1 + i
+        let item = first + i
+        fd_tree_row(mut ed, row, tree.x, tree_right, item, item == selected)
+        let path = git.fuss_item_path(ed.fuss.tree, item)
+        let id = fuss_path_id(mut ed, path)
+        region_add(mut ed.regions, REGION_FUSS_ROW, rect(tree.x, row, layout.tree_width, 1), id)
+        i += 1
+    }
+    fd_edge(mut ed, tree, layout, tree.h)
+    ed.fuss.draw_dirty = false
+}
+
+/// `yew_fuss_draw_footer` (`fussmode.c:2007-2092`): the legend (or the
+/// jump, the message, the detection failure, `loading…`) and the hint
+/// row in F mode's chip colours; the command line over the last row.
+pub fn fuss_draw_footer(mut ed: Ed, footer: Rect) {
+    if !fuss_active(ed) || footer.h == 0 {
+        return
+    }
+    let ascii = ed.fuss.ascii_glyphs
+    let line1 = if ascii {
+        "Legend: ^ staged  x modified  x untracked  v incoming  ! conflict"
+    } else {
+        "Legend: \u{2191} staged  \u{2717} modified  \u{2717} untracked  \u{2193} incoming  ! conflict"
+    }
+    var line2 = if ascii {
+        "type jump | Alt+key actions | C-S-/ list | Esc leave"
+    } else {
+        "type jump \u{b7} Alt+key actions \u{b7} C-S-/ list \u{b7} Esc leave"
+    }
+    let live = git_snapshot(mut ed)
+    if ed.git.snap[live].state == git.GIT_MID_REBASE {
+        line2 = "rebase stopped \u{b7} :git.rebase.continue \u{b7} :git.rebase.abort"
+    }
+    let style = statusline_mode_style(MODE_F)
+    var blank = copy ed.grid.blank
+    blank.fg = copy style.chip_fg
+    blank.bg = copy style.chip_bg
+    blank.attrs = 0
+    term.grid_fill(mut ed.grid, footer.y, footer.x, footer.x + footer.w, blank)
+    if footer.h > 1 {
+        term.grid_fill(mut ed.grid, footer.y + 1, footer.x, footer.x + footer.w, blank)
+    }
+    let right = footer.x + footer.w
+    var col = footer.x
+    if ed.fuss.jump_armed {
+        col = fd_lit(
+            mut ed.grid,
+            footer.y,
+            col,
+            right,
+            "jump: ",
+            style.chip_fg,
+            style.chip_bg,
+            term.ATTR_BOLD,
+        )
+        let pat = copy ed.fuss.jump.pat
+        col = fd_put(
+            mut ed.grid,
+            footer.y,
+            col,
+            right,
+            pat,
+            0,
+            ed.fuss.jump.len,
+            style.chip_fg,
+            style.chip_bg,
+            term.ATTR_BOLD,
+        )
+        let _ = fd_lit(
+            mut ed.grid,
+            footer.y,
+            col,
+            right,
+            "\u{258f}",
+            style.chip_fg,
+            style.chip_bg,
+            term.ATTR_BOLD,
+        )
+    } else if msg_visible(ed) {
+        let mb = msg_bytes(ed.msg)
+        var n = 0
+        while n < mb.len && mb[n] as int != 0 {
+            n += 1
+        }
+        let _ = fd_put(mut ed.grid, footer.y, col, right, mb, 0, n, style.chip_fg, style.chip_bg, 0)
+    } else if git_detect_state(ed) == GIT_ASYNC_FAILED {
+        let _ = fd_lit(
+            mut ed.grid,
+            footer.y,
+            col,
+            right,
+            git.git_state_str(git_detect_result(ed)),
+            style.chip_fg,
+            style.chip_bg,
+            0,
+        )
+    } else if ed.git.snap[live].gen == 0 {
+        let _ = fd_lit(
+            mut ed.grid,
+            footer.y,
+            col,
+            right,
+            "loading\u{2026}",
+            style.chip_fg,
+            style.chip_bg,
+            0,
+        )
+    } else {
+        let _ = fd_lit(mut ed.grid, footer.y, col, right, line1, style.chip_fg, style.chip_bg, 0)
+    }
+    if footer.h > 1 {
+        let _ = fd_lit(
+            mut ed.grid,
+            footer.y + 1,
+            footer.x,
+            right,
+            line2,
+            style.chip_fg,
+            style.chip_bg,
+            0,
+        )
+    }
+    if ed.cmdline.active {
+        cmdline_draw(mut ed, rect(footer.x, footer.y + footer.h - 1, footer.w, 1))
+    }
+}
