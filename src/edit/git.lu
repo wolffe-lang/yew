@@ -1,0 +1,2216 @@
+//! edit.git — the git layer's editor half: the verb table, argv-only
+//! spawning on the job layer, the environment sanitation, repository
+//! detection, the wall-clock snapshot cache and the taxonomy.
+//!
+//! Ports sagitta `src/mod/git/git.c` (2,543 lines) at 9ace98c2 under
+//! `s51-git-layer.md`; the byte parsers it calls are the pure `git`
+//! module (`src/git/porcelain.lu`). What the port leaves to yw13b (s53)
+//! is the cat-file batch the gutter's diff base streams from
+//! (`git.c:952-1360`, `GitBlobBatch`): nothing in s51 or s52 calls it.
+//!
+//! C's shape and the port's (each row a recorded R-yw13 entry):
+//! - `const GitVerb *` → an index into `GitCtx.verbs`, the one table
+//!   (`git.c:163-212`). There is no raw command line anywhere.
+//! - C's `GitCtx *` behind `Ed.git` → a `GitCtx` value in `Ed` built at
+//!   `ed_new` (C's `yew_git_state_init` at `yew_ed_init`).
+//! - C's two snapshots in ping-pong arenas → `snap[0]`/`snap[1]` reset in
+//!   place (G33): the inactive half's pools are reused every refresh.
+//! - C's `test_spawn`/`test_run_sync` function pointers (`git_int.h`) →
+//!   the `test_spawn`/`test_sync` switches and their logs in `GitCtx`
+//!   (no function values, G48): `git_test_spawn` is the C test's
+//!   `gitcache_spawn` and `git_test_run_sync` its `gitcache_run_sync`.
+//! - A completion's owner (C's `GitJobOwner` with `git_job_ops`) → the
+//!   job layer's `CB_GIT` kind; `yew_git_spawn_callback`'s wrapped
+//!   owner → `CB_GIT_OWNED` with the caller's kind in `cb_ms`.
+
+use git
+use std.env as std_env
+use util
+
+/// `YEW_GV_READ` (`git.h:46-50`): parsed; may run under the TTL cache.
+pub const GV_READ: int = 0
+
+/// `YEW_GV_MUTATE`: invalidates the cache on completion (s51 §11).
+pub const GV_MUTATE: int = 1
+
+/// `YEW_GV_NET`: a mutation over the network — the longer timeout and the
+/// auth states.
+pub const GV_NET: int = 2
+
+/// `YEW_GIT_COLLECT_MAX` (`git.h:21`): 16 MiB.
+pub const GIT_COLLECT_MAX: int = 16777216
+
+/// `YEW_GIT_READ_TIMEOUT_MS`.
+pub const GIT_READ_TIMEOUT_MS: int = 5000
+
+/// `YEW_GIT_NET_TIMEOUT_MS`.
+pub const GIT_NET_TIMEOUT_MS: int = 120000
+
+/// `YEW_GIT_MAX_INFLIGHT`: concurrent git jobs.
+pub const GIT_MAX_INFLIGHT: int = 4
+
+/// `YEW_GIT_TTL_MS`: fuss's `CACHE_TTL = 0.5d0`, on the wall clock.
+pub const GIT_TTL_MS: int = 500
+
+/// `GitAsyncState` (`git.h:34-39`).
+pub const GIT_ASYNC_UNTRIED: int = 0
+
+/// A probe is in flight.
+pub const GIT_ASYNC_PENDING: int = 1
+
+/// The probe answered.
+pub const GIT_ASYNC_READY: int = 2
+
+/// The probe failed.
+pub const GIT_ASYNC_FAILED: int = 3
+
+/// `GitReqKind` (`git_int.h:6-17`).
+pub const GREQ_VERSION: int = 0
+
+/// `rev-parse` detection.
+pub const GREQ_DETECT: int = 1
+
+/// The status refresh's first child.
+pub const GREQ_STATUS: int = 2
+
+/// `ls-files` ignore set.
+pub const GREQ_IGNORE: int = 3
+
+/// `rev-parse --verify @{upstream}`.
+pub const GREQ_UPSTREAM: int = 4
+
+/// `diff --name-only -z HEAD...@{upstream}`.
+pub const GREQ_INCOMING: int = 5
+
+/// `log` records.
+pub const GREQ_LOG: int = 6
+
+/// `reflog` records.
+pub const GREQ_REFLOG: int = 7
+
+/// `cat-file blob`.
+pub const GREQ_BLOB: int = 8
+
+/// Any verb whose result is published as-is.
+pub const GREQ_VERB: int = 9
+
+/// `GitVerb` (`git.h:52-58`): one row of the table.
+pub struct GitVerb {
+    name: str,
+    kind: int,
+    timeout_ms: int,
+    needs_repo: bool,
+    needs_head: bool,
+}
+
+/// `GitVersion` (`git.h:28-32`).
+pub struct GitVersion {
+    major: int,
+    minor: int,
+    patch: int,
+}
+
+/// `GitRepo` (`git.h:153-160`); C's NULL strings are empty here
+/// (`git_dir` is absolute whenever detection succeeded).
+pub struct GitRepo {
+    git_dir: str,
+    top_level: str,
+    has_top: bool,
+    inside_work_tree: bool,
+    bare: bool,
+    env_fp: wrapping[u64],
+    detected_ms: int,
+}
+
+/// `GitResult` (`git.h:81-89`): the last completed request, its output
+/// copied (C's `result_arena`, reset in place here).
+pub struct GitResult {
+    state: int,
+    verb: str,
+    out: List[byte],
+    err: List[byte],
+    job_id: int,
+}
+
+/// `struct GitReq` (`git_int.h:19-30`) as a caller hands it in.
+pub struct GitReq {
+    kind: int,
+    literal_paths: bool,
+    retried: bool,
+    stdin: List[byte],
+    owner: int,
+}
+
+/// A request of `kind` with nothing else set (C's `GitReq req = {0}`).
+pub fn git_req(kind: int) -> GitReq {
+    GitReq { kind: kind, literal_paths: false, retried: false, stdin: List[byte](), owner: 0 }
+}
+
+/// `GitPending` (`git.c:19-25`): one of the four in-flight slots. The
+/// argv and stdin lists are reset and refilled per request (G33).
+pub struct GitPending {
+    active: bool,
+    job_id: int,
+    kind: int,
+    verb: int,
+    argv: List[str],
+    literal_paths: bool,
+    retried: bool,
+    stdin: List[byte],
+    detect_root: str,
+    detect_env_fp: wrapping[u64],
+    owner: int,
+}
+
+/// What the test spawn hook saw (`test_gitcache.c`'s `SpawnLog`).
+pub struct GitSpawnLog {
+    next_id: int,
+    calls: int,
+    status_calls: int,
+    ignore_calls: int,
+    comment_calls: int,
+    upstream_calls: int,
+    incoming_calls: int,
+    last_status: int,
+    last_ignore: int,
+    last_comment: int,
+    last_upstream: int,
+    last_incoming: int,
+    fail_next: bool,
+    argv: List[str],
+    verb: str,
+    stdin: List[byte],
+}
+
+/// What the synchronous test hook saw (`test_gitcache.c`'s `SyncLog`).
+pub struct GitSyncLog {
+    calls: int,
+    argv: List[str],
+    env_set: List[str],
+    env_unset: List[str],
+    env_unset_prefix: List[str],
+    inherit_tty: bool,
+    sink: int,
+    cwd: str,
+}
+
+/// `struct GitCtx` (`git.c:53-89`).
+pub struct GitCtx {
+    verbs: List[GitVerb],
+    repo: GitRepo,
+    detected_root: str,
+    has_detected_root: bool,
+    snap: List[git.GitSnapshot],
+    live: int,
+    log_records: List[git.GitLogRecord],
+    result: GitResult,
+    incoming: git.GitPaths,
+    upstream_oid: str,
+    has_upstream_oid: bool,
+    pending_upstream_oid: str,
+    has_pending_upstream_oid: bool,
+    version: GitVersion,
+    avail_state: int,
+    detect_state: int,
+    detect_result: int,
+    pending: List[GitPending],
+    inflight: int,
+    refresh_inflight: bool,
+    refresh_again: bool,
+    detect_requested: bool,
+    log_requested: bool,
+    incoming_dirty: bool,
+    forced: bool,
+    refresh_failed: bool,
+    refresh_failed_ms: int,
+    test_now_ms: int,
+    test_now: bool,
+    test_spawn: bool,
+    tlog: GitSpawnLog,
+    test_sync: bool,
+    slog: GitSyncLog,
+    merge: List[git.GitEntry],
+}
+
+fn gv(name: str, kind: int, repo: bool, head: bool) -> GitVerb {
+    let t = if kind == GV_NET then GIT_NET_TIMEOUT_MS else GIT_READ_TIMEOUT_MS
+    GitVerb { name: name, kind: kind, timeout_ms: t, needs_repo: repo, needs_head: head }
+}
+
+/// `git_verbs` (`git.c:163-212`): deliberately the only inventory of the
+/// commands the module can execute. Callers select a row and provide argv
+/// elements; there is no raw command-line escape hatch.
+pub fn git_verb_table() -> List[GitVerb] {
+    var v = List[GitVerb]()
+    (mut v).push(gv("version", GV_READ, false, false))
+    (mut v).push(gv("detect", GV_READ, false, false))
+    (mut v).push(gv("status", GV_READ, true, false))
+    (mut v).push(gv("ignore", GV_READ, true, false))
+    (mut v).push(gv("comment-char", GV_READ, true, false))
+    (mut v).push(gv("upstream-oid", GV_READ, true, true))
+    (mut v).push(gv("incoming", GV_READ, true, true))
+    (mut v).push(gv("diff", GV_READ, true, true))
+    (mut v).push(gv("blame", GV_READ, true, true))
+    (mut v).push(gv("log", GV_READ, true, true))
+    (mut v).push(gv("reflog", GV_READ, true, true))
+    (mut v).push(gv("blob", GV_READ, true, false))
+    (mut v).push(gv("show", GV_READ, true, true))
+    (mut v).push(gv("branch-list", GV_READ, true, false))
+    (mut v).push(gv("remote-list", GV_READ, true, false))
+    (mut v).push(gv("remote-check", GV_NET, true, false))
+    (mut v).push(gv("init", GV_MUTATE, false, false))
+    (mut v).push(gv("config-local", GV_MUTATE, true, false))
+    (mut v).push(gv("stage", GV_MUTATE, true, false))
+    (mut v).push(gv("unstage", GV_MUTATE, true, false))
+    (mut v).push(gv("stage-all", GV_MUTATE, true, false))
+    (mut v).push(gv("unstage-all", GV_MUTATE, true, false))
+    (mut v).push(gv("commit", GV_MUTATE, true, false))
+    (mut v).push(gv("commit-amend", GV_MUTATE, true, true))
+    (mut v).push(gv("switch", GV_MUTATE, true, true))
+    (mut v).push(gv("switch-create", GV_MUTATE, true, false))
+    (mut v).push(gv("branch-delete", GV_MUTATE, true, true))
+    (mut v).push(gv("merge", GV_MUTATE, true, true))
+    (mut v).push(gv("reset", GV_MUTATE, true, true))
+    (mut v).push(gv("rebase", GV_MUTATE, true, true))
+    (mut v).push(gv("cherry-pick", GV_MUTATE, true, true))
+    (mut v).push(gv("revert", GV_MUTATE, true, true))
+    (mut v).push(gv("stash-push", GV_MUTATE, true, false))
+    (mut v).push(gv("stash-pop", GV_MUTATE, true, true))
+    (mut v).push(gv("tag", GV_MUTATE, true, false))
+    (mut v).push(gv("discard", GV_MUTATE, true, true))
+    (mut v).push(gv("rm", GV_MUTATE, true, false))
+    (mut v).push(gv("mv", GV_MUTATE, true, false))
+    (mut v).push(gv("apply", GV_MUTATE, true, false))
+    (mut v).push(gv("fetch", GV_NET, true, false))
+    (mut v).push(gv("pull", GV_NET, true, true))
+    (mut v).push(gv("push", GV_NET, true, true))
+    v
+}
+
+fn git_repo_none() -> GitRepo {
+    GitRepo {
+        git_dir: "",
+        top_level: "",
+        has_top: false,
+        inside_work_tree: false,
+        bare: false,
+        env_fp: 0 as wrapping[u64],
+        detected_ms: 0,
+    }
+}
+
+fn git_pending_none() -> GitPending {
+    GitPending {
+        active: false,
+        job_id: 0,
+        kind: GREQ_VERB,
+        verb: -1,
+        argv: List[str](),
+        literal_paths: false,
+        retried: false,
+        stdin: List[byte](),
+        detect_root: "",
+        detect_env_fp: 0 as wrapping[u64],
+        owner: 0,
+    }
+}
+
+fn git_spawn_log_new() -> GitSpawnLog {
+    GitSpawnLog {
+        next_id: 0,
+        calls: 0,
+        status_calls: 0,
+        ignore_calls: 0,
+        comment_calls: 0,
+        upstream_calls: 0,
+        incoming_calls: 0,
+        last_status: 0,
+        last_ignore: 0,
+        last_comment: 0,
+        last_upstream: 0,
+        last_incoming: 0,
+        fail_next: false,
+        argv: List[str](),
+        verb: "",
+        stdin: List[byte](),
+    }
+}
+
+fn git_sync_log_new() -> GitSyncLog {
+    GitSyncLog {
+        calls: 0,
+        argv: List[str](),
+        env_set: List[str](),
+        env_unset: List[str](),
+        env_unset_prefix: List[str](),
+        inherit_tty: false,
+        sink: SINK_BUFFER,
+        cwd: "",
+    }
+}
+
+/// `yew_git_state_init` (`git.c:1371-1391`): both snapshots empty with
+/// the divergence unknown, neither probe tried, detection "not a
+/// repository" until it answers.
+pub fn git_ctx_new() -> GitCtx {
+    var snaps = List[git.GitSnapshot]()
+    (mut snaps).push(git.git_snapshot_new())
+    (mut snaps).push(git.git_snapshot_new())
+    var pending = List[GitPending]()
+    var i = 0
+    while i < GIT_MAX_INFLIGHT {
+        (mut pending).push(git_pending_none())
+        i += 1
+    }
+    GitCtx {
+        verbs: git_verb_table(),
+        repo: git_repo_none(),
+        detected_root: "",
+        has_detected_root: false,
+        snap: snaps,
+        live: 0,
+        log_records: List[git.GitLogRecord](),
+        result: GitResult {
+            state: git.GIT_OK,
+            verb: "",
+            out: List[byte](),
+            err: List[byte](),
+            job_id: 0,
+        },
+        incoming: git.git_paths_new(),
+        upstream_oid: "",
+        has_upstream_oid: false,
+        pending_upstream_oid: "",
+        has_pending_upstream_oid: false,
+        version: GitVersion { major: 0, minor: 0, patch: 0 },
+        avail_state: GIT_ASYNC_UNTRIED,
+        detect_state: GIT_ASYNC_UNTRIED,
+        detect_result: git.GIT_NOT_REPO,
+        pending: pending,
+        inflight: 0,
+        refresh_inflight: false,
+        refresh_again: false,
+        detect_requested: false,
+        log_requested: false,
+        incoming_dirty: false,
+        forced: false,
+        refresh_failed: false,
+        refresh_failed_ms: 0,
+        test_now_ms: 0,
+        test_now: false,
+        test_spawn: false,
+        tlog: git_spawn_log_new(),
+        test_sync: false,
+        slog: git_sync_log_new(),
+        merge: List[git.GitEntry](),
+    }
+}
+
+/// `yew_git_verb` (`git.c:294-305`): the row named `name`, -1 for none.
+pub fn git_verb(ed: Ed, name: str) -> int {
+    var i = 0
+    while i < ed.git.verbs.len {
+        if ed.git.verbs[i].name == name {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_git_verb_count` (`git.c:312-315`).
+pub fn git_verb_count(ed: Ed) -> int {
+    ed.git.verbs.len
+}
+
+/// `yew_git_cache_fresh` (`git.c:324-327`): a snapshot taken at `taken`
+/// is fresh at `now` for exactly `GIT_TTL_MS` of WALL time. A clock that
+/// stepped backwards (`now < taken`) is never fresh, so it cannot make a
+/// snapshot immortal.
+pub fn git_cache_fresh(taken: int, now: int) -> bool {
+    now >= taken && now - taken < GIT_TTL_MS
+}
+
+// `git_now` (`git.c:221-226`): the test clock when set, else the loop's.
+fn git_now(ed: Ed) -> int {
+    if ed.git.test_now then ed.git.test_now_ms else ed.now_ms
+}
+
+/// `yew_git_test_now_set` (`git.c:1363-1369`).
+pub fn git_test_now_set(mut ed: Ed, now: int) {
+    ed.git.test_now = true
+    ed.git.test_now_ms = now
+}
+
+/// `yew_git_test_spawn_set` (`git.c:1351-1355`): `on` routes every
+/// asynchronous spawn to `git_test_spawn`, its log reset.
+pub fn git_test_spawn_set(mut ed: Ed, on: bool) {
+    ed.git.test_spawn = on
+    ed.git.tlog = git_spawn_log_new()
+}
+
+/// `yew_git_test_run_sync_set` (`git.c:1357-1361`).
+pub fn git_test_run_sync_set(mut ed: Ed, on: bool) {
+    ed.git.test_sync = on
+    ed.git.slog = git_sync_log_new()
+}
+
+// ------------------------------------------------------------------
+// §3: the environment (pinned)
+// ------------------------------------------------------------------
+
+/// `git_env_build` (`git.c:109-126`, YEW-F-017): every runner gets the
+/// same pinned rows; the interactive rebase replaces only the two editor
+/// rows (`editor`/`sequence_editor` empty for the defaults).
+pub fn git_env_set(editor: str, sequence_editor: str, literal_paths: bool) -> List[str] {
+    var rows = List[str]()
+    (mut rows).push("GIT_TERMINAL_PROMPT=0")
+    (mut rows).push(if editor.len == 0 then "GIT_EDITOR=false" else editor)
+    (mut rows).push(
+        if sequence_editor.len == 0 then "GIT_SEQUENCE_EDITOR=false" else sequence_editor,
+    )
+    (mut rows).push("GIT_FLUSH=1")
+    (mut rows).push("GIT_PAGER=cat")
+    (mut rows).push("PAGER=cat")
+    (mut rows).push("LC_ALL=C")
+    if literal_paths {
+        (mut rows).push("GIT_LITERAL_PATHSPECS=1")
+    }
+    rows
+}
+
+/// `git_env_unset` (`git.c:98-102`).
+pub fn git_env_unset() -> List[str] {
+    var rows = List[str]()
+    for n in [
+        "COLUMNS",
+        "LINES",
+        "GIT_TRACE",
+        "GIT_TRACE_PACKET",
+        "GIT_TRACE_PERFORMANCE",
+        "GIT_CURL_VERBOSE",
+        "GIT_TRANSFER_TRACE",
+    ] {
+        (mut rows).push(n)
+    }
+    rows
+}
+
+/// `git_env_unset_prefix` (`git.c:104`).
+pub fn git_env_unset_prefix() -> List[str] {
+    var rows = List[str]()
+    (mut rows).push("GIT_TRACE2")
+    rows
+}
+
+fn git_fnv(h0: wrapping[u64], s: str) -> wrapping[u64] {
+    var h = h0
+    for b in s.bytes() {
+        h = h ^ b as int as wrapping[u64]
+        h = h * 1099511628211
+    }
+    // C hashes each string with its NUL (`strlen + 1`).
+    h = h ^ 0
+    h * 1099511628211
+}
+
+/// `yew_git_env_fingerprint` (`git.c:264-292`): FNV-1a over the
+/// pass-through rows in table order, then the numbered config rows in the
+/// inherited environment's order (their order matters to git too).
+pub fn git_env_fingerprint() -> wrapping[u64] {
+    // C's literal (`git.c:274`) is FNV's offset basis less its last digit;
+    // kept as written — the value is only ever compared with itself.
+    var h: wrapping[u64] = 1469598103934665603
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "SSH_ASKPASS_REQUIRE",
+    ] {
+        h = git_fnv(h, name)
+        h = git_fnv(h, env_get(name) else "")
+    }
+    for row in std_env.vars() {
+        if row.starts_with("GIT_CONFIG_KEY_") || row.starts_with("GIT_CONFIG_VALUE_") {
+            h = git_fnv(h, row)
+        }
+    }
+    h
+}
+
+// ------------------------------------------------------------------
+// §12: the taxonomy from the filesystem
+// ------------------------------------------------------------------
+
+// `git_join` (`git.c:329-349`): `dir/tail`, one slash.
+fn git_join(dir: str, tail: str) -> str {
+    if dir.len != 0 && !dir.ends_with("/") then "{dir}/{tail}" else "{dir}{tail}"
+}
+
+// `git_exists` (`git.c:351-358`): `access(F_OK)`.
+fn git_exists(dir: str, tail: str) -> bool {
+    fs_access(git_join(dir, tail), 0) else |_| { return false }
+    true
+}
+
+// `git_read_u32` (`git.c:360-398`): a decimal, then only CR/LF, in fewer
+// than 32 bytes.
+fn git_read_u32(dir: str, tail: str) -> (bool, int) {
+    let bytes = fs_read_bytes(git_join(dir, tail)) else |_| { return (false, 0) }
+    if bytes.len == 0 || bytes.len >= 32 {
+        return (false, 0)
+    }
+    var at = 0
+    var value = 0
+    while at < bytes.len && bytes[at] as int >= 48 && bytes[at] as int <= 57 {
+        value = value * 10 + (bytes[at] as int - 48)
+        if value > 4294967295 {
+            return (false, 0)
+        }
+        at += 1
+    }
+    if at == 0 {
+        return (false, 0)
+    }
+    while at < bytes.len && (bytes[at] as int == 10 || bytes[at] as int == 13) {
+        at += 1
+    }
+    if at != bytes.len {
+        return (false, 0)
+    }
+    (true, value)
+}
+
+// `git_operation_state` (`git.c:400-418`).
+fn git_operation_state(repo: GitRepo) -> int {
+    if repo.git_dir.len == 0 {
+        return git.GIT_OK
+    }
+    let dir = repo.git_dir
+    if git_exists(dir, "MERGE_HEAD") {
+        return git.GIT_MID_MERGE
+    }
+    if git_exists(dir, "rebase-merge") || git_exists(dir, "rebase-apply") {
+        return git.GIT_MID_REBASE
+    }
+    if git_exists(dir, "CHERRY_PICK_HEAD") {
+        return git.GIT_MID_CHERRY_PICK
+    }
+    if git_exists(dir, "REVERT_HEAD") {
+        return git.GIT_MID_REVERT
+    }
+    if git_exists(dir, "BISECT_LOG") {
+        return git.GIT_MID_BISECT
+    }
+    git.GIT_OK
+}
+
+/// `yew_git_probe_state` (`git.c:420-440`): the in-progress states from
+/// `access` probes inside the git dir, never from message text; the lock
+/// first.
+pub fn git_probe_state(repo: GitRepo) -> int {
+    if repo.git_dir.len == 0 {
+        return git.GIT_NOT_REPO
+    }
+    if git_exists(repo.git_dir, "index.lock") {
+        return git.GIT_LOCKED
+    }
+    let op = git_operation_state(repo)
+    if op != git.GIT_OK {
+        return op
+    }
+    if repo.bare then git.GIT_BARE else git.GIT_OK
+}
+
+/// A repository whose git dir is `dir` (the probe's whole input, for the
+/// taxonomy test).
+pub fn git_repo_at(dir: str, bare: bool) -> GitRepo {
+    var r = git_repo_none()
+    r.git_dir = dir
+    r.bare = bare
+    r
+}
+
+// ------------------------------------------------------------------
+// §2: the in-flight slots and the spawn
+// ------------------------------------------------------------------
+
+fn git_pending_find(ed: Ed, id: int) -> int {
+    var i = 0
+    while i < ed.git.pending.len {
+        if ed.git.pending[i].active && ed.git.pending[i].job_id == id {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn git_pending_slot(ed: Ed) -> int {
+    var i = 0
+    while i < ed.git.pending.len {
+        if !ed.git.pending[i].active {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `git_pending_drop` (`git.c:464-475`): the stdin bytes zeroed (a commit
+// message is the user's), the slot cleared with its storage kept.
+fn git_pending_drop(mut ed: Ed, p: int) {
+    if p < 0 || !ed.git.pending[p].active {
+        return
+    }
+    var k = 0
+    while k < ed.git.pending[p].stdin.len {
+        ed.git.pending[p].stdin[k] = 0 as byte
+        k += 1
+    }
+    (mut ed.git.pending[p].stdin).reset()
+    (mut ed.git.pending[p].argv).reset()
+    ed.git.pending[p].active = false
+    ed.git.pending[p].job_id = 0
+    ed.git.pending[p].kind = GREQ_VERB
+    ed.git.pending[p].verb = -1
+    ed.git.pending[p].literal_paths = false
+    ed.git.pending[p].retried = false
+    ed.git.pending[p].detect_root = ""
+    ed.git.pending[p].detect_env_fp = 0 as wrapping[u64]
+    ed.git.pending[p].owner = 0
+    if ed.git.inflight != 0 {
+        ed.git.inflight -= 1
+    }
+}
+
+// `git_pending_same` (`git.c:493-520`): only the refresh's shared reads
+// coalesce, on the same verb, kind, argv and stdin.
+fn git_pending_same(ed: Ed, p: int, verb: int, argv: List[str], req: GitReq) -> bool {
+    let pd = copy ed.git.pending[p]
+    let joinable = req.kind == GREQ_STATUS ||
+        req.kind == GREQ_IGNORE ||
+        req.kind == GREQ_UPSTREAM ||
+        req.kind == GREQ_INCOMING
+    if !joinable ||
+        !pd.active ||
+        pd.verb != verb ||
+        ed.git.verbs[verb].kind != GV_READ ||
+        pd.kind != req.kind ||
+        pd.literal_paths != req.literal_paths ||
+        pd.stdin.len != req.stdin.len {
+        return false
+    }
+    if pd.argv.len != argv.len {
+        return false
+    }
+    var i = 0
+    while i < argv.len {
+        if pd.argv[i] != argv[i] {
+            return false
+        }
+        i += 1
+    }
+    git.git_bytes_cmp(pd.stdin, req.stdin) == 0
+}
+
+// `git_takes_paths` (`git.c:522-535`): the verbs that get
+// `GIT_LITERAL_PATHSPECS=1`.
+fn git_takes_paths(name: str) -> bool {
+    for n in [
+        "stage",
+        "unstage",
+        "diff",
+        "blame",
+        "show",
+        "switch",
+        "switch-create",
+        "merge",
+        "discard",
+        "rm",
+        "mv",
+        "apply",
+    ] {
+        if n == name {
+            return true
+        }
+    }
+    false
+}
+
+/// `git_build_argv` (`git.c:550-574`): the global options first, then the
+/// caller's elements copied byte-exactly (YEW-F-020: argv is structural
+/// data — no element is ever formatted from a path).
+pub fn git_build_argv(kind: int, tail: List[str]) -> List[str] {
+    var argv = List[str]()
+    (mut argv).push("git")
+    (mut argv).push("--no-pager")
+    (mut argv).push("-c")
+    (mut argv).push("core.quotepath=false")
+    (mut argv).push("-c")
+    (mut argv).push("status.renames=true")
+    if kind == GV_READ {
+        (mut argv).push("--no-optional-locks")
+    }
+    for a in tail {
+        (mut argv).push(a)
+    }
+    argv
+}
+
+fn git_contains(hay: List[byte], needle: str) -> bool {
+    let nb = needle.bytes()
+    if nb.len == 0 {
+        return true
+    }
+    var i = 0
+    while i + nb.len <= hay.len {
+        var k = 0
+        while k < nb.len && hay[i + k] == nb[k] {
+            k += 1
+        }
+        if k == nb.len {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+/// `git_auth_state` (`git.c:576-597`): the ONE place message text is read
+/// — it picks a message, never a control path. C copies the bytes to a C
+/// string first, so a NUL ends the search there.
+pub fn git_auth_state(bytes: List[byte]) -> int {
+    var n = 0
+    while n < bytes.len && bytes[n] != 0 as byte {
+        n += 1
+    }
+    let text = git.git_slice(bytes, 0, n)
+    for needle in [
+        "could not read Username",
+        "Authentication failed",
+        "terminal prompts disabled",
+        "Permission denied (publickey)",
+    ] {
+        if git_contains(text, needle) {
+            return git.GIT_AUTH
+        }
+    }
+    git.GIT_FAILED
+}
+
+// `git_job_ok` (`git.c:604-608`).
+fn git_job_ok(j: Job) -> bool {
+    j.state == JOB_EXITED && j.exit_code == 0 && !j.collect_capped
+}
+
+/// `git_job_complete` (`git.c:610-637`): the job layer's `CB_GIT`
+/// completion — the job's end as a git state, then the dispatch.
+pub fn git_job_complete(mut ed: Ed, j: Job) {
+    let p = git_pending_find(ed, j.id)
+    if p < 0 {
+        return
+    }
+    let verb = copy ed.git.pending[p].verb
+    var state = git.GIT_FAILED
+    if j.state == JOB_TIMEOUT {
+        state = git.GIT_TIMEOUT
+    } else if j.state == JOB_EXECFAIL && j.exec_errno == 2 {
+        state = git.GIT_NO_GIT
+    } else if git_job_ok(j) {
+        state = git.GIT_OK
+    } else if ed.git.verbs[verb].kind == GV_NET {
+        state = git_auth_state(j.collect_err)
+    }
+    let _ = git_complete_exit(mut ed, j.id, state, j.exit_code, j.collect, j.collect_err)
+}
+
+// `git_error`-free shape: an error answer is `(0, message)`.
+fn git_refuse(why: str) -> (int, str) {
+    (0, why)
+}
+
+/// `yew_git_test_spawn`'s body (`test_gitcache.c:103-150`): the C test's
+/// `gitcache_spawn`, recording the final argv and counting the refresh's
+/// verbs; `fail_next` refuses one spawn.
+fn git_test_spawn(mut ed: Ed, verb: int, argv: List[str], stdin: List[byte]) -> int {
+    ed.git.tlog.calls += 1
+    if ed.git.tlog.fail_next {
+        ed.git.tlog.fail_next = false
+        return 0
+    }
+    let name = copy ed.git.verbs[verb].name
+    let next = ed.git.tlog.next_id + 1
+    if name == "status" {
+        ed.git.tlog.status_calls += 1
+        ed.git.tlog.last_status = next
+    }
+    if name == "ignore" {
+        ed.git.tlog.ignore_calls += 1
+        ed.git.tlog.last_ignore = next
+    }
+    if name == "comment-char" {
+        ed.git.tlog.comment_calls += 1
+        ed.git.tlog.last_comment = next
+    }
+    if name == "upstream-oid" {
+        ed.git.tlog.upstream_calls += 1
+        ed.git.tlog.last_upstream = next
+    }
+    if name == "incoming" {
+        ed.git.tlog.incoming_calls += 1
+        ed.git.tlog.last_incoming = next
+    }
+    (mut ed.git.tlog.argv).reset()
+    for a in argv {
+        (mut ed.git.tlog.argv).push(a)
+    }
+    ed.git.tlog.verb = name
+    (mut ed.git.tlog.stdin).reset()
+    for b in stdin {
+        (mut ed.git.tlog.stdin).push(b)
+    }
+    ed.git.tlog.next_id = next
+    next
+}
+
+/// `yew_git_spawn` (`git.c:649-765`): the request's checks (repository,
+/// HEAD), coalescing onto an identical in-flight read, the in-flight cap,
+/// then argv from the table on the job layer with the pinned environment.
+/// Answers the job id, `(0, why)` for a refusal.
+pub fn git_spawn(mut ed: Ed, verb: int, argv: List[str], req: GitReq) -> (int, str) {
+    if verb < 0 || verb >= ed.git.verbs.len || argv.len == 0 {
+        return git_refuse("")
+    }
+    let v = copy ed.git.verbs[verb]
+    if !ed.git.test_spawn &&
+        v.needs_repo &&
+        (
+            ed.git.detect_state != GIT_ASYNC_READY ||
+                ed.git.detect_result == git.GIT_NOT_REPO ||
+                ed.git.detect_result == git.GIT_NO_GIT
+        ) {
+        return git_refuse(git.git_state_str(git.GIT_NOT_REPO))
+    }
+    if v.needs_head {
+        let live = copy ed.git.live
+        if ed.git.snap[live].gen == 0 || ed.git.snap[live].unborn {
+            let staged = 1 - live
+            let internal_head = (req.kind == GREQ_UPSTREAM || req.kind == GREQ_INCOMING) &&
+                ed.git.snap[staged].has_head_oid &&
+                !ed.git.snap[staged].unborn
+            if !internal_head {
+                return git_refuse(git.git_state_str(git.GIT_NO_HEAD))
+            }
+        }
+    }
+    if v.kind == GV_READ {
+        var i = 0
+        while i < ed.git.pending.len {
+            if git_pending_same(ed, i, verb, argv, req) {
+                return (ed.git.pending[i].job_id, "")
+            }
+            i += 1
+        }
+    }
+    if ed.git.inflight >= GIT_MAX_INFLIGHT {
+        return git_refuse("")
+    }
+    let p = git_pending_slot(ed)
+    if p < 0 {
+        return git_refuse("")
+    }
+    ed.git.pending[p].kind = req.kind
+    ed.git.pending[p].literal_paths = req.literal_paths
+    ed.git.pending[p].retried = req.retried
+    ed.git.pending[p].owner = req.owner
+    (mut ed.git.pending[p].stdin).reset()
+    for b in req.stdin {
+        (mut ed.git.pending[p].stdin).push(b)
+    }
+    ed.git.pending[p].verb = verb
+    (mut ed.git.pending[p].argv).reset()
+    for a in argv {
+        (mut ed.git.pending[p].argv).push(a)
+    }
+    if req.kind == GREQ_DETECT {
+        ed.git.pending[p].detect_root = shell_ws_root(ed)
+        ed.git.pending[p].detect_env_fp = git_env_fingerprint()
+    }
+    ed.git.pending[p].active = true
+    ed.git.inflight += 1
+    let final_argv = git_build_argv(v.kind, argv)
+    var id = 0
+    var why = ""
+    if ed.git.test_spawn {
+        let stdin = copy ed.git.pending[p].stdin
+        id = git_test_spawn(mut ed, verb, final_argv, stdin)
+    } else {
+        var spec = job_spec_new()
+        spec.argv = final_argv
+        spec.cwd = shell_ws_root(ed)
+        spec.has_cwd = true
+        spec.sink = SINK_CALLBACK
+        spec.in_bytes = copy ed.git.pending[p].stdin
+        spec.has_in = ed.git.pending[p].stdin.len != 0
+        spec.timeout_ms = v.timeout_ms
+        spec.display = v.name
+        spec.has_display = true
+        spec.internal = true
+        spec.collect_max = GIT_COLLECT_MAX
+        spec.env_set = git_env_set("", "", req.literal_paths || git_takes_paths(v.name))
+        spec.env_unset = git_env_unset()
+        spec.env_unset_prefix = git_env_unset_prefix()
+        spec.callback = CB_GIT
+        let (got, e) = job_spawn(mut ed, mut spec)
+        id = got
+        why = e
+    }
+    if id == 0 {
+        git_pending_drop(mut ed, p)
+        return (0, why)
+    }
+    ed.git.pending[p].job_id = id
+    (id, "")
+}
+
+/// `yew_git_test_run_sync`'s body (`test_gitcache.c:73-101`): the C
+/// test's `gitcache_run_sync`, recording the spec and answering exit 0.
+fn git_test_run_sync(mut ed: Ed, spec: JobSpec) -> JobWait {
+    ed.git.slog.calls += 1
+    ed.git.slog.argv = copy spec.argv
+    ed.git.slog.env_set = copy spec.env_set
+    ed.git.slog.env_unset = copy spec.env_unset
+    ed.git.slog.env_unset_prefix = copy spec.env_unset_prefix
+    ed.git.slog.inherit_tty = spec.inherit_tty
+    ed.git.slog.sink = spec.sink
+    ed.git.slog.cwd = copy spec.cwd
+    JobWait { state: JOB_EXITED, exit_code: 0, termsig: 0, exec_errno: 0 }
+}
+
+/// `yew_git_run_terminal` (`git.c:767-841`): a mutating verb handed the
+/// terminal (s52's interactive rebase): `editor` is the command git runs
+/// for both editor rows, the rest of the pinned environment unchanged;
+/// the cache is invalidated and a refresh forced after it ran.
+pub fn git_run_terminal(mut ed: Ed, verb: int, argv: List[str], editor: str) -> (
+    bool,
+    JobWait,
+    str,
+) {
+    var none = JobWait { state: JOB_RUNNING, exit_code: 0, termsig: 0, exec_errno: 0 }
+    if verb < 0 ||
+        verb >= ed.git.verbs.len ||
+        argv.len == 0 ||
+        editor.len == 0 ||
+        ed.git.verbs[verb].kind != GV_MUTATE {
+        return (false, none, "invalid Git terminal handover")
+    }
+    let v = copy ed.git.verbs[verb]
+    if v.needs_repo &&
+        (ed.git.detect_state != GIT_ASYNC_READY || ed.git.detect_result != git.GIT_OK) {
+        return (false, none, git.git_state_str(git.GIT_NOT_REPO))
+    }
+    if v.needs_head && (ed.git.snap[ed.git.live].gen == 0 || ed.git.snap[ed.git.live].unborn) {
+        return (false, none, git.git_state_str(git.GIT_NO_HEAD))
+    }
+    var spec = job_spec_new()
+    spec.argv = git_build_argv(v.kind, argv)
+    spec.cwd = shell_ws_root(ed)
+    spec.has_cwd = true
+    spec.sink = SINK_DISCARD
+    spec.display = v.name
+    spec.has_display = true
+    spec.internal = true
+    spec.env_set = git_env_set("GIT_EDITOR={editor}", "GIT_SEQUENCE_EDITOR={editor}", false)
+    spec.env_unset = git_env_unset()
+    spec.env_unset_prefix = git_env_unset_prefix()
+    spec.inherit_tty = true
+    var ran = false
+    var wait = none
+    var why = ""
+    if ed.git.test_sync {
+        wait = git_test_run_sync(mut ed, spec)
+        ran = true
+    } else {
+        let (ok, w, e) = job_run_sync_spec(mut ed, spec)
+        ran = ok
+        wait = w
+        why = e
+    }
+    if ran {
+        git_invalidate(mut ed)
+        let _ = git_refresh(mut ed, true)
+    }
+    (ran, wait, why)
+}
+
+/// The kinds a `git_spawn_callback` owner names (the port of C's
+/// `YewJobCallbackOps` pointer each caller passes): F mode's preview.
+pub const GIT_OWNER_FUSS_PREVIEW: int = 1
+
+/// `yew_git_spawn_callback_input` (`git.c:867-941`): a READ or MUTATE
+/// verb whose completion goes to its caller (`owner` names it, `key` is
+/// its row), not to the refresh; stdin copied and owned until the job is
+/// released.
+pub fn git_spawn_callback_input(
+    mut ed: Ed,
+    verb: int,
+    argv: List[str],
+    stdin: List[byte],
+    owner: int,
+    key: str,
+) -> (int, str) {
+    if verb < 0 ||
+        verb >= ed.git.verbs.len ||
+        argv.len == 0 ||
+        owner == 0 ||
+        ed.git.verbs[verb].kind != GV_READ && ed.git.verbs[verb].kind != GV_MUTATE {
+        return (0, "invalid Git callback job")
+    }
+    if ed.git.test_spawn {
+        return (0, "Git callback job unavailable under test hook")
+    }
+    let v = copy ed.git.verbs[verb]
+    if v.needs_repo &&
+        (ed.git.detect_state != GIT_ASYNC_READY || ed.git.detect_result != git.GIT_OK) {
+        return (0, git.git_state_str(git.GIT_NOT_REPO))
+    }
+    if v.needs_head && (ed.git.snap[ed.git.live].gen == 0 || ed.git.snap[ed.git.live].unborn) {
+        return (0, git.git_state_str(git.GIT_NO_HEAD))
+    }
+    var spec = job_spec_new()
+    spec.argv = git_build_argv(v.kind, argv)
+    spec.cwd = shell_ws_root(ed)
+    spec.has_cwd = true
+    spec.sink = SINK_CALLBACK
+    spec.in_bytes = copy stdin
+    spec.has_in = stdin.len != 0
+    spec.timeout_ms = v.timeout_ms
+    spec.display = v.name
+    spec.has_display = true
+    spec.internal = true
+    spec.collect_max = GIT_COLLECT_MAX
+    spec.env_set = git_env_set("", "", false)
+    spec.env_unset = git_env_unset()
+    spec.env_unset_prefix = git_env_unset_prefix()
+    spec.callback = CB_GIT_OWNED
+    spec.cb_ms = owner
+    spec.cb_key = key
+    job_spawn(mut ed, mut spec)
+}
+
+/// `yew_git_spawn_callback` (`git.c:943-950`).
+pub fn git_spawn_callback(mut ed: Ed, verb: int, argv: List[str], owner: int, key: str) -> (
+    int,
+    str,
+) {
+    git_spawn_callback_input(mut ed, verb, argv, List[byte](), owner, key)
+}
+
+/// `git_callback_complete` (`git.c:843-848`): the wrapped owner's
+/// completion.
+pub fn git_owned_complete(ed: Ed, j: Job) {
+    match j.cb_ms {
+        _ => {},
+    }
+}
+
+/// `git_callback_destroy` (`git.c:850-860`): the wrapped owner's destroy
+/// (the stdin bytes are the job layer's, wiped at its settle).
+pub fn git_owned_destroy(ed: Ed, kind: int, key: str, completed: bool) {
+    match kind {
+        _ => {},
+    }
+}
+
+// ------------------------------------------------------------------
+// §1 and §4: availability and detection
+// ------------------------------------------------------------------
+
+// `git_parse_version` (`git.c:1445-1474`): "git version A.B.C…".
+fn git_parse_version(buf: List[byte]) -> (bool, GitVersion) {
+    let prefix = "git version ".bytes()
+    var v = GitVersion { major: 0, minor: 0, patch: 0 }
+    if buf.len < prefix.len {
+        return (false, v)
+    }
+    var at = 0
+    while at < prefix.len {
+        if buf[at] != prefix[at] {
+            return (false, v)
+        }
+        at += 1
+    }
+    var part = [0, 0, 0]
+    var i = 0
+    while i < 3 {
+        var digit = false
+        while at < buf.len && buf[at] as int >= 48 && buf[at] as int <= 57 {
+            digit = true
+            part[i] = part[i] * 10 + (buf[at] as int - 48)
+            if part[i] > 65535 {
+                return (false, v)
+            }
+            at += 1
+        }
+        if !digit {
+            return (false, v)
+        }
+        if i != 2 {
+            if at >= buf.len || buf[at] as int != 46 {
+                return (false, v)
+            }
+            at += 1
+        }
+        i += 1
+    }
+    v.major = part[0]
+    v.minor = part[1]
+    v.patch = part[2]
+    (true, v)
+}
+
+// `git_version_supported` (`git.c:1476-1479`): `YEW_GIT_MIN` is 2.20.0.
+fn git_version_supported(v: GitVersion) -> bool {
+    v.major > 2 || v.major == 2 && v.minor >= 20
+}
+
+/// `yew_git_avail` (`git.c:1481-1503`): resolved once per process,
+/// asynchronously — the first call spawns `git --version` and answers
+/// false; it answers true once the probe completed with a supported
+/// version.
+pub fn git_avail(mut ed: Ed) -> bool {
+    if ed.git.avail_state == GIT_ASYNC_READY {
+        return true
+    }
+    if ed.git.avail_state == GIT_ASYNC_UNTRIED {
+        var argv = List[str]()
+        (mut argv).push("--version")
+        let (id, _) = git_spawn(mut ed, git_verb(ed, "version"), argv, git_req(GREQ_VERSION))
+        ed.git.avail_state = if id != 0 then GIT_ASYNC_PENDING else GIT_ASYNC_FAILED
+    }
+    false
+}
+
+// `git_line` (`git.c:1505-1518`): the next LF-terminated line, the last
+// one possibly unterminated; `(false, …)` at the end.
+fn git_line(buf: List[byte], at0: int) -> (bool, int, int, int) {
+    var at = at0
+    let start = at
+    while at < buf.len && buf[at] as int != 10 {
+        at += 1
+    }
+    if at == start && at == buf.len {
+        return (false, start, 0, at)
+    }
+    let len = at - start
+    if at < buf.len {
+        at += 1
+    }
+    (true, start, len, at)
+}
+
+fn git_span_is(buf: List[byte], at: int, len: int, want: str) -> bool {
+    let w = want.bytes()
+    if len != w.len {
+        return false
+    }
+    var i = 0
+    while i < len {
+        if buf[at + i] != w[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `git_parse_bool_line` (`git.c:1520-1531`).
+fn git_parse_bool(buf: List[byte], at: int, len: int) -> (bool, bool) {
+    if git_span_is(buf, at, len, "true") {
+        return (true, true)
+    }
+    if git_span_is(buf, at, len, "false") {
+        return (true, false)
+    }
+    (false, false)
+}
+
+/// `git_parse_detect` (`git.c:1533-1607`): `rev-parse`'s rows in argument
+/// order — git dir, inside, bare, and the top level (absent for a bare
+/// repository, whose `--show-toplevel` exits 128 after the first three).
+/// A relative git dir resolves against `cwd`.
+fn git_parse_detect(mut repo: GitRepo, buf: List[byte], cwd: str, env_fp: wrapping[u64]) -> bool {
+    var la = [0, 0, 0, 0]
+    var ll = [0, 0, 0, 0]
+    var at = 0
+    var count = 0
+    while count < 4 {
+        let (ok, a, l, next) = git_line(buf, at)
+        if !ok {
+            break
+        }
+        la[count] = a
+        ll[count] = l
+        at = next
+        count += 1
+    }
+    if count < 3 {
+        return false
+    }
+    let (iok, inside) = git_parse_bool(buf, la[1], ll[1])
+    let (bok, bare) = git_parse_bool(buf, la[2], ll[2])
+    if !iok || !bok {
+        return false
+    }
+    var top = ""
+    let has_top = count == 4
+    if has_top {
+        top = git.git_ascii(buf, la[3], la[3] + ll[3])
+    }
+    if !bare && !has_top {
+        return false
+    }
+    var git_dir = git.git_ascii(buf, la[0], la[0] + ll[0])
+    if !git_dir.starts_with("/") {
+        git_dir = git_join(cwd, git_dir)
+    }
+    repo.git_dir = git_dir
+    repo.top_level = top
+    repo.has_top = has_top
+    repo.inside_work_tree = inside
+    repo.bare = bare
+    repo.env_fp = env_fp
+    repo.detected_ms = 0
+    true
+}
+
+fn git_detected_here(ed: Ed) -> bool {
+    ed.git.has_detected_root &&
+        ed.git.repo.env_fp == git_env_fingerprint() &&
+        ed.git.detected_root == shell_ws_root(ed)
+}
+
+/// `yew_git_detect` (`git.c:1577-1607`): answers the cached result for
+/// this workspace root and environment; otherwise (once git is known
+/// available) spawns the one `rev-parse` that answers everything.
+pub fn git_detect(mut ed: Ed) -> int {
+    if ed.git.avail_state != GIT_ASYNC_READY {
+        ed.git.detect_requested = true
+        let _ = git_avail(mut ed)
+        return git.GIT_NO_GIT
+    }
+    if (ed.git.detect_state == GIT_ASYNC_READY || ed.git.detect_state == GIT_ASYNC_FAILED) &&
+        git_detected_here(ed) {
+        return ed.git.detect_result
+    }
+    if ed.git.detect_state != GIT_ASYNC_PENDING {
+        var argv = List[str]()
+        for a in [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--is-inside-work-tree",
+            "--is-bare-repository",
+            "--show-toplevel",
+        ] {
+            (mut argv).push(a)
+        }
+        let (id, _) = git_spawn(mut ed, git_verb(ed, "detect"), argv, git_req(GREQ_DETECT))
+        ed.git.detect_state = if id != 0 then GIT_ASYNC_PENDING else GIT_ASYNC_FAILED
+    }
+    ed.git.detect_result
+}
+
+/// `yew_git_repo_cached` (`git.c:1609-1615`): the detected repository,
+/// `false` before detection answered.
+pub fn git_repo_ready(ed: Ed) -> bool {
+    ed.git.detect_state == GIT_ASYNC_READY
+}
+
+// A nested workspace (the repository's top level is not the workspace)
+// scopes status and the ignore set to `.` (`git.c:1630-1634`).
+fn git_nested(ed: Ed) -> bool {
+    git_repo_ready(ed) && ed.git.repo.has_top && ed.git.repo.top_level != shell_ws_root(ed)
+}
+
+fn git_argv(words: List[str]) -> List[str] {
+    var argv = List[str]()
+    for w in words {
+        (mut argv).push(w)
+    }
+    argv
+}
+
+// `git_spawn_ignore` (`git.c:1617-1642`).
+fn git_spawn_ignore(mut ed: Ed) -> bool {
+    var argv = git_argv(
+        [
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+        ],
+    )
+    if git_nested(ed) {
+        (mut argv).push("--")
+        (mut argv).push(".")
+    }
+    let (id, _) = git_spawn(mut ed, git_verb(ed, "ignore"), argv, git_req(GREQ_IGNORE))
+    id != 0
+}
+
+// `git_spawn_status` (`git.c:1644-1668`): §5's pinned invocation; nested,
+// every untracked file (the tree filters the scope itself).
+fn git_spawn_status(mut ed: Ed) -> bool {
+    let nested = git_nested(ed)
+    var argv = git_argv(["status", "--porcelain=v2", "--branch", "-z"])
+    (mut argv).push(if nested then "--untracked-files=all" else "--untracked-files=normal")
+    (mut argv).push("--ignored=no")
+    if nested {
+        (mut argv).push("--")
+        (mut argv).push(".")
+    }
+    let (id, _) = git_spawn(mut ed, git_verb(ed, "status"), argv, git_req(GREQ_STATUS))
+    id != 0
+}
+
+// `git_spawn_comment_char` (`git.c:1670-1682`).
+fn git_spawn_comment_char(mut ed: Ed) -> bool {
+    let argv = git_argv(["config", "--get", "core.commentChar"])
+    let (id, _) = git_spawn(mut ed, git_verb(ed, "comment-char"), argv, git_req(GREQ_VERB))
+    id != 0
+}
+
+// `git_spawn_incoming` (`git.c:1684-1696`): THREE dots — the symmetric
+// difference against the merge base, the files THEY changed that we have
+// not seen; two dots is subtly wrong once the branch has commits of its
+// own (fuss got this right; s51 §6).
+fn git_spawn_incoming(mut ed: Ed) -> bool {
+    let argv = git_argv(["diff", "--name-only", "-z", "HEAD...@{{upstream}}"])
+    let (id, _) = git_spawn(mut ed, git_verb(ed, "incoming"), argv, git_req(GREQ_INCOMING))
+    id != 0
+}
+
+// `git_spawn_upstream` (`git.c:1698-1709`).
+fn git_spawn_upstream(mut ed: Ed) -> bool {
+    let argv = git_argv(["rev-parse", "--verify", "@{{upstream}}"])
+    let (id, _) = git_spawn(mut ed, git_verb(ed, "upstream-oid"), argv, git_req(GREQ_UPSTREAM))
+    id != 0
+}
+
+// `git_spawn_log` (`git.c:2509-2524`): §10's pinned format.
+fn git_spawn_log(mut ed: Ed) -> bool {
+    let argv = git_argv(
+        [
+            "log",
+            "-z",
+            "--no-color",
+            "--date=raw",
+            "--pretty=format:%H%x00%h%x00%at%x00%an%x00%ae%x00%P%x00%D%x00%s%x00%b",
+        ],
+    )
+    let (id, _) = git_spawn(mut ed, git_verb(ed, "log"), argv, git_req(GREQ_LOG))
+    id != 0
+}
+
+// ------------------------------------------------------------------
+// §6: the incoming set
+// ------------------------------------------------------------------
+
+// `git_incoming_clear` (`git.c:1739-1749`).
+fn git_incoming_clear(mut ed: Ed) {
+    git.git_paths_reset(mut ed.git.incoming)
+    ed.git.upstream_oid = ""
+    ed.git.has_upstream_oid = false
+    ed.git.pending_upstream_oid = ""
+    ed.git.has_pending_upstream_oid = false
+}
+
+// `git_parse_oid` (`git.c:1767-1785`): 40 or 64 hex digits, a trailing
+// CR/LF run trimmed.
+fn git_parse_oid(out: List[byte]) -> (bool, str) {
+    var n = out.len
+    while n != 0 && (out[n - 1] as int == 10 || out[n - 1] as int == 13) {
+        n -= 1
+    }
+    if n != 40 && n != 64 {
+        return (false, "")
+    }
+    var i = 0
+    while i < n {
+        let c = out[i] as int
+        if !(c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70) {
+            return (false, "")
+        }
+        i += 1
+    }
+    (true, git.git_ascii(out, 0, n))
+}
+
+// `git_cache_comment_char` (`git.c:1787-1813`): `config --get`'s exit 1
+// is an absent key (the snapshot already holds `#`); otherwise one byte
+// that is not NUL, CR or LF, or the literal `auto`, a final LF (and a CR
+// before it) trimmed.
+fn git_cache_comment_char(
+    mut snap: git.GitSnapshot,
+    state: int,
+    exit_code: int,
+    out: List[byte],
+) -> bool {
+    if state == git.GIT_FAILED && exit_code == 1 {
+        return true
+    }
+    if state != git.GIT_OK {
+        return false
+    }
+    var len = out.len
+    if len != 0 && out[len - 1] as int == 10 {
+        len -= 1
+        if len != 0 && out[len - 1] as int == 13 {
+            len -= 1
+        }
+    }
+    let one = len == 1 && out[0] as int != 0 && out[0] as int != 10 && out[0] as int != 13
+    if !(one || git_span_is(out, 0, len, "auto")) {
+        return false
+    }
+    snap.comment_at = git.git_pool_add(mut snap.pool, out, 0, len)
+    snap.comment_len = len
+    true
+}
+
+// `git_merge_incoming` (`git.c:1827-1887`): the sorted incoming paths
+// merged into the sorted entries by byte equality — a shared path gains
+// `incoming`, an incoming-only path becomes an all-false entry with
+// `incoming` (why `↓` can appear alone), duplicate incoming paths once.
+// Built in `ed.git.merge` and copied back (the C arena's new array).
+fn git_merge_incoming(mut ed: Ed, s: int) -> bool {
+    // `yew_sort_stable(snap->entries, git_entry_cmp)` (`git.c:1842-1843`).
+    (mut ed.git.snap[s].tmp).reset()
+    var k = 0
+    while k < ed.git.snap[s].entries.len {
+        let e = copy ed.git.snap[s].entries[k]
+        (mut ed.git.snap[s].tmp).push(e)
+        k += 1
+    }
+    git.git_sort_entries(mut ed.git.snap[s])
+    (mut ed.git.merge).reset()
+    let ne = copy ed.git.snap[s].entries.len
+    let np = copy ed.git.incoming.rows.len
+    var ei = 0
+    var pi = 0
+    while ei < ne || pi < np {
+        var cmp = 0
+        if ei == ne {
+            cmp = 1
+        } else if pi == np {
+            cmp = -1
+        } else {
+            let e = copy ed.git.snap[s].entries[ei]
+            let r = copy ed.git.incoming.rows[pi]
+            cmp = git.git_span_cmp(
+                ed.git.snap[s].pool,
+                e.path_at,
+                e.path_len,
+                ed.git.incoming.pool,
+                r.at,
+                r.len,
+            )
+        }
+        if cmp < 0 {
+            (mut ed.git.merge).push(copy ed.git.snap[s].entries[ei])
+            ei += 1
+        } else if cmp == 0 {
+            var e = copy ed.git.snap[s].entries[ei]
+            e.incoming = true
+            (mut ed.git.merge).push(e)
+            ei += 1
+            pi += 1
+        } else {
+            let r = copy ed.git.incoming.rows[pi]
+            var e = git.git_entry_new()
+            e.path_at = git.git_pool_add(
+                mut ed.git.snap[s].pool,
+                ed.git.incoming.pool,
+                r.at,
+                r.at + r.len,
+            )
+            e.path_len = r.len
+            e.is_dir = r.is_dir
+            e.incoming = true
+            (mut ed.git.merge).push(e)
+            pi += 1
+        }
+        while pi > 0 && pi < np {
+            let a = copy ed.git.incoming.rows[pi - 1]
+            let b = copy ed.git.incoming.rows[pi]
+            if git.git_span_cmp(
+                ed.git.incoming.pool,
+                a.at,
+                a.len,
+                ed.git.incoming.pool,
+                b.at,
+                b.len,
+            ) !=
+                0 {
+                break
+            }
+            pi += 1
+        }
+    }
+    (mut ed.git.snap[s].entries).reset()
+    for e in ed.git.merge {
+        (mut ed.git.snap[s].entries).push(e)
+    }
+    (mut ed.git.merge).reset()
+    true
+}
+
+// ------------------------------------------------------------------
+// §11: the snapshot cache
+// ------------------------------------------------------------------
+
+fn git_reset_next(mut ed: Ed) {
+    let n = 1 - ed.git.live
+    git.git_snapshot_reset(mut ed.git.snap[n])
+}
+
+// `git_continue_refresh_after_comment` (`git.c:1815-1825`).
+fn git_continue_after_comment(mut ed: Ed) -> bool {
+    let n = 1 - ed.git.live
+    if ed.git.snap[n].has_upstream && ed.git.snap[n].upstream_len != 0 {
+        return git_spawn_upstream(mut ed)
+    }
+    git_incoming_clear(mut ed)
+    git_publish_refresh(mut ed)
+    true
+}
+
+// `git_publish_refresh` (`git.c:1889-1940`): the conflict count and the
+// rebase progress, the filesystem state over the parsed one, `gen` one
+// past the live snapshot's, then the ONE flip; the statusline and the
+// document repaint (both consume the cache, neither polls); a log asked
+// for while the refresh ran is started now.
+fn git_publish_refresh(mut ed: Ed) {
+    let n = 1 - ed.git.live
+    let probe = git_probe_state(ed.git.repo)
+    let op = git_operation_state(ed.git.repo)
+    var conflicts = 0
+    for e in ed.git.snap[n].entries {
+        if e.conflicted {
+            conflicts += 1
+        }
+    }
+    ed.git.snap[n].conflict_count = conflicts
+    ed.git.snap[n].rebase_step = 0
+    ed.git.snap[n].rebase_total = 0
+    if op == git.GIT_MID_REBASE {
+        let (sok, step) = git_read_u32(ed.git.repo.git_dir, "rebase-merge/msgnum")
+        if sok {
+            ed.git.snap[n].rebase_step = step
+        }
+        let (tok, total) = git_read_u32(ed.git.repo.git_dir, "rebase-merge/end")
+        if tok {
+            ed.git.snap[n].rebase_total = total
+        }
+    }
+    if op != git.GIT_OK {
+        ed.git.snap[n].state = op
+    } else if probe != git.GIT_OK {
+        ed.git.snap[n].state = probe
+    }
+    ed.git.snap[n].gen = ed.git.snap[ed.git.live].gen + 1
+    ed.git.snap[n].taken_ms = git_now(ed)
+    ed.git.live = n
+    ed.git.refresh_failed = false
+    ed.footer_dirty = true
+    ed.full_damage = true
+    let again = copy ed.git.refresh_again
+    ed.git.refresh_inflight = false
+    ed.git.refresh_again = false
+    if ed.git.log_requested {
+        ed.git.log_requested = false
+        if ed.git.snap[ed.git.live].unborn {
+            ed_msg(mut ed, MSG_ERROR, git.git_state_str(git.GIT_NO_HEAD))
+        } else {
+            let _ = git_spawn_log(mut ed)
+        }
+    }
+    if again {
+        let _ = git_refresh(mut ed, true)
+    }
+}
+
+// `git_refresh_failed` (`git.c:2158-2169`): the published snapshot
+// stands; an ordinary poll waits one full interval (the backoff), a
+// forced request still runs.
+fn git_refresh_failed(mut ed: Ed) {
+    let again = copy ed.git.refresh_again
+    ed.git.refresh_inflight = false
+    ed.git.refresh_again = false
+    ed.git.refresh_failed = true
+    ed.git.refresh_failed_ms = git_now(ed)
+    if again {
+        let _ = git_refresh(mut ed, true)
+    }
+}
+
+/// `yew_git_refresh` (`git.c:1942-2004`): never synchronous, always
+/// coalesced. Availability then detection first (each answer resumes
+/// the refresh); an in-flight refresh absorbs an ordinary poll and owes a
+/// forced one a follow-up; the failure backoff; the TTL on the wall
+/// clock; a held `index.lock` skips the tick. Answers whether a job was
+/// spawned (or is pending for it).
+pub fn git_refresh(mut ed: Ed, force: bool) -> bool {
+    if force {
+        ed.git.forced = true
+    }
+    if ed.git.avail_state != GIT_ASYNC_READY {
+        if ed.git.avail_state == GIT_ASYNC_FAILED && !force {
+            return false
+        }
+        ed.git.refresh_again = true
+        if ed.git.avail_state == GIT_ASYNC_FAILED {
+            ed.git.avail_state = GIT_ASYNC_UNTRIED
+        }
+        let _ = git_avail(mut ed)
+        return ed.git.avail_state == GIT_ASYNC_PENDING
+    }
+    if !force && ed.git.detect_state == GIT_ASYNC_FAILED && git_detected_here(ed) {
+        return false
+    }
+    if force && ed.git.detect_state == GIT_ASYNC_FAILED {
+        ed.git.detect_state = GIT_ASYNC_UNTRIED
+    }
+    if ed.git.detect_state != GIT_ASYNC_READY || !git_detected_here(ed) {
+        ed.git.refresh_again = true
+        let _ = git_detect(mut ed)
+        return ed.git.detect_state == GIT_ASYNC_PENDING
+    }
+    if ed.git.refresh_inflight {
+        // Rendering polls the published snapshot on every keypress; those
+        // reads are satisfied by the refresh in flight. Only an explicit
+        // or invalidating force earns one follow-up.
+        if force {
+            ed.git.refresh_again = true
+        }
+        return false
+    }
+    if !force && ed.git.refresh_failed && git_cache_fresh(ed.git.refresh_failed_ms, git_now(ed)) {
+        return false
+    }
+    let live = copy ed.git.live
+    if !ed.git.forced &&
+        ed.git.snap[live].gen != 0 &&
+        git_cache_fresh(ed.git.snap[live].taken_ms, git_now(ed)) {
+        return false
+    }
+    if git_probe_state(ed.git.repo) == git.GIT_LOCKED {
+        return false
+    }
+    ed.git.refresh_inflight = true
+    ed.git.forced = false
+    if !git_spawn_status(mut ed) {
+        git_refresh_failed(mut ed)
+        return false
+    }
+    true
+}
+
+/// `yew_git_snapshot` (`git.c:2006-2012`): schedules a refresh when one is
+/// due and answers the PUBLISHED snapshot's index (never blocks; `gen` 0
+/// is "loading…").
+pub fn git_snapshot(mut ed: Ed) -> int {
+    let _ = git_refresh(mut ed, false)
+    ed.git.live
+}
+
+/// `yew_git_snapshot_cached` (`git.c:2014-2023`): whether a snapshot was
+/// ever published (side-effect free; the snapshot is `snap[live]`).
+pub fn git_snapshot_cached(ed: Ed) -> bool {
+    ed.git.snap[ed.git.live].gen != 0
+}
+
+/// `yew_git_refresh_busy` (`git.c:2031-2035`).
+pub fn git_refresh_busy(ed: Ed) -> bool {
+    ed.git.refresh_inflight || ed.git.refresh_again
+}
+
+/// `yew_git_avail_state` (`git.c:1418-1422`).
+pub fn git_avail_state(ed: Ed) -> int {
+    ed.git.avail_state
+}
+
+/// `yew_git_detect_state` (`git.c:1424-1428`).
+pub fn git_detect_state(ed: Ed) -> int {
+    ed.git.detect_state
+}
+
+/// `yew_git_detect_result` (`git.c:1430-1434`).
+pub fn git_detect_result(ed: Ed) -> int {
+    ed.git.detect_result
+}
+
+// `git_publish_result` (`git.c:2063-2088`): the last completion's state
+// and bytes, the storage reused.
+fn git_publish_result(
+    mut ed: Ed,
+    job_id: int,
+    verb: str,
+    state: int,
+    out: List[byte],
+    err: List[byte],
+) {
+    ed.git.result.state = state
+    ed.git.result.job_id = job_id
+    ed.git.result.verb = verb
+    (mut ed.git.result.out).reset()
+    for b in out {
+        (mut ed.git.result.out).push(b)
+    }
+    (mut ed.git.result.err).reset()
+    for b in err {
+        (mut ed.git.result.err).push(b)
+    }
+}
+
+/// `yew_git_blob` (`git.c:2090-2122`): `cat-file blob OID` for a 40- or
+/// 64-hex object id (the fetch s53's differ consumes); `(0, why)` for an
+/// invalid id.
+pub fn git_blob(mut ed: Ed, oid: str) -> (int, str) {
+    let b = oid.bytes()
+    let (ok, _) = git_parse_oid(b)
+    if !ok || b.len == 0 || b[b.len - 1] as int == 10 || b[b.len - 1] as int == 13 {
+        return (0, "invalid git object id")
+    }
+    let argv = git_argv(["cat-file", "blob", oid])
+    git_spawn(mut ed, git_verb(ed, "blob"), argv, git_req(GREQ_BLOB))
+}
+
+/// `yew_git_invalidate` (`git.c:2124-2131`): after a mutation — the next
+/// refresh is forced; one in flight owes a follow-up.
+pub fn git_invalidate(mut ed: Ed) {
+    ed.git.forced = true
+    if ed.git.refresh_inflight {
+        ed.git.refresh_again = true
+    }
+}
+
+/// `yew_git_job_owned` (`git.c:2133-2156`): a git private job (an
+/// in-flight slot or a wrapped callback) — the loop's settle does not
+/// count its completion as an observable one.
+pub fn git_job_owned(ed: Ed, job_id: int) -> bool {
+    if job_id == 0 {
+        return false
+    }
+    if git_pending_find(ed, job_id) >= 0 {
+        return true
+    }
+    for j in ed.jobs.v {
+        if j.id == job_id && j.sink == SINK_CALLBACK && j.callback == CB_GIT_OWNED {
+            return true
+        }
+    }
+    false
+}
+
+/// `yew_git_state_free` (`git.c:1393-1443`): every in-flight slot dropped,
+/// a live job's stdin wiped first.
+pub fn git_state_free(mut ed: Ed) {
+    var i = 0
+    while i < ed.git.pending.len {
+        if ed.git.pending[i].active {
+            let at = job_find(ed, ed.git.pending[i].job_id)
+            if at >= 0 {
+                var k = 0
+                while k < ed.jobs.v[at].in_bytes.len {
+                    ed.jobs.v[at].in_bytes[k] = 0 as byte
+                    k += 1
+                }
+                (mut ed.jobs.v[at].in_bytes).reset()
+            }
+            git_pending_drop(mut ed, i)
+        }
+        i += 1
+    }
+    ed.git.repo = git_repo_none()
+    ed.git.has_detected_root = false
+    git_incoming_clear(mut ed)
+}
+
+/// `yew_git_test_complete_exit` (`git.c:2171-2448`): a completion by job
+/// id — the result published, the slot dropped, a mutation's structural
+/// invalidation, then the request kind's step of the refresh chain
+/// (version → detect → status → ignore → comment-char → upstream oid →
+/// incoming → publish). The production completion and the unit tests
+/// both come here.
+pub fn git_complete_exit(
+    mut ed: Ed,
+    job_id: int,
+    state: int,
+    exit_code: int,
+    out: List[byte],
+    err: List[byte],
+) -> bool {
+    let p = git_pending_find(ed, job_id)
+    if p < 0 {
+        return false
+    }
+    let kind = copy ed.git.pending[p].kind
+    let verb = copy ed.git.pending[p].verb
+    let verb_kind = copy ed.git.verbs[verb].kind
+    let verb_name = copy ed.git.verbs[verb].name
+    var retried = ed.git.pending[p].retried
+    if kind == GREQ_DETECT && state == git.GIT_FAILED && exit_code != 129 {
+        retried = true
+    }
+    let detect_root = copy ed.git.pending[p].detect_root
+    let detect_env_fp = copy ed.git.pending[p].detect_env_fp
+    git_publish_result(mut ed, job_id, verb_name, state, out, err)
+    git_pending_drop(mut ed, p)
+    if verb_kind == GV_NET {
+        ed.git.incoming_dirty = true
+    }
+    if verb_kind != GV_READ {
+        git_invalidate(mut ed)
+        let _ = git_refresh(mut ed, true)
+    }
+    if kind == GREQ_VERSION {
+        let (vok, version) = git_parse_version(out)
+        if state == git.GIT_OK && vok && git_version_supported(version) {
+            ed.git.version = version
+            ed.git.avail_state = GIT_ASYNC_READY
+        } else {
+            ed.git.avail_state = GIT_ASYNC_FAILED
+            git_publish_result(mut ed, job_id, verb_name, git.GIT_NO_GIT, out, err)
+            if ed.git.log_requested {
+                ed.git.log_requested = false
+                ed_msg(mut ed, MSG_ERROR, git.git_state_str(git.GIT_NO_GIT))
+            }
+        }
+        if ed.git.detect_requested && ed.git.avail_state == GIT_ASYNC_READY {
+            ed.git.detect_requested = false
+            let _ = git_detect(mut ed)
+        }
+        if ed.git.refresh_again && ed.git.avail_state == GIT_ASYNC_READY {
+            ed.git.refresh_again = false
+            let _ = git_refresh(mut ed, true)
+        }
+        return true
+    }
+    if kind == GREQ_DETECT {
+        git_complete_detect(
+            mut ed,
+            job_id,
+            verb_name,
+            state,
+            exit_code,
+            out,
+            err,
+            retried,
+            detect_root,
+            detect_env_fp,
+        )
+        return true
+    }
+    if kind == GREQ_STATUS {
+        if state != git.GIT_OK {
+            git_refresh_failed(mut ed)
+            return true
+        }
+        git_reset_next(mut ed)
+        let n = 1 - ed.git.live
+        var perr = git.git_parse_err()
+        if !git.git_parse_status(mut ed.git.snap[n], out, out.len, mut perr) ||
+            !git_spawn_ignore(mut ed) {
+            git_publish_result(mut ed, job_id, verb_name, git.GIT_PARSE, out, err)
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+        }
+        return true
+    }
+    if kind == GREQ_IGNORE {
+        let n = 1 - ed.git.live
+        var perr = git.git_parse_err()
+        if state != git.GIT_OK ||
+            !git.git_parse_ignore(out, out.len, mut ed.git.snap[n].ignored, mut perr) {
+            if state == git.GIT_OK {
+                git_publish_result(mut ed, job_id, verb_name, git.GIT_PARSE, out, err)
+            }
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+            return true
+        }
+        if !git_spawn_comment_char(mut ed) {
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+        }
+        return true
+    }
+    if kind == GREQ_VERB && verb_name == "comment-char" && ed.git.refresh_inflight {
+        let n = 1 - ed.git.live
+        let absent = state == git.GIT_FAILED && exit_code == 1
+        if !git_cache_comment_char(mut ed.git.snap[n], state, exit_code, out) {
+            if state == git.GIT_OK {
+                git_publish_result(mut ed, job_id, verb_name, git.GIT_PARSE, out, err)
+            }
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+            return true
+        }
+        if absent {
+            git_publish_result(mut ed, job_id, verb_name, git.GIT_OK, List[byte](), err)
+        }
+        if !git_continue_after_comment(mut ed) {
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+        }
+        return true
+    }
+    if kind == GREQ_UPSTREAM {
+        let (ook, oid) = if state == git.GIT_OK then git_parse_oid(out) else (false, "")
+        if !ook {
+            if state == git.GIT_OK {
+                git_publish_result(mut ed, job_id, verb_name, git.GIT_PARSE, out, err)
+            }
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+            return true
+        }
+        if ed.git.incoming_dirty || !ed.git.has_upstream_oid || ed.git.upstream_oid != oid {
+            ed.git.pending_upstream_oid = oid
+            ed.git.has_pending_upstream_oid = true
+            if !git_spawn_incoming(mut ed) {
+                git_reset_next(mut ed)
+                git_refresh_failed(mut ed)
+            }
+        } else if !git_merge_incoming(mut ed, 1 - ed.git.live) {
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+        } else {
+            git_publish_refresh(mut ed)
+        }
+        return true
+    }
+    if kind == GREQ_INCOMING {
+        var perr = git.git_parse_err()
+        var ok = state == git.GIT_OK
+        if ok {
+            ok = git.git_parse_z_paths(out, out.len, mut ed.git.incoming, mut perr)
+        }
+        if ok {
+            ok = git_merge_incoming(mut ed, 1 - ed.git.live)
+        }
+        if !ok {
+            if state == git.GIT_OK {
+                git_publish_result(mut ed, job_id, verb_name, git.GIT_PARSE, out, err)
+            }
+            git_reset_next(mut ed)
+            git_refresh_failed(mut ed)
+            return true
+        }
+        ed.git.upstream_oid = ed.git.pending_upstream_oid
+        ed.git.has_upstream_oid = ed.git.has_pending_upstream_oid
+        ed.git.pending_upstream_oid = ""
+        ed.git.has_pending_upstream_oid = false
+        ed.git.incoming_dirty = false
+        git_publish_refresh(mut ed)
+        return true
+    }
+    if kind == GREQ_LOG {
+        (mut ed.git.log_records).reset()
+        var perr = git.git_parse_err()
+        if state == git.GIT_OK &&
+            !git.git_parse_log(out, out.len, mut ed.git.log_records, mut perr) {
+            git_publish_result(mut ed, job_id, verb_name, git.GIT_PARSE, out, err)
+        }
+        return true
+    }
+    true
+}
+
+// The detection completion (`git.c:2241-2311`): a bare repository's
+// `--show-toplevel` exits 128 AFTER its three valid rows, which parse; an
+// old git rejecting `--path-format=absolute` (exit 129) is retried once
+// without it; the context captured at the spawn is re-checked, so an
+// answer about a previous root or environment is never cached as this
+// one's.
+fn git_complete_detect(
+    mut ed: Ed,
+    job_id: int,
+    verb_name: str,
+    state: int,
+    exit_code: int,
+    out: List[byte],
+    err: List[byte],
+    retried: bool,
+    detect_root: str,
+    detect_env_fp: wrapping[u64],
+) {
+    let bare_partial_ok = state == git.GIT_FAILED && exit_code == 128
+    var repo = git_repo_none()
+    let parsed = (state == git.GIT_OK || bare_partial_ok) &&
+        git_parse_detect(mut repo, out, detect_root, detect_env_fp)
+    if parsed && (state == git.GIT_OK || bare_partial_ok && repo.bare) {
+        ed.git.repo = repo
+        ed.git.repo.detected_ms = git_now(ed)
+        ed.git.detected_root = detect_root
+        ed.git.has_detected_root = true
+        ed.git.detect_result = if ed.git.repo.bare then git.GIT_BARE else git.GIT_OK
+        ed.git.detect_state = GIT_ASYNC_READY
+    } else if state == git.GIT_FAILED && !retried {
+        let argv = git_argv(
+            [
+                "rev-parse",
+                "--git-dir",
+                "--is-inside-work-tree",
+                "--is-bare-repository",
+                "--show-toplevel",
+            ],
+        )
+        var req = git_req(GREQ_DETECT)
+        req.retried = true
+        let (id, _) = git_spawn(mut ed, git_verb(ed, "detect"), argv, req)
+        if id != 0 {
+            return
+        }
+        ed.git.repo = git_repo_none()
+        ed.git.repo.env_fp = detect_env_fp
+        ed.git.detected_root = detect_root
+        ed.git.has_detected_root = true
+        ed.git.detect_result = git.GIT_NOT_REPO
+        ed.git.detect_state = GIT_ASYNC_FAILED
+    } else {
+        ed.git.repo = git_repo_none()
+        ed.git.repo.env_fp = detect_env_fp
+        ed.git.detected_root = detect_root
+        ed.git.has_detected_root = true
+        ed.git.detect_result = if state == git.GIT_NO_GIT then git.GIT_NO_GIT else git.GIT_NOT_REPO
+        ed.git.detect_state = GIT_ASYNC_FAILED
+    }
+    if (ed.git.detect_state == GIT_ASYNC_READY || ed.git.detect_state == GIT_ASYNC_FAILED) &&
+        (detect_env_fp != git_env_fingerprint() || detect_root != shell_ws_root(ed)) {
+        ed.git.detect_state = GIT_ASYNC_UNTRIED
+        let _ = git_detect(mut ed)
+        return
+    }
+    git_publish_result(mut ed, job_id, verb_name, ed.git.detect_result, out, err)
+    if ed.git.refresh_again &&
+        ed.git.detect_state == GIT_ASYNC_READY &&
+        ed.git.detect_result != git.GIT_BARE {
+        ed.git.refresh_again = false
+        let _ = git_refresh(mut ed, true)
+    }
+    if ed.git.log_requested &&
+        ed.git.detect_state == GIT_ASYNC_READY &&
+        ed.git.detect_result == git.GIT_OK {
+        let _ = git_refresh(mut ed, true)
+    }
+}
+
+/// `yew_git_test_complete` (`git.c:2450-2458`): OK is exit 0, FAILED is
+/// 129, anything else -1.
+pub fn git_test_complete(
+    mut ed: Ed,
+    job_id: int,
+    state: int,
+    out: List[byte],
+    err: List[byte],
+) -> bool {
+    let code = if state == git.GIT_OK then 0 else if state == git.GIT_FAILED then 129 else -1
+    git_complete_exit(mut ed, job_id, state, code, out, err)
+}
+
+// ------------------------------------------------------------------
+// §13: the three working commands
+// ------------------------------------------------------------------
+
+/// `ed.git.info` (`yew_git_cmd_info`, `git.c:2470-2502`): repository,
+/// branch, state and snapshot age to the message line.
+pub fn git_cmd_info(mut ed: Ed, _cx: CmdCtx) -> int {
+    let live = git_snapshot(mut ed)
+    let s = copy ed.git.snap[live]
+    var repo = shell_ws_root(ed)
+    if ed.git.repo.has_top {
+        repo = ed.git.repo.top_level
+    } else if ed.git.repo.git_dir.len != 0 {
+        repo = ed.git.repo.git_dir
+    }
+    let age = if s.gen == 0 then 0 else git_now(ed) - s.taken_ms
+    var state = "loading"
+    if s.gen != 0 {
+        state = git.git_state_str(s.state)
+    } else if ed.git.avail_state == GIT_ASYNC_FAILED {
+        state = git.git_state_str(git.GIT_NO_GIT)
+    } else if ed.git.detect_state != GIT_ASYNC_UNTRIED {
+        state = git.git_state_str(ed.git.detect_result)
+    }
+    var line = List[byte]()
+    for b in "git: {state}; repo {repo}; branch ".bytes() {
+        (mut line).push(b)
+    }
+    if s.has_branch {
+        for b in git.git_snap_branch(s) {
+            (mut line).push(b)
+        }
+    } else {
+        for b in "(unknown)".bytes() {
+            (mut line).push(b)
+        }
+    }
+    for b in "; age {age} ms".bytes() {
+        (mut line).push(b)
+    }
+    ed_msg_bytes(mut ed, MSG_INFO, line)
+    CMD_OK
+}
+
+/// `ed.git.refresh` (`yew_git_cmd_refresh`, `git.c:2504-2511`).
+pub fn git_cmd_refresh(mut ed: Ed, _cx: CmdCtx) -> int {
+    let _ = git_refresh(mut ed, true)
+    ed_msg(mut ed, MSG_INFO, "git refresh scheduled")
+    CMD_OK
+}
+
+/// `ed.git.log` (`yew_git_cmd_log`, `git.c:2526-2543`): the record list
+/// (the viewer is F mode's); before the repository answered, the request
+/// waits on a forced refresh.
+pub fn git_cmd_log(mut ed: Ed, _cx: CmdCtx) -> int {
+    if ed.git.avail_state != GIT_ASYNC_READY ||
+        ed.git.detect_state != GIT_ASYNC_READY ||
+        ed.git.snap[ed.git.live].gen == 0 {
+        ed.git.log_requested = true
+        let _ = git_refresh(mut ed, true)
+        ed_msg(mut ed, MSG_INFO, "git log waiting for repository status")
+        return CMD_OK
+    }
+    if !git_spawn_log(mut ed) {
+        ed_msg(mut ed, MSG_ERROR, "could not start git log")
+        return CMD_ERR_IO
+    }
+    ed_msg(mut ed, MSG_INFO, "git log loading")
+    CMD_OK
+}
+
+/// The util module's string conversion for a snapshot span (a non-UTF-8
+/// branch name is shown empty, G59's neighbour).
+pub fn git_span_str(b: List[byte], at: int, len: int) -> str {
+    util.buf_to_str(git.git_slice(b, at, at + len)) else ""
+}
