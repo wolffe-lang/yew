@@ -409,6 +409,105 @@ pub fn job_run_sync(mut ed: Ed, argv0: List[str], cmdline: str) -> (bool, JobWai
     (true, result, "")
 }
 
+/// `yew_job_run_sync` (`job.c:902-1077`) with C's whole spec: the
+/// caller's `argv` (or `cmdline`), environment rows and directory (the
+/// workspace root when none) — the git layer's terminal handover (s51,
+/// `yew_git_run_terminal`). The spec must inherit the terminal, discard
+/// output and take no stdin or timeout, as C refuses otherwise.
+pub fn job_run_sync_spec(mut ed: Ed, spec: JobSpec) -> (bool, JobWait, str) {
+    var result = jb_wait_none()
+    if !spec.inherit_tty {
+        return (false, result, "synchronous job must inherit tty")
+    }
+    if spec.sink != SINK_DISCARD ||
+        spec.framed != FRAMED_NONE ||
+        spec.stream != STREAM_NONE ||
+        spec.callback != CB_NONE {
+        return (false, result, "inherited-tty job cannot use an output sink")
+    }
+    if spec.argv.len == 0 && !spec.has_cmdline {
+        return (false, result, "no command")
+    }
+    if spec.has_in || spec.in_bytes.len != 0 {
+        return (false, result, "inherited-tty job cannot pipe stdin")
+    }
+    if spec.timeout_ms != 0 {
+        return (false, result, "inherited-tty job cannot use an async timeout")
+    }
+    if !jb_env_spec_valid(spec) {
+        return (false, result, "invalid job environment override")
+    }
+    var argv = copy spec.argv
+    if argv.len == 0 {
+        (mut argv).push(job_shell())
+        (mut argv).push("-c")
+        (mut argv).push(spec.cmdline)
+    }
+    let envp = job_build_env(mut ed, spec)
+    let dir = if spec.has_cwd then spec.cwd else shell_ws_root(ed)
+    signal.ignore(signal.interrupt() | signal.quit()) else |_| {
+        return (false, result, "cannot prepare terminal signals")
+    }
+    var handed = false
+    if ed.tty_ready {
+        if !term.tty_handover_begin(mut ed.tty) {
+            jb_signals_back()
+            return (false, result, "cannot hand over terminal")
+        }
+        handed = true
+    }
+    var c = process.from_argv(argv)
+    process.set_stdin(mut c, fs.stdin())
+    let saved = jb_apply(envp, dir)
+    let started = process.start_job(c, -1, jb_child_defaults())
+    jb_restore(saved)
+    var ok = false
+    var err = ""
+    let ch = started else |e| {
+        match e {
+            not_found => {
+                result.state = JOB_EXECFAIL
+                result.exec_errno = 2
+                result.exit_code = 127
+                ok = true
+            },
+            denied => {
+                result.state = JOB_EXECFAIL
+                result.exec_errno = 13
+                result.exit_code = 127
+                ok = true
+            },
+            invalid => { err = "cannot start the child: invalid" },
+            unsupported => { err = "cannot start the child: unsupported" },
+            io => { err = "cannot fork" },
+        }
+        if !jb_resume(mut ed, handed) {
+            ok = false
+            err = "cannot resume terminal"
+        }
+        jb_signals_back()
+        return (ok, result, err)
+    }
+    let status = process.wait_status(take ch) else |_| {
+        let _ = jb_resume(mut ed, handed)
+        jb_signals_back()
+        return (false, result, "cannot wait for child")
+    }
+    if status >= 0 {
+        result.state = JOB_EXITED
+        result.exit_code = status
+    } else {
+        result.state = JOB_SIGNALED
+        result.termsig = 0 - status
+    }
+    let resumed = jb_resume(mut ed, handed)
+    jb_signals_back()
+    if !resumed {
+        return (false, result, "cannot resume terminal")
+    }
+    (true, result, "")
+}
+
 // The resume epilogue every path takes (`job.c:1052-1076`): the terminal
 // back, the input modes and the window size re-read, a full repaint.
 fn jb_resume(mut ed: Ed, handed: bool) -> bool {
@@ -481,6 +580,14 @@ pub const CB_COMPFISH: int = 3
 
 /// The unit tests' witness (`test_job.c`'s `job_callback_test_*`).
 pub const CB_TEST: int = 4
+
+/// A git layer request (`git.c`'s `git_job_ops`, s51): its completion is
+/// the refresh chain's or the published result's (`edit.git`).
+pub const CB_GIT: int = 5
+
+/// A git verb whose completion goes to its caller (`git.c`'s
+/// `git_callback_ops`, s51): the caller's kind rides `cb_ms`.
+pub const CB_GIT_OWNED: int = 6
 
 /// No proxy owner.
 pub const PROXY_NONE: int = 0
@@ -1461,6 +1568,8 @@ fn jb_callback_complete(mut ed: Ed, i: int) {
         2 => comphelp_job_complete(mut ed, j),
         3 => compfish_job_complete(mut ed, j),
         4 => jb_witness_complete(mut ed, j),
+        5 => git_job_complete(mut ed, j),
+        6 => git_owned_complete(ed, j),
         _ => {},
     }
 }
@@ -1472,11 +1581,13 @@ fn jb_callback_destroy(mut ed: Ed, i: int) {
     ed.jobs.v[i].callback_destroyed = true
     let key = ed.jobs.v[i].cb_key
     let completed = ed.jobs.v[i].callback_called
+    let owner = ed.jobs.v[i].cb_ms
     match ed.jobs.v[i].callback {
         1 => compgen_job_destroy(mut ed, key, completed),
         2 => comphelp_job_destroy(mut ed, key, completed),
         3 => compfish_job_destroy(mut ed, key, completed),
         4 => jb_witness_destroy(mut ed, key),
+        6 => git_owned_destroy(ed, owner, key, completed),
         _ => {},
     }
 }
