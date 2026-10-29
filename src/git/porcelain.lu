@@ -1,0 +1,1603 @@
+//! git.porcelain — the byte parsers of the git layer.
+//!
+//! Ports sagitta `src/mod/git/porcelain.c` (1,017 lines) and the parsed
+//! shapes of `src/mod/git/git.h` (339) at 9ace98c2, under
+//! `s51-git-layer.md` §5–§10: `status --porcelain=v2 --branch -z`, the
+//! `-z` path lists (`diff --name-only`, `ls-files`), the ignore set's
+//! dir-prefix match, `blame --porcelain`/`--incremental`, and the pinned
+//! `--pretty` log and reflog records. NO I/O and no spawning (§1): pure
+//! bytes in, records out.
+//!
+//! The port's shapes. C's arena strings are `List[byte]` owned by the
+//! record; a C `NULL` is a `has_` flag beside an empty list. Every path
+//! stays BYTES (invariant 2): porcelain hands back raw bytes, never
+//! quoted (`-c core.quotepath=false`), and a path that is not UTF-8 is a
+//! path all the same. C's `const u8 *buf, u64 n` is `(buf, n)` with the
+//! parser reading `buf[0..n)`, so a unit test truncates by passing a
+//! shorter `n` over the same bytes, as C's does. C's two local merge
+//! sorts (`sort_entries`, `sort_paths`, `porcelain.c:184-262`) are one
+//! stable bottom-up merge over an index permutation (`git_sort_order`):
+//! the same order, a tie taking the left run.
+
+use util
+
+/// `GitStatusCode` (`git.h:52-71`): the taxonomy, states not strings.
+pub const GIT_OK: int = 0
+
+/// Git is absent or older than 2.20.0.
+pub const GIT_NO_GIT: int = 1
+
+/// Not a repository.
+pub const GIT_NOT_REPO: int = 2
+
+/// A bare repository.
+pub const GIT_BARE: int = 3
+
+/// An unborn branch (`# branch.oid (initial)`).
+pub const GIT_NO_HEAD: int = 4
+
+/// A detached HEAD.
+pub const GIT_DETACHED: int = 5
+
+/// No upstream configured (a state, not an error).
+pub const GIT_NO_UPSTREAM: int = 6
+
+/// Any `u` record.
+pub const GIT_CONFLICTED: int = 7
+
+/// `MERGE_HEAD` exists.
+pub const GIT_MID_MERGE: int = 8
+
+/// `rebase-merge/` or `rebase-apply/` exists.
+pub const GIT_MID_REBASE: int = 9
+
+/// `CHERRY_PICK_HEAD` exists.
+pub const GIT_MID_CHERRY_PICK: int = 10
+
+/// `REVERT_HEAD` exists.
+pub const GIT_MID_REVERT: int = 11
+
+/// `BISECT_LOG` exists.
+pub const GIT_MID_BISECT: int = 12
+
+/// `index.lock` is held.
+pub const GIT_LOCKED: int = 13
+
+/// A network verb failed for credentials.
+pub const GIT_AUTH: int = 14
+
+/// A verb timed out.
+pub const GIT_TIMEOUT: int = 15
+
+/// A nonzero exit; stderr carried, not parsed.
+pub const GIT_FAILED: int = 16
+
+/// Malformed porcelain (our bug).
+pub const GIT_PARSE: int = 17
+
+/// The taxonomy's size (`YEW_ARRAY_LEN(git_states)`).
+pub const GIT_STATE_COUNT: int = 18
+
+/// `yew_git_state_str` (`git.c:212-219`, `:317-322`): stable and testable.
+pub fn git_state_str(code: int) -> str {
+    match code {
+        0 => "ok",
+        1 => "git unavailable",
+        2 => "not a repository",
+        3 => "bare repository",
+        4 => "no HEAD",
+        5 => "detached HEAD",
+        6 => "no upstream",
+        7 => "conflicted",
+        8 => "merge in progress",
+        9 => "rebase in progress",
+        10 => "cherry-pick in progress",
+        11 => "revert in progress",
+        12 => "bisect in progress",
+        13 => "repository locked",
+        14 => "authentication required",
+        15 => "timed out",
+        16 => "git command failed",
+        17 => "malformed git output",
+        _ => "unknown git state",
+    }
+}
+
+/// `GitEntryKind` (`git.h:105-111`): a `1` record.
+pub const GIT_E_ORDINARY: int = 0
+
+/// A `2` record (rename or copy).
+pub const GIT_E_RENAME: int = 1
+
+/// A `u` record.
+pub const GIT_E_UNMERGED: int = 2
+
+/// A `?` record.
+pub const GIT_E_UNTRACKED: int = 3
+
+/// A `!` record.
+pub const GIT_E_IGNORED: int = 4
+
+/// `GitParseErr` (`git.h:100-103`): where and why.
+pub struct GitParseErr {
+    off: int,
+    message: str,
+}
+
+/// No error yet.
+pub fn git_parse_err() -> GitParseErr {
+    GitParseErr { off: 0, message: "" }
+}
+
+/// `GitEntry` (`git.h:113-130`), SCALARS ONLY: its byte fields are
+/// `(at, len)` spans of the owning snapshot's `pool` (C's arena slices).
+/// `x`/`y` are `.` when unmodified (46, never a space); the index oid
+/// `hI` is `oid_len` bytes at `oid_at`, 0 when absent; `orig_*` is a
+/// `2` record's source path.
+pub struct GitEntry {
+    kind: int,
+    x: int,
+    y: int,
+    path_at: int,
+    path_len: int,
+    orig_at: int,
+    orig_len: int,
+    has_orig: bool,
+    score: int,
+    oid_at: int,
+    oid_len: int,
+    is_dir: bool,
+    submodule: bool,
+    staged: bool,
+    unstaged: bool,
+    untracked: bool,
+    conflicted: bool,
+    incoming: bool,
+}
+
+/// A cleared entry (`memset(out, 0, …)`, `x = y = '.'`).
+pub fn git_entry_new() -> GitEntry {
+    GitEntry {
+        kind: GIT_E_ORDINARY,
+        x: 46,
+        y: 46,
+        path_at: 0,
+        path_len: 0,
+        orig_at: 0,
+        orig_len: 0,
+        has_orig: false,
+        score: 0,
+        oid_at: 0,
+        oid_len: 0,
+        is_dir: false,
+        submodule: false,
+        staged: false,
+        unstaged: false,
+        untracked: false,
+        conflicted: false,
+        incoming: false,
+    }
+}
+
+/// One `-z` path (`GitPath`, `git.h:137-141`): `len` bytes at `at` of the
+/// owning `GitPaths.pool`; `is_dir` is its trailing `/`.
+pub struct GitPathRow {
+    at: int,
+    len: int,
+    is_dir: bool,
+}
+
+/// A sorted `-z` path list (`GitPathList`/`GitIgnoreSet`, `git.h:143-151`)
+/// with its own byte pool and the parse's reusable scratch: C's arena,
+/// reset rather than replaced so a session-long owner holds one buffer
+/// (G33), not one a parse.
+pub struct GitPaths {
+    pool: List[byte],
+    rows: List[GitPathRow],
+    tmp: List[GitPathRow],
+    order: List[int],
+    s_at: List[int],
+    s_len: List[int],
+    s_merge: List[int],
+}
+
+/// An empty list.
+pub fn git_paths_new() -> GitPaths {
+    GitPaths {
+        pool: List[byte](),
+        rows: List[GitPathRow](),
+        tmp: List[GitPathRow](),
+        order: List[int](),
+        s_at: List[int](),
+        s_len: List[int](),
+        s_merge: List[int](),
+    }
+}
+
+/// Drop the list's rows and bytes, keeping their storage (`arena_free_all`
+/// then `arena_init`).
+pub fn git_paths_reset(mut p: GitPaths) {
+    (mut p.pool).reset()
+    (mut p.rows).reset()
+    (mut p.tmp).reset()
+    (mut p.order).reset()
+}
+
+/// Row `i`'s bytes, copied.
+pub fn git_paths_bytes(p: GitPaths, i: int) -> List[byte] {
+    git_slice(p.pool, p.rows[i].at, p.rows[i].at + p.rows[i].len)
+}
+
+/// `GitSnapshot` (`git.h:162-182`). Every string is a `(at, len)` span of
+/// `pool`: `branch`, `upstream` and `head_oid` with C's NULLs as `has_`
+/// flags, `comment_char` always present (`#` by default). `tmp` and
+/// `order` are the parse's scratch. The owner RESETS a snapshot and
+/// parses into it again (C's `yew_git_snapshot_drop` + `_init` on the
+/// inactive half), so the two halves' storage is reused for the session.
+pub struct GitSnapshot {
+    state: int,
+    pool: List[byte],
+    branch_at: int,
+    branch_len: int,
+    has_branch: bool,
+    upstream_at: int,
+    upstream_len: int,
+    has_upstream: bool,
+    head_at: int,
+    head_len: int,
+    has_head_oid: bool,
+    comment_at: int,
+    comment_len: int,
+    ahead: int,
+    behind: int,
+    detached: bool,
+    unborn: bool,
+    conflicted: bool,
+    conflict_count: int,
+    rebase_step: int,
+    rebase_total: int,
+    entries: List[GitEntry],
+    ignored: GitPaths,
+    gen: int,
+    taken_ms: int,
+    tmp: List[GitEntry],
+    order: List[int],
+    s_at: List[int],
+    s_len: List[int],
+    s_merge: List[int],
+}
+
+/// `yew_git_snapshot_init` (`git.c:133-143`): empty, `#` the comment
+/// character, the divergence unknown.
+pub fn git_snapshot_new() -> GitSnapshot {
+    var s = GitSnapshot {
+        state: GIT_OK,
+        pool: List[byte](),
+        branch_at: 0,
+        branch_len: 0,
+        has_branch: false,
+        upstream_at: 0,
+        upstream_len: 0,
+        has_upstream: false,
+        head_at: 0,
+        head_len: 0,
+        has_head_oid: false,
+        comment_at: 0,
+        comment_len: 0,
+        ahead: -1,
+        behind: -1,
+        detached: false,
+        unborn: false,
+        conflicted: false,
+        conflict_count: 0,
+        rebase_step: 0,
+        rebase_total: 0,
+        entries: List[GitEntry](),
+        ignored: git_paths_new(),
+        gen: 0,
+        taken_ms: 0,
+        tmp: List[GitEntry](),
+        order: List[int](),
+        s_at: List[int](),
+        s_len: List[int](),
+        s_merge: List[int](),
+    }
+    git_snapshot_reset(mut s)
+    s
+}
+
+/// `yew_git_snapshot_drop` then `_init` (`git.c:133-151`) on storage kept
+/// for reuse: every field to its initial value, the pool holding only the
+/// default comment character.
+pub fn git_snapshot_reset(mut s: GitSnapshot) {
+    (mut s.pool).reset()
+    (mut s.entries).reset()
+    (mut s.tmp).reset()
+    (mut s.order).reset()
+    git_paths_reset(mut s.ignored)
+    s.state = GIT_OK
+    s.has_branch = false
+    s.branch_at = 0
+    s.branch_len = 0
+    s.has_upstream = false
+    s.upstream_at = 0
+    s.upstream_len = 0
+    s.has_head_oid = false
+    s.head_at = 0
+    s.head_len = 0
+    s.comment_at = 0
+    s.comment_len = 1
+    (mut s.pool).push(35 as byte)
+    s.ahead = -1
+    s.behind = -1
+    s.detached = false
+    s.unborn = false
+    s.conflicted = false
+    s.conflict_count = 0
+    s.rebase_step = 0
+    s.rebase_total = 0
+    s.gen = 0
+    s.taken_ms = 0
+}
+
+/// Append `b[at..end)` to `pool`; answers where it starts.
+pub fn git_pool_add(mut pool: List[byte], b: List[byte], at: int, end: int) -> int {
+    let start = pool.len
+    var i = at
+    while i < end {
+        (mut pool).push(b[i])
+        i += 1
+    }
+    start
+}
+
+/// Entry `i`'s path, copied.
+pub fn git_snap_path(s: GitSnapshot, i: int) -> List[byte] {
+    git_slice(s.pool, s.entries[i].path_at, s.entries[i].path_at + s.entries[i].path_len)
+}
+
+/// Entry `i`'s rename source, copied (empty without one).
+pub fn git_snap_orig(s: GitSnapshot, i: int) -> List[byte] {
+    git_slice(s.pool, s.entries[i].orig_at, s.entries[i].orig_at + s.entries[i].orig_len)
+}
+
+/// Entry `i`'s index oid as a `str` ("" when absent).
+pub fn git_snap_oid(s: GitSnapshot, i: int) -> str {
+    git_ascii(s.pool, s.entries[i].oid_at, s.entries[i].oid_at + s.entries[i].oid_len)
+}
+
+/// The branch name's bytes (empty when detached or unknown).
+pub fn git_snap_branch(s: GitSnapshot) -> List[byte] {
+    git_slice(s.pool, s.branch_at, s.branch_at + s.branch_len)
+}
+
+/// The upstream's bytes (empty without one).
+pub fn git_snap_upstream(s: GitSnapshot) -> List[byte] {
+    git_slice(s.pool, s.upstream_at, s.upstream_at + s.upstream_len)
+}
+
+/// HEAD's object name ("" when unborn or unknown).
+pub fn git_snap_head(s: GitSnapshot) -> str {
+    git_ascii(s.pool, s.head_at, s.head_at + s.head_len)
+}
+
+/// The comment character's bytes (`#`, one configured byte, or `auto`).
+pub fn git_snap_comment(s: GitSnapshot) -> List[byte] {
+    git_slice(s.pool, s.comment_at, s.comment_at + s.comment_len)
+}
+
+/// Entry `i`'s path equals `want` (no copy).
+pub fn git_snap_path_eq(s: GitSnapshot, i: int, want: List[byte]) -> bool {
+    git_span_cmp(s.pool, s.entries[i].path_at, s.entries[i].path_len, want, 0, want.len) == 0
+}
+
+/// `GitBlameLine` (`git.h:184-187`): a 1-based line and its commit's
+/// index into the commit list.
+pub struct GitBlameLine {
+    lineno: int,
+    commit: int,
+}
+
+/// `GitCommitMeta` (`git.h:194-202`).
+pub struct GitCommitMeta {
+    sha: str,
+    author: List[byte],
+    author_mail: List[byte],
+    summary: List[byte],
+    author_time: int,
+    author_tz_min: int,
+    boundary: bool,
+}
+
+/// `GitLogRecord` (`git.h:209-219`).
+pub struct GitLogRecord {
+    oid: List[byte],
+    short_oid: List[byte],
+    author_time: int,
+    author: List[byte],
+    author_mail: List[byte],
+    parents: List[byte],
+    refs: List[byte],
+    subject: List[byte],
+    body: List[byte],
+}
+
+/// `GitReflogRecord` (`git.h:226-233`).
+pub struct GitReflogRecord {
+    oid: List[byte],
+    short_oid: List[byte],
+    selector: List[byte],
+    message: List[byte],
+    author_time: int,
+    subject: List[byte],
+}
+
+const I64_MAX: int = 9223372036854775807
+
+const U32_MAX: int = 4294967295
+
+const I32_MAX: int = 2147483647
+
+const I32_MIN: int = -2147483648
+
+// `parse_error` (`porcelain.c:13-20`).
+fn perr(mut err: GitParseErr, off: int, message: str) -> bool {
+    err.off = off
+    err.message = message
+    false
+}
+
+/// The bytes `b[at..end)` as an owned list (C's `span_dup`).
+pub fn git_slice(b: List[byte], at: int, end: int) -> List[byte] {
+    var out = List[byte]()
+    if end > at {
+        (mut out).reserve(end - at)
+    }
+    var i = at
+    while i < end {
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+// `span_eq` (`porcelain.c:27-31`).
+fn span_eq(b: List[byte], at: int, end: int, text: str) -> bool {
+    if end - at != text.len {
+        return false
+    }
+    var i = 0
+    while i < text.len {
+        if b[at + i] != text.bytes()[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// A record's first `text.len` bytes equal `text` (C's `memcmp` prefix test).
+fn has_prefix(b: List[byte], at: int, end: int, text: str) -> bool {
+    end - at >= text.len && span_eq(b, at, at + text.len, text)
+}
+
+// `memchr(buf + at, 0, n - at)`: the next NUL at or after `at`, or -1.
+fn find_nul(b: List[byte], at: int, n: int) -> int {
+    var i = at
+    while i < n {
+        if b[i] as int == 0 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `decimal_u64` (`porcelain.c:49-67`): digits only, at most `limit`.
+fn decimal_u64(b: List[byte], at: int, end: int, limit: int) -> (bool, int) {
+    if end <= at {
+        return (false, 0)
+    }
+    var value = 0
+    var i = at
+    while i < end {
+        let d = b[i] as int
+        if d < 48 || d > 57 {
+            return (false, 0)
+        }
+        let digit = d - 48
+        if value > (limit - digit) / 10 {
+            return (false, 0)
+        }
+        value = value * 10 + digit
+        i += 1
+    }
+    (true, value)
+}
+
+// `decimal_i64` (`porcelain.c:69-89`): an optional sign, then digits.
+// INT64_MIN is the one magnitude past INT64_MAX; it is accumulated
+// negatively so the check cannot overflow.
+fn decimal_i64(b: List[byte], at_in: int, end: int) -> (bool, int) {
+    var at = at_in
+    var negative = false
+    if end > at && (b[at] as int == 43 || b[at] as int == 45) {
+        negative = b[at] as int == 45
+        at += 1
+    }
+    if !negative {
+        return decimal_u64(b, at, end, I64_MAX)
+    }
+    if end <= at {
+        return (false, 0)
+    }
+    var value = 0
+    var i = at
+    while i < end {
+        let d = b[i] as int
+        if d < 48 || d > 57 {
+            return (false, 0)
+        }
+        let digit = d - 48
+        if value < (-I64_MAX - 1 + digit) / 10 {
+            return (false, 0)
+        }
+        value = value * 10 - digit
+        i += 1
+    }
+    (true, value)
+}
+
+// `is_hex_oid` (`porcelain.c:91-105`): 40 or 64 hex digits.
+fn is_hex_oid(b: List[byte], at: int, end: int) -> bool {
+    let n = end - at
+    if n != 40 && n != 64 {
+        return false
+    }
+    var i = at
+    while i < end {
+        let c = b[i] as int
+        if !(c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `valid_mode` (`porcelain.c:107-116`): six octal digits.
+fn valid_mode(b: List[byte], at: int, end: int) -> bool {
+    if end - at != 6 {
+        return false
+    }
+    var i = at
+    while i < end {
+        if b[i] as int < 48 || b[i] as int > 55 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `valid_sub` (`porcelain.c:118-134`): `N...`, or `S` with `C|.`, `M|.`,
+// `U|.`; answers (valid, submodule).
+fn valid_sub(b: List[byte], at: int, end: int) -> (bool, bool) {
+    if end - at != 4 {
+        return (false, false)
+    }
+    if span_eq(b, at, end, "N...") {
+        return (true, false)
+    }
+    if b[at] as int != 83 {
+        return (false, false)
+    }
+    let c = b[at + 1] as int
+    let m = b[at + 2] as int
+    let u = b[at + 3] as int
+    if c != 67 && c != 46 || m != 77 && m != 46 || u != 85 && u != 46 {
+        return (false, false)
+    }
+    (true, true)
+}
+
+// `.MTADRC` (`porcelain.c:136-141`).
+fn xy_byte(c: int) -> bool {
+    c == 46 || c == 77 || c == 84 || c == 65 || c == 68 || c == 82 || c == 67
+}
+
+fn valid_xy(b: List[byte], at: int, end: int) -> bool {
+    end - at == 2 && xy_byte(b[at] as int) && xy_byte(b[at + 1] as int)
+}
+
+// `valid_conflict` (`porcelain.c:143-154`): the CLOSED alphabet.
+fn valid_conflict(b: List[byte], at: int, end: int) -> bool {
+    if end - at != 2 {
+        return false
+    }
+    for p in ["DD", "AU", "UD", "UA", "DU", "AA", "UU"] {
+        if span_eq(b, at, end, p) {
+            return true
+        }
+    }
+    false
+}
+
+/// `a[aa..aa+an)` against `b[ba..ba+bn)`: byte order, then length
+/// (`entry_compare`/`path_compare`, `porcelain.c:156-182`;
+/// `git_path_bytes_cmp`, `git.c:1711-1719`).
+pub fn git_span_cmp(a: List[byte], aa: int, an: int, b: List[byte], ba: int, bn: int) -> int {
+    let common = if an < bn then an else bn
+    var i = 0
+    while i < common {
+        let x = a[aa + i] as int
+        let y = b[ba + i] as int
+        if x != y {
+            return if x < y then -1 else 1
+        }
+        i += 1
+    }
+    if an < bn {
+        return -1
+    }
+    if an > bn {
+        return 1
+    }
+    0
+}
+
+/// Whole-list `git_span_cmp`.
+pub fn git_bytes_cmp(a: List[byte], b: List[byte]) -> int {
+    git_span_cmp(a, 0, a.len, b, 0, b.len)
+}
+
+/// The stable order of `n` spans of `pool` (`at[i]`, `len[i]`) into
+/// `order` (reset first): a bottom-up merge over an index permutation, a
+/// tie taking the left run (`yew_sort_stable`'s order and C's local
+/// merges'). `scratch` is the merge's second buffer.
+pub fn git_sort_spans(
+    pool: List[byte],
+    at: List[int],
+    len: List[int],
+    n: int,
+    mut order: List[int],
+    mut scratch: List[int],
+) {
+    (mut order).reset()
+    var i = 0
+    while i < n {
+        (mut order).push(i)
+        i += 1
+    }
+    // C's presorted fast path (`porcelain.c:192-196`).
+    var sorted = true
+    i = 1
+    while i < n {
+        if git_span_cmp(pool, at[i], len[i], pool, at[i - 1], len[i - 1]) < 0 {
+            sorted = false
+            break
+        }
+        i += 1
+    }
+    if sorted {
+        return
+    }
+    var width = 1
+    while width < n {
+        (mut scratch).reset()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if mid + width < n then mid + width else n
+            var l = lo
+            var r = mid
+            while l < mid && r < hi {
+                let ri = order[r]
+                let li = order[l]
+                if git_span_cmp(pool, at[ri], len[ri], pool, at[li], len[li]) < 0 {
+                    (mut scratch).push(ri)
+                    r += 1
+                } else {
+                    (mut scratch).push(li)
+                    l += 1
+                }
+            }
+            while l < mid {
+                (mut scratch).push(order[l])
+                l += 1
+            }
+            while r < hi {
+                (mut scratch).push(order[r])
+                r += 1
+            }
+            lo += width * 2
+        }
+        i = 0
+        while i < n {
+            order[i] = scratch[i]
+            i += 1
+        }
+        width *= 2
+    }
+}
+
+// `count_status_records` (`porcelain.c:264-293`): the first pass, which
+// owns the termination errors.
+fn count_status_records(buf: List[byte], n: int, mut err: GitParseErr) -> (bool, int) {
+    var at = 0
+    var total = 0
+    while at < n {
+        let record_at = at
+        var nul = find_nul(buf, at, n)
+        if nul < 0 {
+            return (perr(mut err, at, "unterminated status record"), 0)
+        }
+        if nul == at {
+            return (perr(mut err, at, "empty status record"), 0)
+        }
+        let kind = buf[record_at] as int
+        at = nul + 1
+        if kind == 50 {
+            if at >= n {
+                return (perr(mut err, at, "unterminated rename source"), 0)
+            }
+            nul = find_nul(buf, at, n)
+            if nul < 0 {
+                return (perr(mut err, at, "unterminated rename source"), 0)
+            }
+            at = nul + 1
+        }
+        if kind == 49 || kind == 50 || kind == 117 || kind == 63 || kind == 33 {
+            total += 1
+        }
+    }
+    (true, total)
+}
+
+// `parse_header` (`porcelain.c:295-365`): a `#` record `[ra, rb)`.
+fn parse_header(
+    mut snap: GitSnapshot,
+    buf: List[byte],
+    ra: int,
+    rb: int,
+    mut err: GitParseErr,
+    mut saw_upstream: bool,
+) -> bool {
+    if has_prefix(buf, ra, rb, "# branch.oid ") {
+        let va = ra + 13
+        if !span_eq(buf, va, rb, "(initial)") && !is_hex_oid(buf, va, rb) {
+            return perr(mut err, ra + 13, "invalid branch oid")
+        }
+        snap.unborn = span_eq(buf, va, rb, "(initial)")
+        if snap.unborn {
+            snap.has_head_oid = false
+            snap.head_at = 0
+            snap.head_len = 0
+        } else {
+            snap.has_head_oid = true
+            snap.head_at = git_pool_add(mut snap.pool, buf, va, rb)
+            snap.head_len = rb - va
+        }
+        return true
+    }
+    if has_prefix(buf, ra, rb, "# branch.head ") {
+        let va = ra + 14
+        if rb == va {
+            return perr(mut err, ra + 14, "empty branch head")
+        }
+        snap.detached = span_eq(buf, va, rb, "(detached)")
+        if snap.detached {
+            snap.has_branch = false
+            snap.branch_at = 0
+            snap.branch_len = 0
+        } else {
+            snap.has_branch = true
+            snap.branch_at = git_pool_add(mut snap.pool, buf, va, rb)
+            snap.branch_len = rb - va
+        }
+        return true
+    }
+    if has_prefix(buf, ra, rb, "# branch.upstream ") {
+        let va = ra + 18
+        if rb == va {
+            return perr(mut err, ra + 18, "empty branch upstream")
+        }
+        saw_upstream = true
+        snap.has_upstream = true
+        snap.upstream_at = git_pool_add(mut snap.pool, buf, va, rb)
+        snap.upstream_len = rb - va
+        return true
+    }
+    if has_prefix(buf, ra, rb, "# branch.ab ") {
+        var split = ra + 12
+        while split < rb && buf[split] as int != 32 {
+            split += 1
+        }
+        if split == rb || split == ra + 12 || split + 1 == rb {
+            return perr(mut err, ra + 12, "invalid branch divergence")
+        }
+        let aa = ra + 12
+        let ba = split + 1
+        let (aok, ahead) = decimal_i64(buf, aa, split)
+        if buf[aa] as int != 43 || buf[ba] as int != 45 || !aok || ahead < 0 || ahead > I32_MAX {
+            return perr(mut err, ra + 12, "invalid ahead count")
+        }
+        snap.ahead = ahead
+        let (bok, behind) = decimal_i64(buf, ba, rb)
+        if !bok || behind > 0 || behind < I32_MIN {
+            return perr(mut err, split + 1, "invalid behind count")
+        }
+        snap.behind = -behind
+        return true
+    }
+    if has_prefix(buf, ra, rb, "# stash ") {
+        let (sok, count) = decimal_i64(buf, ra + 8, rb)
+        if !sok || count < 0 {
+            return perr(mut err, ra + 8, "invalid stash count")
+        }
+    }
+    true
+}
+
+/// The bytes `b[at..end)` as a `str`; the callers hand it object names
+/// (hex digits, always UTF-8). Bytes that are not UTF-8 answer "".
+pub fn git_ascii(b: List[byte], at: int, end: int) -> str {
+    util.buf_to_str(git_slice(b, at, end)) else ""
+}
+
+// `take_word` (`porcelain.c:33-47`): the field at `at` up to a space that
+// is NOT the record's end; answers (ok, field start, field end, next).
+fn take_word(buf: List[byte], rb: int, at: int) -> (bool, int, int, int) {
+    let start = at
+    if start >= rb {
+        return (false, 0, 0, at)
+    }
+    var i = at
+    while i < rb && buf[i] as int != 32 {
+        i += 1
+    }
+    if i == start || i == rb {
+        return (false, 0, 0, i)
+    }
+    (true, start, i, i + 1)
+}
+
+// `parse_entry` (`porcelain.c:367-451`): a non-header record `[ra, rb)`
+// and, for a `2`, its source field `[oa, ob)`; byte fields into `pool`.
+fn parse_entry(
+    mut pool: List[byte],
+    buf: List[byte],
+    ra: int,
+    rb: int,
+    oa: int,
+    ob: int,
+    mut out: GitEntry,
+    off: int,
+    mut err: GitParseErr,
+) -> bool {
+    out = git_entry_new()
+    if rb - ra < 3 || buf[ra + 1] as int != 32 {
+        return perr(mut err, off, "malformed status record")
+    }
+    let kind = buf[ra] as int
+    if kind == 63 || kind == 33 {
+        let pa = ra + 2
+        if rb == pa {
+            return perr(mut err, off + 2, "invalid status path")
+        }
+        out.kind = if kind == 63 then GIT_E_UNTRACKED else GIT_E_IGNORED
+        out.path_at = git_pool_add(mut pool, buf, pa, rb)
+        out.path_len = rb - pa
+        out.is_dir = buf[rb - 1] as int == 47
+        out.untracked = out.kind == GIT_E_UNTRACKED
+        return true
+    }
+    let fixed = if kind == 49 then 7 else if kind == 50 then 8 else 9
+    // The fixed fields' spans; at most nine (`ByteSpan fields[10]`).
+    var f0a = 0, f0b = 0, f1a = 0, f1b = 0, f2a = 0, f2b = 0, f3a = 0, f3b = 0, f4a = 0
+    var f4b = 0, f5a = 0, f5b = 0, f6a = 0, f6b = 0, f7a = 0, f7b = 0, f8a = 0, f8b = 0
+    var at = ra + 2
+    var i = 0
+    while i < fixed {
+        let (ok, wa, wb, next) = take_word(buf, rb, at)
+        if !ok {
+            return perr(mut err, off + (next - ra), "truncated status fields")
+        }
+        match i {
+            0 => {
+                f0a = wa
+                f0b = wb
+            },
+            1 => {
+                f1a = wa
+                f1b = wb
+            },
+            2 => {
+                f2a = wa
+                f2b = wb
+            },
+            3 => {
+                f3a = wa
+                f3b = wb
+            },
+            4 => {
+                f4a = wa
+                f4b = wb
+            },
+            5 => {
+                f5a = wa
+                f5b = wb
+            },
+            6 => {
+                f6a = wa
+                f6b = wb
+            },
+            7 => {
+                f7a = wa
+                f7b = wb
+            },
+            _ => {
+                f8a = wa
+                f8b = wb
+            },
+        }
+        at = next
+        i += 1
+    }
+    let pa = at
+    if rb == pa {
+        return perr(mut err, off + (at - ra), "invalid status path")
+    }
+    var submodule = false
+    if kind == 117 {
+        let (sok, sub) = valid_sub(buf, f1a, f1b)
+        if !valid_conflict(buf, f0a, f0b) || !sok {
+            return perr(mut err, off + 2, "invalid unmerged state")
+        }
+        submodule = sub
+        if !valid_mode(buf, f2a, f2b) ||
+            !valid_mode(buf, f3a, f3b) ||
+            !valid_mode(buf, f4a, f4b) ||
+            !valid_mode(buf, f5a, f5b) {
+            return perr(mut err, off, "invalid unmerged mode")
+        }
+        if !is_hex_oid(buf, f6a, f6b) || !is_hex_oid(buf, f7a, f7b) || !is_hex_oid(buf, f8a, f8b) {
+            return perr(mut err, off, "invalid unmerged oid")
+        }
+        out.kind = GIT_E_UNMERGED
+        out.conflicted = true
+    } else {
+        let (sok, sub) = valid_sub(buf, f1a, f1b)
+        if !valid_xy(buf, f0a, f0b) || !sok {
+            return perr(mut err, off + 2, "invalid ordinary state")
+        }
+        submodule = sub
+        if !valid_mode(buf, f2a, f2b) || !valid_mode(buf, f3a, f3b) || !valid_mode(buf, f4a, f4b) {
+            return perr(mut err, off, "invalid ordinary mode")
+        }
+        if !is_hex_oid(buf, f5a, f5b) || !is_hex_oid(buf, f6a, f6b) {
+            return perr(mut err, off, "invalid ordinary oid")
+        }
+        out.kind = if kind == 49 then GIT_E_ORDINARY else GIT_E_RENAME
+        out.staged = buf[f0a] as int != 46
+        out.unstaged = buf[f0a + 1] as int != 46
+        if out.kind == GIT_E_RENAME {
+            if ob <= oa || f7b - f7a < 2 || buf[f7a] as int != 82 && buf[f7a] as int != 67 {
+                return perr(mut err, off, "invalid rename record")
+            }
+            let (scok, score) = decimal_u64(buf, f7a + 1, f7b, 100)
+            if !scok {
+                return perr(mut err, off, "invalid rename score")
+            }
+            out.score = score
+        }
+        out.oid_at = git_pool_add(mut pool, buf, f6a, f6b)
+        out.oid_len = f6b - f6a
+        if out.kind == GIT_E_RENAME {
+            out.orig_at = git_pool_add(mut pool, buf, oa, ob)
+            out.orig_len = ob - oa
+            out.has_orig = true
+        }
+    }
+    out.x = buf[f0a] as int
+    out.y = buf[f0a + 1] as int
+    out.submodule = submodule
+    out.path_at = git_pool_add(mut pool, buf, pa, rb)
+    out.path_len = rb - pa
+    true
+}
+
+/// `yew_git_parse_status` (`porcelain.c:453-539`): `buf[0..n)` into
+/// `snap` (whose pool may already hold bytes; the parse appends). Every
+/// record NUL-terminated, a `2` consuming TWO fields (§5.3's pitfall: the
+/// original path is a separate NUL field), headers first, unknown `#`
+/// headers and record kinds skipped (§5.1). The entries end sorted by path
+/// bytes; the state is C's precedence.
+pub fn git_parse_status(
+    mut snap: GitSnapshot,
+    buf: List[byte],
+    n: int,
+    mut err: GitParseErr,
+) -> bool {
+    if n > buf.len || n < 0 {
+        return perr(mut err, 0, "invalid status input")
+    }
+    let (cok, count) = count_status_records(buf, n, mut err)
+    if !cok {
+        return false
+    }
+    (mut snap.tmp).reset()
+    if count > snap.tmp.len {
+        (mut snap.tmp).reserve(count)
+    }
+    snap.has_branch = false
+    snap.branch_at = 0
+    snap.branch_len = 0
+    snap.has_upstream = false
+    snap.upstream_at = 0
+    snap.upstream_len = 0
+    snap.has_head_oid = false
+    snap.head_at = 0
+    snap.head_len = 0
+    snap.ahead = -1
+    snap.behind = -1
+    snap.detached = false
+    snap.unborn = false
+    snap.conflicted = false
+    (mut snap.entries).reset()
+    var saw_upstream = false
+    var at = 0
+    while at < n {
+        let nul = find_nul(buf, at, n)
+        if nul < 0 {
+            return perr(mut err, at, "unterminated status record")
+        }
+        let ra = at
+        let rb = nul
+        var next = nul + 1
+        if rb == ra {
+            return perr(mut err, at, "empty status record")
+        }
+        let kind = buf[ra] as int
+        if kind == 35 {
+            if !parse_header(mut snap, buf, ra, rb, mut err, mut saw_upstream) {
+                return false
+            }
+            at = next
+            continue
+        }
+        var oa = 0
+        var ob = 0
+        if kind == 50 {
+            if next >= n {
+                return perr(mut err, next, "unterminated rename source")
+            }
+            let onul = find_nul(buf, next, n)
+            if onul < 0 {
+                return perr(mut err, next, "unterminated rename source")
+            }
+            oa = next
+            ob = onul
+            next = onul + 1
+        }
+        if kind != 49 && kind != 50 && kind != 117 && kind != 63 && kind != 33 {
+            at = next
+            continue
+        }
+        var entry = git_entry_new()
+        if !parse_entry(mut snap.pool, buf, ra, rb, oa, ob, mut entry, at, mut err) {
+            return false
+        }
+        if entry.conflicted {
+            snap.conflicted = true
+        }
+        (mut snap.tmp).push(entry)
+        at = next
+    }
+    git_sort_entries(mut snap)
+    if snap.conflicted {
+        snap.state = GIT_CONFLICTED
+    } else if snap.unborn {
+        snap.state = GIT_NO_HEAD
+    } else if snap.detached {
+        snap.state = GIT_DETACHED
+    } else if !saw_upstream {
+        snap.state = GIT_NO_UPSTREAM
+    } else {
+        snap.state = GIT_OK
+    }
+    true
+}
+
+/// `snap.tmp` into `snap.entries` in stable path order (C's
+/// `sort_entries`, `porcelain.c:184-222`, and `yew_sort_stable` with
+/// `git_entry_cmp`, `git.c:1842-1843`).
+pub fn git_sort_entries(mut snap: GitSnapshot) {
+    let n = snap.tmp.len
+    (mut snap.s_at).reset()
+    (mut snap.s_len).reset()
+    for e in snap.tmp {
+        (mut snap.s_at).push(e.path_at)
+        (mut snap.s_len).push(e.path_len)
+    }
+    git_sort_spans(snap.pool, snap.s_at, snap.s_len, n, mut snap.order, mut snap.s_merge)
+    (mut snap.entries).reset()
+    var i = 0
+    while i < n {
+        (mut snap.entries).push(copy snap.tmp[snap.order[i]])
+        i += 1
+    }
+    (mut snap.tmp).reset()
+}
+
+/// `yew_git_parse_z_paths` (`porcelain.c:541-589`): a `-z` list into
+/// `paths` (reset first), every path nonempty and NUL-terminated, sorted
+/// by bytes.
+pub fn git_parse_z_paths(
+    buf: List[byte],
+    n: int,
+    mut paths: GitPaths,
+    mut err: GitParseErr,
+) -> bool {
+    git_paths_reset(mut paths)
+    if n > buf.len || n < 0 {
+        return perr(mut err, 0, "invalid path input")
+    }
+    var at = 0
+    while at < n {
+        let nul = find_nul(buf, at, n)
+        if nul < 0 {
+            return perr(mut err, at, "unterminated path")
+        }
+        if nul == at {
+            return perr(mut err, at, "invalid path length")
+        }
+        at = nul + 1
+    }
+    at = 0
+    while at < n {
+        let nul = find_nul(buf, at, n)
+        let start = git_pool_add(mut paths.pool, buf, at, nul)
+        (mut paths.tmp).push(GitPathRow {
+            at: start,
+            len: nul - at,
+            is_dir: buf[nul - 1] as int == 47,
+        })
+        at = nul + 1
+    }
+    git_paths_sort(mut paths)
+    true
+}
+
+/// `paths.tmp` into `paths.rows` in stable byte order.
+pub fn git_paths_sort(mut paths: GitPaths) {
+    let n = paths.tmp.len
+    (mut paths.s_at).reset()
+    (mut paths.s_len).reset()
+    for r in paths.tmp {
+        (mut paths.s_at).push(r.at)
+        (mut paths.s_len).push(r.len)
+    }
+    git_sort_spans(paths.pool, paths.s_at, paths.s_len, n, mut paths.order, mut paths.s_merge)
+    (mut paths.rows).reset()
+    var i = 0
+    while i < n {
+        (mut paths.rows).push(copy paths.tmp[paths.order[i]])
+        i += 1
+    }
+    (mut paths.tmp).reset()
+}
+
+/// `yew_git_parse_ignore` (`porcelain.c:591-602`): the `ls-files
+/// --directory` set.
+pub fn git_parse_ignore(buf: List[byte], n: int, mut set: GitPaths, mut err: GitParseErr) -> bool {
+    git_parse_z_paths(buf, n, mut set, mut err)
+}
+
+// `ignore_exact` (`porcelain.c:609-627`): a lower-bound binary search for
+// `path[pa..pa+len)`.
+fn ignore_exact(set: GitPaths, path: List[byte], pa: int, len: int) -> bool {
+    var lo = 0
+    var hi = set.rows.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if git_span_cmp(set.pool, set.rows[mid].at, set.rows[mid].len, path, pa, len) < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo < set.rows.len &&
+        git_span_cmp(set.pool, set.rows[lo].at, set.rows[lo].len, path, pa, len) == 0
+}
+
+/// `yew_git_ignored` (`porcelain.c:629-640`): `path[pa..pa+len)` is an
+/// exact record, or a record ending in `/` is a prefix of it — probed
+/// longest first, bounded by the path's slash count, never the set's size.
+pub fn git_ignored(set: GitPaths, path: List[byte], pa: int, len: int) -> bool {
+    if ignore_exact(set, path, pa, len) {
+        return true
+    }
+    var i = len
+    while i > 0 {
+        if path[pa + i - 1] as int == 47 && ignore_exact(set, path, pa, i) {
+            return true
+        }
+        i -= 1
+    }
+    false
+}
+
+// `next_line` (`porcelain.c:642-657`): `[la, lb)` and the next offset.
+fn next_line(buf: List[byte], n: int, at: int, mut err: GitParseErr) -> (bool, int, int, int) {
+    if at >= n {
+        return (perr(mut err, at, "missing blame line"), 0, 0, at)
+    }
+    var i = at
+    while i < n && buf[i] as int != 10 {
+        i += 1
+    }
+    if i >= n {
+        return (perr(mut err, at, "unterminated blame line"), 0, 0, at)
+    }
+    (true, at, i, i + 1)
+}
+
+// `blame_header` (`porcelain.c:659-699`): `<sha> <orig> <final> [<n>]`;
+// answers (ok, sha start, sha end, final line, count, continuation).
+fn blame_header(buf: List[byte], la: int, lb: int) -> (bool, int, int, int, int, bool) {
+    var fa = List[int]()
+    var fb = List[int]()
+    var at = la
+    while at < lb && fa.len < 4 {
+        let start = at
+        while at < lb && buf[at] as int != 32 {
+            at += 1
+        }
+        if at == start {
+            return (false, 0, 0, 0, 0, false)
+        }
+        (mut fa).push(start)
+        (mut fb).push(at)
+        if at < lb {
+            at += 1
+            if at == lb {
+                return (false, 0, 0, 0, 0, false)
+            }
+        }
+    }
+    if at != lb || fa.len != 3 && fa.len != 4 {
+        return (false, 0, 0, 0, 0, false)
+    }
+    let (o1, _) = decimal_u64(buf, fa[1], fb[1], U32_MAX)
+    if !is_hex_oid(buf, fa[0], fb[0]) || !o1 {
+        return (false, 0, 0, 0, 0, false)
+    }
+    let (o2, final_line) = decimal_u64(buf, fa[2], fb[2], U32_MAX)
+    if !o2 || final_line == 0 {
+        return (false, 0, 0, 0, 0, false)
+    }
+    var count = 1
+    if fa.len == 4 {
+        let (o3, c) = decimal_u64(buf, fa[3], fb[3], U32_MAX)
+        if !o3 || c == 0 {
+            return (false, 0, 0, 0, 0, false)
+        }
+        count = c
+    }
+    (true, fa[0], fb[0], final_line, count, fa.len == 3)
+}
+
+// `metadata_value` (`porcelain.c:701-709`): the value after `key`.
+fn metadata_value(buf: List[byte], la: int, lb: int, key: str) -> (bool, int) {
+    if !has_prefix(buf, la, lb, key) {
+        return (false, 0)
+    }
+    (true, la + key.len)
+}
+
+// `parse_timezone` (`porcelain.c:711-731`): `+HHMM` as minutes.
+fn parse_timezone(buf: List[byte], at: int, end: int) -> (bool, int) {
+    if end - at != 5 || buf[at] as int != 43 && buf[at] as int != 45 {
+        return (false, 0)
+    }
+    var i = at + 1
+    while i < end {
+        if buf[i] as int < 48 || buf[i] as int > 57 {
+            return (false, 0)
+        }
+        i += 1
+    }
+    let hh = (buf[at + 1] as int - 48) * 10 + (buf[at + 2] as int - 48)
+    let mm = (buf[at + 3] as int - 48) * 10 + (buf[at + 4] as int - 48)
+    if hh > 23 || mm > 59 {
+        return (false, 0)
+    }
+    let sign = if buf[at] as int == 45 then -1 else 1
+    (true, sign * (hh * 60 + mm))
+}
+
+// `find_commit` (`porcelain.c:733-741`).
+fn find_commit(commits: List[GitCommitMeta], buf: List[byte], sa: int, sb: int) -> int {
+    var i = 0
+    while i < commits.len {
+        if span_eq(buf, sa, sb, commits[i].sha) {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn commit_meta_new(sha: str) -> GitCommitMeta {
+    GitCommitMeta {
+        sha: sha,
+        author: List[byte](),
+        author_mail: List[byte](),
+        summary: List[byte](),
+        author_time: 0,
+        author_tz_min: 0,
+        boundary: false,
+    }
+}
+
+/// `yew_git_parse_blame` (`porcelain.c:743-895`): commit-group records;
+/// the metadata block comes ONCE per commit (§9's pitfall), so later
+/// groups take theirs from the commit list. Answers the line count, 0
+/// with `err` set on malformed input.
+pub fn git_parse_blame(
+    buf: List[byte],
+    n: int,
+    mut lines: List[GitBlameLine],
+    mut commits: List[GitCommitMeta],
+    mut err: GitParseErr,
+) -> int {
+    lines = List[GitBlameLine]()
+    commits = List[GitCommitMeta]()
+    if n > buf.len || n < 0 {
+        let _ = perr(mut err, 0, "invalid blame input")
+        return 0
+    }
+    // The first pass owns the line-termination errors (`porcelain.c:764-783`);
+    // C's counts size its arrays, which a `List` does not need.
+    var scan = 0
+    while scan < n {
+        let (ok, _, _, next) = next_line(buf, n, scan, mut err)
+        if !ok {
+            return 0
+        }
+        scan = next
+    }
+    var at = 0
+    while at < n {
+        let (lok, ha, hb, after) = next_line(buf, n, at, mut err)
+        if !lok {
+            let _ = perr(mut err, at, "invalid blame group header")
+            return 0
+        }
+        at = after
+        let (hok, sa, sb, final_line, count, continuation) = blame_header(buf, ha, hb)
+        if !hok {
+            let _ = perr(mut err, at, "invalid blame group header")
+            return 0
+        }
+        var ci = find_commit(commits, buf, sa, sb)
+        let known_commit = ci >= 0
+        if continuation && ci < 0 {
+            let _ = perr(mut err, at, "blame continuation without metadata")
+            return 0
+        }
+        if ci < 0 {
+            (mut commits).push(commit_meta_new(git_ascii(buf, sa, sb)))
+            ci = commits.len - 1
+        }
+        var got_filename = false
+        while !continuation && at < n {
+            let before = at
+            let (ok, la, lb, next) = next_line(buf, n, at, mut err)
+            if !ok {
+                return 0
+            }
+            at = next
+            if lb > la && buf[la] as int == 9 {
+                at = before
+                break
+            }
+            let (fok, _) = metadata_value(buf, la, lb, "filename ")
+            if fok {
+                got_filename = true
+                break
+            }
+            let (aok, av) = metadata_value(buf, la, lb, "author ")
+            let (mok, mv) = metadata_value(buf, la, lb, "author-mail ")
+            let (sok, sv) = metadata_value(buf, la, lb, "summary ")
+            let (tok, tv) = metadata_value(buf, la, lb, "author-time ")
+            let (zok, zv) = metadata_value(buf, la, lb, "author-tz ")
+            if aok {
+                commits[ci].author = git_slice(buf, av, lb)
+            } else if mok {
+                commits[ci].author_mail = git_slice(buf, mv, lb)
+            } else if sok {
+                commits[ci].summary = git_slice(buf, sv, lb)
+            } else if tok {
+                let (dok, t) = decimal_i64(buf, tv, lb)
+                if !dok {
+                    let _ = perr(mut err, before, "invalid blame author time")
+                    return 0
+                }
+                commits[ci].author_time = t
+            } else if zok {
+                let (pok, tz) = parse_timezone(buf, zv, lb)
+                if !pok {
+                    let _ = perr(mut err, before, "invalid blame timezone")
+                    return 0
+                }
+                commits[ci].author_tz_min = tz
+            } else if span_eq(buf, la, lb, "boundary") {
+                commits[ci].boundary = true
+            }
+        }
+        if known_commit && at < n && buf[at] as int == 9 {
+            got_filename = true
+        }
+        if continuation {
+            got_filename = true
+        }
+        if !got_filename {
+            let _ = perr(mut err, at, "blame group missing filename")
+            return 0
+        }
+        if final_line + count - 1 > U32_MAX {
+            let _ = perr(mut err, at, "blame line range overflow")
+            return 0
+        }
+        if at < n && buf[at] as int == 9 {
+            let (cok, _, _, cnext) = next_line(buf, n, at, mut err)
+            if !cok {
+                return 0
+            }
+            at = cnext
+            (mut lines).push(GitBlameLine { lineno: final_line, commit: ci })
+        } else {
+            if continuation {
+                let _ = perr(mut err, at, "blame continuation missing content")
+                return 0
+            }
+            var i = 0
+            while i < count {
+                (mut lines).push(GitBlameLine { lineno: final_line + i, commit: ci })
+                i += 1
+            }
+        }
+    }
+    if lines.len > U32_MAX {
+        let _ = perr(mut err, n, "too many blame lines")
+        return 0
+    }
+    lines.len
+}
+
+// `pretty_record` (`porcelain.c:897-922`): `separators` NUL-terminated
+// fields, then a last field that ends at a NUL or the buffer (`format:`
+// puts the separator BETWEEN records, §10's pitfall). Answers (ok,
+// starts, ends, next).
+fn pretty_record(buf: List[byte], n: int, at_in: int, separators: int, mut err: GitParseErr) -> (
+    bool,
+    List[int],
+    List[int],
+    int,
+) {
+    var fa = List[int]()
+    var fb = List[int]()
+    var at = at_in
+    var field = 0
+    while field < separators {
+        let nul = find_nul(buf, at, n)
+        if nul < 0 {
+            return (perr(mut err, at, "truncated pretty record"), fa, fb, at)
+        }
+        (mut fa).push(at)
+        (mut fb).push(nul)
+        at = nul + 1
+        field += 1
+    }
+    let nul = find_nul(buf, at, n)
+    (mut fa).push(at)
+    if nul >= 0 {
+        (mut fb).push(nul)
+        at = nul + 1
+    } else {
+        (mut fb).push(n)
+        at = n
+    }
+    (true, fa, fb, at)
+}
+
+/// `yew_git_parse_log` (`porcelain.c:940-979`): nine fields a record.
+pub fn git_parse_log(
+    buf: List[byte],
+    n: int,
+    mut records: List[GitLogRecord],
+    mut err: GitParseErr,
+) -> bool {
+    records = List[GitLogRecord]()
+    if n > buf.len || n < 0 {
+        return perr(mut err, 0, "invalid log input")
+    }
+    var at = 0
+    while at < n {
+        let (ok, _, _, next) = pretty_record(buf, n, at, 8, mut err)
+        if !ok {
+            return false
+        }
+        at = next
+    }
+    at = 0
+    while at < n {
+        let record_at = at
+        let (ok, fa, fb, next) = pretty_record(buf, n, at, 8, mut err)
+        if !ok {
+            return false
+        }
+        at = next
+        let (tok, stamp) = decimal_i64(buf, fa[2], fb[2])
+        if !is_hex_oid(buf, fa[0], fb[0]) || fb[1] == fa[1] || !tok {
+            return perr(mut err, record_at, "invalid log record")
+        }
+        (mut records).push(GitLogRecord {
+            oid: git_slice(buf, fa[0], fb[0]),
+            short_oid: git_slice(buf, fa[1], fb[1]),
+            author_time: stamp,
+            author: git_slice(buf, fa[3], fb[3]),
+            author_mail: git_slice(buf, fa[4], fb[4]),
+            parents: git_slice(buf, fa[5], fb[5]),
+            refs: git_slice(buf, fa[6], fb[6]),
+            subject: git_slice(buf, fa[7], fb[7]),
+            body: git_slice(buf, fa[8], fb[8]),
+        })
+    }
+    true
+}
+
+/// `yew_git_parse_reflog` (`porcelain.c:981-1017`): six fields a record.
+pub fn git_parse_reflog(
+    buf: List[byte],
+    n: int,
+    mut records: List[GitReflogRecord],
+    mut err: GitParseErr,
+) -> bool {
+    records = List[GitReflogRecord]()
+    if n > buf.len || n < 0 {
+        return perr(mut err, 0, "invalid reflog input")
+    }
+    var at = 0
+    while at < n {
+        let (ok, _, _, next) = pretty_record(buf, n, at, 5, mut err)
+        if !ok {
+            return false
+        }
+        at = next
+    }
+    at = 0
+    while at < n {
+        let record_at = at
+        let (ok, fa, fb, next) = pretty_record(buf, n, at, 5, mut err)
+        if !ok {
+            return false
+        }
+        at = next
+        let (tok, stamp) = decimal_i64(buf, fa[4], fb[4])
+        if !is_hex_oid(buf, fa[0], fb[0]) || fb[1] == fa[1] || !tok {
+            return perr(mut err, record_at, "invalid reflog record")
+        }
+        (mut records).push(GitReflogRecord {
+            oid: git_slice(buf, fa[0], fb[0]),
+            short_oid: git_slice(buf, fa[1], fb[1]),
+            selector: git_slice(buf, fa[2], fb[2]),
+            message: git_slice(buf, fa[3], fb[3]),
+            author_time: stamp,
+            subject: git_slice(buf, fa[5], fb[5]),
+        })
+    }
+    true
+}
