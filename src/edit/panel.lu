@@ -1,0 +1,685 @@
+//! edit.panel — the transient floating panel, pulled forward from yw11
+//! for F mode's viewer (R-yw13-5).
+//!
+//! Ports sagitta `src/ui/panel.c` (635 lines) and `ui/panel.h` at
+//! 9ace98c2 (Sprint 47): a bordered, titled, word-wrapped box placed
+//! below/above/at the cursor or centred in an area, scrolled by its own
+//! four keys, closed by any other (panels are transient, never modal).
+//! s52's diff viewer (`fussmode.c:196-298`) is its one caller before
+//! yw11; LSP hover's document emphasis (`yew_panel_mark`, `PanelSpec.emph`)
+//! is yw11's and not ported: no s52 caller sets either.
+
+use term
+use unicode
+
+/// `YEW_PANEL_MAX_W` (`panel.h:16`).
+pub const PANEL_MAX_W: int = 72
+
+/// `YEW_PANEL_MAX_H`.
+pub const PANEL_MAX_H: int = 16
+
+/// `YEW_PANEL_BELOW` (`PanelPlace`, `panel.h:20-25`).
+pub const PANEL_BELOW: int = 0
+
+/// Above the anchor.
+pub const PANEL_ABOVE: int = 1
+
+/// Below the anchor when it fits, else above.
+pub const PANEL_CURSOR: int = 2
+
+/// Centred in the area.
+pub const PANEL_CENTER: int = 3
+
+const PANEL_TABWIDTH: int = 4
+
+/// `PanelSpec` (`panel.h:29-40`).
+pub struct PanelSpec {
+    title: str,
+    body: List[byte],
+    x: int,
+    y: int,
+    place: int,
+    max_w: int,
+    max_h: int,
+    role: str,
+    area: Rect,
+    has_area: bool,
+}
+
+/// An empty spec (`PanelSpec spec = {0}`).
+pub fn panel_spec_new() -> PanelSpec {
+    PanelSpec {
+        title: "",
+        body: List[byte](),
+        x: 0,
+        y: 0,
+        place: PANEL_BELOW,
+        max_w: 0,
+        max_h: 0,
+        role: "",
+        area: rect(0, 0, 0, 0),
+        has_area: false,
+    }
+}
+
+/// One wrapped row: bytes `[lo, hi)` of the body.
+pub struct PanelRow {
+    lo: int,
+    hi: int,
+}
+
+/// `Panel` (`panel.h:42-70`): the owned input and the placement state
+/// retained so a resize is deterministic. The body and the rows are
+/// reset and refilled in place (G33).
+pub struct Panel {
+    open: bool,
+    rect: Rect,
+    scroll: int,
+    nrows: int,
+    rows: List[PanelRow],
+    body: List[byte],
+    title: str,
+    role: str,
+    anchor_x: int,
+    anchor_y: int,
+    max_w: int,
+    max_h: int,
+    place: int,
+    area: Rect,
+    has_area: bool,
+}
+
+/// A closed panel.
+pub fn panel_new() -> Panel {
+    Panel {
+        open: false,
+        rect: rect(0, 0, 0, 0),
+        scroll: 0,
+        nrows: 0,
+        rows: List[PanelRow](),
+        body: List[byte](),
+        title: "",
+        role: "",
+        anchor_x: 0,
+        anchor_y: 0,
+        max_w: 0,
+        max_h: 0,
+        place: PANEL_BELOW,
+        area: rect(0, 0, 0, 0),
+        has_area: false,
+    }
+}
+
+// `panel_space` (`panel.c:36-46`): a breaking space cluster.
+fn pn_space(s: List[byte], at: int, end: int) -> bool {
+    let n = end - at
+    if n == 1 && (s[at] as int == 32 || s[at] as int == 9) {
+        return true
+    }
+    let (cp, _) = unicode.utf8_decode(s, at, end)
+    cp == 160 || cp == 5760 || cp >= 8192 && cp <= 8202 || cp == 8239 || cp == 8287 || cp == 12288
+}
+
+// `panel_cluster_width` (`panel.c:48-56`): a tab to the next stop.
+fn pn_cluster_width(s: List[byte], at: int, end: int, col: int) -> int {
+    if end - at == 1 && s[at] as int == 9 {
+        return PANEL_TABWIDTH - col % PANEL_TABWIDTH
+    }
+    let w = unicode.cluster_width(s, at, end)
+    if w > 0 then w else 0
+}
+
+// `panel_fence_line` (`panel.c:58-65`): a Markdown fence is not shown.
+fn pn_fence_line(b: List[byte], lo: int, hi: int) -> bool {
+    var len = hi - lo
+    if len != 0 && b[hi - 1] as int == 13 {
+        len -= 1
+    }
+    len == 3 && b[lo] as int == 96 && b[lo + 1] as int == 96 && b[lo + 2] as int == 96
+}
+
+fn pn_next(p: Panel, at: int, hi: int) -> int {
+    var n = unicode.gb_next_bytes(p.body, p.body.len, at)
+    if n <= at || n > hi {
+        n = hi
+    }
+    n
+}
+
+// `panel_push_line` (`panel.c:67-140`): one source line wrapped at
+// `width` cells, at the last breaking space when there is one.
+fn pn_push_line(mut p: Panel, lo: int, hi: int, width: int) {
+    if lo == hi {
+        (mut p.rows).push(PanelRow { lo: lo, hi: hi })
+        return
+    }
+    var start = lo
+    while start < hi {
+        var pos = start
+        var break_at = -1
+        var resume_at = -1
+        var cells = 0
+        while pos < hi {
+            let next = pn_next(p, pos, hi)
+            let cw = pn_cluster_width(p.body, pos, next, cells)
+            if cells + cw > width {
+                if pn_space(p.body, pos, next) {
+                    break_at = pos
+                    resume_at = next
+                }
+                break
+            }
+            cells += cw
+            if pn_space(p.body, pos, next) {
+                break_at = pos
+                resume_at = next
+            }
+            pos = next
+        }
+        if pos == hi {
+            // Trim trailing spaces, walking clusters of the row's own
+            // window (`panel.c:105-120`).
+            while pos > start {
+                let prev = start +
+                    unicode.gb_prev_bytes_exact(
+                        git_slice_bytes(p.body, start, pos),
+                        pos - start,
+                        pos - start,
+                    )
+                if prev >= pos || !pn_space(p.body, prev, pos) {
+                    break
+                }
+                pos = prev
+            }
+            (mut p.rows).push(PanelRow { lo: start, hi: pos })
+            break
+        }
+        if break_at >= 0 && break_at > start {
+            (mut p.rows).push(PanelRow { lo: start, hi: break_at })
+            start = resume_at
+            while start < hi {
+                let next = unicode.gb_next_bytes(p.body, p.body.len, start)
+                if next <= start || next > hi || !pn_space(p.body, start, next) {
+                    break
+                }
+                start = next
+            }
+        } else {
+            if pos == start {
+                let next = unicode.gb_next_bytes(p.body, p.body.len, start)
+                pos = if next > start && next <= hi then next else hi
+            }
+            (mut p.rows).push(PanelRow { lo: start, hi: pos })
+            start = pos
+        }
+    }
+}
+
+// The bytes `b[at..end)` (the exact-prev walk's own window).
+fn git_slice_bytes(b: List[byte], at: int, end: int) -> List[byte] {
+    var out = List[byte]()
+    var i = at
+    while i < end {
+        (mut out).push(b[i])
+        i += 1
+    }
+    out
+}
+
+// `panel_wrap` (`panel.c:142-162`).
+fn pn_wrap(mut p: Panel, width: int) {
+    (mut p.rows).reset()
+    let n = p.body.len
+    if n == 0 {
+        (mut p.rows).push(PanelRow { lo: 0, hi: 0 })
+    } else {
+        var at = 0
+        while at < n {
+            var end = at
+            while end < n && p.body[end] as int != 10 {
+                end += 1
+            }
+            if !pn_fence_line(p.body, at, end) {
+                pn_push_line(mut p, at, end, width)
+            }
+            at = if end < n then end + 1 else end
+        }
+        if p.body[n - 1] as int == 10 {
+            (mut p.rows).push(PanelRow { lo: n, hi: n })
+        }
+    }
+    p.nrows = p.rows.len
+}
+
+// `panel_area` (`panel.c:164-190`).
+fn pn_area(ed: Ed, p: Panel) -> Rect {
+    if p.has_area {
+        var a = copy p.area
+        if a.x >= ed.grid.cols || a.y >= ed.grid.rows {
+            return rect(0, 0, 0, 0)
+        }
+        if a.x + a.w > ed.grid.cols {
+            a.w = ed.grid.cols - a.x
+        }
+        if a.y + a.h > ed.grid.rows {
+            a.h = ed.grid.rows - a.y
+        }
+        return a
+    }
+    if ed.win >= 0 && ed.wins[ed.win].rect.w != 0 && ed.wins[ed.win].rect.h != 0 {
+        return copy ed.wins[ed.win].rect
+    }
+    rect(0, 0, ed.grid.cols, ed.grid.rows)
+}
+
+fn pn_row_width(p: Panel, r: PanelRow) -> int {
+    if r.hi <= r.lo {
+        return 0
+    }
+    let w = unicode.str_width(p.body, r.lo, r.hi, PANEL_TABWIDTH)
+    if w <= 0 then 0 else if w > 65535 then 65535 else w
+}
+
+fn pn_clamp_scroll(mut p: Panel) {
+    if p.scroll + (p.rect.h - 2) > p.nrows {
+        let last = if p.nrows > p.rect.h - 2 then p.nrows - (p.rect.h - 2) else 0
+        p.scroll = if last > 65535 then 65535 else last
+    }
+}
+
+// `panel_geometry` (`panel.c:204-313`).
+fn pn_geometry(ed: Ed, mut p: Panel) -> bool {
+    let area = pn_area(ed, p)
+    if area.w < 3 || area.h < 3 {
+        return false
+    }
+    var content_cap = PANEL_MAX_W
+    if p.max_w != 0 && p.max_w < content_cap {
+        content_cap = p.max_w
+    }
+    if content_cap > area.w - 2 {
+        content_cap = area.w - 2
+    }
+    if content_cap == 0 {
+        return false
+    }
+    pn_wrap(mut p, content_cap)
+    var widest = 0
+    for r in p.rows {
+        let rw = pn_row_width(p, r)
+        if rw > widest {
+            widest = rw
+        }
+    }
+    if widest == 0 {
+        widest = 1
+    }
+    if widest > content_cap {
+        widest = content_cap
+    }
+    var height_cap = PANEL_MAX_H
+    if p.max_h != 0 && p.max_h < height_cap {
+        height_cap = p.max_h
+    }
+    if height_cap < 3 {
+        return false
+    }
+    var desired_h = if p.nrows >= 65533 then 65535 else p.nrows + 2
+    if desired_h > height_cap {
+        desired_h = height_cap
+    }
+    if desired_h > area.h {
+        desired_h = area.h
+    }
+    let right = area.x + area.w
+    let bottom = area.y + area.h
+    if p.place == PANEL_CENTER {
+        let pw = widest + 2
+        p.rect = rect(area.x + (area.w - pw) / 2, area.y + (area.h - desired_h) / 2, pw, desired_h)
+        pn_clamp_scroll(mut p)
+        return true
+    }
+    var anchor_y = p.anchor_y
+    if anchor_y < area.y {
+        anchor_y = area.y
+    } else if anchor_y >= bottom {
+        anchor_y = bottom - 1
+    }
+    let above = anchor_y - area.y
+    let below = if anchor_y + 1 >= bottom then 0 else bottom - (anchor_y + 1)
+    var use_below = false
+    if p.place == PANEL_ABOVE {
+        use_below = if above >= desired_h {
+            false
+        } else if below >= desired_h {
+            true
+        } else {
+            below > above
+        }
+    } else if p.place == PANEL_BELOW {
+        use_below = if below >= desired_h {
+            true
+        } else if above >= desired_h {
+            false
+        } else {
+            below >= above
+        }
+    } else if below >= desired_h {
+        use_below = true
+    } else if above >= desired_h {
+        use_below = false
+    } else {
+        use_below = below >= above
+    }
+    let room = if use_below then below else above
+    if room < 3 {
+        return false
+    }
+    if desired_h > room {
+        desired_h = room
+    }
+    let y = if use_below then anchor_y + 1 else anchor_y - desired_h
+    var x = if p.anchor_x < area.x then area.x else p.anchor_x
+    if x + widest + 2 > right {
+        x = if right > widest + 2 then right - widest - 2 else area.x
+    }
+    p.rect = rect(x, y, widest + 2, desired_h)
+    pn_clamp_scroll(mut p)
+    true
+}
+
+/// `yew_panel_close` (`panel.c:373-388`).
+pub fn panel_close(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len {
+        return
+    }
+    pn_reset(mut ed.wins[wi].panel)
+    ed.full_damage = true
+}
+
+fn pn_reset(mut p: Panel) {
+    (mut p.body).reset()
+    (mut p.rows).reset()
+    p.open = false
+    p.rect = rect(0, 0, 0, 0)
+    p.scroll = 0
+    p.nrows = 0
+    p.title = ""
+    p.role = ""
+    p.anchor_x = 0
+    p.anchor_y = 0
+    p.max_w = 0
+    p.max_h = 0
+    p.place = PANEL_BELOW
+    p.area = rect(0, 0, 0, 0)
+    p.has_area = false
+}
+
+/// `yew_panel_open` (`panel.c:315-352`): window `wi`'s panel opened over
+/// `spec` (its bytes copied); false when it cannot be placed (then
+/// closed).
+pub fn panel_open(mut ed: Ed, wi: int, spec: PanelSpec) -> bool {
+    if wi < 0 || wi >= ed.wins.len || spec.place > PANEL_CENTER {
+        return false
+    }
+    panel_close(mut ed, wi)
+    for b in spec.body {
+        (mut ed.wins[wi].panel.body).push(b)
+    }
+    ed.wins[wi].panel.title = copy spec.title
+    ed.wins[wi].panel.role = spec.role
+    ed.wins[wi].panel.anchor_x = spec.x
+    ed.wins[wi].panel.anchor_y = spec.y
+    ed.wins[wi].panel.place = spec.place
+    ed.wins[wi].panel.max_w = spec.max_w
+    ed.wins[wi].panel.max_h = spec.max_h
+    ed.wins[wi].panel.area = copy spec.area
+    ed.wins[wi].panel.has_area = spec.has_area
+    ed.wins[wi].panel.open = true
+    var p = copy ed.wins[wi].panel
+    let placed = pn_geometry(ed, mut p)
+    ed.wins[wi].panel = p
+    if !placed {
+        panel_close(mut ed, wi)
+        return false
+    }
+    ed.full_damage = true
+    true
+}
+
+/// `yew_panel_resize` (`panel.c:390-400`).
+pub fn panel_resize(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len || !ed.wins[wi].panel.open {
+        return
+    }
+    var p = copy ed.wins[wi].panel
+    let placed = pn_geometry(ed, mut p)
+    ed.wins[wi].panel = p
+    if !placed {
+        panel_close(mut ed, wi)
+        return
+    }
+    ed.full_damage = true
+}
+
+// `panel_scroll` (`panel.c:402-440`).
+fn pn_scroll(mut ed: Ed, wi: int, action: int) -> bool {
+    if wi < 0 || wi >= ed.wins.len || !ed.wins[wi].panel.open {
+        return false
+    }
+    let h = ed.wins[wi].panel.rect.h
+    let visible = if h > 2 then h - 2 else 0
+    let nrows = ed.wins[wi].panel.nrows
+    var max_scroll = if nrows > visible then nrows - visible else 0
+    if max_scroll > 65535 {
+        max_scroll = 65535
+    }
+    let step = if visible == 0 then 1 else visible
+    let s = ed.wins[wi].panel.scroll
+    if action == -1 {
+        if s != 0 {
+            ed.wins[wi].panel.scroll = s - 1
+        }
+    } else if action == 1 {
+        if s < max_scroll {
+            ed.wins[wi].panel.scroll = s + 1
+        }
+    } else if action == -2 {
+        ed.wins[wi].panel.scroll = if s > step then s - step else 0
+    } else if action == 2 {
+        let next = s + step
+        ed.wins[wi].panel.scroll = if next < max_scroll then next else max_scroll
+    } else {
+        return false
+    }
+    ed.full_damage = true
+    true
+}
+
+/// `yew_panel_key` (`panel.c:442-457`): the four scroll keys scroll;
+/// every other key closes the panel and is NOT consumed (it falls
+/// through the same dispatch pass).
+pub fn panel_key(mut ed: Ed, wi: int, key: term.Key) -> bool {
+    if wi < 0 || wi >= ed.wins.len || !ed.wins[wi].panel.open || key.ev == term.KEY_RELEASE {
+        return false
+    }
+    let k = keyid(key)
+    var action = 0
+    if k == keyid_of(term.KEY_UP, 0) {
+        action = -1
+    } else if k == keyid_of(term.KEY_DOWN, 0) {
+        action = 1
+    } else if k == keyid_of(term.KEY_PAGE_UP, 0) {
+        action = -2
+    } else if k == keyid_of(term.KEY_PAGE_DOWN, 0) {
+        action = 2
+    } else {
+        panel_close(mut ed, wi)
+        return false
+    }
+    pn_scroll(mut ed, wi, action)
+}
+
+/// `ed.ui.panel.move` (`yew_panel_cmd_move`, `panel.c:459-465`).
+pub fn panel_cmd_move(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || !pn_scroll(mut ed, cx.win, cx.iarg) {
+        return CMD_ERR_STATE
+    }
+    CMD_OK
+}
+
+// `panel_style` (`panel.c:467-480`).
+fn pn_style(ed: Ed, p: Panel) -> term.Cell {
+    var style = copy ed.grid.blank
+    if p.role.len != 0 {
+        let (has, t) = theme_ui(ed.theme, p.role, theme_rendition_of(ed.render))
+        if has {
+            style.fg = copy t.fg
+            style.bg = copy t.bg
+            style.attrs = t.attrs
+        }
+    }
+    style
+}
+
+fn pn_put(mut g: term.Grid, row: int, col: int, s: str, style: term.Cell) {
+    let b = s.bytes()
+    let _ = term.grid_put(mut g, row, col, b, 0, b.len, style.fg, style.bg, style.attrs)
+}
+
+// `panel_draw_border` (`panel.c:497-540`).
+fn pn_draw_border(p: Panel, mut g: term.Grid, style: term.Cell) {
+    let right = p.rect.x + p.rect.w - 1
+    let bottom = p.rect.y + p.rect.h - 1
+    pn_put(mut g, p.rect.y, p.rect.x, glyph(GLYPH_BORDER_TL), style)
+    pn_put(mut g, p.rect.y, right, glyph(GLYPH_BORDER_TR), style)
+    pn_put(mut g, bottom, p.rect.x, glyph(GLYPH_BORDER_BL), style)
+    pn_put(mut g, bottom, right, glyph(GLYPH_BORDER_BR), style)
+    var dx = 1
+    while dx + 1 < p.rect.w {
+        pn_put(mut g, p.rect.y, p.rect.x + dx, glyph(GLYPH_BORDER_H), style)
+        pn_put(mut g, bottom, p.rect.x + dx, glyph(GLYPH_BORDER_H), style)
+        dx += 1
+    }
+    var dy = 1
+    while dy + 1 < p.rect.h {
+        pn_put(mut g, p.rect.y + dy, p.rect.x, glyph(GLYPH_BORDER_V), style)
+        pn_put(mut g, p.rect.y + dy, right, glyph(GLYPH_BORDER_V), style)
+        dy += 1
+    }
+    if p.title.len != 0 && p.rect.w > 4 {
+        let tb = p.title.bytes()
+        let (keep, _) = unicode.str_clip(tb, 0, tb.len, p.rect.w - 4)
+        pn_put(mut g, p.rect.y, p.rect.x + 1, " ", style)
+        let _ = term.grid_puts(
+            mut g,
+            p.rect.y,
+            p.rect.x + 2,
+            tb,
+            0,
+            keep,
+            style.fg,
+            style.bg,
+            style.attrs | term.ATTR_BOLD,
+        )
+    }
+    if p.scroll != 0 {
+        pn_put(mut g, p.rect.y + 1, right, glyph(GLYPH_SCROLL_UP), style)
+    }
+    if p.scroll + (p.rect.h - 2) < p.nrows {
+        pn_put(mut g, bottom - 1, right, glyph(GLYPH_DISCLOSE_OPEN), style)
+    }
+}
+
+/// `yew_panel_draw` (`panel.c:542-635`): the box, its border and its
+/// visible rows; the stored rect registered as the last-added BLOCK
+/// region.
+pub fn panel_draw(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len {
+        return
+    }
+    let p = copy ed.wins[wi].panel
+    if !p.open || p.rect.w < 3 || p.rect.h < 3 {
+        return
+    }
+    let grid_right = p.rect.x + p.rect.w
+    let grid_bottom = p.rect.y + p.rect.h
+    if grid_right > ed.grid.cols || grid_bottom > ed.grid.rows {
+        return
+    }
+    let style = pn_style(ed, p)
+    var row = 0
+    while row < p.rect.h {
+        term.grid_fill(mut ed.grid, p.rect.y + row, p.rect.x, grid_right, style)
+        row += 1
+    }
+    pn_draw_border(p, mut ed.grid, style)
+    let visible = p.rect.h - 2
+    row = 0
+    while row < visible {
+        let index = p.scroll + row
+        if index >= p.nrows {
+            break
+        }
+        let span = copy p.rows[index]
+        var at = span.lo
+        var col = p.rect.x + 1
+        let limit = p.rect.x + p.rect.w - 1
+        var have_base = false
+        while at < span.hi && col < limit {
+            let nz = unicode.gb_next_bytes(p.body, p.body.len, at)
+            if nz <= at || nz > span.hi {
+                break
+            }
+            let next = nz
+            let attrs = style.attrs
+            if next - at == 1 && p.body[at] as int == 9 {
+                let tab = pn_cluster_width(p.body, at, next, col - p.rect.x - 1)
+                col = if col + tab < limit then col + tab else limit
+                at = next
+                have_base = false
+                continue
+            }
+            let cw = pn_cluster_width(p.body, at, next, col - p.rect.x - 1)
+            if cw == 0 {
+                if have_base {
+                    let _ = term.grid_put(
+                        mut ed.grid,
+                        p.rect.y + 1 + row,
+                        col,
+                        p.body,
+                        at,
+                        next,
+                        style.fg,
+                        style.bg,
+                        attrs,
+                    )
+                }
+                at = next
+                continue
+            }
+            if col + cw > limit {
+                break
+            }
+            let drawn = term.grid_put(
+                mut ed.grid,
+                p.rect.y + 1 + row,
+                col,
+                p.body,
+                at,
+                next,
+                style.fg,
+                style.bg,
+                attrs,
+            )
+            if drawn <= col || drawn > limit {
+                break
+            }
+            col = drawn
+            at = next
+            have_base = true
+        }
+        row += 1
+    }
+    region_add(mut ed.regions, REGION_BLOCK, copy p.rect, 0)
+}
