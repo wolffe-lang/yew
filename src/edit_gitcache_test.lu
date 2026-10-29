@@ -1,0 +1,1340 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_gitcache.c` (2,142 lines): its 30
+//! s51 cases, one test per C test in registry order
+//! (`tests/unit/registry.c:2337-2373`). The seven s53 cases — the
+//! cat-file batch (`blob_batch_*`, three) and the editor runtime
+//! (`editor_*`, four) — are yw13b's with the code they test.
+//!
+//! C's `gitcache_spawn` / `gitcache_run_sync` hooks are the git layer's
+//! test switches (`edit.git_test_spawn_set`, `git_test_run_sync_set`),
+//! their logs `ed.git.tlog` / `ed.git.slog`; C's callback capture owner is
+//! `GIT_OWNER_TEST` recording into `ed.git.tcap`. Temporary directories
+//! live under `$TMPDIR` (the lane's), named by pid and case.
+//!
+//! The real-git cases spawn `git` (stripspace, apply --check, --version,
+//! hash-object) and a fake `git` script; they run inside the container
+//! with the lane's isolated git configuration.
+//!
+//! `YEW_PICK_CASE=N` runs case N alone (the checked machine's per-case run).
+
+use edit
+use git
+use std.env as std_env
+use std.fs
+use std.signal
+use term
+
+fn b(s: str) -> List[byte] {
+    var v = List[byte]()
+    for x in s.bytes() {
+        (mut v).push(x)
+    }
+    v
+}
+
+fn cat(parts: List[str]) -> List[byte] {
+    var v = List[byte]()
+    for p in parts {
+        for x in p.bytes() {
+            (mut v).push(x)
+        }
+    }
+    v
+}
+
+// `"…\0"` records: each part NUL-terminated.
+fn z(parts: List[str]) -> List[byte] {
+    var v = List[byte]()
+    for p in parts {
+        for x in p.bytes() {
+            (mut v).push(x)
+        }
+        (mut v).push(0 as byte)
+    }
+    v
+}
+
+fn argv(xs: List[str]) -> List[str] {
+    var v = List[str]()
+    for x in xs {
+        (mut v).push(x)
+    }
+    v
+}
+
+fn has(rows: List[str], want: str) -> bool {
+    for r in rows {
+        if r == want {
+            return true
+        }
+    }
+    false
+}
+
+fn none() -> List[byte] {
+    List[byte]()
+}
+
+fn tmp_dir(tag: str) -> str {
+    let base = env_get("TMPDIR") else "/tmp"
+    let dir = if base.ends_with("/") {
+        "{base}yew-gitcache-{os_pid()}-{tag}"
+    } else {
+        "{base}/yew-gitcache-{os_pid()}-{tag}"
+    }
+    fs.remove_dir_all(dir) else |_| {}
+    fs.create_dir_all(dir) else |_| { assert(false, "mkdir {dir}") }
+    dir
+}
+
+fn touch(dir: str, name: str, directory: bool) {
+    if directory {
+        fs.create_dir_all("{dir}/{name}") else |_| { assert(false, "mkdir {name}") }
+    } else {
+        fs.write_bytes("{dir}/{name}", none()) else |_| { assert(false, "touch {name}") }
+    }
+}
+
+fn remove(dir: str, name: str, directory: bool) {
+    if directory {
+        fs.remove_dir_all("{dir}/{name}") else |_| { assert(false, "rmdir {name}") }
+    } else {
+        fs.remove("{dir}/{name}") else |_| { assert(false, "rm {name}") }
+    }
+}
+
+fn write(dir: str, name: str, text: str) {
+    fs.write_bytes("{dir}/{name}", b(text)) else |_| { assert(false, "write {name}") }
+}
+
+// `gitcache_ed` (`test_gitcache.c:153-158`): a fresh editor with the
+// spawn hook on.
+fn ed_hooked() -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.git_test_spawn_set(mut ed, true)
+    ed
+}
+
+fn live(ed: edit.Ed) -> int {
+    ed.git.live
+}
+
+fn branch(ed: edit.Ed) -> str {
+    let s = ed.git.live
+    edit.git_span_str(ed.git.snap[s].pool, ed.git.snap[s].branch_at, ed.git.snap[s].branch_len)
+}
+
+fn comment(ed: edit.Ed) -> str {
+    let s = ed.git.live
+    edit.git_span_str(ed.git.snap[s].pool, ed.git.snap[s].comment_at, ed.git.snap[s].comment_len)
+}
+
+fn entry_path(ed: edit.Ed, i: int) -> str {
+    let s = ed.git.live
+    let e = copy ed.git.snap[s].entries[i]
+    edit.git_span_str(ed.git.snap[s].pool, e.path_at, e.path_len)
+}
+
+fn complete(mut ed: edit.Ed, id: int, state: int, out: List[byte]) {
+    assert(edit.git_test_complete(mut ed, id, state, out, none()), "complete {id}")
+}
+
+// `gitcache_complete_default_comment` (`:188-194`).
+fn complete_default_comment(mut ed: edit.Ed) {
+    let id = ed.git.tlog.last_comment
+    assert(id != 0, "a comment-char spawn")
+    assert(
+        edit.git_complete_exit(mut ed, id, git.GIT_FAILED, 1, none(), none()),
+        "comment completes",
+    )
+}
+
+fn status_trunk() -> List[byte] {
+    z(["# branch.oid 0123456789012345678901234567890123456789", "# branch.head trunk"])
+}
+
+// `gitcache_ready` (`:221-252`): version, detection of `git_dir`, a
+// status, an empty ignore set, the default comment character — the first
+// snapshot published at `now`.
+fn ready(mut ed: edit.Ed, git_dir: str, now: int) {
+    edit.git_test_now_set(mut ed, now)
+    assert(edit.git_refresh(mut ed, false), "refresh spawns")
+    let v = ed.git.tlog.next_id
+    complete(mut ed, v, git.GIT_OK, b("git version 2.40.1\n"))
+    let d = ed.git.tlog.next_id
+    complete(mut ed, d, git.GIT_OK, b("{git_dir}\ntrue\nfalse\n{git_dir}\n"))
+    let st = ed.git.tlog.last_status
+    assert(st != 0, "status spawned")
+    complete(mut ed, st, git.GIT_OK, status_trunk())
+    let ig = ed.git.tlog.last_ignore
+    assert(ig != 0, "ignore spawned")
+    complete(mut ed, ig, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+}
+
+// One loop turn over the jobs (`test_gitcache.c:476-488`).
+fn pump(mut ed: edit.Ed, ms: int) {
+    let fds = edit.job_wait_fds(ed)
+    if fds.len != 0 {
+        let _ = os_signal_wait_fds(fds, signal.child(), ms) else |_| { (-1, 0) }
+    } else {
+        time_sleep_ms(1)
+    }
+    edit.job_pump(mut ed)
+    edit.job_reap(mut ed)
+    edit.job_tick(mut ed, time_now_ms())
+    let _ = edit.job_settle(mut ed)
+}
+
+fn pump_settle_loop(mut ed: edit.Ed, ms: int) -> int {
+    let fds = edit.job_wait_fds(ed)
+    if fds.len != 0 {
+        let _ = os_signal_wait_fds(fds, signal.child(), ms) else |_| { (-1, 0) }
+    } else {
+        time_sleep_ms(1)
+    }
+    edit.job_pump(mut ed)
+    edit.job_reap(mut ed)
+    edit.loop_settle_jobs(mut ed)
+}
+
+// `gitcache_owned_job_id` (`:460-474`): exactly one git-owned job.
+fn owned_job_id(ed: edit.Ed) -> int {
+    var found = 0
+    for j in ed.jobs.v {
+        if edit.git_job_owned(ed, j.id) {
+            assert(found == 0, "one git-owned job")
+            found = j.id
+        }
+    }
+    found
+}
+
+fn wait_job_gone(mut ed: edit.Ed, id: int) -> bool {
+    let start = time_now_ms()
+    while edit.job_find(ed, id) >= 0 && time_now_ms() - start < 5000 {
+        pump(mut ed, 5)
+    }
+    edit.job_find(ed, id) < 0
+}
+
+fn wait_capture(mut ed: edit.Ed, loop_settle: bool) {
+    let start = time_now_ms()
+    while !ed.git.tcap.completed && time_now_ms() - start < 5000 {
+        if loop_settle {
+            let _ = pump_settle_loop(mut ed, 20)
+        } else {
+            pump(mut ed, 20)
+        }
+    }
+}
+
+// `:346-355`.
+fn gitcache_ttl_uses_monotonic_wall_milliseconds() {
+    assert(edit.git_cache_fresh(1000, 1499), "499 fresh")
+    assert(!edit.git_cache_fresh(1000, 1500), "500 stale")
+    assert(!edit.git_cache_fresh(1000, 1501), "501 stale")
+    // Ten seconds of wall time must expire even when the process consumed
+    // zero CPU while blocked in a wait; clock(3) fails this assertion.
+    assert(!edit.git_cache_fresh(1000, 11000), "ten seconds")
+    assert(!edit.git_cache_fresh(1000, 999), "backwards")
+}
+
+// `:357-374`.
+fn gitcache_backwards_wall_clock_forces_refresh() {
+    let tmp = tmp_dir("clock-step")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 700000)
+    let before = ed.git.tlog.status_calls
+    edit.git_test_now_set(mut ed, 100000)
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.tlog.status_calls == before + 1, "a stepped-back clock refreshes")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:254-271`.
+fn gitcache_focus_gain_invalidates_before_ttl() {
+    let tmp = tmp_dir("focus")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    let before = ed.git.tlog.status_calls
+    var key = term.key_new()
+    key.kind = term.EV_FOCUS
+    key.code = term.KEY_FOCUS_IN
+    edit.loop_dispatch_event(mut ed, key, 1001)
+    assert(ed.git.tlog.status_calls == before + 1, "focus-in refreshes")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:273-313`: a user job's completion through the loop's settle.
+fn gitcache_arbitrary_job_completion_invalidates_before_ttl() {
+    let tmp = tmp_dir("job-trigger")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    var spec = edit.job_spec_new()
+    spec.argv = argv(["/bin/sh", "-c", "exit 0"])
+    spec.sink = edit.SINK_DISCARD
+    let (job, why) = edit.job_spawn(mut ed, mut spec)
+    assert(job != 0, "spawn: {why}")
+    let before = ed.git.tlog.status_calls
+    let start = time_now_ms()
+    var completed = false
+    while !completed && time_now_ms() - start < 5000 {
+        completed = pump_settle_loop(mut ed, 20) != 0
+    }
+    assert(completed, "the job completed")
+    assert(ed.git.tlog.status_calls == before + 1, "its completion refreshed")
+    edit.jobs_free(mut ed)
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:315-344`.
+fn gitcache_buffer_save_invalidates_before_ttl() {
+    let tmp = tmp_dir("save-trigger")
+    write(tmp, "saved.txt", "before\n")
+    var ed = ed_hooked()
+    edit.ed_open_scratch(mut ed)
+    let idx = edit.tab_open(mut ed, "{tmp}/saved.txt")
+    assert(idx >= 0, "tab")
+    assert(edit.tab_hydrate(mut ed, idx) == 0, "the file loads")
+    edit.tab_switch(mut ed, idx)
+    ready(mut ed, tmp, 1000)
+    let before = ed.git.tlog.status_calls
+    assert(edit.ed_file_save(mut ed, false) == edit.CMD_OK, "save")
+    assert(edit.git_refresh(mut ed, false), "the save forced a refresh")
+    assert(ed.git.tlog.status_calls == before + 1, "one refresh")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:728-770`: git's own read callback does not invalidate the cache.
+fn gitcache_internal_read_job_completion_does_not_self_invalidate() {
+    let tmp = tmp_dir("internal-trigger")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    edit.git_test_spawn_set(mut ed, false)
+    let (id, why) = edit.git_spawn_callback(
+        mut ed,
+        edit.git_verb(ed, "version"),
+        argv(["--version"]),
+        edit.GIT_OWNER_TEST,
+        "t",
+    )
+    assert(id != 0, "spawn: {why}")
+    assert(edit.git_job_owned(ed, id), "owned")
+    wait_capture(mut ed, true)
+    assert(ed.git.tcap.completed, "completed")
+    assert(ed.git.tcap.destroyed, "destroyed")
+    let tlog_calls = ed.git.tlog.status_calls
+    ed.git.test_spawn = true
+    edit.git_test_now_set(mut ed, 1001)
+    let _ = edit.git_refresh(mut ed, false)
+    assert(ed.git.tlog.status_calls == tlog_calls, "no self-invalidation")
+    edit.jobs_free(mut ed)
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:376-397`.
+fn gitcache_state_strings_cover_taxonomy() {
+    let expected = [
+        "ok",
+        "git unavailable",
+        "not a repository",
+        "bare repository",
+        "no HEAD",
+        "detached HEAD",
+        "no upstream",
+        "conflicted",
+        "merge in progress",
+        "rebase in progress",
+        "cherry-pick in progress",
+        "revert in progress",
+        "bisect in progress",
+        "repository locked",
+        "authentication required",
+        "timed out",
+        "git command failed",
+        "malformed git output",
+    ]
+    var i = 0
+    while i < expected.len {
+        assert(git.git_state_str(i) == expected[i], "state {i}")
+        i += 1
+    }
+    assert(git.git_state_str(99) == "unknown git state", "out of range")
+}
+
+// `:499-531`.
+fn gitcache_filesystem_taxonomy_is_message_free() {
+    let tmp = tmp_dir("taxonomy")
+    assert(edit.git_probe_state(edit.git_repo_at(tmp, false)) == git.GIT_OK, "clean")
+    assert(edit.git_probe_state(edit.git_repo_at(tmp, true)) == git.GIT_BARE, "bare")
+    let names = [
+        "MERGE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "index.lock",
+    ]
+    let dirs = [false, true, true, false, false, false, false]
+    let states = [
+        git.GIT_MID_MERGE,
+        git.GIT_MID_REBASE,
+        git.GIT_MID_REBASE,
+        git.GIT_MID_CHERRY_PICK,
+        git.GIT_MID_REVERT,
+        git.GIT_MID_BISECT,
+        git.GIT_LOCKED,
+    ]
+    var i = 0
+    while i < names.len {
+        touch(tmp, names[i], dirs[i])
+        assert(edit.git_probe_state(edit.git_repo_at(tmp, false)) == states[i], "probe {names[i]}")
+        remove(tmp, names[i], dirs[i])
+        i += 1
+    }
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:1184-1224`.
+fn gitcache_verb_table_and_argv_are_structural() {
+    var ed = ed_hooked()
+    let stage = edit.git_verb(ed, "stage")
+    assert(stage >= 0, "stage")
+    assert(edit.git_verb(ed, "init") >= 0, "init")
+    assert(ed.git.verbs[stage].kind == edit.GV_MUTATE, "stage mutates")
+    var req = edit.git_req(edit.GREQ_VERB)
+    req.literal_paths = true
+    let (id, _) = edit.git_spawn(mut ed, stage, argv(["add", "--", "-n", "a \"$\n"]), req)
+    assert(id != 0, "spawned")
+    let want = [
+        "git",
+        "--no-pager",
+        "-c",
+        "core.quotepath=false",
+        "-c",
+        "status.renames=true",
+        "add",
+        "--",
+        "-n",
+        "a \"$\n",
+    ]
+    assert(ed.git.tlog.argv.len == want.len, "argv length")
+    var i = 0
+    while i < want.len {
+        assert(ed.git.tlog.argv[i] == want[i], "argv {i}")
+        i += 1
+    }
+    i = 0
+    while i < edit.git_verb_count(ed) {
+        let v = copy ed.git.verbs[i]
+        assert(v.name.len != 0, "named")
+        let t = if v.kind == edit.GV_NET then edit.GIT_NET_TIMEOUT_MS else edit.GIT_READ_TIMEOUT_MS
+        assert(v.timeout_ms == t, "timeout {v.name}")
+        i += 1
+    }
+    assert(edit.git_verb(ed, "no-such-verb") < 0, "no raw verb")
+}
+
+// `:1226-1289`.
+fn gitcache_terminal_rebase_inherits_canonical_boundary() {
+    var ed = ed_hooked()
+    ready(mut ed, ".", 1000)
+    let rebase = edit.git_verb(ed, "rebase")
+    assert(rebase >= 0, "rebase")
+    assert(ed.git.verbs[rebase].kind == edit.GV_MUTATE, "mutates")
+    assert(
+        ed.git.verbs[rebase].needs_repo && ed.git.verbs[rebase].needs_head,
+        "needs repo and head",
+    )
+    edit.git_test_run_sync_set(mut ed, true)
+    let (ran, wait, why) = edit.git_run_terminal(
+        mut ed,
+        rebase,
+        argv(["rebase", "-i", "0123456789abcdef"]),
+        "/tmp/yew editor",
+    )
+    assert(ran, "ran: {why}")
+    assert(ed.git.slog.calls == 1, "one sync run")
+    assert(wait.state == edit.JOB_EXITED, "exited")
+    assert(ed.git.slog.inherit_tty, "inherits the tty")
+    assert(ed.git.slog.sink == edit.SINK_DISCARD, "discards")
+    let want = [
+        "git",
+        "--no-pager",
+        "-c",
+        "core.quotepath=false",
+        "-c",
+        "status.renames=true",
+        "rebase",
+        "-i",
+        "0123456789abcdef",
+    ]
+    var i = 0
+    while i < want.len {
+        assert(ed.git.slog.argv[i] == want[i], "argv {i}")
+        i += 1
+    }
+    assert(!has(ed.git.slog.argv, "--no-optional-locks"), "a mutation takes no read lock option")
+    for row in [
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_EDITOR=/tmp/yew editor",
+        "GIT_SEQUENCE_EDITOR=/tmp/yew editor",
+        "GIT_FLUSH=1",
+        "GIT_PAGER=cat",
+        "PAGER=cat",
+        "LC_ALL=C",
+    ] {
+        assert(has(ed.git.slog.env_set, row), "set {row}")
+    }
+    for row in [
+        "COLUMNS",
+        "LINES",
+        "GIT_TRACE",
+        "GIT_TRACE_PACKET",
+        "GIT_TRACE_PERFORMANCE",
+        "GIT_CURL_VERBOSE",
+        "GIT_TRANSFER_TRACE",
+    ] {
+        assert(has(ed.git.slog.env_unset, row), "unset {row}")
+    }
+    assert(has(ed.git.slog.env_unset_prefix, "GIT_TRACE2"), "unset GIT_TRACE2*")
+}
+
+// `:1291-1355`.
+fn gitcache_coalesces_and_caps_inflight() {
+    var ed = ed_hooked()
+    let st = edit.git_verb(ed, "status")
+    var req = edit.git_req(edit.GREQ_STATUS)
+    let (first, _) = edit.git_spawn(mut ed, st, argv(["status"]), req)
+    assert(first != 0, "first")
+    let (again, _) = edit.git_spawn(mut ed, st, argv(["status"]), req)
+    assert(again == first, "coalesced")
+    assert(ed.git.tlog.calls == 1, "one spawn")
+    req.kind = edit.GREQ_VERB
+    let (other, _) = edit.git_spawn(mut ed, st, argv(["status"]), req)
+    assert(other != first, "a plain verb does not coalesce")
+    assert(ed.git.tlog.calls == 2, "two spawns")
+    req.kind = edit.GREQ_STATUS
+    for a in ["0", "1"] {
+        let (id, _) = edit.git_spawn(mut ed, st, argv(["status", a]), req)
+        assert(id != 0, "slot {a}")
+    }
+    let (capped, _) = edit.git_spawn(mut ed, st, argv(["status", "2"]), req)
+    assert(capped == 0, "the fifth is refused")
+    assert(ed.git.tlog.calls == edit.GIT_MAX_INFLIGHT, "four spawns")
+
+    var ed2 = ed_hooked()
+    var owned = edit.git_req(edit.GREQ_STATUS)
+    owned.stdin = b("abc")
+    let (owned_id, _) = edit.git_spawn(mut ed2, st, argv(["status"]), owned)
+    owned.stdin = b("xbc")
+    let (changed, _) = edit.git_spawn(mut ed2, st, argv(["status"]), owned)
+    assert(changed != owned_id, "different stdin does not coalesce")
+    var mutate = edit.git_req(edit.GREQ_VERB)
+    mutate.stdin = b("xbc")
+    let commit = edit.git_verb(ed2, "commit")
+    let (mid, _) = edit.git_spawn(mut ed2, commit, argv(["commit"]), mutate)
+    assert(mid != 0, "commit")
+    let (mid2, _) = edit.git_spawn(mut ed2, commit, argv(["commit"]), mutate)
+    assert(mid2 != mid, "a mutation never coalesces")
+}
+
+// `:1357-1377`.
+fn gitcache_environment_fingerprint_tracks_passthrough() {
+    let name = "GIT_NAMESPACE"
+    let had = env_get(name) else ""
+    let present = (env_get(name) else "\x00") != "\x00"
+    let before = edit.git_env_fingerprint()
+    std_env.set(name, "yew-s51-test") else |_| { assert(false, "setenv") }
+    let after = edit.git_env_fingerprint()
+    assert(before != after, "a pass-through row changes the fingerprint")
+    if present {
+        std_env.set(name, had) else |_| {}
+    } else {
+        std_env.unset(name) else |_| {}
+    }
+    assert(edit.git_env_fingerprint() == before, "restored")
+}
+
+// `:1379-1432`.
+fn gitcache_refresh_ttl_coalesces_and_pingpong_survives_failure() {
+    let tmp = tmp_dir("refresh")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    let s = edit.git_snapshot(mut ed)
+    assert(ed.git.snap[s].gen == 1, "gen 1")
+    assert(branch(ed) == "trunk", "trunk")
+    let baseline = ed.git.tlog.status_calls
+    edit.git_test_now_set(mut ed, 1499)
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.tlog.status_calls == baseline, "fresh at 499")
+    edit.git_test_now_set(mut ed, 1500)
+    let _ = edit.git_snapshot(mut ed)
+    var i = 0
+    while i < 9 {
+        let _ = edit.git_refresh(mut ed, true)
+        i += 1
+    }
+    assert(ed.git.tlog.status_calls == baseline + 1, "ten requests, one spawn")
+    let st = ed.git.tlog.last_status
+    complete(mut ed, st, git.GIT_OK, status_trunk())
+    let ig = ed.git.tlog.last_ignore
+    complete(mut ed, ig, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+    assert(ed.git.tlog.status_calls == baseline + 2, "the follow-up")
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.snap[live(ed)].gen == 2, "gen 2")
+    assert(branch(ed) == "trunk", "trunk")
+    let st2 = ed.git.tlog.last_status
+    complete(mut ed, st2, git.GIT_OK, z(["1 truncated"]))
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.snap[live(ed)].gen == 2, "the failure left gen 2")
+    assert(branch(ed) == "trunk", "and the branch")
+    assert(ed.git.tlog.status_calls == baseline + 2, "backoff")
+    edit.git_test_now_set(mut ed, 1999)
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.tlog.status_calls == baseline + 2, "still backing off")
+    edit.git_test_now_set(mut ed, 2000)
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.tlog.status_calls == baseline + 3, "one interval later")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:1434-1538`: 200 refreshes killed mid-output by a fake `git` that
+// never stops writing; the published snapshot is untouched every time.
+fn gitcache_killed_refresh_200_instants_preserves_snapshot() {
+    let tmp = tmp_dir("kill-refresh")
+    var ed = ed_hooked()
+    ed.ws_dir = tmp
+    ready(mut ed, tmp, 700000)
+    assert(edit.git_refresh(mut ed, true), "refresh")
+    let st = ed.git.tlog.last_status
+    complete(
+        mut ed,
+        st,
+        git.GIT_OK,
+        cat(
+            [
+                "# branch.oid 0123456789012345678901234567890123456789\x00",
+                "# branch.head trunk\x00",
+                "1 M. N... 100644 100644 100644 ",
+                "0123456789012345678901234567890123456789 ",
+                "1123456789012345678901234567890123456789 tracked.c\x00",
+            ],
+        ),
+    )
+    let ig = ed.git.tlog.last_ignore
+    complete(mut ed, ig, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+    assert(edit.git_snapshot_cached(ed), "published")
+    let pub_at = ed.git.live
+    let baseline = copy ed.git.snap[pub_at]
+    assert(baseline.entries.len == 1, "one entry")
+    let fake = "{tmp}/fake-bin"
+    fs.create_dir_all(fake) else |_| { assert(false, "mkdir fake") }
+    write(
+        fake,
+        "git",
+        "#!/bin/sh\ni=0\nwhile :; do\n  printf '? interrupted-%08d\\000' \"$i\"\n  i=$((i + 1))\ndone\n",
+    )
+    fs.set_mode("{fake}/git", 448) else |_| { assert(false, "chmod") }
+    let old_path = env_get("PATH") else ""
+    std_env.set("PATH", fake) else |_| { assert(false, "PATH") }
+    edit.git_test_spawn_set(mut ed, false)
+    var random: int = 1374763645
+    var cycle = 0
+    while cycle < 200 {
+        assert(edit.git_refresh(mut ed, true), "refresh {cycle}")
+        let id = owned_job_id(ed)
+        assert(id != 0, "owned job {cycle}")
+        random = (random * 1664525 + 1013904223) % 4294967296
+        let rounds = random / 536870912
+        var r = 0
+        while r < rounds {
+            pump(mut ed, 1)
+            assert(edit.job_find(ed, id) >= 0, "still running")
+            r += 1
+        }
+        assert(edit.job_signal(mut ed, id, signal.kill()), "kill")
+        assert(wait_job_gone(mut ed, id), "gone")
+        assert(ed.git.live == pub_at, "the same half published")
+        let after = copy ed.git.snap[pub_at]
+        assert(after.gen == baseline.gen, "gen")
+        assert(git.git_bytes_cmp(after.pool, baseline.pool) == 0, "pool bytes")
+        assert(after.entries.len == 1, "entries")
+        let e = copy after.entries[0]
+        let be = copy baseline.entries[0]
+        assert(
+            e.path_at == be.path_at && e.path_len == be.path_len && e.x == be.x && e.y == be.y,
+            "entry",
+        )
+        assert(after.branch_at == baseline.branch_at && after.head_at == baseline.head_at, "spans")
+        assert(
+            after.comment_at == baseline.comment_at && after.taken_ms == baseline.taken_ms,
+            "comment, time",
+        )
+        assert(entry_path(ed, 0) == "tracked.c", "path")
+        cycle += 1
+    }
+    std_env.set("PATH", old_path) else |_| {}
+    edit.jobs_free(mut ed)
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:1540-1610`.
+fn gitcache_comment_char_is_cached_before_snapshot_publish() {
+    let tmp = tmp_dir("comment")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.snap[live(ed)].gen == 1, "gen 1")
+    assert(comment(ed) == "#", "default #")
+    let rows = ["auto\n", ";\n", "too-long\n"]
+    let want = ["auto", ";", ";"]
+    let gens = [2, 3, 3]
+    let nows = [1500, 2000, 2500]
+    var i = 0
+    while i < 3 {
+        edit.git_test_now_set(mut ed, nows[i])
+        assert(edit.git_refresh(mut ed, false), "refresh {i}")
+        let st = ed.git.tlog.last_status
+        complete(mut ed, st, git.GIT_OK, status_trunk())
+        let ig = ed.git.tlog.last_ignore
+        complete(mut ed, ig, git.GIT_OK, none())
+        let cc = ed.git.tlog.last_comment
+        complete(mut ed, cc, git.GIT_OK, b(rows[i]))
+        let _ = edit.git_snapshot(mut ed)
+        assert(ed.git.snap[live(ed)].gen == gens[i], "gen {i}")
+        assert(comment(ed) == want[i], "comment {i}")
+        i += 1
+    }
+    assert(ed.git.result.state == git.GIT_PARSE, "the malformed value is a parse failure")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:1612-1649`.
+fn gitcache_every_mutation_schedules_structural_refresh() {
+    let tmp = tmp_dir("mutate")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    var checked = 0
+    var i = 0
+    while i < edit.git_verb_count(ed) {
+        if ed.git.verbs[i].kind == edit.GV_READ {
+            i += 1
+            continue
+        }
+        let before = ed.git.tlog.status_calls
+        let (job, _) = edit.git_spawn(mut ed, i, argv(["noop"]), edit.git_req(edit.GREQ_VERB))
+        assert(job != 0, "spawn {ed.git.verbs[i].name}")
+        complete(mut ed, job, git.GIT_OK, none())
+        assert(ed.git.tlog.status_calls == before + 1, "refresh after {ed.git.verbs[i].name}")
+        let st = ed.git.tlog.last_status
+        complete(mut ed, st, git.GIT_FAILED, none())
+        checked += 1
+        i += 1
+    }
+    assert(checked >= 20, "every mutation, {checked}")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:1651-1670`.
+fn gitcache_index_lock_skips_expired_refresh() {
+    let tmp = tmp_dir("lock")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    touch(tmp, "index.lock", false)
+    let before = ed.git.tlog.status_calls
+    edit.git_test_now_set(mut ed, 2000)
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.tlog.status_calls == before, "a held lock skips the tick")
+    remove(tmp, "index.lock", false)
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:1672-1705`.
+fn gitcache_log_completion_publishes_owned_records() {
+    let tmp = tmp_dir("log")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    let (job, _) = edit.git_spawn(
+        mut ed,
+        edit.git_verb(ed, "log"),
+        argv(["log", "-z"]),
+        edit.git_req(edit.GREQ_LOG),
+    )
+    assert(job != 0, "log")
+    var out = z(
+        [
+            "0123456789012345678901234567890123456789",
+            "0123456",
+            "1700000000",
+            "Jane",
+            "jane@example.test",
+            "",
+            "HEAD -> trunk",
+            "subject",
+        ],
+    )
+    for x in "body".bytes() {
+        (mut out).push(x)
+    }
+    complete(mut ed, job, git.GIT_OK, out)
+    assert(ed.git.log_records.len == 1, "one record")
+    assert(git.git_bytes_cmp(ed.git.log_records[0].author, b("Jane")) == 0, "author")
+    assert(git.git_bytes_cmp(ed.git.log_records[0].subject, b("subject")) == 0, "subject")
+    assert(git.git_bytes_cmp(ed.git.log_records[0].body, b("body")) == 0, "body")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+fn upstream_round(mut ed: edit.Ed, now: int, oid: str) {
+    edit.git_test_now_set(mut ed, now)
+    assert(edit.git_refresh(mut ed, false), "refresh at {now}")
+    let st = ed.git.tlog.last_status
+    complete(
+        mut ed,
+        st,
+        git.GIT_OK,
+        z(
+            [
+                "# branch.oid 0123456789012345678901234567890123456789",
+                "# branch.head trunk",
+                "# branch.upstream origin/trunk",
+            ],
+        ),
+    )
+    let ig = ed.git.tlog.last_ignore
+    complete(mut ed, ig, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+    let up = ed.git.tlog.last_upstream
+    complete(mut ed, up, git.GIT_OK, b("{oid}\n"))
+}
+
+// `:1707-1808`.
+fn gitcache_initial_upstream_refresh_and_oid_gating() {
+    let oid_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    let oid_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    let incoming = z(["src/a.c", "src/z.c"])
+    var ed = ed_hooked()
+    edit.git_test_now_set(mut ed, 1000)
+    assert(edit.git_refresh(mut ed, false), "refresh")
+    let v = ed.git.tlog.next_id
+    complete(mut ed, v, git.GIT_OK, b("git version 2.40.1\n"))
+    let d = ed.git.tlog.next_id
+    complete(mut ed, d, git.GIT_OK, b("/tmp/yew-git\ntrue\nfalse\n/tmp\n"))
+    let st = ed.git.tlog.last_status
+    complete(
+        mut ed,
+        st,
+        git.GIT_OK,
+        z(
+            [
+                "# branch.oid 0123456789012345678901234567890123456789",
+                "# branch.head trunk",
+                "# branch.upstream origin/trunk",
+            ],
+        ),
+    )
+    let ig = ed.git.tlog.last_ignore
+    complete(mut ed, ig, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+    assert(ed.git.tlog.upstream_calls == 1, "upstream read")
+    let up = ed.git.tlog.last_upstream
+    complete(mut ed, up, git.GIT_OK, b("{oid_a}\n"))
+    assert(ed.git.tlog.incoming_calls == 1, "incoming read")
+    let inc = ed.git.tlog.last_incoming
+    complete(mut ed, inc, git.GIT_OK, incoming)
+    let _ = edit.git_snapshot(mut ed)
+    let s = live(ed)
+    assert(ed.git.snap[s].gen == 1, "gen 1")
+    assert(ed.git.snap[s].entries.len == 2, "two incoming entries")
+    assert(ed.git.snap[s].entries[0].incoming, "incoming")
+    assert(entry_path(ed, 0) == "src/a.c", "src/a.c")
+
+    let first_incoming = ed.git.tlog.incoming_calls
+    upstream_round(mut ed, 1500, oid_a)
+    assert(ed.git.tlog.incoming_calls == first_incoming, "an unchanged oid reuses the set")
+    let s2 = edit.git_snapshot(mut ed)
+    assert(ed.git.snap[s2].gen == 2, "gen 2")
+
+    upstream_round(mut ed, 2000, oid_b)
+    assert(ed.git.tlog.incoming_calls == first_incoming + 1, "a changed oid rereads")
+    let inc2 = ed.git.tlog.last_incoming
+    complete(mut ed, inc2, git.GIT_OK, incoming)
+
+    let (job, _) = edit.git_spawn(
+        mut ed,
+        edit.git_verb(ed, "fetch"),
+        argv(["fetch"]),
+        edit.git_req(edit.GREQ_VERB),
+    )
+    assert(job != 0, "fetch")
+    complete(mut ed, job, git.GIT_OK, none())
+    let st3 = ed.git.tlog.last_status
+    complete(
+        mut ed,
+        st3,
+        git.GIT_OK,
+        z(
+            [
+                "# branch.oid 0123456789012345678901234567890123456789",
+                "# branch.head trunk",
+                "# branch.upstream origin/trunk",
+            ],
+        ),
+    )
+    let ig3 = ed.git.tlog.last_ignore
+    complete(mut ed, ig3, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+    let up3 = ed.git.tlog.last_upstream
+    complete(mut ed, up3, git.GIT_OK, b("{oid_b}\n"))
+    assert(ed.git.tlog.incoming_calls == first_incoming + 2, "a NET verb marks the set dirty")
+    let inc3 = ed.git.tlog.last_incoming
+    complete(mut ed, inc3, git.GIT_OK, incoming)
+}
+
+fn pad4(i: int) -> str {
+    if i < 10 then "000{i}" else if i < 100 then "00{i}" else if i < 1000 then "0{i}" else "{i}"
+}
+
+// `:1810-1866`.
+fn gitcache_large_incoming_merge_is_sorted_and_deduplicated() {
+    let tmp = tmp_dir("large")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    var status = z(
+        [
+            "# branch.oid 0123456789012345678901234567890123456789",
+            "# branch.head trunk",
+            "# branch.upstream origin/trunk",
+        ],
+    )
+    var i = 0
+    while i < 1000 {
+        for x in "? file{pad4(i)}".bytes() {
+            (mut status).push(x)
+        }
+        (mut status).push(0 as byte)
+        i += 1
+    }
+    var incoming = List[byte]()
+    i = 1499
+    while i >= 500 {
+        for x in "file{pad4(i)}".bytes() {
+            (mut incoming).push(x)
+        }
+        (mut incoming).push(0 as byte)
+        i -= 1
+    }
+    edit.git_test_now_set(mut ed, 1500)
+    assert(edit.git_refresh(mut ed, false), "refresh")
+    let st = ed.git.tlog.last_status
+    complete(mut ed, st, git.GIT_OK, status)
+    let ig = ed.git.tlog.last_ignore
+    complete(mut ed, ig, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+    let up = ed.git.tlog.last_upstream
+    complete(mut ed, up, git.GIT_OK, b("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"))
+    let inc = ed.git.tlog.last_incoming
+    complete(mut ed, inc, git.GIT_OK, incoming)
+    let s = edit.git_snapshot(mut ed)
+    assert(ed.git.snap[s].entries.len == 1500, "1500 entries")
+    assert(entry_path(ed, 0) == "file0000", "first")
+    assert(entry_path(ed, 1499) == "file1499", "last")
+    i = 1
+    while i < 1500 {
+        assert(entry_path(ed, i - 1) < entry_path(ed, i), "sorted at {i}")
+        i += 1
+    }
+    i = 500
+    while i < 1500 {
+        assert(ed.git.snap[s].entries[i].incoming, "incoming {i}")
+        i += 1
+    }
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `gitcache_begin_detect` (`:1868-1876`).
+fn begin_detect() -> edit.Ed {
+    var ed = ed_hooked()
+    assert(edit.git_refresh(mut ed, false), "refresh")
+    let v = ed.git.tlog.next_id
+    complete(mut ed, v, git.GIT_OK, b("git version 2.40.1\n"))
+    ed
+}
+
+// `:1878-1902`.
+fn gitcache_nested_workspace_status_is_scoped_and_expanded() {
+    var ed = ed_hooked()
+    ed.ws_dir = "/tmp/repo/work space"
+    assert(edit.git_refresh(mut ed, false), "refresh")
+    let v = ed.git.tlog.next_id
+    complete(mut ed, v, git.GIT_OK, b("git version 2.40.1\n"))
+    let d = ed.git.tlog.next_id
+    complete(mut ed, d, git.GIT_OK, b("/tmp/repo/.git\ntrue\nfalse\n/tmp/repo\n"))
+    assert(ed.git.tlog.status_calls == 1, "status")
+    assert(has(ed.git.tlog.argv, "--untracked-files=all"), "all")
+    assert(!has(ed.git.tlog.argv, "--untracked-files=normal"), "not normal")
+    let n = ed.git.tlog.argv.len
+    assert(
+        n >= 2 && ed.git.tlog.argv[n - 2] == "--" && ed.git.tlog.argv[n - 1] == ".",
+        "scoped to .",
+    )
+}
+
+// `:1904-1981`.
+fn gitcache_bare_exit_codes_and_negative_detection_cache() {
+    let bare = b("/tmp/bare.git\nfalse\ntrue\n")
+    var ed = begin_detect()
+    let id = ed.git.tlog.next_id
+    assert(edit.git_complete_exit(mut ed, id, git.GIT_FAILED, 128, bare, none()), "bare 128")
+    assert(edit.git_detect_state(ed) == edit.GIT_ASYNC_READY, "ready")
+    assert(edit.git_detect(mut ed) == git.GIT_BARE, "bare")
+
+    var e2 = begin_detect()
+    let id2 = e2.git.tlog.next_id
+    var calls = e2.git.tlog.calls
+    assert(edit.git_complete_exit(mut e2, id2, git.GIT_FAILED, 129, bare, none()), "129")
+    assert(e2.git.tlog.calls == calls + 1, "retried without --path-format")
+    let rid = e2.git.tlog.next_id
+    assert(edit.git_complete_exit(mut e2, rid, git.GIT_FAILED, 1, bare, none()), "retry fails")
+    calls = e2.git.tlog.calls
+    var i = 0
+    while i < 1000 {
+        let _ = edit.git_snapshot(mut e2)
+        i += 1
+    }
+    assert(e2.git.tlog.calls == calls, "the negative answer is cached")
+    e2.ws_dir = "/tmp/yew-other-root"
+    let _ = edit.git_snapshot(mut e2)
+    assert(e2.git.tlog.calls == calls + 1, "a new root re-detects")
+    let nid = e2.git.tlog.next_id
+    assert(edit.git_complete_exit(mut e2, nid, git.GIT_FAILED, 2, bare, none()), "fails")
+    calls = e2.git.tlog.calls
+    assert(edit.git_refresh(mut e2, true), "forced")
+    assert(e2.git.tlog.calls == calls + 1, "a force retries")
+    let fid = e2.git.tlog.next_id
+    complete(mut e2, fid, git.GIT_OK, b("/tmp/.git\ntrue\nfalse\n/tmp/yew-other-root\n"))
+    assert(edit.git_detect_state(e2) == edit.GIT_ASYNC_READY, "ready")
+
+    var e3 = begin_detect()
+    let id3 = e3.git.tlog.next_id
+    calls = e3.git.tlog.calls
+    assert(edit.git_complete_exit(mut e3, id3, git.GIT_FAILED, 2, bare, none()), "exit 2")
+    assert(e3.git.tlog.calls == calls, "no retry")
+    assert(edit.git_detect_state(e3) == edit.GIT_ASYNC_FAILED, "failed")
+
+    var e4 = begin_detect()
+    let id4 = e4.git.tlog.next_id
+    e4.git.tlog.fail_next = true
+    assert(edit.git_complete_exit(mut e4, id4, git.GIT_FAILED, 129, bare, none()), "129")
+    assert(edit.git_detect_state(e4) == edit.GIT_ASYNC_FAILED, "a failed retry spawn fails")
+    calls = e4.git.tlog.calls
+    i = 0
+    while i < 1000 {
+        let _ = edit.git_snapshot(mut e4)
+        i += 1
+    }
+    assert(e4.git.tlog.calls == calls, "cached")
+}
+
+// `:1983-2001`.
+fn gitcache_detect_completion_rechecks_captured_context() {
+    var ed = begin_detect()
+    let old_id = ed.git.tlog.next_id
+    let calls = ed.git.tlog.calls
+    ed.ws_dir = "/tmp/new-root"
+    complete(mut ed, old_id, git.GIT_OK, b("/tmp/.git\ntrue\nfalse\n/tmp\n"))
+    assert(ed.git.tlog.calls == calls + 1, "the stale answer re-detects")
+    assert(edit.git_detect_state(ed) == edit.GIT_ASYNC_PENDING, "pending")
+}
+
+// `:2003-2042`.
+fn gitcache_blob_validation_and_owned_binary_result() {
+    let oid40 = "0123456789abcdef0123456789abcdef01234567"
+    let oid64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    var ed = ed_hooked()
+    let (bad, why) = edit.git_blob(mut ed, "abc")
+    assert(bad == 0 && why.contains("invalid"), "short")
+    let (bad2, _) = edit.git_blob(mut ed, "0123456789abcdef0123456789abcdef0123456g")
+    assert(bad2 == 0, "not hex")
+    let (job, _) = edit.git_blob(mut ed, oid40)
+    assert(job != 0, "40")
+    assert(ed.git.tlog.argv[6] == "--no-optional-locks", "read lock option")
+    assert(
+        ed.git.tlog.argv[7] == "cat-file" &&
+            ed.git.tlog.argv[8] == "blob" &&
+            ed.git.tlog.argv[9] == oid40,
+        "argv",
+    )
+    var bytes = List[byte]()
+    for x in [97, 0, 98, 255] {
+        (mut bytes).push(x as byte)
+    }
+    var errb = List[byte]()
+    for x in [101, 0, 114] {
+        (mut errb).push(x as byte)
+    }
+    assert(edit.git_test_complete(mut ed, job, git.GIT_OK, bytes, errb), "complete")
+    assert(ed.git.result.verb == "blob" && ed.git.result.job_id == job, "result")
+    assert(git.git_bytes_cmp(ed.git.result.out, bytes) == 0, "binary out")
+    assert(git.git_bytes_cmp(ed.git.result.err, errb) == 0, "binary err")
+    let (j64, _) = edit.git_blob(mut ed, oid64)
+    assert(j64 != 0, "64")
+}
+
+// `:2044-2121`.
+fn gitcache_runtime_taxonomy_is_behaviorally_reachable() {
+    for t in [
+        "fatal: could not read Username for 'https://host'",
+        "remote: Authentication failed",
+        "fatal: terminal prompts disabled",
+        "git@host: Permission denied (publickey)",
+    ] {
+        assert(edit.git_auth_state(b(t)) == git.GIT_AUTH, "auth: {t}")
+    }
+    assert(edit.git_auth_state(b("fatal: network is down")) == git.GIT_FAILED, "not auth")
+
+    var ed = ed_hooked()
+    assert(edit.git_refresh(mut ed, false), "refresh")
+    let v = ed.git.tlog.next_id
+    complete(mut ed, v, git.GIT_NO_GIT, none())
+    assert(ed.git.result.state == git.GIT_NO_GIT, "no git")
+
+    var e2 = ed_hooked()
+    assert(edit.git_refresh(mut e2, false), "refresh")
+    let v2 = e2.git.tlog.next_id
+    complete(mut e2, v2, git.GIT_OK, b("git version 2.19.9\n"))
+    assert(e2.git.result.state == git.GIT_NO_GIT, "too old")
+
+    var e3 = ed_hooked()
+    for st in [git.GIT_AUTH, git.GIT_TIMEOUT, git.GIT_FAILED] {
+        let (job, _) = edit.git_spawn(
+            mut e3,
+            edit.git_verb(e3, "status"),
+            argv(["status"]),
+            edit.git_req(edit.GREQ_VERB),
+        )
+        assert(job != 0, "spawn")
+        complete(mut e3, job, st, none())
+        assert(e3.git.result.state == st, "state {st}")
+    }
+
+    let tmp = tmp_dir("parse-state")
+    var e4 = ed_hooked()
+    ready(mut e4, tmp, 1000)
+    edit.git_test_now_set(mut e4, 1500)
+    assert(edit.git_refresh(mut e4, false), "refresh")
+    let st4 = e4.git.tlog.last_status
+    complete(mut e4, st4, git.GIT_OK, z(["1 truncated"]))
+    assert(e4.git.result.state == git.GIT_PARSE, "parse")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:2123-2142`: a teardown with a job in flight wipes its stdin.
+fn gitcache_teardown_detaches_inflight_stdin() {
+    var ed = edit.ed_new()
+    var req = edit.git_req(edit.GREQ_VERB)
+    req.stdin = b("sensitive bytes\n")
+    let (id, why) = edit.git_spawn(
+        mut ed,
+        edit.git_verb(ed, "init"),
+        argv(["hash-object", "--stdin"]),
+        req,
+    )
+    assert(id != 0, "spawn: {why}")
+    edit.git_state_free(mut ed)
+    let at = edit.job_find(ed, id)
+    assert(at < 0 || ed.jobs.v[at].in_bytes.len == 0, "stdin detached")
+    assert(ed.git.inflight == 0, "no slot held")
+    edit.jobs_free(mut ed)
+}
+
+// `:533-551`.
+fn gitcache_cached_accessor_and_job_ownership_are_side_effect_free() {
+    var ed = ed_hooked()
+    assert(!edit.git_snapshot_cached(ed), "nothing published")
+    assert(ed.git.tlog.calls == 0, "no spawn")
+    let _ = edit.git_snapshot(mut ed)
+    assert(ed.git.tlog.calls == 1, "the version probe")
+    assert(edit.git_job_owned(ed, ed.git.tlog.next_id), "owned")
+    assert(!edit.git_job_owned(ed, ed.git.tlog.next_id + 1), "not owned")
+    assert(!edit.git_snapshot_cached(ed), "still nothing")
+    assert(ed.git.tlog.calls == 1, "no second spawn")
+}
+
+// `:553-601`.
+fn gitcache_rebase_progress_and_conflict_count_publish() {
+    let tmp = tmp_dir("rebase")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    fs.create_dir_all("{tmp}/rebase-merge") else |_| { assert(false, "mkdir") }
+    write("{tmp}/rebase-merge", "msgnum", "3\n")
+    write("{tmp}/rebase-merge", "end", "7\n")
+    edit.git_test_now_set(mut ed, 1500)
+    assert(edit.git_refresh(mut ed, false), "refresh")
+    let st = ed.git.tlog.last_status
+    complete(
+        mut ed,
+        st,
+        git.GIT_OK,
+        cat(
+            [
+                "# branch.oid 0123456789012345678901234567890123456789\x00",
+                "# branch.head trunk\x00",
+                "u UU N... 100644 100644 100644 100644 ",
+                "0123456789012345678901234567890123456789 ",
+                "1123456789012345678901234567890123456789 ",
+                "2123456789012345678901234567890123456789 conflict.c\x00",
+            ],
+        ),
+    )
+    let ig = ed.git.tlog.last_ignore
+    complete(mut ed, ig, git.GIT_OK, none())
+    complete_default_comment(mut ed)
+    assert(edit.git_snapshot_cached(ed), "published")
+    let s = live(ed)
+    assert(ed.git.snap[s].state == git.GIT_MID_REBASE, "rebase")
+    assert(ed.git.snap[s].conflicted, "conflicted")
+    assert(ed.git.snap[s].conflict_count == 1, "one conflict")
+    assert(ed.git.snap[s].rebase_step == 3 && ed.git.snap[s].rebase_total == 7, "3/7")
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+// `:636-674`.
+fn gitcache_callback_input_copies_and_owns_stdin() {
+    var ed = edit.ed_new()
+    let input = b("owned copy\n")
+    let (id, why) = edit.git_spawn_callback_input(
+        mut ed,
+        edit.git_verb(ed, "version"),
+        argv(["stripspace"]),
+        input,
+        edit.GIT_OWNER_TEST,
+        "t",
+    )
+    assert(id != 0, "spawn: {why}")
+    assert(edit.git_job_owned(ed, id), "owned")
+    assert(edit.job_running_count(ed) == 0, "an internal job")
+    wait_capture(mut ed, false)
+    assert(ed.git.tcap.completed, "completed")
+    assert(ed.git.tcap.destroyed, "destroyed")
+    assert(git.git_bytes_cmp(ed.git.tcap.out, b("owned copy\n")) == 0, "its own stdin")
+    assert(edit.job_find(ed, id) < 0, "released")
+    edit.jobs_free(mut ed)
+}
+
+// `:676-726`.
+fn gitcache_callback_input_allows_mutate_rejects_network() {
+    let tmp = tmp_dir("callback-mutate")
+    var ed = ed_hooked()
+    ready(mut ed, tmp, 1000)
+    edit.git_test_spawn_set(mut ed, false)
+    let input = b("mutation input\n")
+    let (id, why) = edit.git_spawn_callback_input(
+        mut ed,
+        edit.git_verb(ed, "apply"),
+        argv(["apply", "--check", "-"]),
+        input,
+        edit.GIT_OWNER_TEST,
+        "t",
+    )
+    assert(id != 0, "spawn: {why}")
+    wait_capture(mut ed, false)
+    assert(ed.git.tcap.completed && ed.git.tcap.destroyed, "a mutation completes")
+    ed.git.tcap.completed = false
+    ed.git.tcap.destroyed = false
+    let (nid, nwhy) = edit.git_spawn_callback_input(
+        mut ed,
+        edit.git_verb(ed, "remote-check"),
+        argv(["--version"]),
+        input,
+        edit.GIT_OWNER_TEST,
+        "t",
+    )
+    assert(nid == 0 && nwhy == "invalid Git callback job", "network refused")
+    assert(!ed.git.tcap.completed && !ed.git.tcap.destroyed, "nothing ran")
+    edit.jobs_free(mut ed)
+    fs.remove_dir_all(tmp) else |_| {}
+}
+
+fn main() {
+    let chosen = (env_get("YEW_PICK_CASE") else "-1").to_int() else -1
+    var n = 0
+    let names = [
+        "gitcache_ttl_uses_monotonic_wall_milliseconds",
+        "gitcache_backwards_wall_clock_forces_refresh",
+        "gitcache_focus_gain_invalidates_before_ttl",
+        "gitcache_arbitrary_job_completion_invalidates_before_ttl",
+        "gitcache_buffer_save_invalidates_before_ttl",
+        "gitcache_internal_read_job_completion_does_not_self_invalidate",
+        "gitcache_state_strings_cover_taxonomy",
+        "gitcache_filesystem_taxonomy_is_message_free",
+        "gitcache_verb_table_and_argv_are_structural",
+        "gitcache_terminal_rebase_inherits_canonical_boundary",
+        "gitcache_coalesces_and_caps_inflight",
+        "gitcache_environment_fingerprint_tracks_passthrough",
+        "gitcache_refresh_ttl_coalesces_and_pingpong_survives_failure",
+        "gitcache_killed_refresh_200_instants_preserves_snapshot",
+        "gitcache_comment_char_is_cached_before_snapshot_publish",
+        "gitcache_every_mutation_schedules_structural_refresh",
+        "gitcache_index_lock_skips_expired_refresh",
+        "gitcache_log_completion_publishes_owned_records",
+        "gitcache_initial_upstream_refresh_and_oid_gating",
+        "gitcache_nested_workspace_status_is_scoped_and_expanded",
+        "gitcache_bare_exit_codes_and_negative_detection_cache",
+        "gitcache_detect_completion_rechecks_captured_context",
+        "gitcache_blob_validation_and_owned_binary_result",
+        "gitcache_large_incoming_merge_is_sorted_and_deduplicated",
+        "gitcache_runtime_taxonomy_is_behaviorally_reachable",
+        "gitcache_teardown_detaches_inflight_stdin",
+        "gitcache_cached_accessor_and_job_ownership_are_side_effect_free",
+        "gitcache_rebase_progress_and_conflict_count_publish",
+        "gitcache_callback_input_copies_and_owns_stdin",
+        "gitcache_callback_input_allows_mutate_rejects_network",
+    ]
+    var i = 0
+    while i < names.len {
+        if chosen < 0 || chosen == i {
+            match i {
+                0 => gitcache_ttl_uses_monotonic_wall_milliseconds(),
+                1 => gitcache_backwards_wall_clock_forces_refresh(),
+                2 => gitcache_focus_gain_invalidates_before_ttl(),
+                3 => gitcache_arbitrary_job_completion_invalidates_before_ttl(),
+                4 => gitcache_buffer_save_invalidates_before_ttl(),
+                5 => gitcache_internal_read_job_completion_does_not_self_invalidate(),
+                6 => gitcache_state_strings_cover_taxonomy(),
+                7 => gitcache_filesystem_taxonomy_is_message_free(),
+                8 => gitcache_verb_table_and_argv_are_structural(),
+                9 => gitcache_terminal_rebase_inherits_canonical_boundary(),
+                10 => gitcache_coalesces_and_caps_inflight(),
+                11 => gitcache_environment_fingerprint_tracks_passthrough(),
+                12 => gitcache_refresh_ttl_coalesces_and_pingpong_survives_failure(),
+                13 => gitcache_killed_refresh_200_instants_preserves_snapshot(),
+                14 => gitcache_comment_char_is_cached_before_snapshot_publish(),
+                15 => gitcache_every_mutation_schedules_structural_refresh(),
+                16 => gitcache_index_lock_skips_expired_refresh(),
+                17 => gitcache_log_completion_publishes_owned_records(),
+                18 => gitcache_initial_upstream_refresh_and_oid_gating(),
+                19 => gitcache_nested_workspace_status_is_scoped_and_expanded(),
+                20 => gitcache_bare_exit_codes_and_negative_detection_cache(),
+                21 => gitcache_detect_completion_rechecks_captured_context(),
+                22 => gitcache_blob_validation_and_owned_binary_result(),
+                23 => gitcache_large_incoming_merge_is_sorted_and_deduplicated(),
+                24 => gitcache_runtime_taxonomy_is_behaviorally_reachable(),
+                25 => gitcache_teardown_detaches_inflight_stdin(),
+                26 => gitcache_cached_accessor_and_job_ownership_are_side_effect_free(),
+                27 => gitcache_rebase_progress_and_conflict_count_publish(),
+                28 => gitcache_callback_input_copies_and_owns_stdin(),
+                _ => gitcache_callback_input_allows_mutate_rejects_network(),
+            }
+            print("{names[i]}: PASS")
+            n += 1
+        }
+        i += 1
+    }
+    print("edit_gitcache_test: {n} cases run")
+}
