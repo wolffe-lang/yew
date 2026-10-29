@@ -1,0 +1,2519 @@
+//! edit.fusscmds — F mode's verbs: the `ed.git.*` commands, the typed
+//! confirmations, the pickers, the commit flow and the rebase handover.
+//!
+//! Ports `fussmode.c:2094-5082` at 9ace98c2 under `s52-fuss-mode.md`.
+//! Every git invocation goes through `git_spawn` with an argv list
+//! (s51 §2's law): a path is ONE element after `--`, a message travels on
+//! stdin. The port's one gap: an argv element is a `str`, so a path that
+//! is not UTF-8 cannot reach git from F mode (G59; the parsers keep such
+//! paths as bytes): the verb refuses with C's "select a valid workspace
+//! path".
+
+use fl
+use git
+use std.fs
+use term
+use text
+use unicode
+use util
+use ws
+
+/// `FussTargetGuard` (`fussmode.c:2156-2171`).
+const FUSS_TARGET_ANY: int = 0
+
+const FUSS_TARGET_FILE: int = 1
+
+// Staged, FILE OR DIRECTORY (`git restore --staged -- dir` is the
+// directory menu's `Unstage All Below`).
+const FUSS_TARGET_STAGED: int = 2
+
+const FUSS_TARGET_DIRTY_FILE: int = 3
+
+fn fc_bytes(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn fc_argv(words: List[str]) -> List[str] {
+    var v = List[str]()
+    for w in words {
+        (mut v).push(w)
+    }
+    v
+}
+
+// `fuss_safe_path` (`fussmode.c:2103-2122`): relative, no NUL, no `..`
+// component.
+fn fuss_safe_path(p: List[byte]) -> bool {
+    if p.len == 0 || p[0] as int == 47 {
+        return false
+    }
+    var i = 0
+    while i < p.len {
+        if p[i] as int == 0 {
+            return false
+        }
+        i += 1
+    }
+    i = 0
+    while i < p.len {
+        let start = i
+        while i < p.len && p[i] as int != 47 {
+            i += 1
+        }
+        if i - start == 2 && p[start] as int == 46 && p[start + 1] as int == 46 {
+            return false
+        }
+        if i < p.len {
+            i += 1
+        }
+    }
+    true
+}
+
+// `fuss_selected_path` (`fussmode.c:2136-2154`): the command's `sarg`
+// (the menu's captured path) or the selected row's path; (false, …) for
+// an unsafe one, or one that is not UTF-8 (G59).
+fn fuss_selected_path(ed: Ed, cx: CmdCtx) -> (bool, str) {
+    var p = List[byte]()
+    if cx.has_sarg && cx.sarg.len != 0 {
+        p = fc_bytes(cx.sarg)
+    } else {
+        let row = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+        if row < 0 || row >= ed.fuss.tree.items.len {
+            return (false, "")
+        }
+        p = git.fuss_item_path(ed.fuss.tree, row)
+    }
+    if !fuss_safe_path(p) {
+        return (false, "")
+    }
+    let s = util.buf_to_str(p) else { return (false, "") }
+    (true, s)
+}
+
+// `fuss_join_root` (`fussmode.c:2252-2271`).
+fn fuss_join_root(ed: Ed, path: str) -> (bool, str) {
+    if !fuss_safe_path(fc_bytes(path)) {
+        return (false, "")
+    }
+    let root = shell_ws_root(ed)
+    if root.len != 0 && !root.ends_with("/") {
+        return (true, "{root}/{path}")
+    }
+    (true, "{root}{path}")
+}
+
+// `fuss_target_lookup` (`fussmode.c:2173-2214`): the tree's answer, else
+// an lstat of the workspace path.
+fn fuss_target_lookup(ed: Ed, path: str) -> (bool, FussTarget) {
+    var t = fuss_target_none()
+    let pb = fc_bytes(path)
+    var i = 0
+    while i < ed.fuss.tree.items.len {
+        if git.fuss_item_path_eq(ed.fuss.tree, i, pb, 0, pb.len) {
+            if ed.fuss.tree.items[i].node >= ed.fuss.tree.nodes.len {
+                break
+            }
+            let n = copy ed.fuss.tree.nodes[ed.fuss.tree.items[i].node]
+            t.known = true
+            t.status_known = true
+            t.is_file = n.is_file
+            t.staged = n.staged
+            t.unstaged = n.unstaged
+            t.untracked = n.untracked
+            t.incoming = n.incoming
+            t.conflicted = n.conflicted
+            return (true, t)
+        }
+        i += 1
+    }
+    let (ok, absolute) = fuss_join_root(ed, path)
+    if ok {
+        var dir = false
+        var found = true
+        let st = fs_lstat(absolute) else |_| {
+            found = false
+            List[int]()
+        }
+        if found && st.len > 2 {
+            // `S_ISDIR(st.st_mode)`: the stat's mode word.
+            dir = st[2] & 61440 == 16384
+        }
+        if found {
+            t.known = true
+            t.is_file = !dir
+        }
+    }
+    (t.known, t)
+}
+
+// `fuss_target_guard` (`fussmode.c:2216-2250`).
+fn fuss_target_guard(mut ed: Ed, path: str, guard: int, action: str) -> (bool, FussTarget) {
+    if guard == FUSS_TARGET_ANY {
+        return (true, fuss_target_none())
+    }
+    let (known, found) = fuss_target_lookup(ed, path)
+    if !known {
+        ed_msg(mut ed, MSG_ERROR, "select a valid workspace path")
+        return (false, found)
+    }
+    if guard != FUSS_TARGET_STAGED && !found.is_file {
+        ed_msg(mut ed, MSG_ERROR, "select a file to {action}")
+        return (false, found)
+    }
+    if guard == FUSS_TARGET_STAGED && found.status_known && !found.staged {
+        ed_msg(mut ed, MSG_ERROR, "nothing staged to unstage")
+        return (false, found)
+    }
+    if guard == FUSS_TARGET_DIRTY_FILE &&
+        (!found.staged && !found.unstaged || found.untracked || found.conflicted) {
+        ed_msg(mut ed, MSG_ERROR, "nothing dirty to discard")
+        return (false, found)
+    }
+    (true, found)
+}
+
+/// `yew_fuss_selected_directory` (`fussmode.c:2273-2289`): the selected
+/// row's absolute path when it is a directory (`ed.group.from_dir`'s
+/// F-mode default).
+pub fn fuss_selected_directory(ed: Ed) -> (bool, str) {
+    if !ed.fuss.active {
+        return (false, "")
+    }
+    let row = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+    if row < 0 ||
+        row >= ed.fuss.tree.items.len ||
+        ed.fuss.tree.items[row].node >= ed.fuss.tree.nodes.len {
+        return (false, "")
+    }
+    if ed.fuss.tree.nodes[ed.fuss.tree.items[row].node].is_file {
+        return (false, "")
+    }
+    let p = git.fuss_item_path(ed.fuss.tree, row)
+    if !fuss_safe_path(p) {
+        return (false, "")
+    }
+    let s = util.buf_to_str(p) else { return (false, "") }
+    fuss_join_root(ed, s)
+}
+
+// `fuss_spawn` (`fussmode.c:2291-2327`): one F-mode verb at a time; its
+// result arrives through `fuss_result_tick`.
+fn fuss_spawn(
+    mut ed: Ed,
+    verb_name: str,
+    argv: List[str],
+    literal_paths: bool,
+    stdin: List[byte],
+    view: bool,
+) -> int {
+    if ed.fuss.pending_job != 0 {
+        ed_msg(mut ed, MSG_WARN, "a FUSS git command is still running")
+        return CMD_ERR_STATE
+    }
+    let verb = git_verb(ed, verb_name)
+    if verb < 0 {
+        return CMD_ERR_STATE
+    }
+    var req = git_req(GREQ_VERB)
+    req.literal_paths = literal_paths
+    req.stdin = copy stdin
+    let (job, why) = git_spawn(mut ed, verb, argv, req)
+    if job == 0 {
+        ed_msg(mut ed, MSG_ERROR, if why.len == 0 then "cannot start git command" else why)
+        return CMD_ERR_IO
+    }
+    ed.fuss.pending_job = job
+    ed.fuss.pending_view = view
+    ed.fuss.seen_result_job = 0
+    ed_msg(mut ed, MSG_INFO, "{verb_name} running")
+    CMD_OK
+}
+
+fn fuss_spawn0(mut ed: Ed, verb_name: str, argv: List[str]) -> int {
+    fuss_spawn(mut ed, verb_name, argv, false, List[byte](), false)
+}
+
+// ------------------------------------------------------------------
+// The pickers (`fussmode.c:2329-2550`, `:3508-3860`, `:3953-4178`)
+// ------------------------------------------------------------------
+
+// `fuss_picker_clear` (`fussmode.c:2329-2357`).
+fn fuss_picker_clear(mut ed: Ed) {
+    (mut ed.fuss.picker_items).reset()
+    (mut ed.fuss.picker_values).reset()
+    ed.fuss.picker_aux = ""
+    ed.fuss.has_picker_aux = false
+    ed.fuss.picker_aux2 = ""
+    ed.fuss.has_picker_aux2 = false
+    ed.fuss.preview_value = ""
+    ed.fuss.has_preview_value = false
+    (mut ed.fuss.preview_bytes).reset()
+    ed.fuss.picker_action = FUSS_PICK_NONE
+    ed.fuss.picker_alt = false
+    ed.fuss.preview_job = 0
+    ed.fuss.preview_ready = false
+}
+
+// `fuss_picker_add` (`fussmode.c:2359-2397`): a row (label, optional
+// detail) whose accept yields `value`; refused for an empty label or
+// value, or one holding a NUL.
+fn fuss_picker_add(mut ed: Ed, label: List[byte], detail: List[byte], value: List[byte]) -> bool {
+    if label.len == 0 || value.len == 0 {
+        return false
+    }
+    for b in label {
+        if b as int == 0 {
+            return false
+        }
+    }
+    for b in value {
+        if b as int == 0 {
+            return false
+        }
+    }
+    let l = util.buf_to_str(label) else { return false }
+    let v = util.buf_to_str(value) else { return false }
+    var item = pick_item(l, ed.fuss.picker_items.len, 0)
+    if detail.len != 0 {
+        let d = util.buf_to_str(detail) else ""
+        if d.len != 0 {
+            item.detail = d
+            item.has_detail = true
+        }
+    }
+    (mut ed.fuss.picker_items).push(item)
+    (mut ed.fuss.picker_values).push(v)
+    true
+}
+
+fn fuss_picker_add_str(mut ed: Ed, label: str, detail: str, value: str) -> bool {
+    fuss_picker_add(mut ed, fc_bytes(label), fc_bytes(detail), fc_bytes(value))
+}
+
+// `fuss_action_reachable` (`fussmode.c:2399-2414`): rows the jump would
+// consume before dispatch are not listed; Space stays reachable.
+fn fuss_action_reachable(seq: List[int]) -> bool {
+    if seq.len == 0 {
+        return false
+    }
+    let command_mods = term.MOD_CTRL |
+        term.MOD_ALT |
+        term.MOD_SUPER |
+        term.MOD_HYPER |
+        term.MOD_META
+    let code = keyid_code(seq[0])
+    let mods = keyid_mods(seq[0])
+    code >= term.KEY_BASE || mods & command_mods != 0 || code <= 32 || code == 127
+}
+
+// `fuss_actions_sort` (`fussmode.c:2450-2470`): an insertion sort by
+// label bytes, the payloads renumbered.
+fn fuss_actions_sort(mut ed: Ed) {
+    var i = 1
+    let n = ed.fuss.picker_items.len
+    while i < n {
+        let item = copy ed.fuss.picker_items[i]
+        let value = ed.fuss.picker_values[i]
+        var at = i
+        while at != 0 && fc_str_cmp(ed.fuss.picker_items[at - 1].label, item.label) > 0 {
+            ed.fuss.picker_items[at] = copy ed.fuss.picker_items[at - 1]
+            ed.fuss.picker_values[at] = ed.fuss.picker_values[at - 1]
+            at -= 1
+        }
+        ed.fuss.picker_items[at] = item
+        ed.fuss.picker_values[at] = value
+        i += 1
+    }
+    i = 0
+    while i < n {
+        ed.fuss.picker_items[i].payload = i
+        i += 1
+    }
+}
+
+fn fc_str_cmp(a: str, b: str) -> int {
+    git.git_bytes_cmp(fc_bytes(a), fc_bytes(b))
+}
+
+// `fuss_actions_open` (`fussmode.c:3828-3858`): every binding in the
+// live stack that is EFFECTIVE (the stack's own answer for its
+// sequence), reachable past the jump, and an `ed.git.*` command (not the
+// palette itself) or `ed.group.from_dir`, labelled by its key.
+fn fuss_actions_open(mut ed: Ed) {
+    fuss_picker_clear(mut ed)
+    var ok = true
+    var layer = 0
+    while layer < ed.keys.len && ok {
+        let km = copy ed.keymaps[ed.keys[layer]]
+        if keymap_binding_count(km) != 0 {
+            let (listed, rows) = keymap_list(km)
+            if !listed {
+                ok = false
+            }
+            for row in rows {
+                let (m, _, b) = keymap_lookup(km, row.seq, row.seq.len)
+                let (sm, sl, _, sb) = keystack_lookup(ed.keymaps, ed.keys, row.seq, row.seq.len)
+                if sm != MATCH_FULL && sm != MATCH_FULL_PREFIX ||
+                    sl != layer ||
+                    sb != b ||
+                    m == MATCH_NONE {
+                    continue
+                }
+                if !fuss_action_reachable(row.seq) {
+                    continue
+                }
+                let id = row.bind.cmd
+                if id <= 0 || id > ed.reg.entries.len {
+                    continue
+                }
+                let e = copy ed.reg.entries[id - 1]
+                if e.flags & CMD_INTERNAL != 0 ||
+                    e.name == "ed.git.actions" ||
+                    !e.name.starts_with("ed.git.") && e.name != "ed.group.from_dir" {
+                    continue
+                }
+                var label = List[byte]()
+                key_format_seq(row.seq, row.seq.len, mut label)
+                if !fuss_picker_add(mut ed, label, fc_bytes(e.help), fc_bytes(e.name)) {
+                    ok = false
+                    break
+                }
+            }
+        }
+        layer += 1
+    }
+    if !ok || ed.fuss.picker_items.len == 0 {
+        ed_msg(
+            mut ed,
+            MSG_WARN,
+            if ok then "no FUSS actions are bound" else "cannot build FUSS action list",
+        )
+        fuss_picker_clear(mut ed)
+        return
+    }
+    fuss_actions_sort(mut ed)
+    ed.fuss.picker_action = FUSS_PICK_ACTIONS
+    var rows = copy ed.fuss.picker_items
+    var spec = picker_spec(PICK_HOST_FUSS, "FUSS actions", take rows)
+    spec.footer = "Enter run \u{b7} / filter \u{b7} Esc close"
+    spec.has_footer = true
+    spec.filter_requires_slash = true
+    picker_open(mut ed, spec)
+}
+
+/// `fuss_picker_open` (`fussmode.c:3803-3826`).
+pub fn fuss_picker_open(mut ed: Ed, action: int, title: str) {
+    if ed.fuss.picker_items.len == 0 {
+        ed_msg(mut ed, MSG_WARN, "no {title} available")
+        fuss_picker_clear(mut ed)
+        return
+    }
+    ed.fuss.picker_action = action
+    var rows = copy ed.fuss.picker_items
+    var spec = picker_spec(PICK_HOST_FUSS, title, take rows)
+    spec.has_preview = action != FUSS_PICK_REMOTE && action != FUSS_PICK_RESET_MODE
+    spec.has_action = action == FUSS_PICK_STASH
+    if action == FUSS_PICK_STASH {
+        spec.footer = "Enter pop \u{b7} C-v apply \u{b7} Esc cancel"
+        spec.has_footer = true
+    }
+    spec.path_mode = false
+    picker_open(mut ed, spec)
+}
+
+// `fuss_pick_list` (`fussmode.c:2481-2493`).
+fn fuss_pick_list(mut ed: Ed, action: int, verb_name: str, argv: List[str]) -> int {
+    fuss_picker_clear(mut ed)
+    let status = fuss_spawn0(mut ed, verb_name, argv)
+    if status == CMD_OK {
+        ed.fuss.pending_pick = action
+    }
+    status
+}
+
+// `fuss_pick_branches` (`fussmode.c:2495-2511`).
+fn fuss_pick_branches(mut ed: Ed, action: int) -> int {
+    var argv = fc_argv(
+        [
+            "for-each-ref",
+            "--format=%(refname:short)%1f%(upstream:short)%1f%(committerdate:unix)%00",
+            "refs/heads",
+        ],
+    )
+    if action != FUSS_PICK_BRANCH_DELETE {
+        (mut argv).push("refs/remotes")
+    }
+    fuss_pick_list(mut ed, action, "branch-list", argv)
+}
+
+// `fuss_pick_commits` (`fussmode.c:2513-2532`).
+fn fuss_pick_commits(mut ed: Ed, action: int, branch: str, has_branch: bool) -> int {
+    var argv = fc_argv(["log"])
+    if has_branch {
+        (mut argv).push(branch)
+        (mut argv).push("--not")
+        (mut argv).push("HEAD")
+    }
+    for a in ["-n", "200", "-z", "--date-order", "--pretty=format:%H%x1f%h%x1f%at%x1f%s"] {
+        (mut argv).push(a)
+    }
+    fuss_pick_list(mut ed, action, "log", argv)
+}
+
+// `fuss_pick_stashes` (`fussmode.c:2534-2542`).
+fn fuss_pick_stashes(mut ed: Ed) -> int {
+    fuss_pick_list(
+        mut ed,
+        FUSS_PICK_STASH,
+        "stash-pop",
+        fc_argv(["stash", "list", "-z", "--pretty=format:%gd%x1f%at%x1f%gs"]),
+    )
+}
+
+// `fuss_pick_remotes` (`fussmode.c:2544-2549`).
+fn fuss_pick_remotes(mut ed: Ed) -> int {
+    fuss_pick_list(mut ed, FUSS_PICK_REMOTE, "remote-list", fc_argv(["remote", "-v"]))
+}
+
+// `fuss_parse_epoch` (`fussmode.c:3860-3879`).
+fn fuss_parse_epoch(b: List[byte], at: int, len: int) -> (bool, int) {
+    if len == 0 {
+        return (false, 0)
+    }
+    var v = 0
+    var i = 0
+    while i < len {
+        let c = b[at + i] as int
+        if c < 48 || c > 57 {
+            return (false, 0)
+        }
+        let d = c - 48
+        if v > (9223372036854775807 - d) / 10 {
+            return (false, 0)
+        }
+        v = v * 10 + d
+        i += 1
+    }
+    (true, v)
+}
+
+// `fuss_detail_part` (`fussmode.c:3881-3888`).
+fn fuss_detail_part(mut detail: List[byte], b: List[byte], at: int, len: int) {
+    if len == 0 {
+        return
+    }
+    if detail.len != 0 {
+        for x in " \u{b7} ".bytes() {
+            (mut detail).push(x)
+        }
+    }
+    var i = 0
+    while i < len {
+        (mut detail).push(b[at + i])
+        i += 1
+    }
+}
+
+/// `yew_fuss_relative_time` (`fussmode.c:3890-3937`): picker age from the
+/// editor's startup wall anchor plus its monotonic clock (YEW-F-018: the
+/// render never consults the system clock); empty when unanchored.
+pub fn fuss_relative_time(ed: Ed, author_epoch: int) -> str {
+    let now = git_wall_now(ed)
+    if now <= 0 || author_epoch < 0 {
+        return ""
+    }
+    let age = if now > author_epoch then now - author_epoch else 0
+    if age < 60 {
+        return "now"
+    }
+    var count = 0
+    var unit = ""
+    if age < 60 * 60 {
+        count = age / 60
+        unit = "minute"
+    } else if age < 24 * 60 * 60 {
+        count = age / (60 * 60)
+        unit = "hour"
+    } else if age < 14 * 24 * 60 * 60 {
+        count = age / (24 * 60 * 60)
+        unit = "day"
+    } else if age < 90 * 24 * 60 * 60 {
+        count = age / (7 * 24 * 60 * 60)
+        unit = "week"
+    } else if age < 2 * 365 * 24 * 60 * 60 {
+        count = age / (30 * 24 * 60 * 60)
+        unit = "month"
+    } else {
+        count = age / (365 * 24 * 60 * 60)
+        unit = "year"
+    }
+    "{count} {unit}{if count == 1 then "" else "s"} ago"
+}
+
+fn fuss_detail_relative(ed: Ed, mut detail: List[byte], b: List[byte], at: int, len: int) {
+    let (ok, stamp) = fuss_parse_epoch(b, at, len)
+    if !ok {
+        return
+    }
+    let rel = fc_bytes(fuss_relative_time(ed, stamp))
+    fuss_detail_part(mut detail, rel, 0, rel.len)
+}
+
+// `fuss_parse_records` (`fussmode.c:3953-4044`): NUL-separated records of
+// 0x1f-separated fields into picker rows, per action.
+fn fuss_parse_records(mut ed: Ed, action: int, out: List[byte]) -> bool {
+    let len = out.len
+    let live = ed.git.live
+    let has_branch = ed.git.snap[live].has_branch && git_snapshot_cached(ed)
+    let branch = if has_branch then git.git_snap_branch(ed.git.snap[live]) else List[byte]()
+    var off = 0
+    while off < len {
+        while off < len && (out[off] as int == 10 || out[off] as int == 13) {
+            off += 1
+        }
+        if off == len {
+            break
+        }
+        var end = off
+        while end < len && out[end] as int != 0 {
+            end += 1
+        }
+        var fa = [0, 0, 0, 0]
+        var fl = [0, 0, 0, 0]
+        var nfield = 0
+        var at = 0
+        let span = end - off
+        while at < span && nfield < 4 {
+            let start = at
+            while at < span && out[off + at] as int != 31 {
+                at += 1
+            }
+            fa[nfield] = off + start
+            fl[nfield] = at - start
+            nfield += 1
+            if at < span {
+                at += 1
+            }
+        }
+        if (
+            action == FUSS_PICK_BRANCH_SWITCH ||
+                action == FUSS_PICK_BRANCH_DELETE ||
+                action == FUSS_PICK_MERGE ||
+                action == FUSS_PICK_CHERRY_BRANCH
+        ) &&
+            nfield >= 1 {
+            var include = true
+            if action == FUSS_PICK_BRANCH_DELETE &&
+                has_branch &&
+                git.git_span_cmp(out, fa[0], fl[0], branch, 0, branch.len) == 0 {
+                include = false
+            }
+            var detail = List[byte]()
+            if nfield > 1 {
+                fuss_detail_part(mut detail, out, fa[1], fl[1])
+            }
+            if nfield > 2 {
+                fuss_detail_relative(ed, mut detail, out, fa[2], fl[2])
+            }
+            if include {
+                let name = git.git_slice(out, fa[0], fa[0] + fl[0])
+                let _ = fuss_picker_add(mut ed, name, detail, name)
+            }
+        } else if (
+            action == FUSS_PICK_RESET_COMMIT ||
+                action == FUSS_PICK_REBASE ||
+                action == FUSS_PICK_CHERRY_COMMIT ||
+                action == FUSS_PICK_REVERT
+        ) &&
+            nfield >= 2 {
+            var detail = List[byte]()
+            if nfield > 2 {
+                fuss_detail_relative(ed, mut detail, out, fa[2], fl[2])
+            }
+            if nfield > 3 {
+                fuss_detail_part(mut detail, out, fa[3], fl[3])
+            }
+            let _ = fuss_picker_add(
+                mut ed,
+                git.git_slice(out, fa[1], fa[1] + fl[1]),
+                detail,
+                git.git_slice(out, fa[0], fa[0] + fl[0]),
+            )
+        } else if action == FUSS_PICK_STASH && nfield >= 1 {
+            var detail = List[byte]()
+            if nfield > 1 {
+                fuss_detail_relative(ed, mut detail, out, fa[1], fl[1])
+            }
+            if nfield > 2 {
+                fuss_detail_part(mut detail, out, fa[2], fl[2])
+            }
+            let name = git.git_slice(out, fa[0], fa[0] + fl[0])
+            let _ = fuss_picker_add(mut ed, name, detail, name)
+        }
+        off = if end < len then end + 1 else end
+    }
+    ed.fuss.picker_items.len != 0
+}
+
+// `fuss_parse_remotes` (`fussmode.c:4046-4076`): the unique remote names
+// of `remote -v`.
+fn fuss_parse_remotes(mut ed: Ed, out: List[byte]) -> bool {
+    let len = out.len
+    var off = 0
+    while off < len {
+        var end = off
+        while end < len && out[end] as int != 10 && out[end] as int != 0 {
+            end += 1
+        }
+        var name_end = off
+        while name_end < end && out[name_end] as int != 9 && out[name_end] as int != 32 {
+            name_end += 1
+        }
+        let name = git.git_slice(out, off, name_end)
+        var seen = false
+        for v in ed.fuss.picker_values {
+            if git.git_bytes_cmp(fc_bytes(v), name) == 0 {
+                seen = true
+            }
+        }
+        if !seen && name_end > off {
+            let _ = fuss_picker_add(mut ed, name, List[byte](), name)
+        }
+        off = if end < len then end + 1 else end
+    }
+    ed.fuss.picker_items.len != 0
+}
+
+/// `fuss_picker_result` (`fussmode.c:4078-4178`): a list verb's output
+/// into its picker; a lone remote is checked with `ls-remote` and pushed
+/// to directly when it has no such branch.
+pub fn fuss_picker_result(mut ed: Ed, action: int) -> bool {
+    let out = copy ed.git.result.out
+    if action == FUSS_PICK_REMOTE {
+        let _ = fuss_parse_remotes(mut ed, out)
+    } else if action != FUSS_PICK_REMOTE_CHECK {
+        let _ = fuss_parse_records(mut ed, action, out)
+    }
+    if action == FUSS_PICK_REMOTE {
+        let live = git_snapshot(mut ed)
+        if ed.git.snap[live].has_branch {
+            let b = git.git_snap_branch(ed.git.snap[live])
+            let s = util.buf_to_str(b) else ""
+            if s.len != 0 {
+                ed.fuss.picker_aux = s
+                ed.fuss.has_picker_aux = true
+            }
+        }
+        if ed.fuss.picker_items.len == 1 && ed.fuss.has_picker_aux {
+            let remote = ed.fuss.picker_values[0]
+            ed.fuss.picker_aux2 = remote
+            ed.fuss.has_picker_aux2 = true
+            let argv = fc_argv(["ls-remote", "--heads", remote, "refs/heads/{ed.fuss.picker_aux}"])
+            if fuss_spawn0(mut ed, "remote-check", argv) == CMD_OK {
+                ed.fuss.pending_pick = FUSS_PICK_REMOTE_CHECK
+                return true
+            }
+            ed.fuss.picker_aux2 = ""
+            ed.fuss.has_picker_aux2 = false
+        }
+    } else if action == FUSS_PICK_REMOTE_CHECK {
+        if out.len == 0 && ed.fuss.has_picker_aux && ed.fuss.has_picker_aux2 {
+            let branch = ed.fuss.picker_aux
+            let remote = ed.fuss.picker_aux2
+            fuss_picker_clear(mut ed)
+            let status = fuss_spawn0(mut ed, "push", fc_argv(["push", "-u", remote, branch]))
+            if status == CMD_OK {
+                ed_msg(
+                    mut ed,
+                    MSG_INFO,
+                    "one remote; pushing {branch} to {remote} and setting upstream",
+                )
+            }
+            return status == CMD_OK
+        }
+        fuss_picker_open(mut ed, FUSS_PICK_REMOTE, "remote")
+        return true
+    }
+    match action {
+        2 => fuss_picker_open(mut ed, action, "branch"),
+        3 => fuss_picker_open(mut ed, action, "branch"),
+        4 => fuss_picker_open(mut ed, action, "branch"),
+        5 => fuss_picker_open(mut ed, action, "commit"),
+        7 => fuss_picker_open(mut ed, action, "rebase base"),
+        8 => fuss_picker_open(mut ed, action, "branch"),
+        9 => fuss_picker_open(mut ed, action, "commit"),
+        10 => fuss_picker_open(mut ed, action, "commit"),
+        11 => fuss_picker_open(mut ed, action, "stash"),
+        12 => fuss_picker_open(mut ed, action, "remote"),
+        _ => { return false },
+    }
+    true
+}
+
+/// The picker's FUSS host (`PICK_HOST_FUSS`): C's `fuss_picker_accept`,
+/// `fuss_picker_preview` and `fuss_picker_action` behind one match.
+pub fn fuss_picker_host(mut ed: Ed, call: int, payload: int, how: int, r: Rect) -> PkAnswer {
+    if call == 0 {
+        return PkAnswer { ok: fuss_picker_accept(mut ed, payload, how), text: "" }
+    }
+    if call == 1 {
+        fuss_picker_preview(mut ed, payload, r)
+        return PkAnswer { ok: false, text: "" }
+    }
+    if call == 3 {
+        return PkAnswer { ok: fuss_picker_action(mut ed), text: "" }
+    }
+    PkAnswer { ok: false, text: "" }
+}
+
+// `fuss_picker_action` (`fussmode.c:3508-3524`): the stash picker's C-v
+// applies instead of popping.
+fn fuss_picker_action(mut ed: Ed) -> bool {
+    if ed.fuss.picker_action != FUSS_PICK_STASH {
+        return false
+    }
+    let code = ed.picker.action_code
+    if ed.picker.action_mods & term.MOD_CTRL != 0 && (code == 118 || code == 86) {
+        ed.fuss.picker_alt = true
+        let _ = picker_accept(mut ed)
+        return true
+    }
+    false
+}
+
+// `fuss_picker_accept` (`fussmode.c:3526-3661`): the row's value to its
+// action — run the palette's command, switch, delete, merge, reset (a
+// second picker for the mode), rebase, cherry-pick, revert, pop or apply
+// a stash, push to a remote.
+fn fuss_picker_accept(mut ed: Ed, payload: int, _how: int) -> bool {
+    if payload < 0 || payload >= ed.fuss.picker_values.len {
+        return false
+    }
+    let action = ed.fuss.picker_action
+    let value = ed.fuss.picker_values[payload]
+    let has_aux = ed.fuss.has_picker_aux
+    let aux = ed.fuss.picker_aux
+    let alt = ed.fuss.picker_alt
+    fuss_picker_clear(mut ed)
+    if action == FUSS_PICK_ACTIONS {
+        let id = cmd_lookup(ed.reg, value)
+        if id == 0 ||
+            ed.reg.entries[id - 1].flags & CMD_INTERNAL != 0 ||
+            value == "ed.git.actions" {
+            return true
+        }
+        var cx = cmdctx_new(ed.win, SRC_KEY)
+        cx.count = 1
+        ed.last_cmd = id
+        ed.last_status = ed_cmd_invoke(mut ed, id, mut cx)
+        ed.dispatch_count += 1
+    } else if action == FUSS_PICK_BRANCH_SWITCH {
+        let _ = fuss_spawn0(mut ed, "switch", fc_argv(["switch", "--", value]))
+    } else if action == FUSS_PICK_BRANCH_DELETE {
+        ed.fuss.prompt_path = value
+        ed.fuss.has_prompt_path = true
+        if fuss_spawn0(mut ed, "branch-delete", fc_argv(["branch", "-d", "--", value])) != CMD_OK {
+            ed.fuss.prompt_path = ""
+            ed.fuss.has_prompt_path = false
+        }
+    } else if action == FUSS_PICK_MERGE {
+        let _ = fuss_spawn0(mut ed, "merge", fc_argv(["merge", "--no-edit", "--", value]))
+    } else if action == FUSS_PICK_RESET_COMMIT {
+        ed.fuss.picker_aux = value
+        ed.fuss.has_picker_aux = true
+        let _ = fuss_picker_add_str(mut ed, "soft", "", "--soft")
+        let _ = fuss_picker_add_str(mut ed, "mixed", "", "--mixed")
+        let _ = fuss_picker_add_str(mut ed, "hard", "", "--hard")
+        ed.fuss.picker_action = FUSS_PICK_RESET_MODE
+        var rows = copy ed.fuss.picker_items
+        let spec = picker_spec(PICK_HOST_FUSS, "reset mode", take rows)
+        picker_open(mut ed, spec)
+    } else if action == FUSS_PICK_RESET_MODE {
+        if has_aux {
+            let _ = fuss_spawn0(mut ed, "reset", fc_argv(["reset", value, aux]))
+        }
+    } else if action == FUSS_PICK_REBASE {
+        let _ = fuss_rebase_prepare(mut ed, value)
+    } else if action == FUSS_PICK_CHERRY_BRANCH {
+        let _ = fuss_pick_commits(mut ed, FUSS_PICK_CHERRY_COMMIT, value, true)
+    } else if action == FUSS_PICK_CHERRY_COMMIT {
+        let _ = fuss_spawn0(mut ed, "cherry-pick", fc_argv(["cherry-pick", value]))
+    } else if action == FUSS_PICK_REVERT {
+        let _ = fuss_spawn0(mut ed, "revert", fc_argv(["revert", "--no-edit", value]))
+    } else if action == FUSS_PICK_STASH {
+        let _ = fuss_spawn0(
+            mut ed,
+            "stash-pop",
+            fc_argv(["stash", if alt then "apply" else "pop", value]),
+        )
+    } else if action == FUSS_PICK_REMOTE {
+        if has_aux {
+            let _ = fuss_spawn0(mut ed, "push", fc_argv(["push", "-u", value, aux]))
+        }
+    }
+    true
+}
+
+/// `fuss_preview_complete` (`fussmode.c:3663-3689`): the `show` output
+/// for the row it was started for (a stale one is dropped).
+pub fn fuss_preview_complete(mut ed: Ed, j: Job) {
+    if ed.fuss.preview_job != j.id ||
+        !ed.fuss.has_preview_value ||
+        ed.fuss.preview_value != j.cb_key {
+        return
+    }
+    ed.fuss.preview_job = 0
+    (mut ed.fuss.preview_bytes).reset()
+    if j.state == JOB_EXITED && j.exit_code == 0 && !j.collect_capped {
+        for b in j.collect {
+            (mut ed.fuss.preview_bytes).push(b)
+        }
+    } else {
+        for b in "preview unavailable".bytes() {
+            (mut ed.fuss.preview_bytes).push(b)
+        }
+    }
+    ed.fuss.preview_ready = true
+    ed.fuss.draw_dirty = true
+    ed.footer_dirty = true
+}
+
+/// `fuss_preview_destroy` (`fussmode.c:3691-3699`): the owner's key goes
+/// with the job (nothing else is held).
+pub fn fuss_preview_destroy(_ed: Ed, _key: str, _completed: bool) {}
+
+// `fuss_preview_start` (`fussmode.c:3706-3746`): `show --stat --oneline
+// --decorate VALUE`, one at a time.
+fn fuss_preview_start(mut ed: Ed, value: str) -> bool {
+    if value.len == 0 || value.starts_with("-") || ed.fuss.preview_job != 0 {
+        return false
+    }
+    let verb = git_verb(ed, "show")
+    if verb < 0 {
+        return false
+    }
+    let (job, _) = git_spawn_callback(
+        mut ed,
+        verb,
+        fc_argv(["show", "--stat", "--oneline", "--decorate", value]),
+        GIT_OWNER_FUSS_PREVIEW,
+        value,
+    )
+    if job == 0 {
+        return false
+    }
+    ed.fuss.preview_value = value
+    ed.fuss.has_preview_value = true
+    (mut ed.fuss.preview_bytes).reset()
+    ed.fuss.preview_ready = false
+    ed.fuss.preview_job = job
+    true
+}
+
+// `fuss_preview_draw_text` (`fussmode.c:3748-3774`): each line clipped,
+// dimmed in the base style.
+fn fuss_preview_draw_text(mut ed: Ed, r: Rect, bytes: List[byte]) {
+    let style = fc_base_style(ed)
+    var at = 0
+    var row = 0
+    let len = bytes.len
+    while at < len && row < r.h {
+        var end = at
+        while end < len && bytes[end] as int != 10 {
+            end += 1
+        }
+        var stop = end
+        if stop > at && bytes[stop - 1] as int == 13 {
+            stop -= 1
+        }
+        let (fit, _) = unicode.str_clip(bytes, at, stop, r.w)
+        if fit != 0 {
+            let _ = term.grid_puts(
+                mut ed.grid,
+                r.y + row,
+                r.x,
+                bytes,
+                at,
+                at + fit,
+                style.fg,
+                style.bg,
+                style.attrs | term.ATTR_DIM,
+            )
+        }
+        row += 1
+        at = if end < len then end + 1 else end
+    }
+}
+
+fn fc_base_style(ed: Ed) -> ThemeEnt {
+    let r = theme_rendition_of(ed.render)
+    var style = ThemeEnt { fg: term.color_rgb(218, 229, 240), bg: term.color_default(), attrs: 0 }
+    let (hf, fg) = theme_ui(ed.theme, "fg", r)
+    if hf {
+        style.fg = copy fg.fg
+        style.attrs = fg.attrs
+    }
+    let (hb, bg) = theme_ui(ed.theme, "bg", r)
+    if hb {
+        style.bg = copy bg.bg
+        style.attrs = style.attrs | bg.attrs
+    }
+    style
+}
+
+// `fuss_picker_preview` (`fussmode.c:3776-3801`).
+fn fuss_picker_preview(mut ed: Ed, payload: int, r: Rect) {
+    if payload < 0 || payload >= ed.fuss.picker_values.len || r.w == 0 || r.h == 0 {
+        return
+    }
+    let value = ed.fuss.picker_values[payload]
+    if !ed.fuss.has_preview_value || ed.fuss.preview_value != value {
+        if ed.fuss.preview_job == 0 {
+            let _ = fuss_preview_start(mut ed, value)
+        }
+        fuss_preview_draw_text(mut ed, r, fc_bytes("loading\u{2026}"))
+        return
+    }
+    if !ed.fuss.preview_ready {
+        fuss_preview_draw_text(mut ed, r, fc_bytes("loading\u{2026}"))
+        return
+    }
+    let b = copy ed.fuss.preview_bytes
+    fuss_preview_draw_text(mut ed, r, b)
+}
+
+// ------------------------------------------------------------------
+// Path verbs and typed confirmations (`fussmode.c:2551-2600`, `:3308-3506`)
+// ------------------------------------------------------------------
+
+// `fuss_path_verb` (`fussmode.c:2551-2583`): `prefix -- PATH`, the
+// diff of an incoming-only file against the upstream (three dots).
+fn fuss_path_verb(
+    mut ed: Ed,
+    cx: CmdCtx,
+    verb_name: str,
+    prefix: List[str],
+    guard: int,
+    view: bool,
+) -> int {
+    let (ok, path) = fuss_selected_path(ed, cx)
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "select a valid workspace path")
+        return CMD_ERR_ARG
+    }
+    let (pass, target) = fuss_target_guard(mut ed, path, guard, verb_name)
+    if !pass {
+        return CMD_ERR_STATE
+    }
+    var argv = List[str]()
+    var i = 0
+    while i < prefix.len {
+        (mut argv).push(
+            if verb_name == "diff" && target.incoming && prefix.len > 1 && i == 1 {
+                "HEAD...@{{upstream}}"
+            } else {
+                prefix[i]
+            },
+        )
+        i += 1
+    }
+    (mut argv).push("--")
+    (mut argv).push(path)
+    fuss_spawn(mut ed, verb_name, argv, true, List[byte](), view)
+}
+
+/// `fuss_prompt_clear` (`fussmode.c:2585-2593`).
+pub fn fuss_prompt_clear(mut ed: Ed) {
+    ed.fuss.prompt_action = FUSS_PROMPT_NONE
+    ed.fuss.prompt_path = ""
+    ed.fuss.has_prompt_path = false
+    ed.fuss.prompt_untracked = false
+}
+
+fn fuss_text_is(text: List[byte], literal: str) -> bool {
+    git.git_bytes_cmp(text, fc_bytes(literal)) == 0
+}
+
+// `fuss_prompt` (`fussmode.c:3474-3506`): an input prompt owned by F
+// mode, its warning on the message line.
+fn fuss_prompt(mut ed: Ed, action: int, seed: str, path: str, has_path: bool, hint: str) -> int {
+    fuss_prompt_clear(mut ed)
+    ed.fuss.prompt_action = action
+    if has_path {
+        ed.fuss.prompt_path = path
+        ed.fuss.has_prompt_path = true
+        let (known, t) = fuss_target_lookup(ed, path)
+        if known {
+            ed.fuss.prompt_untracked = t.untracked
+        }
+    }
+    cmdline_open_input(mut ed, seed, INPUT_DONE_FUSS, 0)
+    if !ed.cmdline.active {
+        fuss_prompt_clear(mut ed)
+        return CMD_ERR_STATE
+    }
+    if action == FUSS_PROMPT_DISCARD && has_path {
+        ed_msg(
+            mut ed,
+            MSG_WARN,
+            "discard {path} \u{2014} type 'discard' to confirm \u{2014} use hunk discard for an undoable version",
+        )
+    } else if action == FUSS_PROMPT_DELETE && has_path {
+        ed_msg(mut ed, MSG_WARN, "delete {path} \u{2014} type 'delete' to confirm")
+    } else if hint.len != 0 {
+        ed_msg(mut ed, MSG_WARN, hint)
+    }
+    CMD_OK
+}
+
+/// `fuss_prompt_done` (`fussmode.c:3308-3472`): the typed answer to the
+/// question F mode asked.
+pub fn fuss_prompt_done(mut ed: Ed, accepted: bool, answer: List[byte]) {
+    let action = ed.fuss.prompt_action
+    var has_value = false
+    var value = ""
+    if accepted && answer.len != 0 {
+        var nul = false
+        for b in answer {
+            if b as int == 0 {
+                nul = true
+            }
+        }
+        if !nul {
+            let s = util.buf_to_str(answer) else ""
+            if s.len != 0 {
+                value = s
+                has_value = true
+            }
+        }
+    }
+    let path = ed.fuss.prompt_path
+    let has_path = ed.fuss.has_prompt_path
+    if action == FUSS_PROMPT_BRANCH_CREATE {
+        if has_value {
+            if value.starts_with("-") {
+                ed_msg(mut ed, MSG_ERROR, "branch name must not begin with '-'")
+            } else {
+                let _ = fuss_spawn0(mut ed, "switch-create", fc_argv(["switch", "-c", value]))
+            }
+        }
+    } else if action == FUSS_PROMPT_BRANCH_DELETE {
+        if fuss_text_is(answer, "delete") && has_path {
+            let _ = fuss_spawn0(mut ed, "branch-delete", fc_argv(["branch", "-D", "--", path]))
+        }
+    } else if action == FUSS_PROMPT_STASH_PUSH {
+        if has_value {
+            // `git stash push` has no stdin message form; argv preserves
+            // every non-NUL byte without a shell (`fussmode.c:3352-3355`).
+            let _ = fuss_spawn0(mut ed, "stash-push", fc_argv(["stash", "push", "-m", value]))
+        }
+    } else if action == FUSS_PROMPT_TAG {
+        if has_value {
+            let vb = fc_bytes(value)
+            var nl = -1
+            var i = 0
+            while i < vb.len {
+                if vb[i] as int == 10 {
+                    nl = i
+                    break
+                }
+                i += 1
+            }
+            if nl < 0 {
+                let _ = fuss_spawn0(mut ed, "tag", fc_argv(["tag", "--", value]))
+            } else if nl != 0 {
+                let name = util.buf_to_str(git.git_slice(vb, 0, nl)) else ""
+                let message = git.git_slice(vb, nl + 1, vb.len)
+                let _ = fuss_spawn(
+                    mut ed,
+                    "tag",
+                    fc_argv(["tag", "-a", "-F", "-", "--", name]),
+                    false,
+                    message,
+                    false,
+                )
+            }
+        }
+    } else if action == FUSS_PROMPT_DISCARD {
+        if fuss_text_is(answer, "discard") && has_path {
+            let _ = fuss_spawn(
+                mut ed,
+                "discard",
+                fc_argv(["restore", "--source=HEAD", "--staged", "--worktree", "--", path]),
+                true,
+                List[byte](),
+                false,
+            )
+        }
+    } else if action == FUSS_PROMPT_DELETE {
+        if fuss_text_is(answer, "delete") && has_path {
+            if ed.fuss.prompt_untracked {
+                let (ok, absolute) = fuss_join_root(ed, path)
+                if !ok {
+                    ed_msg(mut ed, MSG_ERROR, "cannot delete {path}: invalid path")
+                } else {
+                    var removed = true
+                    var why = ""
+                    fs.remove(absolute) else |e| {
+                        removed = false
+                        // `strerror(errno)`.
+                        why = match e {
+                            denied => "Permission denied",
+                            not_found => "No such file or directory",
+                            io => "Input/output error",
+                        }
+                    }
+                    if !removed {
+                        ed_msg(mut ed, MSG_ERROR, "cannot delete {path}: {why}")
+                    } else {
+                        ed_msg(mut ed, MSG_INFO, "deleted {path}")
+                        git_invalidate(mut ed)
+                        let _ = git_refresh(mut ed, true)
+                    }
+                }
+            } else {
+                let _ = fuss_spawn(
+                    mut ed,
+                    "rm",
+                    fc_argv(["rm", "-f", "--", path]),
+                    true,
+                    List[byte](),
+                    false,
+                )
+            }
+        }
+    } else if action == FUSS_PROMPT_RENAME {
+        if has_value && has_path && fuss_safe_path(fc_bytes(value)) {
+            if ed.fuss.prompt_untracked {
+                let (ok1, old_path) = fuss_join_root(ed, path)
+                let (ok2, new_path) = fuss_join_root(ed, value)
+                if !ok1 || !ok2 {
+                    ed_msg(mut ed, MSG_ERROR, "cannot rename {path}: invalid path")
+                } else {
+                    var moved = true
+                    var why = ""
+                    fs_rename(old_path, new_path) else |e| {
+                        moved = false
+                        // `strerror(errno)`.
+                        why = match e {
+                            cross_device => "Invalid cross-device link",
+                            denied => "Permission denied",
+                            exists => "File exists",
+                            not_found => "No such file or directory",
+                            io => "Input/output error",
+                        }
+                    }
+                    if !moved {
+                        ed_msg(mut ed, MSG_ERROR, "cannot rename {path}: {why}")
+                    } else {
+                        git_invalidate(mut ed)
+                        let _ = git_refresh(mut ed, true)
+                    }
+                }
+            } else {
+                let _ = fuss_spawn(
+                    mut ed,
+                    "mv",
+                    fc_argv(["mv", "--", path, value]),
+                    true,
+                    List[byte](),
+                    false,
+                )
+            }
+        }
+    } else if action == FUSS_PROMPT_PUSH_FORCE {
+        if fuss_text_is(answer, "force") {
+            let _ = fuss_spawn0(mut ed, "push", fc_argv(["push", "--force-with-lease"]))
+        }
+    } else if action == FUSS_PROMPT_REBASE {
+        if fuss_text_is(answer, "rebase") && has_path {
+            let _ = fuss_rebase_sync(mut ed, "-i", path, true)
+        }
+    } else if action == FUSS_PROMPT_COMMIT || action == FUSS_PROMPT_COMMIT_AMEND {
+        if accepted {
+            let (status, _) = fuss_commit_bytes(mut ed, answer, action == FUSS_PROMPT_COMMIT_AMEND)
+            let _ = status
+        }
+    }
+    if !accepted && action != FUSS_PROMPT_NONE {
+        ed_msg(mut ed, MSG_INFO, "git command cancelled")
+    }
+    fuss_prompt_clear(mut ed)
+}
+
+// ------------------------------------------------------------------
+// The commit (`fussmode.c:2602-2980`, `:3132-3223`)
+// ------------------------------------------------------------------
+
+// `fuss_conflict_count` and `fuss_commit_guard` (`fussmode.c:2703-2727`).
+fn fuss_commit_guard(mut ed: Ed, live: int) -> bool {
+    var conflicts = 0
+    for e in ed.git.snap[live].entries {
+        if e.conflicted {
+            conflicts += 1
+        }
+    }
+    if conflicts == 0 {
+        return true
+    }
+    ed_msg(mut ed, MSG_ERROR, "resolve conflicts before committing ({conflicts} files)")
+    false
+}
+
+// `fuss_commit_bytes` (`fussmode.c:2602-2650`): the message cleaned with
+// the commit's comment character (the template's when editing, else
+// resolved from `core.commentChar`) and committed on stdin
+// (`-F - --cleanup=verbatim`); (status, empty).
+fn fuss_commit_bytes(mut ed: Ed, text_in: List[byte], amend: bool) -> (int, bool) {
+    let live = git_snapshot(mut ed)
+    if !fuss_commit_guard(mut ed, live) {
+        return (CMD_ERR_STATE, false)
+    }
+    var comment = 35
+    if ed.fuss.commit_editing && ed.fuss.commit_comment != 0 {
+        comment = ed.fuss.commit_comment
+    } else {
+        let setting = git.git_snap_comment(ed.git.snap[live])
+        let (ok, c) = git.fuss_commit_select_comment(text_in, text_in.len, setting)
+        if !ok {
+            ed_msg(mut ed, MSG_ERROR, "cannot resolve core.commentChar for commit message")
+            return (CMD_ERR_STATE, false)
+        }
+        comment = c
+    }
+    var clean = List[byte]()
+    if !git.fuss_commit_cleanup(mut clean, text_in, text_in.len, comment) ||
+        git.fuss_commit_empty(clean, clean.len) {
+        ed_msg(mut ed, MSG_ERROR, "aborting commit due to empty commit message")
+        return (CMD_ERR_STATE, true)
+    }
+    let argv = if amend {
+        fc_argv(["commit", "--amend", "-F", "-", "--cleanup=verbatim"])
+    } else {
+        fc_argv(["commit", "-F", "-", "--cleanup=verbatim"])
+    }
+    let status = fuss_spawn(
+        mut ed,
+        if amend then "commit-amend" else "commit",
+        argv,
+        false,
+        clean,
+        false,
+    )
+    (status, false)
+}
+
+// `fuss_commit_resume` (`fussmode.c:2686-2701`): the commit view closed,
+// its scratch dropped, F mode re-entered.
+fn fuss_commit_resume(mut ed: Ed, commit: int) {
+    ed.fuss.commit_editing = false
+    ed.fuss.commit_buffer_id = 0
+    ed.fuss.commit_amend = false
+    ed.fuss.commit_comment = 0
+    fuss_commit_view_close(mut ed)
+    if commit >= 0 {
+        ws_scratch_drop(mut ed, commit)
+    }
+    if mode_enter(mut ed, MODE_F) != CMD_OK {
+        let _ = mode_enter(mut ed, MODE_L)
+    }
+}
+
+fn fc_push(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+// `fuss_comment_line` (`fussmode.c:2729-2738`).
+fn fc_comment_line(mut out: List[byte], comment: int, s: str) {
+    (mut out).push(comment as byte)
+    if s.len != 0 {
+        (mut out).push(32 as byte)
+        fc_push(mut out, s)
+    }
+    (mut out).push(10 as byte)
+}
+
+fn fc_comment_prefix(mut out: List[byte], comment: int) {
+    (mut out).push(comment as byte)
+    (mut out).push(32 as byte)
+}
+
+// `fuss_template_path` (`fussmode.c:2746-2762`): LF, CR and TAB escaped.
+fn fc_template_path(mut out: List[byte], b: List[byte], at: int, len: int) {
+    var i = 0
+    while i < len {
+        let c = b[at + i] as int
+        if c == 10 {
+            fc_push(mut out, "\\n")
+        } else if c == 13 {
+            fc_push(mut out, "\\r")
+        } else if c == 9 {
+            fc_push(mut out, "\\t")
+        } else {
+            (mut out).push(b[at + i])
+        }
+        i += 1
+    }
+}
+
+// `fuss_change_label` (`fussmode.c:2764-2777`).
+fn fc_change_label(e: git.GitEntry, staged: bool) -> str {
+    let code = if staged then e.x else e.y
+    if e.kind == git.GIT_E_RENAME || code == 82 || code == 67 {
+        return "renamed"
+    }
+    if code == 65 || e.untracked {
+        return "new file"
+    }
+    if code == 68 {
+        return "deleted"
+    }
+    if code == 84 {
+        return "typechange"
+    }
+    "modified"
+}
+
+// `fuss_status_line` (`fussmode.c:2779-2790`).
+fn fc_status_line(
+    mut out: List[byte],
+    comment: int,
+    pool: List[byte],
+    e: git.GitEntry,
+    staged: bool,
+) {
+    (mut out).push(comment as byte)
+    (mut out).push(9 as byte)
+    fc_push(mut out, fc_change_label(e, staged))
+    fc_push(mut out, ":   ")
+    fc_template_path(mut out, pool, e.path_at, e.path_len)
+    (mut out).push(10 as byte)
+}
+
+// `fuss_has_status` (`fussmode.c:2792-2805`): 0 staged, 1 unstaged
+// tracked, 2 untracked.
+fn fc_has_status(s: git.GitSnapshot, kind: int) -> bool {
+    for e in s.entries {
+        if kind == 0 && e.staged ||
+            kind == 1 && e.unstaged && !e.untracked ||
+            kind == 2 && e.untracked {
+            return true
+        }
+    }
+    false
+}
+
+// `fuss_commit_template` (`fussmode.c:2807-2911`): git's own
+// COMMIT_EDITMSG shape — the prefill, the comment block, the branch and
+// its divergence, the three status sections, the save/close hint;
+// (ok, text, the comment byte chosen).
+fn fuss_commit_template(ed: Ed, live: int, prefill: List[byte], amend: bool) -> (
+    bool,
+    List[byte],
+    int,
+) {
+    let s = ed.git.snap[live]
+    let setting = git.git_snap_comment(s)
+    let (ok, comment) = git.fuss_commit_select_comment(prefill, prefill.len, setting)
+    var text = List[byte]()
+    if !ok {
+        return (false, text, 0)
+    }
+    if prefill.len != 0 {
+        for b in prefill {
+            (mut text).push(b)
+        }
+        if prefill[prefill.len - 1] as int != 10 {
+            (mut text).push(10 as byte)
+        }
+        (mut text).push(10 as byte)
+    } else {
+        (mut text).push(10 as byte)
+    }
+    fc_comment_line(
+        mut text,
+        comment,
+        "Please enter the commit message for your changes. Lines starting",
+    )
+    fc_comment_prefix(mut text, comment)
+    fc_push(mut text, "with '")
+    (mut text).push(comment as byte)
+    fc_push(mut text, "' will be ignored, and an empty message aborts the commit.\n")
+    fc_comment_line(mut text, comment, "")
+    if s.has_branch {
+        fc_comment_prefix(mut text, comment)
+        fc_push(mut text, "On branch ")
+        for b in git.git_snap_branch(s) {
+            (mut text).push(b)
+        }
+        (mut text).push(10 as byte)
+    }
+    if s.has_upstream {
+        let up = util.buf_to_str(git.git_snap_upstream(s)) else ""
+        fc_comment_prefix(mut text, comment)
+        if s.ahead > 0 && s.behind > 0 {
+            fc_push(
+                mut text,
+                "Your branch and '{up}' have diverged ({s.ahead} ahead, {s.behind} behind).\n",
+            )
+        } else if s.ahead > 0 {
+            fc_push(mut text, "Your branch is ahead of '{up}' by {s.ahead} commits.\n")
+        } else if s.behind > 0 {
+            fc_push(mut text, "Your branch is behind '{up}' by {s.behind} commits.\n")
+        } else {
+            fc_push(mut text, "Your branch is up to date with '{up}'.\n")
+        }
+        if amend && s.ahead == 0 {
+            fc_comment_prefix(mut text, comment)
+            fc_push(mut text, "This commit has been pushed to {up}.\n")
+        }
+    }
+    fc_comment_line(mut text, comment, "")
+    if fc_has_status(s, 0) {
+        fc_comment_line(mut text, comment, "Changes to be committed:")
+        for e in s.entries {
+            if e.staged {
+                fc_status_line(mut text, comment, s.pool, e, true)
+            }
+        }
+        fc_comment_line(mut text, comment, "")
+    }
+    if fc_has_status(s, 1) {
+        fc_comment_line(mut text, comment, "Changes not staged for commit:")
+        for e in s.entries {
+            if e.unstaged && !e.untracked {
+                fc_status_line(mut text, comment, s.pool, e, false)
+            }
+        }
+        fc_comment_line(mut text, comment, "")
+    }
+    if fc_has_status(s, 2) {
+        fc_comment_line(mut text, comment, "Untracked files:")
+        for e in s.entries {
+            if e.untracked {
+                fc_status_line(mut text, comment, s.pool, e, false)
+            }
+        }
+        fc_comment_line(mut text, comment, "")
+    }
+    fc_comment_line(
+        mut text,
+        comment,
+        "Save this buffer to commit; close it without saving to abort.",
+    )
+    (true, text, comment)
+}
+
+/// `fuss_commit_begin` (`fussmode.c:2913-2978`): the `*commit*` scratch
+/// filled with the template (its undo at the save point), shown in a
+/// clone of the live window, Insert mode.
+pub fn fuss_commit_begin(mut ed: Ed, amend: bool, prefill: List[byte]) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    if ed.fuss.commit_cancel_pending {
+        fuss_windows_changed(mut ed)
+    }
+    let live = git_snapshot(mut ed)
+    if !fuss_commit_guard(mut ed, live) {
+        return CMD_ERR_STATE
+    }
+    let (ok, template, comment) = fuss_commit_template(ed, live, prefill, amend)
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "cannot resolve core.commentChar for commit template")
+        return CMD_ERR_STATE
+    }
+    var bi = ws_scratch_find(ed, "*commit*")
+    if bi < 0 {
+        bi = ws_scratch_new(mut ed, "*commit*", 0)
+    }
+    if bi < 0 {
+        return CMD_ERR_IO
+    }
+    if !fuss_replace_buffer(mut ed, bi, template) {
+        return CMD_ERR_IO
+    }
+    ed.bufs[bi].ec.undo = text.undo_new(ed.bufs[bi].ec.tb)
+    ed.bufs[bi].ec.has_undo = true
+    text.undo_mark_saved(mut ed.bufs[bi].ec.undo, ed.bufs[bi].ec.tb)
+    ed.fuss.commit_editing = true
+    ed.fuss.commit_buffer_id = ed.bufs[bi].id
+    ed.fuss.commit_amend = amend
+    ed.fuss.commit_comment = comment
+    if !fuss_commit_view_open(mut ed, bi) {
+        ed.fuss.commit_editing = false
+        ed.fuss.commit_buffer_id = 0
+        ed.fuss.commit_amend = false
+        ed.fuss.commit_comment = 0
+        return CMD_ERR_STATE
+    }
+    if mode_enter(mut ed, MODE_I) != CMD_OK {
+        ed.fuss.commit_editing = false
+        ed.fuss.commit_buffer_id = 0
+        ed.fuss.commit_amend = false
+        ed.fuss.commit_comment = 0
+        fuss_commit_view_close(mut ed)
+        return CMD_ERR_STATE
+    }
+    ed_msg(mut ed, MSG_INFO, "edit *commit*, then save to commit or close to abort")
+    CMD_OK
+}
+
+// `fuss_read_small_file` (`fussmode.c:3003-3039`): at most 1 MiB.
+fn fuss_read_small_file(path: str) -> (bool, List[byte]) {
+    let b = fs_read_bytes(path) else |_| { return (false, List[byte]()) }
+    if b.len > 1048576 {
+        return (false, List[byte]())
+    }
+    (true, b)
+}
+
+// `fuss_positive_int` (`fussmode.c:3041-3071`): a positive decimal with
+// optional surrounding blanks.
+fn fuss_positive_int(b: List[byte]) -> (bool, int) {
+    var at = 0
+    let n = b.len
+    while at < n &&
+        (b[at] as int == 32 || b[at] as int == 9 || b[at] as int == 13 || b[at] as int == 10) {
+        at += 1
+    }
+    var v = 0
+    var any = false
+    while at < n && b[at] as int >= 48 && b[at] as int <= 57 {
+        let d = b[at] as int - 48
+        if v > (2147483647 - d) / 10 {
+            return (false, 0)
+        }
+        v = v * 10 + d
+        any = true
+        at += 1
+    }
+    while at < n &&
+        (b[at] as int == 32 || b[at] as int == 9 || b[at] as int == 13 || b[at] as int == 10) {
+        at += 1
+    }
+    if !any || at != n || v <= 0 {
+        return (false, 0)
+    }
+    (true, v)
+}
+
+/// `fuss_rebase_progress_update` (`fussmode.c:3073-3130`): `msgnum/end`
+/// of `rebase-merge`, else `next/last` of `rebase-apply`, both positive
+/// and in order; 0/0 otherwise.
+pub fn fuss_rebase_progress_update(mut ed: Ed, live: int) {
+    ed.fuss.rebase_step = 0
+    ed.fuss.rebase_total = 0
+    if ed.git.snap[live].state != git.GIT_MID_REBASE ||
+        !git_repo_ready(ed) ||
+        ed.git.repo.git_dir.len == 0 {
+        return
+    }
+    let dir = ed.git.repo.git_dir
+    var (sok, step) = fuss_read_small_file("{dir}/rebase-merge/msgnum")
+    var (tok, total) = fuss_read_small_file("{dir}/rebase-merge/end")
+    if !sok || !tok {
+        let (s2, st2) = fuss_read_small_file("{dir}/rebase-apply/next")
+        let (t2, tt2) = fuss_read_small_file("{dir}/rebase-apply/last")
+        sok = s2
+        step = st2
+        tok = t2
+        total = tt2
+    }
+    if sok && tok {
+        let (a, sv) = fuss_positive_int(step)
+        let (c, tv) = fuss_positive_int(total)
+        if a && c && sv <= tv {
+            ed.fuss.rebase_step = sv
+            ed.fuss.rebase_total = tv
+        }
+    }
+}
+
+// `fuss_commit_open` (`fussmode.c:3132-3173`): amend reads the last
+// message first; a merge in progress prefills MERGE_MSG.
+fn fuss_commit_open(mut ed: Ed, amend: bool) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    let live = git_snapshot(mut ed)
+    if !fuss_commit_guard(mut ed, live) {
+        return CMD_ERR_STATE
+    }
+    if amend {
+        let status = fuss_spawn0(mut ed, "log", fc_argv(["log", "-1", "--pretty=%B"]))
+        if status == CMD_OK {
+            ed.fuss.pending_pick = FUSS_PICK_COMMIT_AMEND
+        }
+        return status
+    }
+    if ed.git.snap[live].state == git.GIT_MID_MERGE {
+        let (ok, message) = if git_repo_ready(ed) {
+            fuss_read_small_file("{ed.git.repo.git_dir}/MERGE_MSG")
+        } else {
+            (false, List[byte]())
+        }
+        if !ok {
+            ed_msg(mut ed, MSG_ERROR, "cannot read the pending merge message")
+            return CMD_ERR_IO
+        }
+        return fuss_commit_begin(mut ed, false, message)
+    }
+    fuss_commit_begin(mut ed, false, List[byte]())
+}
+
+/// `yew_fuss_commit_save` (`fussmode.c:3175-3205`): saving the commit
+/// scratch commits it; (handled, status).
+pub fn fuss_commit_save(mut ed: Ed, bi: int) -> (bool, int) {
+    if bi < 0 || !ed.fuss.commit_editing || ed.bufs[bi].id != ed.fuss.commit_buffer_id {
+        return (false, CMD_ERR_STATE)
+    }
+    let message = fuss_buffer_bytes(ed, bi)
+    let (status, empty) = fuss_commit_bytes(mut ed, message, ed.fuss.commit_amend)
+    if status != CMD_OK && !empty {
+        return (true, status)
+    }
+    if empty {
+        fuss_commit_resume(mut ed, bi)
+        return (true, status)
+    }
+    text.undo_mark_saved(mut ed.bufs[bi].ec.undo, ed.bufs[bi].ec.tb)
+    fuss_commit_resume(mut ed, bi)
+    (true, CMD_OK)
+}
+
+/// `yew_fuss_commit_close` (`fussmode.c:3207-3223`): closing it aborts.
+pub fn fuss_commit_close(mut ed: Ed, bi: int) -> (bool, int) {
+    if bi < 0 || !ed.fuss.commit_editing || ed.bufs[bi].id != ed.fuss.commit_buffer_id {
+        return (false, CMD_ERR_STATE)
+    }
+    ed_msg(mut ed, MSG_INFO, "commit aborted")
+    fuss_commit_resume(mut ed, bi)
+    (true, CMD_OK)
+}
+
+// `fuss_rebase_prepare` (`fussmode.c:3225-3264`): the range `BASE..HEAD`
+// logged for review before the typed confirmation.
+fn fuss_rebase_prepare(mut ed: Ed, base: str) -> int {
+    if base.len == 0 {
+        return CMD_ERR_ARG
+    }
+    if base.starts_with("-") {
+        ed_msg(mut ed, MSG_ERROR, "invalid rebase base")
+        return CMD_ERR_ARG
+    }
+    fuss_prompt_clear(mut ed)
+    ed.fuss.prompt_path = base
+    ed.fuss.has_prompt_path = true
+    let status = fuss_spawn0(
+        mut ed,
+        "log",
+        fc_argv(["log", "{base}..HEAD", "--date-order", "--pretty=format:%h%x1f%at%x1f%an%x1f%s"]),
+    )
+    if status == CMD_OK {
+        ed.fuss.pending_pick = FUSS_PICK_REBASE_CONFIRM
+        ed_msg(mut ed, MSG_INFO, "loading rebase range")
+    } else {
+        fuss_prompt_clear(mut ed)
+    }
+    status
+}
+
+// `fuss_rebase_sync` (`fussmode.c:3266-3306`): the terminal handed to
+// `git rebase OP [BASE]` with this yew as git's editor (YEW-F-017).
+fn fuss_rebase_sync(mut ed: Ed, operation: str, base: str, has_base: bool) -> int {
+    let (has_self, me) = job_self_exe()
+    if !has_self || me.len == 0 {
+        ed_msg(mut ed, MSG_ERROR, "rebase handover failed: cannot resolve yew executable")
+        return CMD_ERR_IO
+    }
+    var argv = fc_argv(["rebase", operation])
+    if has_base {
+        (mut argv).push(base)
+    }
+    let (ran, wait, why) = git_run_terminal(mut ed, git_verb(ed, "rebase"), argv, me)
+    if !ran {
+        ed_msg(mut ed, MSG_ERROR, if why.len == 0 then "rebase handover failed" else why)
+        return CMD_ERR_IO
+    }
+    if wait.state != JOB_EXITED || wait.exit_code != 0 {
+        if wait.state == JOB_SIGNALED {
+            ed_msg(mut ed, MSG_ERROR, "rebase stopped by signal {wait.termsig}")
+        } else {
+            ed_msg(mut ed, MSG_ERROR, "rebase exited with status {wait.exit_code}")
+        }
+        return CMD_ERR_STATE
+    }
+    ed_msg(mut ed, MSG_INFO, "rebase complete")
+    CMD_OK
+}
+
+// ------------------------------------------------------------------
+// Navigation, the walk, untracked expansion (`fussmode.c:4180-4376`)
+// ------------------------------------------------------------------
+
+// `fuss_nav` (`fussmode.c:4180-4218`): -1/1 same depth, -2/2 raw rows, 3
+// parent, 4 enter (an untracked directory scans first; a closed
+// directory opens into the manual memory).
+fn fuss_nav(mut ed: Ed, cx: CmdCtx, kind: int) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    if kind == 4 && fuss_expand_start(mut ed) {
+        return CMD_OK
+    }
+    var row = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+    var count = if cx.count_given && cx.count != 0 then cx.count else 1
+    while count != 0 {
+        count -= 1
+        if kind == -1 || kind == 1 {
+            row = git.fuss_nav_step(ed.fuss.tree, row, kind)
+        } else if kind == -2 || kind == 2 {
+            row = git.fuss_nav_raw(ed.fuss.tree, row, if kind < 0 then -1 else 1)
+        } else if kind == 3 {
+            row = git.fuss_nav_parent(ed.fuss.tree, row)
+        } else if kind == 4 {
+            let ok = row >= 0 &&
+                row < ed.fuss.tree.items.len &&
+                ed.fuss.tree.items[row].node < ed.fuss.tree.nodes.len
+            if ok &&
+                !ed.fuss.tree.nodes[ed.fuss.tree.items[row].node].is_file &&
+                !ed.fuss.tree.nodes[ed.fuss.tree.items[row].node].expanded {
+                let p = git.fuss_item_path(ed.fuss.tree, row)
+                let _ = git.fuss_open_memory_set(mut ed.fuss.manual_open, p, 0, p.len, true)
+                fuss_apply_effective(mut ed)
+                row = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+            } else {
+                row = git.fuss_nav_enter(mut ed.fuss.tree, row)
+            }
+        }
+    }
+    git.fuss_sel_from_row(mut ed.fuss.sel, ed.fuss.tree, row)
+    ed.fuss.draw_dirty = true
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+/// `fuss_walk_restart` (`fussmode.c:4220-4236`): the all-files walk
+/// (hidden and ignored as the option says) started over.
+pub fn fuss_walk_restart(mut ed: Ed) {
+    if ed.fuss.has_walk {
+        ws.walk_end(mut ed.fuss.walk)
+        ed.fuss.has_walk = false
+    }
+    ed.fuss.files = ws.filelist_new()
+    if !ed.fuss.opts.all_files {
+        return
+    }
+    var o = ws.walk_opts()
+    o.hidden = ed.fuss.opts.show_hidden
+    o.use_gitignore = !ed.fuss.opts.show_hidden
+    let (ok, w) = ws.walk_begin(shell_ws_root(ed), o)
+    if ok {
+        ed.fuss.walk = w
+        ed.fuss.has_walk = true
+    }
+}
+
+/// `fuss_expand_clear` (`fussmode.c:4238-4249`).
+pub fn fuss_expand_clear(mut ed: Ed) {
+    if ed.fuss.has_expand_walk {
+        ws.walk_end(mut ed.fuss.expand_walk)
+        ed.fuss.has_expand_walk = false
+    }
+    (mut ed.fuss.expand_path).reset()
+    ed.fuss.has_expand_path = false
+}
+
+// `fuss_expand_start` (`fussmode.c:4251-4290`): an unloaded untracked
+// directory scanned one level deep, asynchronously.
+fn fuss_expand_start(mut ed: Ed) -> bool {
+    let row = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+    if row < 0 ||
+        row >= ed.fuss.tree.items.len ||
+        ed.fuss.tree.items[row].node >= ed.fuss.tree.nodes.len {
+        return false
+    }
+    let n = copy ed.fuss.tree.nodes[ed.fuss.tree.items[row].node]
+    if !n.untracked_dir || n.untracked_loaded {
+        return false
+    }
+    if ed.fuss.has_expand_walk {
+        ed_msg(mut ed, MSG_INFO, "untracked directory scan is running")
+        return true
+    }
+    let p = git.fuss_item_path(ed.fuss.tree, row)
+    let ps = util.buf_to_str(p) else { return false }
+    let (ok, root) = fuss_join_root(ed, ps)
+    if !ok {
+        return false
+    }
+    fuss_expand_clear(mut ed)
+    for b in p {
+        (mut ed.fuss.expand_path).push(b)
+    }
+    ed.fuss.has_expand_path = true
+    var o = ws.walk_opts()
+    o.hidden = ed.fuss.opts.show_hidden
+    o.include_dirs = true
+    o.max_depth = 1
+    let (wok, w) = ws.walk_begin(root, o)
+    if !wok {
+        fuss_expand_clear(mut ed)
+        ed_msg(mut ed, MSG_ERROR, "cannot scan untracked directory")
+        return true
+    }
+    ed.fuss.expand_walk = w
+    ed.fuss.has_expand_walk = true
+    ed_msg(mut ed, MSG_INFO, "scanning untracked directory\u{2026}")
+    true
+}
+
+// `fuss_expand_children` + `fuss_expand_tick` (`fussmode.c:4292-4376`):
+// the scan's entries prefixed with the directory, ignored ones dropped
+// (unless hidden files are shown), spliced in one level and opened.
+fn fuss_expand_tick(mut ed: Ed) {
+    if !ed.fuss.has_expand_walk {
+        return
+    }
+    if ws.walk_step(mut ed.fuss.expand_walk, 2000) {
+        return
+    }
+    ws.walk_end(mut ed.fuss.expand_walk)
+    ed.fuss.has_expand_walk = false
+    let base = copy ed.fuss.expand_path
+    var lookup = git.fuss_sel_new()
+    git.fuss_sel_set(mut lookup, base, 0, base.len)
+    let row = git.fuss_row_of(ed.fuss.tree, lookup)
+    if row < 0 ||
+        row >= ed.fuss.tree.items.len ||
+        !git.fuss_item_path_eq(ed.fuss.tree, row, base, 0, base.len) {
+        fuss_expand_clear(mut ed)
+        return
+    }
+    let node = copy ed.fuss.tree.items[row].node
+    let live = git_snapshot(mut ed)
+    var kids = git.git_paths_new()
+    let found = copy ed.fuss.expand_walk.out
+    var i = 0
+    while i < found.paths.len {
+        let tail = found.paths[i].bytes()
+        if tail.len != 0 {
+            var full = copy base
+            (mut full).push(47 as byte)
+            for b in tail {
+                (mut full).push(b)
+            }
+            if ed.fuss.opts.show_hidden ||
+                !git.git_ignored(ed.git.snap[live].ignored, full, 0, full.len) {
+                let at = git.git_pool_add(mut kids.pool, full, 0, full.len)
+                (mut kids.rows).push(git.GitPathRow {
+                    at: at,
+                    len: full.len,
+                    is_dir: i < found.is_dir.len && found.is_dir[i],
+                })
+            }
+        }
+        i += 1
+    }
+    if git.fuss_expand_untracked(mut ed.fuss.tree, node, kids) {
+        let _ = git.fuss_open_memory_set(mut ed.fuss.manual_open, base, 0, base.len, true)
+        fuss_apply_effective(mut ed)
+        let r = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+        git.fuss_sel_from_row(mut ed.fuss.sel, ed.fuss.tree, r)
+        ed.fuss.draw_dirty = true
+        ed.footer_dirty = true
+    }
+    fuss_expand_clear(mut ed)
+}
+
+// ------------------------------------------------------------------
+// The commands (`fussmode.c:4378-5082`)
+// ------------------------------------------------------------------
+
+/// `ed.git.init`.
+pub fn fuss_cmd_init(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn0(mut ed, "init", fc_argv(["init"]))
+}
+
+/// `ed.git.actions` (`fussmode.c:4387-4395`).
+pub fn fuss_cmd_actions(mut ed: Ed, _cx: CmdCtx) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    fuss_actions_open(mut ed)
+    if picker_active(ed) then CMD_OK else CMD_ERR_STATE
+}
+
+/// `ed.git.mode.leave` (`fussmode.c:4397-4402`).
+pub fn fuss_cmd_leave(mut ed: Ed, _cx: CmdCtx) -> int {
+    mode_enter(mut ed, MODE_L)
+}
+
+/// `ed.git.tree.all` (`fussmode.c:4404-4421`).
+pub fn fuss_cmd_tree_all(mut ed: Ed, _cx: CmdCtx) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    ed.fuss.opts.all_files = !ed.fuss.opts.all_files
+    let _ = state_option_bool_set(mut ed, "git.tree.all_files", ed.fuss.opts.all_files)
+    let live = git_snapshot(mut ed)
+    fuss_build(mut ed, live, true)
+    fuss_walk_restart(mut ed)
+    ed_msg(
+        mut ed,
+        MSG_INFO,
+        "all-files tree {if ed.fuss.opts.all_files then "enabled" else "disabled"}",
+    )
+    CMD_OK
+}
+
+/// `ed.git.tree.hidden` (`fussmode.c:4423-4440`).
+pub fn fuss_cmd_tree_hidden(mut ed: Ed, _cx: CmdCtx) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    ed.fuss.opts.show_hidden = !ed.fuss.opts.show_hidden
+    let _ = state_option_bool_set(mut ed, "git.tree.show_hidden", ed.fuss.opts.show_hidden)
+    let live = git_snapshot(mut ed)
+    fuss_build(mut ed, live, true)
+    fuss_walk_restart(mut ed)
+    ed_msg(
+        mut ed,
+        MSG_INFO,
+        "hidden files {if ed.fuss.opts.show_hidden then "shown" else "hidden"}",
+    )
+    CMD_OK
+}
+
+/// `ed.git.nav.prev`.
+pub fn fuss_cmd_nav_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_nav(mut ed, cx, -1)
+}
+
+/// `ed.git.nav.next`.
+pub fn fuss_cmd_nav_next(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_nav(mut ed, cx, 1)
+}
+
+/// `ed.git.nav.parent`.
+pub fn fuss_cmd_nav_parent(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_nav(mut ed, cx, 3)
+}
+
+/// `ed.git.nav.enter`.
+pub fn fuss_cmd_nav_enter(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_nav(mut ed, cx, 4)
+}
+
+/// `ed.git.nav.row_prev`.
+pub fn fuss_cmd_nav_row_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_nav(mut ed, cx, -2)
+}
+
+/// `ed.git.nav.row_next`.
+pub fn fuss_cmd_nav_row_next(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_nav(mut ed, cx, 2)
+}
+
+/// `ed.git.nav.toggle` (`fussmode.c:4449-4480`): a directory opens or
+/// closes in the manual memory; one kept open by an open file says so.
+pub fn fuss_cmd_nav_toggle(mut ed: Ed, _cx: CmdCtx) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    let row = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+    if row < 0 ||
+        row >= ed.fuss.tree.items.len ||
+        ed.fuss.tree.items[row].node >= ed.fuss.tree.nodes.len {
+        return CMD_OK
+    }
+    let n = copy ed.fuss.tree.nodes[ed.fuss.tree.items[row].node]
+    if n.is_file {
+        return CMD_OK
+    }
+    if fuss_expand_start(mut ed) {
+        return CMD_OK
+    }
+    let p = git.fuss_item_path(ed.fuss.tree, row)
+    let remembered = git.fuss_open_memory_has(ed.fuss.manual_open, p, 0, p.len)
+    if n.expanded && !remembered {
+        ed_msg(mut ed, MSG_INFO, "kept open: contains an open file")
+        return CMD_OK
+    }
+    let _ = git.fuss_open_memory_set(mut ed.fuss.manual_open, p, 0, p.len, !n.expanded)
+    fuss_apply_effective(mut ed)
+    let r = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+    git.fuss_sel_from_row(mut ed.fuss.sel, ed.fuss.tree, r)
+    ed.fuss.draw_dirty = true
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+/// `ed.git.jump.arm` (`fussmode.c:4482-4491`).
+pub fn fuss_cmd_jump_arm(mut ed: Ed, _cx: CmdCtx) -> int {
+    if !ed.fuss.active {
+        return CMD_ERR_STATE
+    }
+    fuss_jump_arm(mut ed.fuss, now_ms())
+    ed.footer_dirty = true
+    CMD_OK
+}
+
+/// `ed.git.stage` (`add -- PATH`).
+pub fn fuss_cmd_stage(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_path_verb(mut ed, cx, "stage", fc_argv(["add"]), FUSS_TARGET_ANY, false)
+}
+
+/// `ed.git.unstage` (`restore --staged -- PATH`).
+pub fn fuss_cmd_unstage(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_path_verb(
+        mut ed,
+        cx,
+        "unstage",
+        fc_argv(["restore", "--staged"]),
+        FUSS_TARGET_STAGED,
+        false,
+    )
+}
+
+/// `ed.git.stage.all`.
+pub fn fuss_cmd_stage_all(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn0(mut ed, "stage-all", fc_argv(["add", "--all"]))
+}
+
+/// `ed.git.unstage.all`.
+pub fn fuss_cmd_unstage_all(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn(
+        mut ed,
+        "unstage-all",
+        fc_argv(["restore", "--staged", "--", "."]),
+        true,
+        List[byte](),
+        false,
+    )
+}
+
+/// `ed.git.commit`.
+pub fn fuss_cmd_commit(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_commit_open(mut ed, false)
+}
+
+/// `ed.git.commit.amend`.
+pub fn fuss_cmd_commit_amend(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_commit_open(mut ed, true)
+}
+
+/// `ed.git.push` (`fussmode.c:4536-4548`): a branch with no upstream
+/// picks its remote first.
+pub fn fuss_cmd_push(mut ed: Ed, _cx: CmdCtx) -> int {
+    let live = git_snapshot(mut ed)
+    if ed.git.snap[live].has_branch &&
+        (!ed.git.snap[live].has_upstream || ed.git.snap[live].upstream_len == 0) {
+        return fuss_pick_remotes(mut ed)
+    }
+    fuss_spawn0(mut ed, "push", fc_argv(["push"]))
+}
+
+/// `ed.git.push.force` (`fussmode.c:4550-4554`).
+pub fn fuss_cmd_push_force(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_prompt(
+        mut ed,
+        FUSS_PROMPT_PUSH_FORCE,
+        "",
+        "",
+        false,
+        "force-push \u{2014} type 'force' to confirm",
+    )
+}
+
+/// `ed.git.pull`.
+pub fn fuss_cmd_pull(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn0(mut ed, "pull", fc_argv(["pull"]))
+}
+
+/// `ed.git.fetch`.
+pub fn fuss_cmd_fetch(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn0(mut ed, "fetch", fc_argv(["fetch"]))
+}
+
+/// `ed.git.diff` (`diff HEAD -- PATH` into the viewer).
+pub fn fuss_cmd_diff(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_path_verb(mut ed, cx, "diff", fc_argv(["diff", "HEAD"]), FUSS_TARGET_FILE, true)
+}
+
+/// `ed.git.status` (into the viewer).
+pub fn fuss_cmd_status(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn(mut ed, "status", fc_argv(["status"]), false, List[byte](), true)
+}
+
+/// `ed.git.blame` (`blame --porcelain -- PATH` into the viewer).
+pub fn fuss_cmd_blame(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_path_verb(mut ed, cx, "blame", fc_argv(["blame", "--porcelain"]), FUSS_TARGET_FILE, true)
+}
+
+/// `ed.git.history` (`fussmode.c:4594-4604`).
+pub fn fuss_cmd_history(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn(
+        mut ed,
+        "log",
+        fc_argv(
+            ["log", "-n", "200", "--date-order", "--pretty=format:%h%x1f%at%x1f%an%x1f%d%x1f%s"],
+        ),
+        false,
+        List[byte](),
+        true,
+    )
+}
+
+/// `ed.git.reflog` (`fussmode.c:4606-4615`).
+pub fn fuss_cmd_reflog(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_spawn(
+        mut ed,
+        "reflog",
+        fc_argv(["reflog", "show", "-n", "200", "--pretty=format:%h%x1f%gd%x1f%at%x1f%gs"]),
+        false,
+        List[byte](),
+        true,
+    )
+}
+
+// `fuss_open_path` (`fussmode.c:4617-4670`): a directory toggles; a file
+// opens in its tab leaving F mode (`leave`), or is shown in the viewer.
+fn fuss_open_path(mut ed: Ed, cx: CmdCtx, leave: bool) -> int {
+    let row = git.fuss_row_of(ed.fuss.tree, ed.fuss.sel)
+    let is_dir = row >= 0 &&
+        row < ed.fuss.tree.items.len &&
+        ed.fuss.tree.items[row].node < ed.fuss.tree.nodes.len &&
+        !ed.fuss.tree.nodes[ed.fuss.tree.items[row].node].is_file
+    if !cx.has_sarg && is_dir {
+        return fuss_cmd_nav_toggle(mut ed, cx)
+    }
+    let (ok, path) = fuss_selected_path(ed, cx)
+    if !ok {
+        return CMD_ERR_ARG
+    }
+    let (pass, _) = fuss_target_guard(
+        mut ed,
+        path,
+        FUSS_TARGET_FILE,
+        if leave then "open" else "view",
+    )
+    if !pass {
+        return CMD_ERR_STATE
+    }
+    let (jok, absolute) = fuss_join_root(ed, path)
+    if !jok {
+        return CMD_ERR_ARG
+    }
+    let bi = ws_file_buf(mut ed, absolute)
+    if bi < 0 {
+        return CMD_ERR_IO
+    }
+    let was_resident = ed.bufs[bi].resident
+    if buf_hydrate(mut ed, bi) != 0 {
+        return CMD_ERR_IO
+    }
+    if !was_resident {
+        ed_hook_buffer(mut ed, fl.FL_EV_BUF_OPEN, bi)
+    }
+    if leave {
+        fuss_viewer_close(mut ed)
+        let tab = tab_open(mut ed, ed.bufs[bi].path)
+        if tab < 0 {
+            return CMD_ERR_STATE
+        }
+        if mode_enter(mut ed, MODE_L) != CMD_OK {
+            return CMD_ERR_STATE
+        }
+        tab_switch(mut ed, tab)
+        return CMD_OK
+    }
+    if fuss_show_buffer(mut ed, bi) then CMD_OK else CMD_ERR_STATE
+}
+
+/// `ed.git.view`.
+pub fn fuss_cmd_view(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_open_path(mut ed, cx, false)
+}
+
+/// `ed.git.open`.
+pub fn fuss_cmd_open(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_open_path(mut ed, cx, true)
+}
+
+// `fuss_open_split` (`fussmode.c:4674-4718`).
+fn fuss_open_split(mut ed: Ed, cx: CmdCtx, dir: int) -> int {
+    if !pane_live(ed, ed.focus) {
+        return CMD_ERR_STATE
+    }
+    let (ok, path) = fuss_selected_path(ed, cx)
+    if !ok {
+        return CMD_ERR_ARG
+    }
+    let (pass, _) = fuss_target_guard(mut ed, path, FUSS_TARGET_FILE, "open split")
+    if !pass {
+        return CMD_ERR_STATE
+    }
+    let (jok, absolute) = fuss_join_root(ed, path)
+    if !jok {
+        return CMD_ERR_ARG
+    }
+    let bi = ws_file_buf(mut ed, absolute)
+    if bi < 0 {
+        return CMD_ERR_IO
+    }
+    let was_resident = ed.bufs[bi].resident
+    if buf_hydrate(mut ed, bi) != 0 {
+        return CMD_ERR_IO
+    }
+    if !was_resident {
+        ed_hook_buffer(mut ed, fl.FL_EV_BUF_OPEN, bi)
+    }
+    let leaf = ed.focus
+    let split = pane_split(mut ed, leaf, dir)
+    if split < 0 {
+        ed_msg(mut ed, MSG_ERROR, "no room to split")
+        return CMD_ERR_STATE
+    }
+    let w = ed.panes[split].win
+    ed_win_set_buffer(mut ed, w, bi)
+    fuss_windows_changed(mut ed)
+    pane_refocus(mut ed, split)
+    if mode_enter(mut ed, MODE_L) != CMD_OK {
+        return CMD_ERR_STATE
+    }
+    CMD_OK
+}
+
+/// `ed.git.open_split_h`.
+pub fn fuss_cmd_open_split_h(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_open_split(mut ed, cx, SPLIT_H)
+}
+
+/// `ed.git.open_split_v`.
+pub fn fuss_cmd_open_split_v(mut ed: Ed, cx: CmdCtx) -> int {
+    fuss_open_split(mut ed, cx, SPLIT_V)
+}
+
+fn fc_sarg(cx: CmdCtx) -> (bool, str) {
+    if cx.has_sarg && cx.sarg.len != 0 {
+        for b in cx.sarg.bytes() {
+            if b as int == 0 {
+                return (false, "")
+            }
+        }
+        return (true, cx.sarg)
+    }
+    (false, "")
+}
+
+/// `ed.git.branch.switch` (`fussmode.c:4730-4749`).
+pub fn fuss_cmd_branch_switch(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, name) = fc_sarg(cx)
+    if has {
+        return fuss_spawn0(mut ed, "switch", fc_argv(["switch", "--", name]))
+    }
+    fuss_pick_branches(mut ed, FUSS_PICK_BRANCH_SWITCH)
+}
+
+/// `ed.git.branch.create` (`fussmode.c:4751-4775`).
+pub fn fuss_cmd_branch_create(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, name) = fc_sarg(cx)
+    if has {
+        if name.starts_with("-") {
+            ed_msg(mut ed, MSG_ERROR, "branch name must not begin with '-'")
+            return CMD_ERR_ARG
+        }
+        return fuss_spawn0(mut ed, "switch-create", fc_argv(["switch", "-c", name]))
+    }
+    fuss_prompt(mut ed, FUSS_PROMPT_BRANCH_CREATE, "", "", false, "new branch name")
+}
+
+/// `ed.git.branch.delete` (`fussmode.c:4777-4798`).
+pub fn fuss_cmd_branch_delete(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, name) = fc_sarg(cx)
+    if has {
+        return fuss_spawn0(mut ed, "branch-delete", fc_argv(["branch", "-d", "--", name]))
+    }
+    fuss_pick_branches(mut ed, FUSS_PICK_BRANCH_DELETE)
+}
+
+/// `ed.git.merge` (`fussmode.c:4800-4821`).
+pub fn fuss_cmd_merge(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, name) = fc_sarg(cx)
+    if has {
+        return fuss_spawn0(mut ed, "merge", fc_argv(["merge", "--no-edit", "--", name]))
+    }
+    fuss_pick_branches(mut ed, FUSS_PICK_MERGE)
+}
+
+/// `ed.git.reset` (`fussmode.c:4823-4857`): `[soft |mixed |hard ]REF`.
+pub fn fuss_cmd_reset(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, value) = fc_sarg(cx)
+    if has {
+        var mode = "--mixed"
+        var r = value
+        if value.len > 5 && value.starts_with("soft ") {
+            mode = "--soft"
+            r = value[5..value.len]
+        } else if value.len > 6 && value.starts_with("mixed ") {
+            r = value[6..value.len]
+        } else if value.len > 5 && value.starts_with("hard ") {
+            mode = "--hard"
+            r = value[5..value.len]
+        }
+        if r.len == 0 {
+            return CMD_ERR_ARG
+        }
+        return fuss_spawn0(mut ed, "reset", fc_argv(["reset", mode, r]))
+    }
+    fuss_pick_commits(mut ed, FUSS_PICK_RESET_COMMIT, "", false)
+}
+
+/// `ed.git.rebase.interactive` (`fussmode.c:4859-4874`).
+pub fn fuss_cmd_rebase_interactive(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, base) = fc_sarg(cx)
+    if has {
+        return fuss_rebase_prepare(mut ed, base)
+    }
+    fuss_pick_commits(mut ed, FUSS_PICK_REBASE, "", false)
+}
+
+/// `ed.git.rebase.continue`.
+pub fn fuss_cmd_rebase_continue(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_rebase_sync(mut ed, "--continue", "", false)
+}
+
+/// `ed.git.rebase.abort`.
+pub fn fuss_cmd_rebase_abort(mut ed: Ed, _cx: CmdCtx) -> int {
+    fuss_rebase_sync(mut ed, "--abort", "", false)
+}
+
+/// `ed.git.cherry_pick` (`fussmode.c:4889-4908`).
+pub fn fuss_cmd_cherry_pick(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, commit) = fc_sarg(cx)
+    if has {
+        return fuss_spawn0(mut ed, "cherry-pick", fc_argv(["cherry-pick", commit]))
+    }
+    fuss_pick_branches(mut ed, FUSS_PICK_CHERRY_BRANCH)
+}
+
+/// `ed.git.revert` (`fussmode.c:4910-4931`).
+pub fn fuss_cmd_revert(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, commit) = fc_sarg(cx)
+    if has {
+        return fuss_spawn0(mut ed, "revert", fc_argv(["revert", "--no-edit", commit]))
+    }
+    fuss_pick_commits(mut ed, FUSS_PICK_REVERT, "", false)
+}
+
+/// `ed.git.stash.push` (`fussmode.c:4933-4959`).
+pub fn fuss_cmd_stash_push(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.has_sarg {
+        let (has, message) = fc_sarg(cx)
+        if !has {
+            return CMD_ERR_ARG
+        }
+        return fuss_spawn0(mut ed, "stash-push", fc_argv(["stash", "push", "-m", message]))
+    }
+    fuss_prompt(mut ed, FUSS_PROMPT_STASH_PUSH, "", "", false, "stash message")
+}
+
+/// `ed.git.stash.pop` (`fussmode.c:4961-4979`).
+pub fn fuss_cmd_stash_pop(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, r) = fc_sarg(cx)
+    if has {
+        return fuss_spawn0(mut ed, "stash-pop", fc_argv(["stash", "pop", r]))
+    }
+    fuss_pick_stashes(mut ed)
+}
+
+/// `ed.git.tag` (`fussmode.c:4981-4999`).
+pub fn fuss_cmd_tag(mut ed: Ed, cx: CmdCtx) -> int {
+    let (has, name) = fc_sarg(cx)
+    if has {
+        return fuss_spawn0(mut ed, "tag", fc_argv(["tag", "--", name]))
+    }
+    fuss_prompt(
+        mut ed,
+        FUSS_PROMPT_TAG,
+        "",
+        "",
+        false,
+        "tag name; optional message on following lines",
+    )
+}
+
+/// `ed.git.discard` (`fussmode.c:5001-5017`): typed confirmation.
+pub fn fuss_cmd_discard(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, path) = fuss_selected_path(ed, cx)
+    if !ok {
+        return CMD_ERR_ARG
+    }
+    let (pass, _) = fuss_target_guard(mut ed, path, FUSS_TARGET_DIRTY_FILE, "discard")
+    if !pass {
+        return CMD_ERR_STATE
+    }
+    fuss_prompt(
+        mut ed,
+        FUSS_PROMPT_DISCARD,
+        "",
+        path,
+        true,
+        "type 'discard' to permanently discard the path",
+    )
+}
+
+/// `ed.git.file.delete` (`fussmode.c:5019-5034`).
+pub fn fuss_cmd_file_delete(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, path) = fuss_selected_path(ed, cx)
+    if !ok {
+        return CMD_ERR_ARG
+    }
+    let (pass, _) = fuss_target_guard(mut ed, path, FUSS_TARGET_FILE, "delete")
+    if !pass {
+        return CMD_ERR_STATE
+    }
+    fuss_prompt(
+        mut ed,
+        FUSS_PROMPT_DELETE,
+        "",
+        path,
+        true,
+        "type 'delete' to permanently delete the path",
+    )
+}
+
+/// `ed.git.file.rename` (`fussmode.c:5036-5048`): the prompt seeded with
+/// the path.
+pub fn fuss_cmd_file_rename(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, path) = fuss_selected_path(ed, cx)
+    if !ok {
+        return CMD_ERR_ARG
+    }
+    fuss_prompt(mut ed, FUSS_PROMPT_RENAME, path, path, true, "new workspace-relative path")
+}
+
+/// `ed.git.copy_path` (`fussmode.c:5050-5080`): the captured or selected
+/// path into register `+` (no repository needed).
+pub fn fuss_cmd_copy_path(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, path) = fuss_selected_path(ed, cx)
+    if !ok {
+        ed_msg(mut ed, MSG_ERROR, "no path is selected")
+        return CMD_ERR_ARG
+    }
+    var v = text.regval_new()
+    v.bytes = fc_bytes(path)
+    v.kind = text.REG_CHARWISE
+    text.reg_yank(mut ed.regs, '+' as int, v)
+    ed_msg(mut ed, MSG_INFO, "copied {path}")
+    CMD_OK
+}
