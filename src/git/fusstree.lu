@@ -1,0 +1,1645 @@
+//! git.fusstree — the FUSS tree, its flat item list, depth navigation, the
+//! open-directory memory and the selection held by path.
+//!
+//! Ports sagitta `src/mod/git/fusstree.c` (1,293 lines) and `fusstree.h`
+//! (154) at 9ace98c2, under `s52-fuss-mode.md` §2, §4, §7 and §8 and the
+//! pin's s56.5/s57.5 drawer model: the tree is built from a status
+//! snapshot (dirty files first; all files when the walk's list is merged),
+//! directories synthesised from path components with their flags the OR
+//! of their subtree's, children sorted directories first then
+//! case-insensitively with byte ties (`yew_sort_stable`), every directory
+//! COLLAPSED on a build and opened again by the two memories — the
+//! directories the user opened by hand and the ancestors of every open
+//! file (`yew_fuss_apply_expansion`) — and the selection a PATH resolved
+//! exact → nearest ancestor directory → row 0 (§7: an index-held
+//! selection lands on a different file after a refresh, the most dangerous
+//! thing fuss did).
+//!
+//! The port's shapes. Items carry a node INDEX, never a pointer (§2), as
+//! C's do. Every byte field is an `(at, len)` span of the tree's `pool`
+//! (C's tree arena): a node holds scalars only, so the node and item lists
+//! are RESET and refilled on a rebuild and the storage stays the session's
+//! one buffer each (G33), as `arena_free_all` keeps C's flat. An item's
+//! path is its node's (C stores the same arena pointer in both). C's
+//! comparator-driven `yew_sort_stable` calls are local bottom-up merges
+//! over index lists (G19/G20: no function value crosses a module). Paths
+//! are bytes throughout (invariant 2); the workspace walk's `FileList`
+//! paths are `str` (G40) and are taken as their bytes.
+
+use util
+use ws
+
+/// `FussMarkerKind` (`fusstree.h:35-41`).
+pub const FUSS_MARK_STAGED: int = 0
+
+/// The unstaged marker.
+pub const FUSS_MARK_UNSTAGED: int = 1
+
+/// The untracked marker.
+pub const FUSS_MARK_UNTRACKED: int = 2
+
+/// The incoming marker.
+pub const FUSS_MARK_INCOMING: int = 3
+
+/// The conflict marker (yew's one addition to fuss's vocabulary).
+pub const FUSS_MARK_CONFLICT: int = 4
+
+/// `FussNode` (`fusstree.h:13-33`): scalars and `(at, len)` spans of the
+/// tree's pool. A conflicted node renders only the conflict marker; staged
+/// and unstaged stay aggregated so descendants keep their exact status.
+pub struct FussNode {
+    name_at: int,
+    name_len: int,
+    path_at: int,
+    path_len: int,
+    first_child: int,
+    next_sibling: int,
+    parent: int,
+    is_file: bool,
+    expanded: bool,
+    staged: bool,
+    unstaged: bool,
+    untracked: bool,
+    incoming: bool,
+    conflicted: bool,
+    ignored: bool,
+    untracked_dir: bool,
+    untracked_loaded: bool,
+}
+
+fn node_new() -> FussNode {
+    FussNode {
+        name_at: 0,
+        name_len: 0,
+        path_at: 0,
+        path_len: 0,
+        first_child: 0,
+        next_sibling: 0,
+        parent: 0,
+        is_file: false,
+        expanded: false,
+        staged: false,
+        unstaged: false,
+        untracked: false,
+        incoming: false,
+        conflicted: false,
+        ignored: false,
+        untracked_dir: false,
+        untracked_loaded: false,
+    }
+}
+
+/// `yew_fuss_marker_kinds` (`fusstree.c:9-28`): the locked marker order
+/// (staged, unstaged, untracked, incoming); a conflict replaces them all.
+/// Answers the count and up to four kinds.
+pub fn fuss_marker_kinds(n: FussNode) -> (int, int, int, int, int) {
+    (
+        fuss_marker_count(n),
+        fuss_marker_at(n, 0),
+        fuss_marker_at(n, 1),
+        fuss_marker_at(n, 2),
+        fuss_marker_at(n, 3),
+    )
+}
+
+/// The `idx`th marker of the locked order, -1 past the last (no list built:
+/// a drawn row asks for each in turn).
+pub fn fuss_marker_at(n: FussNode, idx: int) -> int {
+    if n.conflicted {
+        return if idx == 0 then FUSS_MARK_CONFLICT else -1
+    }
+    var k = 0
+    if n.staged {
+        if k == idx {
+            return FUSS_MARK_STAGED
+        }
+        k += 1
+    }
+    if n.unstaged {
+        if k == idx {
+            return FUSS_MARK_UNSTAGED
+        }
+        k += 1
+    }
+    if n.untracked {
+        if k == idx {
+            return FUSS_MARK_UNTRACKED
+        }
+        k += 1
+    }
+    if n.incoming {
+        if k == idx {
+            return FUSS_MARK_INCOMING
+        }
+        k += 1
+    }
+    -1
+}
+
+/// The marker count alone (no list built: the drawing and width paths).
+pub fn fuss_marker_count(n: FussNode) -> int {
+    if n.conflicted {
+        return 1
+    }
+    (if n.staged then 1 else 0) +
+        (if n.unstaged then 1 else 0) +
+        (if n.untracked then 1 else 0) +
+        (if n.incoming then 1 else 0)
+}
+
+/// `FussItem` (`fusstree.h:43-49`): one visible row.
+pub struct FussItem {
+    node: int,
+    depth: int,
+    is_file: bool,
+}
+
+/// One path of a `FussOpenMemory` (`FussOpenPath`).
+pub struct FussOpenRow {
+    at: int,
+    len: int,
+}
+
+/// `FussOpenMemory` (`fusstree.h:68-77`): a sorted, owned set of
+/// workspace-relative paths.
+pub struct FussOpenMemory {
+    pool: List[byte],
+    rows: List[FussOpenRow],
+}
+
+// A cached one-level untracked listing across a rebuild
+// (`CachedUntrackedDir`, `fusstree.c:727-731`): the directory's path and
+// its children, spans of `FussTree.c_pool`.
+struct CachedDir {
+    at: int,
+    len: int,
+    first: int,
+    count: int,
+}
+
+/// `FussTree` (`fusstree.h:84-97`). `nodes[0]` is the unshown root;
+/// `items` is the flattened, expanded view; `repo_prefix` is the
+/// repository-relative path of the workspace root. The `s_`/`c_`/`f_`
+/// lists are the build's reusable scratch.
+pub struct FussTree {
+    pool: List[byte],
+    nodes: List[FussNode],
+    items: List[FussItem],
+    repo_prefix: List[byte],
+    snap_gen: int,
+    opts_valid: bool,
+    scope_valid: bool,
+    all_files: bool,
+    show_hidden: bool,
+    files_merged: bool,
+    s_order: List[int],
+    s_merge: List[int],
+    s_at: List[int],
+    s_len: List[int],
+    s_kids: List[int],
+    sp_nodes: List[int],
+    sp_tails: List[int],
+    c_pool: List[byte],
+    c_dirs: List[CachedDir],
+    c_kids: List[GitPathRow],
+}
+
+/// `FussOpts` (`fusstree.h:99-102`).
+pub struct FussOpts {
+    all_files: bool,
+    show_hidden: bool,
+}
+
+/// `FussSel` (`fusstree.h:104-110`): the selection owns its path, so it
+/// survives the tree being rebuilt beneath it.
+pub struct FussSel {
+    path: List[byte],
+    has: bool,
+}
+
+/// No selection.
+pub fn fuss_sel_new() -> FussSel {
+    FussSel { path: List[byte](), has: false }
+}
+
+/// `yew_fuss_tree_init` (`fusstree.c:189-196`).
+pub fn fuss_tree_new() -> FussTree {
+    FussTree {
+        pool: List[byte](),
+        nodes: List[FussNode](),
+        items: List[FussItem](),
+        repo_prefix: List[byte](),
+        snap_gen: 0,
+        opts_valid: false,
+        scope_valid: true,
+        all_files: false,
+        show_hidden: false,
+        files_merged: false,
+        s_order: List[int](),
+        s_merge: List[int](),
+        s_at: List[int](),
+        s_len: List[int](),
+        s_kids: List[int](),
+        sp_nodes: List[int](),
+        sp_tails: List[int](),
+        c_pool: List[byte](),
+        c_dirs: List[CachedDir](),
+        c_kids: List[GitPathRow](),
+    }
+}
+
+/// Node `i`'s workspace-relative path, copied.
+pub fn fuss_node_path(t: FussTree, i: int) -> List[byte] {
+    span_copy(t.pool, t.nodes[i].path_at, t.nodes[i].path_len)
+}
+
+/// Node `i`'s name (one component), copied.
+pub fn fuss_node_name(t: FussTree, i: int) -> List[byte] {
+    span_copy(t.pool, t.nodes[i].name_at, t.nodes[i].name_len)
+}
+
+/// Item `row`'s path, copied (C's `item->path`).
+pub fn fuss_item_path(t: FussTree, row: int) -> List[byte] {
+    fuss_node_path(t, t.items[row].node)
+}
+
+/// Item `row`'s path equals `want[wa..wa+wn)` (no copy).
+pub fn fuss_item_path_eq(t: FussTree, row: int, want: List[byte], wa: int, wn: int) -> bool {
+    let n = t.items[row].node
+    span_cmp(t.pool, t.nodes[n].path_at, t.nodes[n].path_len, want, wa, wn) == 0
+}
+
+fn span_copy(b: List[byte], at: int, len: int) -> List[byte] {
+    var out = List[byte]()
+    if len > 0 {
+        (mut out).reserve(len)
+    }
+    var i = 0
+    while i < len {
+        (mut out).push(b[at + i])
+        i += 1
+    }
+    out
+}
+
+// `open_path_cmp` (`fusstree.c:30-38`), C's `memcmp`-then-length order.
+fn span_cmp(a: List[byte], aa: int, an: int, b: List[byte], ba: int, bn: int) -> int {
+    let common = if an < bn then an else bn
+    var i = 0
+    while i < common {
+        let x = a[aa + i] as int
+        let y = b[ba + i] as int
+        if x != y {
+            return if x < y then -1 else 1
+        }
+        i += 1
+    }
+    if an < bn {
+        return -1
+    }
+    if an > bn {
+        return 1
+    }
+    0
+}
+
+/// `yew_fuss_open_memory_init` (`fusstree.c:63-67`).
+pub fn fuss_open_memory_new() -> FussOpenMemory {
+    FussOpenMemory { pool: List[byte](), rows: List[FussOpenRow]() }
+}
+
+/// `yew_fuss_open_memory_drop` then `_init`: empty, storage kept.
+pub fn fuss_open_memory_clear(mut m: FussOpenMemory) {
+    (mut m.pool).reset()
+    (mut m.rows).reset()
+}
+
+// `open_memory_find` (`fusstree.c:40-61`): the lower bound and whether it
+// is an exact hit.
+fn open_memory_find(m: FussOpenMemory, path: List[byte], pa: int, plen: int) -> (int, bool) {
+    var lo = 0
+    var hi = m.rows.len
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if span_cmp(m.pool, m.rows[mid].at, m.rows[mid].len, path, pa, plen) < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    let found = lo < m.rows.len &&
+        span_cmp(m.pool, m.rows[lo].at, m.rows[lo].len, path, pa, plen) == 0
+    (lo, found)
+}
+
+/// `yew_fuss_open_memory_has` (`fusstree.c:81-90`).
+pub fn fuss_open_memory_has(m: FussOpenMemory, path: List[byte], pa: int, plen: int) -> bool {
+    let (_, found) = open_memory_find(m, path, pa, plen)
+    found
+}
+
+/// Path `i` of the memory, copied.
+pub fn fuss_open_memory_path(m: FussOpenMemory, i: int) -> List[byte] {
+    span_copy(m.pool, m.rows[i].at, m.rows[i].len)
+}
+
+/// `yew_fuss_open_memory_set` (`fusstree.c:92-136`): insert (`expanded`)
+/// or remove one path, keeping the set sorted; answers whether it changed.
+/// A removed path's bytes stay in the pool until the memory is cleared.
+pub fn fuss_open_memory_set(
+    mut m: FussOpenMemory,
+    path: List[byte],
+    pa: int,
+    plen: int,
+    expanded: bool,
+) -> bool {
+    if plen == 0 {
+        return false
+    }
+    let (at, found) = open_memory_find(m, path, pa, plen)
+    if expanded {
+        if found {
+            return false
+        }
+        let start = m.pool.len
+        var i = 0
+        while i < plen {
+            (mut m.pool).push(path[pa + i])
+            i += 1
+        }
+        (mut m.rows).push(FussOpenRow { at: 0, len: 0 })
+        var k = m.rows.len - 1
+        while k > at {
+            m.rows[k] = copy m.rows[k - 1]
+            k -= 1
+        }
+        m.rows[at] = FussOpenRow { at: start, len: plen }
+        return true
+    }
+    if !found {
+        return false
+    }
+    var k = at
+    while k + 1 < m.rows.len {
+        m.rows[k] = copy m.rows[k + 1]
+        k += 1
+    }
+    let _ = (mut m.rows).pop()
+    true
+}
+
+// `tree_reset` (`fusstree.c:209-215`).
+fn tree_reset(mut t: FussTree) {
+    (mut t.pool).reset()
+    (mut t.nodes).reset()
+    (mut t.items).reset()
+}
+
+// `root_path_len` (`fusstree.c:217-224`): trailing slashes dropped, `/`
+// kept.
+fn root_path_len(path: str) -> int {
+    var len = path.len
+    while len > 1 && path.bytes()[len - 1] as int == 47 {
+        len -= 1
+    }
+    len
+}
+
+/// `yew_fuss_tree_scope_roots` (`fusstree.c:226-281`): porcelain paths are
+/// repository-relative; record the workspace's repository-relative prefix
+/// so out-of-scope entries are filtered and the rest stripped. A change of
+/// scope drops the tree. Answers whether the workspace is inside the
+/// repository.
+pub fn fuss_tree_scope_roots(mut t: FussTree, repo_root: str, workspace_root: str) -> bool {
+    let repo_len = root_path_len(repo_root)
+    let ws_len = root_path_len(workspace_root)
+    var valid = false
+    var prefix_at = 0
+    var prefix_len = 0
+    if repo_len != 0 && ws_len >= repo_len && prefix_eq(repo_root, workspace_root, repo_len) {
+        if ws_len == repo_len {
+            valid = true
+        } else if repo_len == 1 && repo_root.bytes()[0] as int == 47 {
+            valid = true
+            prefix_at = 1
+            prefix_len = ws_len - 1
+        } else if workspace_root.bytes()[repo_len] as int == 47 {
+            valid = true
+            prefix_at = repo_len + 1
+            prefix_len = ws_len - prefix_at
+        }
+    }
+    var same = t.scope_valid == valid && t.repo_prefix.len == (if valid then prefix_len else 0)
+    if same && prefix_len != 0 {
+        var i = 0
+        while i < prefix_len {
+            if t.repo_prefix[i] != workspace_root.bytes()[prefix_at + i] {
+                same = false
+                break
+            }
+            i += 1
+        }
+    }
+    if same {
+        return valid
+    }
+    tree_reset(mut t)
+    (mut t.repo_prefix).reset()
+    if valid {
+        var i = 0
+        while i < prefix_len {
+            (mut t.repo_prefix).push(workspace_root.bytes()[prefix_at + i])
+            i += 1
+        }
+    }
+    t.scope_valid = valid
+    t.snap_gen = 0
+    t.opts_valid = false
+    t.files_merged = false
+    valid
+}
+
+fn prefix_eq(a: str, b: str, n: int) -> bool {
+    var i = 0
+    while i < n {
+        if a.bytes()[i] != b.bytes()[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `scoped_path` (`fusstree.c:283-315`): `p[at..at+len)` in workspace
+// coordinates; answers (in scope, at, len).
+fn scoped_path(t: FussTree, p: List[byte], at: int, len: int) -> (bool, int, int) {
+    if !t.scope_valid || len == 0 {
+        return (false, 0, 0)
+    }
+    let pl = t.repo_prefix.len
+    if pl == 0 {
+        return (true, at, len)
+    }
+    if len <= pl || span_cmp(p, at, pl, t.repo_prefix, 0, pl) != 0 || p[at + pl] as int != 47 {
+        return (false, 0, 0)
+    }
+    let na = at + pl + 1
+    let nl = len - pl - 1
+    if nl == 0 {
+        return (false, 0, 0)
+    }
+    (true, na, nl)
+}
+
+/// `scoped_ignored` (`fusstree.c:317-342`): `path[pa..pa+plen)` (workspace
+/// coordinates) is ignored by the set: exact, the directory itself, or
+/// below an ignored directory.
+pub fn fuss_scoped_ignored(
+    t: FussTree,
+    set: GitPaths,
+    path: List[byte],
+    pa: int,
+    plen: int,
+) -> bool {
+    var i = 0
+    while i < set.rows.len {
+        let (ok, ia, il) = scoped_path(t, set.pool, set.rows[i].at, set.rows[i].len)
+        if ok {
+            let directory = il != 0 && set.pool[ia + il - 1] as int == 47
+            if il == plen && span_cmp(set.pool, ia, il, path, pa, plen) == 0 ||
+                directory && il - 1 == plen && span_cmp(set.pool, ia, plen, path, pa, plen) == 0 ||
+                directory && il <= plen && span_cmp(set.pool, ia, il, path, pa, il) == 0 {
+                return true
+            }
+        }
+        i += 1
+    }
+    false
+}
+
+// `ascii_fold` (`fusstree.c:349-354`).
+fn ascii_fold(c: int) -> int {
+    if c >= 65 && c <= 90 then c + 32 else c
+}
+
+// `name_case_cmp` (`fusstree.c:356-372`): case-insensitive, then shorter,
+// then bytes.
+fn name_case_cmp(t: FussTree, a: int, b: int) -> int {
+    let an = t.nodes[a].name_len
+    let bn = t.nodes[b].name_len
+    let aa = t.nodes[a].name_at
+    let ba = t.nodes[b].name_at
+    let common = if an < bn then an else bn
+    var i = 0
+    while i < common {
+        let ac = ascii_fold(t.pool[aa + i] as int)
+        let bc = ascii_fold(t.pool[ba + i] as int)
+        if ac != bc {
+            return if ac < bc then -1 else 1
+        }
+        i += 1
+    }
+    if an != bn {
+        return if an < bn then -1 else 1
+    }
+    span_cmp(t.pool, aa, common, t.pool, ba, common)
+}
+
+// `child_cmp` (`fusstree.c:374-383`): directories before files.
+fn child_cmp(t: FussTree, a: int, b: int) -> int {
+    if t.nodes[a].is_file != t.nodes[b].is_file {
+        return if t.nodes[a].is_file then 1 else -1
+    }
+    name_case_cmp(t, a, b)
+}
+
+// `sort_children` (`fusstree.c:385-415`): each node's child list in
+// `child_cmp` order, stably, relinked.
+fn sort_children(mut t: FussTree) {
+    if t.nodes.len < 2 {
+        return
+    }
+    var parent = 0
+    while parent < t.nodes.len {
+        (mut t.s_kids).reset()
+        var child = t.nodes[parent].first_child
+        while child != 0 {
+            (mut t.s_kids).push(child)
+            child = t.nodes[child].next_sibling
+        }
+        let n = t.s_kids.len
+        if n < 2 {
+            parent += 1
+            continue
+        }
+        var i = 1
+        var sorted = true
+        while i < n {
+            if child_cmp(t, t.s_kids[i - 1], t.s_kids[i]) > 0 {
+                sorted = false
+                break
+            }
+            i += 1
+        }
+        if sorted {
+            parent += 1
+            continue
+        }
+        merge_kids(mut t, n)
+        t.nodes[parent].first_child = t.s_kids[0]
+        i = 1
+        while i < n {
+            let prev = t.s_kids[i - 1]
+            t.nodes[prev].next_sibling = t.s_kids[i]
+            i += 1
+        }
+        let last = t.s_kids[n - 1]
+        t.nodes[last].next_sibling = 0
+        parent += 1
+    }
+}
+
+// A stable bottom-up merge of `t.s_kids[0..n)` by `child_cmp`.
+fn merge_kids(mut t: FussTree, n: int) {
+    var width = 1
+    while width < n {
+        (mut t.s_merge).reset()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if mid + width < n then mid + width else n
+            var l = lo
+            var r = mid
+            while l < mid && r < hi {
+                let ri = t.s_kids[r]
+                let li = t.s_kids[l]
+                if child_cmp(t, ri, li) < 0 {
+                    (mut t.s_merge).push(ri)
+                    r += 1
+                } else {
+                    (mut t.s_merge).push(li)
+                    l += 1
+                }
+            }
+            while l < mid {
+                let x = t.s_kids[l]
+                (mut t.s_merge).push(x)
+                l += 1
+            }
+            while r < hi {
+                let x = t.s_kids[r]
+                (mut t.s_merge).push(x)
+                r += 1
+            }
+            lo += width * 2
+        }
+        var i = 0
+        while i < n {
+            t.s_kids[i] = t.s_merge[i]
+            i += 1
+        }
+        width *= 2
+    }
+}
+
+// `find_child` (`fusstree.c:417-431`): `parent`'s child named
+// `name[na..na+nl)`, or 0.
+fn find_child(t: FussTree, parent: int, name: List[byte], na: int, nl: int) -> int {
+    if parent >= t.nodes.len {
+        return 0
+    }
+    var child = t.nodes[parent].first_child
+    while child != 0 {
+        if span_cmp(t.pool, t.nodes[child].name_at, t.nodes[child].name_len, name, na, nl) == 0 {
+            return child
+        }
+        child = t.nodes[child].next_sibling
+    }
+    0
+}
+
+// `add_child` (`fusstree.c:433-469`): a new first child, its path the
+// parent's joined with the name.
+fn add_child(
+    mut t: FussTree,
+    parent: int,
+    name: List[byte],
+    na: int,
+    nl: int,
+    is_file: bool,
+) -> int {
+    var node = node_new()
+    let ppa = t.nodes[parent].path_at
+    let ppl = t.nodes[parent].path_len
+    let path_at = t.pool.len
+    if parent != 0 {
+        var i = 0
+        while i < ppl {
+            let x = t.pool[ppa + i]
+            (mut t.pool).push(x)
+            i += 1
+        }
+        (mut t.pool).push(47 as byte)
+    }
+    let name_at = t.pool.len
+    var i = 0
+    while i < nl {
+        (mut t.pool).push(name[na + i])
+        i += 1
+    }
+    node.name_at = name_at
+    node.name_len = nl
+    node.path_at = path_at
+    node.path_len = t.pool.len - path_at
+    node.parent = parent
+    node.is_file = is_file
+    node.expanded = false
+    node.next_sibling = t.nodes[parent].first_child
+    (mut t.nodes).push(node)
+    let index = t.nodes.len - 1
+    t.nodes[parent].first_child = index
+    index
+}
+
+// `path_hidden` (`fusstree.c:471-484`): some component starts with `.`.
+fn path_hidden(p: List[byte], at: int, len: int) -> bool {
+    var i = 0
+    while i < len {
+        let start = i
+        while i < len && p[at + i] as int != 47 {
+            i += 1
+        }
+        if i > start && p[at + start] as int == 46 {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+// `add_path` (`fusstree.c:486-517`): every component of `p[at..at+len)`
+// found or added; answers the last node.
+fn add_path(mut t: FussTree, p: List[byte], at: int, len_in: int, is_dir: bool) -> int {
+    var len = len_in
+    while len > 0 && p[at + len - 1] as int == 47 {
+        len -= 1
+    }
+    var parent = 0
+    var i = 0
+    while i < len {
+        let start = i
+        while i < len && p[at + i] as int != 47 {
+            i += 1
+        }
+        if i == start {
+            i += 1
+            continue
+        }
+        let last = i == len
+        var child = find_child(t, parent, p, at + start, i - start)
+        if child == 0 {
+            child = add_child(mut t, parent, p, at + start, i - start, last && !is_dir)
+        }
+        if !last {
+            t.nodes[child].is_file = false
+        }
+        parent = child
+        i += 1
+    }
+    parent
+}
+
+// `SortedPathState` (`fusstree.c:519-527`): the previous path (a span of
+// the same source buffer), its node per depth (`t.sp_nodes`) and each
+// parent's last child (`t.sp_tails`).
+struct SortedState {
+    prev_at: int,
+    prev_len: int,
+    has_prev: bool,
+    depth: int,
+}
+
+// `add_sorted_child` (`fusstree.c:529-560`): appended at the parent's tail
+// so a sorted input keeps its order without a search.
+fn add_sorted_child(
+    mut t: FussTree,
+    parent: int,
+    name: List[byte],
+    na: int,
+    nl: int,
+    is_file: bool,
+) -> int {
+    while t.sp_tails.len <= parent {
+        (mut t.sp_tails).push(0)
+    }
+    let old_first = t.nodes[parent].first_child
+    let child = add_child(mut t, parent, name, na, nl, is_file)
+    if t.sp_tails[parent] == 0 {
+        t.sp_tails[parent] = child
+    } else {
+        t.nodes[parent].first_child = old_first
+        let tail = t.sp_tails[parent]
+        t.nodes[tail].next_sibling = child
+        t.nodes[child].next_sibling = 0
+        t.sp_tails[parent] = child
+    }
+    child
+}
+
+// `add_sorted_path` (`fusstree.c:562-631`): the common prefix with the
+// previous path reuses its nodes.
+fn add_sorted_path(
+    mut t: FussTree,
+    mut st: SortedState,
+    p: List[byte],
+    at: int,
+    len_in: int,
+    is_dir: bool,
+) -> int {
+    var len = len_in
+    while len > 0 && p[at + len - 1] as int == 47 {
+        len -= 1
+    }
+    var pi = 0
+    var i = 0
+    var common = 0
+    while st.has_prev && pi < st.prev_len && i < len {
+        let ps = pi
+        let s = i
+        while pi < st.prev_len && p[st.prev_at + pi] as int != 47 {
+            pi += 1
+        }
+        while i < len && p[at + i] as int != 47 {
+            i += 1
+        }
+        if pi - ps != i - s || span_cmp(p, st.prev_at + ps, pi - ps, p, at + s, i - s) != 0 {
+            break
+        }
+        common += 1
+        pi += 1
+        i += 1
+    }
+    if common > st.depth {
+        common = st.depth
+    }
+    var depth = 0
+    var parent = 0
+    i = 0
+    while i < len {
+        let start = i
+        while i < len && p[at + i] as int != 47 {
+            i += 1
+        }
+        if i == start {
+            i += 1
+            continue
+        }
+        let last = i == len
+        while t.sp_nodes.len <= depth {
+            (mut t.sp_nodes).push(0)
+        }
+        var child = 0
+        if depth < common {
+            child = t.sp_nodes[depth]
+        } else {
+            child = add_sorted_child(mut t, parent, p, at + start, i - start, last && !is_dir)
+        }
+        t.sp_nodes[depth] = child
+        if !last {
+            t.nodes[child].is_file = false
+        }
+        parent = child
+        depth += 1
+        i += 1
+    }
+    st.prev_at = at
+    st.prev_len = len
+    st.has_prev = true
+    st.depth = depth
+    parent
+}
+
+// `path_below_untracked_dir` (`fusstree.c:633-658`).
+fn path_below_untracked_dir(t: FussTree, p: List[byte], at: int, len: int) -> bool {
+    var parent = 0
+    var i = 0
+    while i < len {
+        let start = i
+        while i < len && p[at + i] as int != 47 {
+            i += 1
+        }
+        if i == start {
+            i += 1
+            continue
+        }
+        let child = find_child(t, parent, p, at + start, i - start)
+        if child == 0 {
+            return false
+        }
+        if i < len && t.nodes[child].untracked_dir {
+            return true
+        }
+        parent = child
+        i += 1
+    }
+    false
+}
+
+// `aggregate_flags` (`fusstree.c:711-725`): children were appended after
+// their parents, so a reverse walk ORs every subtree up.
+fn aggregate_flags(mut t: FussTree) {
+    var i = t.nodes.len
+    while i > 1 {
+        let n = i - 1
+        let p = t.nodes[n].parent
+        if t.nodes[n].staged {
+            t.nodes[p].staged = true
+        }
+        if t.nodes[n].unstaged {
+            t.nodes[p].unstaged = true
+        }
+        if t.nodes[n].untracked {
+            t.nodes[p].untracked = true
+        }
+        if t.nodes[n].incoming {
+            t.nodes[p].incoming = true
+        }
+        if t.nodes[n].conflicted {
+            t.nodes[p].conflicted = true
+        }
+        if t.nodes[n].ignored {
+            t.nodes[p].ignored = true
+        }
+        i -= 1
+    }
+}
+
+// `cache_untracked_dirs` (`fusstree.c:733-790`): every loaded untracked
+// directory's path and children, into the cache scratch.
+fn cache_untracked_dirs(mut t: FussTree) {
+    (mut t.c_pool).reset()
+    (mut t.c_dirs).reset()
+    (mut t.c_kids).reset()
+    var i = 1
+    while i < t.nodes.len {
+        if !t.nodes[i].untracked_dir || !t.nodes[i].untracked_loaded {
+            i += 1
+            continue
+        }
+        let at = t.c_pool.len
+        copy_span_into(mut t, t.nodes[i].path_at, t.nodes[i].path_len)
+        let first = t.c_kids.len
+        var child = t.nodes[i].first_child
+        while child != 0 {
+            let ca = t.c_pool.len
+            copy_span_into(mut t, t.nodes[child].path_at, t.nodes[child].path_len)
+            if !t.nodes[child].is_file {
+                (mut t.c_pool).push(47 as byte)
+            }
+            (mut t.c_kids).push(GitPathRow {
+                at: ca,
+                len: t.c_pool.len - ca,
+                is_dir: !t.nodes[child].is_file,
+            })
+            child = t.nodes[child].next_sibling
+        }
+        (mut t.c_dirs).push(CachedDir {
+            at: at,
+            len: t.nodes[i].path_len,
+            first: first,
+            count: t.c_kids.len - first,
+        })
+        i += 1
+    }
+}
+
+fn copy_span_into(mut t: FussTree, at: int, len: int) {
+    var i = 0
+    while i < len {
+        let x = t.pool[at + i]
+        (mut t.c_pool).push(x)
+        i += 1
+    }
+}
+
+// `node_for_path` (`fusstree.c:792-801`).
+fn node_for_path(t: FussTree, p: List[byte], at: int, len: int) -> int {
+    var i = 1
+    while i < t.nodes.len {
+        if span_cmp(t.pool, t.nodes[i].path_at, t.nodes[i].path_len, p, at, len) == 0 {
+            return i
+        }
+        i += 1
+    }
+    0
+}
+
+/// `yew_fuss_build` (`fusstree.c:803-900`): the status tree, dirty-first
+/// unless `all_files`, hidden and ignored rows out unless `show_hidden`,
+/// every directory collapsed, loaded untracked listings carried across.
+/// A tree already built from this generation with these options is kept.
+pub fn fuss_build(mut t: FussTree, s: GitSnapshot, o: FussOpts) {
+    if t.nodes.len != 0 &&
+        t.opts_valid &&
+        t.snap_gen == s.gen &&
+        t.all_files == o.all_files &&
+        t.show_hidden == o.show_hidden {
+        return
+    }
+    var cached = false
+    if t.nodes.len != 0 {
+        // A lazy walk is filtered by the visibility policy of its time; it
+        // does not survive a hidden-policy change.
+        if !t.opts_valid || t.show_hidden == o.show_hidden {
+            cache_untracked_dirs(mut t)
+            cached = true
+        }
+    }
+    if !cached {
+        (mut t.c_dirs).reset()
+    }
+    tree_reset(mut t)
+    var root = node_new()
+    root.expanded = true
+    (mut t.nodes).push(root)
+    // Entries in byte order (C sorts only when they are not already).
+    let n = s.entries.len
+    (mut t.s_at).reset()
+    (mut t.s_len).reset()
+    for e in s.entries {
+        (mut t.s_at).push(e.path_at)
+        (mut t.s_len).push(e.path_len)
+    }
+    sort_spans(mut t, s.pool, n)
+    var st = SortedState { prev_at: 0, prev_len: 0, has_prev: false, depth: 0 }
+    (mut t.sp_nodes).reset()
+    (mut t.sp_tails).reset()
+    var k = 0
+    while k < n {
+        let e = copy s.entries[t.s_order[k]]
+        k += 1
+        if e.path_len == 0 {
+            continue
+        }
+        let (ok, pa, pl) = scoped_path(t, s.pool, e.path_at, e.path_len)
+        if !ok {
+            continue
+        }
+        let ignored = e.kind == GIT_E_IGNORED ||
+            git_ignored(s.ignored, s.pool, e.path_at, e.path_len)
+        let dirty = e.staged || e.unstaged || e.untracked || e.incoming || e.conflicted || ignored
+        if !dirty && !o.all_files {
+            continue
+        }
+        if !o.show_hidden && (ignored || path_hidden(s.pool, pa, pl)) {
+            continue
+        }
+        let node = add_sorted_path(
+            mut t,
+            mut st,
+            s.pool,
+            pa,
+            pl,
+            e.is_dir || s.pool[e.path_at + e.path_len - 1] as int == 47,
+        )
+        if node != 0 {
+            node_apply_entry(mut t, node, e, ignored)
+        }
+    }
+    aggregate_flags(mut t)
+    sort_children(mut t)
+    t.snap_gen = s.gen
+    t.opts_valid = true
+    t.all_files = o.all_files
+    t.show_hidden = o.show_hidden
+    t.files_merged = false
+    var c = 0
+    while c < t.c_dirs.len {
+        let d = copy t.c_dirs[c]
+        let node = node_for_path(t, t.c_pool, d.at, d.len)
+        if node != 0 && t.nodes[node].untracked_dir {
+            let _ = expand_untracked_cached(mut t, node, d.first, d.count)
+        }
+        c += 1
+    }
+    var i = 1
+    while i < t.nodes.len {
+        if !t.nodes[i].is_file {
+            t.nodes[i].expanded = false
+        }
+        i += 1
+    }
+    fuss_flatten(mut t)
+}
+
+// The stable order of `t.s_at`/`t.s_len` spans of `pool` into `t.s_order`.
+fn sort_spans(mut t: FussTree, pool: List[byte], n: int) {
+    (mut t.s_order).reset()
+    var i = 0
+    while i < n {
+        (mut t.s_order).push(i)
+        i += 1
+    }
+    var sorted = true
+    i = 1
+    while i < n {
+        if span_cmp(pool, t.s_at[i], t.s_len[i], pool, t.s_at[i - 1], t.s_len[i - 1]) < 0 {
+            sorted = false
+            break
+        }
+        i += 1
+    }
+    if sorted {
+        return
+    }
+    var width = 1
+    while width < n {
+        (mut t.s_merge).reset()
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n then lo + width else n
+            let hi = if mid + width < n then mid + width else n
+            var l = lo
+            var r = mid
+            while l < mid && r < hi {
+                let ri = t.s_order[r]
+                let li = t.s_order[l]
+                if span_cmp(pool, t.s_at[ri], t.s_len[ri], pool, t.s_at[li], t.s_len[li]) < 0 {
+                    (mut t.s_merge).push(ri)
+                    r += 1
+                } else {
+                    (mut t.s_merge).push(li)
+                    l += 1
+                }
+            }
+            while l < mid {
+                let x = t.s_order[l]
+                (mut t.s_merge).push(x)
+                l += 1
+            }
+            while r < hi {
+                let x = t.s_order[r]
+                (mut t.s_merge).push(x)
+                r += 1
+            }
+            lo += width * 2
+        }
+        i = 0
+        while i < n {
+            t.s_order[i] = t.s_merge[i]
+            i += 1
+        }
+        width *= 2
+    }
+}
+
+// `node_apply_entry` (`fusstree.c:660-673`).
+fn node_apply_entry(mut t: FussTree, node: int, e: GitEntry, ignored: bool) {
+    if e.staged {
+        t.nodes[node].staged = true
+    }
+    if e.unstaged {
+        t.nodes[node].unstaged = true
+    }
+    if e.untracked {
+        t.nodes[node].untracked = true
+    }
+    if e.incoming {
+        t.nodes[node].incoming = true
+    }
+    if e.conflicted {
+        t.nodes[node].conflicted = true
+    }
+    if ignored {
+        t.nodes[node].ignored = true
+    }
+    if !t.nodes[node].is_file && e.untracked {
+        t.nodes[node].untracked_dir = true
+        t.nodes[node].expanded = false
+    }
+}
+
+/// `yew_fuss_merge_files` (`fusstree.c:902-959`): the status tree rebuilt,
+/// then every walked path not under an untracked directory added clean
+/// (`all_files` only); hidden and ignored walked paths out unless
+/// `show_hidden`. Answers whether the walk was merged.
+pub fn fuss_merge_files(mut t: FussTree, files: ws.FileList, s: GitSnapshot, o: FussOpts) -> bool {
+    // A FileList is a completed inventory, not a delta: force the
+    // status-only base back first.
+    if o.all_files && t.files_merged {
+        t.opts_valid = false
+    }
+    fuss_build(mut t, s, o)
+    if !o.all_files {
+        return false
+    }
+    // The walked paths' bytes, in one scratch pool, sorted (`cstr_ptr_cmp`
+    // is byte order).
+    (mut t.c_pool).reset()
+    (mut t.s_at).reset()
+    (mut t.s_len).reset()
+    for p in files.paths {
+        let len = p.len
+        if len == 0 {
+            continue
+        }
+        let at = t.c_pool.len
+        for x in p.bytes() {
+            (mut t.c_pool).push(x)
+        }
+        if !o.show_hidden &&
+            (
+                path_hidden(t.c_pool, at, len) ||
+                    fuss_scoped_ignored(t, s.ignored, t.c_pool, at, len)
+            ) {
+            // Drop the bytes again: nothing points at them.
+            while t.c_pool.len > at {
+                let _ = (mut t.c_pool).pop()
+            }
+            continue
+        }
+        (mut t.s_at).push(at)
+        (mut t.s_len).push(len)
+    }
+    let n = t.s_at.len
+    let pool = copy t.c_pool
+    sort_spans(mut t, pool, n)
+    var k = 0
+    while k < n {
+        let i = t.s_order[k]
+        let at = t.s_at[i]
+        let len = t.s_len[i]
+        if !path_below_untracked_dir(t, pool, at, len) {
+            let node = add_path(mut t, pool, at, len, false)
+            if node != 0 && fuss_scoped_ignored(t, s.ignored, pool, at, len) {
+                t.nodes[node].ignored = true
+            }
+        }
+        k += 1
+    }
+    aggregate_flags(mut t)
+    sort_children(mut t)
+    fuss_flatten(mut t)
+    t.files_merged = true
+    true
+}
+
+/// `yew_fuss_flatten` (`fusstree.c:961-995`): the items of every expanded
+/// node, pre-order, with their depths.
+pub fn fuss_flatten(mut t: FussTree) {
+    (mut t.items).reset()
+    if t.nodes.len == 0 {
+        return
+    }
+    var node = t.nodes[0].first_child
+    var depth = 0
+    while node != 0 {
+        (mut t.items).push(FussItem { node: node, depth: depth, is_file: t.nodes[node].is_file })
+        if !t.nodes[node].is_file && t.nodes[node].expanded && t.nodes[node].first_child != 0 {
+            node = t.nodes[node].first_child
+            depth += 1
+            continue
+        }
+        while node != 0 && t.nodes[node].next_sibling == 0 {
+            node = t.nodes[node].parent
+            if node != 0 && depth != 0 {
+                depth -= 1
+            }
+        }
+        if node != 0 {
+            node = t.nodes[node].next_sibling
+        }
+    }
+}
+
+/// `yew_fuss_apply_expansion` (`fusstree.c:997-1040`): each directory open
+/// exactly when the hand memory holds it, then every open file's ancestors
+/// opened; re-flattened.
+pub fn fuss_apply_expansion(
+    mut t: FussTree,
+    manual_open: FussOpenMemory,
+    open_files: FussOpenMemory,
+) {
+    var i = 1
+    while i < t.nodes.len {
+        if !t.nodes[i].is_file {
+            t.nodes[i].expanded = fuss_open_memory_has(
+                manual_open,
+                t.pool,
+                t.nodes[i].path_at,
+                t.nodes[i].path_len,
+            )
+        }
+        i += 1
+    }
+    var f = 0
+    while f < open_files.rows.len {
+        let fa = open_files.rows[f].at
+        let fl = open_files.rows[f].len
+        var parent = 0
+        var at = 0
+        while at < fl {
+            let start = at
+            while at < fl && open_files.pool[fa + at] as int != 47 {
+                at += 1
+            }
+            if at == start {
+                at += 1
+                continue
+            }
+            let child = find_child(t, parent, open_files.pool, fa + start, at - start)
+            if child == 0 {
+                break
+            }
+            if !t.nodes[child].is_file {
+                t.nodes[child].expanded = true
+            }
+            parent = child
+            at += 1
+        }
+        f += 1
+    }
+    fuss_flatten(mut t)
+}
+
+// `normalized_row` (`fusstree.c:1042-1049`).
+fn normalized_row(t: FussTree, row: int) -> int {
+    if t.items.len == 0 {
+        return -1
+    }
+    if row < 0 || row >= t.items.len {
+        return 0
+    }
+    row
+}
+
+/// `yew_fuss_nav_step` (`fusstree.c:1051-1073`): the next item at the SAME
+/// depth, wrapping through the whole flat list (fuss's `navigate_down`/
+/// `_up`: "sibling" is a depth predicate).
+pub fn fuss_nav_step(t: FussTree, row: int, dir_in: int) -> int {
+    let selected = normalized_row(t, row)
+    if selected < 0 || dir_in == 0 {
+        return selected
+    }
+    let count = t.items.len
+    let dir = if dir_in > 0 then 1 else -1
+    let depth = t.items[selected].depth
+    var i = selected + dir
+    while i >= 0 && i < count {
+        if t.items[i].depth == depth {
+            return i
+        }
+        i += dir
+    }
+    i = if dir > 0 then 0 else count - 1
+    while i != selected {
+        if t.items[i].depth == depth {
+            return i
+        }
+        i += dir
+    }
+    selected
+}
+
+/// `yew_fuss_nav_raw` (`fusstree.c:1075-1086`): one raw row, clamped.
+pub fn fuss_nav_raw(t: FussTree, row: int, dir: int) -> int {
+    let selected = normalized_row(t, row)
+    if selected < 0 || dir == 0 {
+        return selected
+    }
+    if dir > 0 {
+        return if selected + 1 < t.items.len then selected + 1 else selected
+    }
+    if selected > 0 then selected - 1 else selected
+}
+
+/// `yew_fuss_nav_parent` (`fusstree.c:1088-1103`): the nearest EARLIER
+/// item at `depth - 1`; at depth 0, stay.
+pub fn fuss_nav_parent(t: FussTree, row: int) -> int {
+    let selected = normalized_row(t, row)
+    if selected < 0 {
+        return selected
+    }
+    let depth = t.items[selected].depth
+    if depth == 0 {
+        return selected
+    }
+    var i = selected - 1
+    while i >= 0 {
+        if t.items[i].depth == depth - 1 {
+            return i
+        }
+        i -= 1
+    }
+    selected
+}
+
+// `row_for_node` (`fusstree.c:1105-1112`).
+fn row_for_node(t: FussTree, node: int) -> int {
+    var i = 0
+    while i < t.items.len {
+        if t.items[i].node == node {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_fuss_nav_enter` (`fusstree.c:1114-1139`): on a directory, expand
+/// if collapsed, then the first item one deeper; a file, or a directory
+/// with no children, stays.
+pub fn fuss_nav_enter(mut t: FussTree, row: int) -> int {
+    var selected = normalized_row(t, row)
+    if selected < 0 {
+        return selected
+    }
+    let node = t.items[selected].node
+    if node >= t.nodes.len || t.nodes[node].is_file {
+        return selected
+    }
+    if t.nodes[node].untracked_dir &&
+        !t.nodes[node].untracked_loaded &&
+        t.nodes[node].first_child == 0 {
+        return selected
+    }
+    let depth = t.items[selected].depth
+    if !t.nodes[node].expanded {
+        t.nodes[node].expanded = true
+        fuss_flatten(mut t)
+        selected = row_for_node(t, node)
+    }
+    if selected >= 0 && selected + 1 < t.items.len && t.items[selected + 1].depth == depth + 1 {
+        return selected + 1
+    }
+    selected
+}
+
+/// `yew_fuss_nav_toggle` (`fusstree.c:1141-1158`).
+pub fn fuss_nav_toggle(mut t: FussTree, row: int) -> bool {
+    let selected = normalized_row(t, row)
+    if selected < 0 {
+        return false
+    }
+    let node = t.items[selected].node
+    if node >= t.nodes.len || t.nodes[node].is_file {
+        return false
+    }
+    if t.nodes[node].untracked_dir &&
+        !t.nodes[node].untracked_loaded &&
+        t.nodes[node].first_child == 0 {
+        return false
+    }
+    t.nodes[node].expanded = !t.nodes[node].expanded
+    fuss_flatten(mut t)
+    true
+}
+
+// `child_belongs_to` (`fusstree.c:1160-1178`): `c[ca..ca+cl)` is exactly
+// one level below `parent`.
+fn child_belongs_to(t: FussTree, parent: int, c: List[byte], ca: int, cl: int) -> bool {
+    let pa = t.nodes[parent].path_at
+    let pl = t.nodes[parent].path_len
+    if cl <= pl || span_cmp(c, ca, pl, t.pool, pa, pl) != 0 || c[ca + pl] as int != 47 {
+        return false
+    }
+    var rest = cl - pl - 1
+    while rest > 0 && c[ca + pl + rest] as int == 47 {
+        rest -= 1
+    }
+    if rest == 0 {
+        return false
+    }
+    var i = 0
+    while i < rest {
+        if c[ca + pl + 1 + i] as int == 47 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_fuss_expand_untracked` (`fusstree.c:1180-1218`): a one-level walk's
+/// children (workspace-relative, beneath `node`) spliced in as untracked;
+/// dotfiles out unless the tree shows them. Every child must belong, or
+/// nothing changes.
+pub fn fuss_expand_untracked(mut t: FussTree, node: int, kids: GitPaths) -> bool {
+    if node == 0 ||
+        node >= t.nodes.len ||
+        t.nodes[node].is_file ||
+        !t.nodes[node].untracked_dir ||
+        t.nodes[node].untracked_loaded {
+        return false
+    }
+    var i = 0
+    while i < kids.rows.len {
+        if !child_belongs_to(t, node, kids.pool, kids.rows[i].at, kids.rows[i].len) {
+            return false
+        }
+        i += 1
+    }
+    i = 0
+    while i < kids.rows.len {
+        if !splice_untracked(
+            mut t,
+            kids.pool,
+            kids.rows[i].at,
+            kids.rows[i].len,
+            kids.rows[i].is_dir,
+        ) {
+            return false
+        }
+        i += 1
+    }
+    finish_untracked(mut t, node)
+    true
+}
+
+// The cache's replay of `yew_fuss_expand_untracked` (`fusstree.c:888-894`):
+// the children are `t.c_kids[first..first+count)` of `t.c_pool`.
+fn expand_untracked_cached(mut t: FussTree, node: int, first: int, count: int) -> bool {
+    if node == 0 ||
+        node >= t.nodes.len ||
+        t.nodes[node].is_file ||
+        !t.nodes[node].untracked_dir ||
+        t.nodes[node].untracked_loaded {
+        return false
+    }
+    let cp = copy t.c_pool
+    var i = first
+    while i < first + count {
+        if !child_belongs_to(t, node, cp, t.c_kids[i].at, t.c_kids[i].len) {
+            return false
+        }
+        i += 1
+    }
+    i = first
+    while i < first + count {
+        let r = copy t.c_kids[i]
+        if !splice_untracked(mut t, cp, r.at, r.len, r.is_dir) {
+            return false
+        }
+        i += 1
+    }
+    finish_untracked(mut t, node)
+    true
+}
+
+fn splice_untracked(mut t: FussTree, p: List[byte], at: int, len: int, is_dir: bool) -> bool {
+    if !t.show_hidden && path_hidden(p, at, len) {
+        return true
+    }
+    let child = add_path(mut t, p, at, len, is_dir)
+    if child == 0 {
+        return false
+    }
+    if !t.nodes[child].staged &&
+        !t.nodes[child].unstaged &&
+        !t.nodes[child].incoming &&
+        !t.nodes[child].conflicted {
+        t.nodes[child].untracked = true
+    }
+    if !t.nodes[child].is_file {
+        t.nodes[child].untracked_dir = true
+        t.nodes[child].expanded = false
+    }
+    true
+}
+
+fn finish_untracked(mut t: FussTree, node: int) {
+    t.nodes[node].untracked_loaded = true
+    t.nodes[node].expanded = true
+    aggregate_flags(mut t)
+    sort_children(mut t)
+    fuss_flatten(mut t)
+}
+
+/// `yew_fuss_sel_clear` (`fusstree.c:1220-1227`).
+pub fn fuss_sel_clear(mut s: FussSel) {
+    (mut s.path).reset()
+    s.has = false
+}
+
+/// `yew_fuss_sel_set` (`fusstree.c:1229-1242`): an owned copy of
+/// `p[at..at+len)`.
+pub fn fuss_sel_set(mut s: FussSel, p: List[byte], at: int, len: int) {
+    (mut s.path).reset()
+    var i = 0
+    while i < len {
+        (mut s.path).push(p[at + i])
+        i += 1
+    }
+    s.has = true
+}
+
+/// `yew_fuss_sel_from_row` (`fusstree.c:1244-1253`).
+pub fn fuss_sel_from_row(mut s: FussSel, t: FussTree, row_in: int) {
+    let row = normalized_row(t, row_in)
+    if row < 0 {
+        fuss_sel_clear(mut s)
+        return
+    }
+    let n = t.items[row].node
+    fuss_sel_set(mut s, t.pool, t.nodes[n].path_at, t.nodes[n].path_len)
+}
+
+// `exact_row` (`fusstree.c:1255-1267`).
+fn exact_row(t: FussTree, p: List[byte], len: int, dirs_only: bool) -> int {
+    var i = 0
+    while i < t.items.len {
+        let n = t.items[i].node
+        if (!dirs_only || !t.items[i].is_file) &&
+            span_cmp(t.pool, t.nodes[n].path_at, t.nodes[n].path_len, p, 0, len) == 0 {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_fuss_row_of` (`fusstree.c:1269-1293`): the selection's row — the
+/// exact path, else its nearest existing ancestor directory, else row 0;
+/// -1 for an empty tree.
+pub fn fuss_row_of(t: FussTree, s: FussSel) -> int {
+    if t.items.len == 0 {
+        return -1
+    }
+    if !s.has {
+        return 0
+    }
+    let row = exact_row(t, s.path, s.path.len, false)
+    if row >= 0 {
+        return row
+    }
+    var len = s.path.len
+    while len > 0 {
+        while len > 0 && s.path[len - 1] as int != 47 {
+            len -= 1
+        }
+        if len == 0 {
+            break
+        }
+        len -= 1
+        let r = exact_row(t, s.path, len, true)
+        if r >= 0 {
+            return r
+        }
+    }
+    0
+}
+
+/// The bytes of a `str`, for callers that hold `str` paths (`FileList`,
+/// realpaths).
+pub fn fuss_bytes_of(s: str) -> List[byte] {
+    var out = List[byte]()
+    for x in s.bytes() {
+        (mut out).push(x)
+    }
+    out
+}
+
+/// `util.bug` with the tree's name, for the callers' invariant breaks.
+pub fn fuss_bug(why: str) {
+    util.bug("git.fusstree", why)
+}
