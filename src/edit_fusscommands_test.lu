@@ -1,0 +1,1223 @@
+//! member: false
+//!
+//! The port of sagitta `tests/script/fuss_commands.c` (1,627 lines, `make
+//! test-fuss-commands`): F mode's verbs against REAL git, one case per C
+//! test in `main`'s order, every repository built per run under `$TMPDIR`
+//! (the lane's root in the container) with C's isolated git environment.
+//!
+//! C's spawn hook (`capture_and_run`, `:224-261`) records the argv, stdin
+//! and `literal_paths` a verb hands `yew_git_spawn` and runs that argv
+//! synchronously in the repository (`GIT_LITERAL_PATHSPECS=1` when asked,
+//! stdin fed, output read and dropped). The port's hook is the git layer's
+//! test switch (`git_test_spawn_set`, its log `ed.git.tlog`); `replay`
+//! below is the run half, after the command returns: a verb's spawn hands
+//! back a job id and nothing waits on it, in C as here, so the order
+//! changes nothing the cases observe. A case that saw more than one spawn
+//! would replay only the last: `replay` is RED on one.
+//!
+//! The one divergence is G59: an argv element is a `str`, so F mode cannot
+//! hand git a path that is not UTF-8 and refuses it with C's "select a
+//! valid workspace path" (`fusscmds.lu`). The filename matrix keeps C's
+//! fifth name (`a\x80b`): the parser, the tree and the commit carry its
+//! bytes; F mode's stage, diff and blame of it are refusals by name, and
+//! the test stages it with its own git (`sh`, the only way to name it).
+//!
+//! No git on the host is C's `HARNESS_SKIP fuss_commands`: SKIP by name.
+//! `YEW_PICK_CASE=N` runs case N alone; the two cases that C runs on the
+//! state the case before left (`unstage` after `stage`, `unstage.all`
+//! after `stage.all`) set that state up themselves when picked alone.
+
+use edit
+use git
+use std.env as std_env
+use std.fs
+use std.process
+use std.signal
+use text
+
+fn b(s: str) -> List[byte] {
+    var v = List[byte]()
+    for x in s.bytes() {
+        (mut v).push(x)
+    }
+    v
+}
+
+fn words(xs: List[str]) -> List[str] {
+    var v = List[str]()
+    for x in xs {
+        (mut v).push(x)
+    }
+    v
+}
+
+fn say(what: str) {
+    print("fusscommands_test: {what}")
+    eprint("fusscommands_test: {what}")
+}
+
+// A failed check names itself before the trap (`CHECK`'s line, `:72-79`).
+fn want(ok: bool, what: str) {
+    if !ok {
+        say("RED check failed: {what}")
+        assert(false, what)
+    }
+}
+
+// `isolate_git_environment` (`:51-70`).
+fn isolate_git_environment() {
+    for n in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_DEFAULT_HASH",
+        "GIT_DEFAULT_REF_FORMAT",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_DATE",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_DATE",
+        "GIT_TEMPLATE_DIR",
+    ] {
+        env_unset(n) else |_| {}
+    }
+    env_set("GIT_CONFIG_NOSYSTEM", "1") else |_| {}
+    env_set("GIT_CONFIG_SYSTEM", "/dev/null") else |_| {}
+    env_set("GIT_CONFIG_GLOBAL", "/dev/null") else |_| {}
+}
+
+struct Run {
+    ok: bool,
+    out: List[byte],
+    code: int,
+}
+
+// `run_process` (`:147-198`): ARGV in REPO, INPUT on stdin, stdout and
+// stderr read together; `GIT_LITERAL_PATHSPECS=1` for the child when
+// `literal` (the parent's own is set around the start and put back).
+fn run_process(repo: str, argv: List[str], input: List[byte], literal: bool) -> Run {
+    var r = Run { ok: false, out: List[byte](), code: -1 }
+    var inp = process.pipe() else |_| { return r }
+    var outp = process.pipe() else |_| { return r }
+    let back = std_env.cwd() else |_| { return r }
+    var had = true
+    let before = env_get("GIT_LITERAL_PATHSPECS") else {
+        had = false
+        ""
+    }
+    var c = process.from_argv(argv)
+    process.set_stdin(mut c, inp.read)
+    process.set_stdout(mut c, outp.write)
+    process.set_stderr(mut c, outp.write)
+    std_env.set_cwd(repo) else |_| { return r }
+    if literal {
+        env_set("GIT_LITERAL_PATHSPECS", "1") else |_| {}
+    }
+    let started = process.start(c)
+    if literal {
+        if had {
+            env_set("GIT_LITERAL_PATHSPECS", before) else |_| {}
+        } else {
+            env_unset("GIT_LITERAL_PATHSPECS") else |_| {}
+        }
+    }
+    std_env.set_cwd(back) else |_| {}
+    let child = started else |_| {
+        r.code = 127
+        return r
+    }
+    fs.close(take inp.read) else |_| {}
+    fs.close(take outp.write) else |_| {}
+    var wrote = true
+    if input.len != 0 {
+        fs.write_chunk(mut inp.write, input) else |_| { wrote = false }
+    }
+    fs.close(take inp.write) else |_| {}
+    var done = false
+    while !done {
+        let chunk = fs.read_chunk(mut outp.read, 65536) else |_| {
+            done = true
+            List[byte]()
+        }
+        for x in chunk {
+            (mut r.out).push(x)
+        }
+    }
+    fs.close(take outp.read) else |_| {}
+    let status = process.wait_status(take child) else |_| { return r }
+    let st = process.status_from(status)
+    r.code = 128
+    if process.is_exited(st) {
+        r.code = process.exit_code(st) else 128
+    }
+    r.ok = wrote
+    r
+}
+
+// `run_git` (`:200-213`).
+fn run_git(repo: str, tail: List[str]) -> Run {
+    var argv = words(["git"])
+    for t in tail {
+        (mut argv).push(t)
+    }
+    run_process(repo, argv, List[byte](), false)
+}
+
+fn git_ok(repo: str, tail: List[str]) -> bool {
+    let r = run_git(repo, tail)
+    r.ok && r.code == 0
+}
+
+// The G59 legs' own shell: `printf` names the byte git cannot be handed
+// as a `str` argument.
+fn sh_ok(repo: str, script: str) -> bool {
+    let r = run_process(repo, words(["sh", "-c", script]), List[byte](), false)
+    r.ok && r.code == 0
+}
+
+// C's `SpawnCapture` after the hook ran.
+struct Cap {
+    calls: int,
+    argv: List[str],
+    stdin: List[byte],
+    literal_paths: bool,
+    exit_code: int,
+}
+
+// `capture_and_run`'s run half: the spawn the hook logged, run in REPO.
+fn replay(ed: edit.Ed, repo: str) -> Cap {
+    var c = Cap {
+        calls: ed.git.tlog.calls,
+        argv: copy ed.git.tlog.argv,
+        stdin: copy ed.git.tlog.stdin,
+        literal_paths: ed.git.tlog.literal_paths,
+        exit_code: -1,
+    }
+    if c.calls == 0 {
+        return c
+    }
+    if c.calls > 1 {
+        want(false, "{c.calls} spawns in one command; the port replays the last only")
+    }
+    let r = run_process(repo, c.argv, c.stdin, c.literal_paths)
+    want(r.ok, "the captured argv runs")
+    c.exit_code = r.code
+    c
+}
+
+fn argv_index(c: Cap, arg: str) -> int {
+    var i = 0
+    while i < c.argv.len {
+        if c.argv[i] == arg {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `argv_has_sequence` (`:411-428`).
+fn argv_has_sequence(c: Cap, seq: List[str]) -> bool {
+    if seq.len == 0 {
+        return true
+    }
+    var at = 0
+    while at + seq.len <= c.argv.len {
+        var i = 0
+        while i < seq.len && c.argv[at + i] == seq[i] {
+            i += 1
+        }
+        if i == seq.len {
+            return true
+        }
+        at += 1
+    }
+    false
+}
+
+fn bytes_contains(hay: List[byte], needle: List[byte]) -> bool {
+    if needle.len == 0 {
+        return true
+    }
+    var i = 0
+    while i + needle.len <= hay.len {
+        var k = 0
+        while k < needle.len && hay[i + k] == needle[k] {
+            k += 1
+        }
+        if k == needle.len {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+// `output_is_path` (`:376-382`): exactly PATH and its NUL.
+fn output_is_path(out: List[byte], path: List[byte]) -> bool {
+    if out.len != path.len + 1 || out[path.len] != 0 as byte {
+        return false
+    }
+    var i = 0
+    while i < path.len {
+        if out[i] != path[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `cached_path_is` (`:430-443`).
+fn cached_path_is(repo: str, path: str, staged: bool) -> bool {
+    let r = run_git(repo, words(["diff", "--cached", "--name-only", "-z", "--", path]))
+    r.ok && r.code == 0 && (if staged then output_is_path(r.out, b(path)) else r.out.len == 0)
+}
+
+// `z_paths_has` (`:445-460`).
+fn z_paths_has(out: List[byte], path: List[byte]) -> bool {
+    var at = 0
+    while at < out.len {
+        var end = at
+        while end < out.len && out[end] != 0 as byte {
+            end += 1
+        }
+        if end - at == path.len {
+            var i = 0
+            while i < path.len && out[at + i] == path[i] {
+                i += 1
+            }
+            if i == path.len {
+                return true
+            }
+        }
+        at = if end < out.len then end + 1 else end
+    }
+    false
+}
+
+fn write_repo_file(repo: str, path: str, contents: str) -> bool {
+    var ok = true
+    fs.write_text("{repo}/{path}", contents) else |_| { ok = false }
+    ok
+}
+
+// `setup_repo` (`:486-505`).
+fn setup_repo(repo: str) -> bool {
+    git_ok(repo, words(["init", "-q", "-b", "trunk"])) &&
+        git_ok(repo, words(["config", "user.name", "Yew Test"])) &&
+        git_ok(repo, words(["config", "user.email", "yew@example.invalid"])) &&
+        write_repo_file(repo, "base.txt", "base\n") &&
+        git_ok(repo, words(["add", "--", "base.txt"])) &&
+        git_ok(repo, words(["commit", "-q", "-m", "base"]))
+}
+
+// `child_repo_path` (`:366-374`).
+fn child_repo(parent: str, name: str) -> str {
+    let path = "{parent}/{name}"
+    fs.create_dir(path) else |_| { want(false, "mkdir {path}") }
+    want(setup_repo(path), "{name} is a repository")
+    path
+}
+
+// `run_jobs_idle` (`:801-820`).
+fn run_jobs_idle(mut ed: edit.Ed) -> bool {
+    let start = time_now_ms()
+    while ed.jobs.v.len != 0 {
+        let fds = edit.job_wait_fds(ed)
+        if fds.len != 0 {
+            let _ = os_signal_wait_fds(fds, signal.child(), 20) else |_| { (-1, 0) }
+        }
+        edit.job_pump(mut ed)
+        edit.job_reap(mut ed)
+        edit.job_tick(mut ed, time_now_ms())
+        let _ = edit.job_settle(mut ed)
+        if time_now_ms() - start > 10000 {
+            return false
+        }
+    }
+    true
+}
+
+// `yew_ed_free`'s part a case can see: every job ended.
+fn ed_free(mut ed: edit.Ed) {
+    edit.jobs_free(mut ed)
+}
+
+fn cx_for(ed: edit.Ed, arg: str, has_arg: bool) -> edit.CmdCtx {
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = 1
+    cx.sarg = arg
+    cx.has_sarg = has_arg
+    cx
+}
+
+// `invoke` (`:263-277`).
+fn invoke(mut ed: edit.Ed, name: str, arg: str, has_arg: bool) -> int {
+    let id = edit.cmd_lookup(ed.reg, name)
+    want(id != 0, "{name} is registered")
+    var cx = cx_for(ed, arg, has_arg)
+    edit.ed_cmd_invoke(mut ed, id, mut cx)
+}
+
+fn plain_editor(repo: str) -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    want(edit.ed_set_workspace_root(mut ed, repo), "the workspace root")
+    ed
+}
+
+// `invoke_real` (`:279-295`): a fresh editor rooted at REPO, not in F.
+fn invoke_real(repo: str, name: str, arg: str, has_arg: bool) -> (int, Cap) {
+    var ed = plain_editor(repo)
+    edit.git_test_spawn_set(mut ed, true)
+    let status = invoke(mut ed, name, arg, has_arg)
+    let cap = replay(ed, repo)
+    ed_free(mut ed)
+    (status, cap)
+}
+
+// `enter_fuss` (`:865-880`): F mode over REAL git, its jobs run idle.
+fn enter_fuss(repo: str) -> (bool, edit.Ed) {
+    var ed = plain_editor(repo)
+    if edit.mode_enter(mut ed, edit.MODE_F) != edit.CMD_OK {
+        return (false, ed)
+    }
+    let idle = run_jobs_idle(mut ed)
+    if idle {
+        edit.fuss_tick(mut ed, time_now_ms())
+    }
+    (idle, ed)
+}
+
+fn fuss_editor(repo: str) -> edit.Ed {
+    let (ok, ed) = enter_fuss(repo)
+    want(ok, "F mode at {repo}")
+    ed
+}
+
+// `invoke_active_real` (`:822-836`).
+fn invoke_active_real(repo: str, name: str, arg: str, has_arg: bool) -> (int, Cap) {
+    var ed = fuss_editor(repo)
+    edit.git_test_spawn_set(mut ed, true)
+    let status = invoke(mut ed, name, arg, has_arg)
+    let cap = replay(ed, repo)
+    ed_free(mut ed)
+    (status, cap)
+}
+
+// `invoke_handler_real` (`:840-863`): C passes the handler's pointer; the
+// port names the handler by number.
+fn handler(mut ed: edit.Ed, h: int, cx: edit.CmdCtx) -> int {
+    match h {
+        0 => edit.fuss_cmd_branch_switch(mut ed, cx),
+        1 => edit.fuss_cmd_merge(mut ed, cx),
+        2 => edit.fuss_cmd_branch_delete(mut ed, cx),
+        3 => edit.fuss_cmd_reset(mut ed, cx),
+        4 => edit.fuss_cmd_cherry_pick(mut ed, cx),
+        5 => edit.fuss_cmd_revert(mut ed, cx),
+        6 => edit.fuss_cmd_rebase_interactive(mut ed, cx),
+        _ => edit.fuss_cmd_stash_pop(mut ed, cx),
+    }
+}
+
+const H_SWITCH: int = 0
+
+const H_MERGE: int = 1
+
+const H_DELETE: int = 2
+
+const H_RESET: int = 3
+
+const H_CHERRY: int = 4
+
+const H_REVERT: int = 5
+
+const H_REBASE: int = 6
+
+const H_STASH_POP: int = 7
+
+fn invoke_handler_real(repo: str, h: int, arg: str) -> (int, Cap) {
+    var ed = fuss_editor(repo)
+    let cx = cx_for(ed, arg, true)
+    edit.git_test_spawn_set(mut ed, true)
+    let status = handler(mut ed, h, cx)
+    let cap = replay(ed, repo)
+    ed_free(mut ed)
+    (status, cap)
+}
+
+// `submit_prompt` (`:297-315`).
+fn submit_prompt(mut ed: edit.Ed, answer: str, replace: bool) -> bool {
+    if !ed.cmdline.active {
+        return false
+    }
+    let bi = ed.wins[ed.cmdline.target_win].buf
+    if replace {
+        let n = text.textbuf_len(ed.bufs[bi].ec.tb)
+        text.textbuf_delete(mut ed.bufs[bi].ec.tb, text.Span { lo: 0, hi: n })
+    }
+    if answer.len != 0 {
+        text.textbuf_insert(mut ed.bufs[bi].ec.tb, 0 as text.ByteOff, answer.bytes())
+    }
+    let cx = edit.cmdctx_new(edit.cmdline_target(ed), edit.SRC_TEST)
+    edit.cmdline_accept_cmd(mut ed, cx) == edit.CMD_OK
+}
+
+fn win_buf(ed: edit.Ed) -> int {
+    if ed.win < 0 then -1 else ed.wins[ed.win].buf
+}
+
+fn buffer_bytes(ed: edit.Ed, bi: int) -> List[byte] {
+    if bi < 0 then List[byte]() else text.textbuf_bytes(ed.bufs[bi].ec.tb)
+}
+
+// The commit scratch's whole text replaced (C's `yew_textbuf_delete` then
+// `yew_textbuf_insert`).
+fn set_text(mut ed: edit.Ed, bi: int, message: str) {
+    let n = text.textbuf_len(ed.bufs[bi].ec.tb)
+    text.textbuf_delete(mut ed.bufs[bi].ec.tb, text.Span { lo: 0, hi: n })
+    text.textbuf_insert(mut ed.bufs[bi].ec.tb, 0 as text.ByteOff, message.bytes())
+}
+
+// `open_amend_editor` (`:903-913`).
+fn open_amend_editor(repo: str) -> edit.Ed {
+    var ed = fuss_editor(repo)
+    want(invoke(mut ed, "ed.git.commit.amend", "", false) == edit.CMD_OK, "amend opens")
+    want(run_jobs_idle(mut ed), "the amend's log settles")
+    edit.fuss_tick(mut ed, time_now_ms())
+    let bi = win_buf(ed)
+    want(bi >= 0 && ed.bufs[bi].name == "*commit*", "the commit scratch is focused")
+    ed
+}
+
+fn hostile() -> List[str] {
+    words(["quote\"name.txt", "literal$(id).txt", "line\nbreak.txt", "-n"])
+}
+
+// `test_stage_preserves_hostile_paths` (`:507-529`).
+fn stage_preserves_hostile_paths(repo: str) {
+    for p in hostile() {
+        want(write_repo_file(repo, p, "new\n"), "write {p}")
+        let (status, c) = invoke_real(repo, "ed.git.stage", p, true)
+        want(status == edit.CMD_OK, "stage {p}")
+        let dash = argv_index(c, "--")
+        want(c.calls == 1 && c.exit_code == 0 && c.literal_paths, "{p}: one literal spawn, exit 0")
+        want(dash >= 0 && argv_index(c, p) > dash, "{p} after --")
+        want(cached_path_is(repo, p, true), "{p} is staged")
+    }
+}
+
+// `test_unstage_preserves_hostile_paths` (`:531-552`).
+fn unstage_preserves_hostile_paths(repo: str, alone: bool) {
+    if alone {
+        for p in hostile() {
+            want(write_repo_file(repo, p, "new\n"), "write {p}")
+            want(git_ok(repo, words(["add", "--", p])), "stage {p} first")
+        }
+    }
+    for p in hostile() {
+        let (status, c) = invoke_real(repo, "ed.git.unstage", p, true)
+        want(status == edit.CMD_OK, "unstage {p}")
+        let dash = argv_index(c, "--")
+        want(c.calls == 1 && c.exit_code == 0 && c.literal_paths, "{p}: one literal spawn, exit 0")
+        want(dash >= 0 && argv_index(c, p) > dash, "{p} after --")
+        want(cached_path_is(repo, p, false), "{p} is not staged")
+    }
+}
+
+fn invalid_name() -> List[byte] {
+    [97 as byte, 128 as byte, 98 as byte]
+}
+
+// `"$(printf 'a\200b')"`: the fifth name, spelled for `sh`.
+const INVALID_SH: str = "\"$(printf 'a\\200b')\""
+
+// `index_blob_without_worktree_file` (`:334-364`) for the fifth name.
+fn index_invalid_without_worktree(repo: str) -> bool {
+    sh_ok(
+        repo,
+        "oid=$(printf 'matrix-before\\n' | git hash-object -w --stdin) && git update-index --add --cacheinfo 100644 \"$oid\" {INVALID_SH}",
+    )
+}
+
+fn snapshot_has(s: git.GitSnapshot, path: List[byte]) -> bool {
+    var i = 0
+    while i < s.entries.len {
+        if git.git_snap_path_eq(s, i, path) {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn tree_has(t: git.FussTree, path: List[byte]) -> bool {
+    var i = 0
+    while i < t.nodes.len {
+        if git.git_bytes_cmp(git.fuss_node_path(t, i), path) == 0 {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+// G59: F mode's verb NAME on the fifth name's row is C's refusal, and no
+// git runs.
+fn refuses_invalid_row(repo: str, name: str) {
+    var ed = fuss_editor(repo)
+    let p = invalid_name()
+    git.fuss_sel_set(mut ed.fuss.sel, p, 0, p.len)
+    want(git.fuss_row_of(ed.fuss.tree, ed.fuss.sel) >= 0, "the fifth name has a row")
+    edit.git_test_spawn_set(mut ed, true)
+    want(invoke(mut ed, name, "", false) == edit.CMD_ERR_ARG, "{name} of a\\x80b refuses (G59)")
+    want(ed.msg.text == "select a valid workspace path", "{name}: `{ed.msg.text}`")
+    want(ed.git.tlog.calls == 0, "{name}: no git")
+    ed_free(mut ed)
+}
+
+// `test_f13_filename_matrix_roundtrips_every_git_surface` (`:554-706`).
+fn f13_filename_matrix(parent: str) {
+    let names = ["a b", "a\nb", "a\"b", "α"]
+    let repo = child_repo(parent, "f13-filename-matrix")
+    var materialized = List[bool]()
+    for n in names {
+        let made = write_repo_file(repo, n, "matrix-before\n")
+        want(made, "write {n}")
+        (mut materialized).push(made)
+        let (s1, c1) = invoke_real(repo, "ed.git.stage", n, true)
+        want(s1 == edit.CMD_OK && c1.calls == 1 && c1.exit_code == 0, "stage {n}")
+        let d1 = argv_index(c1, "--")
+        want(c1.literal_paths && d1 >= 0 && argv_index(c1, n) > d1, "stage {n}: after --")
+        let (s2, c2) = invoke_real(repo, "ed.git.unstage", n, true)
+        want(s2 == edit.CMD_OK && c2.calls == 1 && c2.exit_code == 0, "unstage {n}")
+        let d2 = argv_index(c2, "--")
+        want(c2.literal_paths && d2 >= 0 && argv_index(c2, n) > d2, "unstage {n}: after --")
+        let (s3, c3) = invoke_real(repo, "ed.git.stage", n, true)
+        want(s3 == edit.CMD_OK && c3.calls == 1 && c3.exit_code == 0, "stage {n} again")
+    }
+    // The fifth name: written when the file system takes it (C's
+    // `materialized`), else only indexed; F mode's stage refuses it.
+    let fifth = sh_ok(repo, "printf 'matrix-before\\n' > {INVALID_SH}")
+    if !fifth {
+        want(index_invalid_without_worktree(repo), "the fifth name indexed")
+    }
+    (mut materialized).push(fifth)
+    if fifth {
+        refuses_invalid_row(repo, "ed.git.stage")
+    }
+    want(sh_ok(repo, "git add -- {INVALID_SH}"), "the test stages the fifth name")
+    let st = run_git(
+        repo,
+        words(
+            [
+                "-c",
+                "core.quotepath=false",
+                "-c",
+                "status.renames=true",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=normal",
+                "--ignored=no",
+            ],
+        ),
+    )
+    want(st.ok && st.code == 0, "status")
+    var snap = git.git_snapshot_new()
+    var err = git.git_parse_err()
+    want(git.git_parse_status(mut snap, st.out, st.out.len, mut err), "the status parses")
+    var tree = git.fuss_tree_new()
+    git.fuss_build(mut tree, snap, git.FussOpts { all_files: false, show_hidden: false })
+    var all = List[List[byte]]()
+    for n in names {
+        (mut all).push(b(n))
+    }
+    (mut all).push(invalid_name())
+    for p in all {
+        want(snapshot_has(snap, p), "the snapshot holds {str_from_utf8(p) else "a\\x80b"}")
+        want(tree_has(tree, p), "the tree holds {str_from_utf8(p) else "a\\x80b"}")
+    }
+    // The commit through F mode, its message on stdin.
+    var ed = fuss_editor(repo)
+    want(invoke(mut ed, "ed.git.commit", "", false) == edit.CMD_OK, "the commit opens")
+    let bi = win_buf(ed)
+    want(bi >= 0, "the commit scratch")
+    set_text(mut ed, bi, "F13 filename matrix\n")
+    edit.git_test_spawn_set(mut ed, true)
+    let (handled, saved) = edit.fuss_commit_save(mut ed, bi)
+    let cc = replay(ed, repo)
+    want(saved == edit.CMD_OK && handled && cc.calls == 1 && cc.exit_code == 0, "committed")
+    ed_free(mut ed)
+    let ls = run_git(repo, words(["ls-tree", "-r", "-z", "--name-only", "HEAD"]))
+    want(ls.ok && ls.code == 0, "ls-tree")
+    for p in all {
+        want(z_paths_has(ls.out, p), "HEAD holds {str_from_utf8(p) else "a\\x80b"}")
+    }
+    var i = 0
+    for n in names {
+        want(!materialized[i] || write_repo_file(repo, n, "matrix-after\n"), "rewrite {n}")
+        for cmd in ["ed.git.diff", "ed.git.blame"] {
+            let (s, c) = invoke_active_real(repo, cmd, n, true)
+            want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "{cmd} {n}")
+            let d = argv_index(c, "--")
+            want(c.literal_paths && d >= 0 && argv_index(c, n) > d, "{cmd} {n}: after --")
+        }
+        i += 1
+    }
+    if fifth {
+        want(sh_ok(repo, "printf 'matrix-after\\n' > {INVALID_SH}"), "rewrite the fifth name")
+    }
+    refuses_invalid_row(repo, "ed.git.diff")
+    refuses_invalid_row(repo, "ed.git.blame")
+    let (ss, sc) = invoke_active_real(repo, "ed.git.status", "", false)
+    want(ss == edit.CMD_OK && sc.calls == 1 && sc.exit_code == 0, "status runs")
+    want(argv_index(sc, "status") >= 0, "the status argv")
+}
+
+// `test_stage_all_stages_every_change` (`:708-720`).
+fn stage_all_stages_every_change(repo: str) {
+    want(write_repo_file(repo, "all-one.txt", "one\n"), "all-one")
+    want(write_repo_file(repo, "all-two.txt", "two\n"), "all-two")
+    let (s, c) = invoke_real(repo, "ed.git.stage.all", "", false)
+    want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "stage.all")
+    want(cached_path_is(repo, "all-one.txt", true), "all-one staged")
+    want(cached_path_is(repo, "all-two.txt", true), "all-two staged")
+}
+
+// `test_unstage_all_clears_the_index` (`:722-733`).
+fn unstage_all_clears_the_index(repo: str, alone: bool) {
+    if alone {
+        want(write_repo_file(repo, "all-one.txt", "one\n"), "all-one")
+        want(write_repo_file(repo, "all-two.txt", "two\n"), "all-two")
+        want(git_ok(repo, words(["add", "--all"])), "stage all first")
+    }
+    let (s, c) = invoke_real(repo, "ed.git.unstage.all", "", false)
+    want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "unstage.all")
+    want(c.literal_paths, "literal")
+    want(cached_path_is(repo, "all-one.txt", false), "all-one unstaged")
+    want(cached_path_is(repo, "all-two.txt", false), "all-two unstaged")
+}
+
+fn strip_newline(out: List[byte]) -> str {
+    let s = str_from_utf8(out) else ""
+    if s.ends_with("\n") then s[0..s.len - 1] else s
+}
+
+// `test_branch_create_uses_the_exact_argument` (`:735-757`).
+fn branch_create_uses_the_exact_argument(repo: str) {
+    let branch = "topic-$(id)-n"
+    let (s, c) = invoke_real(repo, "ed.git.branch.create", branch, true)
+    want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "branch.create")
+    let at = argv_index(c, branch)
+    want(at >= 2 && c.argv[at - 1] == "-c" && c.argv[at - 2] == "switch", "switch -c BRANCH")
+    let r = run_git(repo, words(["symbolic-ref", "--short", "HEAD"]))
+    want(r.ok && r.code == 0 && r.out.len == branch.len + 1, "HEAD")
+    want(strip_newline(r.out) == branch, "on {branch}")
+}
+
+// `test_tag_uses_the_exact_argument` (`:759-777`).
+fn tag_uses_the_exact_argument(repo: str) {
+    let tag = "tag-quote\"-$(id)"
+    let (s, c) = invoke_real(repo, "ed.git.tag", tag, true)
+    want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "tag")
+    let dash = argv_index(c, "--")
+    want(dash >= 0 && argv_index(c, tag) > dash, "the tag after --")
+    let r = run_git(repo, words(["tag", "--list", tag]))
+    want(r.ok && r.code == 0 && r.out.len == tag.len + 1, "listed")
+    want(strip_newline(r.out) == tag, "the exact tag")
+}
+
+// `test_stash_push_preserves_message_argv` (`:779-799`).
+fn stash_push_preserves_message_argv(repo: str) {
+    let message = "quote\" $(id)\n-n"
+    want(write_repo_file(repo, "base.txt", "dirty\n"), "dirty")
+    let (s, c) = invoke_real(repo, "ed.git.stash.push", message, true)
+    want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "stash.push")
+    want(c.stdin.len == 0, "no stdin")
+    want(argv_index(c, message) > argv_index(c, "-m"), "the message after -m")
+    let r = run_git(repo, words(["log", "-1", "--format=%B", "refs/stash"]))
+    want(r.ok && r.code == 0 && r.out.len >= message.len, "the stash's log")
+    want(bytes_contains(r.out, b(message)), "the exact message")
+}
+
+// `test_empty_commit_message_does_not_spawn_git` (`:1365-1387`).
+fn empty_commit_message_does_not_spawn_git(repo: str) {
+    var ed = plain_editor(repo)
+    want(edit.mode_enter(mut ed, edit.MODE_F) == edit.CMD_OK, "F mode")
+    want(run_jobs_idle(mut ed), "idle")
+    want(invoke(mut ed, "ed.git.commit", "", false) == edit.CMD_OK, "the commit opens")
+    let bi = win_buf(ed)
+    edit.git_test_spawn_set(mut ed, true)
+    let (handled, s) = edit.fuss_commit_save(mut ed, bi)
+    want(s == edit.CMD_ERR_STATE && handled, "the template alone refuses")
+    want(ed.git.tlog.calls == 0, "no git")
+    ed_free(mut ed)
+}
+
+fn commit_template(repo: str) -> List[byte] {
+    var ed = fuss_editor(repo)
+    want(invoke(mut ed, "ed.git.commit", "", false) == edit.CMD_OK, "the commit opens")
+    let t = buffer_bytes(ed, win_buf(ed))
+    ed_free(mut ed)
+    t
+}
+
+fn comment_setting(repo: str) -> str {
+    var ed = fuss_editor(repo)
+    let live = edit.git_snapshot(mut ed)
+    let c = str_from_utf8(git.git_snap_comment(ed.git.snap[live])) else ""
+    ed_free(mut ed)
+    c
+}
+
+// `test_commit_template_uses_auto_comment_char` (`:1222-1249`).
+fn commit_template_uses_auto_comment_char(parent: str) {
+    let repo = child_repo(parent, "commit-auto")
+    want(git_ok(repo, words(["config", "core.commentChar", "auto"])), "auto")
+    want(write_repo_file(repo, "staged.txt", "staged\n"), "staged.txt")
+    want(git_ok(repo, words(["add", "--", "staged.txt"])), "add")
+    want(comment_setting(repo) == "auto", "the snapshot's comment setting")
+    let t = commit_template(repo)
+    want(bytes_contains(t, b("# Please enter the commit message")), "# header")
+    want(bytes_contains(t, b("# Changes to be committed:")), "# changes")
+}
+
+// `test_commit_template_uses_custom_comment_char` (`:1251-1274`).
+fn commit_template_uses_custom_comment_char(parent: str) {
+    let repo = child_repo(parent, "commit-custom")
+    want(git_ok(repo, words(["config", "core.commentChar", ";"])), ";")
+    want(comment_setting(repo) == ";", "the snapshot's comment setting")
+    let t = commit_template(repo)
+    want(bytes_contains(t, b("; Please enter the commit message")), "; header")
+    want(!bytes_contains(t, b("# Please enter the commit message")), "no # header")
+}
+
+// `setup_conflict_repo` (`:1276-1301`).
+fn setup_conflict_repo(parent: str) -> str {
+    let repo = child_repo(parent, "commit-conflict")
+    want(git_ok(repo, words(["switch", "-q", "-c", "topic"])), "topic")
+    want(write_repo_file(repo, "base.txt", "topic\n"), "topic text")
+    want(git_ok(repo, words(["add", "--", "base.txt"])), "add")
+    want(git_ok(repo, words(["commit", "-q", "-m", "topic"])), "topic commit")
+    want(git_ok(repo, words(["switch", "-q", "trunk"])), "trunk")
+    want(write_repo_file(repo, "base.txt", "trunk\n"), "trunk text")
+    want(git_ok(repo, words(["add", "--", "base.txt"])), "add")
+    want(git_ok(repo, words(["commit", "-q", "-m", "trunk"])), "trunk commit")
+    let m = run_git(repo, words(["merge", "topic"]))
+    want(m.ok && m.code != 0, "the merge conflicts")
+    repo
+}
+
+// `test_commit_refuses_conflicted_snapshot` (`:1303-1320`).
+fn commit_refuses_conflicted_snapshot(parent: str) {
+    let repo = setup_conflict_repo(parent)
+    var ed = fuss_editor(repo)
+    edit.git_test_spawn_set(mut ed, true)
+    want(invoke(mut ed, "ed.git.commit", "", false) == edit.CMD_ERR_STATE, "refused")
+    want(ed.msg.text == "resolve conflicts before committing (1 files)", "`{ed.msg.text}`")
+    want(ed.git.tlog.calls == 0, "no git")
+    ed_free(mut ed)
+}
+
+// `test_amend_prefills_previous_message` (`:1322-1336`).
+fn amend_prefills_previous_message(parent: str) {
+    let repo = child_repo(parent, "commit-amend-prefill")
+    var ed = open_amend_editor(repo)
+    let t = buffer_bytes(ed, win_buf(ed))
+    let prefix = b("base\n")
+    want(t.len >= prefix.len, "prefilled")
+    var i = 0
+    while i < prefix.len {
+        want(t[i] == prefix[i], "the previous message first")
+        i += 1
+    }
+    ed_free(mut ed)
+}
+
+// `test_cleared_amend_message_does_not_spawn_git` (`:1338-1363`).
+fn cleared_amend_message_does_not_spawn_git(parent: str) {
+    let repo = child_repo(parent, "commit-amend-empty")
+    var ed = open_amend_editor(repo)
+    let bi = win_buf(ed)
+    let n = text.textbuf_len(ed.bufs[bi].ec.tb)
+    want(text.edit_delete(mut ed.bufs[bi].ec, text.Span { lo: 0, hi: n }), "cleared")
+    edit.git_test_spawn_set(mut ed, true)
+    let (handled, s) = edit.fuss_commit_save(mut ed, bi)
+    want(s == edit.CMD_ERR_STATE && handled, "refused")
+    want(ed.msg.text == "aborting commit due to empty commit message", "`{ed.msg.text}`")
+    want(ed.git.tlog.calls == 0, "no git")
+    ed_free(mut ed)
+}
+
+// `test_commit_and_amend_save_change_head` (`:1389-1458`).
+fn commit_and_amend_save_change_head(parent: str) {
+    let commit_message = "quote\" $(id)\nbody line\n"
+    let amend_message = "amended safely\n"
+    let repo = child_repo(parent, "commit-save")
+    want(write_repo_file(repo, "committed.txt", "committed\n"), "committed.txt")
+    want(git_ok(repo, words(["add", "--", "committed.txt"])), "add")
+    var ed = fuss_editor(repo)
+    want(invoke(mut ed, "ed.git.commit", "", false) == edit.CMD_OK, "the commit opens")
+    let bi = win_buf(ed)
+    want(bi >= 0, "the commit scratch")
+    set_text(mut ed, bi, commit_message)
+    edit.git_test_spawn_set(mut ed, true)
+    let (handled, s) = edit.fuss_commit_save(mut ed, bi)
+    let c = replay(ed, repo)
+    want(s == edit.CMD_OK && handled && c.calls == 1 && c.exit_code == 0, "committed")
+    let message = b(commit_message)
+    want(c.stdin.len == message.len - 1, "the message less its last newline on stdin")
+    var i = 0
+    while i < c.stdin.len {
+        want(c.stdin[i] == message[i], "stdin byte {i}")
+        i += 1
+    }
+    let log = run_git(repo, words(["log", "-1", "--format=%B"]))
+    want(log.ok && log.code == 0 && bytes_contains(log.out, message), "HEAD's message")
+    ed_free(mut ed)
+    var am = open_amend_editor(repo)
+    let ai = win_buf(am)
+    set_text(mut am, ai, amend_message)
+    edit.git_test_spawn_set(mut am, true)
+    let (ah, asv) = edit.fuss_commit_save(mut am, ai)
+    let ac = replay(am, repo)
+    want(asv == edit.CMD_OK && ah && ac.calls == 1 && ac.exit_code == 0, "amended")
+    want(argv_index(ac, "--amend") >= 0, "--amend")
+    let log2 = run_git(repo, words(["log", "-1", "--format=%B"]))
+    want(log2.ok && log2.code == 0 && bytes_contains(log2.out, b(amend_message)), "the amend")
+    ed_free(mut am)
+}
+
+// `test_stash_pop_restores_worktree` (`:1460-1500`).
+fn stash_pop_restores_worktree(parent: str) {
+    let repo = child_repo(parent, "stash-pop")
+    want(write_repo_file(repo, "base.txt", "stashed change\n"), "dirty")
+    let (s1, c1) = invoke_real(repo, "ed.git.stash.push", "safe stash", true)
+    want(s1 == edit.CMD_OK && c1.calls == 1 && c1.exit_code == 0, "stash.push")
+    var ed = fuss_editor(repo)
+    let live = edit.git_snapshot(mut ed)
+    want(ed.git.snap[live].gen != 0 && !ed.git.snap[live].unborn, "a snapshot with HEAD")
+    let cx = cx_for(ed, "stash@{{0}}", true)
+    edit.git_test_spawn_set(mut ed, true)
+    want(edit.fuss_cmd_stash_pop(mut ed, cx) == edit.CMD_OK, "stash.pop")
+    let c = replay(ed, repo)
+    ed_free(mut ed)
+    want(c.calls == 1 && c.exit_code == 0, "one pop, exit 0")
+    want(argv_index(c, "stash@{{0}}") >= 0, "stash@{{0}}")
+    let l = run_git(repo, words(["stash", "list"]))
+    want(l.ok && l.code == 0 && l.out.len == 0, "no stash left")
+}
+
+// `test_confirmed_discard_delete_and_rename` (`:1502-1555`).
+fn confirmed_discard_delete_and_rename(parent: str) {
+    let repo = child_repo(parent, "confirm-discard")
+    want(write_repo_file(repo, "base.txt", "discard me\n"), "dirty")
+    var ed = fuss_editor(repo)
+    want(invoke(mut ed, "ed.git.discard", "base.txt", true) == edit.CMD_OK, "discard asks")
+    edit.git_test_spawn_set(mut ed, true)
+    want(submit_prompt(mut ed, "discard", false), "discard confirmed")
+    let c = replay(ed, repo)
+    want(c.calls == 1 && c.exit_code == 0, "discarded")
+    want(git_ok(repo, words(["diff", "--quiet", "--", "base.txt"])), "base.txt clean")
+    ed_free(mut ed)
+
+    let r2 = child_repo(parent, "confirm-rename")
+    var e2 = fuss_editor(r2)
+    want(invoke(mut e2, "ed.git.file.rename", "base.txt", true) == edit.CMD_OK, "rename asks")
+    edit.git_test_spawn_set(mut e2, true)
+    want(submit_prompt(mut e2, "renamed.txt", true), "renamed")
+    let c2 = replay(e2, r2)
+    want(c2.calls == 1 && c2.exit_code == 0, "rename ran")
+    want(fs.exists("{r2}/renamed.txt"), "renamed.txt")
+    ed_free(mut e2)
+
+    let r3 = child_repo(parent, "confirm-delete")
+    var e3 = fuss_editor(r3)
+    want(invoke(mut e3, "ed.git.file.delete", "base.txt", true) == edit.CMD_OK, "delete asks")
+    edit.git_test_spawn_set(mut e3, true)
+    want(submit_prompt(mut e3, "delete", false), "deleted")
+    let c3 = replay(e3, r3)
+    want(c3.calls == 1 && c3.exit_code == 0, "delete ran")
+    want(!fs.exists("{r3}/base.txt"), "base.txt gone")
+    ed_free(mut e3)
+}
+
+// `test_view_then_open_leaves_f_mode` (`:1557-1574`).
+fn view_then_open_leaves_f_mode(parent: str) {
+    let repo = child_repo(parent, "view-open")
+    var ed = fuss_editor(repo)
+    want(invoke(mut ed, "ed.git.view", "base.txt", true) == edit.CMD_OK, "view")
+    want(edit.fuss_active(ed), "still F")
+    want(win_buf(ed) >= 0, "a buffer")
+    want(invoke(mut ed, "ed.git.open", "base.txt", true) == edit.CMD_OK, "open")
+    want(!edit.fuss_active(ed), "F left")
+    want(ed.mode == edit.MODE_L, "L")
+    let bi = win_buf(ed)
+    want(bi >= 0 && ed.bufs[bi].has_path && ed.bufs[bi].path.contains("base.txt"), "base.txt open")
+    ed_free(mut ed)
+}
+
+// `test_read_views_use_expected_git_argv` (`:915-957`).
+fn read_views_use_expected_git_argv(parent: str) {
+    let repo = child_repo(parent, "read-views")
+    let commands = [
+        "ed.git.diff",
+        "ed.git.status",
+        "ed.git.blame",
+        "ed.git.history",
+        "ed.git.reflog",
+    ]
+    let args = ["base.txt", "", "base.txt", "", ""]
+    let literal = [true, false, true, false, false]
+    let seqs = [
+        words(["diff", "HEAD", "--", "base.txt"]),
+        words(["status"]),
+        words(["blame", "--porcelain", "--", "base.txt"]),
+        words(["log", "-n", "200", "--date-order", "--pretty=format:%h%x1f%at%x1f%an%x1f%d%x1f%s"]),
+        words(["reflog", "show", "-n", "200", "--pretty=format:%h%x1f%gd%x1f%at%x1f%gs"]),
+    ]
+    var i = 0
+    while i < commands.len {
+        let (s, c) = invoke_active_real(repo, commands[i], args[i], args[i].len != 0)
+        want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "{commands[i]}")
+        want(c.literal_paths == literal[i], "{commands[i]}: literal_paths")
+        want(argv_has_sequence(c, seqs[i]), "{commands[i]}: its argv")
+        i += 1
+    }
+}
+
+// `git_current_branch` (`:959-974`).
+fn git_current_branch(repo: str, expected: str) -> bool {
+    let r = run_git(repo, words(["symbolic-ref", "--short", "HEAD"]))
+    r.ok && r.code == 0 && (str_from_utf8(r.out) else "") == "{expected}\n"
+}
+
+// `test_branch_switch_delete_and_merge_change_repo` (`:976-1032`).
+fn branch_switch_delete_and_merge_change_repo(parent: str) {
+    let repo = child_repo(parent, "branch-verbs")
+    want(git_ok(repo, words(["branch", "topic"])), "topic")
+    let (s1, c1) = invoke_handler_real(repo, H_SWITCH, "topic")
+    want(s1 == edit.CMD_OK && c1.exit_code == 0, "switch")
+    want(argv_has_sequence(c1, words(["switch", "--", "topic"])), "switch -- topic")
+    want(git_current_branch(repo, "topic"), "on topic")
+    want(git_ok(repo, words(["switch", "-q", "trunk"])), "trunk")
+    want(git_ok(repo, words(["switch", "-q", "-c", "merge-topic"])), "merge-topic")
+    want(write_repo_file(repo, "merged.txt", "merged\n"), "merged.txt")
+    want(git_ok(repo, words(["add", "--", "merged.txt"])), "add")
+    want(git_ok(repo, words(["commit", "-q", "-m", "merge"])), "commit")
+    want(git_ok(repo, words(["switch", "-q", "trunk"])), "trunk")
+    let (s2, c2) = invoke_handler_real(repo, H_MERGE, "merge-topic")
+    want(s2 == edit.CMD_OK && c2.exit_code == 0, "merge")
+    want(argv_has_sequence(c2, words(["merge", "--no-edit", "--", "merge-topic"])), "merge argv")
+    want(fs.is_file("{repo}/merged.txt"), "merged.txt arrived")
+    let (s3, c3) = invoke_handler_real(repo, H_DELETE, "topic")
+    want(s3 == edit.CMD_OK && c3.exit_code == 0, "delete")
+    want(argv_has_sequence(c3, words(["branch", "-d", "--", "topic"])), "branch -d -- topic")
+}
+
+// `test_reset_cherry_pick_and_revert_use_exact_refs` (`:1048-1106`).
+fn reset_cherry_pick_and_revert_use_exact_refs(parent: str) {
+    let repo = child_repo(parent, "history-verbs")
+    let (s1, c1) = invoke_handler_real(repo, H_RESET, "soft HEAD")
+    want(s1 == edit.CMD_OK && c1.exit_code == 0, "reset")
+    want(argv_has_sequence(c1, words(["reset", "--soft", "HEAD"])), "reset --soft HEAD")
+    want(git_ok(repo, words(["switch", "-q", "-c", "source"])), "source")
+    want(write_repo_file(repo, "picked.txt", "picked\n"), "picked.txt")
+    want(git_ok(repo, words(["add", "--", "picked.txt"])), "add")
+    want(git_ok(repo, words(["commit", "-q", "-m", "picked"])), "commit")
+    let h = run_git(repo, words(["rev-parse", "--verify", "HEAD"]))
+    want(h.ok && h.code == 0 && h.out.len >= 2, "the oid")
+    let oid = strip_newline(h.out)
+    want(git_ok(repo, words(["switch", "-q", "trunk"])), "trunk")
+    let (s2, c2) = invoke_handler_real(repo, H_CHERRY, oid)
+    want(s2 == edit.CMD_OK && c2.exit_code == 0, "cherry-pick")
+    want(argv_has_sequence(c2, words(["cherry-pick", oid])), "cherry-pick OID")
+    want(fs.exists("{repo}/picked.txt"), "picked.txt arrived")
+    let (s3, c3) = invoke_handler_real(repo, H_REVERT, oid)
+    want(s3 == edit.CMD_OK && c3.exit_code == 0, "revert")
+    want(argv_has_sequence(c3, words(["revert", "--no-edit", oid])), "revert --no-edit OID")
+    want(!fs.exists("{repo}/picked.txt"), "picked.txt gone")
+}
+
+// `test_rebase_prepare_only_loads_exact_log_range` (`:1108-1131`).
+fn rebase_prepare_only_loads_exact_log_range(parent: str) {
+    let repo = child_repo(parent, "rebase-prepare")
+    want(write_repo_file(repo, "second.txt", "second\n"), "second.txt")
+    want(git_ok(repo, words(["add", "--", "second.txt"])), "add")
+    want(git_ok(repo, words(["commit", "-q", "-m", "second"])), "commit")
+    let (s, c) = invoke_handler_real(repo, H_REBASE, "HEAD~1")
+    want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "the range logged")
+    want(
+        argv_has_sequence(
+            c,
+            words(
+                ["log", "HEAD~1..HEAD", "--date-order", "--pretty=format:%h%x1f%at%x1f%an%x1f%s"],
+            ),
+        ),
+        "the log argv",
+    )
+}
+
+// `test_local_remote_network_verbs_use_plain_argv` (`:1133-1171`).
+fn local_remote_network_verbs_use_plain_argv(parent: str) {
+    let repo = child_repo(parent, "network-verbs")
+    let remote = "{parent}/network-remote.git"
+    fs.create_dir(remote) else |_| { want(false, "mkdir remote") }
+    want(git_ok(remote, words(["init", "-q", "--bare"])), "bare")
+    want(git_ok(repo, words(["remote", "add", "origin", remote])), "origin")
+    want(git_ok(repo, words(["push", "-q", "-u", "origin", "trunk"])), "first push")
+    let commands = ["ed.git.fetch", "ed.git.pull", "ed.git.push"]
+    let verbs = ["fetch", "pull", "push"]
+    var i = 0
+    while i < commands.len {
+        let (s, c) = invoke_active_real(repo, commands[i], "", false)
+        want(s == edit.CMD_OK && c.calls == 1 && c.exit_code == 0, "{commands[i]}")
+        want(argv_has_sequence(c, words([verbs[i]])), "{verbs[i]}")
+        i += 1
+    }
+}
+
+// `test_file_verbs_reject_directories_and_unsafe_paths` (`:1173-1220`).
+fn file_verbs_reject_directories_and_unsafe_paths(parent: str) {
+    let repo = child_repo(parent, "verb-guards")
+    fs.create_dir("{repo}/dir") else |_| { want(false, "mkdir dir") }
+    var ed = fuss_editor(repo)
+    edit.git_test_spawn_set(mut ed, true)
+    let commands = [
+        "ed.git.diff",
+        "ed.git.blame",
+        "ed.git.view",
+        "ed.git.open",
+        "ed.git.file.delete",
+        "ed.git.discard",
+    ]
+    let messages = [
+        "select a file to diff",
+        "select a file to blame",
+        "select a file to view",
+        "select a file to open",
+        "select a file to delete",
+        "select a file to discard",
+    ]
+    var i = 0
+    while i < commands.len {
+        want(invoke(mut ed, commands[i], "dir", true) == edit.CMD_ERR_STATE, "{commands[i]} dir")
+        want(ed.msg.text == messages[i], "{commands[i]}: `{ed.msg.text}`")
+        i += 1
+    }
+    want(invoke(mut ed, "ed.git.diff", "../base.txt", true) == edit.CMD_ERR_ARG, "../")
+    want(ed.msg.text == "select a valid workspace path", "`{ed.msg.text}`")
+    let cx = cx_for(ed, "--exec", true)
+    want(edit.fuss_cmd_rebase_interactive(mut ed, cx) == edit.CMD_ERR_ARG, "--exec")
+    want(ed.msg.text == "invalid rebase base", "`{ed.msg.text}`")
+    want(ed.git.tlog.calls == 0, "no git")
+    ed_free(mut ed)
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    // `make test-fuss-commands` runs the binary under `LC_ALL=C`.
+    env_set("LC_ALL", "C") else |_| {}
+    let chosen = (env_get("YEW_PICK_CASE") else "-1").to_int() else -1
+    let names = [
+        "fuss_commands_stage_preserves_hostile_paths",
+        "fuss_commands_unstage_preserves_hostile_paths",
+        "fuss_commands_f13_filename_matrix_roundtrips_every_git_surface",
+        "fuss_commands_stage_all_stages_every_change",
+        "fuss_commands_unstage_all_clears_the_index",
+        "fuss_commands_branch_create_uses_the_exact_argument",
+        "fuss_commands_tag_uses_the_exact_argument",
+        "fuss_commands_stash_push_preserves_message_argv",
+        "fuss_commands_empty_commit_message_does_not_spawn_git",
+        "fuss_commands_commit_template_uses_auto_comment_char",
+        "fuss_commands_commit_template_uses_custom_comment_char",
+        "fuss_commands_commit_refuses_conflicted_snapshot",
+        "fuss_commands_amend_prefills_previous_message",
+        "fuss_commands_cleared_amend_message_does_not_spawn_git",
+        "fuss_commands_commit_and_amend_save_change_head",
+        "fuss_commands_stash_pop_restores_worktree",
+        "fuss_commands_confirmed_discard_delete_and_rename",
+        "fuss_commands_view_then_open_leaves_f_mode",
+        "fuss_commands_read_views_use_expected_git_argv",
+        "fuss_commands_branch_switch_delete_and_merge_change_repo",
+        "fuss_commands_reset_cherry_pick_and_revert_use_exact_refs",
+        "fuss_commands_rebase_prepare_only_loads_exact_log_range",
+        "fuss_commands_local_remote_network_verbs_use_plain_argv",
+        "fuss_commands_file_verbs_reject_directories_and_unsafe_paths",
+    ]
+    let probe = run_process(".", words(["git", "--version"]), List[byte](), false)
+    if !probe.ok || probe.code != 0 {
+        var s = 0
+        while s < names.len {
+            if chosen < 0 || chosen == s {
+                say("SKIP {names[s]}: git not found (C's HARNESS_SKIP fuss_commands)")
+            }
+            s += 1
+        }
+        return
+    }
+    if chosen >= names.len {
+        print("fusscommands_test: 0 cases run")
+        return
+    }
+    isolate_git_environment()
+    let tmp = env_get("TMPDIR") else "target/tests"
+    let base = if tmp.len == 0 then "target/tests" else tmp
+    let made = "{base}/yew-fusscmds-{os_pid()}"
+    let _ = run_process(".", words(["rm", "-rf", made]), List[byte](), false)
+    fs.create_dir_all(made) else |_| { want(false, "mkdir {made}") }
+    let parent = fs.realpath(made) else made
+    want(setup_repo(parent), "the parent repository")
+    let alone = chosen >= 0
+    var ran = 0
+    var n = 0
+    while n < names.len {
+        if chosen >= 0 && chosen != n {
+            n += 1
+            continue
+        }
+        match n {
+            0 => stage_preserves_hostile_paths(parent),
+            1 => unstage_preserves_hostile_paths(parent, alone),
+            2 => f13_filename_matrix(parent),
+            3 => stage_all_stages_every_change(parent),
+            4 => unstage_all_clears_the_index(parent, alone),
+            5 => branch_create_uses_the_exact_argument(parent),
+            6 => tag_uses_the_exact_argument(parent),
+            7 => stash_push_preserves_message_argv(parent),
+            8 => empty_commit_message_does_not_spawn_git(parent),
+            9 => commit_template_uses_auto_comment_char(parent),
+            10 => commit_template_uses_custom_comment_char(parent),
+            11 => commit_refuses_conflicted_snapshot(parent),
+            12 => amend_prefills_previous_message(parent),
+            13 => cleared_amend_message_does_not_spawn_git(parent),
+            14 => commit_and_amend_save_change_head(parent),
+            15 => stash_pop_restores_worktree(parent),
+            16 => confirmed_discard_delete_and_rename(parent),
+            17 => view_then_open_leaves_f_mode(parent),
+            18 => read_views_use_expected_git_argv(parent),
+            19 => branch_switch_delete_and_merge_change_repo(parent),
+            20 => reset_cherry_pick_and_revert_use_exact_refs(parent),
+            21 => rebase_prepare_only_loads_exact_log_range(parent),
+            22 => local_remote_network_verbs_use_plain_argv(parent),
+            _ => file_verbs_reject_directories_and_unsafe_paths(parent),
+        }
+        print("{names[n]}: PASS")
+        ran += 1
+        n += 1
+    }
+    let gone = run_process(".", words(["rm", "-rf", parent]), List[byte](), false)
+    want(gone.ok && gone.code == 0, "the fixtures are removed")
+    print("fusscommands_test: {ran} cases run")
+}
