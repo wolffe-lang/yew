@@ -85,7 +85,7 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | `src/syn/` | 14 | 13,064 | yw10 | `syn` | none known |
 | `src/mod/lsp/` | 21 | 11,283 | yw11 | `lsp` | `std.json` exists; incremental `didChange` is the port's own |
 | `src/mod/ai/` | 37 | 12,093 | yw12 | `ai` | an HTTP/1.1 client over `std.net` (the port's own; a std candidate, G9) |
-| `src/mod/git/` | 19 | 15,680 | yw13 | `git` | none known (subprocesses) |
+| `src/mod/git/` | 19 | 15,680 | **yw13** (s51's layer: `git.c`'s probe, verbs, environment, detection, cache and taxonomy as `edit.git`; `porcelain.c`'s status grammar and `fusstree.c` as the pure `git` module; s52's F mode: `fussmode.c` as `edit.fussmode`, `edit.fusscmds`, `edit.fussdraw`; pulled forward, R-yw13-3..5: the statusline's git badge, the editor clock anchor, `ui/panel.c` for the diff viewer, `ws/symwalk.c`'s discovery notice), yw13b (s53: hunks, blame, the diff view, the cat-file batch, the editor runtime) | `git` (pure), `edit` | G59 (no byte argv: a non-UTF-8 path cannot reach git), G60 (no pty opener: the handover's terminal legs), G61 (the process-relative clock) |
 | `src/mod/plug/` | 13 | 7,030 | yw14 | `plug` | none known |
 | `src/mod/mods.c` | 2 | 81 | yw01 | `util.base` (`MODULES_LINE`) | the port is always the full build: `MODULES=""` is a sagitta build shape, not a port shape (a ruling if a `minimal` wolf yew is ever wanted) |
 
@@ -121,7 +121,7 @@ the `s57_*` sequence are placed with their consumers).
 | 08 highlighting | s39, s40, s41, s41.5, s42, s42.5 | yw10 | M-YW8: all 432 syntax goldens; M-YW-PAX2 |
 | 09 completion and LSP | s43, s44, s45, s46, s47 | yw11 | M-YW9 |
 | 10 AI | s48, s49, s49.5, s50 | yw12 | M-YW10 |
-| 11 FUSS / git | s51, s52, s53 | yw13 | M-YW11 |
+| 11 FUSS / git | s51, s52, s53 | **yw13** (s51, s52; s53's code only where s52 calls it, R-yw13-3), yw13b (s53) | M-YW11: yw13's ten FUSS goldens by name (CI's `goldens, campaign 11's FUSS drawer and F mode` step), the 24 that wait on yw10 recorded; yw13b's 23 |
 | 12 plugins | s54, s55, s55.5 | yw14 | M-YW12 |
 | 13 performance | s56, s57, s57-allocation-audit, s57-closeout | yw15 | M-YW13: every gate within 2x |
 | 14 audits and release | s58, s59, s60 | yw16 | M-YW14; M-YW-PAX3 |
@@ -249,6 +249,9 @@ means a ruling is asked (§6), `bug` means a defect with a witness,
 
 
 | G58 | **The checked machine loses a generic receiver's concrete type when a later argument calls another function.** `call_free` sets `pending_rigids` before evaluating its arguments; the nested ordinary call consumes the pending map (`wolf_mem/src/ubcheck.rs:12364-12401` at v0.2.35). | yw09's static host bridge: `re.replace_fn` calls `fl_vm_call_host` with `[fl_temp_get(vm, root)]` | bind the rooted argument before entering the generic call; named in `src/fl/stdre.lu`, and in `src/fl/flhook.lu`'s `hook_fault` notices (`2fdaedb`: `fl_hook_test` was this refusal at `flhook.lu:336` in reg-832febd) and its callers' `fl_nil()` arguments (`e1229cc`: the refusal moved to `flhook.lu:339` in fin-dc1dcc9, because a caller's nested call had already consumed the map). Native/release pass either spelling; checked refuses the nested-call spelling with `trait dispatch on a non-nominal receiver` and passes the bound control. No checked waiver. | `notes/yw09-evidence/host-seam/main.lu` (nested argument) and `control.lu` (bound argument); five real host-bridge cases in `src/fl_host_test.lu` pass all three tiers after the change | **wolf-lang#981** (checked generic frame binding must survive argument evaluation) |
+| G59 | **A process's argv is `List[str]`, so a path that is not UTF-8 cannot be an argument.** sagitta hands git the path's bytes as one argv element after `--` (`fussmode.c`'s verbs through `yew_git_spawn`); a Linux file name is bytes. | yw13 (F mode's verbs, the context menus' path targets), yw13b (s53's blame and diff of such a file) | `process.from_argv(List[str])` and `os_spawn_job(str, List[str], …)`: no byte argument. The porcelain parser, the fuss tree and the commit carry the bytes (`git.git_parse_status` keeps every path a `List[byte]`, held to C's own parser in `notes/yw13-evidence/porcelain-diff/`); only the spawn cannot. | `src/edit_fusscommands_test.lu`'s filename matrix: C's fifth name `a\x80b` is parsed, built into the tree and committed by its bytes; F mode's stage, diff and blame of its row refuse with C's `select a valid workspace path` (`fusscmds.lu`'s `fuss_selected_path`, R-yw13-7) | **wolf-lang, to file by the orchestrator** (a byte argv: `from_argv_bytes(List[List[byte]])`, or an OS-string argument) |
+| G60 | **No pseudo-terminal opener.** sagitta's `test_job_handover` gives the handed-over child a pty (`posix_openpt`, `grantpt`, `unlockpt`, `ptsname`) to prove it inherits the terminal and becomes its foreground group. | yw13 (s52 §11's synchronous handover) | no `openpt` in `std.term`, `std.process` or the prelude; `process.start_foreground` takes a tty the program already holds. | `src/edit_jobhandover_test.lu`: the stdio leg PASSes (the child is the test re-executed); the two terminal legs SKIP by name, naming G60 (R-yw13-8) | **wolf-lang, to file by the orchestrator** (`os_pty_open() -> (master, slave_path)`) |
+| G61 | **`time_now_ms` counts from the process's start; C's `CLOCK_MONOTONIC` from the host's boot.** A stamp C derives from a field still zero (`ed->now_ms` before the loop's first turn) is already past when C's loop starts; the port's is not. | yw13 (F mode's opening frame at a directory launch, `fussmode.c:1066-1070`) | `time_now_ms()` is 0 at `main`; no boot-relative clock. The port keeps wolf's origin (the tests pass `time_now_ms()` into the job ticks, so the editor's clock must share it) and ends a pre-loop opening frame at the loop's first turn (`fuss_mode_enter`, R-yw13-6). | `startup_directory_workspace` (`ptc_wait_sync_pairs(c, 1U)`): with the frame stamped 0 + 16 ms the port painted the opening frame twice (`sync_pairs=2`); ended at the first turn it passes byte for byte | nothing to file: the port answers C's observable order (a `clock_boot_ms` would let the stamp's arithmetic match too) |
 
 **yw07b float-host rulings (R-yw07b-2 and R-yw07b-3, coordinator under
 ruling #118, subject to override):** Linux glibc C is the float-seam oracle.
@@ -468,6 +471,10 @@ maintainer.
   SKIPs the three FUSS kinds by name, the other 54 rows checked and the
   FUSS actions held by the table case (implemented, recommended); (B)
   build C's rows over "unknown" FUSS answers; (C) a sixth FUSS red.
+  **Closed by yw13:** the three FUSS builders are built
+  (`ctxrows.lu`'s file, directory and blank rows over F mode's state)
+  and the walk SKIPs nothing by name; `test_ctxrows`' five FUSS cases
+  run (`src/edit_ctxrows_test.lu`).
 - **R-yw06-12 — type-to-jump's deadline** (`typejump.h:36`, 500 ms). (A)
   C's shape, a timestamp the next key compares against: no production
   host calls `yew_typejump_key` at the pin, only FUSS clears its jump (the
@@ -807,6 +814,76 @@ maintainer.
   in this lane unless the maintainer rules otherwise. It blurs the table
   and keeps the candidate; it does not wrap. The Tab/Up/Down row asserts
   that existing behavior.
+- **R-yw13-1 — the inventory counts the registry, implemented A.** The
+  contract's "58 named `fuss_*` or `git_*`, 71 with blame, hunk and
+  diff-view cases" does not match `tests/pty/registry.c` at the pin: its
+  two `#if YEW_WITH_FUSS` blocks and `tutor_ch07` register 60 cases, 36
+  yw13's (s52, s56.5's drawer, s57.13's two FUSS menus), 23 yw13b's
+  (`git_editor_*`, s53) and one yw16's (`tutor_ch07`). (A) count the
+  registry, every case measured on the C oracle with and without
+  highlighting (`notes/yw13-evidence/inventory/`); (B) the contract's
+  numbers.
+- **R-yw13-2 — the 26 yw13 cases that wait on yw10, implemented A.**
+  Every s52 case built on `s52_open()` spawns `yew src/main.c`, and the
+  drawer's backdrop shows that buffer in C mode's colours; with
+  sagitta's `runtime/syntax/` emptied, C fails 30 of the 60 (26 yw13's,
+  4 yw13b's), each with its text grid identical and its style
+  differences on highlighted source cells alone (`classify.txt`). (A)
+  claim no pass for them: CI records the 24 campaign-11 rows and the two
+  s57.13 menus, red by design, and the note matches each port frame
+  against C's with highlighting off — 24 of the 26 cell for cell, the
+  two `fuss_status_conflict_ignored_incoming` cases also drawing s53's
+  `▎` sign column (yw13b); (B) gate them against a highlight-free
+  re-recording (edits goldens: refused by the contract).
+- **R-yw13-3 — s53 code where s52 calls it, implemented A.** s52's
+  callers reach four s53 pieces: the statusline's git badge (slot 14,
+  `test_statusline`'s badge case), the editor's startup wall anchor
+  (`GitEditorState.clock_*`: F mode's picker ages, YEW-F-018),
+  `ed.group.from_dir`'s F-mode default (`yew_fuss_selected_directory`)
+  and the context menu's document git section, whose rows refuse by
+  name until yw13b ports the hunk and blame commands they invoke. (A)
+  port exactly those, each naming s53; the rest of s53 (hunks, blame,
+  the diff view, the cat-file batch, the editor runtime;
+  `test_gitcache`'s seven s53 cases, `test_blamecache`, `test_diffview`,
+  `test_hunk`, `test_diff`, `test_git_editor`) stays yw13b's; (B) pull
+  s53 whole.
+- **R-yw13-4 — the symbol walk's discovery notice, implemented A.**
+  Every F-mode golden waits in its first frame for C's INFO notice `git
+  discovery unavailable; using workspace walk` (`symwalk.c:455-503`,
+  posted when the workspace has `.git` and `PATH` has no `git`). (A)
+  port the discovery decision alone (`edit.symwalk`,
+  `src/edit_symwalk_test.lu`'s three rows), the walk and the `ls-files`
+  job yw11's; (B) port the walk now.
+- **R-yw13-5 — the floating panel, implemented A.** F mode's diff
+  viewer is C's `ui/panel.c` (Sprint 47, yw11's campaign). (A) port the
+  panel (`edit.panel`; `test_panel.c`'s eighteen cases in
+  `src/edit_panel_test.lu`, LSP's emphasis spans and `yew_panel_mark`
+  SKIP by name as yw11's); (B) a viewer of the port's own.
+- **R-yw13-6 — F mode's opening frame before the loop, implemented A**
+  (G61). (A) a frame entered while `ed.now_ms` is still 0 ends at the
+  loop's first turn, what C's `0 + 16` against a boot-relative clock
+  does; the editor's clock keeps wolf's origin, since the tests share
+  it; (B) anchor the port's clock 2^30 ms in (tried at `01f774c`,
+  reverted at `88f174d`: the unit tests hand `time_now_ms()` to the job
+  ticks, so every job deadline moved).
+- **R-yw13-7 — a path that is not UTF-8 in F mode, implemented A**
+  (G59). (A) F mode's verbs and context menus refuse such a path with
+  C's own `select a valid workspace path`; the parser, the tree and the
+  commit keep its bytes; `fuss_commands.c`'s fifth name is a refusal
+  row, staged by the test's own `git add` (a named divergence until
+  wolf takes a byte argv); (B) pass the path lossily (refused:
+  invariant 2).
+- **R-yw13-8 — the handover's terminal legs, implemented A** (G60). (A)
+  the stdio leg runs and the two pty legs SKIP by name until wolf opens
+  a pty; (B) a pty from `/dev/ptmx` by hand (no `ioctl` in the prelude).
+- **R-yw13-9 — `git_layer.c`'s environment witness, implemented A.**
+  C's fake `git` truncates its dump on every run; the refresh a mutation
+  schedules on completion (`git.c:2209-2211`) runs it again, and C's
+  `yew_ed_free` kills that run before its redirect most of the time. The
+  port read the dump while the second run was live, and read it empty.
+  (A) the port's fake script sets `noclobber` (`set -C`), so the first
+  dump stays (deterministic; every assertion C makes is kept); (B) C's
+  script and a sleep.
 
 ## 7. The next contracts
 
@@ -1000,7 +1077,24 @@ One paragraph each; yw01's is drafted in full
 - **yw13 — FUSS and git** (s51–s53; `src/mod/git/`). Porcelain parsers,
   the status cache on a wall clock, F mode, hunk signs, blame, diff
   views. Goldens: the real-git fixtures and the 19 FUSS PTY cases
-  (M-YW11).
+  (M-YW11). **Landed by yw13** (s51 and s52, the note
+  `notes/yw13-fuss-and-git.md`): the git layer (`edit.git`; the pure
+  `git` module's porcelain grammar, held to C's own parser over 40
+  real-repository streams and 2,461 truncations), F mode with its tree,
+  drawer, verbs, prompts, pickers, commit and rebase handover, the three
+  FUSS context-menu builders (R-yw06-11 closed); ten FUSS goldens gated
+  by name, the 26 that wait on yw10 recorded and matched against C with
+  highlighting off (R-yw13-1/2); `git_layer.c` and `fuss_commands.c`
+  ported over real git; G59–G61 met by name.
+- **yw13b — the git editor** (s53). Hunk signs and the hunk verbs, blame
+  and its cache, the diff view and its row map, the cat-file batch, the
+  editor runtime, the statusline's branch segment beyond yw13's badge,
+  `ed.group.from_dir`'s s53 half. Goldens: the 23 `git_editor_*` cases
+  (four wait on yw10), `test_gitcache`'s seven s53 cases,
+  `test_blamecache`, `test_diffview`, `test_hunk`, `test_diff`,
+  `test_git_editor`, `git_hunks.c`; the two
+  `fuss_status_conflict_ignored_incoming` FUSS cases need its sign
+  column.
 - **yw14 — plugins** (s54, s55, s55.5; `src/mod/plug/`). Discovery,
   lifecycle, hooks, capability prompts, `yew pkg`, the two example
   plugins. Goldens: the 53 package cases and the plugin PTY cases
