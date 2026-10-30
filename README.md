@@ -31,7 +31,8 @@ number from the same run, and a 2x gate holds from the first paint.
 
 ## Status
 
-Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), at wolf
+Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), and campaign
+11's git layer and F mode (yw13), at wolf
 0.2.36 (lupin 0.1.58): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
 identical to sagitta's); the terminal (raw mode, the input decoder, the
 cell grid and damage renderer, the restore on every exit path); the text
@@ -61,10 +62,16 @@ asks for it), and diagnostics in the gutter, under the text, on the
 statusline, as the cursor's hint and in a list with jumps, so `wolf lsp`
 works in the editor; and its features: hover and signature help in a
 floating panel, the four gotos, references, document symbols, document
-highlight and rename. Completion follows.
+highlight and rename. Completion follows. FUSS, the git layer and F mode
+(campaign 11, s51 and s52): git as a subprocess through a fixed verb
+table, its environment pinned and its `status --porcelain=v2` grammar
+parsed byte for byte, a status cache on the wall clock; F mode's tree and
+drawer, depth navigation, type-to-jump, the verbs with their typed
+confirmations, the commit editor, the pickers, the actions palette and the
+diff viewer; s53's hunks, blame and diff view are yw13b's.
 Each campaign's reachable PTY goldens are gated by name against C yew's
-(campaign 05's eleven that need FUSS or syntax
-highlighting are recorded under the lane that lands them); every path
+(the cases that draw source text in syntax colours, campaign 05's four
+and campaign 11's 24, are recorded until yw10 lands highlighting); every path
 not yet ported hard-errors naming its sagitta sprint and the port lane
 that lands it. The map of every sagitta
 directory and sprint to a port lane, and of every wolf gap the port has
