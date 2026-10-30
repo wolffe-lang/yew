@@ -5,6 +5,32 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw13 — FUSS: the git layer and F mode (2026-10-29)
+
+- The pin kept at wolf 0.2.35 / lupin 0.1.56.
+- s51, the git layer (`edit.git`, the pure `git` module): the
+  availability probe, the verb table as the only argv path, the pinned
+  environment, repository detection, the `status --porcelain=v2
+  --branch -z` grammar byte for byte (held to sagitta's own parser over
+  40 real-repository streams and every one of 2,461 truncations), the
+  status cache on the wall clock, the taxonomy and `ed.git.info`;
+  `test_gitcache`'s 30 s51 cases, `git_layer.c`'s six checks and two
+  port rows over `tests/fixtures/git/` (sagitta's `mkrepo.sh` verbatim,
+  and `mkxy.sh`: every unmerged XY, copies, intent-to-add, a submodule,
+  non-UTF-8 names).
+- s52, F mode: entry and exit, the fuss tree and its items, the glyph
+  table, depth navigation, type-to-jump (C's W4 clear), the verb keymap,
+  refresh keeping the collapsed state and the selection, untracked
+  directories on demand, the drawer, the typed confirmations, the
+  commit editor, the pickers, the actions palette and the diff viewer
+  over the floating panel (pulled forward, R-yw13-5); the three FUSS
+  context-menu builders (R-yw06-11 closed); `test_fussdrawer` 27,
+  `test_fussjump` 13, `test_ctxrows`' FUSS cases, `test_fusstheme`,
+  `test_panel` 18, `fuss_commands.c`'s 24 over real git.
+- Goldens: ten FUSS cases gated by name; the 26 that wait on yw10's
+  highlighting recorded, 24 of them matched cell for cell against C with
+  highlighting off (R-yw13-1/2). G59–G61 met by name.
+
 ### yw08 — the Fletch prompt, its bug report, the ledger and the perf gates (2026-10-26)
 
 - The pin kept at wolf 0.2.35 / lupin 0.1.56 (the latest releases, read

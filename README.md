@@ -31,7 +31,8 @@ number from the same run, and a 2x gate holds from the first paint.
 
 ## Status
 
-Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), at wolf
+Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), and campaign
+11's git layer and F mode (yw13), at wolf
 0.2.35 (lupin 0.1.56): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
 identical to sagitta's); the terminal (raw mode, the input decoder, the
 cell grid and damage renderer, the restore on every exit path); the text
@@ -53,10 +54,16 @@ exits with (campaign 06's 39 conformance units, its coverage ledger and
 three fuzzers against C's drivers). Fletch also runs inside the editor:
 origin-owned bindings and hooks, live `init.fl`, recording and replay with
 the recorder/Fletch round-trip, the macro browser and library, workspace
-config trust, and headless `--batch` editing (campaign 07).
+config trust, and headless `--batch` editing (campaign 07). FUSS, the git
+layer and F mode (campaign 11, s51 and s52): git as a subprocess through a
+fixed verb table, its environment pinned and its `status --porcelain=v2`
+grammar parsed byte for byte, a status cache on the wall clock; F mode's
+tree and drawer, depth navigation, type-to-jump, the verbs with their typed
+confirmations, the commit editor, the pickers, the actions palette and the
+diff viewer; s53's hunks, blame and diff view are yw13b's.
 Each campaign's reachable PTY goldens are gated by name against C yew's
-(campaign 05's eleven that need FUSS or syntax
-highlighting are recorded under the lane that lands them); every path
+(the cases that draw source text in syntax colours, campaign 05's four
+and campaign 11's 24, are recorded until yw10 lands highlighting); every path
 not yet ported hard-errors naming its sagitta sprint and the port lane
 that lands it. The map of every sagitta
 directory and sprint to a port lane, and of every wolf gap the port has
