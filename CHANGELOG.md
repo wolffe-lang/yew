@@ -5,6 +5,15 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### r41q — the pin to wolf 0.2.36 / lupin 0.1.58 (2026-11-01)
+
+- The pin moves to wolf 0.2.36 / lupin 0.1.58 and the bundled wolf-std
+  `78b9d3cb` (the release API read twice, every archive hashed twice); no
+  source moves. Available and left to yew's own lanes: s265's start-up fix
+  (wolf-lang#918, yew#55's rows by R12) and s261's `env_arg0` /
+  `env_args_bytes`. wolf-lang#948's E1010 at `fl/gc.lu` (yew#98) comes
+  after this tag.
+
 ### yw08 — the Fletch prompt, its bug report, the ledger and the perf gates (2026-10-26)
 
 - The pin kept at wolf 0.2.35 / lupin 0.1.56 (the latest releases, read
