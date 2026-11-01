@@ -32,7 +32,7 @@ number from the same run, and a 2x gate holds from the first paint.
 ## Status
 
 Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), at wolf
-0.2.35 (lupin 0.1.56): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
+0.2.36 (lupin 0.1.58): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
 identical to sagitta's); the terminal (raw mode, the input decoder, the
 cell grid and damage renderer, the restore on every exit path); the text
 engine (piece tree, byte-exact load, the atomic and synced save, the
