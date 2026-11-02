@@ -19,9 +19,10 @@ variant() {
     mkdir -p "$lane/var/$name"
     cp -r "$root/src" "$lane/var/$name/src"
     if [ "$kind" = patch ]; then
-        patch -s -d "$lane/var/$name" -p1 < "$here/$arg" || { echo "END variant $name apply=FAIL"; return 1; }
+        # The container has git, not patch(1); `git apply` works outside a repository.
+        (cd "$lane/var/$name" && git apply -p1 "$here/$arg") || { echo "END variant $name apply=FAIL"; red=$((red + 1)); return 1; }
     else
-        python3 -I -c "$arg" "$lane/var/$name/src" || { echo "END variant $name apply=FAIL"; return 1; }
+        python3 -I -c "$arg" "$lane/var/$name/src" || { echo "END variant $name apply=FAIL"; red=$((red + 1)); return 1; }
     fi
     echo "APPLIED $name"
 }
