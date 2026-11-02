@@ -863,8 +863,8 @@ maintainer.
   (G61). (A) a frame entered while `ed.now_ms` is still 0 ends at the
   loop's first turn, what C's `0 + 16` against a boot-relative clock
   does; the editor's clock keeps wolf's origin, since the tests share
-  it; (B) anchor the port's clock 2^30 ms in (tried at `01f774c`,
-  reverted at `88f174d`: the unit tests hand `time_now_ms()` to the job
+  it; (B) anchor the port's clock 2^30 ms in (tried at `32c8c45`,
+  reverted at `cf6d957`: the unit tests hand `time_now_ms()` to the job
   ticks, so every job deadline moved).
 - **R-yw13-7 — a path that is not UTF-8 in F mode, implemented A**
   (G59). (A) F mode's verbs and context menus refuse such a path with
