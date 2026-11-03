@@ -36,6 +36,9 @@ The format follows Keep a Changelog; the port has no release yet.
   leaf count: the native tier loads all of `Ed` for a field read through
   `mut ed` (G62), and inline the two had made a native edit build 1.5×
   slower (kasumi: 238 s, boxed 171 s, trunk 161 s).
+- `tools/check-perf-cmdcomp-build`'s fixture tree makes `src/git`, and
+  `tools/check-staged-modules` holds every harness fixture to the modules
+  its harness stages; `red.sh` runs the checkout that holds it.
 
 ### yw15 — the keys help, and wolf lsp by default (2026-11-07)
 
