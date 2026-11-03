@@ -42,6 +42,9 @@ The format follows Keep a Changelog; the port has no release yet.
 - The git layer's first poll takes the start-up turn C's buffer index
   gives it, so the probe and detection settle before the first key
   (`startup_multiple_files` was unstable on a slow macOS runner).
+- CI: the linux oracle leg's perf_cmdcomp harness build and its 2x gate
+  run as `oracle-cmdcomp`, so the leg's three release builds of the editor
+  fit its cap again; every row is kept on both legs.
 
 ### yw15 — the keys help, and wolf lsp by default (2026-11-07)
 
