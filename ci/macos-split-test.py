@@ -4,6 +4,12 @@
 The old run's seeds, campaign switches, native selections, byte counts and
 advisory/hard-gate distinction are unchanged. Negative controls below reject
 missing work, smaller campaigns, larger fan-out and a stale artifact handoff.
+
+yw13 split the linux oracle leg too: its perf_cmdcomp harness build and the
+2x gate that runs it are the oracle-cmdcomp job's, which runs where the
+linux oracle leg runs; macOS still builds the harness in oracle for
+macos-perf. The controls also refuse the harness built on linux in both
+jobs and the gate dropped from the new job.
 """
 from pathlib import Path
 import re
@@ -40,8 +46,12 @@ def steps(block):
 
 def validate(text):
     oracle = job(text, "oracle")
+    cmdcomp = job(text, "oracle-cmdcomp")
     fuzz = job(text, "macos-fuzz")
     perf = job(text, "macos-perf")
+    # The linux oracle leg's measurements: the oracle job's non-macOS steps
+    # and the oracle-cmdcomp job's, which runs on that leg alone.
+    linux = steps(oracle) + steps(cmdcomp)
     assert "    needs: legs\n" in fuzz
     assert "    needs: [legs, oracle]\n" in perf
     assert "family: [against-c-1, against-c-2]" in fuzz
@@ -74,20 +84,29 @@ def validate(text):
         assert "          " + command + "\n" in block, prefix
         assert f"        timeout-minutes: {timeout}\n" in block
         assert "continue-on-error: true" in block and "::warning::continue-on-error:" in block
-        original = [b for n, b in steps(oracle) if n == name]
-        assert len(original) == 1 and "runner.os != 'macOS'" in original[0]
+        original = [b for n, b in linux if n == name]
+        assert len(original) == 1, "Linux measurement missing or doubled: " + prefix
+        assert "runner.os != 'macOS'" in original[0] or original[0] in [b for _, b in steps(cmdcomp)]
         assert "          " + command + "\n" in original[0], "Linux measurement changed"
-    for name, block in steps(oracle):
+    for name, block in linux:
         if name.startswith("build "):
             assert "continue-on-error" not in block, "compile gate became advisory"
     assert "tools/run-perf-cmdcomp --build-only" in oracle
+    # The harness is built once per leg: oracle on macOS, oracle-cmdcomp on linux.
+    built = [b for n, b in steps(oracle) if n == "build perf_cmdcomp harnesses (hard gate)"]
+    assert len(built) == 1 and "if: matrix.port && runner.os == 'macOS'\n" in built[0], "linux harness built twice"
+    moved = [b for n, b in steps(cmdcomp) if n == "build perf_cmdcomp harnesses (hard gate)"]
+    assert len(moved) == 1 and "tools/run-perf-cmdcomp --build-only\n" in moved[0]
+    assert "python3 -I tools/check-perf-cmdcomp-build\n" in moved[0] and "        timeout-minutes: 60\n" in moved[0]
+    assert "    needs: legs\n" in cmdcomp and "    runs-on: ubuntu-latest\n" in cmdcomp
+    assert "    if: ${{ contains(needs.legs.outputs.matrix_oracle, 'ubuntu-latest') }}\n" in cmdcomp
     assert "actions/upload-artifact@v4" in oracle and "if-no-files-found: error" in oracle
     assert "target/perf-cmdcomp/perf-cmdcomp" in oracle and "target/oracle/sagitta" in oracle
     assert "tar -czf target/macos-oracle.tar.gz" in oracle
     assert "actions/download-artifact@v4" in perf and "run-id:" not in perf
     assert 'test "$(cat target/macos-oracle-head)" = "$(git rev-parse HEAD)"' in perf
     assert "tar -xzf target/macos-input/macos-oracle.tar.gz" in perf
-    assert "needs: [legs, port, unit, macos-unit, fuzz, checked-cases, oracle, macos-fuzz, macos-perf]" in job(text, "nightly-red")
+    assert "needs: [legs, port, unit, macos-unit, fuzz, checked-cases, oracle, oracle-cmdcomp, macos-fuzz, macos-perf]" in job(text, "nightly-red")
 
 
 def main():
@@ -110,7 +129,22 @@ def main():
         except AssertionError:
             continue
         raise AssertionError("control accepted regression: " + old)
-    print("macos-split-test: seven campaigns, six measurements, four added jobs and five negative controls PASS")
+    # The linux split's controls: the harness built on linux in oracle again
+    # (twice per run), and the moved 2x gate dropped from oracle-cmdcomp.
+    cmd_start = text.index("  oracle-cmdcomp:\n")
+    linux_controls = [
+        (0, "        if: matrix.port && runner.os == 'macOS'\n        timeout-minutes: 60\n", "        if: matrix.port\n        timeout-minutes: 60\n"),
+        (cmd_start, "          PERF_PREBUILT=1 tools/run-perf-cmdcomp --trials 100\n", "          true\n"),
+    ]
+    for start, old, new in linux_controls:
+        assert old in text[start:], old
+        broken = text[:start] + text[start:].replace(old, new, 1)
+        try:
+            validate(broken)
+        except AssertionError:
+            continue
+        raise AssertionError("control accepted regression: " + old)
+    print("macos-split-test: seven campaigns, six measurements, five added jobs and seven negative controls PASS")
 
 
 if __name__ == "__main__":

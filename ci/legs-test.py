@@ -27,7 +27,10 @@
       carries the six oracle measurements, with no new host exclusion;
       `checked-cases` (yw06: the checked machine one case at a time) needs
       it too and runs on ubuntu only, the checked machine being the same
-      on every host, in four shards of its run list (yw07b); the outputs are declared; the trunk
+      on every host, in four shards of its run list (yw07b); `oracle-cmdcomp`
+      (yw13: the linux oracle leg's perf_cmdcomp harness build and its 2x
+      gate) needs it, runs on ubuntu, and only where the linux oracle leg
+      runs; the outputs are declared; the trunk
       push, the pull request, the nightly and the dispatch are there; cancel-in-progress
       is for pull requests only and every other run has a group of its own
       run id; a red nightly, and only a red nightly, runs
@@ -117,7 +120,7 @@ say(night == BEFORE, "L3 the nightly runs exactly the legs every push ran before
 # --- L4 the wiring -----------------------------------------------------------------
 wf = open(WORKFLOW, encoding="utf-8").read()
 JOBS = re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", wf[wf.index("\njobs:\n"):], re.M)
-say(JOBS == ["legs", "port", "unit", "macos-unit", "fuzz", "checked-cases", "oracle", "macos-fuzz", "macos-perf", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
+say(JOBS == ["legs", "port", "unit", "macos-unit", "fuzz", "checked-cases", "oracle", "oracle-cmdcomp", "macos-fuzz", "macos-perf", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
 blocks = {}
 for j in JOBS:
     m = re.search(r"^  %s:\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)" % re.escape(j), wf, re.M | re.S)
@@ -181,6 +184,11 @@ say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-latest$", cc,
 fl = "run: tools/build-fakelsp --cc gcc\n"
 say(fl in cc and cc.index(fl) < cc.index("run: python3 -I tools/check-test-cases --shard"),
     "L4 checked-cases builds C's fake language server before its cases run")
+oc = blocks["oracle-cmdcomp"]
+say("    needs: legs\n" in oc and re.search(r"^    runs-on: ubuntu-latest$", oc, re.M) is not None
+    and "    if: ${{ contains(needs.legs.outputs.matrix_oracle, 'ubuntu-latest') }}\n" in oc
+    and "          tools/run-perf-cmdcomp --build-only\n" in oc and "          PERF_PREBUILT=1 tools/run-perf-cmdcomp --trials 100\n" in oc,
+    "L4 oracle-cmdcomp needs the legs and runs the linux oracle leg's perf_cmdcomp rows on ubuntu, where that leg runs")
 say(re.search(r"^  push:\n    branches: \[trunk\]\n", wf, re.M) is not None and re.search(r"^  pull_request:\s*$", wf, re.M) is not None
     and re.search(r"^  schedule:\n(\s+#.*\n)*\s+- cron: ", wf, re.M) is not None and re.search(r"^  workflow_dispatch:\s*$", wf, re.M) is not None,
     "L4 the trunk push, the pull request, the nightly and the dispatch are there")
@@ -190,7 +198,7 @@ g = g.group(1).rstrip() if g else ""
 say(g.endswith("|| format('ci-{0}-{1}', github.event_name, github.run_id) }}") and "github.head_ref" in g,
     "L4 a pull request's runs share its branch's group; every other run has a group of its own run id")
 n = blocks["nightly-red"]
-say("    needs: [legs, port, unit, macos-unit, fuzz, checked-cases, oracle, macos-fuzz, macos-perf]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
+say("    needs: [legs, port, unit, macos-unit, fuzz, checked-cases, oracle, oracle-cmdcomp, macos-fuzz, macos-perf]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
     and "      issues: write\n" in n and "        run: ci/nightly-red.sh\n" in n and "WORKFLOW: ${{ github.workflow }}" in n,
     "L4 a red nightly, and only a red nightly, runs ci/nightly-red.sh with issues: write")
 
