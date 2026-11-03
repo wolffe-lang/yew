@@ -84,6 +84,17 @@ Totals: yw13's 10 passable cases pass byte for byte. Of the 26 that wait on yw10
 - `red.sh` named the lane's clone. `a457293` makes it run the checkout that holds it, with its scratch outside that checkout; a variant that changes nothing counts as not applied.
 - The gauntlet now runs from a fresh clone under planning's `tools/gauntlet-record.sh`. The record for this note's head is in the PR body.
 
+**Third fix round (run 41592653221 at `7196d95`).**
+- `oracle (macos-latest)` was red on `startup_multiple_files: unstable snapshot` in yw06's gate. That was new on this branch. The case was red in 3 of yw13's 9 macOS runs (the head twice, the porcelain plant once as a mismatch) and in none of 38 other runs back to 10-25 (`notes/yw13-evidence/startup-race/ci-macos-scan.txt`).
+- The cause, measured on nomad with the editor under `taskpolicy -b` (`startup-race/result.txt`): the port was unstable in 24 of 40 runs and C in none of 40.
+  - The `:buffers` picker's filter owns the cmdline from its first draw.
+  - A footer repainted after that draws the prompt, `find.buffer` over `:`, where C's frame keeps the status line.
+  - Any job event repaints the footer, as in C (`loop.c:615-620`).
+  - C's git probe and detection run on its first idle turn, right after start-up. That turn comes from the buffer symbol index's deadline (`loop.c:244-279`, yw11's), so they settle before the first key.
+  - The port has no such turn. Its probe waited for the first idle turn after input and settled under the picker. In the stamped runs (`git-chain-stamps.txt`) C's probe starts at +46 and +49 ms, the port's at +95 and +128 ms, after `:`. The relay log shows the extra frame 1 ms after the picker's (`port-unstable-relay-bad.log`).
+  - Red first: `435559e` (loop_test's port row: a ready model with an untried git layer must not sleep). The fix, `7fa1b72`: `git_first_poll_deadline` asks for that turn until yw11's index gives it (R-yw13-4). Throttled after the fix: 40 of 40 ok. Unthrottled at the fix, yw06's 81 gated goldens and yw13's gated FUSS cases were 95 of 95 ok.
+- `oracle (ubuntu-latest)` was cut at 211 of its 210 minutes. That was this branch too, not runner speed. Each of the job's three release-tier builds of the editor took 52–54 minutes, against trunk's 40–44 (trunk runs 41512556775 and 41361984681), so the job grew by about 32 minutes. Trunk's slowest run is 183 minutes, so the job would end near 218. This is G62's cost in the new code: every field read through `mut ed` loads all of `Ed`. Nothing is changed for it in this round; the options are in the PR body.
+
 **Gauntlet**: yw09b's wrapper (fail-fast, a `COUNTS` and an `END <step> exit=N` line per step) with yw13's paths and its own steps: `staged` (`tools/check-staged-modules`), `ci-checks` and `ci-checks-oracle` (ci.yml's python checks), `fuss36` (the ten gated cases ok, the 26 matched against `nosyn-match/c-nosyn/`: 24 SAME and only the two conflict cases DIFF), `porcelain-diff` (`run.sh`) and `red-first` (`red.sh`). Its reachable PTY inventory is 310 (yw09b's 300 and yw13's ten). The run at `54ebe37` (`gauntlet-54ebe37`) went red at `demo` with the same E0301 as CI (`END demo exit=2`, after fmt, harness, registry, oracle, native-all 217/217, checked-lane, tools-build, release and runtime-explicit green). It runs detached at this note's head, launched after the push; its pid, log and marker are in the PR body.
 
 ## 5. Rulings asked, issues, corrections
@@ -113,6 +124,7 @@ Test targets:
 - [x] checked machine, case by case: 202 cases over the ten lane files; the five first-run reds fixed or allowed, re-run alone at `50b1f88` on wolf 0.2.36 (fussdrawer 15, 21, 22 and fussrefresh 0, 1 `exit(0)`; gitcache 13 now past the budget, allowed in `8bcacaf`)
 - [x] porcelain differential: 40/40 streams, 2,461/2,461 prefixes
 - [x] staged harness trees close over their imports (`tools/check-staged-modules`, red first at `6594087` naming the five lists, green at `ce71e59`)
+- [x] the git layer's first poll gets C's start-up turn (`edit_loop_test`'s port row red at `435559e`, green at `7fa1b72`; `startup_multiple_files` throttled on macOS: 24 of 40 unstable before, 40 of 40 ok after)
 - [x] a harness's fixture tree makes every module it stages (`tools/check-staged-modules`, red first at `20a0684` naming `check-perf-cmdcomp-build`, green at `1502290`; both rows red then green in a fresh clone)
 - [x] compile time back to trunk's: `edit_block_test` native 238.4 s with `Ed`'s git and F-mode state inline, 171.0 s boxed, trunk 160.7 s (kasumi 12–15, G62)
 - [x] yw13 goldens: 10/10 gated ok; 24/26 equal to C without highlighting
