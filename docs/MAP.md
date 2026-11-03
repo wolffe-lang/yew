@@ -854,7 +854,9 @@ maintainer.
   posted when the workspace has `.git` and `PATH` has no `git`). (A)
   port the discovery decision alone (`edit.symwalk`,
   `src/edit_symwalk_test.lu`'s three rows), the walk and the `ls-files`
-  job yw11's; (B) port the walk now.
+  job yw11's; (B) port the walk now. The buffer index's start-up turn
+  (`loop.c:244-279`) is yw11's too: until it lands, `git_first_poll_deadline`
+  asks for that turn, and yw11 retires it with the index.
 - **R-yw13-5 — the floating panel, implemented A.** F mode's diff
   viewer is C's `ui/panel.c` (Sprint 47, yw11's campaign). (A) port the
   panel (`edit.panel`; `test_panel.c`'s eighteen cases in
