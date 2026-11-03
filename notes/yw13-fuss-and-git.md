@@ -75,7 +75,16 @@ Totals: yw13's 10 passable cases pass byte for byte. Of the 26 that wait on yw10
 
   `ed.git` and `ed.fuss` are now one-element lists (`ed.git[0]` is `ed->git`), and the build takes 171.0 s (codegen 80.6 s, against trunk's 80.4 s). CI's per-file builds had gone from about 85 s to 220 s.
 
-**Gauntlet**: yw09b's wrapper (fail-fast, a `COUNTS` and an `END <step> exit=N` line per step) with yw13's paths and four steps of its own: `staged` (`tools/check-staged-modules`), `fuss36` (the ten gated cases ok, the 26 matched against `nosyn-match/c-nosyn/`: 24 SAME and only the two conflict cases DIFF), `porcelain-diff` (`run.sh`) and `red-first` (`red.sh`). Its reachable PTY inventory is 310 (yw09b's 300 and yw13's ten). The run at `54ebe37` (`gauntlet-54ebe37`) went red at `demo` with the same E0301 as CI (`END demo exit=2`, after fmt, harness, registry, oracle, native-all 217/217, checked-lane, tools-build, release and runtime-explicit green). It runs detached at this note's head, launched after the push; its pid, log and marker are in the PR body.
+**Second fix round (run 41555906630 at `4cd005a`).** Both oracle jobs were red on one row, `tools/check-perf-cmdcomp-build`: `AssertionError: (2, 1, '', "cp: cannot stat 'src/git' …")`, the same on macOS (`cp: src/git: No such file or directory`).
+- The cause is the test's own fixture, not a lane-local or untracked path. The test builds a scratch root with an empty `src/<module>` for each module `tools/run-perf-cmdcomp` copies. Once `ce71e59` put `git` in that list, the fixture lacked it, and the copy failed (exit 1 where the test wants the fake compiler's 2). It is red in a fresh clone (`notes/yw13-evidence/clean-clone/result.txt`).
+- Red first: `20a0684` holds a harness's fixture tree to the modules the harness stages (`tools/check-staged-modules`, red naming `check-perf-cmdcomp-build`). Green: `1502290` makes `src/git` in the fixture.
+- The other reds were red at trunk too: macOS's recorded kill9 driver (`text_save_paths_test.lu:434`), its recorded `notepad_restore_segv`, and ubuntu's jobstream advisory (ratio 4.04).
+- The timeouts held: `port (ubuntu-latest)` 46 of 60 minutes, the unit shards 66–112 of 120, the fuzz jobs 36–105 of 120.
+- The gauntlet missed the row because no step ran ci.yml's python checks. Its `ci-checks` and `ci-checks-oracle` steps now run them.
+- `red.sh` named the lane's clone. `a457293` makes it run the checkout that holds it, with its scratch outside that checkout; a variant that changes nothing counts as not applied.
+- The gauntlet now runs from a fresh clone under planning's `tools/gauntlet-record.sh`. The record for this note's head is in the PR body.
+
+**Gauntlet**: yw09b's wrapper (fail-fast, a `COUNTS` and an `END <step> exit=N` line per step) with yw13's paths and its own steps: `staged` (`tools/check-staged-modules`), `ci-checks` and `ci-checks-oracle` (ci.yml's python checks), `fuss36` (the ten gated cases ok, the 26 matched against `nosyn-match/c-nosyn/`: 24 SAME and only the two conflict cases DIFF), `porcelain-diff` (`run.sh`) and `red-first` (`red.sh`). Its reachable PTY inventory is 310 (yw09b's 300 and yw13's ten). The run at `54ebe37` (`gauntlet-54ebe37`) went red at `demo` with the same E0301 as CI (`END demo exit=2`, after fmt, harness, registry, oracle, native-all 217/217, checked-lane, tools-build, release and runtime-explicit green). It runs detached at this note's head, launched after the push; its pid, log and marker are in the PR body.
 
 ## 5. Rulings asked, issues, corrections
 
@@ -104,6 +113,7 @@ Test targets:
 - [x] checked machine, case by case: 202 cases over the ten lane files; the five first-run reds fixed or allowed, re-run alone at `50b1f88` on wolf 0.2.36 (fussdrawer 15, 21, 22 and fussrefresh 0, 1 `exit(0)`; gitcache 13 now past the budget, allowed in `8bcacaf`)
 - [x] porcelain differential: 40/40 streams, 2,461/2,461 prefixes
 - [x] staged harness trees close over their imports (`tools/check-staged-modules`, red first at `6594087` naming the five lists, green at `ce71e59`)
+- [x] a harness's fixture tree makes every module it stages (`tools/check-staged-modules`, red first at `20a0684` naming `check-perf-cmdcomp-build`, green at `1502290`; both rows red then green in a fresh clone)
 - [x] compile time back to trunk's: `edit_block_test` native 238.4 s with `Ed`'s git and F-mode state inline, 171.0 s boxed, trunk 160.7 s (kasumi 12–15, G62)
 - [x] yw13 goldens: 10/10 gated ok; 24/26 equal to C without highlighting
 - [x] plants and red-first mutations: 3 plants and 5 mutations, 11 rows, every one RED by name (`red2`, `COUNTS red-first not-caught=0`); the plants are draft PRs
