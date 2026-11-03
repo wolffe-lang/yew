@@ -29,7 +29,13 @@ The format follows Keep a Changelog; the port has no release yet.
   `test_panel` 18, `fuss_commands.c`'s 24 over real git.
 - Goldens: ten FUSS cases gated by name; the 26 that wait on yw10's
   highlighting recorded, 24 of them matched cell for cell against C with
-  highlighting off (R-yw13-1/2). G59–G61 met by name.
+  highlighting off (R-yw13-1/2). G59–G62 met by name.
+- The five harnesses that stage their own source tree copy the `git`
+  module, held by `tools/check-staged-modules` (CI and the gauntlet).
+  `ed.git` and `ed.fuss` are one-element lists, so `Ed` keeps trunk's
+  leaf count: the native tier loads all of `Ed` for a field read through
+  `mut ed` (G62), and inline the two had made a native edit build 1.5×
+  slower (kasumi: 238 s, boxed 171 s, trunk 161 s).
 
 ### yw15 — the keys help, and wolf lsp by default (2026-11-07)
 
