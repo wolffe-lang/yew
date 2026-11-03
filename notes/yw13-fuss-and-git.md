@@ -93,13 +93,21 @@ Totals: yw13's 10 passable cases pass byte for byte. Of the 26 that wait on yw10
   - C's git probe and detection run on its first idle turn, right after start-up. That turn comes from the buffer symbol index's deadline (`loop.c:244-279`, yw11's), so they settle before the first key.
   - The port has no such turn. Its probe waited for the first idle turn after input and settled under the picker. In the stamped runs (`git-chain-stamps.txt`) C's probe starts at +46 and +49 ms, the port's at +95 and +128 ms, after `:`. The relay log shows the extra frame 1 ms after the picker's (`port-unstable-relay-bad.log`).
   - Red first: `435559e` (loop_test's port row: a ready model with an untried git layer must not sleep). The fix, `7fa1b72`: `git_first_poll_deadline` asks for that turn until yw11's index gives it (R-yw13-4). Throttled after the fix: 40 of 40 ok. Unthrottled at the fix, yw06's 81 gated goldens and yw13's gated FUSS cases were 95 of 95 ok.
-- `oracle (ubuntu-latest)` was cut at 211 of its 210 minutes. That was this branch too, not runner speed. Each of the job's three release-tier builds of the editor took 52–54 minutes, against trunk's 40–44 (trunk runs 41512556775 and 41361984681), so the job grew by about 32 minutes. Trunk's slowest run is 183 minutes, so the job would end near 218. This is G62's cost in the new code: every field read through `mut ed` loads all of `Ed`. Nothing is changed for it in this round; the options are in the PR body.
+- `oracle (ubuntu-latest)` was cut at 211 of its 210 minutes. That was this branch too, not runner speed. Each of the job's three release-tier builds of the editor took 52–54 minutes, against trunk's 40–44 (trunk runs 41512556775 and 41361984681), so the job grew by about 32 minutes. Trunk's slowest run is 183 minutes, so the job would end near 218. This is G62's cost in the new code: every field read through `mut ed` loads all of `Ed`. It was split as R-yw13-10 = B (below).
+
+**The linux oracle leg's split (R-yw13-10 = B).** The perf_cmdcomp harness build (hard gate) and its 2x gate (advisory) are `oracle-cmdcomp`'s. That job runs where the linux oracle leg runs (`needs: legs`, the leg named in its matrix), checks out the pinned C tree for C's perf_cmdcomp and the pinned toolchain, and keeps both steps' own 60 and 15 minutes. The oracle job still builds the harness on macOS, for macos-perf's artifact.
+
+The rows did not vanish (`notes/yw13-evidence/ubuntu-split/compare.txt`, from `rows.py`):
+- linux: 44 rows at `7196d95` and 44 after (oracle 42, oracle-cmdcomp 2), the same multiset;
+- macOS: 34 and 34.
+
+The controls: `ci/macos-split-test.py` and `ci/legs-test.py` went red before the job existed (`d41e961`) and green with it (`e2d7221`). Their new controls refuse the harness built on linux in both jobs and the moved gate dropped.
 
 **Gauntlet**: yw09b's wrapper (fail-fast, a `COUNTS` and an `END <step> exit=N` line per step) with yw13's paths and its own steps: `staged` (`tools/check-staged-modules`), `ci-checks` and `ci-checks-oracle` (ci.yml's python checks), `fuss36` (the ten gated cases ok, the 26 matched against `nosyn-match/c-nosyn/`: 24 SAME and only the two conflict cases DIFF), `porcelain-diff` (`run.sh`) and `red-first` (`red.sh`). Its reachable PTY inventory is 310 (yw09b's 300 and yw13's ten). The run at `54ebe37` (`gauntlet-54ebe37`) went red at `demo` with the same E0301 as CI (`END demo exit=2`, after fmt, harness, registry, oracle, native-all 217/217, checked-lane, tools-build, release and runtime-explicit green). It runs detached at this note's head, launched after the push; its pid, log and marker are in the PR body.
 
 ## 5. Rulings asked, issues, corrections
 
-Ruling entries R-yw13-1..9 are in `docs/MAP.md` §6, each implemented as A:
+Ruling entries R-yw13-1..10 are in `docs/MAP.md` §6, the first nine implemented as A:
 1. The registry's 60.
 2. The 26 that wait on yw10 are recorded and matched without highlighting.
 3. s53 code only where s52 calls it.
@@ -109,6 +117,7 @@ Ruling entries R-yw13-1..9 are in `docs/MAP.md` §6, each implemented as A:
 7. A non-UTF-8 path in F mode is refused with C's message; the parser, tree and commit keep its bytes (G59).
 8. The handover's pty legs SKIP (G60).
 9. `git_layer.c`'s fake git keeps its first dump (`set -C`).
+10. The linux oracle leg's perf_cmdcomp rows as their own job (B; boxing `Ed`'s largest fields filed for later).
 
 Gaps G59 (no byte argv), G60 (no pty opener), G61 (process-relative clock) and G62 (a field read loads the whole root aggregate; the builder's LIFO delete is quadratic) are listed for the orchestrator to file.
 G59 and G60 still stand at wolf 0.2.36: its std has no byte argv for a spawn and no pty opener.
@@ -124,6 +133,7 @@ Test targets:
 - [x] checked machine, case by case: 202 cases over the ten lane files; the five first-run reds fixed or allowed, re-run alone at `50b1f88` on wolf 0.2.36 (fussdrawer 15, 21, 22 and fussrefresh 0, 1 `exit(0)`; gitcache 13 now past the budget, allowed in `8bcacaf`)
 - [x] porcelain differential: 40/40 streams, 2,461/2,461 prefixes
 - [x] staged harness trees close over their imports (`tools/check-staged-modules`, red first at `6594087` naming the five lists, green at `ce71e59`)
+- [x] the linux oracle leg's split: the same 44 linux and 34 macOS rows before and after (`ubuntu-split/compare.txt`); the split tests red at `d41e961`, green at `e2d7221`
 - [x] the git layer's first poll gets C's start-up turn (`edit_loop_test`'s port row red at `435559e`, green at `7fa1b72`; `startup_multiple_files` throttled on macOS: 24 of 40 unstable before, 40 of 40 ok after)
 - [x] a harness's fixture tree makes every module it stages (`tools/check-staged-modules`, red first at `20a0684` naming `check-perf-cmdcomp-build`, green at `1502290`; both rows red then green in a fresh clone)
 - [x] compile time back to trunk's: `edit_block_test` native 238.4 s with `Ed`'s git and F-mode state inline, 171.0 s boxed, trunk 160.7 s (kasumi 12–15, G62)
