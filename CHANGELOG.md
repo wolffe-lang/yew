@@ -39,6 +39,9 @@ The format follows Keep a Changelog; the port has no release yet.
 - `tools/check-perf-cmdcomp-build`'s fixture tree makes `src/git`, and
   `tools/check-staged-modules` holds every harness fixture to the modules
   its harness stages; `red.sh` runs the checkout that holds it.
+- The git layer's first poll takes the start-up turn C's buffer index
+  gives it, so the probe and detection settle before the first key
+  (`startup_multiple_files` was unstable on a slow macOS runner).
 
 ### r41q — the pin to wolf 0.2.36 / lupin 0.1.58 (2026-11-01)
 
