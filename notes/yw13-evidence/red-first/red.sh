@@ -94,9 +94,9 @@ variant mut-selection py '
 import sys
 p = sys.argv[1] + "/edit/fussmode.lu"
 s = open(p).read()
-old = "    if fuss_row(ed) < 0 && ed.fuss.tree.items.len != 0 {\n        fuss_select_row(mut ed, 0)\n    }\n    ed.fuss.scroll = 0\n    fuss_damage(mut ed)\n}"
+old = "    if fuss_row(ed) < 0 && ed.fuss[0].tree.items.len != 0 {\n        fuss_select_row(mut ed, 0)\n    }\n    ed.fuss[0].scroll = 0\n    fuss_damage(mut ed)\n}"
 assert old in s
-open(p, "w").write(s.replace(old, "    if ed.fuss.tree.items.len != 0 {\n        fuss_select_row(mut ed, 0)\n    }\n    ed.fuss.scroll = 0\n    fuss_damage(mut ed)\n}"))
+open(p, "w").write(s.replace(old, "    if ed.fuss[0].tree.items.len != 0 {\n        fuss_select_row(mut ed, 0)\n    }\n    ed.fuss[0].scroll = 0\n    fuss_damage(mut ed)\n}"))
 ' && probe mut-selection edit_fussrefresh_test 1
 rm -rf "$lane/var"
 echo "COUNTS red-first not-caught=$red"
