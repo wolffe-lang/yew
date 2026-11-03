@@ -898,6 +898,21 @@ maintainer.
   no cap raised and nothing built twice (`notes/yw13-evidence/ubuntu-split/`:
   44 rows on linux and 34 on macOS, before and after); (C) wolf-lang's
   fix of G62.
+- **R-yw13-11 — `fletch/macrolib_scan_200` named MISS on yew#77, ruled.**
+  yw09 measured it at 1.89-1.98x and left it off the ledger. At this lane's
+  head (kasumi CPUs 0-3, release, wolf 0.2.36) a gauntlet record's second
+  perf step read 2.012x MISS (port median 1,830,110 ns, min 1,789,746;
+  C 909,742).
+  Five isolated runs of the row at the same head, port median (min) / C:
+  1,809,511 (1,782,158) / 906,275 = 1.997x; 1,821,531 (1,764,484) /
+  911,814 = 1.998x; 1,811,139 (1,783,099) / 912,815 = 1.984x; 1,821,537
+  (1,783,603) / 907,812 = 2.007x; 1,783,105 (1,765,033) / 909,081 =
+  1.961x. The port is at or under its baseline (1,854,969 / 1,819,383 ns)
+  in all six, so the row is on the 2x line, not regressed: the VM's
+  per-instruction work of R-yw08-3. It is named in
+  `tools/perf-fletch-misses.txt` (owner R-yw13-11, yew#77), still held to
+  `tools/perf-fletch-baseline.txt`, and leaves the ledger when it meets 2x
+  with margin; a coin-flip re-record of a six-hour gauntlet was not taken.
 
 ## 7. The next contracts
 
