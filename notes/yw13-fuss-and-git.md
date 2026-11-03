@@ -64,7 +64,18 @@ Totals: yw13's 10 passable cases pass byte for byte. Of the 26 that wait on yw10
 
 **CI.** A new gate step, `goldens, campaign 11's FUSS drawer and F mode by name (yw13's gate)`, runs the ten cases by name. The campaign-05 recorded step drops the seven now gated. A campaign-11 recorded step announces the 24 that wait on yw10 (`fa87cba`).
 
-**Gauntlet**: yw09b's wrapper (fail-fast, a `COUNTS` and an `END <step> exit=N` line per step) with yw13's paths and three steps of its own: `fuss36` (the ten gated cases ok, the 26 matched against `nosyn-match/c-nosyn/`: 24 SAME and only the two conflict cases DIFF), `porcelain-diff` (`run.sh`) and `red-first` (`red.sh`). Its reachable PTY inventory is 310 (yw09b's 300 and yw13's ten). It runs detached at this note's head, launched after the PR opens; its pid, log and marker are in the PR body.
+**Fix round (yew#102's run 41500851220 at `54ebe37`).** Every failing job read:
+- E0301 `there is no module named git`: five harnesses stage their own source tree (`tools/build-demo`, `build-fuzz-cmdparse`, `build-fuzz-search`, `build-perf-search`, `run-perf-cmdcomp`) and their lists lacked yw13's `git` module. This failed both oracle jobs' demo build, `fuzz (port-2)` and `fuzz (against-c-1)` on linux and macOS. `tools/check-staged-modules` (a CI step and the gauntlet's `staged` step) follows each list's `use` closure. It was committed red first, naming all five (`6594087`), and goes green with the lists fixed (`ce71e59`: `ok (10 staged lists, every import closed)`).
+- Cascades of the demo build, not defects of their own: campaign 01's and 03's goldens (`cannot resolve target/tools/demo_paint`). Also the fault-shim step's `Permission denied`: the skipped clipboard step normally makes `target/tests` as the runner, so the torture-live container made it as root. That step now makes the directory first (`4ea1203`).
+- Advisories red at trunk too: macOS `notepad_restore_segv` (recorded) and the hosted jobstream 2× gate (trunk run 41361984681: ratio 3.37; here 4.15).
+- The two timeouts, `port (ubuntu-latest)` at its 60 minutes and `unit (shard 2/6)` at its 120, were yw13's (G62). The native tier loads all of `Ed` for a field read through `mut ed`. The builder's LIFO delete is quadratic in a function's size. `Ed` carrying `GitCtx` and `FussMode` inline grew from 1,107 leaves to 1,355, and every function that reads `ed` grew with it. Measured on `edit_block_test`, native, `--no-cache`, kasumi 12–15:
+  - the build took 160.7 s at trunk and 238.4 s with the two structs inline;
+  - the WIR grew from 185 MB to 247 MB;
+  - under perf, `truncate_to_mark` went from 21 % to 25 % of samples.
+
+  `ed.git` and `ed.fuss` are now one-element lists (`ed.git[0]` is `ed->git`), and the build takes 171.0 s (codegen 80.6 s, against trunk's 80.4 s). CI's per-file builds had gone from about 85 s to 220 s.
+
+**Gauntlet**: yw09b's wrapper (fail-fast, a `COUNTS` and an `END <step> exit=N` line per step) with yw13's paths and four steps of its own: `staged` (`tools/check-staged-modules`), `fuss36` (the ten gated cases ok, the 26 matched against `nosyn-match/c-nosyn/`: 24 SAME and only the two conflict cases DIFF), `porcelain-diff` (`run.sh`) and `red-first` (`red.sh`). Its reachable PTY inventory is 310 (yw09b's 300 and yw13's ten). The run at `54ebe37` (`gauntlet-54ebe37`) went red at `demo` with the same E0301 as CI (`END demo exit=2`, after fmt, harness, registry, oracle, native-all 217/217, checked-lane, tools-build, release and runtime-explicit green). It runs detached at this note's head, launched after the push; its pid, log and marker are in the PR body.
 
 ## 5. Rulings asked, issues, corrections
 
@@ -79,7 +90,7 @@ Ruling entries R-yw13-1..9 are in `docs/MAP.md` §6, each implemented as A:
 8. The handover's pty legs SKIP (G60).
 9. `git_layer.c`'s fake git keeps its first dump (`set -C`).
 
-Gaps G59 (no byte argv), G60 (no pty opener) and G61 (process-relative clock) are listed for the orchestrator to file.
+Gaps G59 (no byte argv), G60 (no pty opener), G61 (process-relative clock) and G62 (a field read loads the whole root aggregate; the builder's LIFO delete is quadratic) are listed for the orchestrator to file.
 G59 and G60 still stand at wolf 0.2.36: its std has no byte argv for a spawn and no pty opener.
 
 Not done, plainly:
@@ -92,6 +103,8 @@ Test targets:
 - [x] unit, native, on kasumi: every lane file green (listed in §4); after the rebase onto wolf 0.2.36, gitcache, fussdrawer and fussrefresh re-run green (`v1b`), the whole suite in the gauntlet's `native-all`
 - [x] checked machine, case by case: 202 cases over the ten lane files; the five first-run reds fixed or allowed, re-run alone at `50b1f88` on wolf 0.2.36 (fussdrawer 15, 21, 22 and fussrefresh 0, 1 `exit(0)`; gitcache 13 now past the budget, allowed in `8bcacaf`)
 - [x] porcelain differential: 40/40 streams, 2,461/2,461 prefixes
+- [x] staged harness trees close over their imports (`tools/check-staged-modules`, red first at `6594087` naming the five lists, green at `ce71e59`)
+- [x] compile time back to trunk's: `edit_block_test` native 238.4 s with `Ed`'s git and F-mode state inline, 171.0 s boxed, trunk 160.7 s (kasumi 12–15, G62)
 - [x] yw13 goldens: 10/10 gated ok; 24/26 equal to C without highlighting
 - [x] plants and red-first mutations: 3 plants and 5 mutations, 11 rows, every one RED by name (`red2`, `COUNTS red-first not-caught=0`); the plants are draft PRs
 - [x] macOS F-mode PTY rows (nomad, macOS 26.4.1 arm64, the Mac lock, a worktree pinned to `b7fb08d`, wolf 0.2.36): `fuss_drawer_startup_dot`, `startup_directory_workspace`, `fuss_tree_light_tabs_80`, `fuss_nonrepo` ok by name against the release editor (sha256 `19d171aa…51e6`; `notes/yw13-evidence/macos/`)
