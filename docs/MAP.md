@@ -887,6 +887,17 @@ maintainer.
   (A) the port's fake script sets `noclobber` (`set -C`), so the first
   dump stays (deterministic; every assertion C makes is kept); (B) C's
   script and a sleep.
+- **R-yw13-10 — the linux oracle leg's minutes, implemented B.** With the
+  git and F-mode code each release-tier build of the editor takes 52-54
+  minutes on the hosted runner, against trunk's 40-44 (G62), and the leg
+  builds three of them: run 41592653221 cut it at its 210. (A) box `Ed`'s
+  four largest fields (`cmdline` 110 leaves, `regs` 102, `search` 101,
+  `picker` 84, of 1,109), a rename across other campaigns' files, filed for
+  later; (B) the perf_cmdcomp harness build and the 2x gate that runs it
+  as a job of their own, `oracle-cmdcomp`, where the linux leg runs, with
+  no cap raised and nothing built twice (`notes/yw13-evidence/ubuntu-split/`:
+  44 rows on linux and 34 on macOS, before and after); (C) wolf-lang's
+  fix of G62.
 
 ## 7. The next contracts
 
