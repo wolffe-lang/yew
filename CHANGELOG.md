@@ -5,6 +5,47 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw13 — FUSS: the git layer and F mode (2026-10-29 to 11-02)
+
+- Rebased onto r41q's pin (wolf 0.2.36 / lupin 0.1.58, trunk `1218169e`).
+- s51, the git layer (`edit.git`, the pure `git` module): the
+  availability probe, the verb table as the only argv path, the pinned
+  environment, repository detection, the `status --porcelain=v2
+  --branch -z` grammar byte for byte (held to sagitta's own parser over
+  40 real-repository streams and every one of 2,461 truncations), the
+  status cache on the wall clock, the taxonomy and `ed.git.info`;
+  `test_gitcache`'s 30 s51 cases, `git_layer.c`'s six checks and two
+  port rows over `tests/fixtures/git/` (sagitta's `mkrepo.sh` verbatim,
+  and `mkxy.sh`: every unmerged XY, copies, intent-to-add, a submodule,
+  non-UTF-8 names).
+- s52, F mode: entry and exit, the fuss tree and its items, the glyph
+  table, depth navigation, type-to-jump (C's W4 clear), the verb keymap,
+  refresh keeping the collapsed state and the selection, untracked
+  directories on demand, the drawer, the typed confirmations, the
+  commit editor, the pickers, the actions palette and the diff viewer
+  over the floating panel (pulled forward, R-yw13-5); the three FUSS
+  context-menu builders (R-yw06-11 closed); `test_fussdrawer` 27,
+  `test_fussjump` 13, `test_ctxrows`' FUSS cases, `test_fusstheme`,
+  `test_panel` 18, `fuss_commands.c`'s 24 over real git.
+- Goldens: ten FUSS cases gated by name; the 26 that wait on yw10's
+  highlighting recorded, 24 of them matched cell for cell against C with
+  highlighting off (R-yw13-1/2). G59–G62 met by name.
+- The five harnesses that stage their own source tree copy the `git`
+  module, held by `tools/check-staged-modules` (CI and the gauntlet).
+  `ed.git` and `ed.fuss` are one-element lists, so `Ed` keeps trunk's
+  leaf count: the native tier loads all of `Ed` for a field read through
+  `mut ed` (G62), and inline the two had made a native edit build 1.5×
+  slower (kasumi: 238 s, boxed 171 s, trunk 161 s).
+- `tools/check-perf-cmdcomp-build`'s fixture tree makes `src/git`, and
+  `tools/check-staged-modules` holds every harness fixture to the modules
+  its harness stages; `red.sh` runs the checkout that holds it.
+- The git layer's first poll takes the start-up turn C's buffer index
+  gives it, so the probe and detection settle before the first key
+  (`startup_multiple_files` was unstable on a slow macOS runner).
+- CI: the linux oracle leg's perf_cmdcomp harness build and its 2x gate
+  run as `oracle-cmdcomp`, so the leg's three release builds of the editor
+  fit its cap again; every row is kept on both legs.
+
 ### r41q — the pin to wolf 0.2.36 / lupin 0.1.58 (2026-11-01)
 
 - The pin moves to wolf 0.2.36 / lupin 0.1.58 and the bundled wolf-std
