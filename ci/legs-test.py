@@ -17,7 +17,11 @@
       runs this file before ci/legs.py; `port` and `oracle` need it and
       take their hosts from it, read with a default, with no host list of
       their own; `unit` (the Linux unit lanes in six shards, yw09) and `fuzz`
-      (the Linux fuzzers in five families, yw09) need it and run on ubuntu, and
+      (the Linux fuzzers in five families, yw09) need it and run on ubuntu;
+      `macos-unit` (yw14: the macOS unit lanes in four shards) needs it and
+      runs on macOS exactly where the port's macOS leg runs, the port job
+      running neither lane; both unit jobs build C's fake clipboard tool first
+      and prove no clipboard row SKIPped for it last (yew#42); and
       the port leaves those steps on Linux and macos-fuzz carries the seven
       oracle campaigns on macOS with their original commands; macos-perf
       carries the six oracle measurements, with no new host exclusion;
@@ -113,7 +117,7 @@ say(night == BEFORE, "L3 the nightly runs exactly the legs every push ran before
 # --- L4 the wiring -----------------------------------------------------------------
 wf = open(WORKFLOW, encoding="utf-8").read()
 JOBS = re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", wf[wf.index("\njobs:\n"):], re.M)
-say(JOBS == ["legs", "port", "unit", "fuzz", "checked-cases", "oracle", "macos-fuzz", "macos-perf", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
+say(JOBS == ["legs", "port", "unit", "macos-unit", "fuzz", "checked-cases", "oracle", "macos-fuzz", "macos-perf", "nightly-red"], "L4 the jobs: %s" % " ".join(JOBS))
 blocks = {}
 for j in JOBS:
     m = re.search(r"^  %s:\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)" % re.escape(j), wf, re.M | re.S)
@@ -134,6 +138,21 @@ say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-latest$", un,
     and "        shard: [1, 2, 3, 4, 5, 6]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/6\n" in un
     and "run: tools/check-test --native --shard ${{ matrix.shard }}/6\n" in un,
     "L4 unit needs the legs and runs both unit lanes in six shards on ubuntu")
+# yw14 (yew#49): the macOS unit lanes left the port job for macos-unit, four
+# shards on macOS, run exactly where the port's macOS leg runs.
+mu = blocks.get("macos-unit", "")
+say("    needs: legs\n" in mu and re.search(r"^    runs-on: macos-latest$", mu, re.M) is not None
+    and "    if: ${{ contains(needs.legs.outputs.matrix_port, 'macos-latest') }}\n" in mu
+    and "        shard: [1, 2, 3, 4]\n" in mu and "run: tools/check-test --shard ${{ matrix.shard }}/4\n" in mu
+    and "run: tools/check-test --native --shard ${{ matrix.shard }}/4\n" in mu
+    and not re.search(r"tools/check-test( --native)?$", blocks["port"], re.M),
+    "L4 macos-unit needs the legs and runs both unit lanes in four shards on macOS, where the port's macOS leg runs; the port job runs neither")
+# yw14 (yew#42): every unit lane builds C's fake clipboard tool and then
+# proves no clipboard row SKIPped for want of it.
+say(all("run: tools/build-fakeclip --cc " in b and b.index("tools/build-fakeclip") < b.index("tools/check-test --shard")
+        and "run: tools/check-test --fakeclip-ran\n" in b and b.index("--native --shard") < b.index("--fakeclip-ran")
+        for b in (un, mu)),
+    "L4 unit and macos-unit build the fake clipboard tool first and check no clipboard row SKIPped for it last")
 fz = blocks["fuzz"]
 say("    needs: legs\n" in fz and re.search(r"^    runs-on: ubuntu-latest$", fz, re.M) is not None
     and "        family: [port, port-2, against-c-1, against-c-2, against-c-3]\n" in fz
@@ -145,9 +164,8 @@ moved = [m.group(1) for j in ("port", "oracle") for m in re.finditer(
     r"^      - name: (.*)\n        if: \$\{\{ (?:.*) && runner.os != 'Linux' \}\}$", blocks[j], re.M)]
 moved += re.findall(r"^      - name: (fuzz_.*)$", blocks["macos-fuzz"], re.M)
 fuzz_names = re.findall(r"^      - name: (.*)$", fz, re.M)
-say(len(moved) == 15 and all(n in fuzz_names for n in moved if not n.startswith(("wolf test", "the same tests")))
-    and sum(1 for n in moved if n.startswith(("wolf test", "the same tests"))) == 2,
-    "L4 every step the port and oracle jobs leave on Linux is a unit or fuzz step there (%d moved)" % len(moved))
+say(len(moved) == 13 and all(n in fuzz_names for n in moved),
+    "L4 every step the port and oracle jobs leave on Linux is a fuzz step there (%d moved)" % len(moved))
 cc = blocks["checked-cases"]
 say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-latest$", cc, re.M) is not None
     and "        shard: [1, 2, 3, 4]\n" in cc and not re.search(r"^\s+(os|include):", cc, re.M)
@@ -162,7 +180,7 @@ g = g.group(1).rstrip() if g else ""
 say(g.endswith("|| format('ci-{0}-{1}', github.event_name, github.run_id) }}") and "github.head_ref" in g,
     "L4 a pull request's runs share its branch's group; every other run has a group of its own run id")
 n = blocks["nightly-red"]
-say("    needs: [legs, port, unit, fuzz, checked-cases, oracle, macos-fuzz, macos-perf]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
+say("    needs: [legs, port, unit, macos-unit, fuzz, checked-cases, oracle, macos-fuzz, macos-perf]\n" in n and "    if: ${{ failure() && github.event_name == 'schedule' }}\n" in n
     and "      issues: write\n" in n and "        run: ci/nightly-red.sh\n" in n and "WORKFLOW: ${{ github.workflow }}" in n,
     "L4 a red nightly, and only a red nightly, runs ci/nightly-red.sh with issues: write")
 

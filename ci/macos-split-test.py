@@ -87,7 +87,7 @@ def validate(text):
     assert "actions/download-artifact@v4" in perf and "run-id:" not in perf
     assert 'test "$(cat target/macos-oracle-head)" = "$(git rev-parse HEAD)"' in perf
     assert "tar -xzf target/macos-input/macos-oracle.tar.gz" in perf
-    assert "needs: [legs, port, unit, fuzz, checked-cases, oracle, macos-fuzz, macos-perf]" in job(text, "nightly-red")
+    assert "needs: [legs, port, unit, macos-unit, fuzz, checked-cases, oracle, macos-fuzz, macos-perf]" in job(text, "nightly-red")
 
 
 def main():
