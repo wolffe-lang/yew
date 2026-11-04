@@ -27,7 +27,9 @@ THE LEGS. A leg is one entry of a job's matrix: one host.
                 held a slot for 12 to 15 minutes on every push, so it runs
                 every night (ci/tl30.md). The `oracle` job builds the port on
                 macOS too (release tier), so a pull request still proves it
-                builds there.
+                builds there. Since yw14 the macOS unit lanes are the
+                `macos-unit` job's four shards, which run wherever this
+                plan gives `port` its macOS leg.
 
 ci/legs-test.py is this file's proof and runs first in the same job.
 """
