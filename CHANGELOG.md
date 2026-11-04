@@ -5,6 +5,32 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw14 — the sweep: the red nightly and the correctness backlog (2026-11-04)
+
+- The pin kept at wolf 0.2.36 / lupin 0.1.58 (still the latest releases).
+- The nightly (yew#49, yew#90): the macOS port leg was red every night
+  from 10-22 and then cut at its 240 minutes. Two deterministic macOS
+  reds are fixed in the tests: the comphelp fixture names itself by
+  `argv[0]` as C's does (`os_exe()` keeps `/tmp`'s symlink on macOS), and
+  runtime_skew expects the workspace refusal's canonical path (a TMPDIR
+  under `/var/folders`). The macOS unit lanes move to `macos-unit`, four
+  shards beside the port job, which keeps its fuzzers.
+- The fake clipboard tool (yew#42): `tools/build-fakeclip` builds C's
+  `fakeclip` alone; every unit job builds it and `tools/check-test
+  --fakeclip-ran` proves no clipboard row skipped for want of it.
+- The `.gitignore` matcher (yew#100): an unanchored pattern with a
+  crossing star rescanned the path's tail from every component
+  (quadratic: 1.64 s at 48,100 bytes); the walk now memoises the star
+  states it has proven false, linear, its answers C's matcher's.
+  `fuzz-gitignore --scale` is the row.
+- `fl/gc.lu` pushes `copy fl_empty_slot()` (yew#98): the G50 witness
+  exits 139 natively without it at the pin, and wolf-lang#998 refuses the
+  old form (E1010).
+- Rows for the answered issues: `edit_paste_bytes_test` (yew#18, fixed at
+  `a7be446`), witness B's inner refusal (yew#93), `final-newline-pty.py`
+  (yew#33: C yew saves the same bytes), `runtime-pty.py` clears its root
+  (yew#99).
+
 ### r41q — the pin to wolf 0.2.36 / lupin 0.1.58 (2026-11-01)
 
 - The pin moves to wolf 0.2.36 / lupin 0.1.58 and the bundled wolf-std
