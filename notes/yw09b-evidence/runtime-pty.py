@@ -23,8 +23,13 @@ p.add_argument("--fixture-only", action="store_true", help="prepare an owned run
 a = p.parse_args()
 root = Path(a.root).resolve()
 root.mkdir(parents=True, exist_ok=True)
-for part in ("home", "config", "state", "cache", "data", "work"):
-    (root / part).mkdir(exist_ok=True)
+# yew#99: yew keys workspace state to the folder's path, so a root reused
+# from an earlier run restored that run's cursor and moved Down to line 3.
+# Every run starts from empty home, config, state, cache and data trees.
+for part in ("home", "config", "state", "cache", "data"):
+    if (root / part).exists(): shutil.rmtree(root / part)
+    (root / part).mkdir()
+(root / "work").mkdir(exist_ok=True)
 runtime = root / "runtime"
 if runtime.exists(): shutil.rmtree(runtime)
 shutil.copytree(a.runtime, runtime)
