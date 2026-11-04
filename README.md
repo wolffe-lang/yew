@@ -80,6 +80,8 @@ tools/check-test                 # output/refusals visible; native fallback coun
 tools/check-test --native        # all unit files built and run natively
 tools/check-test --no-native-fallback # strict checked-only run (refusals fail)
 tools/check-test-cases           # the checked machine one case at a time (files past its budget)
+tools/build-fakeclip             # C's fake clipboard tool alone, for the clipboard rows
+tools/check-test --fakeclip-ran  # after both lanes: no clipboard row skipped for want of it
 tools/check-tables               # tables.lu is the generator's, and sagitta's
 tools/oracle --unit              # C yew at the pin, gcc and clang, its unit suite
 tools/goldens --yew target/release/yew
