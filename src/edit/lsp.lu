@@ -1,0 +1,556 @@
+//! edit.lsp — the language-server module's editor-facing boundary
+//! (Sprint 45, 46): info, log, restart, stop, the diagnostic list and
+//! jump, the attachment and badge, the pump, the editor's teardown, the
+//! buffer hooks, the sync hooks and the commands; and the minimum of
+//! language detection the client needs (R-yw11-1).
+//!
+//! Ports sagitta `src/mod/lsp/lsp.c` (467 lines; the feature entry points
+//! — completion, hover, signature, the gotos, references, rename, symbols
+//! and the signature auto-trigger — are Sprint 47's, yw11b, and keep
+//! refusing by name through the registry), `src/mod/lsp/sync.c:398-497`
+//! (the editor hooks), `src/edit/lsp_cmds.c:1-61`, and the path half of
+//! `yew_syn_lang_for` (`src/syn/defs.c:3440-3510`) with `yew_ed_syn_bind`'s
+//! naming (`src/edit/ed.c:183-232`) at 9ace98c2. `shim.c` (the disabled
+//! module) is not ported: the port is always the full build (#93 R4).
+//!
+//! **R-yw11-1, the language.** C names a buffer's language through the
+//! syntax engine (yw10's): a path's exact name, glob or extension, then a
+//! shebang, a first-line pattern, the Fortran scorer and user
+//! definitions. The client starts a server only for a buffer with a
+//! language (`client.c:1133`, `lsp.c:446`), so yw11 ports the path half
+//! over the generated index's rows (`edit.syn_paths`,
+//! `tools/gen-syn-paths`); the rest stays yw10's, and a buffer only it
+//! would name has no language, as before.
+
+use lsp
+use std.map as std_map
+use text
+use util
+
+// ---------------------------------------------------------------------
+// The path half of language detection (R-yw11-1).
+// ---------------------------------------------------------------------
+
+// A builtin language's row (`SynLangSeed`'s id, name, priority).
+struct SynLang {
+    id: int,
+    name: str,
+    priority: int,
+}
+
+fn syn_langs() -> List[SynLang] {
+    var out = List[SynLang]()
+    for row in SYN_LANGS.lines() {
+        let f = row.split(" ")
+        if f.len == 3 {
+            (mut out).push(SynLang {
+                id: f[0].to_int() else 0,
+                name: f[1],
+                priority: f[2].to_int() else 0,
+            })
+        }
+    }
+    out
+}
+
+fn syn_lang_by_id(langs: List[SynLang], id: int) -> int {
+    var i = 0
+    while i < langs.len {
+        if langs[i].id == id {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `better` (`defs.c:3341-3345`): priority, then the name's byte order.
+fn syn_better(langs: List[SynLang], a: int, b: int) -> bool {
+    if b < 0 {
+        return true
+    }
+    if langs[a].priority != langs[b].priority {
+        return langs[a].priority > langs[b].priority
+    }
+    label_less(langs[a].name, langs[b].name)
+}
+
+fn fold_eq(a: str, b: str) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        var x = a.bytes()[i] as int
+        var y = b.bytes()[i] as int
+        if x >= 65 && x <= 90 {
+            x += 32
+        }
+        if y >= 65 && y <= 90 {
+            y += 32
+        }
+        if x != y {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `path_language` (`defs.c:3440-3510`) over the builtin index: an exact
+/// filename, else a glob, else the longest extension (case folded); ties
+/// by `better`. Answers the language's name, or `none`.
+pub fn syn_lang_for_path(path: str) -> str ! {none} {
+    let slash = path.rfind("/") else -1
+    let base = if slash < 0 then path else path[slash + 1..]
+    let langs = syn_langs()
+    var exact = -1
+    for row in SYN_EXACT.lines() {
+        let f = row.split(" ")
+        if f.len == 2 && f[0] == base {
+            let l = syn_lang_by_id(langs, f[1].to_int() else 0)
+            if l >= 0 && syn_better(langs, l, exact) {
+                exact = l
+            }
+        }
+    }
+    if exact >= 0 {
+        return langs[exact].name
+    }
+    var glob = -1
+    for row in SYN_GLOBS.lines() {
+        let f = row.split(" ")
+        if f.len != 3 {
+            continue
+        }
+        let key = f[0]
+        let prefix = f[1].to_int() else 0
+        let suffix = key.len - prefix - 1
+        if base.len < prefix + suffix {
+            continue
+        }
+        if key[0..prefix] != base[0..prefix] || key[prefix + 1..] != base[base.len - suffix..] {
+            continue
+        }
+        let l = syn_lang_by_id(langs, f[2].to_int() else 0)
+        if l >= 0 && syn_better(langs, l, glob) {
+            glob = l
+        }
+    }
+    if glob >= 0 {
+        return langs[glob].name
+    }
+    var ext = -1
+    var ext_len = 0
+    var dot = 0
+    while dot < base.len {
+        if base.bytes()[dot] as int == 46 {
+            let extension = base[dot + 1..]
+            var best = -1
+            for row in SYN_EXT.lines() {
+                let f = row.split(" ")
+                if f.len == 2 && fold_eq(f[0], extension) {
+                    let l = syn_lang_by_id(langs, f[1].to_int() else 0)
+                    if l >= 0 && syn_better(langs, l, best) {
+                        best = l
+                    }
+                }
+            }
+            if best >= 0 &&
+                (
+                    extension.len > ext_len ||
+                        extension.len == ext_len && syn_better(langs, best, ext)
+                ) {
+                ext_len = extension.len
+                ext = best
+            }
+        }
+        dot += 1
+    }
+    if ext < 0 {
+        return none
+    }
+    langs[ext].name
+}
+
+/// `yew_ed_syn_bind`'s naming (`ed.c:183-232`): a non-binary buffer with a
+/// path gets the language its path names, `fortran-fixed` spelled
+/// `fortran(fixed)`; otherwise none.
+pub fn ed_syn_bind_lang(mut ed: Ed, bi: int) {
+    if bi < 0 || bi >= ed.bufs.len {
+        return
+    }
+    let id = ed.bufs[bi].id
+    let _ = std_map.remove(mut ed.buf_languages, id) else ""
+    if !ed.bufs[bi].has_path || ed.bufs[bi].ec.meta.binary {
+        return
+    }
+    let name = syn_lang_for_path(ed.bufs[bi].path) else {
+        return
+    }
+    ed.buf_languages[id] = if name == "fortran-fixed" then "fortran(fixed)" else name
+}
+
+// ---------------------------------------------------------------------
+// The editor hooks of sync (`sync.c:398-497`).
+// ---------------------------------------------------------------------
+
+/// The edit choke point's log for buffer `bi` replayed into its document
+/// (`yew_lsp_note_edit` and `yew_lsp_note_edit_post`, `sync.c:414-435`):
+/// only while its server is READY, as C's `edit_sync` answers.
+pub fn lsp_sync_drain(mut ed: Ed, bi: int) {
+    if bi < 0 || ed.bufs[bi].ec.lsp_log.len == 0 {
+        return
+    }
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    let log = copy ed.bufs[bi].ec.lsp_log
+    let texts = copy ed.bufs[bi].ec.lsp_text
+    (mut ed.bufs[bi].ec.lsp_log).reset()
+    (mut ed.bufs[bi].ec.lsp_text).reset()
+    if k < 0 || ed.lsp.servers[k].life.state != lsp.LSP_READY {
+        return
+    }
+    let sync_kind = ed.lsp.servers[k].life.caps.sync_kind
+    var t = 0
+    var i = 0
+    while i + 6 < log.len {
+        let kind = log[i]
+        var bytes = List[byte]()
+        if kind == text.JOURNAL_INS && t < texts.len {
+            bytes = copy texts[t]
+            t += 1
+        }
+        lsp.lsp_doc_note_logged(
+            mut ed.lsp.servers[k].docv[d],
+            sync_kind,
+            kind,
+            log[i + 2],
+            log[i + 3],
+            log[i + 4],
+            log[i + 5],
+            log[i + 6],
+            take bytes,
+        )
+        i += 7
+    }
+}
+
+/// `yew_lsp_sync_save` (`sync.c:459-477`).
+pub fn lsp_sync_save(mut ed: Ed, bi: int) {
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 || ed.lsp.servers[k].life.state != lsp.LSP_READY {
+        return
+    }
+    lsp_sync_drain(mut ed, bi)
+    let _ = lsp.lsp_doc_flush(
+        mut ed.lsp.servers[k].rpc,
+        mut ed.lsp.servers[k].docv[d],
+        ed.lsp.servers[k].life.caps.sync_kind,
+        ed.bufs[bi].ec.tb,
+    )
+    if ed.lsp.servers[k].life.caps.save_supported {
+        lsp.lsp_doc_save(
+            mut ed.lsp.servers[k].rpc,
+            ed.lsp.servers[k].docv[d],
+            ed.bufs[bi].ec.tb,
+            ed.lsp.servers[k].life.caps.save_include_text,
+        )
+    }
+    lsp_flush_tx(mut ed, ed.lsp.servers[k].id)
+}
+
+// ---------------------------------------------------------------------
+// The boundary (`lsp.c`).
+// ---------------------------------------------------------------------
+
+// `state_name` (`lsp.c:22-30`).
+fn state_name(state: int) -> str {
+    match state {
+        0 => "spawning",
+        1 => "initializing",
+        2 => "ready",
+        3 => "shutting down",
+        4 => "dead",
+        _ => "unknown",
+    }
+}
+
+// `cap_names` (`lsp.c:32-73`): the capability names joined by commas,
+// cut at 255 bytes, `none` when empty.
+fn cap_names(caps: lsp.LspCaps) -> str {
+    let names = [
+        (lsp.LSPC_COMPLETION, "completion"),
+        (lsp.LSPC_HOVER, "hover"),
+        (lsp.LSPC_SIGNATURE, "signatureHelp"),
+        (lsp.LSPC_DEFINITION, "definition"),
+        (lsp.LSPC_DECLARATION, "declaration"),
+        (lsp.LSPC_TYPE_DEFINITION, "typeDefinition"),
+        (lsp.LSPC_IMPLEMENTATION, "implementation"),
+        (lsp.LSPC_REFERENCES, "references"),
+        (lsp.LSPC_DOCUMENT_HIGHLIGHT, "documentHighlight"),
+        (lsp.LSPC_DOCUMENT_SYMBOL, "documentSymbol"),
+        (lsp.LSPC_RENAME, "rename"),
+        (lsp.LSPC_WORKSPACE_SYMBOL, "workspaceSymbol"),
+    ]
+    var out = ""
+    for (bit, name) in names {
+        if !lsp.lsp_caps_has(caps, bit) {
+            continue
+        }
+        let piece = if out.len == 0 then name else ",{name}"
+        if out.len + piece.len >= 255 {
+            out = out + piece[0..255 - out.len]
+            break
+        }
+        out = out + piece
+    }
+    if out.len == 0 then "none" else out
+}
+
+// The focused window's buffer, or -1.
+fn focused_buf(ed: Ed) -> int {
+    if ed.win < 0 || ed.win >= ed.wins.len then -1 else ed.wins[ed.win].buf
+}
+
+/// `yew_lsp_info` (`lsp.c:96-133`).
+pub fn lsp_info(mut ed: Ed) -> bool {
+    let bi = focused_buf(ed)
+    if bi < 0 {
+        return false
+    }
+    let (k0, d0) = lsp_doc_of_buffer(ed, bi)
+    var k = k0
+    var d = d0
+    if k < 0 {
+        if !lsp_client_start(mut ed, bi) {
+            let lang = ed.buf_languages[ed.bufs[bi].id] else "this buffer"
+            ed_msg(mut ed, MSG_INFO, "no LSP server configured for {lang}")
+            return true
+        }
+        let (k2, d2) = lsp_doc_of_buffer(ed, bi)
+        k = k2
+        d = d2
+    }
+    if k < 0 {
+        return false
+    }
+    let s = copy ed.lsp.servers[k]
+    let enc = if s.life.pos_enc == lsp.POSENC_UTF8 then "utf-8" else "utf-16"
+    let version = if d < 0 then 0 else s.docv[d].version
+    ed_msg(
+        mut ed,
+        MSG_INFO,
+        "{s.cfg.id} {state_name(s.life.state)}; root {s.root}; {enc}; caps {cap_names(s.life.caps)}; restarts {s.life.restarts}; doc v{version}; stale drops {s.dropped_stale}",
+    )
+    ed_msg_hint(mut ed, MSG_INFO, "LSP snippets are inserted as plain text")
+    true
+}
+
+/// `yew_lsp_log` (`lsp.c:135-170`): the server's stderr in the
+/// `[LSP Log]` scratch.
+pub fn lsp_log(mut ed: Ed) -> bool {
+    let bi = focused_buf(ed)
+    if bi < 0 {
+        return false
+    }
+    let (k, _) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 {
+        ed_msg(mut ed, MSG_INFO, "no LSP server for this buffer")
+        return true
+    }
+    var log = ws_scratch_find(ed, "[LSP Log]")
+    if log < 0 {
+        log = ws_scratch_new(mut ed, "[LSP Log]", BUF_NOUNDO | BUF_READONLY)
+    }
+    if log < 0 {
+        return false
+    }
+    var body = List[byte]()
+    let s = copy ed.lsp.servers[k]
+    util.buf_append_str(mut body, "{s.cfg.id} [{state_name(s.life.state)}]\nroot: {s.root}\n\n")
+    let j = job_find(ed, s.job)
+    if j >= 0 && ed.jobs.v[j].framed_err.len != 0 {
+        util.buf_append(mut body, ed.jobs.v[j].framed_err)
+    } else {
+        util.buf_append_str(mut body, "(no stderr output)\n")
+    }
+    let len = text.textbuf_len(ed.bufs[log].ec.tb)
+    text.textbuf_delete(mut ed.bufs[log].ec.tb, text.Span { lo: 0, hi: len })
+    text.textbuf_insert(mut ed.bufs[log].ec.tb, 0 as text.ByteOff, body)
+    ed_show_buffer(mut ed, log)
+    true
+}
+
+/// `yew_lsp_start` (`lsp.c:172-185`): `:lsp.restart`.
+pub fn lsp_start(mut ed: Ed, bi: int) -> bool {
+    if bi < 0 {
+        return false
+    }
+    var has_cfg = false
+    let lang = ed.buf_languages[ed.bufs[bi].id] else ""
+    if lang.len != 0 {
+        let _ = lsp_client_cfg(mut ed, lang) else {
+            ed_msg(mut ed, MSG_INFO, "no LSP server configured for this buffer")
+            return true
+        }
+        has_cfg = true
+    }
+    if !ed.bufs[bi].has_path || !has_cfg {
+        ed_msg(mut ed, MSG_INFO, "no LSP server configured for this buffer")
+        return true
+    }
+    lsp_client_restart(mut ed, bi)
+}
+
+/// `yew_lsp_stop` (`lsp.c:187-197`).
+pub fn lsp_stop(mut ed: Ed, bi: int) -> bool {
+    let (k, _) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 {
+        ed_msg(mut ed, MSG_INFO, "no LSP server for this buffer")
+        return true
+    }
+    lsp_client_stop(mut ed, k, true)
+    true
+}
+
+/// `yew_lsp_diagnostics` (`lsp.c:199-205`).
+pub fn lsp_diagnostics(mut ed: Ed) -> bool {
+    diag_picker_open(mut ed)
+    true
+}
+
+/// `yew_lsp_diag_step` (`lsp.c:207-214`).
+pub fn lsp_diag_step(mut ed: Ed, wi: int, forward: bool) -> bool {
+    if !diag_jump(mut ed, wi, forward) {
+        ed_msg(mut ed, MSG_INFO, "no diagnostics in this buffer")
+    }
+    true
+}
+
+/// `yew_lsp_attached` (`lsp.c:398-411`): a server attached to buffer
+/// `bi`, ready or not.
+pub fn lsp_attached(ed: Ed, bi: int) -> bool {
+    let (k, _) = lsp_doc_of_buffer(ed, bi)
+    k >= 0
+}
+
+/// `yew_lsp_status_badge` (`lsp.c:413-428`): the server's id, `…` while
+/// it initializes; empty when none is attached.
+pub fn lsp_status_badge(ed: Ed, bi: int) -> str {
+    let (k, _) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 {
+        return ""
+    }
+    let tail = if ed.lsp.servers[k].life.state == lsp.LSP_INITIALIZING then "\u{2026}" else ""
+    "{ed.lsp.servers[k].cfg.id}{tail}"
+}
+
+/// `yew_lsp_pump` (`lsp.c:430-446`): a server started for every buffer
+/// with a path and a language and none yet, then the client's pump. Not
+/// before the model is ready (init.fl's table may replace the defaults).
+pub fn lsp_pump(mut ed: Ed) {
+    if !ed.model_ready {
+        return
+    }
+    lsp_client_refresh_config(mut ed)
+    var bi = 0
+    while bi < ed.bufs.len {
+        if ed.bufs[bi].resident &&
+            !buffer_binary(ed, bi) &&
+            ed.bufs[bi].has_path &&
+            std_map.has(ed.buf_languages, ed.bufs[bi].id) {
+            let (k, _) = lsp_doc_of_buffer(ed, bi)
+            if k < 0 {
+                let _ = lsp_client_start(mut ed, bi)
+            }
+        }
+        bi += 1
+    }
+    lsp_client_pump(mut ed)
+}
+
+/// `yew_lsp_free` (`lsp.c:448-459`): every store dropped, then the client.
+pub fn lsp_free(mut ed: Ed) {
+    var bi = 0
+    while bi < ed.bufs.len {
+        diag_store_free(mut ed, bi)
+        bi += 1
+    }
+    lsp_client_free(mut ed)
+}
+
+/// `yew_lsp_buffer_open` (`lsp.c:461-468`): startup is deferred to the
+/// pump (a buffer hydrates before init.fl's table is known).
+pub fn lsp_buffer_open(ed: Ed, bi: int) {
+    let _ = bi
+    let _ = ed.lsp.present
+}
+
+/// `yew_lsp_buffer_save` (`lsp.c:470-473`).
+pub fn lsp_buffer_save(mut ed: Ed, bi: int) {
+    lsp_sync_save(mut ed, bi)
+}
+
+/// `yew_lsp_buffer_close` (`lsp.c:475-481`); the document highlight's
+/// clear is yw11b's.
+pub fn lsp_buffer_close(mut ed: Ed, bi: int) {
+    lsp_client_close_buffer(mut ed, bi)
+}
+
+// ---------------------------------------------------------------------
+// The commands (`src/edit/lsp_cmds.c:1-61`).
+// ---------------------------------------------------------------------
+
+fn status_of(ok: bool) -> int {
+    if ok then CMD_OK else CMD_ERR_STATE
+}
+
+/// `yew_lsp_cmd_info`.
+pub fn lsp_cmd_info(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    status_of(lsp_info(mut ed))
+}
+
+/// `yew_lsp_cmd_log`.
+pub fn lsp_cmd_log(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    status_of(lsp_log(mut ed))
+}
+
+/// `yew_lsp_cmd_start` (`ed.lsp.restart`).
+pub fn lsp_cmd_start(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || cx.win >= ed.wins.len {
+        return CMD_ERR_STATE
+    }
+    status_of(lsp_start(mut ed, ed.wins[cx.win].buf))
+}
+
+/// `yew_lsp_cmd_stop`.
+pub fn lsp_cmd_stop(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || cx.win >= ed.wins.len {
+        return CMD_ERR_STATE
+    }
+    status_of(lsp_stop(mut ed, ed.wins[cx.win].buf))
+}
+
+/// `yew_lsp_cmd_diagnostics`.
+pub fn lsp_cmd_diagnostics(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    status_of(lsp_diagnostics(mut ed))
+}
+
+/// `yew_lsp_cmd_diag_next`.
+pub fn lsp_cmd_diag_next(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || cx.win >= ed.wins.len {
+        return CMD_ERR_STATE
+    }
+    status_of(lsp_diag_step(mut ed, cx.win, true))
+}
+
+/// `yew_lsp_cmd_diag_prev`.
+pub fn lsp_cmd_diag_prev(mut ed: Ed, cx: CmdCtx) -> int {
+    if cx.win < 0 || cx.win >= ed.wins.len {
+        return CMD_ERR_STATE
+    }
+    status_of(lsp_diag_step(mut ed, cx.win, false))
+}
