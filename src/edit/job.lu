@@ -62,6 +62,17 @@ pub const FILTER_TIMEOUT_MS: int = 5000
 /// SIGTERM → SIGKILL (`YEW_JOB_TERM_GRACE_MS`).
 pub const JOB_TERM_GRACE_MS: int = 200
 
+/// Port-only: after a SIGKILL to a job's group, the group is killed again
+/// this often while the job still owes its pipes or its wait status.
+/// macOS can leave out of `kill(-pgid)` a child the shell is still
+/// forking; that child then holds the job's pipes until it exits.
+pub const JOB_REKILL_MS: int = 50
+
+/// Port-only: the most resends after one SIGKILL. The fork race needs
+/// one; a member that outlives this many is not that race, and the job
+/// is left to drain as it would without them.
+pub const JOB_REKILL_MAX: int = 20
+
 /// Mode (c)'s collection ceiling (`YEW_JOB_COLLECT_MAX`).
 pub const JOB_COLLECT_MAX: int = 67108864
 
@@ -602,6 +613,8 @@ pub struct Job {
     end_ms: int,
     timeout_ms: int,
     kill_at_ms: int,
+    rekill_at_ms: int,
+    rekills: int,
     buf: int,
     origin_buf_id: int,
     follow_tail: bool,
@@ -659,6 +672,8 @@ fn jb_job_new() -> Job {
         end_ms: 0,
         timeout_ms: 0,
         kill_at_ms: 0,
+        rekill_at_ms: 0,
+        rekills: 0,
         buf: -1,
         origin_buf_id: 0,
         follow_tail: true,
@@ -1312,6 +1327,37 @@ pub fn job_signal(mut ed: Ed, id: int, meaning: int) -> bool {
     if meaning == signal.terminate() {
         ed.jobs.v[i].kill_at_ms = now_ms() + JOB_TERM_GRACE_MS
     }
+    if meaning == signal.kill() {
+        jb_rekill_arm(mut ed, i, now_ms())
+    }
+    true
+}
+
+// Port-only: after a SIGKILL to job `i`'s group, send it again in
+// `JOB_REKILL_MS` (`jb_rekill`).
+fn jb_rekill_arm(mut ed: Ed, i: int, now: int) {
+    ed.jobs.v[i].rekill_at_ms = now + JOB_REKILL_MS
+    ed.jobs.v[i].rekills = 0
+}
+
+// Port-only: the group's SIGKILL again while the job is pending and the
+// group still answers, every `JOB_REKILL_MS`, at most `JOB_REKILL_MAX`
+// times. A settled job, a group gone (the send fails) or the last resend
+// disarms it.
+fn jb_rekill(mut ed: Ed, i: int, now: int) {
+    ed.jobs.v[i].rekill_at_ms = 0
+    if !job_pending(ed.jobs.v[i]) || ed.jobs.v[i].pgid <= 0 {
+        return
+    }
+    if ed.jobs.v[i].rekills >= JOB_REKILL_MAX || !jb_group_kill(ed.jobs.v[i].pgid) {
+        return
+    }
+    ed.jobs.v[i].rekills += 1
+    ed.jobs.v[i].rekill_at_ms = now + JOB_REKILL_MS
+}
+
+fn jb_group_kill(pgid: int) -> bool {
+    os_signal_send_group(pgid, signal.kill()) else |_| { return false }
     true
 }
 
@@ -1974,7 +2020,9 @@ pub fn job_settle(mut ed: Ed) -> int {
 }
 
 /// `yew_job_deadline` (`job.c:1887-1932`): ms until the next timeout or
-/// SIGTERM-to-SIGKILL escalation, -1 for none, 0 when one is due.
+/// SIGTERM-to-SIGKILL escalation, -1 for none, 0 when one is due; and,
+/// port-only, a pending job's next group SIGKILL (`jb_rekill`), whatever
+/// its state, since the race leaves the leader reaped.
 pub fn job_deadline(ed: Ed, now: int) -> int {
     var best = -1
     for j in ed.jobs.v {
@@ -1985,6 +2033,14 @@ pub fn job_deadline(ed: Ed, now: int) -> int {
             }
             if sat >= 0 && (best < 0 || sat - now < best) {
                 best = sat - now
+            }
+        }
+        if j.rekill_at_ms != 0 && job_pending(j) {
+            if j.rekill_at_ms <= now {
+                return 0
+            }
+            if best < 0 || j.rekill_at_ms - now < best {
+                best = j.rekill_at_ms - now
             }
         }
         if j.state != JOB_RUNNING {
@@ -2015,9 +2071,14 @@ pub fn job_deadline(ed: Ed, now: int) -> int {
 pub fn job_tick(mut ed: Ed, now: int) {
     var i = 0
     while i < ed.jobs.v.len {
+        if ed.jobs.v[i].rekill_at_ms != 0 && now >= ed.jobs.v[i].rekill_at_ms {
+            jb_rekill(mut ed, i, now)
+        }
         if ed.jobs.v[i].kill_at_ms != 0 && now >= ed.jobs.v[i].kill_at_ms {
             if job_pending(ed.jobs.v[i]) && ed.jobs.v[i].pgid > 0 {
-                os_signal_send_group(ed.jobs.v[i].pgid, signal.kill()) else |_| {}
+                if jb_group_kill(ed.jobs.v[i].pgid) {
+                    jb_rekill_arm(mut ed, i, now)
+                }
             }
             ed.jobs.v[i].kill_at_ms = 0
             i += 1
