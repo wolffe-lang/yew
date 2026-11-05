@@ -141,8 +141,11 @@ not read (the clean room covers JSON libraries).
 
 ## Inputs verified
 
-- **Base:** yew trunk `1218169e` (r41q's record), still trunk at the
-  final records; #110 had not merged.
+- **Base:** #110's head `2eb9cb9b` (yw14), trunk's next state as a
+  fast-forward of trunk `1218169e` (r41q's record); the branch was
+  rebased onto it before the final records. Only `CHANGELOG.md`
+  conflicted (both entries kept, newest first); `ci.yml`, `edit.job`,
+  `MAP.md` and the README merged with both sides' lines intact.
 - **Toolchain:** wolf 0.2.36 (`5adf3d91`), lupin 0.1.58, std
   `78b9d3cb`, from the pinned archives (`tools/fetch-toolchain`).
 - **C yew:** `sagitta.pin` (`9ace98c2`), built by `tools/oracle` (clang
@@ -171,31 +174,31 @@ not read (the clean room covers JSON libraries).
 
 Commits, in order:
 
-- `a072d53` the prediction.
-- `8d32e6f` `lsp_json_test`, red (no `lsp.json`); `fd55262` `lsp.json`.
-- `3bfc91c` `lsp_jsonrpc_test`, red; `68d2f9b` `lsp.jsonrpc`.
-- `ee959d8` `lsp_client_test` and `lsp_sync_test`, red (no
-  `lsp_uri_of_path`, no `lsp.sync`); `46b846d` `lsp.client`; `a906546`
+- `50ef9dd` the prediction.
+- `354d52d` `lsp_json_test`, red (no `lsp.json`); `9cd40a2` `lsp.json`.
+- `13b4d33` `lsp_jsonrpc_test`, red; `99eec83` `lsp.jsonrpc`.
+- `0ce0987` `lsp_client_test` and `lsp_sync_test`, red (no
+  `lsp_uri_of_path`, no `lsp.sync`); `27dd56f` `lsp.client`; `753b819`
   `lsp.sync`.
-- `15c0b13` `edit_lsp_diag_test` and `8bd1bf1` `edit_lsp_config_test`,
+- `4d5cb49` `edit_lsp_diag_test` and `de97d8a` `edit_lsp_config_test`,
   each red at its commit (no `edit.diag_replace`, no `lsp_client_cfg`).
-- The oracle rows, red against the trunk port: `95620c4` the fake
-  server, `e9655fd` the runner's cases, `a52da0b` the comparison,
-  `191a9af` `tools/run-lsp-rows`.
-- The client: `da8bc43` `lsp.sync` replays a logged edit; `79f4237`
+- The oracle rows, red against the trunk port: `a049ebb` the fake
+  server, `ddf02e5` the runner's cases, `5e9abf6` the comparison,
+  `a3d4736` `tools/run-lsp-rows`.
+- The client: `623abb2` `lsp.sync` replays a logged edit; `bc67f30`
   `text.edit` logs each edit at the choke point (C's notify hooks,
-  `notify.c:44,57`); `33aea55` `edit.syn_paths` and `256bc60`
-  `tools/check-syn-paths` (R-yw11-1); `8fa40d9` `edit.lsp_client`;
-  `59fc468` `edit.lsp_diag`; `16267ef` `edit.lsp`; `53ae984` the framed
-  sink in `edit.job`; `c190d38`, `404f645`, `e75b2c4` the `Ed`, the
-  close and free paths and the commands; `f76b308` the server table
+  `notify.c:44,57`); `95ebaf8` `edit.syn_paths` and `79c421a`
+  `tools/check-syn-paths` (R-yw11-1); `d4e5f60` `edit.lsp_client`;
+  `71ecf93` `edit.lsp_diag`; `9af2ebf` `edit.lsp`; `0873751` the framed
+  sink in `edit.job`; `0d7b757`, `8b215ab`, `0ad5746` the `Ed`, the
+  close and free paths and the commands; `e73803b` the server table
   read against a running script's VM.
-- The drawing: `c4d0a4e` the underline and the hint, `230e5ac` the
-  statusline badge, `9b68920` the picker host.
-- `864ba37` `lsp` staged for the tools that build the editor;
-  `bd58161` the demo's `s46_diag_*` scenes; `02b6e91` CI's gate;
-  `92ef035` the four files over the checked machine's budget one case at
-  a time (G29); `f13b04b` `wolf fmt`.
+- The drawing: `8536908` the underline and the hint, `0acea03` the
+  statusline badge, `ac75dcd` the picker host.
+- `b149354` `lsp` staged for the tools that build the editor;
+  `d25253f` the demo's `s46_diag_*` scenes; `df31080` CI's gate;
+  `595e199` the four files over the checked machine's budget one case at
+  a time (G29); `a8fa142` `wolf fmt`.
 
 **The rows, and what each showed.**
 
@@ -225,7 +228,7 @@ Commits, in order:
   that a running batch script holds the Fletch VM out of the `Ed`, so
   the server table read from `t.pump` found no `lsp` binding and the
   pump started clangd; `t.pump` now reads the table against the
-  script's own VM (`f76b308`).
+  script's own VM (`e73803b`).
 - **The oracle rows** (`tools/run-lsp-rows`, nine cases, seventeen
   screens), C yew and the port against the same pinned `wolf lsp` and
   the same fake server, each case twice per editor:
