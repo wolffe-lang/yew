@@ -222,7 +222,9 @@ backtrack enters, and `gitignore_scales_linearly` goes red by name.
   Options: (A) keep the resend as a port-only row of the job layer; (B) keep it, and also send the
   reproduction (a shell forking background sleeps, killed mid-loop, on macOS) to sagitta so C can take the
   same resend. Without the resend, `:kill` cannot end such a job on macOS while the stray child lives.
-  Implemented: A. Recommended: B, since the filing is a public step for the maintainer.
+  Recommended and decided: B. The resend stays as implemented, and the reproduction is filed as
+  tenseleyFlow/sagitta#2, with a script that shows the race without the editor: on macOS arm64 a survivor
+  in 17 of 40 cycles, each ended by a second group SIGKILL; on Linux none in 200.
 
 ## Done-when
 
