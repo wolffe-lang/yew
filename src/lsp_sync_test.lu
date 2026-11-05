@@ -1,0 +1,429 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_lsp_sync.c` (357 lines) at
+//! 9ace98c2, in registry order (`tests/unit/registry.c:1438-1441`), and
+//! one port case: the incremental changes sent for a run of edits,
+//! applied in order to a copy of the opened text, give back the buffer
+//! (the server's view matches the editor's, MAP's "incremental didChange
+//! is the port's own").
+
+use lsp
+use text
+use util
+
+struct Tally {
+    n: int,
+}
+
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    assert(cond, what)
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn text_of(b: List[byte]) -> str {
+    str_from_utf8(b) else "<not utf-8>"
+}
+
+struct Fix {
+    tb: text.TextBuf,
+    doc: lsp.LspDoc,
+    rpc: lsp.RpcConn,
+    binary: bool,
+}
+
+fn fix_new(s: List[byte]) -> Fix {
+    Fix {
+        tb: text.textbuf_from_bytes(s, 0, s.len),
+        doc: lsp.lsp_doc_new(7, "file:///tmp/a%20b.c"),
+        rpc: lsp.rpc_conn_new(),
+        binary: false,
+    }
+}
+
+fn tx_clear(mut f: Fix) {
+    lsp.rpctx_consume(mut f.rpc.tx, f.rpc.tx.pending.len)
+}
+
+// `frame_body` (`test_lsp_sync.c:30-68`): frame `wanted`'s body.
+fn frame_body(rpc: lsp.RpcConn, wanted: int) -> List[byte] {
+    let p = copy rpc.tx.pending
+    var at = 0
+    var frame = 0
+    while at < p.len {
+        let prefix = "Content-Length: "
+        var i = at + prefix.len
+        var n = 0
+        while i < p.len && p[i] as int >= 48 && p[i] as int <= 57 {
+            n = n * 10 + (p[i] as int - 48)
+            i += 1
+        }
+        while i + 3 < p.len &&
+            !(
+                p[i] as int == 13 &&
+                    p[i + 1] as int == 10 &&
+                    p[i + 2] as int == 13 &&
+                    p[i + 3] as int == 10
+            ) {
+            i += 1
+        }
+        let start = i + 4
+        if frame == wanted {
+            var out = List[byte]()
+            var k = 0
+            while k < n {
+                (mut out).push(p[start + k])
+                k += 1
+            }
+            return out
+        }
+        at = start + n
+        frame += 1
+    }
+    assert(false, "no frame {wanted}")
+    List[byte]()
+}
+
+fn frame_json(rpc: lsp.RpcConn, frame: int) -> lsp.Json {
+    let body = frame_body(rpc, frame)
+    var err = lsp.json_err_new()
+    let j = lsp.json_parse(body, 0, body.len, mut err) else {
+        assert(false, "frame {frame}: {err.msg}")
+        return lsp.json_new()
+    }
+    j
+}
+
+fn params_of(mut t: Tally, j: lsp.Json, method: str) -> int {
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_field(j, j.root, "method"), method),
+        "the method is {method}",
+    )
+    lsp.json_field(j, j.root, "params")
+}
+
+fn apply_insert(mut f: Fix, enc: int, sync_kind: int, at: int, s: str) {
+    lsp.lsp_doc_note_edit(mut f.doc, enc, sync_kind, f.tb, text.JOURNAL_INS, at, s.len)
+    text.textbuf_insert(mut f.tb, at as text.ByteOff, pb(s))
+    lsp.lsp_doc_note_edit_post(mut f.doc, text.JOURNAL_INS, f.tb, at, s.len)
+}
+
+fn apply_delete(mut f: Fix, enc: int, sync_kind: int, at: int, len: int) {
+    lsp.lsp_doc_note_edit(mut f.doc, enc, sync_kind, f.tb, text.JOURNAL_DEL, at, len)
+    text.textbuf_delete(mut f.tb, text.Span { lo: at, hi: at + len })
+    lsp.lsp_doc_note_edit_post(mut f.doc, text.JOURNAL_DEL, f.tb, at, len)
+}
+
+fn open(mut f: Fix) -> bool {
+    lsp.lsp_doc_open(mut f.rpc, mut f.doc, f.tb, f.binary, "c")
+}
+
+fn int_at(j: lsp.Json, v: int, path: str) -> int {
+    lsp.json_int(j, lsp.json_path(j, v, path), -1)
+}
+
+// test_lsp_sync.c:116-199
+fn lsp_sync_open_save_close_and_generation(mut t: Tally) {
+    var f = fix_new(pb("int main(void) {{}}\n"))
+    ok(mut t, open(mut f), "didOpen")
+    var j = frame_json(f.rpc, 0)
+    var params = params_of(mut t, j, "textDocument/didOpen")
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_path(j, params, "textDocument.uri"), "file:///tmp/a%20b.c"),
+        "the uri",
+    )
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_path(j, params, "textDocument.languageId"), "c"),
+        "the language",
+    )
+    ok(mut t, int_at(j, params, "textDocument.version") == 1, "version 1")
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_path(j, params, "textDocument.text"), "int main(void) {{}}\n"),
+        "the text",
+    )
+    let gen = lsp.lsp_gen(f.doc, f.tb)
+    ok(mut t, lsp.lsp_gen_matches(gen, f.doc, f.tb), "the generation matches")
+    text.textbuf_insert(mut f.tb, 0 as text.ByteOff, pb("x"))
+    ok(mut t, !lsp.lsp_gen_matches(gen, f.doc, f.tb), "an edit moves it")
+    tx_clear(mut f)
+    lsp.lsp_doc_save(mut f.rpc, f.doc, f.tb, true)
+    j = frame_json(f.rpc, 0)
+    params = params_of(mut t, j, "textDocument/didSave")
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_field(j, params, "text"), "xint main(void) {{}}\n"),
+        "didSave with text",
+    )
+    tx_clear(mut f)
+    lsp.lsp_doc_save(mut f.rpc, f.doc, f.tb, false)
+    j = frame_json(f.rpc, 0)
+    params = params_of(mut t, j, "textDocument/didSave")
+    ok(mut t, lsp.json_field(j, params, "text") < 0, "didSave without text")
+    tx_clear(mut f)
+    lsp.lsp_doc_close(mut f.rpc, mut f.doc)
+    j = frame_json(f.rpc, 0)
+    let _ = params_of(mut t, j, "textDocument/didClose")
+    ok(mut t, !f.doc.open, "closed")
+    ok(mut t, !lsp.lsp_gen_matches(gen, f.doc, f.tb), "a closed document matches nothing")
+    ok(mut t, open(mut f), "reopened")
+    j = frame_json(f.rpc, 1)
+    params = params_of(mut t, j, "textDocument/didOpen")
+    ok(mut t, int_at(j, params, "textDocument.version") == 1, "version 1 again")
+    ok(mut t, f.doc.version == 1, "the document is at 1")
+
+    var g = fix_new(pb("ab\ncd"))
+    ok(mut t, open(mut g), "didOpen ab/cd")
+    tx_clear(mut g)
+    apply_insert(mut g, lsp.POSENC_UTF8, 2, 3, "S")
+    apply_insert(mut g, lsp.POSENC_UTF8, 2, text.textbuf_len(g.tb), "E")
+    ok(mut t, lsp.lsp_doc_flush(mut g.rpc, mut g.doc, 2, g.tb), "flushed")
+    j = frame_json(g.rpc, 0)
+    let changes = lsp.json_path(j, params_of(mut t, j, "textDocument/didChange"), "contentChanges")
+    ok(mut t, lsp.json_size(j, changes) == 2, "two changes")
+    let c0 = lsp.json_at(j, changes, 0)
+    ok(
+        mut t,
+        int_at(j, c0, "range.start.line") == 1 && int_at(j, c0, "range.start.character") == 0,
+        "S at 1:0",
+    )
+    let c1 = lsp.json_at(j, changes, 1)
+    ok(
+        mut t,
+        int_at(j, c1, "range.start.line") == 1 && int_at(j, c1, "range.start.character") == 3,
+        "E at 1:3",
+    )
+    ok(mut t, g.doc.version == 2, "version 2")
+    tx_clear(mut g)
+    apply_insert(mut g, lsp.POSENC_UTF8, 2, text.textbuf_len(g.tb), "!")
+    ok(mut t, lsp.lsp_doc_flush(mut g.rpc, mut g.doc, 2, g.tb), "flushed again")
+    ok(mut t, g.doc.version == 3, "version 3")
+}
+
+// test_lsp_sync.c:201-259
+fn lsp_sync_preop_delete_and_ordered_insert_batch(mut t: Tally) {
+    var f = fix_new(pb("ab\ncd\nef"))
+    ok(mut t, open(mut f), "didOpen")
+    tx_clear(mut f)
+    apply_delete(mut f, lsp.POSENC_UTF8, 2, 1, 4)
+    apply_insert(mut f, lsp.POSENC_UTF8, 2, 1, "XY")
+    apply_insert(mut f, lsp.POSENC_UTF8, 2, 3, "Z")
+    ok(mut t, lsp.lsp_doc_flush(mut f.rpc, mut f.doc, 2, f.tb), "flushed")
+    var j = frame_json(f.rpc, 0)
+    let changes = lsp.json_path(j, params_of(mut t, j, "textDocument/didChange"), "contentChanges")
+    ok(mut t, lsp.json_size(j, changes) == 3, "three changes")
+    let c0 = lsp.json_at(j, changes, 0)
+    ok(
+        mut t,
+        int_at(j, c0, "range.start.line") == 0 && int_at(j, c0, "range.start.character") == 1,
+        "the delete starts at 0:1",
+    )
+    ok(
+        mut t,
+        int_at(j, c0, "range.end.line") == 1 && int_at(j, c0, "range.end.character") == 2,
+        "and ends at 1:2",
+    )
+    ok(mut t, lsp.json_streq(j, lsp.json_field(j, c0, "text"), ""), "with no text")
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_field(j, lsp.json_at(j, changes, 1), "text"), "XY"),
+        "then XY",
+    )
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_field(j, lsp.json_at(j, changes, 2), "text"), "Z"),
+        "then Z",
+    )
+    ok(mut t, f.doc.version == 2, "version 2")
+    ok(mut t, f.doc.sent_gen == f.tb.gen, "the sent generation")
+
+    var g = fix_new(pb("a\r\nb"))
+    ok(mut t, open(mut g), "didOpen a CRLF b")
+    tx_clear(mut g)
+    apply_delete(mut g, lsp.POSENC_UTF16, 2, 1, 2)
+    ok(mut t, lsp.lsp_doc_flush(mut g.rpc, mut g.doc, 2, g.tb), "flushed")
+    j = frame_json(g.rpc, 0)
+    let c = lsp.json_at(
+        j,
+        lsp.json_path(j, params_of(mut t, j, "textDocument/didChange"), "contentChanges"),
+        0,
+    )
+    ok(
+        mut t,
+        int_at(j, c, "range.start.line") == 0 && int_at(j, c, "range.start.character") == 1,
+        "the CRLF delete at 0:1",
+    )
+    ok(
+        mut t,
+        int_at(j, c, "range.end.line") == 1 && int_at(j, c, "range.end.character") == 0,
+        "to 1:0",
+    )
+}
+
+// test_lsp_sync.c:261-315
+fn lsp_sync_burst_batches_once_and_overflow_falls_back_full(mut t: Tally) {
+    var f = fix_new(List[byte]())
+    ok(mut t, open(mut f), "didOpen")
+    tx_clear(mut f)
+    let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var i = 0
+    while i < 40 {
+        apply_insert(mut f, lsp.POSENC_UTF8, 2, i, letters[i % 26..i % 26 + 1])
+        i += 1
+    }
+    ok(mut t, f.rpc.tx.pending.len == 0, "nothing sent before the flush")
+    ok(mut t, lsp.lsp_doc_flush(mut f.rpc, mut f.doc, 2, f.tb), "flushed")
+    var j = frame_json(f.rpc, 0)
+    var changes = lsp.json_path(j, params_of(mut t, j, "textDocument/didChange"), "contentChanges")
+    ok(mut t, lsp.json_size(j, changes) == 40, "forty changes")
+    i = 0
+    while i < 40 {
+        let c = lsp.json_at(j, changes, i)
+        let s = lsp.json_str(j, lsp.json_field(j, c, "text"))
+        ok(mut t, s.len == 1 && s[0] == letters.bytes()[i % 26], "change {i}'s text")
+        ok(mut t, int_at(j, c, "range.start.character") == i, "change {i}'s column")
+        i += 1
+    }
+    tx_clear(mut f)
+    i = 0
+    while i <= lsp.LSP_PENDING_MAX {
+        apply_insert(mut f, lsp.POSENC_UTF8, 2, text.textbuf_len(f.tb), "y")
+        i += 1
+    }
+    ok(mut t, f.doc.full_sync, "the overflow falls back to a full sync")
+    ok(mut t, f.doc.pending.len == 0, "with nothing queued")
+    ok(mut t, lsp.lsp_doc_flush(mut f.rpc, mut f.doc, 2, f.tb), "flushed")
+    j = frame_json(f.rpc, 0)
+    changes = lsp.json_path(j, params_of(mut t, j, "textDocument/didChange"), "contentChanges")
+    ok(mut t, lsp.json_size(j, changes) == 1, "one change")
+    let whole = lsp.json_str(j, lsp.json_field(j, lsp.json_at(j, changes, 0), "text"))
+    ok(mut t, whole.len == 40 + lsp.LSP_PENDING_MAX + 1, "the whole text: {whole.len}")
+}
+
+// test_lsp_sync.c:317-357
+fn lsp_sync_full_mode_and_binary_open_policy(mut t: Tally) {
+    var src = pb("a😀\r\nz")
+    var f = fix_new(src)
+    let (line, character) = lsp.lsp_pos_of_off(lsp.POSENC_UTF16, f.tb, 5)
+    ok(mut t, line == 0 && character == 3, "offset 5 is 0:3 in UTF-16: {line}:{character}")
+    ok(mut t, lsp.lsp_off_of_pos(lsp.POSENC_UTF16, f.tb, 0, 3) == 5, "0:3 is offset 5")
+    ok(
+        mut t,
+        lsp.lsp_off_of_pos(lsp.POSENC_UTF16, f.tb, 0, 2) == 1,
+        "0:2 is inside the emoji: its start",
+    )
+    ok(
+        mut t,
+        lsp.lsp_off_of_pos(lsp.POSENC_UTF8, f.tb, 0, 99) == 5,
+        "past the content: before the CRLF",
+    )
+    f.binary = true
+    ok(mut t, !open(mut f), "a binary buffer is not opened")
+    ok(mut t, f.rpc.tx.pending.len == 0, "and nothing is sent")
+    f.binary = false
+    ok(mut t, open(mut f), "didOpen")
+    tx_clear(mut f)
+    apply_insert(mut f, lsp.POSENC_UTF16, 1, 1, "Q")
+    ok(mut t, f.doc.full_sync, "a full-sync server queues the whole text")
+    ok(mut t, lsp.lsp_doc_flush(mut f.rpc, mut f.doc, 1, f.tb), "flushed")
+    let j = frame_json(f.rpc, 0)
+    let changes = lsp.json_path(j, params_of(mut t, j, "textDocument/didChange"), "contentChanges")
+    ok(mut t, lsp.json_size(j, changes) == 1, "one change")
+    ok(
+        mut t,
+        lsp.json_streq(j, lsp.json_field(j, lsp.json_at(j, changes, 0), "text"), "aQ😀\r\nz"),
+        "the whole text",
+    )
+    ok(mut t, f.doc.version == 2, "version 2")
+    let _ = src
+}
+
+// The server's side of incremental sync: apply a change list to a byte
+// copy, positions read back through the pre-edit text of the copy.
+fn server_apply(mut copy_text: List[byte], enc: int, j: lsp.Json, changes: int) {
+    var i = 0
+    while i < lsp.json_size(j, changes) {
+        let c = lsp.json_at(j, changes, i)
+        let view = text.textbuf_from_bytes(copy_text, 0, copy_text.len)
+        let lo = lsp.lsp_off_of_pos(
+            enc,
+            view,
+            int_at(j, c, "range.start.line"),
+            int_at(j, c, "range.start.character"),
+        )
+        let hi = lsp.lsp_off_of_pos(
+            enc,
+            view,
+            int_at(j, c, "range.end.line"),
+            int_at(j, c, "range.end.character"),
+        )
+        let ins = lsp.json_str(j, lsp.json_field(j, c, "text"))
+        var next = List[byte]()
+        var k = 0
+        while k < lo {
+            (mut next).push(copy_text[k])
+            k += 1
+        }
+        util.buf_append(mut next, ins)
+        k = hi
+        while k < copy_text.len {
+            (mut next).push(copy_text[k])
+            k += 1
+        }
+        copy_text = next
+        i += 1
+    }
+}
+
+fn port_lsp_sync_incremental_view_matches_buffer(mut t: Tally) {
+    for enc in [lsp.POSENC_UTF8, lsp.POSENC_UTF16] {
+        var f = fix_new(pb("fn main() {{\n    let x = 1\r\n    print(\"é😀\")\n}}\n"))
+        var server = text.textbuf_bytes(f.tb)
+        ok(mut t, open(mut f), "didOpen")
+        tx_clear(mut f)
+        // A run of edits: an insert, a delete across a CRLF, an astral
+        // insert, a multi-line insert, deletes at both ends.
+        apply_insert(mut f, enc, 2, 3, "aux_")
+        apply_delete(mut f, enc, 2, 29, 2)
+        apply_insert(mut f, enc, 2, 10, "🌲")
+        apply_insert(mut f, enc, 2, text.textbuf_len(f.tb), "// one\n// two\n")
+        apply_delete(mut f, enc, 2, 0, 2)
+        apply_delete(mut f, enc, 2, text.textbuf_len(f.tb) - 3, 3)
+        ok(mut t, lsp.lsp_doc_flush(mut f.rpc, mut f.doc, 2, f.tb), "flushed")
+        let j = frame_json(f.rpc, 0)
+        let changes = lsp.json_path(
+            j,
+            params_of(mut t, j, "textDocument/didChange"),
+            "contentChanges",
+        )
+        ok(mut t, lsp.json_size(j, changes) == 6, "six changes")
+        server_apply(mut server, enc, j, changes)
+        let want = text.textbuf_bytes(f.tb)
+        ok(
+            mut t,
+            text_of(server) == text_of(want),
+            "enc {enc}: the server's view {text_of(server)} is the buffer {text_of(want)}",
+        )
+    }
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var t = Tally { n: 0 }
+    lsp_sync_open_save_close_and_generation(mut t)
+    lsp_sync_preop_delete_and_ordered_insert_batch(mut t)
+    lsp_sync_burst_batches_once_and_overflow_falls_back_full(mut t)
+    lsp_sync_full_mode_and_binary_open_policy(mut t)
+    port_lsp_sync_incremental_view_matches_buffer(mut t)
+    print("lsp_sync_test: 4 cases and 1 port case pass, {t.n} assertions")
+}
