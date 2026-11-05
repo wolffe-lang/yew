@@ -109,12 +109,31 @@ Commits, in order:
     under `8989074`; the copy builds and runs on both.
 - **#18** `b85e085` the row. It is green as committed, and red at `edit_paste_bytes_test.lu:38` when the
   paste is carried as a `str` again.
+- **The eight-shard dispatch's one red** (41950341602, `unit (macOS arm64, shard 3/8)`): the torture case's
+  `run_to_completion` at `edit_job_test.lu:1070` failed in `wolf test`'s native run of the file and passed in the
+  native lane. The `os_exe()` text in the FAILED line only says why `wolf test` ran the file natively. The
+  failure is a real race in the job layer.
+  - On macOS arm64 a probe swept the kill across the shell's fork window (a 0–3 ms wait after the spawn, the
+    two forking shapes only, four probes at once). It hung 12 times in about 680 cycles. Each time the shell
+    had been killed by signal 9 and reaped, while a `sleep 30` lived on in the job's group (PPID 1) and held
+    the job's pipe. `job_signal` then refuses, since the job is no longer running, and the job drained only
+    when the sleep exited. The torture's own mix passed 8,000 cycles under the same contention, and so did
+    C's `job_torture_spawn_kill_cycles` (40 rounds of 200 in its own test binary).
+  - `0fe8a7f` the row, `t_port_job_group_kill_reaches_children_forked_during_it`. The shell forks 64
+    background sleeps and the kill lands inside that loop. It is red at `edit_job_test.lu:1285` on macOS
+    arm64, alone and in each of four runs at once. The Mac runs the committed file with `main` narrowed to
+    this row and the torture, since the file's other cases write under `/tmp`; the whole file runs in the
+    gauntlet and in CI.
+  - `c08831f` the fix. After a SIGKILL to a job's group (`job_signal`, or the timeout's escalation), the group's
+    SIGKILL is sent again every 50 ms while the job is pending, at most 20 times, and the loop's deadline
+    wakes for it. The row then passes alone, and the row and the torture pass in each of four runs at once.
+    The fork-window probe is in the macOS rows table below. R-yw14-7.
 - **Docs**
   - `c4bc2a1` MAP's G50 and G23 rows.
   - `db1d1ab` README only.
   - `db6d591` CHANGELOG.
 
-The macOS rows, on macOS arm64 with TMPDIR through a symlink and a trailing slash:
+The macOS rows, on macOS arm64 (comphelp and runtime_skew with TMPDIR through a symlink and a trailing slash):
 
 | row | state | result |
 |---|---|---|
@@ -122,6 +141,10 @@ The macOS rows, on macOS arm64 with TMPDIR through a symlink and a trailing slas
 | comphelp | at `e16c027` | `21 C cases pass, 0 SKIP; 4 port cases pass` |
 | runtime_skew | before `1aea4be` | `runtime_config_0/1` pass, then a trap at `:83` |
 | runtime_skew | at `1aea4be` | all four pass |
+| the fork-window sweep, four at once | at `99deb41` | 12 hung in about 680 cycles |
+| the mid-fork kill row | at `0fe8a7f` | red at `:1285`, alone and in 4 of 4 at once |
+| the mid-fork kill row and the torture | at `c08831f` | both pass, alone and in 4 of 4 at once; the file builds with `--deny-warnings` |
+| the fork-window sweep, four at once | at `c08831f` | 0 hung in 8,000 cycles |
 
 The gauntlet runs at the final head, under the recorder, in yew CI's own image (`ubuntu:24.04` with the
 hosted runner's tools) on six pinned Linux x86-64 CPUs. It holds:
@@ -131,7 +154,8 @@ hosted runner's tools) on six pinned Linux x86-64 CPUs. It holds:
 - the CI proofs;
 - C's build and the fake tool;
 - every row above: comphelp and runtime_skew under a symlinked TMPDIR (runtime_skew on both machines),
-  the nested witness, the paste row, the clipboard rows with their control, the final-newline PTY pair,
+  the nested witness, the paste row, the job file with the mid-fork kill row (green on Linux either
+  way: its red is the Mac's), the clipboard rows with their control, the final-newline PTY pair,
   runtime-pty twice, the scaling row, the fuzz row against C's driver with the answer fold, and the G50
   row;
 - cmdcomp_shell's whole-file checked run three times (#78).
@@ -190,12 +214,20 @@ backtrack enters, and `gitignore_scales_linearly` goes red by name.
   Six round-robin shards would break the twice rule at 1.5×, because the heavy `edit_*` files fall
   unevenly. Options: (A) six shards balanced on a weights table; (B) eight round-robin shards at 180, the
   partition the Linux `unit` job uses; (C) six round-robin shards at 240. Decided: B. It is about 2.1×
-  if the editor's builds grow 10% more.
+  if the editor's builds grow 10% more. Measured in dispatch 41950341602, the eight shards took 47 to 66
+  minutes, so the longest is under the cap by 2.7×.
+- **R-yw14-7 (the group kill's resend).** The port now sends a job's group SIGKILL again until the job
+  drains, which C's job layer may not do. Whether C has the same exposure is not known here: its torture
+  passed under the same contention, its sources are not read, and no C test kills inside a forking loop.
+  Options: (A) keep the resend as a port-only row of the job layer; (B) keep it, and also send the
+  reproduction (a shell forking background sleeps, killed mid-loop, on macOS) to sagitta so C can take the
+  same resend. Without the resend, `:kill` cannot end such a job on macOS while the stray child lives.
+  Implemented: A. Recommended: B, since the filing is a public step for the maintainer.
 
 ## Done-when
 
-- [x] Every change has its row, seen red before green (macOS rows, the CI proofs, #99, #100, #18; #98's
-  row carries its red form in itself).
+- [x] Every change has its row, seen red before green (macOS rows, the CI proofs, #99, #100, #18, the
+  mid-fork kill on macOS; #98's row carries its red form in itself).
 - [x] The gauntlet is green at the final head under the recorder, and the plant is red by name (records in
   the PR body).
 - [ ] CI at the head (cross-cutting: `.github/`, `ci/`). The macOS `macos-unit` legs run only on a nightly
