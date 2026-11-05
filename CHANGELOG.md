@@ -5,6 +5,24 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw11a — the LSP client core and diagnostics (2026-11-05)
+
+- sagitta's `src/mod/lsp/` json, jsonrpc, client, sync and diag, and
+  lsp.c's boundary as far as diagnostics need (s45, s46): `lsp.json`,
+  `lsp.jsonrpc`, `lsp.client`, `lsp.sync`, `edit.lsp_client`,
+  `edit.lsp_diag` and `edit.lsp`; the language by path from the pin's
+  builtin detection table (`edit.syn_paths`, `tools/gen-syn-paths`,
+  `tools/check-syn-paths`) until highlighting lands.
+- Unit files for the JSON parser and writer, the JSON-RPC framing and
+  table, URIs, capabilities, the lifecycle, sync, diagnostics and the
+  config table; the eight `lsp_diag_*` PTY goldens over the demo's s46
+  scenes and `tests/script/lsp_sync.fl`, by name.
+- The oracle rows (`tools/run-lsp-rows`): C yew and the port against
+  the same `wolf lsp` and the same fake server (`tools/lsp-rows/`),
+  screen by screen, for open, jump, list, edit, undo, two cursors,
+  incremental sync, a crash, a malformed frame, a slow and a silent
+  initialize, and a server that never shuts down.
+
 ### yw14 — the sweep: the red nightly and the correctness backlog (2026-11-04)
 
 - The pin kept at wolf 0.2.36 / lupin 0.1.58 (still the latest releases).
