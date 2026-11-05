@@ -1,0 +1,214 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_lsp_config.c` (205 lines) at
+//! 9ace98c2, one test per C test in registry order
+//! (`tests/unit/registry.c:1551-1555`): `init.fl`'s `lsp.servers` table
+//! — the compiled defaults until a table replaces them, the rows owned
+//! by the client and re-read after a reload, an invalid row refused by
+//! name without losing the valid ones, an empty table never retried by
+//! the pump, and a binary buffer that never starts a server.
+//!
+//! C's fixture writes the config to a `mkstemp` file under `/tmp` and
+//! loads it as `--config` would (`test_lsp_config.c:29-44`); the port's
+//! file is under `target/tests/`. C sets `Buffer.lang`; the port's
+//! language is `Ed.buf_languages` by buffer id. C captures the log
+//! through its test sink; the port reads `YEW_LOG` back
+//! (`util.log_capture_has`).
+
+use edit
+use lsp
+use std.fs
+use util
+
+const LOG_PATH: str = "target/tests/edit-lsp-config-test.log"
+
+var fix_counter: int = 0
+
+fn write_config(path: str, source: str) {
+    fs.write_text(path, source) else |_| {
+        assert(false, "LSP config fixture write failed: {path}")
+    }
+}
+
+// `fix_init` (`test_lsp_config.c:29-44`).
+fn fix_init(source: str) -> (str, edit.Ed) {
+    var n = 0
+    // # Safety: the test is one thread; the counter names fresh files.
+    unsafe {
+        fix_counter += 1
+        n = fix_counter
+    }
+    let path = "target/tests/yew-lsp-config-{os_pid()}-{n}.fl"
+    write_config(path, source)
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    var s = edit.startup_default()
+    s.config_path = path
+    s.no_workspace_config = true
+    edit.config_init(mut ed, s)
+    assert(edit.config_load_all(mut ed) == edit.CFG_OK, "the config loads")
+    (path, ed)
+}
+
+fn no_cfg() -> lsp.LspServerCfg {
+    lsp.LspServerCfg {
+        id: "",
+        lang: "",
+        cmd: "",
+        args: List[str](),
+        roots: List[str](),
+        init_options: "",
+        has_init_options: false,
+        init_timeout_ms: 0,
+    }
+}
+
+fn cfg_of(mut ed: edit.Ed, lang: str) -> (bool, lsp.LspServerCfg) {
+    let c = edit.lsp_client_cfg(mut ed, lang) else {
+        return (false, no_cfg())
+    }
+    (true, c)
+}
+
+fn has_cfg(mut ed: edit.Ed, lang: str) -> bool {
+    let (found, _) = cfg_of(mut ed, lang)
+    found
+}
+
+fn lsp_config_defaults_and_replacement_semantics() {
+    var (path, ed) = fix_init("\n")
+    let (found_c, cc) = cfg_of(mut ed, "c")
+    assert(found_c && cc.id == "clangd", "c is clangd by default")
+    let (found, c) = cfg_of(mut ed, "wolf")
+    assert(found, "wolf has a default")
+    assert(c.id == "wolf" && c.cmd == "wolf", "wolf lsp: {c.id} {c.cmd}")
+    assert(c.args.len == 1 && c.args[0] == "lsp", "args [lsp]")
+    assert(c.roots.len != 0 && c.roots[0] == "wolf.pkg", "rooted at wolf.pkg")
+    assert(!has_cfg(mut ed, "fletch"), "fletch has no server")
+    fs.remove(path) else |_| {}
+
+    var (path2, ed2) = fix_init(
+        "let lsp = {{servers: {{wolf: {{id: \"wolfd\", cmd: \"wolf-lsp\", args: [\"serve\", \"--stdio\"], roots: [\"wolf.toml\", \".git\"], init_options: \"{{\\\"dialect\\\":\\\"flow\\\"}}\", init_timeout_ms: 4321}}}}}}\n",
+    )
+    let (found2, c2) = cfg_of(mut ed2, "wolf")
+    assert(found2, "the table's wolf row")
+    assert(c2.lang == "wolf" && c2.id == "wolfd" && c2.cmd == "wolf-lsp", "the row: {c2.lang} {c2.id} {c2.cmd}")
+    assert(c2.args.len == 2 && c2.args[0] == "serve" && c2.args[1] == "--stdio", "the args")
+    assert(c2.roots.len == 2 && c2.roots[0] == "wolf.toml" && c2.roots[1] == ".git", "the roots")
+    assert(c2.has_init_options && c2.init_options == "{{\"dialect\":\"flow\"}}", "init_options: {c2.init_options}")
+    assert(c2.init_timeout_ms == 4321, "the timeout")
+    assert(!has_cfg(mut ed2, "c"), "the table replaced the defaults")
+    fs.remove(path2) else |_| {}
+}
+
+fn lsp_config_is_owned_and_refreshes_after_reload() {
+    var (path, ed) = fix_init(
+        "let lsp = {{servers: {{wolf: {{id: \"first\", cmd: \"wolf-one\", args: [\"old\"], roots: [\"wolf.toml\"]}}}}}}\n",
+    )
+    let (found, c) = cfg_of(mut ed, "wolf")
+    assert(found && c.cmd == "wolf-one", "the first row")
+    write_config(
+        path,
+        "let lsp = {{servers: {{wolf: {{id: \"second\", cmd: \"wolf-two\", args: [\"new\"], roots: [\".git\"]}}}}}}\n",
+    )
+    assert(edit.config_reload(mut ed) == edit.CFG_OK, "the reload")
+    let (found2, c2) = cfg_of(mut ed, "wolf")
+    assert(found2, "a row after the reload")
+    assert(c2.id == "second" && c2.cmd == "wolf-two", "the second row: {c2.id} {c2.cmd}")
+    assert(c2.args[0] == "new" && c2.roots[0] == ".git", "its args and roots")
+    fs.remove(path) else |_| {}
+}
+
+fn lsp_config_rejects_invalid_rows_without_losing_valid_rows() {
+    var (path, ed) = fix_init(
+        "let lsp = {{servers: {{nul: {{id: \"bad\\0id\", cmd: \"x\"}}, timeout: {{id: \"bad-time\", cmd: \"x\", init_timeout_ms: 0}}, json: {{id: \"bad-json\", cmd: \"x\", init_options: \"[]\"}}, roots: {{id: \"bad-roots\", cmd: \"x\", roots: \".git\"}}, good: {{id: \"goodd\", cmd: \"good-lsp\", init_options: nil, init_timeout_ms: 600000}}}}}}\n",
+    )
+    for lang in ["nul", "timeout", "json", "roots"] {
+        assert(!has_cfg(mut ed, lang), "the {lang} row is refused")
+    }
+    let (found, c) = cfg_of(mut ed, "good")
+    assert(found && c.cmd == "good-lsp", "the good row kept")
+    assert(c.init_timeout_ms == 600000, "its timeout")
+    assert(
+        util.log_capture_has(util.LOG_WARN, copy "LSP config: ignoring server nul".bytes()),
+        "the refusal is logged",
+    )
+    assert(ed.msg.active && ed.msg.sev == edit.MSG_WARN, "and said")
+    fs.remove(path) else |_| {}
+}
+
+fn lsp_config_defers_startup_and_does_not_retry_disabled_language() {
+    let config = "target/tests/yew-lsp-disabled-config-{os_pid()}.fl"
+    let document = "target/tests/yew-lsp-disabled-doc-{os_pid()}"
+    write_config(config, "let lsp = {{servers: {{}}}}\n")
+    write_config(document, "")
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let bi = edit.ed_doc(ed)
+    ed.bufs[bi].path = document
+    ed.bufs[bi].has_path = true
+    ed.buf_languages[ed.bufs[bi].id] = "c"
+    assert(!ed.lsp.present, "hydrate/open precedes init.fl")
+    var s = edit.startup_default()
+    s.config_path = config
+    s.no_workspace_config = true
+    edit.config_init(mut ed, s)
+    assert(edit.config_load_all(mut ed) == edit.CFG_OK, "the config loads")
+    var i = 0
+    while i < 20 {
+        edit.lsp_pump(mut ed)
+        i += 1
+    }
+    let (k, _) = edit.lsp_doc_of_buffer(ed, bi)
+    assert(k < 0, "no server for the disabled language")
+    if ed.msg.active {
+        eprint("lsp_config_defers_startup: said: {ed.msg.text}")
+    }
+    assert(!ed.msg.active, "and nothing said")
+    fs.remove(document) else |_| {}
+    fs.remove(config) else |_| {}
+}
+
+fn lsp_config_binary_buffer_never_allocates_or_starts_a_client() {
+    let c = lsp.LspServerCfg {
+        id: "must-not-start",
+        lang: "fortran",
+        cmd: "must-not-exec",
+        args: List[str](),
+        roots: List[str](),
+        init_options: "",
+        has_init_options: false,
+        init_timeout_ms: 1000,
+    }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let bi = edit.ed_doc(ed)
+    ed.bufs[bi].path = "target/tests/yew-binary-encode"
+    ed.bufs[bi].has_path = true
+    ed.buf_languages[ed.bufs[bi].id] = "fortran"
+    ed.bufs[bi].ec.meta.binary = true
+    assert(!edit.lsp_client_start_cfg(mut ed, bi, c), "start_cfg refuses a binary buffer")
+    assert(!edit.lsp_client_start(mut ed, bi), "start refuses it")
+    assert(!ed.lsp.present, "no client allocated")
+    edit.lsp_pump(mut ed)
+    assert(ed.lsp.present, "the pump's config refresh owns the client")
+    assert(edit.lsp_server_index(ed, 1) < 0, "and no server")
+    let (k, _) = edit.lsp_doc_of_buffer(ed, bi)
+    assert(k < 0, "and no document")
+}
+
+fn main() {
+    fs.create_dir_all("target/tests") else |_| {}
+    fs.remove(LOG_PATH) else |_| {}
+    env_set("YEW_LOG", LOG_PATH) else |_| {}
+    // The repository's runtime (the tests run from the root), so no
+    // installed runtime's skew warning is the message a case reads.
+    let runtime = fs_realpath("runtime") else "runtime"
+    env_set("YEW_RUNTIME_DIR", runtime) else |_| {}
+    lsp_config_defaults_and_replacement_semantics()
+    lsp_config_is_owned_and_refreshes_after_reload()
+    lsp_config_rejects_invalid_rows_without_losing_valid_rows()
+    lsp_config_defers_startup_and_does_not_retry_disabled_language()
+    lsp_config_binary_buffer_never_allocates_or_starts_a_client()
+    print("lsp_config_test: 5 cases pass")
+}
