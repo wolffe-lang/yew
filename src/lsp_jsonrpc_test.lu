@@ -1,0 +1,514 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_jsonrpc_frame.c` (208 lines) and
+//! `test_jsonrpc.c` (385) at 9ace98c2, one test per C test in registry
+//! order (`tests/unit/registry.c:1558-1577`). C's `on_msg` and `on_value`
+//! callbacks are the reader's queues (`rx.bodies`, `rx.inbox`); a pending
+//! request's callback and release are the row `rpc_dispatch`, `rpc_drop`,
+//! `rpc_sweep` and `rpc_conn_free` hand back, counted here by its `ctx`.
+
+use lsp
+use util
+
+struct Tally {
+    n: int,
+}
+
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    assert(cond, what)
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn text_of(b: List[byte]) -> str {
+    str_from_utf8(b) else "<not utf-8>"
+}
+
+fn parse(text: str) -> lsp.Json {
+    var err = lsp.json_err_new()
+    let j = lsp.json_parse(text.bytes(), 0, text.len, mut err) else {
+        assert(false, "parse {text}: {err.msg}")
+        return lsp.json_new()
+    }
+    j
+}
+
+fn make_frame(mut wire: List[byte], headers: str, body: List[byte]) {
+    util.buf_append_str(mut wire, "Content-Length: {body.len}\r\n{headers}\r\n")
+    util.buf_append(mut wire, body)
+}
+
+fn remember(mut expected: List[byte], body: List[byte]) {
+    util.buf_append(mut expected, body)
+    (mut expected).push(0 as byte)
+}
+
+fn joined(rx: lsp.RpcRx) -> List[byte] {
+    var out = List[byte]()
+    for b in rx.bodies {
+        util.buf_append(mut out, b)
+        (mut out).push(0 as byte)
+    }
+    out
+}
+
+fn assert_dead(mut t: Tally, wire: str, error: str) {
+    var rx = lsp.rpcrx_new()
+    let _ = lsp.rpcrx_feed(mut rx, wire.bytes(), 0, wire.len)
+    ok(mut t, rx.state == lsp.RPCRX_DEAD, "{error}: the reader is dead")
+    ok(mut t, rx.err == error, "{error}: got '{rx.err}'")
+}
+
+// test_jsonrpc_frame.c:52-113
+fn jsonrpc_frame_every_split(mut t: Tally) {
+    let body1 = pb("{{\"jsonrpc\":\"2.0\",\"method\":\"one\",\"params\":{{}}}}")
+    let body2 = pb("{{\"jsonrpc\":\"2.0\",\"method\":\"café\"}}")
+    var wire = List[byte]()
+    var expected = List[byte]()
+    make_frame(mut wire, "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n", body1)
+    remember(mut expected, body1)
+    util.buf_append_str(mut wire, "X-Test: yes\r\ncontent-length: {body2.len}\r\n\r\n")
+    util.buf_append(mut wire, body2)
+    remember(mut expected, body2)
+    var i = 0
+    while i < 9 {
+        let body = pb("{{\"jsonrpc\":\"2.0\",\"method\":\"method-{i}\"}}")
+        make_frame(mut wire, "", body)
+        remember(mut expected, body)
+        i += 1
+    }
+    var pad = pb("{{\"jsonrpc\":\"2.0\",\"method\":\"pad\",\"params\":\"")
+    i = 0
+    while i < 40000 {
+        (mut pad).push(97 as byte)
+        i += 1
+    }
+    util.buf_append_str(mut pad, "\"}}")
+    make_frame(mut wire, "", pad)
+    remember(mut expected, pad)
+    ok(mut t, wire.len > 40000, "the wire is past 40,000 bytes")
+    var split = 0
+    var good = 0
+    while split <= wire.len {
+        // Each split's reader and copies die with the turn.
+        region turn {
+            var rx = lsp.rpcrx_new()
+            rx.keep_bodies = true
+            let _ = lsp.rpcrx_feed(mut rx, wire, 0, split)
+            let _ = lsp.rpcrx_feed(mut rx, wire, split, wire.len)
+            let whole = rx.state == lsp.RPCRX_HDR &&
+                rx.bodies.len == 12 &&
+                rx.msgs_in == 12 &&
+                rx.bytes_in == wire.len &&
+                same(joined(rx), expected)
+            assert(whole, "split {split}: state {rx.state} bodies {rx.bodies.len} in {rx.bytes_in}")
+            good += 1
+        }
+        split += 1
+    }
+    // C asserts six facts a split; the port counts them once a split.
+    t.n += good * 6
+}
+
+// test_jsonrpc_frame.c:115-137
+fn jsonrpc_frame_one_byte_chunks(mut t: Tally) {
+    let body = pb("{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":\"☃\"}}")
+    var wire = List[byte]()
+    make_frame(mut wire, "", body)
+    var rx = lsp.rpcrx_new()
+    rx.keep_bodies = true
+    var i = 0
+    while i < wire.len {
+        let _ = lsp.rpcrx_feed(mut rx, wire, i, i + 1)
+        i += 1
+    }
+    ok(mut t, rx.bodies.len == 1, "one frame")
+    ok(mut t, same(rx.bodies[0], body), "its body")
+    ok(mut t, rx.state == lsp.RPCRX_HDR, "back in the header state")
+}
+
+// test_jsonrpc_frame.c:139-168
+fn jsonrpc_frame_errors(mut t: Tally) {
+    assert_dead(mut t, "X: y\r\n\r\n", "frame has no Content-Length")
+    assert_dead(mut t, "Content-Length: nope\r\n\r\n", "bad Content-Length 'nope'")
+    assert_dead(mut t, "Content-Length: 67108865\r\n\r\n", "bad Content-Length '67108865'")
+    assert_dead(mut t, "Content-Length: 1\rX", "header line must end with CRLF")
+    var huge = List[byte]()
+    var i = 0
+    while i < 4300 {
+        (mut huge).push(97 as byte)
+        i += 1
+    }
+    var rx = lsp.rpcrx_new()
+    let _ = lsp.rpcrx_feed(mut rx, huge, 0, huge.len)
+    ok(mut t, rx.err == "header line too long", "a 4,300-byte header line: {rx.err}")
+    var wire = List[byte]()
+    i = 0
+    while i < 33 {
+        util.buf_append_str(mut wire, "X-{i}: yes\r\n")
+        i += 1
+    }
+    util.buf_append_str(mut wire, "Content-Length: 2\r\n\r\n{{}}")
+    var rx2 = lsp.rpcrx_new()
+    let _ = lsp.rpcrx_feed(mut rx2, wire, 0, wire.len)
+    ok(mut t, rx2.err == "too many headers", "33 headers: {rx2.err}")
+}
+
+// test_jsonrpc_frame.c:170-186
+fn jsonrpc_frame_rejects_invalid_body(mut t: Tally) {
+    var bad = pb("Content-Length: 1\r\n\r\n")
+    (mut bad).push(255 as byte)
+    var rx = lsp.rpcrx_new()
+    let _ = lsp.rpcrx_feed(mut rx, bad, 0, bad.len)
+    ok(mut t, rx.err == "body is not UTF-8 at offset 0", "a 0xff body: {rx.err}")
+    assert_dead(mut t, "Content-Length: 1\r\n\r\n5", "frame is not a JSON-RPC object")
+    assert_dead(mut t, "Content-Length: 0\r\n\r\n", "frame is not a JSON-RPC object")
+}
+
+fn tx_view(c: lsp.RpcConn) -> List[byte] {
+    var out = List[byte]()
+    var i = c.tx.sent
+    while i < c.tx.pending.len {
+        (mut out).push(c.tx.pending[i])
+        i += 1
+    }
+    out
+}
+
+// test_jsonrpc_frame.c:188-208
+fn jsonrpc_frame_tx_and_eof(mut t: Tally) {
+    var c = lsp.rpc_conn_new()
+    lsp.rpctx_send(mut c.tx, pb("{{}}"))
+    ok(mut t, lsp.rpc_tx_len(c) == 23, "23 bytes queued")
+    ok(
+        mut t,
+        same(tx_view(c), pb("Content-Length: 2\r\n\r\n{{}}")),
+        "the frame: {text_of(tx_view(c))}",
+    )
+    lsp.rpc_tx_consume(mut c, 5)
+    ok(mut t, lsp.rpc_tx_len(c) == 18, "18 left")
+    lsp.rpc_tx_consume(mut c, 100)
+    ok(mut t, lsp.rpc_tx_len(c) == 0, "none left")
+    ok(mut t, lsp.rpc_finish_stdout(mut c), "a clean EOF")
+    let line = pb("Content-Length: 2\r\n")
+    ok(mut t, lsp.rpc_feed_stdout(mut c, line, 0, line.len), "a header line")
+    ok(mut t, !lsp.rpc_finish_stdout(mut c), "EOF mid-frame")
+    ok(mut t, c.rx.err == "unexpected EOF in JSON-RPC frame", "the EOF message: {c.rx.err}")
+}
+
+// test_jsonrpc.c:18-58
+fn jsonrpc_classification_table(mut t: Tally) {
+    let cases = [
+        ("{{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\"}}", lsp.RPC_NOTIFY),
+        (
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"workspace/configuration\"}}",
+            lsp.RPC_SRV_REQUEST,
+        ),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"x\"}}", lsp.RPC_SRV_REQUEST),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}}", lsp.RPC_RESPONSE),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"result\":{{}}}}", lsp.RPC_RESPONSE),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-1}}}}", lsp.RPC_ERROR),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32700}}}}", lsp.RPC_ERROR),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":\"nope\",\"result\":null}}", lsp.RPC_MALFORMED),
+        ("{{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":null}}", lsp.RPC_MALFORMED),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":1}}", lsp.RPC_MALFORMED),
+        ("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":0,\"error\":{{}}}}", lsp.RPC_MALFORMED),
+        ("[]", lsp.RPC_MALFORMED),
+    ]
+    for (text, kind) in cases {
+        let j = parse(text)
+        ok(mut t, lsp.rpc_classify(j, j.root) == kind, "{text}: {lsp.rpc_classify(j, j.root)}")
+    }
+}
+
+// test_jsonrpc.c:60-90
+fn jsonrpc_id_shapes_and_errors(mut t: Tally) {
+    let root = parse(
+        "{{\"id\":9223372036854775807,\"sid\":\"18446744073709551615\",\"bad\":\"18446744073709551616\"}}",
+    )
+    let (v1, id1) = lsp.rpc_id_u64(root, lsp.json_field(root, root.root, "id"))
+    ok(mut t, v1, "INT64_MAX is an id")
+    ok(mut t, id1 == 9223372036854775807, "its value")
+    let sid = lsp.json_field(root, root.root, "sid")
+    let (v2, _) = lsp.rpc_id_u64(root, sid)
+    ok(mut t, v2, "UINT64_MAX's digits are an id")
+    ok(mut t, lsp.rpc_id_is_u64_max(root, sid), "and are UINT64_MAX")
+    let (v3, _) = lsp.rpc_id_u64(root, lsp.json_field(root, root.root, "bad"))
+    ok(mut t, !v3, "UINT64_MAX + 1 is not")
+    let errors = [
+        (-32700, lsp.RPC_ERR_PARSE),
+        (-32600, lsp.RPC_ERR_INVALID_REQUEST),
+        (-32601, lsp.RPC_ERR_METHOD_NOT_FOUND),
+        (-32602, lsp.RPC_ERR_INVALID_PARAMS),
+        (-32603, lsp.RPC_ERR_INTERNAL),
+        (-32800, lsp.RPC_ERR_SILENT),
+        (-32801, lsp.RPC_ERR_SILENT),
+        (-32802, lsp.RPC_ERR_SILENT),
+        (-32803, lsp.RPC_ERR_REQUEST_FAILED),
+        (-32099, lsp.RPC_ERR_SERVER_RESERVED),
+        (-32000, lsp.RPC_ERR_SERVER_RESERVED),
+        (-31999, lsp.RPC_ERR_OTHER),
+        (42, lsp.RPC_ERR_OTHER),
+    ]
+    for (code, action) in errors {
+        ok(mut t, lsp.rpc_error_action(code) == action, "code {code}")
+    }
+}
+
+// test_jsonrpc.c:140-156
+fn jsonrpc_connection_delivers_parsed_values(mut t: Tally) {
+    let wire = pb(
+        "Content-Length: 46\r\n\r\n{{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\"}}",
+    )
+    var c = lsp.rpc_conn_new()
+    var i = 0
+    var alive = true
+    while i < wire.len {
+        alive = alive && lsp.rpc_feed_stdout(mut c, wire, i, i + 1)
+        i += 1
+    }
+    ok(mut t, alive, "every byte is accepted")
+    ok(mut t, c.rx.inbox.len == 1, "one value delivered")
+    ok(
+        mut t,
+        lsp.rpc_classify(c.rx.inbox[0], c.rx.inbox[0].root) == lsp.RPC_NOTIFY,
+        "a notification",
+    )
+    ok(mut t, lsp.rpc_finish_stdout(mut c), "a clean EOF")
+}
+
+fn tx_body(c: lsp.RpcConn) -> List[byte] {
+    let v = tx_view(c)
+    var i = 0
+    while i + 3 < v.len {
+        if v[i] as int == 13 &&
+            v[i + 1] as int == 10 &&
+            v[i + 2] as int == 13 &&
+            v[i + 3] as int == 10 {
+            var out = List[byte]()
+            var k = i + 4
+            while k < v.len {
+                (mut out).push(v[k])
+                k += 1
+            }
+            return out
+        }
+        i += 1
+    }
+    List[byte]()
+}
+
+// test_jsonrpc.c:176-220
+fn jsonrpc_call_dispatch_and_string_echo(mut t: Tally) {
+    var c = lsp.rpc_conn_new()
+    var p = lsp.rpc_pending_new()
+    p.gen = 91
+    p.sent_ms = 100
+    p.kind = 7
+    p.ctx = 1
+    let id = lsp.rpc_call(mut c, "textDocument/hover", pb("{{\"x\":1}}"), p)
+    ok(mut t, id == 1, "the first id is 1")
+    ok(mut t, c.npending == 1, "one pending")
+    let row = lsp.rpc_pending(c, id) else lsp.rpc_pending_new()
+    ok(mut t, row.deadline_ms == 10100, "the default deadline")
+    ok(mut t, row.gen == 91, "the generation is kept")
+    let want = pb(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"textDocument/hover\",\"params\":{{\"x\":1}}}}",
+    )
+    ok(mut t, same(tx_body(c), want), "the request body: {text_of(tx_body(c))}")
+    let response = parse("{{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{{\"ok\":true}}}}")
+    let done = lsp.rpc_dispatch(mut c, response, response.root)
+    ok(mut t, done.ok, "the string id dispatches")
+    ok(mut t, done.pending.kind == 7 && done.pending.ctx == 1, "its callback")
+    ok(mut t, done.result >= 0, "a result")
+    ok(mut t, done.error < 0, "no error")
+    ok(mut t, c.npending == 0, "nothing pending")
+    let gone = lsp.rpc_pending(c, id) else lsp.rpc_pending_new()
+    ok(mut t, gone.id == 0, "the row is gone")
+    ok(
+        mut t,
+        !lsp.rpc_dispatch(mut c, response, response.root).ok,
+        "a second dispatch finds nothing",
+    )
+}
+
+// test_jsonrpc.c:222-298
+fn jsonrpc_pending_cap_timeout_and_cancel(mut t: Tally) {
+    var c = lsp.rpc_conn_new()
+    var p = lsp.rpc_pending_new()
+    p.sent_ms = 50
+    p.deadline_ms = 75
+    p.kind = 7
+    var i = 0
+    while i < lsp.RPC_MAX_PENDING {
+        ok(mut t, lsp.rpc_call(mut c, "x", List[byte](), p) != 0, "call {i}")
+        i += 1
+    }
+    ok(mut t, c.npending == lsp.RPC_MAX_PENDING, "the table is full")
+    ok(mut t, lsp.rpc_deadline(c) == 75, "the earliest deadline")
+    ok(mut t, lsp.rpc_call(mut c, "overflow", List[byte](), p) == 0, "a full table refuses")
+    ok(mut t, lsp.rpc_sweep(mut c, 74).len == 0, "nothing expires at 74")
+    let expired = lsp.rpc_sweep(mut c, 75)
+    ok(mut t, expired.len == lsp.RPC_MAX_PENDING, "everything expires at 75")
+    var calls = 0
+    for e in expired {
+        if e.kind == 7 {
+            calls += 1
+        }
+    }
+    ok(mut t, calls == lsp.RPC_MAX_PENDING, "each is called back")
+    let timeout = lsp.rpc_timeout_error()
+    ok(
+        mut t,
+        lsp.json_int(timeout, lsp.json_field(timeout, timeout.root, "code"), 0) == -32001,
+        "with -32001",
+    )
+    ok(mut t, c.npending == 0, "nothing pending")
+    ok(mut t, lsp.rpc_deadline(c) == -1, "no deadline")
+    c.tx = lsp.rpctx_new()
+    let id = lsp.rpc_call(mut c, "initialize", List[byte](), lsp.rpc_pending_new())
+    let row = lsp.rpc_pending(c, id) else lsp.rpc_pending_new()
+    ok(mut t, row.deadline_ms == 60000, "initialize waits 60 s")
+    c.tx = lsp.rpctx_new()
+    lsp.rpc_cancel(mut c, id)
+    let want = pb(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{{\"id\":257}}}}",
+    )
+    ok(mut t, same(tx_body(c), want), "the cancel: {text_of(tx_body(c))}")
+    let still = lsp.rpc_pending(c, id) else lsp.rpc_pending_new()
+    ok(mut t, still.id == id, "the request stays pending")
+    c.tx = lsp.rpctx_new()
+    lsp.rpc_cancel(mut c, 999999)
+    ok(mut t, c.tx.pending.len == 0, "an unknown id sends nothing")
+}
+
+// test_jsonrpc.c:300-341: each request handed back exactly once, after
+// its callback where it has one.
+fn jsonrpc_pending_context_released_exactly_once(mut t: Tally) {
+    var c = lsp.rpc_conn_new()
+    var p = lsp.rpc_pending_new()
+    p.sent_ms = 10
+    p.kind = 9
+    var ids = List[int]()
+    var i = 0
+    while i < 4 {
+        p.deadline_ms = if i + 1 == 4 then 30 else 20
+        p.ctx = i
+        let id = lsp.rpc_call(mut c, "owned", List[byte](), p)
+        ok(mut t, id != 0, "owned {i}")
+        (mut ids).push(id)
+        i += 1
+    }
+    var callbacks = [0, 0, 0, 0]
+    var releases = [0, 0, 0, 0]
+    let response = parse("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}}")
+    let done = lsp.rpc_dispatch(mut c, response, response.root)
+    ok(mut t, done.ok, "id 1 dispatches")
+    callbacks[done.pending.ctx] = callbacks[done.pending.ctx] + 1
+    releases[done.pending.ctx] = releases[done.pending.ctx] + 1
+    let dropped = lsp.rpc_drop(mut c, ids[1]) else {
+        ok(mut t, false, "id 2 drops")
+        return
+    }
+    releases[dropped.ctx] = releases[dropped.ctx] + 1
+    let swept = lsp.rpc_sweep(mut c, 20)
+    ok(mut t, swept.len == 1, "one sweeps at 20")
+    for s in swept {
+        callbacks[s.ctx] = callbacks[s.ctx] + 1
+        releases[s.ctx] = releases[s.ctx] + 1
+    }
+    for r in lsp.rpc_conn_free(mut c) {
+        releases[r.ctx] = releases[r.ctx] + 1
+    }
+    ok(mut t, callbacks[0] == 1 && releases[0] == 1, "dispatched: one callback, one release")
+    ok(mut t, callbacks[1] == 0 && releases[1] == 1, "dropped: no callback, one release")
+    ok(mut t, callbacks[2] == 1 && releases[2] == 1, "timed out: one callback, one release")
+    ok(mut t, callbacks[3] == 0 && releases[3] == 1, "torn down: no callback, one release")
+}
+
+// test_jsonrpc.c:343-372
+fn jsonrpc_reply_shapes(mut t: Tally) {
+    var c = lsp.rpc_conn_new()
+    let id = parse("\"server-7\"")
+    lsp.rpc_reply(mut c, id, id.root, pb("{{\"ok\":true}}"))
+    let want = pb("{{\"jsonrpc\":\"2.0\",\"id\":\"server-7\",\"result\":{{\"ok\":true}}}}")
+    ok(mut t, same(tx_body(c), want), "the reply: {text_of(tx_body(c))}")
+    c.tx = lsp.rpctx_new()
+    lsp.rpc_reply_error(mut c, id, id.root, -32601, "not \"there\"")
+    let want2 = pb(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"server-7\",\"error\":{{\"code\":-32601,\"message\":\"not \\\"there\\\"\"}}}}",
+    )
+    ok(mut t, same(tx_body(c), want2), "the error reply: {text_of(tx_body(c))}")
+}
+
+// test_jsonrpc.c:158-174
+fn jsonrpc_connection_kills_eight_malformed_messages(mut t: Tally) {
+    let wire = pb("Content-Length: 2\r\n\r\n{{}}")
+    var c = lsp.rpc_conn_new()
+    var i = 0
+    while i < 7 {
+        ok(mut t, lsp.rpc_feed_stdout(mut c, wire, 0, wire.len), "malformed {i} is survived")
+        i += 1
+    }
+    ok(mut t, c.malformed == 7, "seven counted")
+    ok(mut t, !lsp.rpc_feed_stdout(mut c, wire, 0, wire.len), "the eighth kills")
+    ok(mut t, c.rx.err == "too many malformed JSON-RPC messages", "the message: {c.rx.err}")
+}
+
+// test_jsonrpc.c:374-385
+fn jsonrpc_ids_stop_at_signed_wire_limit(mut t: Tally) {
+    var c = lsp.rpc_conn_new()
+    c.next_id = 9223372036854775807
+    ok(
+        mut t,
+        lsp.rpc_call(mut c, "last", List[byte](), lsp.rpc_pending_new()) == 9223372036854775807,
+        "INT64_MAX is issued",
+    )
+    ok(
+        mut t,
+        lsp.rpc_call(mut c, "overflow", List[byte](), lsp.rpc_pending_new()) == 0,
+        "and is the last",
+    )
+    ok(mut t, c.npending == 1, "one pending")
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var t = Tally { n: 0 }
+    jsonrpc_frame_every_split(mut t)
+    jsonrpc_frame_one_byte_chunks(mut t)
+    jsonrpc_frame_errors(mut t)
+    jsonrpc_frame_rejects_invalid_body(mut t)
+    jsonrpc_frame_tx_and_eof(mut t)
+    jsonrpc_classification_table(mut t)
+    jsonrpc_id_shapes_and_errors(mut t)
+    jsonrpc_connection_delivers_parsed_values(mut t)
+    jsonrpc_call_dispatch_and_string_echo(mut t)
+    jsonrpc_pending_cap_timeout_and_cancel(mut t)
+    jsonrpc_pending_context_released_exactly_once(mut t)
+    jsonrpc_reply_shapes(mut t)
+    jsonrpc_connection_kills_eight_malformed_messages(mut t)
+    jsonrpc_ids_stop_at_signed_wire_limit(mut t)
+    print("lsp_jsonrpc_test: 14 cases pass, {t.n} assertions")
+}
