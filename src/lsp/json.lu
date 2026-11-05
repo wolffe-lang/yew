@@ -1,0 +1,1316 @@
+//! lsp.json — the JSON tree, its parser and its writer (Sprint 45).
+//!
+//! Ports sagitta `src/mod/lsp/json.c` (1,074 lines) and `json.h` (110) at
+//! 9ace98c2. The bytes on the wire are the writer's, so the writer is C's
+//! byte for byte: keys in call order, `\"` `\\` `\b` `\f` `\n` `\r` `\t`,
+//! `\u00xx` (lower-case hex) for the other controls, `/` never escaped, a
+//! U+DC80-U+DCFF escape of the decoded stream written back as `\uDCxx`
+//! (`json.c:836-883`), an integer in decimal, a real as `%.17g` with `.0`
+//! added (`json.c:1001-1018`). The parser keeps member order, keeps a
+//! duplicate key's first position with its last value and flags it
+//! (`json.c:419-428`), flags a lossy number, reads `\uDCxx` back to the
+//! raw byte, and refuses at depth 128, 64 MiB and 4,194,304 nodes with
+//! C's messages and offsets.
+//!
+//! **The shape, and why.** C's tree is pointers into an arena; the port's
+//! is one `Json` value of parallel lists, a node an index (-1 is C's
+//! `NULL`): a node's kind, flags, value word and count, where the value
+//! word is the integer, the bool, the offset of a string's bytes in
+//! `bytes`, the index of a real in `reals`, or the first child of an
+//! array in `kids` or member of an object in `mk`/`ml`/`mv` — children
+//! and members contiguous, as C copies its chunks into one array
+//! (`json.c:326-334`). 18 bytes a node against C's 24.
+//!
+//! The real formatter and reader follow `fl.float` (`src/fl/float.lu`),
+//! yew's own seam over `std.fmt.decimal`; no conversion library's source
+//! is read, and `std.json`'s neither (the clean room covers JSON
+//! libraries).
+
+use std.fmt.decimal as decimal
+use std.math.float as floats
+use unicode
+use util
+
+/// `YEW_JS_NULL` .. `YEW_JS_OBJ` (`json.h:12-20`).
+pub const JS_NULL: int = 0
+
+/// `YEW_JS_BOOL`.
+pub const JS_BOOL: int = 1
+
+/// `YEW_JS_INT`.
+pub const JS_INT: int = 2
+
+/// `YEW_JS_REAL`.
+pub const JS_REAL: int = 3
+
+/// `YEW_JS_STR`.
+pub const JS_STR: int = 4
+
+/// `YEW_JS_ARR`.
+pub const JS_ARR: int = 5
+
+/// `YEW_JS_OBJ`.
+pub const JS_OBJ: int = 6
+
+/// `YEW_JSF_LOSSY_NUM` (`json.h:22-27`).
+pub const JSF_LOSSY_NUM: int = 1
+
+/// A string with this flag is deliberately not valid UTF-8.
+pub const JSF_RAW_BYTE: int = 2
+
+/// `YEW_JSF_DUP_KEY`.
+pub const JSF_DUP_KEY: int = 4
+
+/// `YEW_JSON_MAX_DEPTH` (`json.h:8-10`).
+pub const JSON_MAX_DEPTH: int = 128
+
+/// `YEW_JSON_MAX_BYTES`: 64 MiB.
+pub const JSON_MAX_BYTES: int = 67108864
+
+/// `YEW_JSON_MAX_NODES`: 4 Mi.
+pub const JSON_MAX_NODES: int = 4194304
+
+/// A parsed document (C's arena of `JsonValue`s).
+pub struct Json {
+    nk: List[byte],
+    nf: List[byte],
+    nv: List[int],
+    nn: List[int],
+    bytes: List[byte],
+    reals: List[f64],
+    kids: List[int],
+    mk: List[int],
+    ml: List[int],
+    mv: List[int],
+    root: int,
+}
+
+/// `JsonErr` (`json.h:63-68`).
+pub struct JsonErr {
+    line: int,
+    col: int,
+    off: int,
+    msg: str,
+}
+
+/// An empty document.
+pub fn json_new() -> Json {
+    Json {
+        nk: List[byte](),
+        nf: List[byte](),
+        nv: List[int](),
+        nn: List[int](),
+        bytes: List[byte](),
+        reals: List[f64](),
+        kids: List[int](),
+        mk: List[int](),
+        ml: List[int](),
+        mv: List[int](),
+        root: -1,
+    }
+}
+
+/// A cleared error (`memset(err, 0, …)`).
+pub fn json_err_new() -> JsonErr {
+    JsonErr { line: 0, col: 0, off: 0, msg: "" }
+}
+
+// The parser's state (`JsonParser`, `json.c:30-37`); the input is passed
+// beside it, lent, at every call.
+struct JP {
+    start: int,
+    pos: int,
+    end: int,
+    nodes: int,
+    line: int,
+    col: int,
+    off: int,
+    msg: str,
+}
+
+// `json_err_at` (`json.c:39-61`): line and column count from the parse's
+// first byte, a column a byte.
+fn jp_err_at(s: List[byte], mut p: JP, at: int, msg: str) {
+    var off = at
+    if off > p.end {
+        off = p.end
+    }
+    var line = 1
+    var col = 1
+    var i = p.start
+    while i < off {
+        if s[i] as int == 10 {
+            line += 1
+            col = 1
+        } else {
+            col += 1
+        }
+        i += 1
+    }
+    p.line = line
+    p.col = col
+    p.off = off - p.start
+    p.msg = msg
+}
+
+fn jp_err(s: List[byte], mut p: JP, msg: str) {
+    jp_err_at(s, mut p, p.pos, msg)
+}
+
+fn jp_skip_ws(s: List[byte], mut p: JP) {
+    while p.pos < p.end {
+        let c = s[p.pos] as int
+        if c != 32 && c != 9 && c != 13 && c != 10 {
+            break
+        }
+        p.pos += 1
+    }
+}
+
+// `json_new` (`json.c:76-89`).
+fn jp_node(s: List[byte], mut p: JP, mut j: Json, kind: int) -> int {
+    if p.nodes >= JSON_MAX_NODES {
+        jp_err(s, mut p, "too many JSON nodes")
+        return -1
+    }
+    p.nodes += 1
+    (mut j.nk).push(kind as byte)
+    (mut j.nf).push(0 as byte)
+    (mut j.nv).push(0)
+    (mut j.nn).push(0)
+    j.nk.len - 1
+}
+
+fn hex_upper4(v: int) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    var shift = 12
+    while shift >= 0 {
+        let d = v >> shift & 15
+        out += digits[d..d + 1]
+        shift -= 4
+    }
+    out
+}
+
+// `json_hex4` (`json.c:91-119`).
+fn jp_hex4(s: List[byte], mut p: JP) -> int {
+    if p.end - p.pos < 4 {
+        jp_err(s, mut p, "short Unicode escape")
+        return -1
+    }
+    var value = 0
+    var i = 0
+    while i < 4 {
+        let c = s[p.pos + i] as int
+        var digit = 0
+        if c >= 48 && c <= 57 {
+            digit = c - 48
+        } else if c >= 97 && c <= 102 {
+            digit = c - 97 + 10
+        } else if c >= 65 && c <= 70 {
+            digit = c - 65 + 10
+        } else {
+            jp_err_at(s, mut p, p.pos + i, "non-hex digit in Unicode escape")
+            return -1
+        }
+        value = value * 16 + digit
+        i += 1
+    }
+    p.pos += 4
+    value
+}
+
+// `json_string` (`json.c:121-249`): the scan for the closing quote and
+// its refusals first, then the decode into `j.bytes`. Answers the
+// decoded bytes' (offset, length, flags), or offset -1 on a refusal.
+fn jp_string(s: List[byte], mut p: JP, mut j: Json) -> (int, int, int) {
+    if p.pos >= p.end || s[p.pos] as int != 34 {
+        jp_err(s, mut p, "expected string")
+        return (-1, 0, 0)
+    }
+    p.pos += 1
+    let content = p.pos
+    var scan = content
+    while scan < p.end {
+        let c = s[scan] as int
+        scan += 1
+        if c == 34 {
+            break
+        }
+        if c < 32 {
+            jp_err_at(s, mut p, scan - 1, "control byte in string")
+            return (-1, 0, 0)
+        }
+        if c == 92 {
+            if scan >= p.end {
+                jp_err_at(s, mut p, scan - 1, "unterminated escape")
+                return (-1, 0, 0)
+            }
+            scan += 1
+        }
+    }
+    if scan == p.end && (scan == content || s[scan - 1] as int != 34) {
+        jp_err_at(s, mut p, content - 1, "unterminated string")
+        return (-1, 0, 0)
+    }
+    let at = j.bytes.len
+    var flags = 0
+    while p.pos < scan - 1 {
+        var c = s[p.pos] as int
+        p.pos += 1
+        if c != 92 {
+            (mut j.bytes).push(c as byte)
+            continue
+        }
+        c = s[p.pos] as int
+        p.pos += 1
+        if c == 34 || c == 92 || c == 47 {
+            (mut j.bytes).push(c as byte)
+        } else if c == 98 {
+            (mut j.bytes).push(8 as byte)
+        } else if c == 102 {
+            (mut j.bytes).push(12 as byte)
+        } else if c == 110 {
+            (mut j.bytes).push(10 as byte)
+        } else if c == 114 {
+            (mut j.bytes).push(13 as byte)
+        } else if c == 116 {
+            (mut j.bytes).push(9 as byte)
+        } else if c == 117 {
+            var cp = jp_hex4(s, mut p)
+            if cp < 0 {
+                return (-1, 0, 0)
+            }
+            if cp >= 55296 && cp <= 56319 {
+                let high = cp
+                if p.end - p.pos < 6 || s[p.pos] as int != 92 || s[p.pos + 1] as int != 117 {
+                    jp_err_at(s, mut p, p.pos - 4, "lone high surrogate U+{hex_upper4(high)}")
+                    return (-1, 0, 0)
+                }
+                p.pos += 2
+                let low = jp_hex4(s, mut p)
+                if low < 0 {
+                    return (-1, 0, 0)
+                }
+                if low < 56320 || low > 57343 {
+                    jp_err_at(s, mut p, p.pos - 10, "lone high surrogate U+{hex_upper4(high)}")
+                    return (-1, 0, 0)
+                }
+                cp = 65536 + (high - 55296) * 1024 + (low - 56320)
+            } else if cp >= 56448 && cp <= 56575 {
+                (mut j.bytes).push((cp - 56320) as byte)
+                flags = flags | JSF_RAW_BYTE
+                continue
+            } else if cp >= 56320 && cp <= 57343 {
+                jp_err_at(s, mut p, p.pos - 4, "lone low surrogate U+{hex_upper4(cp)}")
+                return (-1, 0, 0)
+            }
+            if unicode.utf8_encode_into(mut j.bytes, cp) == 0 {
+                jp_err(s, mut p, "invalid Unicode scalar")
+                return (-1, 0, 0)
+            }
+        } else {
+            // C formats the byte with `%c`; a byte past ASCII has no `str`
+            // spelling, so the message names the escape without it.
+            let shown = if c < 128 then (str_from_utf8([c as byte]) else "?") else "?"
+            jp_err_at(s, mut p, p.pos - 1, "unknown escape '\\{shown}'")
+            return (-1, 0, 0)
+        }
+    }
+    p.pos = scan
+    (at, j.bytes.len - at, flags)
+}
+
+// `json_array` (`json.c:283-335`).
+fn jp_array(s: List[byte], mut p: JP, mut j: Json, depth: int) -> int {
+    if depth + 1 >= JSON_MAX_DEPTH {
+        jp_err(s, mut p, "nesting deeper than 128")
+        return -1
+    }
+    let arr = jp_node(s, mut p, mut j, JS_ARR)
+    if arr < 0 {
+        return -1
+    }
+    p.pos += 1
+    jp_skip_ws(s, mut p)
+    if p.pos < p.end && s[p.pos] as int == 93 {
+        p.pos += 1
+        j.nv[arr] = j.kids.len
+        return arr
+    }
+    var items = List[int]()
+    loop {
+        let value = jp_value(s, mut p, mut j, depth + 1)
+        if value < 0 {
+            return -1
+        }
+        (mut items).push(value)
+        jp_skip_ws(s, mut p)
+        if p.pos >= p.end {
+            jp_err(s, mut p, "unterminated array")
+            return -1
+        }
+        if s[p.pos] as int == 93 {
+            p.pos += 1
+            break
+        }
+        if s[p.pos] as int != 44 {
+            jp_err(s, mut p, "expected ',' or ']'")
+            return -1
+        }
+        p.pos += 1
+        jp_skip_ws(s, mut p)
+        if p.pos < p.end && s[p.pos] as int == 93 {
+            jp_err(s, mut p, "trailing comma in array")
+            return -1
+        }
+    }
+    j.nv[arr] = j.kids.len
+    j.nn[arr] = items.len
+    for v in items {
+        (mut j.kids).push(v)
+    }
+    arr
+}
+
+fn same_key(j: Json, at: int, n: int, bat: int, bn: int) -> bool {
+    if n != bn {
+        return false
+    }
+    var i = 0
+    while i < n {
+        if j.bytes[at + i] != j.bytes[bat + i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `json_object` (`json.c:378-454`).
+fn jp_object(s: List[byte], mut p: JP, mut j: Json, depth: int) -> int {
+    if depth + 1 >= JSON_MAX_DEPTH {
+        jp_err(s, mut p, "nesting deeper than 128")
+        return -1
+    }
+    let obj = jp_node(s, mut p, mut j, JS_OBJ)
+    if obj < 0 {
+        return -1
+    }
+    p.pos += 1
+    jp_skip_ws(s, mut p)
+    if p.pos < p.end && s[p.pos] as int == 125 {
+        p.pos += 1
+        j.nv[obj] = j.mk.len
+        return obj
+    }
+    var keys = List[int]()
+    var lens = List[int]()
+    var vals = List[int]()
+    loop {
+        let (kat, klen, _) = jp_string(s, mut p, mut j)
+        if kat < 0 {
+            return -1
+        }
+        jp_skip_ws(s, mut p)
+        if p.pos >= p.end || s[p.pos] as int != 58 {
+            jp_err(s, mut p, "expected ':' after object key")
+            return -1
+        }
+        p.pos += 1
+        let value = jp_value(s, mut p, mut j, depth + 1)
+        if value < 0 {
+            return -1
+        }
+        var old = -1
+        var k = 0
+        while k < keys.len {
+            if same_key(j, keys[k], lens[k], kat, klen) {
+                old = k
+                break
+            }
+            k += 1
+        }
+        if old >= 0 {
+            vals[old] = value
+            j.nf[obj] = (j.nf[obj] as int | JSF_DUP_KEY) as byte
+            util.log_warn("duplicate JSON object key")
+        } else {
+            (mut keys).push(kat)
+            (mut lens).push(klen)
+            (mut vals).push(value)
+        }
+        jp_skip_ws(s, mut p)
+        if p.pos >= p.end {
+            jp_err(s, mut p, "unterminated object")
+            return -1
+        }
+        if s[p.pos] as int == 125 {
+            p.pos += 1
+            break
+        }
+        if s[p.pos] as int != 44 {
+            jp_err(s, mut p, "expected ',' or '}}'")
+            return -1
+        }
+        p.pos += 1
+        jp_skip_ws(s, mut p)
+        if p.pos < p.end && s[p.pos] as int == 125 {
+            jp_err(s, mut p, "trailing comma in object")
+            return -1
+        }
+    }
+    j.nv[obj] = j.mk.len
+    j.nn[obj] = keys.len
+    var m = 0
+    while m < keys.len {
+        (mut j.mk).push(keys[m])
+        (mut j.ml).push(lens[m])
+        (mut j.mv).push(vals[m])
+        m += 1
+    }
+    obj
+}
+
+fn is_digit(s: List[byte], i: int) -> bool {
+    let c = s[i] as int
+    c >= 48 && c <= 57
+}
+
+// A lexeme of ASCII bytes as a `str`.
+fn ascii_text(s: List[byte], at: int, end: int) -> str {
+    var b = List[byte]()
+    var i = at
+    while i < end {
+        (mut b).push(s[i])
+        i += 1
+    }
+    str_from_utf8(b) else ""
+}
+
+// `json_number` (`json.c:456-569`). The grammar is checked first; an
+// integer that fits i64 is an INT; anything else goes through the real
+// reader, C's `strtod` (`fl.float`'s seam: `std.fmt.decimal` over the
+// magnitude, the sign applied after). An integer overflow or an
+// underflow to zero is lossy; an infinity is out of range.
+fn jp_number(s: List[byte], mut p: JP, mut j: Json) -> int {
+    let start = p.pos
+    var negative = false
+    var real = false
+    if s[p.pos] as int == 45 {
+        negative = true
+        p.pos += 1
+    }
+    if p.pos >= p.end {
+        jp_err_at(s, mut p, start, "malformed number")
+        return -1
+    }
+    let digits = p.pos
+    let first = s[p.pos] as int
+    if first == 48 {
+        p.pos += 1
+        if p.pos < p.end && is_digit(s, p.pos) {
+            jp_err_at(s, mut p, start, "malformed number")
+            return -1
+        }
+    } else if first >= 49 && first <= 57 {
+        while p.pos < p.end && is_digit(s, p.pos) {
+            p.pos += 1
+        }
+    } else {
+        jp_err_at(s, mut p, start, "malformed number")
+        return -1
+    }
+    let int_end = p.pos
+    if p.pos < p.end && s[p.pos] as int == 46 {
+        real = true
+        p.pos += 1
+        if p.pos >= p.end || !is_digit(s, p.pos) {
+            jp_err_at(s, mut p, start, "malformed number")
+            return -1
+        }
+        while p.pos < p.end && is_digit(s, p.pos) {
+            p.pos += 1
+        }
+    }
+    if p.pos < p.end && (s[p.pos] as int == 101 || s[p.pos] as int == 69) {
+        real = true
+        p.pos += 1
+        if p.pos < p.end && (s[p.pos] as int == 43 || s[p.pos] as int == 45) {
+            p.pos += 1
+        }
+        if p.pos >= p.end || !is_digit(s, p.pos) {
+            jp_err_at(s, mut p, start, "malformed number")
+            return -1
+        }
+        while p.pos < p.end && is_digit(s, p.pos) {
+            p.pos += 1
+        }
+    }
+    var overflow = false
+    if !real {
+        // The magnitude against INT64_MAX (INT64_MAX + 1 when negative),
+        // digit by digit, as C's `limit` (json.c:526-537), accumulated
+        // negative so that INT64_MIN itself fits.
+        let lim: int = -922337203685477580
+        let maxd = if negative then 8 else 7
+        var acc: int = 0
+        var i = digits
+        while i < int_end {
+            let digit = s[i] as int - 48
+            if acc < lim || acc == lim && digit > maxd {
+                overflow = true
+                break
+            }
+            acc = acc * 10 - digit
+            i += 1
+        }
+        if !overflow {
+            let v = jp_node(s, mut p, mut j, JS_INT)
+            if v < 0 {
+                return -1
+            }
+            j.nv[v] = if negative then acc else 0 - acc
+            return v
+        }
+    }
+    let mag_text = ascii_text(s, if negative then start + 1 else start, p.pos)
+    var out_of_range = false
+    let magnitude = decimal.parse_float(mag_text) else |e| match e {
+        overflow => {
+            out_of_range = true
+            0.0
+        },
+        parse => {
+            out_of_range = true
+            0.0
+        },
+    }
+    if out_of_range || floats.is_inf(magnitude) {
+        jp_err_at(s, mut p, start, "number out of range")
+        return -1
+    }
+    let d = if negative then -magnitude else magnitude
+    let v = jp_node(s, mut p, mut j, JS_REAL)
+    if v < 0 {
+        return -1
+    }
+    j.nv[v] = j.reals.len
+    (mut j.reals).push(d)
+    if overflow || magnitude == 0.0 && has_nonzero_digit(s, digits, p.pos) {
+        j.nf[v] = (j.nf[v] as int | JSF_LOSSY_NUM) as byte
+    }
+    v
+}
+
+// A significand digit other than zero before the exponent: strtod's
+// ERANGE with a zero result is an underflow of such a number.
+fn has_nonzero_digit(s: List[byte], at: int, end: int) -> bool {
+    var i = at
+    while i < end {
+        let c = s[i] as int
+        if c == 101 || c == 69 {
+            return false
+        }
+        if c >= 49 && c <= 57 {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn jp_literal(s: List[byte], mut p: JP, word: str) -> bool {
+    if p.end - p.pos < word.len {
+        return false
+    }
+    var i = 0
+    while i < word.len {
+        if s[p.pos + i] != word.bytes()[i] {
+            return false
+        }
+        i += 1
+    }
+    p.pos += word.len
+    true
+}
+
+fn looks_at(s: List[byte], p: JP, word: str) -> bool {
+    if p.end - p.pos < word.len {
+        return false
+    }
+    var i = 0
+    while i < word.len {
+        if s[p.pos + i] != word.bytes()[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `json_value` (`json.c:581-636`).
+fn jp_value(s: List[byte], mut p: JP, mut j: Json, depth: int) -> int {
+    jp_skip_ws(s, mut p)
+    if p.pos >= p.end {
+        jp_err(s, mut p, "expected JSON value")
+        return -1
+    }
+    let c = s[p.pos] as int
+    if c == 123 {
+        return jp_object(s, mut p, mut j, depth)
+    }
+    if c == 91 {
+        return jp_array(s, mut p, mut j, depth)
+    }
+    if c == 34 {
+        let v = jp_node(s, mut p, mut j, JS_STR)
+        if v < 0 {
+            return -1
+        }
+        let (at, n, flags) = jp_string(s, mut p, mut j)
+        if at < 0 {
+            return -1
+        }
+        j.nv[v] = at
+        j.nn[v] = n
+        j.nf[v] = flags as byte
+        return v
+    }
+    if c == 110 {
+        if jp_literal(s, mut p, "null") {
+            return jp_node(s, mut p, mut j, JS_NULL)
+        }
+    } else if c == 116 {
+        if jp_literal(s, mut p, "true") {
+            let v = jp_node(s, mut p, mut j, JS_BOOL)
+            if v >= 0 {
+                j.nv[v] = 1
+            }
+            return v
+        }
+    } else if c == 102 {
+        if jp_literal(s, mut p, "false") {
+            return jp_node(s, mut p, mut j, JS_BOOL)
+        }
+    } else {
+        if looks_at(s, p, "Infinity") || looks_at(s, p, "NaN") {
+            jp_err(s, mut p, "number out of range")
+            return -1
+        }
+        if c == 45 || c == 43 || c == 46 || c >= 48 && c <= 57 {
+            return jp_number(s, mut p, mut j)
+        }
+    }
+    jp_err(s, mut p, "expected JSON value")
+    -1
+}
+
+/// `yew_json_parse` (`json.c:638-678`) over `s[at..end)`: the document, or
+/// `invalid` with `err` filled (its offset counted from `at`).
+pub fn json_parse(s: List[byte], at: int, end: int, mut err: JsonErr) -> Json ! {invalid} {
+    err.line = 0
+    err.col = 0
+    err.off = 0
+    err.msg = ""
+    var j = json_new()
+    var p = JP { start: at, pos: at, end: end, nodes: 0, line: 0, col: 0, off: 0, msg: "" }
+    if end - at > JSON_MAX_BYTES {
+        // C counts the position over the bytes it was given; nothing is
+        // read past the cap's check, so the error stands at offset 0.
+        err.line = 1
+        err.col = 1
+        err.msg = "document exceeds 64 MiB"
+        return invalid
+    }
+    jp_skip_ws(s, mut p)
+    var root = -1
+    if p.pos == p.end {
+        jp_err(s, mut p, "empty document")
+    } else {
+        root = jp_value(s, mut p, mut j, 0)
+        if root >= 0 {
+            jp_skip_ws(s, mut p)
+            if p.pos != p.end {
+                jp_err(s, mut p, "trailing bytes after JSON value")
+                root = -1
+            }
+        }
+    }
+    if root < 0 {
+        err.line = p.line
+        err.col = p.col
+        err.off = p.off
+        err.msg = p.msg
+        return invalid
+    }
+    j.root = root
+    j
+}
+
+/// `json_parse` over the whole of `s`.
+pub fn json_parse_all(s: List[byte], mut err: JsonErr) -> Json ! {invalid} {
+    json_parse(s, 0, s.len, mut err)
+}
+
+// ------------------------------------------------------------------
+// Accessors (`json.c:680-810`). A node is an index; -1 is C's NULL.
+// ------------------------------------------------------------------
+
+/// A node's kind, or -1 for no node.
+pub fn json_kind(j: Json, v: int) -> int {
+    if v < 0 then -1 else j.nk[v] as int
+}
+
+/// A node's flags (`JSF_*`), or 0 for no node.
+pub fn json_flags(j: Json, v: int) -> int {
+    if v < 0 then 0 else j.nf[v] as int
+}
+
+fn key_is(j: Json, m: int, key: List[byte], at: int, n: int) -> bool {
+    if j.ml[m] != n {
+        return false
+    }
+    let base = j.mk[m]
+    var i = 0
+    while i < n {
+        if j.bytes[base + i] != key[at + i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_json_get` (`json.c:680-696`; the prelude owns `json_get`): the
+/// member named `key` of object `o`, or -1.
+pub fn json_field(j: Json, o: int, key: str) -> int {
+    if o < 0 || j.nk[o] as int != JS_OBJ {
+        return -1
+    }
+    let first = j.nv[o]
+    var i = 0
+    while i < j.nn[o] {
+        if key_is(j, first + i, key.bytes(), 0, key.len) {
+            return j.mv[first + i]
+        }
+        i += 1
+    }
+    -1
+}
+
+/// `yew_json_at` (`json.c:698-703`): element `i` of array `a`, or -1.
+pub fn json_at(j: Json, a: int, i: int) -> int {
+    if a < 0 || j.nk[a] as int != JS_ARR || i < 0 || i >= j.nn[a] {
+        return -1
+    }
+    j.kids[j.nv[a] + i]
+}
+
+/// `yew_json_len` (`json.c:705-716`; the prelude owns `json_len`).
+pub fn json_size(j: Json, v: int) -> int {
+    if v < 0 {
+        return 0
+    }
+    let k = j.nk[v] as int
+    if k == JS_STR || k == JS_ARR || k == JS_OBJ then j.nn[v] else 0
+}
+
+/// `yew_json_int` (`json.c:718-721`).
+pub fn json_int(j: Json, v: int, dflt: int) -> int {
+    if v >= 0 && j.nk[v] as int == JS_INT then j.nv[v] else dflt
+}
+
+/// `yew_json_real` (`json.c:723-726`).
+pub fn json_real(j: Json, v: int, dflt: f64) -> f64 {
+    if v >= 0 && j.nk[v] as int == JS_REAL then j.reals[j.nv[v]] else dflt
+}
+
+/// `yew_json_bool` (`json.c:728-731`).
+pub fn json_bool(j: Json, v: int, dflt: bool) -> bool {
+    if v >= 0 && j.nk[v] as int == JS_BOOL then j.nv[v] != 0 else dflt
+}
+
+/// Whether `v` is a string (`yew_json_str` answering non-NULL).
+pub fn json_is_str(j: Json, v: int) -> bool {
+    v >= 0 && j.nk[v] as int == JS_STR
+}
+
+/// A string node's byte offset in `j.bytes` (with `json_size`, C's
+/// `yew_json_str` pointer and length); -1 when `v` is not a string.
+pub fn json_str_at(j: Json, v: int) -> int {
+    if json_is_str(j, v) then j.nv[v] else -1
+}
+
+/// A string node's bytes, copied (`yew_json_str`, `json.c:733-742`);
+/// empty when `v` is not a string.
+pub fn json_str(j: Json, v: int) -> List[byte] {
+    var out = List[byte]()
+    if !json_is_str(j, v) {
+        return out
+    }
+    let at = j.nv[v]
+    var i = 0
+    while i < j.nn[v] {
+        (mut out).push(j.bytes[at + i])
+        i += 1
+    }
+    out
+}
+
+/// `yew_json_streq` (`json.c:744-752`).
+pub fn json_streq(j: Json, v: int, s: str) -> bool {
+    if !json_is_str(j, v) || j.nn[v] != s.len {
+        return false
+    }
+    let at = j.nv[v]
+    var i = 0
+    while i < s.len {
+        if j.bytes[at + i] != s.bytes()[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// Whether string `v` equals `s[at..end)`.
+pub fn json_str_eq_bytes(j: Json, v: int, s: List[byte], at: int, end: int) -> bool {
+    if !json_is_str(j, v) || j.nn[v] != end - at {
+        return false
+    }
+    let base = j.nv[v]
+    var i = 0
+    while i < end - at {
+        if j.bytes[base + i] != s[at + i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// `yew_json_path` (`json.c:754-783`): a dotted member path from `root`.
+pub fn json_path(j: Json, root: int, path: str) -> int {
+    var value = root
+    var obj = root
+    if path.len == 0 {
+        return value
+    }
+    let b = path.bytes()
+    var part = 0
+    while part < b.len {
+        var dot = part
+        while dot < b.len && b[dot] as int != 46 {
+            dot += 1
+        }
+        let n = dot - part
+        if value < 0 || j.nk[value] as int != JS_OBJ || n == 0 {
+            return -1
+        }
+        value = -1
+        let first = j.nv[obj]
+        var i = 0
+        while i < j.nn[obj] {
+            if key_is(j, first + i, b, part, n) {
+                value = j.mv[first + i]
+                break
+            }
+            i += 1
+        }
+        if value < 0 || dot >= b.len {
+            return value
+        }
+        obj = value
+        part = dot + 1
+    }
+    value
+}
+
+/// `yew_json_eq` (`json.c:785-821`): structural equality across two
+/// documents (C compares pointers first; the port's trees are values).
+pub fn json_eq(a: Json, av: int, b: Json, bv: int) -> bool {
+    if av < 0 || bv < 0 {
+        return av < 0 && bv < 0
+    }
+    let k = a.nk[av] as int
+    if k != b.nk[bv] as int {
+        return false
+    }
+    if k == JS_NULL {
+        return true
+    }
+    if k == JS_BOOL || k == JS_INT {
+        return a.nv[av] == b.nv[bv]
+    }
+    if k == JS_REAL {
+        return a.reals[a.nv[av]] == b.reals[b.nv[bv]]
+    }
+    if k == JS_STR {
+        if a.nn[av] != b.nn[bv] {
+            return false
+        }
+        var i = 0
+        while i < a.nn[av] {
+            if a.bytes[a.nv[av] + i] != b.bytes[b.nv[bv] + i] {
+                return false
+            }
+            i += 1
+        }
+        return true
+    }
+    if a.nn[av] != b.nn[bv] {
+        return false
+    }
+    var i = 0
+    while i < a.nn[av] {
+        if k == JS_ARR {
+            if !json_eq(a, a.kids[a.nv[av] + i], b, b.kids[b.nv[bv] + i]) {
+                return false
+            }
+        } else {
+            let ma = a.nv[av] + i
+            let mb = b.nv[bv] + i
+            if a.ml[ma] != b.ml[mb] {
+                return false
+            }
+            var c = 0
+            while c < a.ml[ma] {
+                if a.bytes[a.mk[ma] + c] != b.bytes[b.mk[mb] + c] {
+                    return false
+                }
+                c += 1
+            }
+            if !json_eq(a, a.mv[ma], b, b.mv[mb]) {
+                return false
+            }
+        }
+        i += 1
+    }
+    true
+}
+
+/// Member `i` of object `o`: its key's bytes.
+pub fn json_member_key(j: Json, o: int, i: int) -> List[byte] {
+    var out = List[byte]()
+    let m = j.nv[o] + i
+    var c = 0
+    while c < j.ml[m] {
+        (mut out).push(j.bytes[j.mk[m] + c])
+        c += 1
+    }
+    out
+}
+
+/// Member `i` of object `o`: its value node.
+pub fn json_member_val(j: Json, o: int, i: int) -> int {
+    j.mv[j.nv[o] + i]
+}
+
+// ------------------------------------------------------------------
+// The writer (`json.c:823-1074`).
+// ------------------------------------------------------------------
+
+/// `JsonW` (`json.h:89-96`): the writer owns its output; the caller takes
+/// `w.out` when the root is written.
+pub struct JsonW {
+    out: List[byte],
+    comma: List[bool],
+    kinds: List[int],
+    depth: int,
+    key_pending: bool,
+    root_written: bool,
+}
+
+/// `yew_jsonw_init` (`json.c:885-889`) with an empty output.
+pub fn jsonw_new() -> JsonW {
+    var comma = List[bool]()
+    var kinds = List[int]()
+    var i = 0
+    while i < JSON_MAX_DEPTH {
+        (mut comma).push(false)
+        (mut kinds).push(0)
+        i += 1
+    }
+    JsonW {
+        out: List[byte](),
+        comma: comma,
+        kinds: kinds,
+        depth: 0,
+        key_pending: false,
+        root_written: false,
+    }
+}
+
+fn jw_bug(detail: str) {
+    util.bug("lsp.json", detail)
+}
+
+// `jsonw_before_value` (`json.c:842-860`).
+fn jw_before_value(mut w: JsonW) {
+    if w.depth == 0 {
+        if w.root_written {
+            jw_bug("JSON writer received a second root value")
+        }
+        w.root_written = true
+        return
+    }
+    if w.kinds[w.depth - 1] == JS_OBJ {
+        if !w.key_pending {
+            jw_bug("JSON object value has no key")
+        }
+        w.key_pending = false
+        return
+    }
+    if w.comma[w.depth - 1] {
+        (mut w.out).push(44 as byte)
+    }
+    w.comma[w.depth - 1] = true
+}
+
+fn hex_lower(n: int) -> byte {
+    "0123456789abcdef".bytes()[n]
+}
+
+// `jsonw_quoted` (`json.c:862-913`).
+fn jw_quoted(mut w: JsonW, s: List[byte], at: int, end: int) {
+    (mut w.out).push(34 as byte)
+    var valid = unicode.utf8_validate(s, at, end)
+    var i = at
+    while i < end {
+        let c = s[i] as int
+        if i == valid {
+            let (cp, consumed) = unicode.utf8_decode(s, i, end)
+            if unicode.utf8_is_escape(cp) {
+                let raw = unicode.utf8_escape_byte(cp)
+                (mut w.out).push(92 as byte)
+                (mut w.out).push(117 as byte)
+                (mut w.out).push(68 as byte)
+                (mut w.out).push(67 as byte)
+                (mut w.out).push(hex_lower(raw >> 4))
+                (mut w.out).push(hex_lower(raw & 15))
+                i += consumed
+                valid = unicode.utf8_validate(s, i, end)
+                continue
+            }
+        }
+        if c == 34 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(34 as byte)
+        } else if c == 92 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(92 as byte)
+        } else if c == 8 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(98 as byte)
+        } else if c == 12 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(102 as byte)
+        } else if c == 10 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(110 as byte)
+        } else if c == 13 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(114 as byte)
+        } else if c == 9 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(116 as byte)
+        } else if c < 32 {
+            (mut w.out).push(92 as byte)
+            (mut w.out).push(117 as byte)
+            (mut w.out).push(48 as byte)
+            (mut w.out).push(48 as byte)
+            (mut w.out).push(hex_lower(c >> 4))
+            (mut w.out).push(hex_lower(c & 15))
+        } else {
+            (mut w.out).push(c as byte)
+        }
+        i += 1
+    }
+    (mut w.out).push(34 as byte)
+}
+
+// `jsonw_begin` (`json.c:891-901`).
+fn jw_begin(mut w: JsonW, kind: int, open: int) {
+    jw_before_value(mut w)
+    if w.depth >= JSON_MAX_DEPTH {
+        jw_bug("JSON writer nesting exceeds 128")
+    }
+    (mut w.out).push(open as byte)
+    w.kinds[w.depth] = kind
+    w.comma[w.depth] = false
+    w.depth += 1
+}
+
+/// `yew_jsonw_obj`.
+pub fn jsonw_obj(mut w: JsonW) {
+    jw_begin(mut w, JS_OBJ, 123)
+}
+
+/// `yew_jsonw_arr`.
+pub fn jsonw_arr(mut w: JsonW) {
+    jw_begin(mut w, JS_ARR, 91)
+}
+
+// `jsonw_end` (`json.c:913-922`).
+fn jw_end(mut w: JsonW, kind: int, close: int) {
+    if w.depth == 0 || w.kinds[w.depth - 1] != kind {
+        jw_bug("JSON writer container end mismatch")
+    }
+    if kind == JS_OBJ && w.key_pending {
+        jw_bug("JSON object key has no value")
+    }
+    w.depth -= 1
+    (mut w.out).push(close as byte)
+}
+
+/// `yew_jsonw_obj_end`.
+pub fn jsonw_obj_end(mut w: JsonW) {
+    jw_end(mut w, JS_OBJ, 125)
+}
+
+/// `yew_jsonw_arr_end`.
+pub fn jsonw_arr_end(mut w: JsonW) {
+    jw_end(mut w, JS_ARR, 93)
+}
+
+// `jsonw_keyn` (`json.c:953-964`); `yew_jsonw_key` is it over a `str`.
+fn jw_keyn(mut w: JsonW, k: List[byte], at: int, end: int) {
+    if w.depth == 0 || w.kinds[w.depth - 1] != JS_OBJ || w.key_pending {
+        jw_bug("JSON key outside object or without prior value")
+    }
+    if w.comma[w.depth - 1] {
+        (mut w.out).push(44 as byte)
+    }
+    w.comma[w.depth - 1] = true
+    jw_quoted(mut w, k, at, end)
+    (mut w.out).push(58 as byte)
+    w.key_pending = true
+}
+
+/// `yew_jsonw_key` (`json.c:934-951`).
+pub fn jsonw_key(mut w: JsonW, k: str) {
+    jw_keyn(mut w, k.bytes(), 0, k.len)
+}
+
+/// `yew_jsonw_str` over `s[at..end)`.
+pub fn jsonw_str_range(mut w: JsonW, s: List[byte], at: int, end: int) {
+    jw_before_value(mut w)
+    jw_quoted(mut w, s, at, end)
+}
+
+/// `yew_jsonw_str` (`json.c:966-970`).
+pub fn jsonw_str(mut w: JsonW, s: List[byte]) {
+    jsonw_str_range(mut w, s, 0, s.len)
+}
+
+/// `yew_jsonw_cstr` (`json.c:972-979`).
+pub fn jsonw_cstr(mut w: JsonW, s: str) {
+    jw_before_value(mut w)
+    jw_quoted(mut w, s.bytes(), 0, s.len)
+}
+
+/// `yew_jsonw_int` (`json.c:981-985`).
+pub fn jsonw_int(mut w: JsonW, v: int) {
+    jw_before_value(mut w)
+    util.buf_append_str(mut w.out, "{v}")
+}
+
+fn trim_fraction(text: str) -> str {
+    if !text.contains(".") {
+        return text
+    }
+    var end = text.len
+    while end > 0 && text.bytes()[end - 1] as int == 48 {
+        end -= 1
+    }
+    if end > 0 && text.bytes()[end - 1] as int == 46 {
+        end -= 1
+    }
+    text[0..end]
+}
+
+/// C's `%.17g` (C11 7.21.6.1's style e/f choice from the exponent after
+/// rounding), as `fl.float_general` spells it (`src/fl/float.lu`).
+pub fn json_real_text(v: f64) -> str {
+    let p = 17
+    let scientific = decimal.to_str_exp(v, p - 1)
+    let at = scientific.find("e") else { return scientific }
+    let exp = scientific[at + 1..].to_int() else 0
+    if exp < -4 || exp >= p {
+        return trim_fraction(scientific[0..at]) + scientific[at..]
+    }
+    trim_fraction(decimal.to_str_fixed(v, p - 1 - exp))
+}
+
+/// `yew_jsonw_real` (`json.c:987-1004`): `%.17g`, and `.0` when the text
+/// has neither a point nor an exponent.
+pub fn jsonw_real(mut w: JsonW, v: f64) {
+    if !floats.is_finite(v) {
+        jw_bug("JSON writer cannot emit a non-finite real")
+    }
+    jw_before_value(mut w)
+    let text = json_real_text(v)
+    util.buf_append_str(mut w.out, text)
+    if !text.contains(".") && !text.contains("e") && !text.contains("E") {
+        util.buf_append_str(mut w.out, ".0")
+    }
+}
+
+/// `yew_jsonw_bool` (`json.c:1006-1010`).
+pub fn jsonw_bool(mut w: JsonW, v: bool) {
+    jw_before_value(mut w)
+    util.buf_append_str(mut w.out, if v then "true" else "false")
+}
+
+/// `yew_jsonw_null` (`json.c:1012-1016`).
+pub fn jsonw_null(mut w: JsonW) {
+    jw_before_value(mut w)
+    util.buf_append_str(mut w.out, "null")
+}
+
+/// `yew_jsonw_raw` (`json.c:1018-1022`): bytes already JSON.
+pub fn jsonw_raw(mut w: JsonW, json: List[byte]) {
+    jw_before_value(mut w)
+    util.buf_append(mut w.out, json)
+}
+
+/// `yew_jsonw_value` (`json.c:1024-1074`): a parsed tree re-emitted.
+pub fn jsonw_value(mut w: JsonW, j: Json, v: int) {
+    if v < 0 {
+        jw_bug("JSON writer received a NULL tree")
+    }
+    let k = j.nk[v] as int
+    if k == JS_NULL {
+        jsonw_null(mut w)
+    } else if k == JS_BOOL {
+        jsonw_bool(mut w, j.nv[v] != 0)
+    } else if k == JS_INT {
+        jsonw_int(mut w, j.nv[v])
+    } else if k == JS_REAL {
+        jsonw_real(mut w, j.reals[j.nv[v]])
+    } else if k == JS_STR {
+        jsonw_str_range(mut w, j.bytes, j.nv[v], j.nv[v] + j.nn[v])
+    } else if k == JS_ARR {
+        jsonw_arr(mut w)
+        var i = 0
+        while i < j.nn[v] {
+            jsonw_value(mut w, j, j.kids[j.nv[v] + i])
+            i += 1
+        }
+        jsonw_arr_end(mut w)
+    } else if k == JS_OBJ {
+        jsonw_obj(mut w)
+        var i = 0
+        while i < j.nn[v] {
+            let m = j.nv[v] + i
+            jw_keyn(mut w, j.bytes, j.mk[m], j.mk[m] + j.ml[m])
+            jsonw_value(mut w, j, j.mv[m])
+            i += 1
+        }
+        jsonw_obj_end(mut w)
+    } else {
+        jw_bug("JSON writer received invalid value kind")
+    }
+}
