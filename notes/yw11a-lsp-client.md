@@ -23,7 +23,7 @@ unit, and which half of campaign 09 takes it:
 | `sync.c`, `sync.h` | 581 | `lsp.sync` (the document, positions, didOpen/didChange/didSave/didClose bodies) and `edit.lsp_sync` (the editor hooks) | all | — |
 | `diag.c`, `diag.h` | 901 | `edit.lsp_diag` | all: the store on marks, the gutter signs, the underline attributes, the cursor hint, the picker, the jump | — |
 | `lsp.c`, `lsp.h` | 567 | `edit.lsp` | the boundary: info, log, start (restart), stop, diagnostics, diag_step, attached, the status badge, pump, free, buffer open/save/close | complete, hover, signature, the gotos, references, rename, symbols, the signature auto-trigger: they keep refusing by name (Sprint 47, yw11b) |
-| `shim.c` | 230 | none | the disabled-module stub; the port is always the full build (ruling #93 R4), so it is not ported | — |
+| `shim.c` | 230 | none | the disabled-module stub; the port is always the full build, so it is not ported | — |
 | `features.c`, `.h` | 2,450 | — | — | all |
 | `rename.c`, `.h` | 1,581 | — | — | all |
 | `pickers.c`, `.h` | 744 | — | — | all |
@@ -63,8 +63,8 @@ hover, signature, definition, references, symbols, highlight),
   builtin detection index's path half (extensions and file names,
   `syn/defs.c:3614-3622`'s `path_language`), with no shebang, no first
   line, no Fortran scoring and no user definitions; those stay yw10's,
-  and a buffer they would name has no language, as now. That is
-  **R-yw11-1**.
+  and a buffer they would name has no language, as now (decided
+  below).
 - **yw11b's highlight, shadow and symbol index:** the sync hook clears
   the document highlight (`sync.c:430-431`), close cancels the shadow
   request (`client.c:1186-1192`), and `ed.lsp.symbols` falls back to the
@@ -188,7 +188,7 @@ Commits, in order:
 - The client: `623abb2` `lsp.sync` replays a logged edit; `bc67f30`
   `text.edit` logs each edit at the choke point (C's notify hooks,
   `notify.c:44,57`); `95ebaf8` `edit.syn_paths` and `79c421a`
-  `tools/check-syn-paths` (R-yw11-1); `d4e5f60` `edit.lsp_client`;
+  `tools/check-syn-paths`; `d4e5f60` `edit.lsp_client`;
   `71ecf93` `edit.lsp_diag`; `9af2ebf` `edit.lsp`; `0873751` the framed
   sink in `edit.job`; `0d7b757`, `8b215ab`, `0ad5746` the `Ed`, the
   close and free paths and the commands; `e73803b` the server table
@@ -272,7 +272,7 @@ Commits, in order:
   incremental change's end one character late), red by name at
   `lspf_mirror_sync`: both records are the PR's.
 
-**What the rows taught the comparison** (R-yw11-3): C's syntax engine
+**What the rows taught the comparison**: C's syntax engine
 colours `.lu` (yw10's, not ported) and paints frames of its own as it
 settles (`ed.c:1383-1389`), so the comparison leaves out the document
 area's foreground, bold and italic and the header's frame count; every
@@ -283,58 +283,55 @@ it is yw11b's, and the rows' config turns it off in both editors. The
 diagnostic list labels a row by the buffer's whole path (`diag.c:639-643`,
 `ed.c:333-340`), so both editors open the same fixed path.
 
-### Rulings asked
+### Decided
 
-- **R-yw11-1 — the language before yw10.** C starts a server only for a
-  buffer with a language (`client.c:1133`), and the language is syn's.
-  (A) port the builtin detection index's path half only, generated from
+- **The language before yw10.** C starts a server only for a buffer
+  with a language (`client.c:1133`), and the language is syn's. The
+  port has the builtin detection index's path half only, generated from
   the pin (`tools/gen-syn-paths`, checked by `tools/check-syn-paths`):
-  extensions, exact names and globs, no shebang, no first line, no
-  Fortran scoring, no user definitions; (B) wait for yw10. **Recommend
-  A** (implemented): every `.lu`, `.c`, `.py` and the rest name their
-  language as C's do; a file only a shebang or a user definition would
-  name has none until yw10.
-- **R-yw11-2 — the hung `initialize`.** The contract asks for a deadline
-  and a named message. C has the deadline (the server's
-  `init_timeout_ms`, 60 s by default) and kills the server, but says
-  nothing: the badge loses its ellipsis (`client.c:833-844`). (A) match
-  C (implemented; the row holds the port to C's screen); (B) a message
-  such as `wolf: initialize timed out`, a divergence from C's screen
-  that a golden-free row would accept but sagitta never draws.
-  **Recommend A**; B is a one-line change if wanted, and would want the
-  same in sagitta.
-- **R-yw11-3 — what the oracle rows compare** (above). (A) every cell
-  but the document area's syntax colouring and the frame count, the
-  shadow off in both (implemented); (B) whole snapshots, which waits for
-  yw10. **Recommend A** until yw10 lands, then B: `compare.py` loses
-  two lines.
-- **R-yw11-4 — `lsp_sync.fl`'s list.** (A) it stays in
-  `tools/scripts-deferred.txt` (yw09's partition of the pin's 94 holds
-  at 69 + 25) and yw11a's own step gates it by name (implemented); (B)
-  move it into a gate list and re-partition. **Recommend A.**
-- **R-yw11-5 — `test_lsp_transport` and `test_lsp_life`.** Their C
+  extensions, exact names and globs; no shebang, no first line, no
+  Fortran scoring, no user definitions. Every `.lu`, `.c`, `.py` and the
+  rest name their language as C's do; a file only a shebang or a user
+  definition would name has none until yw10. Waiting for yw10 was the
+  alternative.
+- **The hung `initialize` says nothing, as C.** C has the deadline (the
+  server's `init_timeout_ms`, 60 s by default) and kills the server, but
+  draws no message: the badge loses its ellipsis (`client.c:833-844`).
+  The port matches, and the silent-initialize row holds it to C's
+  screen. A named message such as `wolf: initialize timed out` was the
+  alternative: a divergence from C's screen that sagitta never draws.
+- **What the oracle rows compare** (above): every cell but the document
+  area's syntax colouring and the header's frame count, the shadow off
+  in both editors, until yw10 lands; then whole snapshots, and
+  `compare.py` loses two lines.
+- **`lsp_sync.fl`'s list.** It stays in `tools/scripts-deferred.txt`
+  (yw09's partition of the pin's 94 holds at 69 + 25), and yw11a's own
+  CI step gates it by name.
+- **`test_lsp_transport` and `test_lsp_life` wait for yw11b.** Their C
   fixtures hand the job layer an ops table for a test owner; the port's
   framed owner is a server id the job layer matches by kind, so they
-  have no seam to port onto as written. (A) leave them, covered here by
-  `lsp_sync.fl` and the rows' crash, malformed frame, slow and silent
-  initialize and deaf shutdown (implemented); (B) port them through a
-  real `LspServer` fixture with yw11b. **Recommend A now, B in yw11b.**
+  have no seam to port onto as written. Here `lsp_sync.fl` and the
+  rows' crash, malformed frame, slow and silent initialize and deaf
+  shutdown cover those paths; yw11b ports the files through a real
+  `LspServer` fixture.
 
 ## Done-when
 
-- [x] The map, with what waits for yw11b and what syn gives (R-yw11-1).
+- [x] The map, with what waits for yw11b and what syn gives.
 - [x] sagitta's JSON and JSON-RPC, ported, their unit files red first.
 - [x] The client and the child: configs, roots, the job on pipes, the
   handshake, shutdown and exit, a crash, a malformed frame, a hang with
-  its deadline (R-yw11-2), through the existing wait (G2).
+  its deadline (silent, as C's), through the existing wait (G2).
 - [x] Sync: didOpen, incremental didChange, didSave, didClose, with the
   server's view held to the buffer after edits, undo and two cursors.
 - [x] Diagnostics drawn as C draws them: gutter, underline, statusline,
   hint, list, jumps; the eight goldens.
-- [x] The oracle rows, each red before its code, green on macOS and in
-  the Linux gauntlet.
+- [x] The oracle rows, each red before its code, green on macOS; the
+  Linux gauntlet's record is the PR's.
 - [x] Static for PAX: the binary's digest, and the client starting
-  `wolf lsp` in a container holding only it and PAX's musl wolf.
+  `wolf lsp` in a container holding only it and PAX's musl wolf (the
+  gauntlet's `static` and `pax-container` steps; the record is the
+  PR's).
 - **wolf yew opening a `.lu` file shows `wolf lsp`'s diagnostics
   exactly as C yew shows them, on the same server:** the `lspw_*` rows'
-  screens, cell for cell, syntax colouring aside (R-yw11-3).
+  screens, cell for cell, syntax colouring aside.
