@@ -53,7 +53,13 @@ exits with (campaign 06's 39 conformance units, its coverage ledger and
 three fuzzers against C's drivers). Fletch also runs inside the editor:
 origin-owned bindings and hooks, live `init.fl`, recording and replay with
 the recorder/Fletch round-trip, the macro browser and library, workspace
-config trust, and headless `--batch` editing (campaign 07).
+config trust, and headless `--batch` editing (campaign 07). The language
+server client's first half (campaign 09): a server started for each
+language and workspace root as a job on pipes, its handshake, shutdown,
+crash restart and deadlines, document sync (incremental when the server
+asks for it), and diagnostics in the gutter, under the text, on the
+statusline, as the cursor's hint and in a list with jumps, so `wolf lsp`
+works in the editor; completion, hover, navigation and rename follow.
 Each campaign's reachable PTY goldens are gated by name against C yew's
 (campaign 05's eleven that need FUSS or syntax
 highlighting are recorded under the lane that lands them); every path
