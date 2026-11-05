@@ -1,0 +1,1185 @@
+//! edit.lsp_client — the language-server client's editor half (Sprint 45).
+//!
+//! Ports sagitta `src/mod/lsp/client.c:105-343` (the `init.fl` server
+//! table), `:807-1487` (the framed transport's seams, the handshake,
+//! dispatch, server requests, start, stop, close, restart, the pump and
+//! the editor's shutdown wait) at 9ace98c2. The pure half — the default
+//! table, roots, URIs, capabilities, `initialize`'s parameters and the
+//! lifecycle transitions — is `lsp.client`.
+//!
+//! **The shape, and why.** C's client is `ed->lsp`, NULL until first
+//! needed, holding heap servers the job layer reaches through a framed
+//! owner pointer and an ops table. Here it is a value in the `Ed`
+//! (`ed.lsp`, `present` C's non-NULL), each server named by its id: the
+//! job carries the id as its framed owner (`Job.framed_owner`) and the
+//! job layer's one `match` on the framed kind calls `lsp_framed_feed`,
+//! `_finish`, `_destroy` and `_tick` by name (G19/G20, G48). A pending
+//! request's callback is a kind (`LSP_PK_*`) matched in
+//! `lsp_pending_done`. The server's process is an ordinary job, so it
+//! counts in the statusline's job badge as C's does (`job.c:375-388`:
+//! the spec is not internal).
+
+use fl
+use lsp
+use std.signal
+use util
+
+/// `initialize_done` (`client.c:836-855`).
+pub const LSP_PK_INITIALIZE: int = 1
+
+/// `shutdown_done` (`client.c:1157-1169`).
+pub const LSP_PK_SHUTDOWN: int = 2
+
+/// A server (`LspServer`, `client.h:63-89`); its lifecycle (state,
+/// capabilities, encoding, restarts, give-up) is `life`.
+pub struct LspServer {
+    id: int,
+    cfg: lsp.LspServerCfg,
+    root: str,
+    job: int,
+    rpc: lsp.RpcConn,
+    rpc_live: bool,
+    life: lsp.LspLife,
+    docv: List[lsp.LspDoc],
+    exit_sent: bool,
+    missing_warned: int,
+    dropped_stale: int,
+    shadow_request: int,
+    shadow_buf_id: int,
+    shadow_seq: int,
+}
+
+/// The client (`LspClient`, `client.c:41-50`).
+pub struct LspClient {
+    present: bool,
+    servers: List[LspServer],
+    next_id: int,
+    cfgs: List[lsp.LspServerCfg],
+    config_token: int,
+    config_loaded: bool,
+    replaces_defaults: bool,
+}
+
+/// `yew_lsp_client_new` (`client.c:962-968`), not yet allocated.
+pub fn lsp_client_new() -> LspClient {
+    LspClient {
+        present: false,
+        servers: List[LspServer](),
+        next_id: 1,
+        cfgs: List[lsp.LspServerCfg](),
+        config_token: 0,
+        config_loaded: false,
+        replaces_defaults: false,
+    }
+}
+
+/// The index of server `sid`, or -1 (`yew_lsp_server_by_id`).
+pub fn lsp_server_index(ed: Ed, sid: int) -> int {
+    var k = 0
+    while k < ed.lsp.servers.len {
+        if ed.lsp.servers[k].id == sid {
+            return k
+        }
+        k += 1
+    }
+    -1
+}
+
+// ---------------------------------------------------------------------
+// The init.fl server table (`client.c:105-343`).
+// ---------------------------------------------------------------------
+
+// A Fletch string's bytes (`FlStr.b`).
+fn fl_bytes(vm: fl.FlVm, v: fl.FlValue) -> List[byte] {
+    copy vm.gc.slots[fl.fl_obj_index(vm, v)].bytes
+}
+
+// `copy_fl_string` (`client.c:113-124`): no NUL inside; and, here, UTF-8.
+fn fl_text(vm: fl.FlVm, v: fl.FlValue) -> (bool, str) {
+    let b = fl_bytes(vm, v)
+    for x in b {
+        if x as int == 0 {
+            return (false, "")
+        }
+    }
+    let s = str_from_utf8(b) else {
+        return (false, "")
+    }
+    (true, s)
+}
+
+// `fl_map_name` (`client.c:126-148`): the member named `name`.
+fn fl_member(vm: fl.FlVm, m: fl.FlValue, name: str) -> (bool, fl.FlValue) {
+    var cursor = 0
+    loop {
+        let (next, key, value) = fl.fl_map_iter(vm, m, cursor) else {
+            break
+        }
+        cursor = next
+        if key.t == fl.FL_STR {
+            let k = fl_bytes(vm, key)
+            if k.len == name.len {
+                var same = true
+                var i = 0
+                while i < k.len {
+                    if k[i] != name.bytes()[i] {
+                        same = false
+                        break
+                    }
+                    i += 1
+                }
+                if same {
+                    return (true, value)
+                }
+            }
+        }
+    }
+    (false, fl.fl_nil())
+}
+
+// `cfg_string` (`client.c:186-198`): answers (field valid, text, present).
+fn cfg_string(vm: fl.FlVm, m: fl.FlValue, name: str, required: bool) -> (bool, str, bool) {
+    let (has, v) = fl_member(vm, m, name)
+    if !has {
+        return (!required, "", false)
+    }
+    if v.t != fl.FL_STR {
+        return (false, "", false)
+    }
+    let (good, s) = fl_text(vm, v)
+    (good, s, good)
+}
+
+// `cfg_string_list` (`client.c:200-227`).
+fn cfg_string_list(vm: fl.FlVm, m: fl.FlValue, name: str, max: int) -> (bool, List[str]) {
+    var out = List[str]()
+    let (has, v) = fl_member(vm, m, name)
+    if !has || v.t == fl.FL_NIL {
+        return (true, out)
+    }
+    if v.t != fl.FL_LIST {
+        return (false, out)
+    }
+    let n = fl.fl_list_len(vm, v)
+    if n > max {
+        return (false, out)
+    }
+    var i = 0
+    while i < n {
+        let e = fl.fl_list_get(vm, v, i) else {
+            return (false, List[str]())
+        }
+        if e.t != fl.FL_STR {
+            return (false, List[str]())
+        }
+        let (good, s) = fl_text(vm, e)
+        if !good {
+            return (false, List[str]())
+        }
+        (mut out).push(s)
+        i += 1
+    }
+    (true, out)
+}
+
+// `cfg_init_options` (`client.c:229-253`): a string holding a JSON object.
+fn cfg_init_options(vm: fl.FlVm, m: fl.FlValue) -> (bool, str, bool) {
+    let (has, v) = fl_member(vm, m, "init_options")
+    if !has || v.t == fl.FL_NIL {
+        return (true, "", false)
+    }
+    if v.t != fl.FL_STR {
+        return (false, "", false)
+    }
+    let (good, s) = fl_text(vm, v)
+    if !good {
+        return (false, "", false)
+    }
+    var err = lsp.json_err_new()
+    let j = lsp.json_parse(s.bytes(), 0, s.len, mut err) else {
+        return (false, "", false)
+    }
+    if lsp.json_kind(j, j.root) != lsp.JS_OBJ {
+        return (false, "", false)
+    }
+    (true, s, true)
+}
+
+// `cfg_timeout` (`client.c:255-268`).
+fn cfg_timeout(vm: fl.FlVm, m: fl.FlValue) -> (bool, int) {
+    let (has, v) = fl_member(vm, m, "init_timeout_ms")
+    if !has {
+        return (true, lsp.RPC_INIT_TIMEOUT_MS)
+    }
+    if v.t != fl.FL_INT || v.i <= 0 || v.i > lsp.LSP_MAX_INIT_TIMEOUT_MS {
+        return (false, 0)
+    }
+    (true, v.i)
+}
+
+// `owned_cfg_parse` (`client.c:270-301`).
+fn owned_cfg_parse(vm: fl.FlVm, lang: str, row: fl.FlValue) -> (bool, lsp.LspServerCfg) {
+    let (i_ok, id, _) = cfg_string(vm, row, "id", true)
+    let (c_ok, cmd, _) = cfg_string(vm, row, "cmd", true)
+    let (a_ok, args) = cfg_string_list(vm, row, "args", lsp.LSP_MAX_ARGS)
+    let (r_ok, roots) = cfg_string_list(vm, row, "roots", lsp.LSP_MAX_ROOTS)
+    let (o_ok, opts, has_opts) = cfg_init_options(vm, row)
+    let (t_ok, timeout) = cfg_timeout(vm, row)
+    var c = lsp.LspServerCfg {
+        id: id,
+        lang: lang,
+        cmd: cmd,
+        args: args,
+        roots: roots,
+        init_options: opts,
+        has_init_options: has_opts,
+        init_timeout_ms: timeout,
+    }
+    if lang.len == 0 || !i_ok || !c_ok || !a_ok || !r_ok || !o_ok || !t_ok {
+        return (false, c)
+    }
+    if c.id.len == 0 || c.cmd.len == 0 {
+        return (false, c)
+    }
+    c.lang = lang
+    (true, c)
+}
+
+// `cfg_warn` (`client.c:303-310`).
+fn cfg_warn(mut ed: Ed, lang: str, why: str) {
+    util.log_warn("LSP config: ignoring server {lang}: {why}")
+    ed_msg(mut ed, MSG_WARN, "LSP config: ignoring server {lang}: {why}")
+}
+
+// C's `ed->config` identity: the live config state's serial.
+fn cfg_token(ed: Ed) -> int {
+    if ed.cfg.len == 0 then 0 else ed.cfg[0].serial
+}
+
+// `client_cfg_load` (`client.c:312-341`), against the VM `vm`: the
+// runtime's, which a running batch script holds out of the `Ed`
+// (`runtime_take`), so `t.pump` passes its own (`lsp_client_refresh_config_vm`).
+fn client_cfg_load(mut ed: Ed, mut vm: fl.FlVm) {
+    ed.lsp.config_token = cfg_token(ed)
+    ed.lsp.config_loaded = true
+    let lsp_v = config_get_global_vm(ed, mut vm, "lsp") else {
+        return
+    }
+    if lsp_v.t != fl.FL_MAP {
+        return
+    }
+    let (has, servers) = fl_member(vm, lsp_v, "servers")
+    if !has {
+        return
+    }
+    ed.lsp.replaces_defaults = true
+    if servers.t != fl.FL_MAP {
+        util.log_warn("LSP config: lsp.servers must be a map")
+        ed_msg(mut ed, MSG_WARN, "LSP config: lsp.servers must be a map")
+        return
+    }
+    var cursor = 0
+    loop {
+        let (next, key, value) = fl.fl_map_iter(vm, servers, cursor) else {
+            break
+        }
+        cursor = next
+        if key.t != fl.FL_STR {
+            continue
+        }
+        let lang_bytes = fl_bytes(vm, key)
+        let lang = str_from_utf8(lang_bytes) else "?"
+        if ed.lsp.cfgs.len == lsp.LSP_MAX_SERVERS {
+            cfg_warn(mut ed, lang, "server table exceeds 16 entries")
+            continue
+        }
+        if value.t != fl.FL_MAP {
+            cfg_warn(mut ed, lang, "invalid row or field type")
+            continue
+        }
+        let (lang_ok, lang_text) = fl_text(vm, key)
+        let (good, c) = owned_cfg_parse(vm, if lang_ok then lang_text else "", value)
+        if !good {
+            cfg_warn(mut ed, lang, "invalid row or field type")
+            continue
+        }
+        (mut ed.lsp.cfgs).push(c)
+    }
+}
+
+// The first half of `yew_lsp_client_refresh_config`: a client whose
+// table came from another configuration is dropped, and one exists.
+// Answers whether the table still has to be read.
+fn refresh_begin(mut ed: Ed) -> bool {
+    if ed.lsp.present && ed.lsp.config_loaded && ed.lsp.config_token != cfg_token(ed) {
+        lsp_client_free(mut ed)
+    }
+    if !ed.lsp.present {
+        ed.lsp = lsp_client_new()
+        ed.lsp.present = true
+    }
+    !ed.lsp.config_loaded
+}
+
+/// `yew_lsp_client_refresh_config` (`client.c:970-981`). With no VM in
+/// the `Ed` (none yet, or a batch script holding it) the table is left
+/// unread for a later call that has one.
+pub fn lsp_client_refresh_config(mut ed: Ed) {
+    if !refresh_begin(mut ed) || !ed.flrt.ready || ed.flrt.vms.len == 0 {
+        return
+    }
+    var vm = runtime_take(mut ed)
+    client_cfg_load(mut ed, mut vm)
+    (mut ed.flrt.vms).push(take vm)
+}
+
+/// `yew_lsp_client_refresh_config` while a batch script runs: the VM
+/// is the script's (`t.pump`, `batch_test.c:597-634`).
+pub fn lsp_client_refresh_config_vm(mut ed: Ed, mut vm: fl.FlVm) {
+    if refresh_begin(mut ed) {
+        client_cfg_load(mut ed, mut vm)
+    }
+}
+
+/// `yew_lsp_client_cfg` (`client.c:983-999`): the configured server for
+/// `lang` — the compiled default, unless `init.fl` replaced the table.
+pub fn lsp_client_cfg(mut ed: Ed, lang: str) -> lsp.LspServerCfg ! {none} {
+    lsp_client_refresh_config(mut ed)
+    if !ed.lsp.replaces_defaults {
+        return lsp.lsp_default_cfg(lang)?
+    }
+    let key = lsp.lsp_lang_key(lang)
+    for c in ed.lsp.cfgs {
+        if c.lang == key {
+            return copy c
+        }
+    }
+    none
+}
+
+// ---------------------------------------------------------------------
+// The framed transport's seams (`client.c:807-834`), by name from the
+// job layer's match on `FRAMED_LSP`.
+// ---------------------------------------------------------------------
+
+/// `framed_feed`: bytes on the server's stdout; every message they finish
+/// is dispatched in order (C's `on_rpc_value`, from inside the feed).
+pub fn lsp_framed_feed(mut ed: Ed, sid: int, bytes: List[byte]) -> bool {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return false
+    }
+    let alive = lsp.rpc_feed_stdout(mut ed.lsp.servers[k].rpc, bytes, 0, bytes.len)
+    lsp_drain_inbox(mut ed, sid)
+    alive
+}
+
+// The queued messages out of the reader, then each dispatched.
+fn lsp_drain_inbox(mut ed: Ed, sid: int) {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || ed.lsp.servers[k].rpc.rx.inbox.len == 0 {
+        return
+    }
+    let msgs = copy ed.lsp.servers[k].rpc.rx.inbox
+    (mut ed.lsp.servers[k].rpc.rx.inbox).reset()
+    for m in msgs {
+        lsp_server_dispatch_value(mut ed, sid, m)
+    }
+}
+
+/// `framed_finish`: the server's stdout ended.
+pub fn lsp_framed_finish(mut ed: Ed, sid: int) -> bool {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return false
+    }
+    lsp.rpc_finish_stdout(mut ed.lsp.servers[k].rpc)
+}
+
+/// `framed_destroy` (`client.c:807-815`): the connection ends; its
+/// pending requests are released, none called back.
+pub fn lsp_framed_destroy(mut ed: Ed, sid: int) {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return
+    }
+    let _ = lsp.rpc_conn_free(mut ed.lsp.servers[k].rpc)
+    ed.lsp.servers[k].rpc_live = false
+}
+
+/// `framed_view`: queued bytes for the server's stdin.
+pub fn lsp_framed_tx_len(ed: Ed, sid: int) -> int {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return 0
+    }
+    lsp.rpc_tx_len(ed.lsp.servers[k].rpc)
+}
+
+/// `framed_view` as bytes: at most `max` of the queued stdin bytes, from
+/// the first not yet written.
+pub fn lsp_framed_tx_chunk(ed: Ed, sid: int, max: int) -> List[byte] {
+    var out = List[byte]()
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return out
+    }
+    let at = ed.lsp.servers[k].rpc.tx.sent
+    var end = ed.lsp.servers[k].rpc.tx.pending.len
+    if end - at > max {
+        end = at + max
+    }
+    var i = at
+    while i < end {
+        (mut out).push(ed.lsp.servers[k].rpc.tx.pending[i])
+        i += 1
+    }
+    out
+}
+
+/// `framed_consume`: `n` queued bytes were written.
+pub fn lsp_framed_tx_consume(mut ed: Ed, sid: int, n: int) {
+    let k = lsp_server_index(ed, sid)
+    if k >= 0 && ed.lsp.servers[k].rpc_live {
+        lsp.rpc_tx_consume(mut ed.lsp.servers[k].rpc, n)
+    }
+}
+
+/// `framed_deadline`: the earliest pending request's deadline, or -1.
+pub fn lsp_framed_deadline(ed: Ed, sid: int) -> int {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return -1
+    }
+    lsp.rpc_deadline(ed.lsp.servers[k].rpc)
+}
+
+/// `framed_tick` (`yew_rpc_job_tick`): every expired request called back
+/// with the timeout error.
+pub fn lsp_framed_tick(mut ed: Ed, sid: int, now: int) {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return
+    }
+    let expired = lsp.rpc_sweep(mut ed.lsp.servers[k].rpc, now)
+    if expired.len == 0 {
+        return
+    }
+    let err = lsp.rpc_timeout_error()
+    for p in expired {
+        lsp_pending_done(mut ed, p, err, -1, err.root)
+    }
+}
+
+// The one match on a pending request's kind (C's `RpcPending.cb`).
+fn lsp_pending_done(mut ed: Ed, p: lsp.RpcPending, j: lsp.Json, result: int, error: int) {
+    match p.kind {
+        1 => initialize_done(mut ed, p.ctx, j, result, error), // LSP_PK_INITIALIZE
+        2 => shutdown_done(mut ed, p.ctx), // LSP_PK_SHUTDOWN
+        _ => {},
+    }
+}
+
+// The server's queued stdin bytes written now (C waits for POLLOUT; the
+// job layer writes non-blocking at once and when the loop says the pipe
+// is writable).
+fn lsp_flush_tx(mut ed: Ed, sid: int) {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 {
+        return
+    }
+    let j = job_find(ed, ed.lsp.servers[k].job)
+    if j >= 0 {
+        job_write_framed(mut ed, j)
+    }
+}
+
+// ---------------------------------------------------------------------
+// The handshake and dispatch (`client.c:836-960`).
+// ---------------------------------------------------------------------
+
+// `initialize_done` (`client.c:836-855`).
+fn initialize_done(mut ed: Ed, sid: int, j: lsp.Json, result: int, error: int) {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 {
+        return
+    }
+    var ready = false
+    if error < 0 {
+        let id = ed.lsp.servers[k].cfg.id
+        let v = lsp.lsp_life_initialized(mut ed.lsp.servers[k].life, id, j, result)
+        if v.warn.len != 0 {
+            ed_msg(mut ed, MSG_WARN, v.warn)
+        }
+        if v.log_error.len != 0 {
+            util.log_error(v.log_error)
+            ed_msg(mut ed, MSG_ERROR, v.error)
+        }
+        ready = v.ready
+    }
+    if !ready {
+        ed.lsp.servers[k].life.state = lsp.LSP_DEAD
+        ed.lsp.servers[k].life.gave_up = true
+        let _ = job_signal(mut ed, ed.lsp.servers[k].job, signal.terminate())
+        return
+    }
+    lsp.rpc_notify_text(mut ed.lsp.servers[k].rpc, "initialized", "{{}}")
+    var d = 0
+    while d < ed.lsp.servers[k].docv.len {
+        let bi = ed_buf_index(ed, ed.lsp.servers[k].docv[d].buf_id)
+        if bi >= 0 {
+            let _ = lsp_doc_open_buffer(mut ed, k, d, bi)
+        }
+        d += 1
+    }
+    lsp_flush_tx(mut ed, sid)
+}
+
+/// `yew_lsp_doc_open` for document `d` of server `k` over buffer `bi`; a
+/// document now open is logged at the edit choke point (`text.edit`'s LSP
+/// log, the port's `yew_lsp_note_edit`).
+pub fn lsp_doc_open_buffer(mut ed: Ed, k: int, d: int, bi: int) -> bool {
+    let lang = ed.buf_languages[ed.bufs[bi].id] else ""
+    let binary = ed.bufs[bi].ec.meta.binary
+    let opened = lsp.lsp_doc_open(
+        mut ed.lsp.servers[k].rpc,
+        mut ed.lsp.servers[k].docv[d],
+        ed.bufs[bi].ec.tb,
+        binary,
+        lang,
+    )
+    if opened {
+        ed.bufs[bi].ec.lsp_logging = true
+        ed.bufs[bi].ec.lsp_pos_enc = ed.lsp.servers[k].life.pos_enc
+    }
+    opened
+}
+
+/// `yew_lsp_dispatch_response` (`client.c:857-880`): a response for a
+/// request tied to a buffer generation the buffer has left is dropped
+/// before its callback (`dropped_stale`).
+pub fn lsp_dispatch_response(mut ed: Ed, sid: int, j: lsp.Json, msg: int) -> bool {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 {
+        return false
+    }
+    let (valid, number) = lsp.rpc_id_u64(j, lsp.json_field(j, msg, "id"))
+    if !valid || number < 0 {
+        return false
+    }
+    let pending = lsp.rpc_pending(ed.lsp.servers[k].rpc, number) else lsp.rpc_pending_new()
+    if pending.id != 0 && pending.buf_id != 0 {
+        let bi = ed_buf_index(ed, pending.buf_id)
+        if bi < 0 || ed.bufs[bi].ec.tb.gen != pending.gen {
+            let _ = lsp.rpc_drop(mut ed.lsp.servers[k].rpc, number) else {
+                return false
+            }
+            ed.lsp.servers[k].dropped_stale += 1
+            return false
+        }
+    }
+    let done = lsp.rpc_dispatch(mut ed.lsp.servers[k].rpc, j, msg)
+    if !done.ok {
+        return false
+    }
+    lsp_pending_done(mut ed, done.pending, j, done.result, done.error)
+    true
+}
+
+// `reply_configuration` (`client.c:882-898`): a null per item.
+fn reply_configuration(mut ed: Ed, k: int, j: lsp.Json, id: int, params: int) {
+    let items = lsp.json_field(j, params, "items")
+    var w = lsp.jsonw_new()
+    lsp.jsonw_arr(mut w)
+    var i = 0
+    while lsp.json_kind(j, items) == lsp.JS_ARR && i < lsp.json_size(j, items) {
+        lsp.jsonw_null(mut w)
+        i += 1
+    }
+    lsp.jsonw_arr_end(mut w)
+    lsp.rpc_reply(mut ed.lsp.servers[k].rpc, j, id, w.out)
+}
+
+/// `yew_lsp_server_dispatch_value` (`client.c:900-955`): responses to the
+/// gate, `publishDiagnostics` to the store, the two server requests yew
+/// answers, everything else refused or ignored.
+pub fn lsp_server_dispatch_value(mut ed: Ed, sid: int, j: lsp.Json) {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 {
+        return
+    }
+    let msg = j.root
+    let kind = lsp.rpc_classify(j, msg)
+    if kind == lsp.RPC_MALFORMED {
+        return
+    }
+    if kind == lsp.RPC_RESPONSE || kind == lsp.RPC_ERROR {
+        let _ = lsp_dispatch_response(mut ed, sid, j, msg)
+        lsp_flush_tx(mut ed, sid)
+        return
+    }
+    let method = lsp.json_field(j, msg, "method")
+    let params = lsp.json_field(j, msg, "params")
+    if lsp.json_streq(j, method, "textDocument/publishDiagnostics") {
+        let uri = lsp.json_field(j, params, "uri")
+        let items = lsp.json_field(j, params, "diagnostics")
+        let version = lsp.json_int(j, lsp.json_field(j, params, "version"), -1)
+        if !lsp.json_is_str(j, uri) {
+            return
+        }
+        var d = 0
+        while d < ed.lsp.servers[k].docv.len {
+            let doc_uri = ed.lsp.servers[k].docv[d].uri
+            if lsp.json_str_eq_bytes(j, uri, doc_uri.bytes(), 0, doc_uri.len) {
+                let bi = ed_buf_index(ed, ed.lsp.servers[k].docv[d].buf_id)
+                if bi >= 0 &&
+                    lsp.json_kind(j, items) == lsp.JS_ARR &&
+                    (version < 0 || version >= ed.lsp.servers[k].docv[d].version) {
+                    diag_replace(mut ed, bi, sid, j, items, version)
+                }
+                break
+            }
+            d += 1
+        }
+        return
+    }
+    if kind == lsp.RPC_SRV_REQUEST {
+        let id = lsp.json_field(j, msg, "id")
+        if lsp.json_streq(j, method, "workspace/configuration") {
+            reply_configuration(mut ed, k, j, id, params)
+        } else if lsp.json_streq(j, method, "window/workDoneProgress/create") {
+            lsp.rpc_reply(mut ed.lsp.servers[k].rpc, j, id, "null".bytes())
+        } else {
+            lsp.rpc_reply_error(
+                mut ed.lsp.servers[k].rpc,
+                j,
+                id,
+                -32601,
+                "method not supported by yew",
+            )
+        }
+        lsp_flush_tx(mut ed, sid)
+        return
+    }
+    if lsp.json_streq(j, method, "$/progress") || lsp.json_streq(j, method, "window/logMessage") {
+        return
+    }
+    if lsp.json_streq(j, method, "window/showMessage") {
+        let text_node = lsp.json_field(j, params, "message")
+        if lsp.json_is_str(j, text_node) {
+            ed_msg_bytes(mut ed, MSG_INFO, lsp.json_str(j, text_node))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Start, attach, stop, close, restart (`client.c:1001-1268`).
+// ---------------------------------------------------------------------
+
+fn find_server(ed: Ed, id: str, root: str) -> int {
+    var k = 0
+    while k < ed.lsp.servers.len {
+        if ed.lsp.servers[k].cfg.id == id && ed.lsp.servers[k].root == root {
+            return k
+        }
+        k += 1
+    }
+    -1
+}
+
+// `spawn_server` (`client.c:1013-1065`).
+fn spawn_server(mut ed: Ed, k: int) -> bool {
+    var argv = List[str]()
+    (mut argv).push(ed.lsp.servers[k].cfg.cmd)
+    for a in ed.lsp.servers[k].cfg.args {
+        if argv.len + 1 >= 16 {
+            return false
+        }
+        (mut argv).push(a)
+    }
+    ed.lsp.servers[k].rpc = lsp.rpc_conn_new()
+    ed.lsp.servers[k].rpc_live = true
+    let sid = ed.lsp.servers[k].id
+    var spec = job_spec_new()
+    spec.argv = argv
+    spec.cwd = ed.lsp.servers[k].root
+    spec.has_cwd = true
+    spec.sink = SINK_FRAMED
+    spec.display = ed.lsp.servers[k].cfg.id
+    spec.has_display = true
+    spec.framed = FRAMED_LSP
+    spec.framed_owner = sid
+    let (job, err) = job_spawn(mut ed, mut spec)
+    ed.lsp.servers[k].job = job
+    if job == 0 {
+        lsp_framed_destroy(mut ed, sid)
+        ed.lsp.servers[k].life.state = lsp.LSP_DEAD
+        // A missing optional tool is disabled for this session; retry
+        // only after an explicit :lsp.restart.
+        ed.lsp.servers[k].life.gave_up = true
+        ed_msg(mut ed, MSG_ERROR, err)
+        return false
+    }
+    let params = lsp.lsp_initialize_params(ed.lsp.servers[k].cfg, ed.lsp.servers[k].root, os_pid())
+    var p = lsp.rpc_pending_new()
+    p.kind = LSP_PK_INITIALIZE
+    p.ctx = sid
+    p.sent_ms = ed.now_ms
+    p.deadline_ms = ed.now_ms + ed.lsp.servers[k].cfg.init_timeout_ms
+    let _ = lsp.rpc_call(mut ed.lsp.servers[k].rpc, "initialize", params, p)
+    ed.lsp.servers[k].life.state = lsp.LSP_INITIALIZING
+    lsp_flush_tx(mut ed, sid)
+    true
+}
+
+// The path a document's URI names (`b->meta.realpath`, else `b->path`).
+fn buffer_uri_path(ed: Ed, bi: int) -> str {
+    if ed.bufs[bi].ec.has_meta && ed.bufs[bi].ec.meta.has_realpath {
+        return ed.bufs[bi].ec.meta.realpath
+    }
+    ed.bufs[bi].path
+}
+
+// `attach_doc` (`client.c:1067-1086`): the server's document for buffer
+// `bi`, made if absent.
+fn attach_doc(mut ed: Ed, k: int, bi: int) -> int {
+    let id = ed.bufs[bi].id
+    var d = 0
+    while d < ed.lsp.servers[k].docv.len {
+        if ed.lsp.servers[k].docv[d].buf_id == id {
+            return d
+        }
+        d += 1
+    }
+    var doc = lsp.lsp_doc_new(id, lsp.lsp_uri_text(buffer_uri_path(ed, bi)))
+    doc.server = ed.lsp.servers[k].id
+    (mut ed.lsp.servers[k].docv).push(doc)
+    ed.lsp.servers[k].docv.len - 1
+}
+
+fn buffer_binary(ed: Ed, bi: int) -> bool {
+    ed.bufs[bi].ec.meta.binary
+}
+
+/// `yew_lsp_client_start_cfg` (`client.c:1088-1125`).
+pub fn lsp_client_start_cfg(mut ed: Ed, bi: int, c: lsp.LspServerCfg) -> bool {
+    if bi < 0 ||
+        buffer_binary(ed, bi) ||
+        !ed.bufs[bi].has_path ||
+        c.id.len == 0 ||
+        c.lang.len == 0 ||
+        c.cmd.len == 0 {
+        return false
+    }
+    if !ed.lsp.present {
+        ed.lsp = lsp_client_new()
+        ed.lsp.present = true
+    }
+    let root = lsp.lsp_resolve_root(c, ed.bufs[bi].path, ws_root(ed)) else {
+        return false
+    }
+    let found = find_server(ed, c.id, root)
+    if found >= 0 {
+        let d = attach_doc(mut ed, found, bi)
+        if ed.lsp.servers[found].life.state == lsp.LSP_READY &&
+            !ed.lsp.servers[found].docv[d].open {
+            let _ = lsp_doc_open_buffer(mut ed, found, d, bi)
+            lsp_flush_tx(mut ed, ed.lsp.servers[found].id)
+        }
+        return !ed.lsp.servers[found].life.gave_up
+    }
+    if ed.lsp.servers.len >= lsp.LSP_MAX_SERVERS {
+        ed_msg(mut ed, MSG_ERROR, "LSP server limit reached")
+        return false
+    }
+    let sid = ed.lsp.next_id
+    ed.lsp.next_id += 1
+    (mut ed.lsp.servers).push(LspServer {
+        id: sid,
+        cfg: copy c,
+        root: root,
+        job: 0,
+        rpc: lsp.rpc_conn_new(),
+        rpc_live: false,
+        life: lsp.lsp_life_new(),
+        docv: List[lsp.LspDoc](),
+        exit_sent: false,
+        missing_warned: 0,
+        dropped_stale: 0,
+        shadow_request: 0,
+        shadow_buf_id: 0,
+        shadow_seq: 0,
+    })
+    let k = ed.lsp.servers.len - 1
+    let _ = attach_doc(mut ed, k, bi)
+    spawn_server(mut ed, k)
+}
+
+/// `yew_lsp_client_start` (`client.c:1127-1135`).
+pub fn lsp_client_start(mut ed: Ed, bi: int) -> bool {
+    if bi < 0 || buffer_binary(ed, bi) {
+        return false
+    }
+    let lang = ed.buf_languages[ed.bufs[bi].id] else {
+        return false
+    }
+    let c = lsp_client_cfg(mut ed, lang) else {
+        return false
+    }
+    lsp_client_start_cfg(mut ed, bi, c)
+}
+
+// `shutdown_done` (`client.c:1137-1149`).
+fn shutdown_done(mut ed: Ed, sid: int) {
+    let k = lsp_server_index(ed, sid)
+    if k < 0 {
+        return
+    }
+    lsp.rpc_notify_text(mut ed.lsp.servers[k].rpc, "exit", "null")
+    ed.lsp.servers[k].exit_sent = true
+    ed.lsp.servers[k].life.next_try_ms = 0
+    lsp_flush_tx(mut ed, sid)
+}
+
+/// `yew_lsp_client_stop` (`client.c:1151-1168`).
+pub fn lsp_client_stop(mut ed: Ed, k: int, graceful: bool) {
+    if k < 0 || ed.lsp.servers[k].life.state == lsp.LSP_DEAD {
+        return
+    }
+    ed.lsp.servers[k].life.state = lsp.LSP_SHUTTING_DOWN
+    lsp_logging_off(mut ed, k)
+    if graceful && ed.lsp.servers[k].rpc_live {
+        var p = lsp.rpc_pending_new()
+        p.kind = LSP_PK_SHUTDOWN
+        p.ctx = ed.lsp.servers[k].id
+        p.sent_ms = ed.now_ms
+        let _ = lsp.rpc_call(mut ed.lsp.servers[k].rpc, "shutdown", List[byte](), p)
+        lsp_flush_tx(mut ed, ed.lsp.servers[k].id)
+    } else {
+        let _ = job_signal(mut ed, ed.lsp.servers[k].job, signal.terminate())
+    }
+}
+
+// A server's documents stop logging at the edit choke point: it is no
+// longer READY, so C's `edit_sync` would answer false (`sync.c:398-412`).
+fn lsp_logging_off(mut ed: Ed, k: int) {
+    var d = 0
+    while d < ed.lsp.servers[k].docv.len {
+        let bi = ed_buf_index(ed, ed.lsp.servers[k].docv[d].buf_id)
+        d += 1
+        if bi >= 0 {
+            ed.bufs[bi].ec.lsp_logging = false
+            (mut ed.bufs[bi].ec.lsp_log).reset()
+            (mut ed.bufs[bi].ec.lsp_text).reset()
+        }
+    }
+}
+
+/// `yew_lsp_client_close_buffer` (`client.c:1170-1210`).
+pub fn lsp_client_close_buffer(mut ed: Ed, bi: int) {
+    if bi < 0 {
+        return
+    }
+    diag_store_free(mut ed, bi)
+    if !ed.lsp.present {
+        return
+    }
+    let id = ed.bufs[bi].id
+    var k = 0
+    while k < ed.lsp.servers.len {
+        var d = 0
+        while d < ed.lsp.servers[k].docv.len {
+            if ed.lsp.servers[k].docv[d].buf_id == id {
+                if ed.lsp.servers[k].life.state == lsp.LSP_READY {
+                    lsp_sync_drain(mut ed, bi)
+                    lsp.lsp_doc_close(mut ed.lsp.servers[k].rpc, mut ed.lsp.servers[k].docv[d])
+                    lsp_flush_tx(mut ed, ed.lsp.servers[k].id)
+                }
+                ed.bufs[bi].ec.lsp_logging = false
+                var rest = List[lsp.LspDoc]()
+                var e = 0
+                while e < ed.lsp.servers[k].docv.len {
+                    if e != d {
+                        (mut rest).push(copy ed.lsp.servers[k].docv[e])
+                    }
+                    e += 1
+                }
+                ed.lsp.servers[k].docv = rest
+                return
+            }
+            d += 1
+        }
+        k += 1
+    }
+}
+
+// `reset_server_session` (`client.c:1212-1242`).
+fn reset_server_session(mut ed: Ed, k: int) {
+    ed.lsp.servers[k].life.caps = lsp.lsp_caps_new()
+    ed.lsp.servers[k].life.pos_enc = lsp.POSENC_UTF16
+    ed.lsp.servers[k].exit_sent = false
+    ed.lsp.servers[k].missing_warned = 0
+    ed.lsp.servers[k].shadow_request = 0
+    ed.lsp.servers[k].shadow_buf_id = 0
+    ed.lsp.servers[k].shadow_seq = 0
+    lsp_logging_off(mut ed, k)
+    var d = 0
+    while d < ed.lsp.servers[k].docv.len {
+        ed.lsp.servers[k].docv[d].version = 0
+        ed.lsp.servers[k].docv[d].sent_gen = 0
+        ed.lsp.servers[k].docv[d].open = false
+        ed.lsp.servers[k].docv[d].full_sync = false
+        ed.lsp.servers[k].docv[d].insert_waiting = false
+        (mut ed.lsp.servers[k].docv[d].pending).reset()
+        let bi = ed_buf_index(ed, ed.lsp.servers[k].docv[d].buf_id)
+        if bi >= 0 {
+            diag_store_free(mut ed, bi)
+        }
+        d += 1
+    }
+}
+
+/// `yew_lsp_client_restart` (`client.c:1244-1266`).
+pub fn lsp_client_restart(mut ed: Ed, bi: int) -> bool {
+    if bi < 0 {
+        return false
+    }
+    let (k, _) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 {
+        return lsp_client_start(mut ed, bi)
+    }
+    var d = 0
+    while d < ed.lsp.servers[k].docv.len {
+        if ed.lsp.servers[k].life.state == lsp.LSP_READY {
+            lsp.lsp_doc_close(mut ed.lsp.servers[k].rpc, mut ed.lsp.servers[k].docv[d])
+        }
+        d += 1
+    }
+    lsp_flush_tx(mut ed, ed.lsp.servers[k].id)
+    reset_server_session(mut ed, k)
+    lsp.lsp_life_restart_reset(mut ed.lsp.servers[k].life)
+    let _ = job_signal(mut ed, ed.lsp.servers[k].job, signal.terminate())
+    ed.lsp.servers[k].life.state = lsp.LSP_DEAD
+    ed.lsp.servers[k].life.next_try_ms = ed.now_ms
+    true
+}
+
+/// `yew_lsp_doc_find` (`client.c:1424-1442`): the server index and the
+/// document index of buffer `bi`, or (-1, -1).
+pub fn lsp_doc_of_buffer(ed: Ed, bi: int) -> (int, int) {
+    if bi < 0 || !ed.lsp.present {
+        return (-1, -1)
+    }
+    let id = ed.bufs[bi].id
+    var k = 0
+    while k < ed.lsp.servers.len {
+        var d = 0
+        while d < ed.lsp.servers[k].docv.len {
+            if ed.lsp.servers[k].docv[d].buf_id == id {
+                return (k, d)
+            }
+            d += 1
+        }
+        k += 1
+    }
+    (-1, -1)
+}
+
+// The last line of the server's stderr, trailing CR and LF dropped
+// (`client.c:1322-1335`).
+fn stderr_tail(ed: Ed, j: int) -> str {
+    if j < 0 {
+        return ""
+    }
+    var end = ed.jobs.v[j].framed_err.len
+    while end != 0 &&
+        (
+            ed.jobs.v[j].framed_err[end - 1] as int == 10 ||
+                ed.jobs.v[j].framed_err[end - 1] as int == 13
+        ) {
+        end -= 1
+    }
+    var start = end
+    while start != 0 && ed.jobs.v[j].framed_err[start - 1] as int != 10 {
+        start -= 1
+    }
+    var b = List[byte]()
+    var i = start
+    while i < end {
+        (mut b).push(ed.jobs.v[j].framed_err[i])
+        i += 1
+    }
+    str_from_utf8(b) else ""
+}
+
+/// `yew_lsp_client_pump` (`client.c:1268-1360`): the stderr tail capped,
+/// an exec failure named, a ready server's documents flushed, a shutting-
+/// down server's stdin closed and then signalled, a dead server's crash
+/// counted and its restart scheduled.
+pub fn lsp_client_pump(mut ed: Ed) {
+    if !ed.lsp.present {
+        return
+    }
+    var k = 0
+    while k < ed.lsp.servers.len {
+        let sid = ed.lsp.servers[k].id
+        let j = job_find(ed, ed.lsp.servers[k].job)
+        if j >= 0 && ed.jobs.v[j].framed_err.len > lsp.LSP_STDERR_TAIL {
+            let n = ed.jobs.v[j].framed_err.len
+            var keep = List[byte]()
+            var i = n - lsp.LSP_STDERR_TAIL
+            while i < n {
+                (mut keep).push(ed.jobs.v[j].framed_err[i])
+                i += 1
+            }
+            ed.jobs.v[j].framed_err = keep
+        }
+        if j >= 0 && ed.jobs.v[j].state == JOB_EXECFAIL {
+            ed.lsp.servers[k].life.state = lsp.LSP_DEAD
+            ed.lsp.servers[k].life.gave_up = true
+            let c = copy ed.lsp.servers[k].cfg
+            let why = os_error_text(ed.jobs.v[j].exec_errno)
+            ed_msg(
+                mut ed,
+                MSG_ERROR,
+                "{c.id}: {why} \u{2014} install {c.cmd} or set lsp.servers.{c.lang}.cmd",
+            )
+            k += 1
+            continue
+        }
+        if j >= 0 && ed.jobs.v[j].state == JOB_RUNNING {
+            if ed.lsp.servers[k].life.state == lsp.LSP_READY {
+                var d = 0
+                while d < ed.lsp.servers[k].docv.len {
+                    let bi = ed_buf_index(ed, ed.lsp.servers[k].docv[d].buf_id)
+                    if bi >= 0 {
+                        lsp_sync_drain(mut ed, bi)
+                        let _ = lsp.lsp_doc_flush(
+                            mut ed.lsp.servers[k].rpc,
+                            mut ed.lsp.servers[k].docv[d],
+                            ed.lsp.servers[k].life.caps.sync_kind,
+                            ed.bufs[bi].ec.tb,
+                        )
+                    }
+                    d += 1
+                }
+                lsp_flush_tx(mut ed, sid)
+            } else if ed.lsp.servers[k].life.state == lsp.LSP_SHUTTING_DOWN &&
+                ed.lsp.servers[k].exit_sent {
+                if ed.lsp.servers[k].life.next_try_ms == 0 &&
+                    lsp.rpc_tx_len(ed.lsp.servers[k].rpc) == 0 {
+                    ed.jobs.v[j].in_fd = jb_close_fd(ed.jobs.v[j].in_fd)
+                    ed.lsp.servers[k].life.next_try_ms = ed.now_ms + JOB_TERM_GRACE_MS
+                } else if ed.lsp.servers[k].life.next_try_ms != 0 &&
+                    ed.now_ms >= ed.lsp.servers[k].life.next_try_ms {
+                    let _ = job_signal(mut ed, ed.lsp.servers[k].job, signal.terminate())
+                    ed.lsp.servers[k].life.next_try_ms = 0
+                    ed.lsp.servers[k].exit_sent = false
+                }
+            }
+            k += 1
+            continue
+        }
+        let st = ed.lsp.servers[k].life.state
+        if st != lsp.LSP_DEAD && st != lsp.LSP_SHUTTING_DOWN {
+            reset_server_session(mut ed, k)
+            let tail = stderr_tail(ed, j)
+            let id = ed.lsp.servers[k].cfg.id
+            let (again, msg) = lsp.lsp_life_crashed(mut ed.lsp.servers[k].life, id, ed.now_ms, tail)
+            if !again || msg.len != 0 {
+                let sev = if ed.lsp.servers[k].life.gave_up {
+                    MSG_ERROR
+                } else if ed.lsp.servers[k].life.restarts == 2 {
+                    MSG_INFO
+                } else {
+                    MSG_WARN
+                }
+                ed_msg(mut ed, sev, msg)
+            }
+        }
+        if !ed.lsp.servers[k].life.gave_up &&
+            ed.lsp.servers[k].life.state == lsp.LSP_DEAD &&
+            ed.now_ms >= ed.lsp.servers[k].life.next_try_ms {
+            let jj = job_find(ed, ed.lsp.servers[k].job)
+            if jj >= 0 && !job_pending(ed.jobs.v[jj]) {
+                job_release(mut ed, jj)
+            }
+            let _ = spawn_server(mut ed, k)
+        }
+        k += 1
+    }
+}
+
+/// `yew_lsp_client_free` (`client.c:1362-1422`): every server asked to shut
+/// down gracefully, waited on for at most 500 ms through the jobs' own
+/// pump, then killed; the client gone.
+pub fn lsp_client_free(mut ed: Ed) {
+    if !ed.lsp.present {
+        return
+    }
+    var k = 0
+    while k < ed.lsp.servers.len {
+        lsp_client_stop(mut ed, k, true)
+        k += 1
+    }
+    let deadline = now_ms() + 500
+    loop {
+        var pending = false
+        k = 0
+        while k < ed.lsp.servers.len {
+            let j = job_find(ed, ed.lsp.servers[k].job)
+            if j >= 0 && job_pending(ed.jobs.v[j]) {
+                pending = true
+                break
+            }
+            k += 1
+        }
+        var now = now_ms()
+        if !pending || now >= deadline {
+            break
+        }
+        job_fds_refresh(mut ed)
+        var timeout = deadline - now
+        if timeout > 10 {
+            timeout = 10
+        }
+        if ed.jobs.fds.len != 0 {
+            let _ = os_signal_wait_fds(ed.jobs.fds, signal.child(), timeout) else |_| { (-1, 0) }
+        } else {
+            time_sleep_ms(timeout)
+        }
+        now = now_ms()
+        ed.now_ms = now
+        job_pump(mut ed)
+        job_reap(mut ed)
+        job_tick(mut ed, now)
+        let _ = job_settle(mut ed)
+        lsp_client_pump(mut ed)
+    }
+    k = 0
+    while k < ed.lsp.servers.len {
+        let j = job_find(ed, ed.lsp.servers[k].job)
+        if j >= 0 && job_pending(ed.jobs.v[j]) {
+            let _ = job_signal(mut ed, ed.jobs.v[j].id, signal.kill())
+        }
+        k += 1
+    }
+    k = 0
+    while k < ed.lsp.servers.len {
+        if ed.lsp.servers[k].life.state != lsp.LSP_DEAD {
+            let _ = job_signal(mut ed, ed.lsp.servers[k].job, signal.terminate())
+        }
+        let j = job_find(ed, ed.lsp.servers[k].job)
+        if j >= 0 &&
+            ed.jobs.v[j].framed == FRAMED_LSP &&
+            ed.jobs.v[j].framed_owner == ed.lsp.servers[k].id {
+            lsp_framed_destroy(mut ed, ed.lsp.servers[k].id)
+            ed.jobs.v[j].framed_owner = 0
+            ed.jobs.v[j].framed = FRAMED_NONE
+            ed.jobs.v[j].framed_destroyed = true
+        }
+        lsp_logging_off(mut ed, k)
+        k += 1
+    }
+    ed.lsp = lsp_client_new()
+}
