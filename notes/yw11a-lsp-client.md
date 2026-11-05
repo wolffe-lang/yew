@@ -201,8 +201,12 @@ Commits, in order:
 
 - **JSON and JSON-RPC** (`lsp_json_test`, 13 cases, 407 assertions;
   `lsp_jsonrpc_test`, 14 cases, 245,125 assertions): red at their
-  commits, green natively and one case at a time on the checked
-  machine. The writer's corpus (`tests/fixtures/lsp/writer-corpus.json`)
+  commits, green natively; on the checked machine one case at a time
+  (`tools/check-test-cases`), where eight of the 38 cases across the four
+  over-budget files are still past a budget alone and carry `allow`
+  rows: JSON's depth case (call depth), its size and node limits, its
+  writer-bug children (self-exec), the frame split at every byte, the
+  16,385-entry store, the thousand edits and the two config loads. The writer's corpus (`tests/fixtures/lsp/writer-corpus.json`)
   is C's, byte for byte.
 - **URIs, capabilities, the lifecycle and sync** (`lsp_client_test`, 12
   cases; `lsp_sync_test`, 4 cases and one port case): green on the
