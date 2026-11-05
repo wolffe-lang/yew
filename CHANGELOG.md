@@ -13,8 +13,8 @@ The format follows Keep a Changelog; the port has no release yet.
   reds are fixed in the tests: the comphelp fixture names itself by
   `argv[0]` as C's does (`os_exe()` keeps `/tmp`'s symlink on macOS), and
   runtime_skew expects the workspace refusal's canonical path (a TMPDIR
-  under `/var/folders`). The macOS unit lanes move to `macos-unit`, four
-  shards beside the port job, which keeps its fuzzers.
+  under `/var/folders`). The macOS unit lanes move to `macos-unit`, eight
+  shards at 180 minutes each beside the port job, which keeps its fuzzers.
 - The fake clipboard tool (yew#42): `tools/build-fakeclip` builds C's
   `fakeclip` alone; every unit job builds it and `tools/check-test
   --fakeclip-ran` proves no clipboard row skipped for want of it.

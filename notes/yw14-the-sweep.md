@@ -82,6 +82,9 @@ Commits, in order:
   - `4cfb068` the workflow: the macOS unit lanes as four `macos-unit` shards, where the port's macOS leg
     runs. From 11-02's per-file times, each shard's checked lane is 34–42 minutes. The proofs are green
     here.
+  - Four shards were too few. Dispatch 41916949246 cut shards 1–3 at their 120-minute cap with 0 FAILED
+    lines (shard 4 passed in 116), so `6806eed` (the proof wants eight shards at 180, red) and `ba1df0a`
+    (the workflow, green) follow. The sizing is R-yw14-6.
   - `4ff4928` the planner's docstring.
 - **#42**
   - `c298a9e` `tools/build-fakeclip`.
@@ -146,7 +149,7 @@ backtrack enters, and `gitignore_scales_linearly` goes red by name.
 | #18 | already fixed, `a7be446`; row `b85e085` |
 | #33 | the oracle's behaviour; row `c75f974` (R-yw14-1) |
 | #78 | still open: not reproduced since 10-25; the trap never printed its message; three checked runs in the gauntlet |
-| #79 | an oracle question (the feeder is the oracle's driver, which the clean room leaves unread). A second torture-live red exists: trunk push 40448806681 (10-27), the replica's determinism lane, run 0's fault-shim log with an extra leading `close`. Same step, same shape (an fs operation on either side of the arm). |
+| #79 | an oracle question (the feeder is the oracle's driver, which the clean room leaves unread). A second torture-live red exists: trunk push 40448806681 (10-27), the replica's determinism lane, run 0's fault-shim log with an extra leading `close`. Same step, same shape (an fs operation on either side of the arm). At the head, torture-live passed 10 of 10 runs in yew CI's image ("storage ENOSPC preserves old+journal ok" every time). A per-thread signal-mask witness was tried and is invalid: it was handed the editor by a relative path after its child had changed directory, so the exec never happened and it read the Python parent's masks. It is not needed for the merge. |
 | #43 | a watch; the macOS oracle's pty goldens were green on 11-03's nightly |
 | #109 | not started: it renames `ed.<field>` across files PR#102 also changes (R-yw14-3) |
 | #17, #27 | blocked on wolf-lang#916 and #917 |
@@ -158,14 +161,36 @@ backtrack enters, and `gitignore_scales_linearly` goes red by name.
 - **R-yw14-1 (#33).** C yew keeps no final newline after `G` `o` on the empty last line, and the port is
   C's. Options: (A) close as the oracle's behaviour; (B) file a sagitta change if vim's model is
   wanted. Recommended and implemented: A. The row holds the port to C.
-- **R-yw14-2 (the macOS unit lanes).** Options: (A) four `macos-unit` shards on the nightly; (B) raise the
-  port job's cap. B cannot fit: about 300 minutes of unit lanes plus the fuzzers is past GitHub's 360.
+- **R-yw14-2 (the macOS unit lanes).** Options: (A) `macos-unit` shards on the nightly (how many is
+  R-yw14-6); (B) raise the port job's cap. B cannot fit: about 300 minutes of unit lanes plus the fuzzers is past GitHub's 360.
   Recommended and implemented: A. PRs and trunk pushes still run no macOS unit leg (tl30), so only a
   nightly or a dispatch proves it.
 - **R-yw14-3 (#109).** Options: (A) after PR#102 merges, one mechanical lane; (B) now, conflicting with
   #102 in every editor file it touches. Recommended: A. Not done here.
 - **R-yw14-4 (#23).** Options: (A) file one wolf-lang gap issue for the record lock and the write-only
   open; (B) leave G32's text as the only record. Recommended: A. Filing is not this lane's.
+- **R-yw14-5 (the fuzz budget).** `fuzz (macOS arm64, against-c-2)` was red on the per-answer 250 ms
+  wall-clock budget five times since 10-25, all on linear shapes and short paths. The latest was the
+  port's driver in nightly 41877566157: `pattern '[]' took 410 ms against a 166-byte path`. A campaign is
+  deterministic for its seed, so a real complexity case trips at the same input on every run, and a
+  stall does not; `--scale` is now the complexity gate. Options: (A) `tools/run-fuzz-gitignore` re-runs
+  a driver once, loudly, when its only failure is a budget trip; (B) leave the fuzz row as it is.
+  Implemented here: B, since the fuzz row is kept. A is recommended as a one-file follow-on.
+- **R-yw14-6 (how many `macos-unit` shards).** Sized from dispatch 41916949246's per-file times. Every
+  file's checked lane was measured; on the native lane, 167 files were measured and 36 that the cut
+  shards never reached were estimated from their checked time and their group's ratio. The model gives
+  shard 4 118 minutes against its measured 116. A job's cap should be at least twice its measured time.
+
+  | partition | the shards (minutes, setup included) | longest | 180 ÷ longest |
+  |---|---|---|---|
+  | six, round-robin | 118, 88, 83, 86, 91, 77 | 118 | 1.5× |
+  | six, balanced on the measured weights | 91 each | 91 | 1.98× |
+  | eight, round-robin | 66, 56, 71, 55, 78, 78, 78, 65 | 78 | 2.3× |
+
+  Six round-robin shards would break the twice rule at 1.5×, because the heavy `edit_*` files fall
+  unevenly. Options: (A) six shards balanced on a weights table; (B) eight round-robin shards at 180, the
+  partition the Linux `unit` job uses; (C) six round-robin shards at 240. Decided: B. It is about 2.1×
+  if the editor's builds grow 10% more.
 
 ## Done-when
 
