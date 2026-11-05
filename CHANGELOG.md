@@ -26,6 +26,14 @@ The format follows Keep a Changelog; the port has no release yet.
 - `fl/gc.lu` pushes `copy fl_empty_slot()` (yew#98): the G50 witness
   exits 139 natively without it at the pin, and wolf-lang#998 refuses the
   old form (E1010).
+- A job's group SIGKILL is sent again until the job drains (port-only).
+  On macOS a kill that lands while the job's shell is forking can miss
+  the child being forked, and that child held the job's pipes until it
+  exited: the torture case's red on one macOS unit shard. After a
+  SIGKILL to the group, from `job_signal` or the timeout's escalation,
+  the port sends it again every 50 ms while the job is pending, at most
+  20 times, and the loop's deadline wakes for it.
+  `t_port_job_group_kill_reaches_children_forked_during_it` is the row.
 - Rows for the answered issues: `edit_paste_bytes_test` (yew#18, fixed at
   `a7be446`), witness B's inner refusal (yew#93), `final-newline-pty.py`
   (yew#33: C yew saves the same bytes), `runtime-pty.py` clears its root
