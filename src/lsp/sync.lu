@@ -1,0 +1,344 @@
+//! lsp.sync — document synchronization (Sprint 45): the document, the
+//! position conversions, the queued incremental changes and the bodies of
+//! didOpen, didChange, didSave and didClose.
+//!
+//! Ports sagitta `src/mod/lsp/sync.c:1-410` (the document, `append_text`,
+//! the didOpen/didChange/didSave/didClose writers, the one position
+//! boundary, `yew_lsp_doc_note_edit` and its post hook, the generations)
+//! and `sync.h` at 9ace98c2. C's writers send through the connection;
+//! the port's answer the parameters and the caller sends them, so the
+//! document is a value with no connection in it. The editor's hooks
+//! (`yew_lsp_note_edit`, the flush, save and close over the workspace)
+//! are `edit.lsp_sync`'s.
+
+use text
+use util
+
+/// `YEW_LSP_PENDING_MAX` (`sync.h:16-20`): queued changes before a full
+/// resync.
+pub const LSP_PENDING_MAX: int = 512
+
+/// One incremental change (`LspChange`, `sync.h:22-26`): the range in the
+/// pre-edit document, and the inserted text.
+pub struct LspChange {
+    sl: int,
+    sc: int,
+    el: int,
+    ec: int,
+    text: List[byte],
+}
+
+/// A document a server has open (`LspDoc`, `sync.h:30-41`); `server` is
+/// the owning server's id.
+pub struct LspDoc {
+    server: int,
+    buf_id: int,
+    uri: str,
+    version: int,
+    sent_gen: int,
+    open: bool,
+    full_sync: bool,
+    insert_waiting: bool,
+    pending: List[LspChange],
+}
+
+/// `yew_lsp_doc_init` (`sync.c:24-36`).
+pub fn lsp_doc_new(buf_id: int, uri: str) -> LspDoc {
+    LspDoc {
+        server: 0,
+        buf_id: buf_id,
+        uri: uri,
+        version: 0,
+        sent_gen: 0,
+        open: false,
+        full_sync: false,
+        insert_waiting: false,
+        pending: List[LspChange](),
+    }
+}
+
+// `doc_clear_changes` (`sync.c:16-22`).
+fn clear_changes(mut doc: LspDoc) {
+    (mut doc.pending).reset()
+    doc.full_sync = false
+    doc.insert_waiting = false
+}
+
+// `jsonw_textbuf` (`sync.c:76-90`): the whole document as one string.
+fn w_text(mut w: JsonW, tb: text.TextBuf) {
+    jsonw_str(mut w, text.textbuf_bytes(tb))
+}
+
+/// `yew_lsp_doc_open`'s parameters (`sync.c:99-128`).
+pub fn lsp_doc_open_params(doc: LspDoc, tb: text.TextBuf, language_id: str) -> List[byte] {
+    var w = jsonw_new()
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "textDocument")
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "uri")
+    jsonw_cstr(mut w, doc.uri)
+    jsonw_key(mut w, "languageId")
+    jsonw_cstr(mut w, language_id)
+    jsonw_key(mut w, "version")
+    jsonw_int(mut w, 1)
+    jsonw_key(mut w, "text")
+    w_text(mut w, tb)
+    jsonw_obj_end(mut w)
+    jsonw_obj_end(mut w)
+    w.out
+}
+
+/// What `yew_lsp_doc_open` records after the notification (`sync.c:123-
+/// 127`).
+pub fn lsp_doc_opened(mut doc: LspDoc, gen: int) {
+    clear_changes(mut doc)
+    doc.version = 1
+    doc.sent_gen = gen
+    doc.open = true
+}
+
+/// `yew_lsp_doc_open` (`sync.c:93-129`) through the connection: false for
+/// a binary buffer or a document already open.
+pub fn lsp_doc_open(
+    mut rpc: RpcConn,
+    mut doc: LspDoc,
+    tb: text.TextBuf,
+    binary: bool,
+    language_id: str,
+) -> bool {
+    if binary || doc.open {
+        return false
+    }
+    rpc_notify(mut rpc, "textDocument/didOpen", lsp_doc_open_params(doc, tb, language_id))
+    lsp_doc_opened(mut doc, tb.gen)
+    true
+}
+
+// `lsp_content_span` (`sync.c:131-152`): the line without its LF, and
+// without a CR before that LF.
+fn content_span(tb: text.TextBuf, line: int) -> text.Span {
+    let span = text.textbuf_line_span(tb, line as text.LineNo)
+    var hi = span.hi
+    if hi > span.lo && text.textbuf_byte_at(tb, hi - 1) == 10 {
+        hi -= 1
+        if hi > span.lo && text.textbuf_byte_at(tb, hi - 1) == 13 {
+            hi -= 1
+        }
+    }
+    text.Span { lo: span.lo, hi: hi }
+}
+
+/// `yew_lsp_pos_of_off` (`sync.c:154-163`, `176-183`): the protocol
+/// position of `off`, its character in UTF-8 bytes or UTF-16 units.
+pub fn lsp_pos_of_off(pos_enc: int, tb: text.TextBuf, off: int) -> (int, int) {
+    if off < 0 || off > text.textbuf_len(tb) {
+        util.bug("lsp.sync", "lsp position: invalid offset conversion")
+    }
+    let l = text.textbuf_line_of(tb, off as text.ByteOff) as int
+    let span = text.textbuf_line_span(tb, l as text.LineNo)
+    if pos_enc == POSENC_UTF8 {
+        return (l, off - span.lo)
+    }
+    (l, text.off_to_u16col(tb, span, off as text.ByteOff) as int)
+}
+
+/// `yew_lsp_off_of_pos` (`sync.c:165-174`, `185-191`): the offset of a
+/// protocol position, the line clamped to the last, the character to the
+/// line's content.
+pub fn lsp_off_of_pos(pos_enc: int, tb: text.TextBuf, line_in: int, character: int) -> int {
+    let count = text.textbuf_line_count(tb)
+    if count == 0 {
+        util.bug("lsp.sync", "lsp position: invalid protocol conversion")
+    }
+    let line = if line_in >= count then count - 1 else line_in
+    let span = content_span(tb, line)
+    if pos_enc == POSENC_UTF8 {
+        return if character > span.hi - span.lo then span.hi else span.lo + character
+    }
+    text.u16col_to_off(tb, span, character as text.U16Col) as int
+}
+
+// `force_full` (`sync.c:193-197`).
+fn force_full(mut doc: LspDoc) {
+    clear_changes(mut doc)
+    doc.full_sync = true
+}
+
+/// `yew_lsp_doc_note_edit` (`sync.c:199-234`): before the edit, its range
+/// in the pre-edit text queued; a full-sync server, an overflowing queue
+/// or a huge edit falls back to sending the whole document.
+pub fn lsp_doc_note_edit(
+    mut doc: LspDoc,
+    pos_enc: int,
+    sync_kind: int,
+    tb: text.TextBuf,
+    kind: int,
+    at: int,
+    len: int,
+) {
+    if kind != text.JOURNAL_INS && kind != text.JOURNAL_DEL {
+        util.bug("lsp.sync", "lsp note edit: invalid argument")
+    }
+    if !doc.open || len == 0 || doc.full_sync {
+        return
+    }
+    if doc.insert_waiting {
+        util.bug("lsp.sync", "lsp note edit: insert post notification missing")
+    }
+    if sync_kind == 1 || len > 4294967295 || doc.pending.len >= LSP_PENDING_MAX {
+        force_full(mut doc)
+        return
+    }
+    if sync_kind != 2 {
+        return
+    }
+    let (sl, sc) = lsp_pos_of_off(pos_enc, tb, at)
+    var change = LspChange { sl: sl, sc: sc, el: sl, ec: sc, text: List[byte]() }
+    if kind == text.JOURNAL_DEL {
+        if at + len > text.textbuf_len(tb) {
+            util.bug("lsp.sync", "lsp note delete: range out of bounds")
+        }
+        let (el, ec) = lsp_pos_of_off(pos_enc, tb, at + len)
+        change.el = el
+        change.ec = ec
+    } else {
+        doc.insert_waiting = true
+    }
+    (mut doc.pending).push(change)
+}
+
+/// `yew_lsp_doc_note_edit_post` (`sync.c:236-261`): after an insert, its
+/// bytes copied into the queued change.
+pub fn lsp_doc_note_edit_post(mut doc: LspDoc, kind: int, tb: text.TextBuf, at: int, len: int) {
+    if !doc.open || kind != text.JOURNAL_INS || !doc.insert_waiting {
+        return
+    }
+    if doc.full_sync {
+        doc.insert_waiting = false
+        return
+    }
+    if doc.pending.len == 0 || at + len > text.textbuf_len(tb) {
+        util.bug("lsp.sync", "lsp note insert post: invalid range")
+    }
+    let last = doc.pending.len - 1
+    doc.pending[last].text = text.textbuf_copy_range(tb, at, at + len)
+    doc.insert_waiting = false
+}
+
+fn w_position(mut w: JsonW, line: int, character: int) {
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "line")
+    jsonw_int(mut w, line)
+    jsonw_key(mut w, "character")
+    jsonw_int(mut w, character)
+    jsonw_obj_end(mut w)
+}
+
+fn w_change(mut w: JsonW, c: LspChange) {
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "range")
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "start")
+    w_position(mut w, c.sl, c.sc)
+    jsonw_key(mut w, "end")
+    w_position(mut w, c.el, c.ec)
+    jsonw_obj_end(mut w)
+    jsonw_key(mut w, "text")
+    jsonw_str(mut w, c.text)
+    jsonw_obj_end(mut w)
+}
+
+/// `yew_lsp_doc_flush` (`sync.c:288-331`): the queued changes as one
+/// didChange (the whole text when the server syncs fully or the queue
+/// fell back), the version bumped. False when nothing is queued.
+pub fn lsp_doc_flush(mut rpc: RpcConn, mut doc: LspDoc, sync_kind: int, tb: text.TextBuf) -> bool {
+    if !doc.open || !doc.full_sync && doc.pending.len == 0 {
+        return false
+    }
+    if doc.insert_waiting {
+        util.bug("lsp.sync", "lsp didChange: insert post notification missing")
+    }
+    var w = jsonw_new()
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "textDocument")
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "uri")
+    jsonw_cstr(mut w, doc.uri)
+    jsonw_key(mut w, "version")
+    jsonw_int(mut w, doc.version + 1)
+    jsonw_obj_end(mut w)
+    jsonw_key(mut w, "contentChanges")
+    jsonw_arr(mut w)
+    if sync_kind == 1 || doc.full_sync {
+        jsonw_obj(mut w)
+        jsonw_key(mut w, "text")
+        w_text(mut w, tb)
+        jsonw_obj_end(mut w)
+    } else {
+        for c in doc.pending {
+            w_change(mut w, c)
+        }
+    }
+    jsonw_arr_end(mut w)
+    jsonw_obj_end(mut w)
+    rpc_notify(mut rpc, "textDocument/didChange", w.out)
+    doc.version += 1
+    doc.sent_gen = tb.gen
+    clear_changes(mut doc)
+    true
+}
+
+/// `yew_lsp_doc_save` (`sync.c:333-357`).
+pub fn lsp_doc_save(mut rpc: RpcConn, doc: LspDoc, tb: text.TextBuf, include_text: bool) {
+    if !doc.open {
+        return
+    }
+    var w = jsonw_new()
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "textDocument")
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "uri")
+    jsonw_cstr(mut w, doc.uri)
+    jsonw_obj_end(mut w)
+    if include_text {
+        jsonw_key(mut w, "text")
+        w_text(mut w, tb)
+    }
+    jsonw_obj_end(mut w)
+    rpc_notify(mut rpc, "textDocument/didSave", w.out)
+}
+
+/// `yew_lsp_doc_close` (`sync.c:359-381`).
+pub fn lsp_doc_close(mut rpc: RpcConn, mut doc: LspDoc) {
+    if !doc.open {
+        return
+    }
+    var w = jsonw_new()
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "textDocument")
+    jsonw_obj(mut w)
+    jsonw_key(mut w, "uri")
+    jsonw_cstr(mut w, doc.uri)
+    jsonw_obj_end(mut w)
+    jsonw_obj_end(mut w)
+    rpc_notify(mut rpc, "textDocument/didClose", w.out)
+    clear_changes(mut doc)
+    doc.open = false
+}
+
+/// A response's generation (`LspGen`, `sync.h:43-47`).
+pub struct LspGen {
+    buf_id: int,
+    version: int,
+    tb_gen: int,
+}
+
+/// `yew_lsp_gen` (`sync.c:383-388`).
+pub fn lsp_gen(doc: LspDoc, tb: text.TextBuf) -> LspGen {
+    LspGen { buf_id: doc.buf_id, version: doc.version, tb_gen: tb.gen }
+}
+
+/// `yew_lsp_gen_matches` (`sync.c:390-396`).
+pub fn lsp_gen_matches(g: LspGen, doc: LspDoc, tb: text.TextBuf) -> bool {
+    doc.open && g.buf_id == doc.buf_id && g.version == doc.version && g.tb_gen == tb.gen
+}
