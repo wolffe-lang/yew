@@ -391,6 +391,13 @@ static void case_lspf_hang(PtyCtx *c)
         return;
     lsprow_open_fake(c, "hang", 1000);
     ptc_settle(c, 2000);
+    /* Past the deadline: the server is still the buffer's (its badge),
+     * no longer initializing (no ellipsis) and no longer a job (no
+     * <1> badge): killed, and nothing said (client.c:833-844). */
+    ptc_check(c, s43_screen_contains(&c->vt, "fake") &&
+                     !s43_screen_contains(&c->vt, "fake\xe2\x80\xa6") &&
+                     !s43_screen_contains(&c->vt, "\xe2\x9f\xa8" "1\xe2\x9f\xa9"),
+              "the initialize deadline did not end the server");
     lsprow_dump(c, "1-deadline");
     force_quit(c);
 }
