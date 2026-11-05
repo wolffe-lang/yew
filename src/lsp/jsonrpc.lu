@@ -1,0 +1,861 @@
+//! lsp.jsonrpc — JSON-RPC 2.0 over Content-Length frames (Sprint 45).
+//!
+//! Ports sagitta `src/mod/lsp/jsonrpc.c` (756 lines) and `jsonrpc.h`
+//! (150) at 9ace98c2: the frame reader (`RpcRx`), the writer (`RpcTx`),
+//! classification, the id rules, the error-code actions, the open-
+//! addressed pending table with its tombstones (`jsonrpc.c:331-379`),
+//! calls, notifications, replies, cancellation, the deadline sweep, and
+//! the connection's malformed-message kill.
+//!
+//! **The shape, and why.** C's reader calls back (`on_value`, `on_msg`)
+//! from inside `feed`, and a pending request carries a callback, a
+//! release hook and an opaque context. No function value crosses a module
+//! boundary here (G19/G20, G48), so the reader QUEUES what it delivers —
+//! each parsed object in `inbox`, each raw body in `bodies` when
+//! `keep_bodies` is on — and the caller drains the queue in order, which
+//! is the order C's callbacks run in; and a pending request carries a
+//! KIND and a context id the caller's one `match` reads. Every path that
+//! ends a request — a dispatched response, a drop, a timeout, the
+//! connection's end — hands that request back exactly once, which is C's
+//! "released exactly once" (`jsonrpc.h:123-128`).
+
+use unicode
+use util
+
+/// `YEW_RPC_MAX_HDRS` (`jsonrpc.h:12-17`).
+pub const RPC_MAX_HDRS: int = 32
+
+/// `YEW_RPC_MAX_HDRLINE`.
+pub const RPC_MAX_HDRLINE: int = 4096
+
+/// `YEW_RPC_MAX_PENDING`.
+pub const RPC_MAX_PENDING: int = 256
+
+/// `YEW_RPC_PENDING_SLOTS`.
+pub const RPC_PENDING_SLOTS: int = 512
+
+/// `YEW_RPC_MAX_BODY`: 64 MiB.
+pub const RPC_MAX_BODY: int = 67108864
+
+/// `YEW_RPC_TIMEOUT_MS`.
+pub const RPC_TIMEOUT_MS: int = 10000
+
+/// `YEW_RPC_INIT_TIMEOUT_MS`.
+pub const RPC_INIT_TIMEOUT_MS: int = 60000
+
+/// `YEW_RPCRX_HDR`.
+pub const RPCRX_HDR: int = 0
+
+/// `YEW_RPCRX_BODY`.
+pub const RPCRX_BODY: int = 1
+
+/// `YEW_RPCRX_DEAD`.
+pub const RPCRX_DEAD: int = 2
+
+/// `YEW_RPC_REQUEST` (`jsonrpc.h:78-85`).
+pub const RPC_REQUEST: int = 0
+
+/// `YEW_RPC_RESPONSE`.
+pub const RPC_RESPONSE: int = 1
+
+/// `YEW_RPC_ERROR`.
+pub const RPC_ERROR: int = 2
+
+/// `YEW_RPC_NOTIFY`.
+pub const RPC_NOTIFY: int = 3
+
+/// `YEW_RPC_SRV_REQUEST`.
+pub const RPC_SRV_REQUEST: int = 4
+
+/// `YEW_RPC_MALFORMED`.
+pub const RPC_MALFORMED: int = 5
+
+/// `YEW_RPC_ERR_PARSE` (`jsonrpc.h:103-113`).
+pub const RPC_ERR_PARSE: int = 0
+
+/// `YEW_RPC_ERR_INVALID_REQUEST`.
+pub const RPC_ERR_INVALID_REQUEST: int = 1
+
+/// `YEW_RPC_ERR_METHOD_NOT_FOUND`.
+pub const RPC_ERR_METHOD_NOT_FOUND: int = 2
+
+/// `YEW_RPC_ERR_INVALID_PARAMS`.
+pub const RPC_ERR_INVALID_PARAMS: int = 3
+
+/// `YEW_RPC_ERR_INTERNAL`.
+pub const RPC_ERR_INTERNAL: int = 4
+
+/// `YEW_RPC_ERR_SILENT`.
+pub const RPC_ERR_SILENT: int = 5
+
+/// `YEW_RPC_ERR_REQUEST_FAILED`.
+pub const RPC_ERR_REQUEST_FAILED: int = 6
+
+/// `YEW_RPC_ERR_SERVER_RESERVED`.
+pub const RPC_ERR_SERVER_RESERVED: int = 7
+
+/// `YEW_RPC_ERR_OTHER`.
+pub const RPC_ERR_OTHER: int = 8
+
+/// The error code a sweep's timeout reports (`jsonrpc.c:690`).
+pub const RPC_TIMEOUT_CODE: int = -32001
+
+// `RPC_SLOT_EMPTY`, `_USED`, `_TOMB` (`jsonrpc.c:10`).
+const SLOT_EMPTY: int = 0
+
+const SLOT_USED: int = 1
+
+const SLOT_TOMB: int = 2
+
+/// The frame reader (`RpcRx`, `jsonrpc.h:33-48`).
+pub struct RpcRx {
+    state: int,
+    pending_cr: bool,
+    line: List[byte],
+    body: List[byte],
+    want: int,
+    have_len: bool,
+    nhdr: int,
+    bytes_in: int,
+    msgs_in: int,
+    err: str,
+    // What C's `on_value` and `on_msg` receive, queued in delivery order.
+    inbox: List[Json],
+    keep_bodies: bool,
+    bodies: List[List[byte]],
+    // C's `conn_on_value` (`jsonrpc.c:421-433`), run inside the delivery
+    // when the reader is a connection's: the eighth malformed message
+    // kills the reader.
+    count_malformed: bool,
+    malformed: int,
+}
+
+/// `yew_rpcrx_init` (`jsonrpc.c:150-156`).
+pub fn rpcrx_new() -> RpcRx {
+    RpcRx {
+        state: RPCRX_HDR,
+        pending_cr: false,
+        line: List[byte](),
+        body: List[byte](),
+        want: 0,
+        have_len: false,
+        nhdr: 0,
+        bytes_in: 0,
+        msgs_in: 0,
+        err: "",
+        inbox: List[Json](),
+        keep_bodies: false,
+        bodies: List[List[byte]](),
+        count_malformed: false,
+        malformed: 0,
+    }
+}
+
+// `rpc_dead` (`jsonrpc.c:16-20`).
+fn rx_dead(mut rx: RpcRx, msg: str) {
+    rx.state = RPCRX_DEAD
+    rx.err = msg
+}
+
+fn lower(c: int) -> int {
+    if c >= 65 && c <= 90 then c + 32 else c
+}
+
+// `ascii_ieq` (`jsonrpc.c:22-41`) over `s[at..at + n)`.
+fn ascii_ieq(s: List[byte], at: int, n: int, lit: str) -> bool {
+    if lit.len != n {
+        return false
+    }
+    var i = 0
+    while i < n {
+        if lower(s[at + i] as int) != lower(lit.bytes()[i] as int) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `parse_length` (`jsonrpc.c:43-77`): the value after the colon, leading
+// spaces and tabs skipped; at most the 64 MiB cap; the offending text (to
+// 47 bytes) in the message.
+fn parse_length(mut rx: RpcRx, s: List[byte], at: int, end: int) -> bool {
+    var i = at
+    while i < end && (s[i] as int == 32 || s[i] as int == 9) {
+        i += 1
+    }
+    let start = i
+    let n = end - start
+    var good = n > 0
+    var value = 0
+    var k = start
+    while good && k < end {
+        let digit = s[k] as int
+        if digit < 48 || digit > 57 {
+            good = false
+        } else if value > (RPC_MAX_BODY - (digit - 48)) / 10 {
+            good = false
+        } else {
+            value = value * 10 + (digit - 48)
+        }
+        k += 1
+    }
+    if good {
+        rx.want = value
+        rx.have_len = true
+        return true
+    }
+    let shown = if n < 47 then n else 47
+    var text = List[byte]()
+    var c = 0
+    while c < shown {
+        (mut text).push(s[start + c])
+        c += 1
+    }
+    rx.state = RPCRX_DEAD
+    rx.err = "bad Content-Length '{str_from_utf8(text) else "?"}'"
+    false
+}
+
+// `finish_header_line` (`jsonrpc.c:79-108`).
+fn finish_header_line(mut rx: RpcRx) -> bool {
+    if rx.line.len == 0 {
+        if !rx.have_len {
+            rx_dead(mut rx, "frame has no Content-Length")
+            return false
+        }
+        rx.state = RPCRX_BODY
+        (mut rx.body).reset()
+        return true
+    }
+    rx.nhdr += 1
+    if rx.nhdr > RPC_MAX_HDRS {
+        rx_dead(mut rx, "too many headers")
+        return false
+    }
+    var colon = 0
+    while colon < rx.line.len {
+        if rx.line[colon] as int == 58 {
+            break
+        }
+        colon += 1
+    }
+    if colon < rx.line.len && ascii_ieq(rx.line, 0, colon, "Content-Length") {
+        let line = copy rx.line
+        if !parse_length(mut rx, line, colon + 1, line.len) {
+            return false
+        }
+    }
+    (mut rx.line).reset()
+    true
+}
+
+// `deliver_body` (`jsonrpc.c:110-148`): the body must be UTF-8 and a JSON
+// object; it is queued (C's `on_value`, then `on_msg`).
+fn deliver_body(mut rx: RpcRx) -> bool {
+    let bad = unicode.utf8_validate(rx.body, 0, rx.body.len)
+    if bad != rx.body.len {
+        rx.state = RPCRX_DEAD
+        rx.err = "body is not UTF-8 at offset {bad}"
+        return false
+    }
+    var err = json_err_new()
+    let doc = json_parse(rx.body, 0, rx.body.len, mut err) else {
+        rx_dead(mut rx, "frame is not a JSON-RPC object")
+        return false
+    }
+    if json_kind(doc, doc.root) != JS_OBJ {
+        rx_dead(mut rx, "frame is not a JSON-RPC object")
+        return false
+    }
+    if rx.count_malformed && rpc_classify(doc, doc.root) == RPC_MALFORMED {
+        if rx.malformed < 255 {
+            rx.malformed += 1
+        }
+        if rx.malformed >= 8 {
+            rx_dead(mut rx, "too many malformed JSON-RPC messages")
+        }
+    }
+    (mut rx.inbox).push(doc)
+    if rx.keep_bodies {
+        (mut rx.bodies).push(copy rx.body)
+    }
+    rx.msgs_in += 1
+    if rx.state == RPCRX_DEAD {
+        return false
+    }
+    rx.state = RPCRX_HDR
+    (mut rx.line).reset()
+    (mut rx.body).reset()
+    rx.want = 0
+    rx.have_len = false
+    rx.nhdr = 0
+    true
+}
+
+/// `yew_rpcrx_feed` (`jsonrpc.c:167-219`) over `b[at..end)`: answers the
+/// number of frames delivered (queued in `rx.inbox`).
+pub fn rpcrx_feed(mut rx: RpcRx, b: List[byte], at: int, end: int) -> int {
+    if rx.state == RPCRX_DEAD {
+        return 0
+    }
+    var pos = at
+    var delivered = 0
+    rx.bytes_in += end - at
+    while pos < end && rx.state != RPCRX_DEAD {
+        if rx.state == RPCRX_BODY {
+            let need = rx.want - rx.body.len
+            let n_take = if end - pos < need then end - pos else need
+            var k = 0
+            while k < n_take {
+                (mut rx.body).push(b[pos + k])
+                k += 1
+            }
+            pos += n_take
+            if rx.body.len == rx.want {
+                if !deliver_body(mut rx) {
+                    break
+                }
+                delivered += 1
+            }
+            continue
+        }
+        if rx.pending_cr {
+            rx.pending_cr = false
+            let c = b[pos] as int
+            pos += 1
+            if c != 10 {
+                rx_dead(mut rx, "header line must end with CRLF")
+                break
+            }
+            if !finish_header_line(mut rx) {
+                break
+            }
+            if rx.state == RPCRX_BODY && rx.want == 0 {
+                if !deliver_body(mut rx) {
+                    break
+                }
+                delivered += 1
+            }
+            continue
+        }
+        if b[pos] as int == 13 {
+            rx.pending_cr = true
+            pos += 1
+        } else {
+            (mut rx.line).push(b[pos])
+            pos += 1
+            if rx.line.len > RPC_MAX_HDRLINE {
+                rx_dead(mut rx, "header line too long")
+                break
+            }
+        }
+    }
+    delivered
+}
+
+/// The frame writer (`RpcTx`, `jsonrpc.h:57-60`).
+pub struct RpcTx {
+    pending: List[byte],
+    sent: int,
+}
+
+/// `yew_rpctx_init`.
+pub fn rpctx_new() -> RpcTx {
+    RpcTx { pending: List[byte](), sent: 0 }
+}
+
+/// `yew_rpctx_send` (`jsonrpc.c:240-247`): a frame queued; a body past the
+/// cap is dropped.
+pub fn rpctx_send(mut tx: RpcTx, body: List[byte]) {
+    if body.len > RPC_MAX_BODY {
+        return
+    }
+    util.buf_append_str(mut tx.pending, "Content-Length: {body.len}\r\n\r\n")
+    util.buf_append(mut tx.pending, body)
+}
+
+/// `yew_rpctx_consume` (`jsonrpc.c:249-259`): `n` bytes were written; when
+/// everything has gone the buffer is reused from empty.
+pub fn rpctx_consume(mut tx: RpcTx, n: int) {
+    let left = tx.pending.len - tx.sent
+    let k = if n > left then left else n
+    tx.sent += k
+    if tx.sent == tx.pending.len {
+        (mut tx.pending).reset()
+        tx.sent = 0
+    }
+}
+
+/// A pending request (`RpcPending`, `jsonrpc.h:87-101`). C's callback,
+/// release hook and context are `kind` and `ctx`, read by the caller.
+pub struct RpcPending {
+    id: int,
+    method: int,
+    gen: int,
+    buf_id: int,
+    sent_ms: int,
+    deadline_ms: int,
+    kind: int,
+    ctx: int,
+    state: int,
+}
+
+/// A zeroed request (`memset(&p, 0, …)`).
+pub fn rpc_pending_new() -> RpcPending {
+    RpcPending {
+        id: 0,
+        method: 0,
+        gen: 0,
+        buf_id: 0,
+        sent_ms: 0,
+        deadline_ms: 0,
+        kind: 0,
+        ctx: 0,
+        state: SLOT_EMPTY,
+    }
+}
+
+/// The connection (`RpcConn`, `jsonrpc.h:118-127`).
+pub struct RpcConn {
+    rx: RpcRx,
+    tx: RpcTx,
+    slots: List[RpcPending],
+    next_id: int,
+    npending: int,
+    malformed: int,
+}
+
+/// `yew_rpc_conn_init` (`jsonrpc.c:383-391`).
+pub fn rpc_conn_new() -> RpcConn {
+    var slots = List[RpcPending]()
+    var i = 0
+    while i < RPC_PENDING_SLOTS {
+        (mut slots).push(rpc_pending_new())
+        i += 1
+    }
+    var rx = rpcrx_new()
+    rx.count_malformed = true
+    RpcConn { rx: rx, tx: rpctx_new(), slots: slots, next_id: 1, npending: 0, malformed: 0 }
+}
+
+/// `yew_rpc_conn_free` (`jsonrpc.c:393-411`): every request still pending,
+/// in slot order, handed back for its release; the connection is empty.
+pub fn rpc_conn_free(mut c: RpcConn) -> List[RpcPending] {
+    var out = List[RpcPending]()
+    for s in c.slots {
+        if s.state == SLOT_USED {
+            (mut out).push(copy s)
+        }
+    }
+    c = rpc_conn_new()
+    out
+}
+
+/// `yew_rpc_id_u64` (`jsonrpc.c:268-293`): a non-negative integer id, or a
+/// string of decimal digits up to UINT64_MAX. Answers whether the id is
+/// valid and, when it fits `int` (every id this client issues does), its
+/// value; a valid id past INT64_MAX answers -1.
+pub fn rpc_id_u64(j: Json, id: int) -> (bool, int) {
+    let k = json_kind(j, id)
+    if k == JS_INT {
+        let v = json_int(j, id, -1)
+        if v < 0 {
+            return (false, 0)
+        }
+        return (true, v)
+    }
+    if k != JS_STR || json_size(j, id) == 0 {
+        return (false, 0)
+    }
+    let at = json_str_at(j, id)
+    let n = json_size(j, id)
+    let top: wrapping[u64] = 18446744073709551615
+    let ten: wrapping[u64] = 10
+    var value: wrapping[u64] = 0
+    var i = 0
+    while i < n {
+        let d = j.bytes[at + i] as int
+        if d < 48 || d > 57 {
+            return (false, 0)
+        }
+        let digit = (d - 48) as wrapping[u64]
+        if value > (top - digit) / ten {
+            return (false, 0)
+        }
+        value = value * ten + digit
+        i += 1
+    }
+    let limit: wrapping[u64] = 9223372036854775807
+    if value > limit {
+        return (true, -1)
+    }
+    (true, value as int)
+}
+
+/// Whether string id `id` is exactly UINT64_MAX's digits (the test's
+/// witness that the upper half of the id space is valid).
+pub fn rpc_id_is_u64_max(j: Json, id: int) -> bool {
+    json_streq(j, id, "18446744073709551615")
+}
+
+/// `yew_rpc_classify` (`jsonrpc.c:295-329`).
+pub fn rpc_classify(j: Json, msg: int) -> int {
+    if json_kind(j, msg) != JS_OBJ {
+        return RPC_MALFORMED
+    }
+    let version = json_field(j, msg, "jsonrpc")
+    let id = json_field(j, msg, "id")
+    let method = json_field(j, msg, "method")
+    let result = json_field(j, msg, "result")
+    let error = json_field(j, msg, "error")
+    if !json_streq(j, version, "2.0") {
+        return RPC_MALFORMED
+    }
+    if method >= 0 {
+        if json_kind(j, method) != JS_STR || result >= 0 || error >= 0 {
+            return RPC_MALFORMED
+        }
+        if id < 0 {
+            return RPC_NOTIFY
+        }
+        let (valid, _) = rpc_id_u64(j, id)
+        return if valid then RPC_SRV_REQUEST else RPC_MALFORMED
+    }
+    if id < 0 || (result < 0) == (error < 0) {
+        return RPC_MALFORMED
+    }
+    if json_kind(j, id) == JS_NULL && error >= 0 {
+        return RPC_ERROR
+    }
+    let (valid, _) = rpc_id_u64(j, id)
+    if !valid {
+        return RPC_MALFORMED
+    }
+    if error >= 0 then RPC_ERROR else RPC_RESPONSE
+}
+
+/// `yew_rpc_error_action` (`jsonrpc.c:331-349`).
+pub fn rpc_error_action(code: int) -> int {
+    if code == -32700 {
+        return RPC_ERR_PARSE
+    }
+    if code == -32600 {
+        return RPC_ERR_INVALID_REQUEST
+    }
+    if code == -32601 {
+        return RPC_ERR_METHOD_NOT_FOUND
+    }
+    if code == -32602 {
+        return RPC_ERR_INVALID_PARAMS
+    }
+    if code == -32603 {
+        return RPC_ERR_INTERNAL
+    }
+    if code == -32800 || code == -32801 || code == -32802 {
+        return RPC_ERR_SILENT
+    }
+    if code == -32803 {
+        return RPC_ERR_REQUEST_FAILED
+    }
+    if code >= -32099 && code <= -32000 then RPC_ERR_SERVER_RESERVED else RPC_ERR_OTHER
+}
+
+// `slot_start` (`jsonrpc.c:351-355`): Fibonacci hashing in u64.
+fn slot_start(id: int) -> int {
+    let k: wrapping[u64] = 11400714819323198485
+    let h = id as wrapping[u64] * k
+    (h & 511 as wrapping[u64]) as int
+}
+
+// `find_slot` (`jsonrpc.c:357-377`): the used slot holding `id`; or, when
+// inserting, the first tombstone on the probe else the empty slot that
+// ends it. -1 when none.
+fn find_slot(c: RpcConn, id: int, inserting: bool) -> int {
+    var at = slot_start(id)
+    var tomb = -1
+    var n = 0
+    while n < RPC_PENDING_SLOTS {
+        let st = c.slots[at].state
+        if st == SLOT_EMPTY {
+            if inserting {
+                return if tomb >= 0 then tomb else at
+            }
+            return -1
+        }
+        if st == SLOT_TOMB {
+            if tomb < 0 {
+                tomb = at
+            }
+        } else if c.slots[at].id == id {
+            return at
+        }
+        at = at + 1 & RPC_PENDING_SLOTS - 1
+        n += 1
+    }
+    tomb
+}
+
+// `find_slot_const` (`jsonrpc.c:379-393`).
+fn find_used(c: RpcConn, id: int) -> int {
+    var at = slot_start(id)
+    var n = 0
+    while n < RPC_PENDING_SLOTS {
+        let st = c.slots[at].state
+        if st == SLOT_EMPTY {
+            return -1
+        }
+        if st == SLOT_USED && c.slots[at].id == id {
+            return at
+        }
+        at = at + 1 & RPC_PENDING_SLOTS - 1
+        n += 1
+    }
+    -1
+}
+
+/// `yew_rpc_feed_stdout` (`jsonrpc.c:435-444`): bytes from the server,
+/// each delivered object queued in `c.rx.inbox`. False once the reader
+/// is dead (a bad frame, or the eighth malformed message).
+pub fn rpc_feed_stdout(mut c: RpcConn, bytes: List[byte], at: int, end: int) -> bool {
+    let _ = rpcrx_feed(mut c.rx, bytes, at, end)
+    c.malformed = c.rx.malformed
+    c.rx.state != RPCRX_DEAD
+}
+
+/// `yew_rpc_finish_stdout` (`jsonrpc.c:446-460`): the server's stdout
+/// ended; a frame cut short is the reader's death.
+pub fn rpc_finish_stdout(mut c: RpcConn) -> bool {
+    if c.rx.state == RPCRX_DEAD {
+        return false
+    }
+    if c.rx.state == RPCRX_BODY || c.rx.pending_cr || c.rx.line.len != 0 || c.rx.have_len {
+        rx_dead(mut c.rx, "unexpected EOF in JSON-RPC frame")
+        return false
+    }
+    true
+}
+
+/// `yew_rpc_tx_view` (`jsonrpc.c:462-475`): how many queued bytes wait,
+/// from `c.tx.sent`.
+pub fn rpc_tx_len(c: RpcConn) -> int {
+    if c.tx.sent >= c.tx.pending.len then 0 else c.tx.pending.len - c.tx.sent
+}
+
+/// `yew_rpc_tx_consume`.
+pub fn rpc_tx_consume(mut c: RpcConn, n: int) {
+    rpctx_consume(mut c.tx, n)
+}
+
+fn append_quoted(mut body: List[byte], s: str) {
+    var w = jsonw_new()
+    jsonw_cstr(mut w, s)
+    util.buf_append(mut body, w.out)
+}
+
+/// `yew_rpc_call` (`jsonrpc.c:494-536`): the request queued and its pending
+/// row inserted; answers its id, or 0 when the table is full or ids are
+/// spent. `params` empty is `null`. A deadline at or before `sent_ms` is
+/// the default: 60 s for `initialize`, 10 s for the rest.
+pub fn rpc_call(mut c: RpcConn, method: str, params: List[byte], p: RpcPending) -> int {
+    // C refuses once `next_id` passes INT64_MAX (`jsonrpc.c:502-504`); the
+    // port's id after INT64_MAX is 0, the same refusal.
+    if c.npending >= RPC_MAX_PENDING || c.next_id == 0 {
+        return 0
+    }
+    let id = c.next_id
+    c.next_id = if id == 9223372036854775807 then 0 else id + 1
+    let slot = find_slot(c, id, true)
+    if slot < 0 {
+        return 0
+    }
+    var row = copy p
+    row.id = id
+    if row.deadline_ms <= row.sent_ms {
+        let timeout = if method == "initialize" then RPC_INIT_TIMEOUT_MS else RPC_TIMEOUT_MS
+        row.deadline_ms = row.sent_ms + timeout
+    }
+    row.state = SLOT_USED
+    c.slots[slot] = row
+    c.npending += 1
+    var body = List[byte]()
+    util.buf_append_str(mut body, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":")
+    append_quoted(mut body, method)
+    util.buf_append_str(mut body, ",\"params\":")
+    if params.len != 0 {
+        util.buf_append(mut body, params)
+    } else {
+        util.buf_append_str(mut body, "null")
+    }
+    (mut body).push(125 as byte)
+    rpctx_send(mut c.tx, body)
+    id
+}
+
+/// `yew_rpc_notify` (`jsonrpc.c:538-556`).
+pub fn rpc_notify(mut c: RpcConn, method: str, params: List[byte]) {
+    var body = List[byte]()
+    util.buf_append_str(mut body, "{{\"jsonrpc\":\"2.0\",\"method\":")
+    append_quoted(mut body, method)
+    util.buf_append_str(mut body, ",\"params\":")
+    if params.len != 0 {
+        util.buf_append(mut body, params)
+    } else {
+        util.buf_append_str(mut body, "null")
+    }
+    (mut body).push(125 as byte)
+    rpctx_send(mut c.tx, body)
+}
+
+/// `yew_rpc_notify` with a `str` body.
+pub fn rpc_notify_text(mut c: RpcConn, method: str, params: str) {
+    rpc_notify(mut c, method, params.bytes())
+}
+
+fn append_id(mut body: List[byte], j: Json, id: int) {
+    var w = jsonw_new()
+    jsonw_value(mut w, j, id)
+    util.buf_append(mut body, w.out)
+}
+
+/// `yew_rpc_reply` (`jsonrpc.c:566-584`): the id echoed as the server sent
+/// it (a string stays a string).
+pub fn rpc_reply(mut c: RpcConn, j: Json, id: int, result: List[byte]) {
+    if id < 0 {
+        return
+    }
+    var body = List[byte]()
+    util.buf_append_str(mut body, "{{\"jsonrpc\":\"2.0\",\"id\":")
+    append_id(mut body, j, id)
+    util.buf_append_str(mut body, ",\"result\":")
+    if result.len != 0 {
+        util.buf_append(mut body, result)
+    } else {
+        util.buf_append_str(mut body, "null")
+    }
+    (mut body).push(125 as byte)
+    rpctx_send(mut c.tx, body)
+}
+
+/// `yew_rpc_reply_error` (`jsonrpc.c:586-603`).
+pub fn rpc_reply_error(mut c: RpcConn, j: Json, id: int, code: int, msg: str) {
+    if id < 0 {
+        return
+    }
+    var body = List[byte]()
+    util.buf_append_str(mut body, "{{\"jsonrpc\":\"2.0\",\"id\":")
+    append_id(mut body, j, id)
+    util.buf_append_str(mut body, ",\"error\":{{\"code\":{code},\"message\":")
+    append_quoted(mut body, msg)
+    util.buf_append_str(mut body, "}}}}")
+    rpctx_send(mut c.tx, body)
+}
+
+/// `yew_rpc_cancel` (`jsonrpc.c:605-616`): `$/cancelRequest` for a request
+/// the table still knows (used or tombstoned); the row stays pending.
+pub fn rpc_cancel(mut c: RpcConn, id: int) {
+    if find_slot(c, id, false) < 0 {
+        return
+    }
+    rpc_notify_text(mut c, "$/cancelRequest", "{{\"id\":{id}}}")
+}
+
+/// `yew_rpc_pending` (`jsonrpc.c:618-626`): the pending row for `id`.
+pub fn rpc_pending(c: RpcConn, id: int) -> RpcPending ! {none} {
+    let at = find_used(c, id)
+    if at < 0 {
+        return none
+    }
+    copy c.slots[at]
+}
+
+/// What a dispatched response hands back: the request it ends, and the
+/// `result` and `error` nodes of the message (-1 when absent).
+pub struct RpcDone {
+    ok: bool,
+    pending: RpcPending,
+    result: int,
+    error: int,
+}
+
+// The slot emptied to a tombstone and its row handed back.
+fn take_slot(mut c: RpcConn, at: int) -> RpcPending {
+    let row = copy c.slots[at]
+    c.slots[at] = rpc_pending_new()
+    c.slots[at].state = SLOT_TOMB
+    c.npending -= 1
+    row
+}
+
+/// `yew_rpc_dispatch` (`jsonrpc.c:628-653`): a response or an error for a
+/// pending request ends it; C then runs its callback and its release, the
+/// port hands the row back (`ok` false: not a response, or not pending).
+pub fn rpc_dispatch(mut c: RpcConn, j: Json, msg: int) -> RpcDone {
+    var done = RpcDone { ok: false, pending: rpc_pending_new(), result: -1, error: -1 }
+    let kind = rpc_classify(j, msg)
+    if kind != RPC_RESPONSE && kind != RPC_ERROR {
+        return done
+    }
+    let (valid, number) = rpc_id_u64(j, json_field(j, msg, "id"))
+    if !valid || number < 0 {
+        return done
+    }
+    let at = find_slot(c, number, false)
+    if at < 0 || c.slots[at].state != SLOT_USED {
+        return done
+    }
+    done.pending = take_slot(mut c, at)
+    done.ok = true
+    done.result = json_field(j, msg, "result")
+    done.error = json_field(j, msg, "error")
+    done
+}
+
+/// `yew_rpc_drop` (`jsonrpc.c:655-671`): a pending request removed without
+/// its callback; the row is handed back for its release.
+pub fn rpc_drop(mut c: RpcConn, id: int) -> RpcPending ! {none} {
+    let at = find_slot(c, id, false)
+    if at < 0 || c.slots[at].state != SLOT_USED {
+        return none
+    }
+    take_slot(mut c, at)
+}
+
+/// `yew_rpc_sweep` (`jsonrpc.c:673-718`): every pending request whose
+/// deadline has come, in slot order — each to be called back with the
+/// timeout error (code -32001, "timed out") and released.
+pub fn rpc_sweep(mut c: RpcConn, now_ms: int) -> List[RpcPending] {
+    var out = List[RpcPending]()
+    var i = 0
+    while i < RPC_PENDING_SLOTS {
+        if c.slots[i].state == SLOT_USED &&
+            c.slots[i].deadline_ms >= 0 &&
+            now_ms >= c.slots[i].deadline_ms {
+            (mut out).push(take_slot(mut c, i))
+        }
+        i += 1
+    }
+    out
+}
+
+/// The timeout error a sweep reports, as a document whose root is
+/// `{"code":-32001,"message":"timed out"}` (`jsonrpc.c:680-697`).
+pub fn rpc_timeout_error() -> Json {
+    var err = json_err_new()
+    let text = "{{\"code\":-32001,\"message\":\"timed out\"}}"
+    json_parse(text.bytes(), 0, text.len, mut err) else json_new()
+}
+
+/// `yew_rpc_deadline` (`jsonrpc.c:720-735`): the earliest pending deadline,
+/// or -1.
+pub fn rpc_deadline(c: RpcConn) -> int {
+    var deadline = -1
+    for s in c.slots {
+        if s.state == SLOT_USED &&
+            s.deadline_ms >= 0 &&
+            (deadline < 0 || s.deadline_ms < deadline) {
+            deadline = s.deadline_ms
+        }
+    }
+    deadline
+}
