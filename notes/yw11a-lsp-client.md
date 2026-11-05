@@ -120,3 +120,212 @@ not read (the clean room covers JSON libraries).
 - What I expect to go wrong: the position conversion at a CRLF line end
   and at a non-BMP character (UTF-16), and the shutdown wait's 500 ms on
   the checked machine, which has no real pipes for a child.
+
+## Forbidden
+
+- No merge, label, tag or release, and no issue closed. No attribution
+  trailer.
+- Clean room: sagitta at the pin was read and is cited `file:line`; no
+  other editor's source, no JSON, JSON-RPC or LSP library's source
+  (`std.json`'s included), no fackr crate. `wolf lsp` was run as a black
+  box and read on the wire; its source was not read.
+  `tools/lsp-rows/fakeserver.py` is written from the LSP specification
+  for these rows alone.
+- No golden is edited and no sagitta file changed: the oracle rows are
+  this repository's own runner over sagitta's PTY harness objects, as
+  `tools/trials/` is, and keep their screens outside the oracle tree.
+  `sagitta.pin` and the wolf pin are unchanged.
+- PR#102–#106 and #110 are untouched. #110 also changes `ci.yml`,
+  `docs/MAP.md`, `README.md` and `CHANGELOG.md`; the hunks are apart.
+- No perf row.
+
+## Inputs verified
+
+- **Base:** yew trunk `1218169e` (r41q's record), still trunk at the
+  final records; #110 had not merged.
+- **Toolchain:** wolf 0.2.36 (`5adf3d91`), lupin 0.1.58, std
+  `78b9d3cb`, from the pinned archives (`tools/fetch-toolchain`).
+- **C yew:** `sagitta.pin` (`9ace98c2`), built by `tools/oracle` (clang
+  on macOS, gcc in the Linux image) with `fakelsp` beside it.
+- **The server:** the pinned `wolf lsp` answers `initialize` with full
+  sync (`textDocumentSync.change` 1), `positionEncoding` utf-8 and
+  `save.includeText` false, and publishes one diagnostic per error with
+  a multi-line message, a `code` and `relatedInformation`. With full
+  sync on the wire, the incremental path is the fake server's
+  (`change` 2, UTF-16) and the unit rows'.
+- **The PTY harness** writes every PTY session a user `init.fl` of
+  `let lsp = {servers: {}}` (`tests/pty/runner.c:201-236`), so no
+  existing golden starts a server; the port honours the empty table (a
+  table that exists replaces the defaults, `client.c:312-341`).
+- **PAX's compiler:** `tools/mkwolf` builds wolf-lang `v0.2.36` for
+  `x86_64-unknown-linux-musl` (`+crt-static`, `relocation-model=static`,
+  stripped, no build-id; `user/wolf.pin`); PAX's `user/wolf.sums`
+  records `wolf` `2df1fb76…` (16,257,584 bytes).
+
+| host | role |
+|---|---|
+| Apple M-series Mac, macOS arm64 | builds, the macOS rows (C yew built with clang) |
+| x86-64 Linux, rootless podman, a 6-CPU block | the gauntlet in `ubuntu:24.04` with the runner's tools, the musl wolf in a Rust 1.97.1 image, the static binary and the scratch container |
+
+## Evidence index
+
+Commits, in order:
+
+- `a072d53` the prediction.
+- `8d32e6f` `lsp_json_test`, red (no `lsp.json`); `fd55262` `lsp.json`.
+- `3bfc91c` `lsp_jsonrpc_test`, red; `68d2f9b` `lsp.jsonrpc`.
+- `ee959d8` `lsp_client_test` and `lsp_sync_test`, red (no
+  `lsp_uri_of_path`, no `lsp.sync`); `46b846d` `lsp.client`; `a906546`
+  `lsp.sync`.
+- `15c0b13` `edit_lsp_diag_test` and `8bd1bf1` `edit_lsp_config_test`,
+  each red at its commit (no `edit.diag_replace`, no `lsp_client_cfg`).
+- The oracle rows, red against the trunk port: `95620c4` the fake
+  server, `e9655fd` the runner's cases, `a52da0b` the comparison,
+  `191a9af` `tools/run-lsp-rows`.
+- The client: `da8bc43` `lsp.sync` replays a logged edit; `79f4237`
+  `text.edit` logs each edit at the choke point (C's notify hooks,
+  `notify.c:44,57`); `33aea55` `edit.syn_paths` and `256bc60`
+  `tools/check-syn-paths` (R-yw11-1); `8fa40d9` `edit.lsp_client`;
+  `59fc468` `edit.lsp_diag`; `16267ef` `edit.lsp`; `53ae984` the framed
+  sink in `edit.job`; `c190d38`, `404f645`, `e75b2c4` the `Ed`, the
+  close and free paths and the commands; `f76b308` the server table
+  read against a running script's VM.
+- The drawing: `c4d0a4e` the underline and the hint, `230e5ac` the
+  statusline badge, `9b68920` the picker host.
+- `864ba37` `lsp` staged for the tools that build the editor;
+  `bd58161` the demo's `s46_diag_*` scenes; `02b6e91` CI's gate;
+  `92ef035` the four files over the checked machine's budget one case at
+  a time (G29); `f13b04b` `wolf fmt`.
+
+**The rows, and what each showed.**
+
+- **JSON and JSON-RPC** (`lsp_json_test`, 13 cases, 407 assertions;
+  `lsp_jsonrpc_test`, 14 cases, 245,125 assertions): red at their
+  commits, green natively and one case at a time on the checked
+  machine. The writer's corpus (`tests/fixtures/lsp/writer-corpus.json`)
+  is C's, byte for byte.
+- **URIs, capabilities, the lifecycle and sync** (`lsp_client_test`, 12
+  cases; `lsp_sync_test`, 4 cases and one port case): green on the
+  checked machine whole. The port case applies every incremental change
+  the document sends to a copy, in UTF-8 and UTF-16, through edits, undo
+  and a two-cursor insert, and holds the copy to the buffer.
+- **Diagnostics and config** (`edit_lsp_diag_test`, 6 cases;
+  `edit_lsp_config_test`, 5): red at their commits; green. The config
+  file caught one divergence: the port read a buffer's binary flag only
+  for a file-backed buffer, where C reads `meta.binary` always
+  (`lsp_client.lu` now does).
+- **The eight `lsp_diag_*` PTY goldens**: red against the trunk demo
+  (`demo_paint: error: not yet ported: scene s46_diag_*`), then green
+  by name against the port's demo; no golden moved.
+- **`tests/script/lsp_sync.fl`**: green by name. On the way it showed
+  that a running batch script holds the Fletch VM out of the `Ed`, so
+  the server table read from `t.pump` found no `lsp` binding and the
+  pump started clangd; `t.pump` now reads the table against the
+  script's own VM (`f76b308`).
+- **The oracle rows** (`tools/run-lsp-rows`, nine cases, seventeen
+  screens), C yew and the port against the same pinned `wolf lsp` and
+  the same fake server, each case twice per editor:
+  - against `wolf lsp`: a type error opened (the gutter's ✗, the
+    undercurl, `E:1`), `ed.lsp.diag_next` (the cursor on line 2 and
+    the hint), `ed.lsp.diagnostics` (the list); an insert that breaks
+    the file brings `E:1` and undo takes it away; one insert at two
+    cursors brings `E:2` and undo mends both;
+  - against the fake: incremental sync through a non-BMP line, a
+    deletion across a line join, two cursors and undo, the server's
+    copy then held to the saved file (`view matches disk`); a crash on
+    save, the restart at the editor's next turn and the second
+    server's diagnostic; a header that is not a length, the transport
+    dropped and the server restarted; an `initialize` answered 1.5 s
+    late while the editor takes keys; one never answered (the 1,000 ms
+    deadline: the server killed, the badge's ellipsis gone, no
+    message); a server that answers neither `shutdown` nor `exit`
+    (the quit is bounded by the 500 ms wait).
+  - Red against the trunk port: every case `FAIL` by name.
+  - Green on macOS: all seventeen screens `same`, both runs of both
+    editors stable.
+- **Static for PAX:** `tools/build --static` in the Linux image gives
+  an `ET_EXEC` with no `PT_INTERP` (the gauntlet's `static` step prints
+  its digest twice and its size). PAX's musl-static `wolf`, rebuilt here
+  from the `v0.2.36` tag by PAX's recipe (Rust 1.97.1,
+  `x86_64-unknown-linux-musl`, the three packages, 2 min 15 s), is
+  `2df1fb7660ce27dd6bd0d8c7395abec74bb399824842f89b8a407060be80ab59`,
+  16,257,584 bytes, read twice: the bytes PAX's `user/wolf.sums` records
+  (its `wolf-cimport-worker` and `libwolf_rt.a` agree too). A `FROM
+  scratch` image holds `/yew`, `/bin/wolf` and the pin's std beside it,
+  nothing else (no shell, no libc). In it, `yew --batch --test` opens
+  `src/main.lu` of a wolf package with a type error, pumps the jobs,
+  runs `ed.lsp.diag_next` and asserts the cursor stands on `wolf lsp`'s
+  E0401, line 2, column 17: `YEWTEST 3 0 0`, exit 0. The control, the
+  same run with no `wolf` on `PATH`, fails the two cursor assertions
+  (the gauntlet's `pax-container` step).
+- **The gauntlet** at the final head, in the Linux image, and **the
+  plant** (`yw11a-plant-*`: one hunk in `src/lsp/sync.lu`, every
+  incremental change's end one character late), red by name at
+  `lspf_mirror_sync`: both records are the PR's.
+
+**What the rows taught the comparison** (R-yw11-3): C's syntax engine
+colours `.lu` (yw10's, not ported) and paints frames of its own as it
+settles (`ed.c:1383-1389`), so the comparison leaves out the document
+area's foreground, bold and italic and the header's frame count; every
+glyph, the cursor, the modes, the background and the underline,
+undercurl, strike, dim and reverse attributes are compared everywhere.
+C's shadow (ghost text) repaints once a server is ready (`ed.c:2690`);
+it is yw11b's, and the rows' config turns it off in both editors. The
+diagnostic list labels a row by the buffer's whole path (`diag.c:639-643`,
+`ed.c:333-340`), so both editors open the same fixed path.
+
+### Rulings asked
+
+- **R-yw11-1 — the language before yw10.** C starts a server only for a
+  buffer with a language (`client.c:1133`), and the language is syn's.
+  (A) port the builtin detection index's path half only, generated from
+  the pin (`tools/gen-syn-paths`, checked by `tools/check-syn-paths`):
+  extensions, exact names and globs, no shebang, no first line, no
+  Fortran scoring, no user definitions; (B) wait for yw10. **Recommend
+  A** (implemented): every `.lu`, `.c`, `.py` and the rest name their
+  language as C's do; a file only a shebang or a user definition would
+  name has none until yw10.
+- **R-yw11-2 — the hung `initialize`.** The contract asks for a deadline
+  and a named message. C has the deadline (the server's
+  `init_timeout_ms`, 60 s by default) and kills the server, but says
+  nothing: the badge loses its ellipsis (`client.c:833-844`). (A) match
+  C (implemented; the row holds the port to C's screen); (B) a message
+  such as `wolf: initialize timed out`, a divergence from C's screen
+  that a golden-free row would accept but sagitta never draws.
+  **Recommend A**; B is a one-line change if wanted, and would want the
+  same in sagitta.
+- **R-yw11-3 — what the oracle rows compare** (above). (A) every cell
+  but the document area's syntax colouring and the frame count, the
+  shadow off in both (implemented); (B) whole snapshots, which waits for
+  yw10. **Recommend A** until yw10 lands, then B: `compare.py` loses
+  two lines.
+- **R-yw11-4 — `lsp_sync.fl`'s list.** (A) it stays in
+  `tools/scripts-deferred.txt` (yw09's partition of the pin's 94 holds
+  at 69 + 25) and yw11a's own step gates it by name (implemented); (B)
+  move it into a gate list and re-partition. **Recommend A.**
+- **R-yw11-5 — `test_lsp_transport` and `test_lsp_life`.** Their C
+  fixtures hand the job layer an ops table for a test owner; the port's
+  framed owner is a server id the job layer matches by kind, so they
+  have no seam to port onto as written. (A) leave them, covered here by
+  `lsp_sync.fl` and the rows' crash, malformed frame, slow and silent
+  initialize and deaf shutdown (implemented); (B) port them through a
+  real `LspServer` fixture with yw11b. **Recommend A now, B in yw11b.**
+
+## Done-when
+
+- [x] The map, with what waits for yw11b and what syn gives (R-yw11-1).
+- [x] sagitta's JSON and JSON-RPC, ported, their unit files red first.
+- [x] The client and the child: configs, roots, the job on pipes, the
+  handshake, shutdown and exit, a crash, a malformed frame, a hang with
+  its deadline (R-yw11-2), through the existing wait (G2).
+- [x] Sync: didOpen, incremental didChange, didSave, didClose, with the
+  server's view held to the buffer after edits, undo and two cursors.
+- [x] Diagnostics drawn as C draws them: gutter, underline, statusline,
+  hint, list, jumps; the eight goldens.
+- [x] The oracle rows, each red before its code, green on macOS and in
+  the Linux gauntlet.
+- [x] Static for PAX: the binary's digest, and the client starting
+  `wolf lsp` in a container holding only it and PAX's musl wolf.
+- **wolf yew opening a `.lu` file shows `wolf lsp`'s diagnostics
+  exactly as C yew shows them, on the same server:** the `lspw_*` rows'
+  screens, cell for cell, syntax colouring aside (R-yw11-3).
