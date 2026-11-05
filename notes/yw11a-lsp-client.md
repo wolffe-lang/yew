@@ -240,7 +240,9 @@ Commits, in order:
     deadline: the server killed, the badge's ellipsis gone, no
     message); a server that answers neither `shutdown` nor `exit`
     (the quit is bounded by the 500 ms wait).
-  - Red against the trunk port: every case `FAIL` by name.
+  - Red against the trunk port: every case `FAIL` by name (the
+    trunk port has no client: no badge, no sign, no list, no saved view
+    answered).
   - Green on macOS: all seventeen screens `same`, both runs of both
     editors stable.
 - **Static for PAX:** `tools/build --static` in the Linux image gives
