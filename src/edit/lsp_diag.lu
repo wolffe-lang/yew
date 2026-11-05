@@ -1,0 +1,935 @@
+//! edit.lsp_diag — diagnostics (Sprint 46): the per-buffer store on
+//! marks, the gutter signs, the underline attributes, the cursor hint,
+//! the diagnostic picker and the jump.
+//!
+//! Ports sagitta `src/mod/lsp/diag.c` (819 lines) and `diag.h` (82) at
+//! 9ace98c2, and the two draw seams C keeps beside the drawing code:
+//! `draw_diag_rows` (`src/ui/draw.c:694-756`) is `draw.lu`'s, and the
+//! cursor hint is called from the footer (`draw.c:1062-1064`).
+//!
+//! **The shape, and why.** C hangs a heap `DiagStore` off each `Buffer`
+//! (`b->diag`) and keeps the picker's rows in a file static. Here the
+//! stores are a list in the `Ed` keyed by buffer id (`ed.diags`, a
+//! buffer without one has none, C's NULL), so `Buffer` keeps its shape;
+//! the picker's state is `ed.diag_pick`, its host kind `PICK_HOST_DIAG`.
+//! A diagnostic's strings are bytes (`code`, `source`, `message`), cut at
+//! 64 KiB as C cuts them; a text that is shown is cut at its first NUL,
+//! as C's `%s` stops there.
+
+use lsp
+use term
+use text
+use util
+
+/// `YEW_DIAG_ERROR` (`diag.h:17-22`).
+pub const DIAG_ERROR: int = 1
+
+/// `YEW_DIAG_WARN`.
+pub const DIAG_WARN: int = 2
+
+/// `YEW_DIAG_INFO`.
+pub const DIAG_INFO: int = 3
+
+/// `YEW_DIAG_HINT`.
+pub const DIAG_HINT: int = 4
+
+/// `YEW_DIAGT_UNNECESSARY` (`diag.h:24-30`).
+pub const DIAGT_UNNECESSARY: int = 1
+
+/// `YEW_DIAGT_DEPRECATED`.
+pub const DIAGT_DEPRECATED: int = 2
+
+/// `YEW_DIAG_STORE_MAX`: above Sprint 46's 10k render gate, bounded
+/// against a hostile publication.
+pub const DIAG_STORE_MAX: int = 16384
+
+/// `YEW_DIAG_STRING_MAX` (`diag.c:19-22`).
+pub const DIAG_STRING_MAX: int = 65536
+
+/// `YEW_DIAG_PICK_MAX`.
+pub const DIAG_PICK_MAX: int = 4096
+
+/// One diagnostic (`Diagnostic`, `diag.h:32-46`).
+pub struct Diagnostic {
+    lo: text.MarkId,
+    hi: text.MarkId,
+    cache_lo: int,
+    cache_hi: int,
+    cache_gen: int,
+    line: int,
+    sev: int,
+    tags: int,
+    server: int,
+    identity: int,
+    code: List[byte],
+    has_code: bool,
+    source: List[byte],
+    has_source: bool,
+    message: List[byte],
+}
+
+/// A buffer's diagnostics (`DiagStore`, `diag.h:50-58`), `n` counted by
+/// severity.
+pub struct DiagStore {
+    buf_id: int,
+    d: List[Diagnostic],
+    n: List[int],
+    gen: int,
+    next_identity: int,
+    version: int,
+    stale: bool,
+}
+
+/// The picker's state (`DiagPickCtx`, `diag.c:29-42`; the file static).
+pub struct DiagPick {
+    ref_buf: List[int],
+    ref_identity: List[int],
+    next_payload: int,
+    workspace: bool,
+    truncated: bool,
+    trunc_warned: bool,
+    title: str,
+    footer: str,
+}
+
+/// An empty picker state.
+pub fn diag_pick_new() -> DiagPick {
+    var rb = List[int]()
+    var ri = List[int]()
+    var i = 0
+    while i < DIAG_PICK_MAX {
+        (mut rb).push(0)
+        (mut ri).push(0)
+        i += 1
+    }
+    DiagPick {
+        ref_buf: rb,
+        ref_identity: ri,
+        next_payload: 0,
+        workspace: false,
+        truncated: false,
+        trunc_warned: false,
+        title: "",
+        footer: "",
+    }
+}
+
+// `yew_diag_store_new` (`diag.c:82-89`).
+fn store_new(buf_id: int) -> DiagStore {
+    DiagStore {
+        buf_id: buf_id,
+        d: List[Diagnostic](),
+        n: [0, 0, 0, 0, 0],
+        gen: 0,
+        next_identity: 1,
+        version: -1,
+        stale: false,
+    }
+}
+
+/// The index in `ed.diags` of buffer `bi`'s store, or -1 (C's NULL).
+pub fn diag_store_of(ed: Ed, bi: int) -> int {
+    if bi < 0 {
+        return -1
+    }
+    let id = ed.bufs[bi].id
+    var s = 0
+    while s < ed.diags.len {
+        if ed.diags[s].buf_id == id {
+            return s
+        }
+        s += 1
+    }
+    -1
+}
+
+// `diagnostic_drop_marks` (`diag.c:72-80`).
+fn drop_marks(mut ed: Ed, bi: int, lo: text.MarkId, hi: text.MarkId) {
+    if !ed.bufs[bi].ec.has_marks {
+        return
+    }
+    if text.mark_alive(ed.bufs[bi].ec.marks, lo) {
+        text.mark_del(mut ed.bufs[bi].ec.marks, lo)
+    }
+    if text.mark_alive(ed.bufs[bi].ec.marks, hi) {
+        text.mark_del(mut ed.bufs[bi].ec.marks, hi)
+    }
+}
+
+/// `yew_diag_store_free` (`diag.c:91-104`).
+pub fn diag_store_free(mut ed: Ed, bi: int) {
+    let s = diag_store_of(ed, bi)
+    if s < 0 {
+        return
+    }
+    var i = 0
+    while i < ed.diags[s].d.len {
+        let lo = copy ed.diags[s].d[i].lo
+        let hi = copy ed.diags[s].d[i].hi
+        drop_marks(mut ed, bi, lo, hi)
+        i += 1
+    }
+    var rest = List[DiagStore]()
+    var k = 0
+    while k < ed.diags.len {
+        if k != s {
+            (mut rest).push(copy ed.diags[k])
+        }
+        k += 1
+    }
+    ed.diags = rest
+}
+
+// `diag_position` (`diag.c:106-118`): the server's encoding, else UTF-16.
+fn diag_position(ed: Ed, bi: int, server: int, j: lsp.Json, position: int) -> int {
+    let raw_line = lsp.json_int(j, lsp.json_field(j, position, "line"), 0)
+    let raw_ch = lsp.json_int(j, lsp.json_field(j, position, "character"), 0)
+    let line = if raw_line < 0 then 0 else raw_line
+    let ch = if raw_ch < 0 then 0 else raw_ch
+    var enc = lsp.POSENC_UTF16
+    let k = lsp_server_index(ed, server)
+    if k >= 0 {
+        enc = ed.lsp.servers[k].life.pos_enc
+    }
+    lsp.lsp_off_of_pos(enc, ed.bufs[bi].ec.tb, line, ch)
+}
+
+// `diag_severity` (`diag.c:120-127`).
+fn diag_severity(j: lsp.Json, v: int) -> int {
+    let sev = lsp.json_int(j, v, DIAG_ERROR)
+    if sev < DIAG_ERROR || sev > DIAG_HINT then DIAG_ERROR else sev
+}
+
+// `diag_tags` (`diag.c:129-145`).
+fn diag_tags(j: lsp.Json, v: int) -> int {
+    if lsp.json_kind(j, v) != lsp.JS_ARR {
+        return 0
+    }
+    var tags = 0
+    var i = 0
+    while i < lsp.json_size(j, v) {
+        let tag = lsp.json_int(j, lsp.json_at(j, v, i), 0)
+        if tag == 1 {
+            tags = tags | DIAGT_UNNECESSARY
+        } else if tag == 2 {
+            tags = tags | DIAGT_DEPRECATED
+        }
+        i += 1
+    }
+    tags
+}
+
+// `diag_order` (`diag.c:147-158`): line, then start, then identity.
+fn diag_less(a: Diagnostic, b: Diagnostic) -> bool {
+    if a.line != b.line {
+        return a.line < b.line
+    }
+    if a.cache_lo != b.cache_lo {
+        return a.cache_lo < b.cache_lo
+    }
+    a.identity < b.identity
+}
+
+// A JSON string's bytes cut at 64 KiB (`arena_copy_json`, `diag.c:44-56`).
+fn copy_json(j: lsp.Json, v: int) -> (bool, List[byte]) {
+    if !lsp.json_is_str(j, v) {
+        return (false, List[byte]())
+    }
+    let at = lsp.json_str_at(j, v)
+    var n = lsp.json_size(j, v)
+    if n > DIAG_STRING_MAX {
+        n = DIAG_STRING_MAX
+    }
+    var out = List[byte]()
+    var i = 0
+    while i < n {
+        (mut out).push(j.bytes[at + i])
+        i += 1
+    }
+    (true, out)
+}
+
+// `arena_copy_code` (`diag.c:58-70`): a string, or an integer's digits.
+fn copy_code(j: lsp.Json, v: int) -> (bool, List[byte]) {
+    let k = lsp.json_kind(j, v)
+    if k == lsp.JS_STR {
+        return copy_json(j, v)
+    }
+    if k != lsp.JS_INT {
+        return (false, List[byte]())
+    }
+    var out = List[byte]()
+    util.buf_append_str(mut out, "{lsp.json_int(j, v, 0)}")
+    (true, out)
+}
+
+fn recount(mut store: DiagStore) {
+    store.n = [0, 0, 0, 0, 0]
+    for d in store.d {
+        store.n[d.sev] = store.n[d.sev] + 1
+    }
+}
+
+/// `yew_diag_replace` (`diag.c:177-277`): server `server`'s diagnostics
+/// for buffer `bi` replaced by `arr`; the other servers' kept; a stale
+/// version refused; the gutter of the focused window refreshed.
+pub fn diag_replace(mut ed: Ed, bi: int, server: int, j: lsp.Json, arr: int, version: int) {
+    if bi < 0 || !ed.bufs[bi].ec.has_marks || lsp.json_kind(j, arr) != lsp.JS_ARR {
+        return
+    }
+    var s = diag_store_of(ed, bi)
+    if s < 0 {
+        (mut ed.diags).push(store_new(ed.bufs[bi].id))
+        s = ed.diags.len - 1
+    }
+    if version >= 0 && ed.diags[s].version >= 0 && version < ed.diags[s].version {
+        return
+    }
+    var next = List[Diagnostic]()
+    var i = 0
+    while i < ed.diags[s].d.len {
+        let old = copy ed.diags[s].d[i]
+        if old.server == server || next.len >= DIAG_STORE_MAX {
+            drop_marks(mut ed, bi, old.lo, old.hi)
+        } else {
+            (mut next).push(old)
+        }
+        i += 1
+    }
+    let count = lsp.json_size(j, arr)
+    i = 0
+    while i < count && next.len < DIAG_STORE_MAX {
+        let item = lsp.json_at(j, arr, i)
+        i += 1
+        if lsp.json_kind(j, item) != lsp.JS_OBJ {
+            continue
+        }
+        let range = lsp.json_field(j, item, "range")
+        let start = lsp.json_field(j, range, "start")
+        let end = lsp.json_field(j, range, "end")
+        let (has_msg, message) = copy_json(j, lsp.json_field(j, item, "message"))
+        if lsp.json_kind(j, range) != lsp.JS_OBJ ||
+            lsp.json_kind(j, start) != lsp.JS_OBJ ||
+            lsp.json_kind(j, end) != lsp.JS_OBJ ||
+            !has_msg {
+            continue
+        }
+        let lo = diag_position(ed, bi, server, j, start)
+        var hi = diag_position(ed, bi, server, j, end)
+        if hi < lo {
+            hi = lo
+        }
+        let mlo = text.mark_add(mut ed.bufs[bi].ec.marks, lo as text.ByteOff, text.BIAS_LEFT)
+        let mhi = text.mark_add(mut ed.bufs[bi].ec.marks, hi as text.ByteOff, text.BIAS_RIGHT)
+        let identity = ed.diags[s].next_identity
+        ed.diags[s].next_identity = if identity + 1 > 4294967295 then 1 else identity + 1
+        let (has_code, code) = copy_code(j, lsp.json_field(j, item, "code"))
+        let (has_source, source) = copy_json(j, lsp.json_field(j, item, "source"))
+        (mut next).push(Diagnostic {
+            lo: mlo,
+            hi: mhi,
+            cache_lo: lo,
+            cache_hi: hi,
+            cache_gen: ed.bufs[bi].ec.tb.gen,
+            line: text.textbuf_line_of(ed.bufs[bi].ec.tb, lo as text.ByteOff) as int,
+            sev: diag_severity(j, lsp.json_field(j, item, "severity")),
+            tags: diag_tags(j, lsp.json_field(j, item, "tags")),
+            server: server,
+            identity: identity,
+            code: code,
+            has_code: has_code,
+            source: source,
+            has_source: has_source,
+            message: message,
+        })
+    }
+    if i < count {
+        util.log_warn(
+            "LSP diagnostics: server {server} published {count} entries; keeping at most {DIAG_STORE_MAX}",
+        )
+    }
+    if next.len > 1 {
+        util.sort_stable(mut next, diag_less)
+    }
+    ed.diags[s].d = next
+    recount(mut ed.diags[s])
+    if version < 0 {
+        // Without a wire version, the only state provably stale is a local
+        // generation the server has not seen at the last flush.
+        let (k, d) = lsp_doc_of_buffer(ed, bi)
+        ed.diags[s].stale = k < 0 || ed.lsp.servers[k].docv[d].sent_gen != ed.bufs[bi].ec.tb.gen
+    } else {
+        ed.diags[s].stale = false
+        ed.diags[s].version = version
+    }
+    ed.diags[s].gen += 1
+    diag_refresh_view(mut ed, ed.win)
+    ed.full_damage = true
+    ed.footer_dirty = true
+}
+
+// `diagnostic_span` (`diag.c:279-300`): the cached range, re-read from the
+// marks when the text moved.
+fn diag_cached(mut ed: Ed, bi: int, s: int, i: int) -> text.Span {
+    let gen = ed.bufs[bi].ec.tb.gen
+    if ed.diags[s].d[i].cache_gen == gen {
+        return text.Span { lo: ed.diags[s].d[i].cache_lo, hi: ed.diags[s].d[i].cache_hi }
+    }
+    let lo_id = copy ed.diags[s].d[i].lo
+    let hi_id = copy ed.diags[s].d[i].hi
+    if !text.mark_alive(ed.bufs[bi].ec.marks, lo_id) ||
+        !text.mark_alive(ed.bufs[bi].ec.marks, hi_id) {
+        return text.Span { lo: 0, hi: 0 }
+    }
+    var lo = text.mark_pos(ed.bufs[bi].ec.marks, lo_id) as int
+    var hi = text.mark_pos(ed.bufs[bi].ec.marks, hi_id) as int
+    let len = text.textbuf_len(ed.bufs[bi].ec.tb)
+    if lo > len {
+        lo = len
+    }
+    if hi < lo {
+        hi = lo
+    }
+    if hi > len {
+        hi = len
+    }
+    ed.diags[s].d[i].cache_lo = lo
+    ed.diags[s].d[i].cache_hi = hi
+    ed.diags[s].d[i].line = text.textbuf_line_of(ed.bufs[bi].ec.tb, lo as text.ByteOff) as int
+    ed.diags[s].d[i].cache_gen = gen
+    text.Span { lo: lo, hi: hi }
+}
+
+/// `yew_diag_at_line` (`diag.c:302-323`): how many of buffer `bi`'s
+/// diagnostics start on `line`.
+pub fn diag_count_at_line(mut ed: Ed, bi: int, line: int) -> int {
+    let s = diag_store_of(ed, bi)
+    if s < 0 {
+        return 0
+    }
+    var found = 0
+    var i = 0
+    while i < ed.diags[s].d.len {
+        let _ = diag_cached(mut ed, bi, s, i)
+        if ed.diags[s].d[i].line == line {
+            found += 1
+        }
+        i += 1
+    }
+    found
+}
+
+// `visible_span` (`diag.c:325-338`): an empty range shows one grapheme.
+fn diag_visible(mut ed: Ed, bi: int, s: int, i: int) -> text.Span {
+    var sp = diag_cached(mut ed, bi, s, i)
+    let len = text.textbuf_len(ed.bufs[bi].ec.tb)
+    if sp.lo != sp.hi {
+        return sp
+    }
+    if sp.lo < len {
+        sp.hi = text.grapheme_next_boundary(ed.bufs[bi].ec.tb, sp.lo as text.ByteOff) as int
+    } else if sp.lo != 0 {
+        sp.lo = text.grapheme_prev_boundary(mut ed.bufs[bi].ec.tb, sp.lo as text.ByteOff) as int
+    }
+    sp
+}
+
+/// `yew_diag_span` (`diag.c:340-345`): diagnostic `i` of buffer `bi`'s
+/// store `s`, as drawn.
+pub fn diag_span(mut ed: Ed, bi: int, s: int, i: int) -> text.Span {
+    diag_visible(mut ed, bi, s, i)
+}
+
+/// `yew_diag_at_point` (`diag.c:347-366`): the most severe diagnostic
+/// covering `point`, or -1.
+pub fn diag_at_point(mut ed: Ed, bi: int, point: int) -> int {
+    let s = diag_store_of(ed, bi)
+    if s < 0 {
+        return -1
+    }
+    var best = -1
+    var i = 0
+    while i < ed.diags[s].d.len {
+        let sp = diag_visible(mut ed, bi, s, i)
+        if point >= sp.lo && point < sp.hi {
+            if best < 0 || ed.diags[s].d[i].sev < ed.diags[s].d[best].sev {
+                best = i
+            }
+        }
+        i += 1
+    }
+    best
+}
+
+/// `yew_diag_glyph` (`diag.c:368-378`): ✗ ▲ ● ·.
+pub fn diag_glyph(sev: int) -> str {
+    match sev {
+        1 => "\u{2717}",
+        2 => "\u{25b2}",
+        3 => "\u{25cf}",
+        4 => "\u{b7}",
+        _ => "",
+    }
+}
+
+/// `yew_diag_role` (`diag.c:380-387`).
+pub fn diag_role(sev: int) -> str {
+    match sev {
+        1 => "diag.error",
+        2 => "diag.warn",
+        3 => "diag.info",
+        4 => "diag.hint",
+        _ => "",
+    }
+}
+
+/// `yew_diag_attrs` (`diag.c:389-411`): undercurl on a truecolor terminal
+/// for an error or a warning, else underline; the underline's colour by
+/// severity; dim for unnecessary, strike for deprecated.
+pub fn diag_attrs(sev: int, tags: int, truecolor: bool) -> int {
+    var attrs = 0
+    if sev == DIAG_ERROR || sev == DIAG_WARN {
+        attrs = if truecolor then term.ATTR_UNDERCURL else term.ATTR_UNDERLINE
+    } else if sev == DIAG_INFO {
+        attrs = term.ATTR_UNDERLINE
+    }
+    if sev == DIAG_ERROR {
+        attrs = attrs | term.CELL_UL_ERROR
+    } else if sev == DIAG_WARN {
+        attrs = attrs | term.CELL_UL_WARN
+    } else if sev == DIAG_INFO {
+        attrs = attrs | term.CELL_UL_INFO
+    }
+    if tags & DIAGT_UNNECESSARY != 0 {
+        attrs = attrs | term.ATTR_DIM
+    }
+    if tags & DIAGT_DEPRECATED != 0 {
+        attrs = attrs | term.ATTR_STRIKE
+    }
+    attrs
+}
+
+/// `yew_diag_msg_sev` (`diag.c:413-417`).
+pub fn diag_msg_sev(sev: int) -> int {
+    if sev == DIAG_ERROR then MSG_ERROR else if sev == DIAG_WARN then MSG_WARN else MSG_INFO
+}
+
+/// `yew_diag_refresh_view` (`diag.c:419-455`): window `wi`'s diagnostic
+/// signs, one per line, the most severe; dim while the store is stale.
+pub fn diag_refresh_view(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len {
+        return
+    }
+    let bi = ed.wins[wi].buf
+    if bi < 0 || bi >= ed.bufs.len {
+        return
+    }
+    gutter_sign_clear_kind(
+        mut ed.wins[wi],
+        0,
+        text.textbuf_line_count(ed.bufs[bi].ec.tb),
+        SIGN_DIAG,
+    )
+    let s = diag_store_of(ed, bi)
+    if s < 0 {
+        return
+    }
+    var i = 0
+    while i < ed.diags[s].d.len {
+        let _ = diag_cached(mut ed, bi, s, i)
+        let line = ed.diags[s].d[i].line
+        var best = i
+        var k = i + 1
+        while k < ed.diags[s].d.len {
+            let _ = diag_cached(mut ed, bi, s, k)
+            if ed.diags[s].d[k].line != line {
+                break
+            }
+            if ed.diags[s].d[k].sev < ed.diags[s].d[best].sev {
+                best = k
+            }
+            k += 1
+        }
+        let sev = ed.diags[s].d[best].sev
+        let attrs = if ed.diags[s].stale then term.ATTR_DIM else 0
+        gutter_sign_set(
+            mut ed.wins[wi],
+            line,
+            SIGN_DIAG,
+            gutter_sign(diag_glyph(sev), diag_role(sev), attrs),
+        )
+        i = k
+    }
+}
+
+// Bytes as a `str`, cut at the first NUL (C's `%s`).
+fn shown_text(b: List[byte]) -> str {
+    var cut = List[byte]()
+    for x in b {
+        if x as int == 0 {
+            break
+        }
+        (mut cut).push(x)
+    }
+    str_from_utf8(cut) else "?"
+}
+
+/// `yew_diag_cursor_hint` (`diag.c:457-499`): the diagnostic under the
+/// primary cursor as the message line's hint.
+pub fn diag_cursor_hint(mut ed: Ed, wi: int) {
+    if wi < 0 ||
+        wi >= ed.wins.len ||
+        ed.wins[wi].cs.curs.len == 0 ||
+        ed.wins[wi].cs.primary >= ed.wins[wi].cs.curs.len {
+        ed_msg_hint_clear(mut ed)
+        return
+    }
+    let bi = ed.wins[wi].buf
+    let pos = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    let i = diag_at_point(mut ed, bi, pos)
+    if i < 0 {
+        ed_msg_hint_clear(mut ed)
+        return
+    }
+    let s = diag_store_of(ed, bi)
+    let line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff) as int
+    let count = diag_count_at_line(mut ed, bi, line)
+    let d = copy ed.diags[s].d[i]
+    let letter = if d.sev == DIAG_ERROR {
+        "E"
+    } else if d.sev == DIAG_WARN {
+        "W"
+    } else if d.sev == DIAG_INFO {
+        "I"
+    } else {
+        "H"
+    }
+    let suffix = if count > 1 then " (+{count - 1} more)" else ""
+    let source = if d.has_source then " [{shown_text(d.source)}]" else ""
+    let code = if d.has_code then " ({shown_text(d.code)})" else ""
+    ed_msg_hint(
+        mut ed,
+        diag_msg_sev(d.sev),
+        "{letter} {diag_glyph(d.sev)}{source} {shown_text(d.message)}{code}{suffix}",
+    )
+}
+
+// `pick_payload` (`diag.c:532-545`): the next unused payload, the counter
+// kept across openings (C's static).
+fn pick_payload(mut ed: Ed, mut used: List[bool]) -> int {
+    var attempts = 0
+    while attempts < DIAG_PICK_MAX {
+        let payload = ed.diag_pick.next_payload % DIAG_PICK_MAX
+        ed.diag_pick.next_payload += 1
+        if !used[payload] {
+            used[payload] = true
+            return payload
+        }
+        attempts += 1
+    }
+    bug("diagnostic picker payload table exhausted")
+    0
+}
+
+// A candidate row (`DiagCandidate`, `diag.c:44-47`): buffer, store, index.
+struct DiagCand {
+    bi: int,
+    s: int,
+    i: int,
+    sev: int,
+    label: str,
+    line: int,
+    identity: int,
+}
+
+// `strcmp(a, b) < 0` over the bytes.
+fn label_less(a: str, b: str) -> bool {
+    let n = if a.len < b.len then a.len else b.len
+    var i = 0
+    while i < n {
+        let x = a.bytes()[i] as int
+        let y = b.bytes()[i] as int
+        if x != y {
+            return x < y
+        }
+        i += 1
+    }
+    a.len < b.len
+}
+
+// `candidate_order` (`diag.c:516-530`): severity, label, line, identity.
+fn cand_less(a: DiagCand, b: DiagCand) -> bool {
+    if a.sev != b.sev {
+        return a.sev < b.sev
+    }
+    if a.label != b.label {
+        return label_less(a.label, b.label)
+    }
+    if a.line != b.line {
+        return a.line < b.line
+    }
+    a.identity < b.identity
+}
+
+// `diag_list_scope` (`diag.c:547-623`): the rows for one buffer or the
+// workspace, the selection's payload kept by identity.
+fn diag_list_scope(
+    mut ed: Ed,
+    only: int,
+    keep_buf: int,
+    keep_identity: int,
+    keep_payload: int,
+) -> List[PickItem] {
+    var cands = List[DiagCand]()
+    var omitted = 0
+    var bi = 0
+    while bi < ed.bufs.len {
+        let s = diag_store_of(ed, bi)
+        if only >= 0 && bi != only || s < 0 {
+            bi += 1
+            continue
+        }
+        var i = 0
+        while i < ed.diags[s].d.len {
+            if cands.len < DIAG_PICK_MAX {
+                (mut cands).push(DiagCand {
+                    bi: bi,
+                    s: s,
+                    i: i,
+                    sev: ed.diags[s].d[i].sev,
+                    label: buf_label(ed.bufs[bi]),
+                    line: ed.diags[s].d[i].line,
+                    identity: ed.diags[s].d[i].identity,
+                })
+            } else {
+                omitted += 1
+            }
+            i += 1
+        }
+        bi += 1
+    }
+    if cands.len > 1 {
+        util.sort_stable(mut cands, cand_less)
+    }
+    var used = List[bool]()
+    var u = 0
+    while u < DIAG_PICK_MAX {
+        (mut used).push(false)
+        u += 1
+    }
+    var keep_present = false
+    if keep_payload >= 0 && keep_payload < DIAG_PICK_MAX {
+        for c in cands {
+            if ed.bufs[c.bi].id == keep_buf && c.identity == keep_identity {
+                keep_present = true
+                used[keep_payload] = true
+                break
+            }
+        }
+    }
+    var rows = List[PickItem]()
+    for c in cands {
+        let sp = diag_cached(mut ed, c.bi, c.s, c.i)
+        let line = text.textbuf_line_of(ed.bufs[c.bi].ec.tb, sp.lo as text.ByteOff) as int
+        let line_span = text.textbuf_line_span(ed.bufs[c.bi].ec.tb, line as text.LineNo)
+        let col = text.off_to_gcol(mut ed.bufs[c.bi].ec.tb, line_span, sp.lo as text.ByteOff) as int
+        let bid = ed.bufs[c.bi].id
+        let payload = if keep_present && bid == keep_buf && c.identity == keep_identity {
+            keep_payload
+        } else {
+            pick_payload(mut ed, mut used)
+        }
+        let d = copy ed.diags[c.s].d[c.i]
+        let label = "{buf_label(ed.bufs[c.bi])}:{line + 1}:{col + 1}  {diag_glyph(d.sev)} {shown_text(d.message)}"
+        (mut rows).push(pick_item(label, payload, 0))
+        ed.diag_pick.ref_buf[payload] = bid
+        ed.diag_pick.ref_identity[payload] = c.identity
+    }
+    ed.diag_pick.truncated = omitted != 0
+    rows
+}
+
+/// `yew_diag_list` (`diag.c:625-628`): the workspace's rows.
+pub fn diag_list(mut ed: Ed) -> List[PickItem] {
+    diag_list_scope(mut ed, -1, 0, 0, -1)
+}
+
+fn diag_footer(truncated: bool) -> str {
+    if truncated {
+        "tab scope . enter jump . first 4096 shown"
+    } else {
+        "tab scope . enter jump . esc"
+    }
+}
+
+fn find_identity(ed: Ed, bi: int, identity: int) -> (int, int) {
+    let s = diag_store_of(ed, bi)
+    if s < 0 {
+        return (-1, -1)
+    }
+    var i = 0
+    while i < ed.diags[s].d.len {
+        if ed.diags[s].d[i].identity == identity {
+            return (s, i)
+        }
+        i += 1
+    }
+    (-1, -1)
+}
+
+// The primary cursor of window `wi` moved to `pos` as a jump.
+fn diag_jump_to(mut ed: Ed, wi: int, pos: int) {
+    let p = ed.wins[wi].cs.primary
+    ed.wins[wi].cs.curs[p].pos = pos
+    ed.wins[wi].cs.curs[p].anchor = pos
+    ed.wins[wi].cs.curs[p].goal_col = 0
+    let b = ed.wins[wi].buf
+    vp_follow(mut ed.wins[wi], ed.bufs[b].ec.tb)
+    ed.full_damage = true
+}
+
+// `diag_pick_accept` (`diag.c:648-672`).
+fn diag_pick_accept(mut ed: Ed, payload: int) -> bool {
+    if payload < 0 || payload >= DIAG_PICK_MAX {
+        return false
+    }
+    let bi = ed_buf_index(ed, ed.diag_pick.ref_buf[payload])
+    if bi < 0 {
+        return false
+    }
+    let (s, i) = find_identity(ed, bi, ed.diag_pick.ref_identity[payload])
+    if s < 0 {
+        return false
+    }
+    if ed.wins[ed.win].buf != bi {
+        ed_show_buffer(mut ed, bi)
+    }
+    let w = ed.win
+    let from = ed.wins[w].cs.curs[ed.wins[w].cs.primary].pos
+    jump_push(mut ed, w, from, ed.now_ms)
+    let sp = diag_visible(mut ed, bi, s, i)
+    diag_jump_to(mut ed, w, sp.lo)
+    true
+}
+
+// `diag_pick_action` (`diag.c:674-705`): Tab flips the scope, keeping
+// the selected row by identity.
+fn diag_pick_action(mut ed: Ed, payload: int) -> bool {
+    var keep_buf = 0
+    var keep_identity = 0
+    var keep = -1
+    if payload >= 0 && payload < DIAG_PICK_MAX {
+        keep_buf = ed.diag_pick.ref_buf[payload]
+        keep_identity = ed.diag_pick.ref_identity[payload]
+        keep = payload
+    }
+    ed.diag_pick.workspace = !ed.diag_pick.workspace
+    let only = if ed.diag_pick.workspace || ed.win < 0 then -1 else ed.wins[ed.win].buf
+    let rows = diag_list_scope(mut ed, only, keep_buf, keep_identity, keep)
+    ed.diag_pick.title = if ed.diag_pick.workspace {
+        "Diagnostics (workspace)"
+    } else {
+        "Diagnostics (buffer)"
+    }
+    ed.diag_pick.footer = diag_footer(ed.diag_pick.truncated)
+    if ed.diag_pick.truncated && !ed.diag_pick.trunc_warned {
+        util.log_warn("diagnostic picker showing only the first {DIAG_PICK_MAX} entries")
+        ed.diag_pick.trunc_warned = true
+    }
+    ed.picker.items = rows
+    ed.picker.title = ed.diag_pick.title
+    ed.picker.footer = ed.diag_pick.footer
+    ed.picker.has_footer = true
+    picker_refilter(mut ed)
+    ed.full_damage = true
+    true
+}
+
+/// The diagnostic picker's host (`PICK_HOST_DIAG`): accept, and Tab.
+pub fn diag_pick_host(mut ed: Ed, call: int, payload: int, kch: int) -> PkAnswer {
+    if call == PK_ACCEPT {
+        return PkAnswer { ok: diag_pick_accept(mut ed, payload), text: "" }
+    }
+    if call == PK_ACTION && kch == PK_KEY_TAB {
+        return PkAnswer { ok: diag_pick_action(mut ed, payload), text: "" }
+    }
+    pk_no()
+}
+
+/// `yew_diag_picker_open` (`diag.c:707-739`): the focused buffer's
+/// diagnostics, Tab for the workspace's.
+pub fn diag_picker_open(mut ed: Ed) {
+    ed.diag_pick.workspace = false
+    ed.diag_pick.trunc_warned = false
+    let only = if ed.win < 0 then -1 else ed.wins[ed.win].buf
+    let rows = diag_list_scope(mut ed, only, 0, 0, -1)
+    ed.diag_pick.title = "Diagnostics (buffer)"
+    ed.diag_pick.footer = diag_footer(ed.diag_pick.truncated)
+    if ed.diag_pick.truncated {
+        util.log_warn("diagnostic picker showing only the first {DIAG_PICK_MAX} entries")
+        ed.diag_pick.trunc_warned = true
+    }
+    var spec = picker_spec(PICK_HOST_DIAG, ed.diag_pick.title, take rows)
+    spec.has_action = true
+    spec.footer = ed.diag_pick.footer
+    spec.has_footer = true
+    picker_open(mut ed, spec)
+}
+
+/// `yew_diag_jump` (`diag.c:741-779`): the next (or previous) diagnostic
+/// from the primary cursor, wrapping; false when the buffer has none.
+pub fn diag_jump(mut ed: Ed, wi: int, forward: bool) -> bool {
+    if wi < 0 || wi >= ed.wins.len {
+        return false
+    }
+    let bi = ed.wins[wi].buf
+    let s = diag_store_of(ed, bi)
+    if s < 0 || ed.wins[wi].cs.curs.len == 0 || ed.wins[wi].cs.primary >= ed.wins[wi].cs.curs.len {
+        return false
+    }
+    let n = ed.diags[s].d.len
+    if n == 0 {
+        return false
+    }
+    let here = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    var target = -1
+    if forward {
+        var i = 0
+        while i < n {
+            if diag_visible(mut ed, bi, s, i).lo > here {
+                target = i
+                break
+            }
+            i += 1
+        }
+        if target < 0 {
+            target = 0
+        }
+    } else {
+        var i = n
+        while i > 0 {
+            if diag_visible(mut ed, bi, s, i - 1).lo < here {
+                target = i - 1
+                break
+            }
+            i -= 1
+        }
+        if target < 0 {
+            target = n - 1
+        }
+    }
+    jump_push(mut ed, wi, here, ed.now_ms)
+    let sp = diag_visible(mut ed, bi, s, target)
+    diag_jump_to(mut ed, wi, sp.lo)
+    true
+}
+
+/// The store's counts of errors and warnings for buffer `bi` (the
+/// statusline's `E:` and `W:`).
+pub fn diag_counts(ed: Ed, bi: int) -> (int, int) {
+    let s = diag_store_of(ed, bi)
+    if s < 0 {
+        return (0, 0)
+    }
+    (ed.diags[s].n[DIAG_ERROR], ed.diags[s].n[DIAG_WARN])
+}
