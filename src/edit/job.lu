@@ -471,6 +471,10 @@ pub const FRAMED_NONE: int = 0
 /// The persistent shell session's link (`shsession.c`'s `link_ops`).
 pub const FRAMED_SESSION: int = 1
 
+/// A language server's JSON-RPC connection (`mod/lsp/client.c:817-834`,
+/// yw11): the owner is the server's id (`framed_owner`).
+pub const FRAMED_LSP: int = 2
+
 /// No stream owner.
 pub const STREAM_NONE: int = 0
 
@@ -530,6 +534,7 @@ pub struct JobSpec {
     has_env_base: bool,
     inherit_tty: bool,
     framed: int,
+    framed_owner: int,
     stream: int,
     callback: int,
     cb_key: str,
@@ -564,6 +569,7 @@ pub fn job_spec_new() -> JobSpec {
         has_env_base: false,
         inherit_tty: false,
         framed: FRAMED_NONE,
+        framed_owner: 0,
         stream: STREAM_NONE,
         callback: CB_NONE,
         cb_key: "",
@@ -597,6 +603,7 @@ pub struct Job {
     collect_max: int,
     framed_err: List[byte],
     framed: int,
+    framed_owner: int,
     stream_err: List[byte],
     stream: int,
     callback: int,
@@ -656,6 +663,7 @@ fn jb_job_new() -> Job {
         collect_max: JOB_COLLECT_MAX,
         framed_err: List[byte](),
         framed: FRAMED_NONE,
+        framed_owner: 0,
         stream_err: List[byte](),
         stream: STREAM_NONE,
         callback: CB_NONE,
@@ -1263,6 +1271,7 @@ pub fn job_spawn(mut ed: Ed, mut spec: JobSpec) -> (int, str) {
     j.internal = spec.internal
     j.evictable = spec.evictable
     j.framed = spec.framed
+    j.framed_owner = spec.framed_owner
     j.stream = spec.stream
     j.callback = spec.callback
     j.cb_key = spec.cb_key
@@ -1297,6 +1306,11 @@ pub fn job_spawn(mut ed: Ed, mut spec: JobSpec) -> (int, str) {
         j.in_fd = in_w2
         j.out_fd = out_r
         j.err_fd = err_r
+        // The language server's stdin is written non-blocking, as C's
+        // framed writer (`job.c:1726-1755`, G30's 0.2.35 surface).
+        if j.framed == FRAMED_LSP {
+            fs_set_nonblock(in_w2, true) else |_| {}
+        }
     }
     // No stdin to write closes it at once: a child whose read never sees
     // EOF is this subsystem's signature hang (`job.c:1318-1321`).
@@ -1373,6 +1387,7 @@ fn jb_proxy_signal(mut ed: Ed, id: int, meaning: int) -> bool {
 fn jb_framed_feed(mut ed: Ed, i: int, bytes: List[byte]) -> bool {
     match ed.jobs.v[i].framed {
         1 => shsession_link_feed(mut ed, ed.jobs.v[i].id, bytes),
+        2 => lsp_framed_feed(mut ed, ed.jobs.v[i].framed_owner, bytes), // FRAMED_LSP
         _ => true,
     }
 }
@@ -1380,7 +1395,43 @@ fn jb_framed_feed(mut ed: Ed, i: int, bytes: List[byte]) -> bool {
 fn jb_framed_finish(mut ed: Ed, i: int) -> bool {
     match ed.jobs.v[i].framed {
         1 => shsession_link_finish(mut ed, ed.jobs.v[i].id),
+        2 => lsp_framed_finish(mut ed, ed.jobs.v[i].framed_owner), // FRAMED_LSP
         _ => true,
+    }
+}
+
+/// `job_write_framed` (`job.c:1726-1755`): the owner's queued bytes
+/// written to the child's stdin until the pipe is full or a turn's budget
+/// is spent; a write error closes stdin and fails the transport.
+pub fn job_write_framed(mut ed: Ed, i: int) {
+    if i < 0 || ed.jobs.v[i].framed != FRAMED_LSP || ed.jobs.v[i].in_fd < 0 {
+        return
+    }
+    let sid = ed.jobs.v[i].framed_owner
+    var sent = 0
+    while sent < JOB_READ_BUDGET {
+        let chunk = lsp_framed_tx_chunk(ed, sid, JOB_READ_BUDGET - sent)
+        if chunk.len == 0 {
+            return
+        }
+        let n = fs_write_some(ed.jobs.v[i].in_fd, chunk) else |e| match e {
+            busy => { return },
+            invalid => {
+                ed.jobs.v[i].framed_failed = true
+                ed.jobs.v[i].in_fd = jb_close_fd(ed.jobs.v[i].in_fd)
+                return
+            },
+            io => {
+                ed.jobs.v[i].framed_failed = true
+                ed.jobs.v[i].in_fd = jb_close_fd(ed.jobs.v[i].in_fd)
+                return
+            },
+        }
+        if n == 0 {
+            return
+        }
+        lsp_framed_tx_consume(mut ed, sid, n)
+        sent += n
     }
 }
 
@@ -1391,6 +1442,7 @@ fn jb_framed_destroy(mut ed: Ed, i: int) {
     ed.jobs.v[i].framed_destroyed = true
     match ed.jobs.v[i].framed {
         1 => shsession_link_destroy(mut ed, ed.jobs.v[i].id),
+        2 => lsp_framed_destroy(mut ed, ed.jobs.v[i].framed_owner), // FRAMED_LSP
         _ => {},
     }
 }
@@ -1612,7 +1664,15 @@ pub fn job_fds_refresh(mut ed: Ed) {
     var n = 0
     var i = 0
     while i < ed.jobs.v.len {
-        for fd in [ed.jobs.v[i].out_fd, ed.jobs.v[i].err_fd] {
+        // A language server's stdin with bytes queued is waited on for
+        // write readiness (bit 62, C's POLLOUT row, `job.c:1366-1378`).
+        var wfd = -1
+        if ed.jobs.v[i].framed == FRAMED_LSP &&
+            ed.jobs.v[i].in_fd >= 0 &&
+            lsp_framed_tx_len(ed, ed.jobs.v[i].framed_owner) != 0 {
+            wfd = ed.jobs.v[i].in_fd + 4611686018427387904
+        }
+        for fd in [ed.jobs.v[i].out_fd, ed.jobs.v[i].err_fd, wfd] {
             if fd >= 0 {
                 if n < ed.jobs.fds.len {
                     ed.jobs.fds[n] = fd
@@ -1858,6 +1918,15 @@ fn jb_read_once(mut ed: Ed, i: int, is_err: bool, want: int) -> int {
 /// zero-deadline ask answers instead is kept for the turn's reap.
 pub fn job_pump(mut ed: Ed) {
     job_pump_except(mut ed, -1)
+    // The framed writers (`yew_job_pump`'s POLLOUT row, `job.c:1781-
+    // 1786`): non-blocking, so a stdin that cannot take more answers busy.
+    var i = 0
+    while i < ed.jobs.v.len {
+        if ed.jobs.v[i].framed == FRAMED_LSP {
+            job_write_framed(mut ed, i)
+        }
+        i += 1
+    }
 }
 
 /// `job_pump` past descriptor `skip`, which this turn's caller read itself
@@ -2026,6 +2095,15 @@ pub fn job_settle(mut ed: Ed) -> int {
 pub fn job_deadline(ed: Ed, now: int) -> int {
     var best = -1
     for j in ed.jobs.v {
+        if j.state == JOB_RUNNING && j.sink == SINK_FRAMED && j.framed == FRAMED_LSP {
+            let fat = lsp_framed_deadline(ed, j.framed_owner)
+            if fat >= 0 && fat <= now {
+                return 0
+            }
+            if fat >= 0 && (best < 0 || fat - now < best) {
+                best = fat - now
+            }
+        }
         if j.state == JOB_RUNNING && j.sink == SINK_STREAM {
             let sat = jb_stream_deadline(ed, j)
             if sat >= 0 && sat <= now {
@@ -2088,6 +2166,9 @@ pub fn job_tick(mut ed: Ed, now: int) {
             i += 1
             continue
         }
+        if ed.jobs.v[i].sink == SINK_FRAMED && ed.jobs.v[i].framed == FRAMED_LSP {
+            lsp_framed_tick(mut ed, ed.jobs.v[i].framed_owner, now)
+        }
         if ed.jobs.v[i].sink == SINK_STREAM {
             jb_stream_tick(mut ed, i, now)
         }
@@ -2110,16 +2191,17 @@ pub fn job_tick(mut ed: Ed, now: int) {
 /// `yew_loop_settle_jobs`), and one table refresh and footer redraw a
 /// turn however many jobs changed.
 pub fn job_turn(mut ed: Ed, now: int) {
-    if ed.jobs.v.len == 0 && !ed.jobs.child_seen {
-        return
+    if ed.jobs.v.len != 0 || ed.jobs.child_seen {
+        job_pump(mut ed)
+        if ed.jobs.child_seen {
+            job_reap(mut ed)
+        }
+        job_tick(mut ed, now)
+        let _ = job_settle(mut ed)
+        shsession_settle(mut ed)
     }
-    job_pump(mut ed)
-    if ed.jobs.child_seen {
-        job_reap(mut ed)
-    }
-    job_tick(mut ed, now)
-    let _ = job_settle(mut ed)
-    shsession_settle(mut ed)
+    // `yew_lsp_pump` (`loop.c:614`), every turn: it starts servers.
+    lsp_pump(mut ed)
     if ed.jobs.dirty {
         ed.jobs.dirty = false
         jobs_table_refresh(mut ed)
