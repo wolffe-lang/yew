@@ -18,7 +18,7 @@
       take their hosts from it, read with a default, with no host list of
       their own; `unit` (the Linux unit lanes in six shards, yw09) and `fuzz`
       (the Linux fuzzers in five families, yw09) need it and run on ubuntu;
-      `macos-unit` (yw14: the macOS unit lanes in four shards) needs it and
+      `macos-unit` (yw14: the macOS unit lanes in eight shards, 180 minutes each) needs it and
       runs on macOS exactly where the port's macOS leg runs, the port job
       running neither lane; both unit jobs build C's fake clipboard tool first
       and prove no clipboard row SKIPped for it last (yew#42); and
@@ -138,15 +138,19 @@ say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-latest$", un,
     and "        shard: [1, 2, 3, 4, 5, 6]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/6\n" in un
     and "run: tools/check-test --native --shard ${{ matrix.shard }}/6\n" in un,
     "L4 unit needs the legs and runs both unit lanes in six shards on ubuntu")
-# yw14 (yew#49): the macOS unit lanes left the port job for macos-unit, four
-# shards on macOS, run exactly where the port's macOS leg runs.
+# yw14 (yew#49): the macOS unit lanes left the port job for macos-unit, eight
+# round-robin shards on macOS (the partition the Linux unit job uses), run
+# exactly where the port's macOS leg runs, each capped at 180 minutes: at
+# least twice its measured time (run 41916949246's per-file times put the
+# longest eight-way shard at about 78 minutes).
 mu = blocks.get("macos-unit", "")
 say("    needs: legs\n" in mu and re.search(r"^    runs-on: macos-latest$", mu, re.M) is not None
     and "    if: ${{ contains(needs.legs.outputs.matrix_port, 'macos-latest') }}\n" in mu
-    and "        shard: [1, 2, 3, 4]\n" in mu and "run: tools/check-test --shard ${{ matrix.shard }}/4\n" in mu
-    and "run: tools/check-test --native --shard ${{ matrix.shard }}/4\n" in mu
+    and "        shard: [1, 2, 3, 4, 5, 6, 7, 8]\n" in mu and "run: tools/check-test --shard ${{ matrix.shard }}/8\n" in mu
+    and "run: tools/check-test --native --shard ${{ matrix.shard }}/8\n" in mu
+    and "    timeout-minutes: 180\n" in mu
     and not re.search(r"tools/check-test( --native)?$", blocks["port"], re.M),
-    "L4 macos-unit needs the legs and runs both unit lanes in four shards on macOS, where the port's macOS leg runs; the port job runs neither")
+    "L4 macos-unit needs the legs and runs both unit lanes in eight shards on macOS, capped at 180 minutes, where the port's macOS leg runs; the port job runs neither")
 # yw14 (yew#42): every unit lane builds C's fake clipboard tool and then
 # proves no clipboard row SKIPped for want of it.
 say(all("run: tools/build-fakeclip --cc " in b and b.index("tools/build-fakeclip") < b.index("tools/check-test --shard")
