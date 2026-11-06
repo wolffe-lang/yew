@@ -1,0 +1,1362 @@
+//! edit.lsp_rename — rename as a multi-buffer transaction (Sprint 47 §6):
+//! ask (the identifier under the cursor seeds an input prompt), request,
+//! validate ALL of the `WorkspaceEdit` before a byte changes (every file
+//! hydrated into a tab, every range converted against ITS text), confirm
+//! in a summary panel (Enter applies, `d` shows the diff, Esc cancels),
+//! then apply one `TXN_LSP` undo node per buffer, all or nothing.
+//!
+//! Ports sagitta `src/mod/lsp/rename.c` (1,476 lines) and `rename.h` at
+//! 9ace98c2. C's `ed->lsp_rename` (a heap state, NULL when none) is
+//! `Ed.lsp_rename`, `active` its non-NULL, with a `serial` per rename:
+//! a pending row's `ctx` and the prompt's context are the serial, which
+//! is C's pointer identity (`ed->lsp_rename != state`). C's `EditCtx`
+//! over a buffer (`yew_ed_edit_ctx_buffer`) is the edit seam through a
+//! window that shows the buffer: the rename opened every file it touches
+//! in a tab, so one exists. The error texts are C's, `strerror`'s words
+//! for the rows the port's fs calls answer.
+
+use lsp
+use term
+use text
+use util
+
+/// `YEW_RENAME_MAX_FILES`, `YEW_RENAME_MAX_EDITS` (`rename.h:16-20`).
+pub const RENAME_MAX_FILES: int = 200
+
+/// `YEW_RENAME_MAX_EDITS`: the most edits one plan holds.
+pub const RENAME_MAX_EDITS: int = 20000
+
+/// `LspRenameAnswer` (`lsp.h:72-76`).
+pub const LSP_RENAME_APPLY: int = 0
+
+/// `YEW_LSP_RENAME_DIFF`.
+pub const LSP_RENAME_DIFF: int = 1
+
+/// `YEW_LSP_RENAME_CANCEL`.
+pub const LSP_RENAME_CANCEL: int = 2
+
+/// The rename request (`rename_response_done`, `rename.c:957-1000`).
+pub const LSP_PK_RENAME: int = 7
+
+/// The rename prompt's answer (`rename_prompt_done`).
+pub const INPUT_DONE_LSP_RENAME: int = 2
+
+// `RenamePhase` (`rename.c:52-57`).
+const RENAME_ASK: int = 1
+
+const RENAME_REQUEST: int = 2
+
+const RENAME_CONFIRM: int = 3
+
+const RENAME_DIFF: int = 4
+
+const RENAME_DIFF_NAME: str = "[LSP Rename Diff]"
+
+/// `RenameEdit` (`rename.h:22-27`): a byte span and its new text.
+pub struct RenameEdit {
+    lo: int,
+    hi: int,
+    text: List[byte],
+}
+
+/// `RenameFile` (`rename.h:31-43`).
+pub struct RenameFile {
+    path: str,
+    buf_id: int,
+    tab_id: int,
+    undo_before: int,
+    edits: List[RenameEdit],
+    buf_gen: int,
+    version: int,
+    has_version: bool,
+    was_open: bool,
+    was_dirty: bool,
+}
+
+/// `RenamePlan` (`rename.h:47-57`), with C's deterministic test seam.
+pub struct RenamePlan {
+    files: List[RenameFile],
+    nedits: int,
+    old_name: str,
+    new_name: str,
+    test_fail_file: int,
+    test_fail_edit: int,
+    test_fail_enabled: bool,
+}
+
+/// `yew_lsp_rename_plan_init` (`rename.c:101-107`).
+pub fn rename_plan_new() -> RenamePlan {
+    RenamePlan {
+        files: List[RenameFile](),
+        nedits: 0,
+        old_name: "",
+        new_name: "",
+        test_fail_file: 0,
+        test_fail_edit: 0,
+        test_fail_enabled: false,
+    }
+}
+
+/// `yew_lsp_rename_plan_test_fail_at` (`rename.c:122-130`).
+pub fn rename_plan_test_fail_at(mut plan: RenamePlan, file_index: int, edit_index: int) {
+    plan.test_fail_file = file_index
+    plan.test_fail_edit = edit_index
+    plan.test_fail_enabled = true
+}
+
+// `RenameDraftEdit` and `RenameDraftFile` (`rename.c:32-50`).
+struct RenameDraftEdit {
+    start_line: int,
+    start_chr: int,
+    end_line: int,
+    end_chr: int,
+    text: List[byte],
+}
+
+struct RenameDraftFile {
+    path: str,
+    edits: List[RenameDraftEdit],
+    version: int,
+    has_version: bool,
+}
+
+/// `LspRenameState` (`rename.c:59-75`).
+pub struct LspRenameState {
+    active: bool,
+    serial: int,
+    plan: RenamePlan,
+    ask_gen: lsp.LspGen,
+    request_gen: lsp.LspGen,
+    cursor: int,
+    old_name: str,
+    new_name: str,
+    win_id: int,
+    buf_id: int,
+    server_id: int,
+    diff_buf_id: int,
+    request: int,
+    pos_enc: int,
+    phase: int,
+}
+
+fn gen_none() -> lsp.LspGen {
+    lsp.LspGen { buf_id: 0, version: 0, tb_gen: 0 }
+}
+
+/// No rename (`ed->lsp_rename == NULL`).
+pub fn lsp_rename_state_new() -> LspRenameState {
+    LspRenameState {
+        active: false,
+        serial: 0,
+        plan: rename_plan_new(),
+        ask_gen: gen_none(),
+        request_gen: gen_none(),
+        cursor: 0,
+        old_name: "",
+        new_name: "",
+        win_id: 0,
+        buf_id: 0,
+        server_id: 0,
+        diff_buf_id: 0,
+        request: 0,
+        pos_enc: lsp.POSENC_UTF8,
+        phase: 0,
+    }
+}
+
+/// A preflight's answer: the plan, or C's refusal text in `err`.
+pub struct RenameVerdict {
+    ok: bool,
+    err: str,
+}
+
+fn refuse(err: str) -> RenameVerdict {
+    RenameVerdict { ok: false, err: err }
+}
+
+fn fine() -> RenameVerdict {
+    RenameVerdict { ok: true, err: "" }
+}
+
+// `strerror`'s words for an fs row.
+fn fs_reason(row: str) -> str {
+    match row {
+        "not_found" => "No such file or directory",
+        "denied" => "Permission denied",
+        "invalid" => "Invalid argument",
+        _ => os_error_text(os_error()),
+    }
+}
+
+// `rename_path_inside` (`rename.c:141-152`).
+fn path_inside(root: str, path: str) -> bool {
+    if root == "/" {
+        return path.starts_with("/")
+    }
+    path.starts_with(root) && (path.len == root.len || path.bytes()[root.len] as int == 47)
+}
+
+// `rename_canonical_path` (`rename.c:154-213`): the URI decoded, resolved,
+// inside the workspace, a regular readable file.
+fn rename_canonical_path(ed: Ed, uri: List[byte]) -> (str, RenameVerdict) {
+    var decoded = List[byte]()
+    if !lsp.lsp_path_of_uri(mut decoded, uri, 0, uri.len) || decoded.len == 0 {
+        return ("", refuse("rename touches a non-file URI; refusing"))
+    }
+    for b in decoded {
+        if b as int == 0 {
+            return ("", refuse("rename touches a non-file URI; refusing"))
+        }
+    }
+    let decoded_path = str_from_utf8(decoded) else {
+        return ("", refuse("rename touches a non-file URI; refusing"))
+    }
+    let root = fs_realpath(ws_root(ed)) else ""
+    let path = fs_realpath(decoded_path) else |e| {
+        let row = match e {
+            not_found => "not_found",
+            io => "io",
+        }
+        return ("", refuse("cannot edit {decoded_path}: {fs_reason(row)}"))
+    }
+    if root.len == 0 || !path_inside(root, path) {
+        return ("", refuse("rename would edit outside the workspace: {path}"))
+    }
+    let _ = fs_stat(path) else |e| {
+        let row = match e {
+            denied => "denied",
+            io => "io",
+            not_found => "not_found",
+        }
+        return ("", refuse("cannot edit {path}: {fs_reason(row)}"))
+    }
+    if !fs_is_file(path) {
+        return ("", refuse("cannot edit {path}: Invalid argument"))
+    }
+    fs_access(path, 4) else |e| {
+        let row = match e {
+            denied => "denied",
+            invalid => "invalid",
+            io => "io",
+            not_found => "not_found",
+            unsupported => "io",
+        }
+        return ("", refuse("cannot edit {path}: {fs_reason(row)}"))
+    }
+    (path, fine())
+}
+
+// `rename_draft_file` (`rename.c:215-245`): the draft for the URI's path,
+// one per path, at most 200.
+fn draft_file(ed: Ed, mut drafts: List[RenameDraftFile], uri: List[byte]) -> (int, RenameVerdict) {
+    let (path, v) = rename_canonical_path(ed, uri)
+    if !v.ok {
+        return (-1, v)
+    }
+    var i = 0
+    while i < drafts.len {
+        if drafts[i].path == path {
+            return (i, fine())
+        }
+        i += 1
+    }
+    if drafts.len >= RENAME_MAX_FILES {
+        return (
+            -1,
+            refuse("rename spans {drafts.len + 1} files; refusing (limit {RENAME_MAX_FILES})"),
+        )
+    }
+    (mut drafts).push(RenameDraftFile {
+        path: path,
+        edits: List[RenameDraftEdit](),
+        version: 0,
+        has_version: false,
+    })
+    (drafts.len - 1, fine())
+}
+
+// `rename_position` (`rename.c:247-263`).
+fn position(j: lsp.Json, v: int) -> (bool, int, int) {
+    if lsp.json_kind(j, v) != lsp.JS_OBJ {
+        return (false, 0, 0)
+    }
+    let linev = lsp.json_field(j, v, "line")
+    let chrv = lsp.json_field(j, v, "character")
+    if lsp.json_kind(j, linev) != lsp.JS_INT || lsp.json_kind(j, chrv) != lsp.JS_INT {
+        return (false, 0, 0)
+    }
+    let line = lsp.json_int(j, linev, 0)
+    let chr = lsp.json_int(j, chrv, 0)
+    if line < 0 || chr < 0 || line > 4294967295 || chr > 4294967295 {
+        return (false, 0, 0)
+    }
+    (true, line, chr)
+}
+
+// `rename_draft_edit` (`rename.c:265-284`).
+fn draft_edit(j: lsp.Json, v: int) -> RenameDraftEdit ! {none} {
+    if lsp.json_kind(j, v) != lsp.JS_OBJ {
+        return none
+    }
+    let range = lsp.json_field(j, v, "range")
+    let new_text = lsp.json_field(j, v, "newText")
+    if lsp.json_kind(j, range) != lsp.JS_OBJ || !lsp.json_is_str(j, new_text) {
+        return none
+    }
+    let (ok_s, sl, sc) = position(j, lsp.json_field(j, range, "start"))
+    let (ok_e, el, ec) = position(j, lsp.json_field(j, range, "end"))
+    if !ok_s || !ok_e {
+        return none
+    }
+    RenameDraftEdit {
+        start_line: sl,
+        start_chr: sc,
+        end_line: el,
+        end_chr: ec,
+        text: lsp.json_str(j, new_text),
+    }
+}
+
+// `rename_add_edits` (`rename.c:286-307`).
+fn add_edits(j: lsp.Json, mut file: RenameDraftFile, edits: int, total_in: int) -> RenameVerdict {
+    var total = total_in
+    if lsp.json_kind(j, edits) != lsp.JS_ARR {
+        return refuse("server returned an invalid rename edit; refusing")
+    }
+    var i = 0
+    while i < lsp.json_size(j, edits) {
+        if total >= RENAME_MAX_EDITS {
+            return refuse("rename spans {total + 1} edits; refusing (limit {RENAME_MAX_EDITS})")
+        }
+        let e = draft_edit(j, lsp.json_at(j, edits, i)) else {
+            return refuse("rename produced an invalid range in {file.path}:1")
+        }
+        (mut file.edits).push(e)
+        total += 1
+        i += 1
+    }
+    fine()
+}
+
+// `rename_set_version` (`rename.c:309-322`).
+fn set_version(j: lsp.Json, mut file: RenameDraftFile, version: int) -> RenameVerdict {
+    if version < 0 || lsp.json_kind(j, version) == lsp.JS_NULL {
+        return fine()
+    }
+    if lsp.json_kind(j, version) != lsp.JS_INT ||
+        file.has_version && file.version != lsp.json_int(j, version, 0) {
+        return refuse("rename is stale; the buffer changed. try again")
+    }
+    file.version = lsp.json_int(j, version, 0)
+    file.has_version = true
+    fine()
+}
+
+// The running edit count the two parsers share.
+struct EditTotal {
+    n: int,
+}
+
+// `rename_parse_document_changes` (`rename.c:324-364`).
+fn parse_document_changes(
+    ed: Ed,
+    j: lsp.Json,
+    mut drafts: List[RenameDraftFile],
+    changes: int,
+    mut total: EditTotal,
+) -> RenameVerdict {
+    if lsp.json_kind(j, changes) != lsp.JS_ARR {
+        return refuse("server returned an invalid rename edit; refusing")
+    }
+    var i = 0
+    while i < lsp.json_size(j, changes) {
+        let item = lsp.json_at(j, changes, i)
+        i += 1
+        if lsp.json_kind(j, item) != lsp.JS_OBJ {
+            return refuse("server returned an invalid rename edit; refusing")
+        }
+        if lsp.json_field(j, item, "kind") >= 0 {
+            return refuse("server asked to create or delete files; refusing (not supported in 1.0)")
+        }
+        let document = lsp.json_field(j, item, "textDocument")
+        if lsp.json_kind(j, document) != lsp.JS_OBJ {
+            return refuse("rename touches a non-file URI; refusing")
+        }
+        let uriv = lsp.json_field(j, document, "uri")
+        if !lsp.json_is_str(j, uriv) {
+            return refuse("rename touches a non-file URI; refusing")
+        }
+        let (f, v) = draft_file(ed, mut drafts, lsp.json_str(j, uriv))
+        if !v.ok {
+            return v
+        }
+        let vv = set_version(j, mut drafts[f], lsp.json_field(j, document, "version"))
+        if !vv.ok {
+            return vv
+        }
+        let before = drafts[f].edits.len
+        let av = add_edits(j, mut drafts[f], lsp.json_field(j, item, "edits"), total.n)
+        total.n += drafts[f].edits.len - before
+        if !av.ok {
+            return av
+        }
+    }
+    fine()
+}
+
+// `rename_parse_changes` (`rename.c:366-385`).
+fn parse_changes(
+    ed: Ed,
+    j: lsp.Json,
+    mut drafts: List[RenameDraftFile],
+    changes: int,
+    mut total: EditTotal,
+) -> RenameVerdict {
+    if lsp.json_kind(j, changes) != lsp.JS_OBJ {
+        return refuse("server returned an invalid rename edit; refusing")
+    }
+    var i = 0
+    while i < lsp.json_size(j, changes) {
+        let (f, v) = draft_file(ed, mut drafts, lsp.json_member_key(j, changes, i))
+        if !v.ok {
+            return v
+        }
+        let before = drafts[f].edits.len
+        let av = add_edits(j, mut drafts[f], lsp.json_member_val(j, changes, i), total.n)
+        total.n += drafts[f].edits.len - before
+        if !av.ok {
+            return av
+        }
+        i += 1
+    }
+    fine()
+}
+
+// `rename_offset` (`rename.c:387-400`): exact, on a grapheme boundary.
+fn rename_offset(tb: text.TextBuf, pos_enc: int, line: int, chr: int) -> (bool, int) {
+    if line >= text.textbuf_line_count(tb) {
+        return (false, 0)
+    }
+    let off = lsp.lsp_off_of_pos(pos_enc, tb, line, chr)
+    let (el, ec) = lsp.lsp_pos_of_off(pos_enc, tb, off)
+    (el == line && ec == chr && text.is_grapheme_boundary(tb, off as text.ByteOff), off)
+}
+
+// `rename_edit_cmp` (`rename.c:402-413`): DESCENDING by start, then end.
+fn edit_desc(a: RenameEdit, b: RenameEdit) -> bool {
+    if a.lo != b.lo {
+        return a.lo > b.lo
+    }
+    a.hi > b.hi
+}
+
+// `rename_file_cmp` (`rename.c:415-422`).
+fn file_less(a: RenameFile, b: RenameFile) -> bool {
+    lsp.lsp_bytes_less(a.path, b.path)
+}
+
+// `rename_span_matches` (`rename.c:424-454`): the span already holds the
+// new text.
+fn span_matches(tb: text.TextBuf, lo: int, hi: int, t: List[byte]) -> bool {
+    if lo > hi || hi > text.textbuf_len(tb) || hi - lo != t.len {
+        return false
+    }
+    var i = 0
+    while i < t.len {
+        if text.textbuf_byte_at(tb, lo + i) != t[i] as int {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `rename_file_convert` (`rename.c:456-541`): the file opened as a tab
+// (or found), hydrated, its version held to the document's, its ranges
+// converted and sorted descending, overlaps refused, no-op edits
+// dropped.
+fn file_convert(
+    mut ed: Ed,
+    mut plan: RenamePlan,
+    draft: RenameDraftFile,
+    pos_enc: int,
+) -> RenameVerdict {
+    if draft.edits.len == 0 {
+        return fine()
+    }
+    var tab = tab_find_by_path(ed, draft.path)
+    let was_open = tab >= 0
+    if tab < 0 {
+        tab = tab_open(mut ed, draft.path)
+    }
+    if tab < 0 {
+        return refuse("cannot edit {draft.path}: too many tabs")
+    }
+    let bi = tab_buffer(ed, tab)
+    if bi < 0 || buf_hydrate(mut ed, bi) != 0 {
+        return refuse("cannot edit {draft.path}: Input/output error")
+    }
+    var file = RenameFile {
+        path: draft.path,
+        buf_id: ed.bufs[bi].id,
+        tab_id: ed.tabs[tab].tab_id,
+        undo_before: text.undo_current(ed.bufs[bi].ec.undo),
+        edits: List[RenameEdit](),
+        buf_gen: ed.bufs[bi].ec.tb.gen,
+        version: draft.version,
+        has_version: draft.has_version,
+        was_open: was_open,
+        was_dirty: buf_dirty(ed.bufs[bi]),
+    }
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    if file.has_version && (k < 0 || d < 0 || ed.lsp.servers[k].docv[d].version != file.version) {
+        return refuse("rename is stale; the buffer changed. try again")
+    }
+    for e in draft.edits {
+        let (ok_lo, lo) = rename_offset(ed.bufs[bi].ec.tb, pos_enc, e.start_line, e.start_chr)
+        let (ok_hi, hi) = rename_offset(ed.bufs[bi].ec.tb, pos_enc, e.end_line, e.end_chr)
+        if !ok_lo || !ok_hi || lo > hi {
+            return refuse("rename produced an invalid range in {draft.path}:{e.start_line + 1}")
+        }
+        (mut file.edits).push(RenameEdit { lo: lo, hi: hi, text: copy e.text })
+    }
+    if file.edits.len > 1 {
+        util.sort_stable(mut file.edits, edit_desc)
+    }
+    var i = 1
+    while i < file.edits.len {
+        if file.edits[i].lo == file.edits[i - 1].lo || file.edits[i].hi > file.edits[i - 1].lo {
+            return refuse("server sent overlapping edits for {draft.path}; refusing")
+        }
+        i += 1
+    }
+    var keep = List[RenameEdit]()
+    for e in file.edits {
+        if !span_matches(ed.bufs[bi].ec.tb, e.lo, e.hi, e.text) {
+            (mut keep).push(e)
+        }
+    }
+    if keep.len == 0 {
+        return fine()
+    }
+    file.edits = keep
+    (mut plan.files).push(file)
+    fine()
+}
+
+/// `yew_lsp_rename_preflight` (`rename.c:543-600`): the whole
+/// `WorkspaceEdit` validated and hydrated into a plan before any source
+/// byte changes; `documentChanges` preferred, `changes` accepted. On a
+/// refusal the plan is empty and `err` is C's sentence.
+pub fn lsp_rename_preflight(
+    mut ed: Ed,
+    j: lsp.Json,
+    workspace_edit: int,
+    pos_enc: int,
+    old_name: str,
+    new_name: str,
+    mut plan: RenamePlan,
+) -> RenameVerdict {
+    if lsp.json_kind(j, workspace_edit) != lsp.JS_OBJ {
+        return refuse("server returned an invalid rename edit; refusing")
+    }
+    plan = rename_plan_new()
+    plan.old_name = old_name
+    plan.new_name = new_name
+    var drafts = List[RenameDraftFile]()
+    var total = EditTotal { n: 0 }
+    let document_changes = lsp.json_field(j, workspace_edit, "documentChanges")
+    let changes = lsp.json_field(j, workspace_edit, "changes")
+    var v = fine()
+    if document_changes >= 0 {
+        v = parse_document_changes(ed, j, mut drafts, document_changes, mut total)
+    } else if changes >= 0 {
+        v = parse_changes(ed, j, mut drafts, changes, mut total)
+    } else {
+        v = refuse("server returned an invalid rename edit; refusing")
+    }
+    if v.ok {
+        for d in drafts {
+            v = file_convert(mut ed, mut plan, d, pos_enc)
+            if !v.ok {
+                break
+            }
+        }
+    }
+    if !v.ok {
+        plan = rename_plan_new()
+        return v
+    }
+    if plan.files.len > 1 {
+        util.sort_stable(mut plan.files, file_less)
+    }
+    plan.nedits = 0
+    for f in plan.files {
+        plan.nedits += f.edits.len
+    }
+    fine()
+}
+
+// A window showing buffer `bi`: the focused one first, then every tab's.
+fn win_showing(ed: Ed, bi: int) -> int {
+    if ed.win >= 0 && ed.win < ed.wins.len && ed.wins[ed.win].buf == bi {
+        return ed.win
+    }
+    for t in ed.tabs {
+        for leaf in pane_collect_leaves(ed, t.root, PANE_MAX_LEAVES) {
+            let w = ed.panes[leaf].win
+            if w >= 0 && w < ed.wins.len && ed.wins[w].buf == bi && ed.wins[w].id != 0 {
+                return w
+            }
+        }
+    }
+    -1
+}
+
+// `rename_file_current` (`rename.c:602-623`): the buffer is still the one
+// the plan was made over.
+fn file_current(ed: Ed, file: RenameFile) -> bool {
+    let bi = ed_buf_index(ed, file.buf_id)
+    if bi < 0 ||
+        !ed.bufs[bi].resident ||
+        !ed.bufs[bi].has_path ||
+        ed.bufs[bi].path != file.path ||
+        ed.bufs[bi].ec.tb.gen != file.buf_gen ||
+        text.undo_current(ed.bufs[bi].ec.undo) != file.undo_before {
+        return false
+    }
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    !(file.has_version && (k < 0 || d < 0 || ed.lsp.servers[k].docv[d].version != file.version))
+}
+
+// `RenameCommit` (`rename.c:625-628`).
+struct RenameCommit {
+    node: int,
+    parent: int,
+}
+
+fn undo_node_ok(ut: text.UndoTree, id: int) -> bool {
+    id != 0 && id <= ut.nodes.len && ut.nodes[id - 1].id == id
+}
+
+// `rename_rollback` (`rename.c:640-676`): every committed buffer, last
+// first, takes back exactly its one node, which is pruned. Sound because
+// each buffer received exactly one node and, single-threaded (invariant
+// 8), nothing edited it in between: never a partial apply.
+fn rollback(mut ed: Ed, plan: RenamePlan, commits: List[RenameCommit]) {
+    var committed = commits.len
+    while committed != 0 {
+        committed -= 1
+        let file = copy plan.files[committed]
+        let c = copy commits[committed]
+        let bi = ed_buf_index(ed, file.buf_id)
+        if bi < 0 {
+            bug("rename rollback lost buffer {file.buf_id}")
+            return
+        }
+        let ut = copy ed.bufs[bi].ec.undo
+        if !undo_node_ok(ut, c.node) || text.undo_current(ut) != c.node {
+            bug("rename rollback lost undo node for {file.path}")
+            return
+        }
+        let node = ut.nodes[c.node - 1]
+        if node.parent != c.parent || node.reason != text.TXN_LSP || node.n_ops == 0 {
+            bug("rename rollback found wrong transaction for {file.path}")
+            return
+        }
+        let w = win_showing(ed, bi)
+        if w < 0 {
+            bug("rename rollback lost the view of {file.path}")
+            return
+        }
+        edit_take(mut ed, w)
+        let undone = text.undo(mut ed.bufs[bi].ec)
+        edit_give(mut ed, w)
+        if !undone {
+            bug("rename rollback lost transaction for {file.path}")
+            return
+        }
+        if !text.undo_prune_redo(mut ed.bufs[bi].ec.undo, text.TXN_LSP) {
+            bug("rename rollback could not prune transaction for {file.path}")
+            return
+        }
+        ed_finish_edit(mut ed, w)
+        if text.undo_current(ed.bufs[bi].ec.undo) != c.parent {
+            bug("rename rollback did not restore undo cursor for {file.path}")
+            return
+        }
+    }
+}
+
+/// `yew_lsp_rename_apply` (`rename.c:678-756`): every file revalidated
+/// first (the confirmation may have sat open), then one atomic `TXN_LSP`
+/// transaction per buffer in path order, edits in descending offsets so
+/// none shifts another; a failure aborts that file and rolls back every
+/// committed one.
+pub fn lsp_rename_apply(mut ed: Ed, plan: RenamePlan) -> RenameVerdict {
+    for f in plan.files {
+        if !file_current(ed, f) {
+            return refuse("rename is stale; the buffer changed. try again")
+        }
+    }
+    var commits = List[RenameCommit]()
+    var i = 0
+    while i < plan.files.len {
+        let file = copy plan.files[i]
+        let bi = ed_buf_index(ed, file.buf_id)
+        let w = win_showing(ed, bi)
+        if w < 0 {
+            rollback(mut ed, plan, commits)
+            return refuse(
+                "rename aborted: the buffer has no view in {file.path}; {commits.len} files rolled back",
+            )
+        }
+        ed_undo_begin(mut ed, w, text.TXN_LSP)
+        var failure = ""
+        var e = 0
+        while e < file.edits.len {
+            let edit = copy file.edits[e]
+            if plan.test_fail_enabled && plan.test_fail_file == i && plan.test_fail_edit == e {
+                failure = "injected edit failure"
+                break
+            }
+            if edit.lo != edit.hi && !ed_edit_delete(mut ed, w, edit.lo, edit.hi) {
+                failure = "the crash journal rejected a deletion: Input/output error"
+                break
+            }
+            if edit.text.len != 0 &&
+                !ed_edit_insert(mut ed, w, edit.lo, edit.text, 0, edit.text.len) {
+                failure = "the crash journal rejected an insertion: Input/output error"
+                break
+            }
+            e += 1
+        }
+        if failure.len != 0 {
+            ed_undo_abort(mut ed, w)
+            ed_finish_edit(mut ed, w)
+            rollback(mut ed, plan, commits)
+            return refuse(
+                "rename aborted: {failure} in {file.path}; {commits.len} files rolled back",
+            )
+        }
+        ed_undo_end(mut ed, w)
+        ed_finish_edit(mut ed, w)
+        let ut = copy ed.bufs[bi].ec.undo
+        let node_id = text.undo_current(ut)
+        if !undo_node_ok(ut, node_id) ||
+            node_id == file.undo_before ||
+            ut.nodes[node_id - 1].reason != text.TXN_LSP ||
+            ut.nodes[node_id - 1].n_ops == 0 {
+            bug("rename did not commit one LSP transaction for {file.path}")
+        }
+        (mut commits).push(RenameCommit { node: node_id, parent: ut.nodes[node_id - 1].parent })
+        i += 1
+    }
+    ed.footer_dirty = true
+    fine()
+}
+
+// `rename_span_copy` (`rename.c:758-796`).
+fn span_copy(tb: text.TextBuf, lo: int, hi: int) -> List[byte] {
+    text.textbuf_copy_range(tb, lo, hi)
+}
+
+// `rename_state_finish` (`rename.c:798-826`): the prompt's answer
+// detached, the request cancelled, the panel closed, the state gone.
+fn state_finish(mut ed: Ed, close_panel: bool) {
+    if !ed.lsp_rename.active {
+        return
+    }
+    if ed.cmdline.active &&
+        ed.cmdline.input_done == INPUT_DONE_LSP_RENAME &&
+        ed.cmdline.input_ctx == ed.lsp_rename.serial {
+        ed.cmdline.input_done = INPUT_DONE_NONE
+        ed.cmdline.input_ctx = 0
+    }
+    if ed.lsp_rename.request != 0 {
+        lsp_cancel_request(mut ed, ed.lsp_rename.server_id, ed.lsp_rename.request)
+    }
+    let wi = ed_win_by_id(ed, ed.lsp_rename.win_id)
+    let serial = ed.lsp_rename.serial
+    ed.lsp_rename = lsp_rename_state_new()
+    ed.lsp_rename.serial = serial
+    if close_panel && wi >= 0 {
+        panel_close(mut ed, wi)
+    }
+}
+
+// `rename_relative_path` (`rename.c:859-870`).
+fn relative_path(ed: Ed, path: str) -> str {
+    let root = ws_root(ed)
+    if root.len != 0 &&
+        path.len > root.len &&
+        path.starts_with(root) &&
+        path.bytes()[root.len] as int == 47 {
+        return path[root.len + 1..]
+    }
+    path
+}
+
+// printf's `%-Ns` and `%Nllu`: byte-counted padding.
+fn pad_right(s: str, n: int) -> str {
+    var out = s
+    var k = s.len
+    while k < n {
+        out = out + " "
+        k += 1
+    }
+    out
+}
+
+fn pad_left(s: str, n: int) -> str {
+    var out = s
+    var k = s.len
+    while k < n {
+        out = " " + out
+        k += 1
+    }
+    out
+}
+
+// `rename_summary_open` (`rename.c:872-926`): the confirmation panel at
+// the cursor.
+fn summary_open(mut ed: Ed) -> bool {
+    let wi = ed_win_by_id(ed, ed.lsp_rename.win_id)
+    if wi < 0 || ed.win != wi || ed.bufs[ed.wins[wi].buf].id != ed.lsp_rename.buf_id {
+        return false
+    }
+    let (anchored, x, y) = lsp_panel_cursor_anchor(mut ed, wi)
+    if !anchored {
+        return false
+    }
+    var dirty = 0
+    for f in ed.lsp_rename.plan.files {
+        if f.was_dirty {
+            dirty += 1
+        }
+    }
+    var body = "rename '{ed.lsp_rename.old_name}' \u{2192} '{ed.lsp_rename.new_name}'\n"
+    body = body +
+        "{ed.lsp_rename.plan.nedits} edits in {ed.lsp_rename.plan.files.len} files, {dirty} already modified\n\n"
+    for f in ed.lsp_rename.plan.files {
+        let mark = if f.was_dirty then " *" else ""
+        body = body +
+            "  {pad_right(relative_path(ed, f.path), 40)} {pad_left("{f.edits.len}", 5)}{mark}\n"
+    }
+    body = body + "\nenter apply \u{00B7} esc cancel \u{00B7} d show diff"
+    var bytes = List[byte]()
+    for b in body.bytes() {
+        (mut bytes).push(b)
+    }
+    var spec = panel_spec_new(bytes, x, y, PANEL_CURSOR)
+    spec.title = "rename"
+    spec.has_title = true
+    spec.role = "bg"
+    spec.has_role = true
+    ed.lsp_rename.phase = RENAME_CONFIRM
+    if !panel_open(mut ed, wi, spec) {
+        ed.lsp_rename.phase = RENAME_REQUEST
+        return false
+    }
+    true
+}
+
+// `rename_request_params` (`rename.c:928-955`).
+fn request_params(
+    uri: str,
+    pos_enc: int,
+    tb: text.TextBuf,
+    cursor: int,
+    new_name: List[byte],
+) -> List[byte] {
+    let (line, character) = lsp.lsp_pos_of_off(pos_enc, tb, cursor)
+    var w = lsp.jsonw_new()
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "textDocument")
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "uri")
+    lsp.jsonw_cstr(mut w, uri)
+    lsp.jsonw_obj_end(mut w)
+    lsp.jsonw_key(mut w, "position")
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "line")
+    lsp.jsonw_int(mut w, line)
+    lsp.jsonw_key(mut w, "character")
+    lsp.jsonw_int(mut w, character)
+    lsp.jsonw_obj_end(mut w)
+    lsp.jsonw_key(mut w, "newName")
+    lsp.jsonw_str(mut w, new_name)
+    lsp.jsonw_obj_end(mut w)
+    w.out
+}
+
+// `yew_lsp_gen_current` (`sync.c:485-497`).
+fn gen_current(ed: Ed, g: lsp.LspGen) -> bool {
+    let bi = ed_buf_index(ed, g.buf_id)
+    if bi < 0 {
+        return false
+    }
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    k >= 0 &&
+        d >= 0 &&
+        ed.lsp.servers[k].life.state == lsp.LSP_READY &&
+        lsp.lsp_gen_matches(g, ed.lsp.servers[k].docv[d], ed.bufs[bi].ec.tb)
+}
+
+/// `rename_response_done` (`rename.c:957-1000`).
+pub fn lsp_rename_done(mut ed: Ed, p: lsp.RpcPending, j: lsp.Json, result: int, error: int) {
+    if !ed.lsp_rename.active ||
+        ed.lsp_rename.serial != p.ctx ||
+        ed.lsp_rename.phase != RENAME_REQUEST {
+        return
+    }
+    ed.lsp_rename.request = 0
+    let k = lsp_server_index(ed, ed.lsp_rename.server_id)
+    if error >= 0 {
+        if k >= 0 && lsp_error_is_method_not_found(j, error) {
+            ed.lsp.servers[k].life.caps.bits = ed.lsp.servers[k].life.caps.bits & !lsp.LSPC_RENAME
+        }
+        ed_msg(mut ed, MSG_ERROR, "rename request failed")
+        state_finish(mut ed, true)
+        return
+    }
+    if k < 0 ||
+        ed.lsp.servers[k].life.state != lsp.LSP_READY ||
+        !gen_current(ed, ed.lsp_rename.request_gen) {
+        state_finish(mut ed, true)
+        return
+    }
+    if result < 0 || lsp.json_kind(j, result) == lsp.JS_NULL {
+        ed_msg(mut ed, MSG_INFO, "no rename available here")
+        state_finish(mut ed, true)
+        return
+    }
+    var plan = copy ed.lsp_rename.plan
+    let v = lsp_rename_preflight(
+        mut ed,
+        j,
+        result,
+        ed.lsp_rename.pos_enc,
+        ed.lsp_rename.old_name,
+        ed.lsp_rename.new_name,
+        mut plan,
+    )
+    if !v.ok {
+        ed_msg(mut ed, MSG_ERROR, v.err)
+        state_finish(mut ed, true)
+        return
+    }
+    ed.lsp_rename.plan = plan
+    if !summary_open(mut ed) {
+        ed_msg(mut ed, MSG_ERROR, "cannot show rename confirmation")
+        state_finish(mut ed, true)
+    }
+}
+
+/// `rename_prompt_done` (`rename.c:1002-1068`): the new name, then the
+/// request; an empty or unchanged answer cancels silently.
+pub fn lsp_rename_prompt_done(mut ed: Ed, ctx: int, accepted: bool, answer: List[byte]) {
+    if !ed.lsp_rename.active || ed.lsp_rename.serial != ctx || ed.lsp_rename.phase != RENAME_ASK {
+        return
+    }
+    let old = ed.lsp_rename.old_name.bytes()
+    var same = answer.len == old.len
+    var i = 0
+    while same && i < answer.len {
+        if answer[i] != old[i] {
+            same = false
+        }
+        i += 1
+    }
+    if !accepted || answer.len == 0 || same {
+        state_finish(mut ed, true)
+        return
+    }
+    var has_nul = false
+    for b in answer {
+        if b as int == 0 {
+            has_nul = true
+        }
+    }
+    if has_nul || !gen_current(ed, ed.lsp_rename.ask_gen) {
+        state_finish(mut ed, true)
+        return
+    }
+    let wi = ed_win_by_id(ed, ed.lsp_rename.win_id)
+    if wi < 0 || ed.win != wi || ed.bufs[ed.wins[wi].buf].id != ed.lsp_rename.buf_id {
+        state_finish(mut ed, true)
+        return
+    }
+    ed.lsp_rename.new_name = str_from_utf8(answer) else {
+        state_finish(mut ed, true)
+        return
+    }
+    lsp_sync_flush(mut ed)
+    let bi = ed.wins[wi].buf
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 ||
+        d < 0 ||
+        ed.lsp.servers[k].id != ed.lsp_rename.server_id ||
+        ed.lsp.servers[k].life.state != lsp.LSP_READY ||
+        !lsp.lsp_caps_has(ed.lsp.servers[k].life.caps, lsp.LSPC_RENAME) {
+        ed_msg(mut ed, MSG_INFO, "rename is no longer available")
+        state_finish(mut ed, true)
+        return
+    }
+    ed.lsp_rename.request_gen = lsp.lsp_gen(ed.lsp.servers[k].docv[d], ed.bufs[bi].ec.tb)
+    ed.lsp_rename.pos_enc = ed.lsp.servers[k].life.pos_enc
+    let params = request_params(
+        ed.lsp.servers[k].docv[d].uri,
+        ed.lsp.servers[k].life.pos_enc,
+        ed.bufs[bi].ec.tb,
+        ed.lsp_rename.cursor,
+        answer,
+    )
+    var p = lsp.rpc_pending_new()
+    p.kind = LSP_PK_RENAME
+    p.ctx = ed.lsp_rename.serial
+    p.buf_id = ed.lsp_rename.buf_id
+    p.gen = ed.bufs[bi].ec.tb.gen
+    p.sent_ms = ed.now_ms
+    ed.lsp_rename.phase = RENAME_REQUEST
+    let request = lsp.rpc_call(mut ed.lsp.servers[k].rpc, "textDocument/rename", params, p)
+    if request == 0 {
+        ed_msg(mut ed, MSG_ERROR, "could not send rename request")
+        state_finish(mut ed, true)
+        return
+    }
+    ed.lsp_rename.request = request
+}
+
+// A new rename state for window `wi` (C's `yew_xcalloc` and the fields
+// `yew_lsp_rename_request` and the test seam set).
+fn state_begin(mut ed: Ed, wi: int, old_name: str, pos_enc: int, phase: int) {
+    let serial = ed.lsp_rename.serial + 1
+    ed.lsp_rename = lsp_rename_state_new()
+    ed.lsp_rename.active = true
+    ed.lsp_rename.serial = serial
+    ed.lsp_rename.old_name = old_name
+    ed.lsp_rename.win_id = ed.wins[wi].id
+    ed.lsp_rename.buf_id = ed.bufs[ed.wins[wi].buf].id
+    ed.lsp_rename.pos_enc = pos_enc
+    ed.lsp_rename.phase = phase
+}
+
+/// `yew_lsp_rename_test_confirm` (`rename.c:1079-1111`): the confirm
+/// phase without a transport — the real preflight and the real summary,
+/// for the PANEL menu's rows and the three commands' tests.
+pub fn lsp_rename_test_confirm(
+    mut ed: Ed,
+    wi: int,
+    j: lsp.Json,
+    workspace_edit: int,
+    pos_enc: int,
+    old_name: str,
+    new_name: str,
+) -> bool {
+    if wi < 0 || wi >= ed.wins.len || ed.lsp_rename.active {
+        return false
+    }
+    state_begin(mut ed, wi, old_name, pos_enc, RENAME_REQUEST)
+    ed.lsp_rename.new_name = new_name
+    var plan = rename_plan_new()
+    let v = lsp_rename_preflight(mut ed, j, workspace_edit, pos_enc, old_name, new_name, mut plan)
+    if !v.ok {
+        state_finish(mut ed, true)
+        return false
+    }
+    ed.lsp_rename.plan = plan
+    if !summary_open(mut ed) {
+        state_finish(mut ed, true)
+        return false
+    }
+    true
+}
+
+/// `yew_lsp_rename_request` (`rename.c:1113-1171`): exactly one cursor, an
+/// identifier under it, a ready server with the capability; the prompt
+/// opens seeded with the identifier.
+pub fn lsp_rename_request(mut ed: Ed, wi: int) -> bool {
+    if wi < 0 || wi >= ed.wins.len {
+        return false
+    }
+    if ed.wins[wi].cs.curs.len != 1 || ed.wins[wi].cs.primary >= ed.wins[wi].cs.curs.len {
+        ed_msg(mut ed, MSG_INFO, "rename requires exactly one cursor")
+        return true
+    }
+    let bi = ed.wins[wi].buf
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 ||
+        d < 0 ||
+        ed.lsp.servers[k].life.state != lsp.LSP_READY ||
+        !lsp.lsp_caps_has(ed.lsp.servers[k].life.caps, lsp.LSPC_RENAME) {
+        return false
+    }
+    if ed.lsp_rename.active {
+        if ed.cmdline.active &&
+            ed.cmdline.input_done == INPUT_DONE_LSP_RENAME &&
+            ed.cmdline.input_ctx == ed.lsp_rename.serial {
+            cmdline_close(mut ed, false)
+        } else {
+            state_finish(mut ed, true)
+        }
+    }
+    let pos = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    let u = unitctx_of(ed, bi)
+    let word = unit_span(UNIT_WORD, mut ed.bufs[bi].ec.tb, u, pos, false)
+    if word.lo == word.hi {
+        ed_msg(mut ed, MSG_INFO, "no identifier under the cursor")
+        return true
+    }
+    let old_name = str_from_utf8(span_copy(ed.bufs[bi].ec.tb, word.lo, word.hi)) else {
+        return false
+    }
+    state_begin(mut ed, wi, old_name, ed.lsp.servers[k].life.pos_enc, RENAME_ASK)
+    ed.lsp_rename.ask_gen = lsp.lsp_gen(ed.lsp.servers[k].docv[d], ed.bufs[bi].ec.tb)
+    ed.lsp_rename.cursor = pos
+    ed.lsp_rename.server_id = ed.lsp.servers[k].id
+    cmdline_open_input(mut ed, old_name, INPUT_DONE_LSP_RENAME, ed.lsp_rename.serial)
+    if !ed.cmdline.active || ed.cmdline.input_ctx != ed.lsp_rename.serial {
+        state_finish(mut ed, true)
+        return false
+    }
+    true
+}
+
+// `rename_text_append` (`rename.c:1173-1189`).
+fn text_of(tb: text.TextBuf) -> List[byte] {
+    text.textbuf_bytes(tb)
+}
+
+// `rename_diff_lines` (`rename.c:1191-1202`).
+fn diff_lines(t: List[byte]) -> int {
+    var lines = 0
+    for b in t {
+        if b as int == 10 {
+            lines += 1
+        }
+    }
+    if t.len != 0 && t[t.len - 1] as int != 10 {
+        lines += 1
+    }
+    lines
+}
+
+// `rename_diff_prefixed` (`rename.c:1204-1222`).
+fn diff_prefixed(mut out: List[byte], t: List[byte], prefix: int) {
+    var start = 0
+    while start < t.len {
+        var end = start
+        while end < t.len && t[end] as int != 10 {
+            end += 1
+        }
+        let newline = end < t.len
+        if newline {
+            end += 1
+        }
+        (mut out).push(prefix as byte)
+        var i = start
+        while i < end {
+            (mut out).push(t[i])
+            i += 1
+        }
+        if !newline {
+            util.buf_append_str(mut out, "\n\\ No newline at end of file\n")
+        }
+        start = end
+    }
+}
+
+// `rename_diff_file` (`rename.c:1224-1257`): the whole file before and
+// after, as one hunk.
+fn diff_file(ed: Ed, file: RenameFile, mut out: List[byte]) {
+    let bi = ed_buf_index(ed, file.buf_id)
+    if bi < 0 {
+        bug("rename diff lost buffer {file.buf_id}")
+        return
+    }
+    let before = text_of(ed.bufs[bi].ec.tb)
+    var changed = text.textbuf_from_bytes(before, 0, before.len)
+    for e in file.edits {
+        if e.lo != e.hi {
+            text.textbuf_delete(mut changed, text.Span { lo: e.lo, hi: e.hi })
+        }
+        if e.text.len != 0 {
+            text.textbuf_insert(mut changed, e.lo as text.ByteOff, e.text)
+        }
+    }
+    let after = text_of(changed)
+    let relative = relative_path(ed, file.path)
+    util.buf_append_str(mut out, "--- a/{relative}\n+++ b/{relative}\n")
+    util.buf_append_str(mut out, "@@ -1,{diff_lines(before)} +1,{diff_lines(after)} @@\n")
+    diff_prefixed(mut out, before, 45)
+    diff_prefixed(mut out, after, 43)
+}
+
+// `rename_diff_open` (`rename.c:1259-1300`): the plan as a unified diff
+// in the `[LSP Rename Diff]` scratch, outside undo.
+fn diff_open(mut ed: Ed) -> bool {
+    var body = List[byte]()
+    var i = 0
+    while i < ed.lsp_rename.plan.files.len {
+        if i != 0 {
+            (mut body).push(10 as byte)
+        }
+        let f = copy ed.lsp_rename.plan.files[i]
+        diff_file(ed, f, mut body)
+        i += 1
+    }
+    var diff = ws_scratch_find(ed, RENAME_DIFF_NAME)
+    if diff < 0 {
+        diff = ws_scratch_new(mut ed, RENAME_DIFF_NAME, BUF_NOUNDO | BUF_READONLY)
+    }
+    if diff < 0 {
+        return false
+    }
+    let len = text.textbuf_len(ed.bufs[diff].ec.tb)
+    if len != 0 {
+        text.textbuf_delete(mut ed.bufs[diff].ec.tb, text.Span { lo: 0, hi: len })
+    }
+    if body.len != 0 {
+        text.textbuf_insert(mut ed.bufs[diff].ec.tb, 0 as text.ByteOff, body)
+    }
+    ed_show_buffer(mut ed, diff)
+    if ed.win < 0 || ed.wins[ed.win].buf != diff {
+        return false
+    }
+    ed.lsp_rename.diff_buf_id = ed.bufs[diff].id
+    ed.lsp_rename.phase = RENAME_DIFF
+    ed_msg(mut ed, MSG_INFO, "rename diff: enter apply, esc cancel, d return to summary")
+    true
+}
+
+// `rename_diff_return` (`rename.c:1302-1312`).
+fn diff_return(mut ed: Ed) -> bool {
+    let wi = ed_win_by_id(ed, ed.lsp_rename.win_id)
+    let origin = ed_buf_index(ed, ed.lsp_rename.buf_id)
+    if wi < 0 || origin < 0 || ed.win != wi {
+        return false
+    }
+    ed_show_buffer(mut ed, origin)
+    if ed.wins[ed.win].buf != origin {
+        return false
+    }
+    summary_open(mut ed)
+}
+
+// `rename_apply_confirmed` (`rename.c:1314-1330`).
+fn apply_confirmed(mut ed: Ed) {
+    let plan = copy ed.lsp_rename.plan
+    let edits = plan.nedits
+    let files = plan.files.len
+    let v = lsp_rename_apply(mut ed, plan)
+    state_finish(mut ed, true)
+    if !v.ok {
+        ed_msg(mut ed, MSG_ERROR, v.err)
+        return
+    }
+    ed_msg(
+        mut ed,
+        MSG_INFO,
+        "renamed {edits} occurrences in {files} files (unsaved \u{2014} :wa to write)",
+    )
+}
+
+// `rename_answer_apply` (`rename.c:1344-1371`): `d` is the same toggle
+// from both routes.
+fn answer_apply(mut ed: Ed, answer: int) {
+    if answer == LSP_RENAME_APPLY {
+        apply_confirmed(mut ed)
+        return
+    }
+    if answer == LSP_RENAME_DIFF {
+        if ed.lsp_rename.phase == RENAME_CONFIRM {
+            let wi = ed_win_by_id(ed, ed.lsp_rename.win_id)
+            if wi >= 0 {
+                panel_close(mut ed, wi)
+            }
+            if !diff_open(mut ed) {
+                ed_msg(mut ed, MSG_ERROR, "cannot show rename diff")
+                state_finish(mut ed, true)
+            }
+        } else if !diff_return(mut ed) {
+            ed_msg(mut ed, MSG_INFO, "return to the rename window before reopening summary")
+        }
+        return
+    }
+    state_finish(mut ed, true)
+}
+
+// `rename_awaiting` (`rename.c:1376-1386`): CONFIRM or DIFF.
+fn awaiting(ed: Ed) -> bool {
+    ed.lsp_rename.active &&
+        (ed.lsp_rename.phase == RENAME_CONFIRM || ed.lsp_rename.phase == RENAME_DIFF)
+}
+
+/// `yew_lsp_rename_answer` (`rename.c:1398-1411`): the three answers'
+/// one implementation; refused with its message when nothing waits.
+pub fn lsp_rename_answer(mut ed: Ed, answer: int) -> bool {
+    if !awaiting(ed) {
+        ed_msg(mut ed, MSG_ERROR, "no rename is waiting for confirmation")
+        return false
+    }
+    answer_apply(mut ed, answer)
+    ed.full_damage = true
+    true
+}
+
+/// `yew_lsp_rename_confirm_active` (`rename.c:1413-1431`): the focused
+/// window's panel is the rename's summary.
+pub fn lsp_rename_confirm_active(ed: Ed) -> bool {
+    if !ed.lsp_rename.active || ed.win < 0 || ed.lsp_rename.phase != RENAME_CONFIRM {
+        return false
+    }
+    ed.wins[ed.win].id == ed.lsp_rename.win_id && ed.wins[ed.win].panel.open
+}
+
+/// `yew_lsp_rename_key` (`rename.c:1433-1471`): Esc cancels, Enter
+/// applies, `d` toggles the diff; in CONFIRM the scroll keys scroll the
+/// summary and any other key cancels and goes on to the editor.
+pub fn lsp_rename_key(mut ed: Ed, key: term.Key) -> bool {
+    if !awaiting(ed) {
+        return false
+    }
+    if key.ev == term.KEY_RELEASE {
+        return true
+    }
+    if key.code == term.KEY_ESCAPE {
+        answer_apply(mut ed, LSP_RENAME_CANCEL)
+        return true
+    }
+    if key.code == term.KEY_ENTER || key.code == term.KEY_KP_ENTER {
+        answer_apply(mut ed, LSP_RENAME_APPLY)
+        return true
+    }
+    if key.mods == 0 && key.code == 100 {
+        answer_apply(mut ed, LSP_RENAME_DIFF)
+        return true
+    }
+    if ed.lsp_rename.phase == RENAME_CONFIRM {
+        if key.mods == 0 &&
+            (
+                key.code == term.KEY_UP ||
+                    key.code == term.KEY_DOWN ||
+                    key.code == term.KEY_PAGE_UP ||
+                    key.code == term.KEY_PAGE_DOWN
+            ) {
+            let wi = ed_win_by_id(ed, ed.lsp_rename.win_id)
+            if wi >= 0 {
+                let _ = panel_key(mut ed, wi, key)
+            }
+            return true
+        }
+        state_finish(mut ed, true)
+        return false
+    }
+    false
+}
+
+/// `yew_lsp_rename_shutdown` (`rename.c:1473-1476`).
+pub fn lsp_rename_shutdown(mut ed: Ed) {
+    state_finish(mut ed, true)
+}
