@@ -1041,6 +1041,25 @@ static int lsprow_rm(const char *path, const struct stat *st, int flag,
     return remove(path);
 }
 
+/* A failed run's state directory, moved aside under the editor's tag
+ * ($YEW_LSPROW_OUT's last name, `c` or `port`): the other editor's run of
+ * the same case opens the same path and would remove it. Returns the
+ * kept path, or STATE if it could not be moved. */
+static const char *lsprow_keep(const char *state)
+{
+    static char kept[PATH_MAX];
+    const char *out = getenv("YEW_LSPROW_OUT");
+    const char *tag = out != NULL ? strrchr(out, '/') : NULL;
+    int n;
+
+    tag = tag != NULL ? tag + 1 : (out != NULL && out[0] != '\0' ? out : "run");
+    n = snprintf(kept, sizeof(kept), "%s.%s", state, tag);
+    if (n <= 0 || (size_t)n >= sizeof(kept))
+        return state;
+    (void)nftw(kept, lsprow_rm, 16, FTW_DEPTH | FTW_PHYS);
+    return rename(state, kept) == 0 ? kept : state;
+}
+
 /* One run of one case in a fresh state directory (the harness makes it
  * absolute and puts the workspace inside), removed when the run passes.
  * The pty runner's hermetic user init.fl (runner.c:204) is not written:
@@ -1080,7 +1099,7 @@ static bool lsprow_once(const PtyCase *test, const char *demo,
         (void)fprintf(stderr, "lsp-row: %s run %u: %s (state kept: %s)\n",
                       test->name, lsprow_run,
                       ctx.failure[0] == '\0' ? "failed" : ctx.failure,
-                      state);
+                      lsprow_keep(state));
     ptc_dispose(&ctx);
     return ok;
 }
