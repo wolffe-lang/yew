@@ -539,6 +539,55 @@ static void lsprow_wait_row(PtyCtx *c, int row, const char *failure)
     ptc_settle(c, LSPROW_QUIET_MS);
 }
 
+/* The rows' gutter (compare.py's GUTTER): text column 0 is screen column
+ * 6, and screen row 0 is the tab strip, so line N is screen row N. */
+#define LSPROW_GUTTER 6
+
+static bool lsprow_color_eq(YewColor a, YewColor b)
+{
+    return a.tag == b.tag &&
+           (a.tag == YEW_COLOR_DEFAULT ||
+            (a.r == b.r && a.g == b.g && a.b == b.b));
+}
+
+/* The cell at ROW, COL carries a mark the cell at ROW, PLAIN lacks: a
+ * background or an underline, which on these rows' text only an overlay
+ * sets (draw.c:606-639). */
+static bool lsprow_cell_marked(const VtScreen *vt, int row, int col,
+                               int plain)
+{
+    const VtCell *a;
+    const VtCell *b;
+
+    if (row < 0 || row >= vt->rows || col < 0 || col >= vt->cols ||
+        plain < 0 || plain >= vt->cols || vt->cells == NULL)
+        return false;
+    a = &vt->cells[(size_t)row * (size_t)vt->cols + (size_t)col];
+    b = &vt->cells[(size_t)row * (size_t)vt->cols + (size_t)plain];
+    return !lsprow_color_eq(a->bg, b->bg) ||
+           ((a->attrs ^ b->attrs) & YEW_ATTR_UNDERLINE) != 0;
+}
+
+/* Both of the fake's highlights drawn (fakeserver.py's `highlight`: line
+ * 1's characters 0-2 and line 2's 4-5), each against a cell of its own
+ * line outside it. Which span is the read and which the write is the
+ * comparison's to hold, cell for cell: this waits on the frame only. */
+static bool lsprow_highlit(const PtyCtx *c, const void *arg)
+{
+    (void)arg;
+    return lsprow_cell_marked(&c->vt, 1, LSPROW_GUTTER + 0,
+                              LSPROW_GUTTER + 3) &&
+           lsprow_cell_marked(&c->vt, 2, LSPROW_GUTTER + 4,
+                              LSPROW_GUTTER + 6);
+}
+
+static void lsprow_wait_highlit(PtyCtx *c, const char *failure)
+{
+    ptc_wait_until(c, lsprow_highlit, NULL, failure);
+    lsprow_show_failure(c);
+    ptc_settle(c, LSPROW_QUIET_MS);
+}
+
 /* The cursor at LINE:COL (1-based) by the statusline's position field:
  * each step of a row's walk is waited for, so a busy host cannot fold the
  * next command line into the last one. */
@@ -626,7 +675,7 @@ static void case_lspw_references(PtyCtx *c)
     lsprow_wait(c, "2/2", "the references picker never showed two rows");
     lsprow_dump(c, "1-picker");
     ptc_keys(c, "esc");
-    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_wait_gone(c, "up/down move", "esc did not close the references picker");
     lsprow_dump(c, "2-closed");
     force_quit(c);
 }
@@ -641,7 +690,7 @@ static void case_lspw_symbols(PtyCtx *c)
     lsprow_wait(c, "2/2", "the symbol picker never showed two rows");
     lsprow_dump(c, "1-picker");
     ptc_keys(c, "esc");
-    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_wait_gone(c, "up/down move", "esc did not close the symbol picker");
     force_quit(c);
 }
 
@@ -778,7 +827,7 @@ static void case_lspf_partial(PtyCtx *c)
     lsprow_dump(c, "1-hover");
     /* A refused command keeps its line open for an edit: ESC closes it. */
     ptc_keys(c, "esc");
-    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_wait_gone(c, ":ed.lsp.hover", "esc did not close the refused command");
     lsprow_command(c, "ed.lsp.goto_def");
     lsprow_wait_row(c, 1, "the one capability did not answer");
     lsprow_dump(c, "2-def");
@@ -792,11 +841,17 @@ static void case_lspf_highlight(PtyCtx *c)
     lsprow_open_fake(c, "highlight", 30000);
     lsprow_wait_ready(c, "fake");
     lsprow_char_right(c, 1, 1, 1);
-    /* The idle 300 ms, the reply, the frame. */
-    ptc_settle(c, 1500);
+    /* The idle 300 ms (highlight.c:17), the reply, the frame. */
+    lsprow_wait_highlit(c, "the highlights never showed after the idle");
     lsprow_dump(c, "1-highlit");
     ptc_keys(c, "i z esc");
+    /* The edit moves the buffer's generation, which drops both spans
+     * (draw.c:646-648); the cursor then stops again, and after the idle
+     * the server's answer for the edited text is drawn. The kept screen
+     * is that one, waited for: a quiet gap after the edit would race the
+     * idle timer. */
     lsprow_wait(c, "fzn add", "the edit did not land");
+    lsprow_wait_highlit(c, "the highlights never came back after the edit");
     lsprow_dump(c, "2-edited");
     force_quit(c);
 }
@@ -813,7 +868,7 @@ static void case_lspf_signature(PtyCtx *c)
     lsprow_wait(c, "plus(x: int, y: int)", "the signature panel never showed");
     lsprow_dump(c, "1-panel");
     ptc_keys(c, "esc");
-    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_wait_gone(c, "plus(x: int, y: int)", "esc did not close the signature panel");
     lsprow_dump(c, "2-closed");
     force_quit(c);
 }
@@ -852,41 +907,44 @@ static void case_lspf_rename_files(PtyCtx *c)
  * editor binary, `alpha.c` made dirty first), kept as screens instead of
  * held to a golden: the goldens also hold the document's syntax colouring
  * (the typed `!` is C's operator colour), which is yw10's, and these rows
- * compare everything else. */
+ * compare everything else. After KEYS the row waits for WAIT to show or
+ * for GONE to leave (the panel's key hint: C's own unknown-key check,
+ * registry.c:10014-10016). */
 static void lsprow_s47(PtyCtx *c, const char *keys, const char *wait,
-                       const char *label)
+                       const char *gone, const char *label)
 {
     S47RenameFix f;
 
     if (!s47_rename_open(c, "session-rename", &f))
         return;
     s47_rename_begin(c, true, "rename 'alpha' \xE2\x86\x92 'beta'");
-    if (keys != NULL) {
+    if (keys != NULL)
         ptc_keys(c, keys);
-        if (wait != NULL)
-            lsprow_wait(c, wait, "the rename answer did not show");
-        else
-            ptc_settle(c, LSPROW_QUIET_MS);
-    } else {
+    if (wait != NULL)
+        lsprow_wait(c, wait, "the rename answer did not show");
+    else if (gone != NULL)
+        lsprow_wait_gone(c, gone, "the rename confirmation stayed open");
+    else
         ptc_settle(c, LSPROW_QUIET_MS);
-    }
     lsprow_dump(c, label);
     s47_rename_finish(c, &f);
 }
 
+/* s47_rename_begin waited for the summary's title; the summary's last
+ * line is the key hint. */
 static void case_lspg_rename_summary(PtyCtx *c)
 {
-    lsprow_s47(c, NULL, NULL, "1-summary");
+    lsprow_s47(c, NULL, "enter apply", NULL, "1-summary");
 }
 
 static void case_lspg_rename_apply(PtyCtx *c)
 {
-    lsprow_s47(c, "enter", "renamed ", "1-applied");
+    lsprow_s47(c, "enter", "renamed ", NULL, "1-applied");
 }
 
 static void case_lspg_rename_unknown_key(PtyCtx *c)
 {
-    lsprow_s47(c, "left", NULL, "1-left");
+    lsprow_s47(c, "left", NULL, "enter apply", "1-left");
 }
 
 /* registry.c #undefs its C() macro at its end, so the rows are spelled
