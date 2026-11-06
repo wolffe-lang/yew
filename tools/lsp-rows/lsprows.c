@@ -242,7 +242,9 @@ static void case_lspw_open_diag(PtyCtx *c)
     ptc_check(c, c->vt.cur_r == 2U, "diag_next did not reach line 2");
     lsprow_dump(c, "2-next");
     lsprow_command(c, "ed.lsp.diagnostics");
-    ptc_settle(c, 500);
+    /* The list's count, not a blind settle: a slow host can leave a quiet
+     * gap between the picker's frame and its populated list. */
+    lsprow_wait(c, "1/1", "the diagnostic list never showed its one row");
     lsprow_dump(c, "3-list");
     /* The picker's footer: the alias hint for the long command name
      * covers its title row in both editors. */
