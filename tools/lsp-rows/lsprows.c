@@ -825,23 +825,42 @@ static bool lsprow_fake_marked(const PtyCtx *c, const void *arg)
     return n > 0 && (size_t)n < sizeof(path) && access(path, F_OK) == 0;
 }
 
+/* A request's deadline (jsonrpc.h:20: YEW_RPC_TIMEOUT_MS). */
+#define LSPROW_RPC_TIMEOUT_MS 10000
+
+static bool lsprow_clock_past(const PtyCtx *c, const void *arg)
+{
+    (void)c;
+    return ptc_now_ms() >= *(const i64 *)arg;
+}
+
 static void case_lspf_deadline(PtyCtx *c)
 {
+    i64 expired;
+
     if (!lsprow_package(c, lsprow_calls))
         return;
     lsprow_open_fake(c, "deadline", 30000);
     lsprow_wait_ready(c, "fake");
     lsprow_to_call(c);
     lsprow_command(c, "ed.lsp.goto_def");
-    /* The request at the fake (its marker), the command line closed. */
+    /* The request at the fake (its marker), the command line closed. The
+     * editor stamped the request before sending it (jsonrpc.c:519-524),
+     * so its deadline is at most 10 s after the marker was seen, on the
+     * same monotonic clock. */
     ptc_wait_until(c, lsprow_fake_marked, NULL,
                    "the definition request never reached the fake");
+    expired = ptc_now_ms() + LSPROW_RPC_TIMEOUT_MS;
     lsprow_wait_gone(c, ":ed.lsp.goto_def", "the command line stayed open");
     lsprow_dump(c, "1-pending");
-    /* The answer comes 12 s after the request, past its 10 s deadline
-     * (jsonrpc.h:20): the sweep has already called the request back with
-     * the timeout error (jsonrpc.c:682-718), so the answer's id is no
-     * longer pending and it is ignored. Nothing is said, nothing moves. */
+    /* Then a save: the fake holds its answer until the didSave. The save's
+     * key is read in a turn past the deadline, and that turn's tick sweeps
+     * the request with the timeout error (loop.c:602-605, jsonrpc.c:
+     * 682-718) before the answer can arrive, so the answer's id is no
+     * longer pending and it is ignored: the cursor stays on the call. */
+    ptc_wait_until(c, lsprow_clock_past, &expired,
+                   "the request's deadline never passed");
+    ptc_keys(c, "s");
     lsprow_wait_receipt(c, 1, "the late definition reply never came");
     ptc_check(c, c->vt.cur_r == 6U,
               "a definition answered past its deadline moved the cursor");
