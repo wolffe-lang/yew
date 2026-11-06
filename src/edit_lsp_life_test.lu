@@ -1,0 +1,1602 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_lsp_life.c` (1,794 lines) at
+//! 9ace98c2 from `:205` on, one test per C test in file order; its first
+//! five (the lifecycle, root and table cases, `:47-203`) are
+//! `src/lsp_client_test.lu`'s.
+//!
+//! **The fixture is a real server.** C's `life_fix_init` (`:356-394`)
+//! writes a file, opens it, and starts C's `fakelsp` in a mode through
+//! the client's own start; so does this one, through the port's
+//! `LspServer` and job, against the oracle's build of the helper
+//! (`edit.fakelsp_path`). `life_pump_once` (`:419-434`) is
+//! `edit.ed_pump_jobs_once`. Without the helper each case that spawns it
+//! SKIPs by name ("fakelsp is missing") and the file exits 0; `tools/
+//! check-test --fakelsp-ran` refuses any such line. Scratch files live
+//! under `$TMPDIR`, not C's `/tmp`.
+//!
+//! **C's test callback.** The stale cases count calls of `stale_callback`
+//! (`:195-203`); the port's callback is a kind matched in one place
+//! (`lsp_pending_done`), reached only when `lsp_dispatch_response`
+//! answers true, so "never called" is that answer false with the stale
+//! count moved and the request gone.
+//!
+//! **RED by name.** The completion cases (`:663-738`) are yw11b1's
+//! (R-yw11b-3): each asserts the port's refusal of `ed.lsp.complete` and
+//! prints a RED line. `ed.syn.set` is Sprint 39's (yw10): the language
+//! change case asserts that refusal, then the half C's handler runs for
+//! the LSP (`yew_lsp_buffer_close`, `cmd.c:105-106`) and its transcript,
+//! and prints a RED line.
+//!
+//! The per-case selector `YEW_LSP_LIFE_CASE=N` (0-based, 36 cases).
+
+use edit
+use lsp
+use std.fs
+use std.signal
+use term
+use text
+use util
+
+struct Tally {
+    n: int,
+}
+
+// A failed check says what it was before the trap (a native trap prints
+// only its site).
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    if !cond {
+        eprint("assertion failed: {what}")
+    }
+    assert(cond, what)
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn text_of(b: List[byte]) -> str {
+    str_from_utf8(b) else "<not utf-8>"
+}
+
+fn parse(text: str) -> lsp.Json {
+    var err = lsp.json_err_new()
+    let j = lsp.json_parse(text.bytes(), 0, text.len, mut err) else {
+        assert(false, "parse {text}: {err.msg}")
+        return lsp.json_new()
+    }
+    j
+}
+
+// `bytes_contain` (`:1457-1468`), from byte `from`.
+fn bytes_contain(bytes: List[byte], from: int, needle: str) -> bool {
+    let nb = needle.bytes()
+    var i = from
+    while i + nb.len <= bytes.len {
+        var hit = true
+        var k = 0
+        while k < nb.len {
+            if bytes[i + k] != nb[k] {
+                hit = false
+                break
+            }
+            k += 1
+        }
+        if hit {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+fn scratch_dir() -> str {
+    let tmp = env_get("TMPDIR") else "target/tests"
+    let base = if tmp.len == 0 then "target/tests" else tmp
+    fs.create_dir_all(base) else |_| {}
+    base
+}
+
+// Whether a process of group `pgid` still exists (C's `kill(-pgid, 0)`):
+// 1 yes, 0 no, -1 where the host has no /proc to ask
+// (`src/edit_job_test.lu`'s, by value).
+fn group_alive(pgid: int) -> int {
+    let rows = fs_read_dir_entries("/proc") else |_| { return -1 }
+    for row in rows {
+        if row.len < 2 {
+            continue
+        }
+        let raw_name = row[1..row.len]
+        var digits = true
+        for b in raw_name {
+            if b as int < 48 || b as int > 57 {
+                digits = false
+            }
+        }
+        if !digits {
+            continue
+        }
+        let name = str_from_utf8(raw_name) else |_| { continue }
+        let stat = fs.read_text("/proc/{name}/stat") else |_| { continue }
+        let close = stat.rfind(")") else -1
+        if close < 0 {
+            continue
+        }
+        let rest = stat[close + 2..].words()
+        if rest.len >= 3 && rest[2] == "{pgid}" {
+            return 1
+        }
+    }
+    0
+}
+
+// `open_fd_count` (`:1286-1306`).
+fn fd_count() -> int {
+    let rows = fs_read_dir_entries("/dev/fd") else |_| { return -1 }
+    rows.len
+}
+
+// ---- the bare server (C's memset LspServer) ---------------------------------
+
+fn place_server(mut ed: edit.Ed) -> int {
+    ed.lsp.present = true
+    let sid = ed.lsp.next_id
+    ed.lsp.next_id += 1
+    let cfg = lsp.LspServerCfg {
+        id: "fakelsp",
+        lang: "c",
+        cmd: "",
+        args: List[str](),
+        roots: List[str](),
+        init_options: "",
+        has_init_options: false,
+        init_timeout_ms: 1000,
+    }
+    (mut ed.lsp.servers).push(edit.LspServer {
+        id: sid,
+        cfg: cfg,
+        root: os_cwd() else ".",
+        job: 0,
+        rpc: lsp.rpc_conn_new(),
+        rpc_live: true,
+        life: lsp.lsp_life_new(),
+        docv: List[lsp.LspDoc](),
+        exit_sent: false,
+        missing_warned: 0,
+        dropped_stale: 0,
+        shadow_request: 0,
+        shadow_buf_id: 0,
+        shadow_seq: 0,
+    })
+    sid
+}
+
+// test_lsp_life.c:205-251
+fn lsp_lifecycle_drops_stale_response_before_callback(mut t: Tally) {
+    var ed = edit.ed_new()
+    edit.ed_open_memory(mut ed, pb("old"), "stale")
+    let bi = ed.wins[ed.win].buf
+    let sid = place_server(mut ed)
+    let k = ed.lsp.servers.len - 1
+    var p = lsp.rpc_pending_new()
+    p.buf_id = ed.bufs[bi].id
+    p.gen = ed.bufs[bi].ec.tb.gen + 1
+    let id = lsp.rpc_call(mut ed.lsp.servers[k].rpc, "textDocument/hover", pb("{{}}"), p)
+    let j = parse("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}")
+    ok(mut t, !edit.lsp_dispatch_response(mut ed, sid, j, j.root), "dropped before the callback")
+    ok(mut t, ed.lsp.servers[k].dropped_stale == 1, "one stale drop")
+    let gone = lsp.rpc_pending(ed.lsp.servers[k].rpc, id) else lsp.rpc_pending_new()
+    ok(mut t, gone.id == 0, "the request is gone")
+}
+
+// test_lsp_life.c:253-317
+fn lsp_lifecycle_drops_every_stale_feature_response(mut t: Tally) {
+    let methods = [
+        "textDocument/completion",
+        "completionItem/resolve",
+        "textDocument/hover",
+        "textDocument/signatureHelp",
+        "textDocument/definition",
+        "textDocument/declaration",
+        "textDocument/typeDefinition",
+        "textDocument/implementation",
+        "textDocument/references",
+        "textDocument/documentHighlight",
+        "textDocument/documentSymbol",
+        "textDocument/rename",
+    ]
+    var ed = edit.ed_new()
+    edit.ed_open_memory(mut ed, pb("before"), "stale-every")
+    let bi = ed.wins[ed.win].buf
+    let sid = place_server(mut ed)
+    let k = ed.lsp.servers.len - 1
+    ed.lsp.servers[k].life.state = lsp.LSP_READY
+    var p = lsp.rpc_pending_new()
+    p.buf_id = ed.bufs[bi].id
+    p.gen = ed.bufs[bi].ec.tb.gen
+    var ids = List[int]()
+    for m in methods {
+        let id = lsp.rpc_call(mut ed.lsp.servers[k].rpc, m, pb("{{}}"), p)
+        ok(mut t, id != 0, "{m}: an id")
+        let live = lsp.rpc_pending(ed.lsp.servers[k].rpc, id) else lsp.rpc_pending_new()
+        ok(mut t, live.id == id, "{m}: pending")
+        (mut ids).push(id)
+    }
+    text.textbuf_insert(mut ed.bufs[bi].ec.tb, 0 as text.ByteOff, pb("x"))
+    var i = 0
+    while i < ids.len {
+        let j = parse("{{\"jsonrpc\":\"2.0\",\"id\":{ids[i]},\"result\":null}}")
+        ok(mut t, !edit.lsp_dispatch_response(mut ed, sid, j, j.root), "{methods[i]}: dropped")
+        let gone = lsp.rpc_pending(ed.lsp.servers[k].rpc, ids[i]) else lsp.rpc_pending_new()
+        ok(mut t, gone.id == 0, "{methods[i]}: gone")
+        i += 1
+    }
+    ok(
+        mut t,
+        ed.lsp.servers[k].dropped_stale == methods.len,
+        "every one stale: {ed.lsp.servers[k].dropped_stale}",
+    )
+}
+
+// ---- the life fixture (`:319-661`) ------------------------------------------
+
+struct LifeFix {
+    ed: edit.Ed,
+    path: str,
+    marker: str,
+    bi: int,
+}
+
+// A sanitizer worker can be descheduled while the restarted helper execs
+// (`LIFE_RESTART_READY_TIMEOUT_MS`, `:333-336`).
+const LIFE_RESTART_READY_TIMEOUT_MS: int = 10000
+
+// `life_fix_init` (`:356-394`).
+fn fix_init(helper: str, mode: str, timeout_ms: int, tag: str) -> LifeFix {
+    let dir = scratch_dir()
+    let path = "{dir}/yew-lsp-life-{os_pid()}-{tag}"
+    let marker = "{dir}/yew-lsp-restart-{os_pid()}-{tag}"
+    fs_write_bytes(path, pb("int x;\n")) else |_| {
+        assert(false, "write {path}")
+    }
+    fs.remove(marker) else |_| {}
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let idx = edit.tab_open(mut ed, path)
+    assert(idx >= 0, "open {path}")
+    assert(edit.tab_hydrate(mut ed, idx) == 0, "load {path}")
+    edit.tab_switch(mut ed, idx)
+    let bi = ed.wins[ed.win].buf
+    ed.buf_languages[ed.bufs[bi].id] = "c"
+    ed.now_ms = edit.now_ms()
+    var args = List[str]()
+    (mut args).push(mode)
+    (mut args).push(marker)
+    let cfg = lsp.LspServerCfg {
+        id: "fakelsp",
+        lang: "c",
+        cmd: helper,
+        args: args,
+        roots: List[str](),
+        init_options: "",
+        has_init_options: false,
+        init_timeout_ms: timeout_ms,
+    }
+    assert(edit.lsp_client_start_cfg(mut ed, bi, cfg), "start fakelsp {mode}")
+    let (k, _) = edit.lsp_doc_of_buffer(ed, bi)
+    assert(k >= 0, "the document attached")
+    LifeFix { ed: ed, path: path, marker: marker, bi: bi }
+}
+
+// `life_fix_free` (`:396-406`): the editor's own LSP teardown, then the
+// files.
+fn fix_free(mut f: LifeFix) {
+    edit.lsp_free(mut f.ed)
+    fs.remove(f.path) else |_| {
+        assert(false, "unlink {f.path}")
+    }
+    fs.remove(f.marker) else |_| {}
+}
+
+// `life_marker_write` (`:408-417`).
+fn marker_write(f: LifeFix, body: str) {
+    fs_write_bytes(f.marker, pb(body)) else |_| {
+        assert(false, "write {f.marker}")
+    }
+}
+
+fn pump(mut f: LifeFix) {
+    edit.ed_pump_jobs_once(mut f.ed, 10)
+}
+
+// `life_server` (`:436-443`).
+fn server(f: LifeFix) -> int {
+    let (k, _) = edit.lsp_doc_of_buffer(f.ed, f.bi)
+    assert(k >= 0, "LSP lifecycle fixture lost its document")
+    k
+}
+
+fn doc(f: LifeFix) -> int {
+    let (_, d) = edit.lsp_doc_of_buffer(f.ed, f.bi)
+    assert(d >= 0, "LSP lifecycle fixture lost its document")
+    d
+}
+
+fn sid(f: LifeFix) -> int {
+    f.ed.lsp.servers[server(f)].id
+}
+
+// `wait_state` (`:445-456`).
+fn wait_state(mut f: LifeFix, state: int, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        if f.ed.lsp.servers[server(f)].life.state == state {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_panel_title` (`:470-484`).
+fn wait_panel_title(mut f: LifeFix, title: str, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        let w = f.ed.win
+        if f.ed.wins[w].panel.open &&
+            f.ed.wins[w].panel.has_title &&
+            f.ed.wins[w].panel.title == title {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_message` (`:486-496`).
+fn wait_message(mut f: LifeFix, message: str, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        if f.ed.msg.active && f.ed.msg.text == message {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_capability_clear` (`:498-509`).
+fn wait_capability_clear(mut f: LifeFix, cap: int, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        if !lsp.lsp_caps_has(f.ed.lsp.servers[server(f)].life.caps, cap) {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_rpc_tx_empty` (`:511-521`).
+fn wait_rpc_tx_empty(mut f: LifeFix, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        if f.ed.lsp.servers[server(f)].rpc.tx.pending.len == 0 {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_current_path` (`:575-588`).
+fn wait_current_path(mut f: LifeFix, path: str, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        let d = edit.ed_doc(f.ed)
+        if d >= 0 && f.ed.bufs[d].has_path && f.ed.bufs[d].path == path {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_picker_rows` (`:590-601`).
+fn wait_picker_rows(mut f: LifeFix, rows: int, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        if edit.picker_active(f.ed) && edit.picker_total(f.ed) == rows {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_drained` and `wait_server_drained` (`:633-661`): the server's job
+// drained. The server's entry outlives its stop, so the two are one here.
+fn wait_drained(mut f: LifeFix, timeout_ms: int) -> bool {
+    let k = server(f)
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+        if j >= 0 && f.ed.jobs.v[j].drained {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_new_ready` (`:1556-1570`).
+fn wait_new_ready(mut f: LifeFix, old_job: int, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        let (k, d) = edit.lsp_doc_of_buffer(f.ed, f.bi)
+        if k >= 0 &&
+            d >= 0 &&
+            f.ed.lsp.servers[k].job != old_job &&
+            f.ed.lsp.servers[k].life.state == lsp.LSP_READY &&
+            f.ed.lsp.servers[k].docv[d].open {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// `wait_restart_notice` (`:1622-1635`).
+fn wait_restart_notice(mut f: LifeFix, restarts: int, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        if f.ed.lsp.servers[server(f)].life.restarts == restarts && f.ed.msg.active {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// The server stopped and its job drained: every fakelsp case's ending.
+fn stop_and_drain(mut t: Tally, mut f: LifeFix) {
+    let k = server(f)
+    edit.lsp_client_stop(mut f.ed, k, true)
+    ok(mut t, wait_drained(mut f, 2000), "the server drained")
+}
+
+// The job's stderr: fakelsp's `seq:` transcript.
+fn transcript_is(f: LifeFix, want: str) -> bool {
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[server(f)].job)
+    j >= 0 && same(f.ed.jobs.v[j].framed_err, pb(want))
+}
+
+fn transcript_of(f: LifeFix) -> str {
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[server(f)].job)
+    if j < 0 {
+        return "<no job>"
+    }
+    text_of(f.ed.jobs.v[j].framed_err)
+}
+
+fn set_cursor(mut f: LifeFix, pos: int) {
+    let w = f.ed.win
+    let p = f.ed.wins[w].cs.primary
+    f.ed.wins[w].cs.curs[p].pos = pos
+    f.ed.wins[w].cs.curs[p].anchor = pos
+}
+
+fn cursor_pos(f: LifeFix) -> int {
+    let w = f.ed.win
+    f.ed.wins[w].cs.curs[f.ed.wins[w].cs.primary].pos
+}
+
+// C's `yew_ed_edit_ctx` + `yew_edit_insert` + `yew_ed_finish_edit`.
+fn insert_front(mut f: LifeFix, s: str) -> bool {
+    let w = f.ed.win
+    let bytes = pb(s)
+    let done = edit.ed_edit_insert(mut f.ed, w, 0, bytes, 0, bytes.len)
+    edit.ed_finish_edit(mut f.ed, w)
+    done
+}
+
+fn panel_size(mut f: LifeFix) {
+    let w = f.ed.win
+    f.ed.wins[w].rect = edit.rect(0, 0, 80, 24)
+    f.ed.wins[w].vp.cols = 80
+    f.ed.wins[w].vp.rows = 24
+}
+
+fn grid_up(mut f: LifeFix) {
+    f.ed.grid = term.grid_new(24, 80)
+    f.ed.grid_ready = true
+}
+
+fn jumps(f: LifeFix) -> int {
+    text.jumplist_len(f.ed.wins[f.ed.win].jumps)
+}
+
+// ---- completion (yw11b1) ----------------------------------------------------
+
+// The completion cases' half before yw11b1: the command refuses by name.
+fn completion_red(mut t: Tally, name: str, cite: str) -> int {
+    var ed = edit.ed_new()
+    edit.ed_open_memory(mut ed, pb("int x;\n"), "complete.c")
+    let id = edit.cmd_lookup(ed.reg, "ed.lsp.complete")
+    ok(mut t, id != 0, "ed.lsp.complete is registered")
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = 1
+    ok(mut t, edit.ed_cmd_invoke(mut ed, id, mut cx) == edit.CMD_ERR_DEFERRED, "{name}: deferred")
+    ok(
+        mut t,
+        ed.msg.text.starts_with("not yet ported: ed.lsp.complete: "),
+        "{name}: by name: {ed.msg.text}",
+    )
+    print(
+        "RED {name}: the completion menu, resolve and shadow completion ({cite}): sagitta Sprints 43-44 (yw11b1, R-yw11b-3)",
+    )
+    1
+}
+
+// ---- the panels (`:740-816`) ------------------------------------------------
+
+// test_lsp_life.c:740-791
+fn lsp_lifecycle_hover_signature_panels_and_auto_trigger(mut t: Tally, helper: str) {
+    let hover = "**int** docs"
+    let signature = "sum(int a, int b)"
+    var f = fix_init(helper, "session-panels", 1000, "panels")
+    panel_size(mut f)
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_HOVER), "hover")
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_SIGNATURE), "signature")
+    ok(mut t, f.ed.lsp.servers[k].life.caps.sig_trigger == "(", "the trigger")
+
+    ok(mut t, edit.lsp_hover(mut f.ed, f.ed.win), "hover sent")
+    ok(mut t, wait_panel_title(mut f, "hover", 2000), "the hover panel")
+    let w = f.ed.win
+    ok(mut t, f.ed.wins[w].panel.place == edit.PANEL_BELOW, "below")
+    ok(
+        mut t,
+        same(f.ed.wins[w].panel.body, pb(hover)),
+        "the body: {text_of(f.ed.wins[w].panel.body)}",
+    )
+    ok(mut t, f.ed.wins[w].panel.mark_live, "the range marked")
+    ok(mut t, f.ed.wins[w].panel.mark.lo == 0 && f.ed.wins[w].panel.mark.hi == 3, "0..3")
+    ok(mut t, f.ed.wins[w].panel.mark_buf_id == f.ed.bufs[f.bi].id, "the buffer")
+    ok(mut t, f.ed.wins[w].panel.mark_buf_gen == f.ed.bufs[f.bi].ec.tb.gen, "the generation")
+    ok(
+        mut t,
+        f.ed.wins[w].panel.has_mark_role && f.ed.wins[w].panel.mark_role == "lsp.hover_range",
+        "the role",
+    )
+
+    edit.lsp_signature_maybe_auto_trigger(mut f.ed, f.ed.win, pb("("))
+    ok(mut t, f.ed.wins[f.ed.win].panel_source_request != 0, "signature sent")
+    ok(mut t, wait_panel_title(mut f, "signature", 2000), "the signature panel")
+    let w2 = f.ed.win
+    ok(mut t, f.ed.wins[w2].panel.place == edit.PANEL_ABOVE, "above")
+    ok(mut t, same(f.ed.wins[w2].panel.body, pb(signature)), "the label")
+    ok(mut t, f.ed.wins[w2].panel.emph.len == 1, "one emphasis")
+    ok(mut t, f.ed.wins[w2].panel.emph[0].lo == 4 && f.ed.wins[w2].panel.emph[0].hi == 9, "4..9")
+    ok(mut t, !f.ed.wins[w2].panel.mark_live, "no range")
+
+    ok(mut t, edit.lsp_hover(mut f.ed, f.ed.win), "hover again")
+    ok(mut t, wait_message(mut f, "no hover information here", 2000), "nothing here")
+    ok(mut t, !f.ed.wins[f.ed.win].panel.open, "closed")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:793-816
+fn lsp_lifecycle_method_not_found_clears_panel_capabilities(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-panel-missing", 1000, "panel-missing")
+    panel_size(mut f)
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_HOVER), "hover")
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_SIGNATURE), "signature")
+    ok(mut t, edit.lsp_hover(mut f.ed, f.ed.win), "hover sent")
+    ok(mut t, wait_capability_clear(mut f, lsp.LSPC_HOVER, 2000), "hover cleared")
+    ok(mut t, edit.lsp_signature(mut f.ed, f.ed.win), "signature sent")
+    ok(mut t, wait_capability_clear(mut f, lsp.LSPC_SIGNATURE, 2000), "signature cleared")
+    ok(mut t, !f.ed.wins[f.ed.win].panel.open, "no panel")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// ---- navigation and symbols (`:818-975`) ------------------------------------
+
+// test_lsp_life.c:818-846
+fn lsp_lifecycle_definition_response_jumps_to_single_location(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-definition", 1000, "definition")
+    marker_write(f, "abcdef\n")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DEFINITION), "definition")
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_REFERENCES), "references")
+    set_cursor(mut f, 1)
+    ok(mut t, edit.lsp_goto_definition(mut f.ed, f.ed.win), "sent")
+    ok(mut t, wait_current_path(mut f, f.marker, 2000), "at the target")
+    ok(mut t, cursor_pos(f) == 2, "byte 2: {cursor_pos(f)}")
+    ok(mut t, jumps(f) == 1, "one jump")
+    ok(mut t, f.ed.wins[f.ed.win].nav_source_request == 0, "the request record cleared")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:848-870
+fn lsp_lifecycle_references_response_opens_multi_location_picker(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-references", 1000, "references")
+    marker_write(f, "abcdef\n")
+    grid_up(mut f)
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_REFERENCES), "references")
+    ok(mut t, edit.lsp_references(mut f.ed, f.ed.win), "sent")
+    ok(mut t, wait_picker_rows(mut f, 2, 2000), "two rows")
+    ok(mut t, jumps(f) == 0, "no jump yet")
+    edit.picker_close(mut f.ed, false)
+    ok(mut t, jumps(f) == 0, "none on cancel")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:872-889
+fn lsp_lifecycle_empty_definition_reports_exact_info_message(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-definition-empty", 1000, "definition-empty")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    ok(mut t, edit.lsp_goto_definition(mut f.ed, f.ed.win), "sent")
+    ok(mut t, wait_message(mut f, "fakelsp: no definition found", 2000), "the sentence")
+    ok(mut t, f.ed.msg.sev == edit.MSG_INFO, "info")
+    ok(mut t, jumps(f) == 0, "no jump")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:891-910
+fn lsp_lifecycle_method_not_found_clears_definition_capability(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-definition-missing", 1000, "definition-missing")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DEFINITION), "definition")
+    ok(mut t, edit.lsp_goto_definition(mut f.ed, f.ed.win), "sent")
+    ok(mut t, wait_capability_clear(mut f, lsp.LSPC_DEFINITION, 2000), "cleared")
+    ok(mut t, !edit.lsp_goto_definition(mut f.ed, f.ed.win), "refused")
+    ok(
+        mut t,
+        f.ed.msg.text == "fakelsp does not support definition",
+        "the sentence: {f.ed.msg.text}",
+    )
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:912-932
+fn lsp_lifecycle_document_symbols_open_nested_picker(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-symbols", 1000, "symbols")
+    grid_up(mut f)
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_SYMBOL), "symbols")
+    ok(mut t, edit.lsp_symbols(mut f.ed, f.ed.win), "sent")
+    ok(mut t, wait_picker_rows(mut f, 2, 2000), "two rows")
+    ok(mut t, f.ed.wins[f.ed.win].symbol_source_request == 0, "the request record cleared")
+    edit.picker_close(mut f.ed, false)
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:934-953
+fn lsp_lifecycle_empty_document_symbols_report_exact_info_message(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-symbols-empty", 1000, "symbols-empty")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_SYMBOL), "symbols")
+    ok(mut t, edit.lsp_symbols(mut f.ed, f.ed.win), "sent")
+    ok(mut t, wait_message(mut f, "fakelsp: no document symbols found", 2000), "the sentence")
+    ok(mut t, f.ed.msg.sev == edit.MSG_INFO, "info")
+    ok(mut t, !edit.picker_active(f.ed), "no picker")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:955-975
+fn lsp_lifecycle_method_not_found_clears_document_symbol_capability(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-symbols-missing", 1000, "symbols-missing")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_SYMBOL), "symbols")
+    ok(mut t, edit.lsp_symbols(mut f.ed, f.ed.win), "sent")
+    ok(mut t, wait_capability_clear(mut f, lsp.LSPC_DOCUMENT_SYMBOL, 2000), "cleared")
+    ok(mut t, !edit.lsp_symbols(mut f.ed, f.ed.win), "refused")
+    ok(
+        mut t,
+        f.ed.msg.text == "fakelsp does not support document symbols",
+        "the sentence: {f.ed.msg.text}",
+    )
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// ---- document highlight (`:977-1169`) ---------------------------------------
+
+// `highlight_life_ready` (`:523-536`).
+fn highlight_ready(mut t: Tally, helper: str, tag: str) -> LifeFix {
+    var f = fix_init(helper, "session-utf8", 1000, tag)
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    ok(mut t, wait_rpc_tx_empty(mut f, 2000), "the handshake written")
+    let k = server(f)
+    f.ed.lsp.servers[k].life.caps.bits = f.ed.lsp.servers[k].life.caps.bits |
+        lsp.LSPC_DOCUMENT_HIGHLIGHT
+    ok(
+        mut t,
+        lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_HIGHLIGHT),
+        "highlight on",
+    )
+    ok(mut t, f.ed.lsp.servers[k].rpc.npending == 0, "nothing pending")
+    f
+}
+
+// `highlight_fire` (`:538-547`).
+fn highlight_fire(mut t: Tally, mut f: LifeFix, elapsed_ms: int) -> int {
+    let armed_at = f.ed.now_ms
+    edit.lsp_highlight_cursor(mut f.ed, f.ed.win)
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.timer != edit.TIMER_NONE, "armed")
+    f.ed.now_ms = armed_at + elapsed_ms
+    edit.ed_timers_fire(mut f.ed, f.ed.now_ms)
+    f.ed.wins[f.ed.win].lsp_highlight.request
+}
+
+// `highlight_dispatch` (`:549-562`).
+fn highlight_dispatch(mut f: LifeFix, id: int, member: str) -> bool {
+    let j = parse("{{\"jsonrpc\":\"2.0\",\"id\":{id},{member}}}")
+    edit.lsp_dispatch_response(mut f.ed, sid(f), j, j.root)
+}
+
+// `highlight_life_finish` (`:564-573`): the response was injected, so the
+// queued request is dropped before the stop.
+fn highlight_finish(mut t: Tally, mut f: LifeFix) {
+    let k = server(f)
+    (mut f.ed.lsp.servers[k].rpc.tx.pending).reset()
+    f.ed.lsp.servers[k].rpc.tx.sent = 0
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+fn range_member(lo: int, hi: int, kind: int) -> str {
+    "{{\"range\":{{\"start\":{{\"line\":0,\"character\":{lo}}},\"end\":{{\"line\":0,\"character\":{hi}}}}},\"kind\":{kind}}}"
+}
+
+// test_lsp_life.c:977-1004
+fn lsp_lifecycle_document_highlight_waits_for_idle(mut t: Tally, helper: str) {
+    var f = highlight_ready(mut t, helper, "hl-idle")
+    let k = server(f)
+    let armed_at = f.ed.now_ms
+    edit.lsp_highlight_cursor(mut f.ed, f.ed.win)
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.timer != edit.TIMER_NONE, "armed")
+    edit.ed_timers_fire(mut f.ed, armed_at + 299)
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.request == 0, "not at 299 ms")
+    ok(mut t, f.ed.lsp.servers[k].rpc.npending == 0, "nothing pending")
+    f.ed.now_ms = armed_at + 300
+    edit.ed_timers_fire(mut f.ed, f.ed.now_ms)
+    let request = f.ed.wins[f.ed.win].lsp_highlight.request
+    ok(mut t, request != 0, "sent at 300 ms")
+    ok(mut t, f.ed.lsp.servers[k].rpc.npending == 1, "one pending")
+    let tx = copy f.ed.lsp.servers[k].rpc.tx
+    ok(mut t, tx.pending.len > tx.sent, "queued")
+    ok(
+        mut t,
+        bytes_contain(tx.pending, tx.sent, "\"method\":\"textDocument/documentHighlight\""),
+        "the method",
+    )
+    ok(mut t, highlight_dispatch(mut f, request, "\"result\":[]"), "answered")
+    highlight_finish(mut t, mut f)
+}
+
+// test_lsp_life.c:1006-1028
+fn lsp_lifecycle_document_highlight_separates_read_and_write_overlays(mut t: Tally, helper: str) {
+    var f = highlight_ready(mut t, helper, "hl-rw")
+    let request = highlight_fire(mut t, mut f, 300)
+    ok(mut t, request != 0, "sent")
+    ok(
+        mut t,
+        highlight_dispatch(
+            mut f,
+            request,
+            "\"result\":[{range_member(0, 3, 2)},{range_member(4, 5, 3)}]",
+        ),
+        "answered",
+    )
+    let w = f.ed.win
+    ok(mut t, f.ed.wins[w].lsp_highlight.read.len == 1, "one read")
+    ok(
+        mut t,
+        f.ed.wins[w].lsp_highlight.read[0].lo == 0 && f.ed.wins[w].lsp_highlight.read[0].hi == 3,
+        "read 0..3",
+    )
+    ok(mut t, f.ed.wins[w].lsp_highlight.write.len == 1, "one write")
+    ok(
+        mut t,
+        f.ed.wins[w].lsp_highlight.write[0].lo == 4 && f.ed.wins[w].lsp_highlight.write[0].hi == 5,
+        "write 4..5",
+    )
+    ok(mut t, f.ed.wins[w].overlay.spans.len == 0, "the search overlay untouched")
+    highlight_finish(mut t, mut f)
+}
+
+// test_lsp_life.c:1030-1066
+fn lsp_lifecycle_document_highlight_edit_clears_and_cancels_stale_response(
+    mut t: Tally,
+    helper: str,
+) {
+    var f = highlight_ready(mut t, helper, "hl-edit")
+    let k = server(f)
+    let request = highlight_fire(mut t, mut f, 300)
+    ok(
+        mut t,
+        highlight_dispatch(mut f, request, "\"result\":[{range_member(0, 3, 2)}]"),
+        "answered",
+    )
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.read.len == 1, "one read")
+    set_cursor(mut f, 1)
+    let stale = highlight_fire(mut t, mut f, 300)
+    ok(mut t, stale != 0, "a second request")
+    let live = lsp.rpc_pending(f.ed.lsp.servers[k].rpc, stale) else lsp.rpc_pending_new()
+    ok(mut t, live.id == stale, "pending")
+    // The edit, before its finish: C's notify hook clears and cancels.
+    let w = f.ed.win
+    ok(mut t, edit.ed_edit_insert(mut f.ed, w, 0, pb(" "), 0, 1), "inserted")
+    ok(mut t, f.ed.wins[w].lsp_highlight.read.len == 0, "reads cleared")
+    ok(mut t, f.ed.wins[w].lsp_highlight.write.len == 0, "writes cleared")
+    ok(mut t, f.ed.wins[w].lsp_highlight.request == 0, "the request forgotten")
+    let gone = lsp.rpc_pending(f.ed.lsp.servers[k].rpc, stale) else lsp.rpc_pending_new()
+    ok(mut t, gone.id == 0, "the request cancelled")
+    ok(
+        mut t,
+        !highlight_dispatch(mut f, stale, "\"result\":[{range_member(0, 1, 3)}]"),
+        "the late answer dropped",
+    )
+    ok(mut t, f.ed.wins[w].lsp_highlight.write.len == 0, "still no writes")
+    edit.ed_finish_edit(mut f.ed, w)
+    highlight_finish(mut t, mut f)
+}
+
+// test_lsp_life.c:1068-1102
+fn lsp_lifecycle_document_highlight_cursor_rearm_rejects_stale_response(mut t: Tally, helper: str) {
+    var f = highlight_ready(mut t, helper, "hl-rearm")
+    let stale = highlight_fire(mut t, mut f, 300)
+    ok(mut t, stale != 0, "sent")
+    set_cursor(mut f, 1)
+    edit.lsp_highlight_cursor(mut f.ed, f.ed.win)
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.request == 0, "the request forgotten")
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.timer != edit.TIMER_NONE, "re-armed")
+    ok(
+        mut t,
+        !highlight_dispatch(mut f, stale, "\"result\":[{range_member(0, 3, 2)}]"),
+        "the stale answer dropped",
+    )
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.read.len == 0, "no reads")
+    f.ed.now_ms += 300
+    edit.ed_timers_fire(mut f.ed, f.ed.now_ms)
+    let current = f.ed.wins[f.ed.win].lsp_highlight.request
+    ok(mut t, current != 0 && current != stale, "a new request")
+    ok(
+        mut t,
+        highlight_dispatch(mut f, current, "\"result\":[{range_member(4, 5, 3)}]"),
+        "answered",
+    )
+    ok(mut t, f.ed.wins[f.ed.win].lsp_highlight.write.len == 1, "one write")
+    highlight_finish(mut t, mut f)
+}
+
+// test_lsp_life.c:1104-1132
+fn lsp_lifecycle_document_highlight_focus_return_rearms(mut t: Tally, helper: str) {
+    var f = highlight_ready(mut t, helper, "hl-focus")
+    let w = f.ed.win
+    let stale = highlight_fire(mut t, mut f, 300)
+    ok(mut t, stale != 0, "sent")
+    f.ed.win = -1
+    ok(mut t, highlight_dispatch(mut f, stale, "\"result\":[{range_member(0, 3, 2)}]"), "delivered")
+    ok(mut t, f.ed.wins[w].lsp_highlight.request == 0, "forgotten")
+    ok(mut t, !f.ed.wins[w].lsp_highlight.cursor_valid, "the cursor forgotten")
+    ok(mut t, f.ed.wins[w].lsp_highlight.read.len == 0, "no reads while unfocused")
+    f.ed.win = w
+    edit.lsp_highlight_cursor(mut f.ed, w)
+    ok(mut t, f.ed.wins[w].lsp_highlight.timer != edit.TIMER_NONE, "re-armed on return")
+    f.ed.now_ms += 300
+    edit.ed_timers_fire(mut f.ed, f.ed.now_ms)
+    let current = f.ed.wins[w].lsp_highlight.request
+    ok(mut t, current != 0 && current != stale, "a new request")
+    ok(mut t, highlight_dispatch(mut f, current, "\"result\":[]"), "answered")
+    highlight_finish(mut t, mut f)
+}
+
+// test_lsp_life.c:1134-1148
+fn lsp_lifecycle_method_not_found_clears_highlight_capability(mut t: Tally, helper: str) {
+    var f = highlight_ready(mut t, helper, "hl-mnf")
+    let k = server(f)
+    let request = highlight_fire(mut t, mut f, 300)
+    ok(mut t, request != 0, "sent")
+    ok(
+        mut t,
+        highlight_dispatch(mut f, request, "\"error\":{{\"code\":-32601,\"message\":\"missing\"}}"),
+        "answered",
+    )
+    ok(
+        mut t,
+        !lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_HIGHLIGHT),
+        "cleared",
+    )
+    let w = f.ed.win
+    ok(mut t, f.ed.wins[w].lsp_highlight.request == 0, "forgotten")
+    ok(
+        mut t,
+        f.ed.wins[w].lsp_highlight.read.len == 0 && f.ed.wins[w].lsp_highlight.write.len == 0,
+        "nothing drawn",
+    )
+    highlight_finish(mut t, mut f)
+}
+
+// test_lsp_life.c:1150-1169
+fn lsp_lifecycle_unfocused_method_not_found_clears_highlight_capability(mut t: Tally, helper: str) {
+    var f = highlight_ready(mut t, helper, "hl-mnf-unfocused")
+    let k = server(f)
+    let w = f.ed.win
+    let request = highlight_fire(mut t, mut f, 300)
+    ok(mut t, request != 0, "sent")
+    f.ed.win = -1
+    ok(
+        mut t,
+        highlight_dispatch(mut f, request, "\"error\":{{\"code\":-32601,\"message\":\"missing\"}}"),
+        "answered",
+    )
+    ok(
+        mut t,
+        !lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_HIGHLIGHT),
+        "cleared",
+    )
+    ok(mut t, f.ed.wins[w].lsp_highlight.request == 0, "forgotten")
+    ok(mut t, !f.ed.wins[w].lsp_highlight.cursor_valid, "the cursor forgotten")
+    ok(
+        mut t,
+        f.ed.wins[w].lsp_highlight.read.len == 0 && f.ed.wins[w].lsp_highlight.write.len == 0,
+        "nothing drawn",
+    )
+    f.ed.win = w
+    highlight_finish(mut t, mut f)
+}
+
+// ---- the fakelsp sessions (`:1171-1440`) ------------------------------------
+
+// test_lsp_life.c:1171-1210
+fn lsp_lifecycle_fakelsp_handshake_queue_and_shutdown(mut t: Tally, helper: str) {
+    let transcript = "seq:initialize\nseq:initialized\nseq:didOpen\nseq:shutdown\nseq:exit\n"
+    var f = fix_init(helper, "session-utf8", 1000, "handshake")
+    let k = server(f)
+    ok(mut t, f.ed.lsp.servers[k].life.state == lsp.LSP_INITIALIZING, "initializing")
+    ok(mut t, !f.ed.lsp.servers[k].docv[doc(f)].open, "not open yet")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    ok(mut t, f.ed.lsp.servers[k].docv[doc(f)].open, "opened")
+    ok(mut t, f.ed.lsp.servers[k].life.pos_enc == lsp.POSENC_UTF8, "utf-8")
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+    ok(mut t, j >= 0, "the job")
+    let pgid = f.ed.jobs.v[j].pgid
+    edit.lsp_client_stop(mut f.ed, k, true)
+    ok(mut t, f.ed.lsp.servers[k].life.state == lsp.LSP_SHUTTING_DOWN, "shutting down")
+    ok(mut t, wait_drained(mut f, 2000), "drained")
+    let j2 = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+    ok(mut t, j2 >= 0, "the job")
+    ok(mut t, f.ed.jobs.v[j2].state == edit.JOB_EXITED, "exited")
+    ok(mut t, f.ed.jobs.v[j2].exit_code == 0, "status 0")
+    ok(mut t, transcript_is(f, transcript), "the transcript: {transcript_of(f)}")
+    // C's `kill(-pgid, 0)` and `waitpid(pid, WNOHANG)`: the group gone,
+    // the child reaped (the job layer read its status).
+    ok(mut t, group_alive(pgid) <= 0, "the group is gone")
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1212-1243
+fn lsp_lifecycle_fakelsp_position_encoding_variants(mut t: Tally, helper: str) {
+    let cases = [
+        ("session-utf8", lsp.POSENC_UTF8, false),
+        ("session-utf16", lsp.POSENC_UTF16, false),
+        ("session-absent", lsp.POSENC_UTF16, false),
+        ("session-garbage", lsp.POSENC_UTF16, true),
+    ]
+    for (mode, encoding, warn) in cases {
+        var f = fix_init(helper, mode, 1000, mode)
+        ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "{mode}: ready")
+        let k = server(f)
+        ok(mut t, f.ed.lsp.servers[k].life.pos_enc == encoding, "{mode}: the encoding")
+        if warn {
+            ok(mut t, f.ed.msg.active && f.ed.msg.sev == edit.MSG_WARN, "{mode}: a warning")
+            ok(
+                mut t,
+                f.ed.msg.text.contains("unknown positionEncoding; using utf-16"),
+                "{mode}: {f.ed.msg.text}",
+            )
+        } else {
+            ok(mut t, !f.ed.msg.active, "{mode}: silent")
+        }
+        stop_and_drain(mut t, mut f)
+        fix_free(mut f)
+    }
+}
+
+// test_lsp_life.c:1245-1263
+fn lsp_lifecycle_fakelsp_rejects_missing_sync(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-nosync", 1000, "nosync")
+    ok(mut t, wait_state(mut f, lsp.LSP_DEAD, 2000), "dead")
+    ok(mut t, f.ed.msg.active && f.ed.msg.sev == edit.MSG_ERROR, "an error")
+    ok(
+        mut t,
+        f.ed.msg.text.contains("does not support document synchronization"),
+        "why: {f.ed.msg.text}",
+    )
+    ok(mut t, f.ed.msg.text.contains("LSP is off for this workspace"), "what: {f.ed.msg.text}")
+    ok(
+        mut t,
+        util.log_capture_has(util.LOG_ERROR, pb("does not support document synchronization")),
+        "logged",
+    )
+    ok(mut t, wait_drained(mut f, 2000), "drained")
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1265-1284
+fn lsp_lifecycle_fakelsp_initialize_timeout_kills_child(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-timeout", 30, "timeout")
+    let k = server(f)
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+    ok(mut t, j >= 0, "the job")
+    let pgid = f.ed.jobs.v[j].pgid
+    ok(mut t, wait_state(mut f, lsp.LSP_DEAD, 1000), "dead")
+    ok(mut t, wait_drained(mut f, 2000), "drained")
+    ok(mut t, group_alive(pgid) <= 0, "the group is gone")
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1308-1325
+fn lsp_lifecycle_fakelsp_repeated_sessions_do_not_leak_fds(mut t: Tally, helper: str) {
+    let before = fd_count()
+    var i = 0
+    while i < 200 {
+        var f = fix_init(helper, "session-utf8", 1000, "leak")
+        ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "session {i}: ready")
+        stop_and_drain(mut t, mut f)
+        fix_free(mut f)
+        i += 1
+    }
+    ok(mut t, fd_count() == before, "no descriptor leaked: {before} then {fd_count()}")
+}
+
+// test_lsp_life.c:1327-1356
+fn lsp_lifecycle_fakelsp_open_edit_save_close_sequence(mut t: Tally, helper: str) {
+    let transcript = "seq:initialize\nseq:initialized\nseq:didOpen\nseq:didChange\nseq:didSave\nseq:didClose\nseq:shutdown\nseq:exit\n"
+    var f = fix_init(helper, "session-sync", 1000, "sync")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, insert_front(mut f, "x"), "inserted")
+    pump(mut f)
+    ok(mut t, edit.ed_file_save(mut f.ed, false) == edit.CMD_OK, "saved")
+    edit.lsp_client_close_buffer(mut f.ed, f.bi)
+    edit.lsp_client_stop(mut f.ed, k, true)
+    // The document is closed, so the server is found by its index here.
+    let start = edit.now_ms()
+    var drained = false
+    while edit.now_ms() - start <= 2000 {
+        let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+        if j >= 0 && f.ed.jobs.v[j].drained {
+            drained = true
+            break
+        }
+        pump(mut f)
+    }
+    ok(mut t, drained, "drained")
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+    ok(mut t, j >= 0 && f.ed.jobs.v[j].exit_code == 0, "status 0")
+    ok(
+        mut t,
+        j >= 0 && same(f.ed.jobs.v[j].framed_err, pb(transcript)),
+        "the transcript: {text_of(f.ed.jobs.v[j].framed_err)}",
+    )
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1358-1393: `ed.syn.set` is yw10's; its LSP half runs.
+fn lsp_lifecycle_language_change_closes_document(mut t: Tally, helper: str) -> int {
+    let transcript = "seq:initialize\nseq:initialized\nseq:didOpen\nseq:didClose\nseq:shutdown\nseq:exit\n"
+    var f = fix_init(helper, "session-close", 1000, "close")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    let id = edit.cmd_lookup(f.ed.reg, "ed.syn.set")
+    ok(mut t, id != 0, "ed.syn.set is registered")
+    var cx = edit.cmdctx_new(f.ed.win, edit.SRC_TEST)
+    cx.count = 1
+    cx.sarg = "none"
+    cx.has_sarg = true
+    ok(
+        mut t,
+        edit.ed_cmd_invoke(mut f.ed, id, mut cx) == edit.CMD_ERR_DEFERRED,
+        "ed.syn.set: deferred",
+    )
+    ok(
+        mut t,
+        f.ed.msg.text.starts_with("not yet ported: ed.syn.set: ") &&
+            f.ed.msg.text.ends_with("(yw10)"),
+        "by name: {f.ed.msg.text}",
+    )
+    // `cmd_syn_set`'s LSP half (`cmd.c:103-110`).
+    edit.lsp_buffer_close(mut f.ed, f.bi)
+    let (gone, _) = edit.lsp_doc_of_buffer(f.ed, f.bi)
+    ok(mut t, gone < 0, "the document is closed")
+    edit.lsp_client_stop(mut f.ed, k, true)
+    let start = edit.now_ms()
+    var drained = false
+    while edit.now_ms() - start <= 2000 {
+        let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+        if j >= 0 && f.ed.jobs.v[j].drained {
+            drained = true
+            break
+        }
+        pump(mut f)
+    }
+    ok(mut t, drained, "drained")
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+    ok(
+        mut t,
+        j >= 0 && same(f.ed.jobs.v[j].framed_err, pb(transcript)),
+        "the transcript: {text_of(f.ed.jobs.v[j].framed_err)}",
+    )
+    fix_free(mut f)
+    print(
+        "RED lsp_lifecycle_language_change_closes_document: ed.syn.set (cmd.c:91-110) is sagitta Sprint 39's (yw10); its LSP half (yew_lsp_buffer_close) and the transcript asserted",
+    )
+    1
+}
+
+// test_lsp_life.c:1395-1428
+fn lsp_lifecycle_fakelsp_delayed_response_is_stale(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-stale", 1000, "stale")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    var p = lsp.rpc_pending_new()
+    p.buf_id = f.ed.bufs[f.bi].id
+    p.gen = f.ed.bufs[f.bi].ec.tb.gen
+    p.sent_ms = f.ed.now_ms
+    ok(
+        mut t,
+        lsp.rpc_call(mut f.ed.lsp.servers[k].rpc, "textDocument/hover", pb("{{}}"), p) != 0,
+        "sent",
+    )
+    pump(mut f)
+    ok(mut t, insert_front(mut f, "x"), "inserted")
+    let start = edit.now_ms()
+    while f.ed.lsp.servers[k].dropped_stale == 0 && edit.now_ms() - start <= 2000 {
+        pump(mut f)
+    }
+    ok(
+        mut t,
+        f.ed.lsp.servers[k].dropped_stale == 1,
+        "the late answer dropped: {f.ed.lsp.servers[k].dropped_stale}",
+    )
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1430-1455
+fn lsp_lifecycle_editor_free_is_graceful(mut t: Tally, helper: str) {
+    let transcript = "seq:initialize\nseq:initialized\nseq:didOpen\nseq:shutdown\nseq:exit\n"
+    var f = fix_init(helper, "session-utf8", 1000, "free")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let job_id = f.ed.lsp.servers[server(f)].job
+    edit.lsp_client_free(mut f.ed)
+    ok(mut t, !f.ed.lsp.present, "the client is gone")
+    let j = edit.job_find(f.ed, job_id)
+    ok(mut t, j >= 0, "the job")
+    ok(mut t, f.ed.jobs.v[j].drained, "drained")
+    ok(mut t, f.ed.jobs.v[j].state == edit.JOB_EXITED, "exited")
+    ok(mut t, f.ed.jobs.v[j].exit_code == 0, "status 0")
+    ok(
+        mut t,
+        same(f.ed.jobs.v[j].framed_err, pb(transcript)),
+        "the transcript: {text_of(f.ed.jobs.v[j].framed_err)}",
+    )
+    fix_free(mut f)
+}
+
+// ---- diagnostics and restarts (`:1470-1698`) ---------------------------------
+
+// `dispatch_diag` (`:1470-1499`): a version < 0 sends none.
+fn dispatch_diag(mut f: LifeFix, version: int) {
+    let k = server(f)
+    let uri = copy f.ed.lsp.servers[k].docv[doc(f)].uri
+    let field = if version < 0 then "" else "\"version\":{version},"
+    let json = "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{uri}\",{field}\"diagnostics\":[{{\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}},\"severity\":1,\"message\":\"boom\"}}]}}}}"
+    let j = parse(json)
+    edit.lsp_server_dispatch_value(mut f.ed, f.ed.lsp.servers[k].id, j)
+}
+
+fn store(f: LifeFix) -> int {
+    edit.diag_store_of(f.ed, f.bi)
+}
+
+// test_lsp_life.c:1501-1547
+fn lsp_lifecycle_unversioned_diagnostics_track_flush(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-unversioned", 1000, "unversioned")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    let d = doc(f)
+    ok(mut t, f.ed.lsp.servers[k].docv[d].sent_gen == f.ed.bufs[f.bi].ec.tb.gen, "flushed")
+    dispatch_diag(mut f, -1)
+    ok(mut t, store(f) >= 0, "a store")
+    ok(mut t, !f.ed.diags[store(f)].stale, "fresh")
+    let w = f.ed.win
+    let bytes = pb("x")
+    ok(mut t, edit.ed_edit_insert(mut f.ed, w, 0, bytes, 0, 1), "inserted")
+    edit.ed_finish_edit(mut f.ed, w)
+    ok(mut t, f.ed.lsp.servers[k].docv[doc(f)].sent_gen != f.ed.bufs[f.bi].ec.tb.gen, "not flushed")
+    dispatch_diag(mut f, -1)
+    ok(mut t, f.ed.diags[store(f)].stale, "stale against the unflushed edit")
+    pump(mut f)
+    ok(
+        mut t,
+        f.ed.lsp.servers[k].docv[doc(f)].sent_gen == f.ed.bufs[f.bi].ec.tb.gen,
+        "flushed again",
+    )
+    dispatch_diag(mut f, -1)
+    ok(mut t, !f.ed.diags[store(f)].stale, "fresh again")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+fn change_zero() -> lsp.LspChange {
+    lsp.LspChange { sl: 0, sc: 0, el: 0, ec: 0, text: List[byte]() }
+}
+
+// test_lsp_life.c:1549-1586
+fn lsp_lifecycle_diagnostics_follow_live_document_version(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-utf8", 1000, "version")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    ok(mut t, f.ed.lsp.servers[k].docv[doc(f)].version == 1, "version 1")
+    dispatch_diag(mut f, 0)
+    ok(mut t, store(f) < 0, "version 0 is old")
+    dispatch_diag(mut f, 1)
+    ok(mut t, store(f) >= 0 && f.ed.diags[store(f)].d.len == 1, "version 1 lands")
+    let d = doc(f)
+    f.ed.lsp.servers[k].docv[d].full_sync = true
+    f.ed.lsp.servers[k].docv[d].insert_waiting = true
+    (mut f.ed.lsp.servers[k].docv[d].pending).push(change_zero())
+    let old_job = f.ed.lsp.servers[k].job
+    ok(mut t, edit.lsp_client_restart(mut f.ed, f.bi), "restarted")
+    ok(mut t, store(f) < 0, "the store dropped")
+    let d2 = doc(f)
+    ok(mut t, f.ed.lsp.servers[k].docv[d2].version == 0, "version 0")
+    ok(mut t, !f.ed.lsp.servers[k].docv[d2].open, "closed")
+    ok(mut t, !f.ed.lsp.servers[k].docv[d2].full_sync, "no full sync owed")
+    ok(mut t, !f.ed.lsp.servers[k].docv[d2].insert_waiting, "no insert waiting")
+    ok(mut t, f.ed.lsp.servers[k].docv[d2].pending.len == 0, "no changes pending")
+    ok(
+        mut t,
+        wait_new_ready(mut f, old_job, LIFE_RESTART_READY_TIMEOUT_MS),
+        "the new session ready",
+    )
+    ok(mut t, f.ed.lsp.servers[k].docv[doc(f)].version == 1, "version 1 again")
+    dispatch_diag(mut f, 1)
+    ok(mut t, store(f) >= 0 && f.ed.diags[store(f)].d.len == 1, "version 1 lands again")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+fn kill_server(mut t: Tally, f: LifeFix) {
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[server(f)].job)
+    ok(mut t, j >= 0, "the job")
+    var sent = true
+    os_signal_send_group(f.ed.jobs.v[j].pgid, signal.kill()) else |_| {
+        sent = false
+    }
+    ok(mut t, sent, "SIGKILL to the group")
+}
+
+// test_lsp_life.c:1588-1620
+fn lsp_lifecycle_automatic_restart_reopens_documents(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-crash-restart", 1000, "crash")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    dispatch_diag(mut f, 1)
+    ok(mut t, store(f) >= 0, "a store")
+    kill_server(mut t, f)
+    let d = doc(f)
+    f.ed.lsp.servers[k].docv[d].full_sync = true
+    (mut f.ed.lsp.servers[k].docv[d].pending).push(change_zero())
+    let old_job = f.ed.lsp.servers[k].job
+    ok(mut t, wait_new_ready(mut f, old_job, LIFE_RESTART_READY_TIMEOUT_MS), "restarted")
+    ok(mut t, store(f) < 0, "the store dropped")
+    let d2 = doc(f)
+    ok(mut t, f.ed.lsp.servers[k].docv[d2].open, "reopened")
+    ok(mut t, f.ed.lsp.servers[k].docv[d2].version == 1, "version 1")
+    ok(mut t, !f.ed.lsp.servers[k].docv[d2].full_sync, "no full sync owed")
+    ok(mut t, !f.ed.lsp.servers[k].docv[d2].insert_waiting, "no insert waiting")
+    ok(mut t, f.ed.lsp.servers[k].docv[d2].pending.len == 0, "no changes pending")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1645-1677
+fn lsp_lifecycle_restart_message_severities(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-utf8", 1000, "severities")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    f.ed.lsp.servers[k].life.restarts = 1
+    f.ed.lsp.servers[k].life.first_restart_ms = f.ed.now_ms
+    var old_job = f.ed.lsp.servers[k].job
+    kill_server(mut t, f)
+    ok(mut t, wait_restart_notice(mut f, 2, 2000), "the second restart's notice")
+    ok(mut t, f.ed.msg.sev == edit.MSG_INFO, "info")
+    ok(mut t, f.ed.msg.text == "fakelsp restarted", "the sentence: {f.ed.msg.text}")
+    f.ed.lsp.servers[k].life.next_try_ms = f.ed.now_ms
+    ok(mut t, wait_new_ready(mut f, old_job, LIFE_RESTART_READY_TIMEOUT_MS), "ready again")
+
+    edit.ed_msg_clear(mut f.ed)
+    f.ed.lsp.servers[k].life.restarts = 2
+    f.ed.lsp.servers[k].life.first_restart_ms = f.ed.now_ms
+    old_job = f.ed.lsp.servers[k].job
+    kill_server(mut t, f)
+    ok(mut t, wait_restart_notice(mut f, 3, 2000), "the third restart's notice")
+    ok(mut t, f.ed.msg.sev == edit.MSG_WARN, "a warning")
+    ok(mut t, f.ed.msg.text == "fakelsp restarted (3)", "the sentence: {f.ed.msg.text}")
+    f.ed.lsp.servers[k].life.next_try_ms = f.ed.now_ms
+    ok(mut t, wait_new_ready(mut f, old_job, LIFE_RESTART_READY_TIMEOUT_MS), "ready again")
+    stop_and_drain(mut t, mut f)
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1679-1698
+fn lsp_lifecycle_stop_escalates_to_sigkill(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-resistant", 1000, "resistant")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    let k = server(f)
+    let start = edit.now_ms()
+    edit.lsp_client_stop(mut f.ed, k, true)
+    ok(mut t, wait_drained(mut f, 2000), "drained")
+    ok(mut t, edit.now_ms() - start >= 350, "after the grace: {edit.now_ms() - start} ms")
+    let j = edit.job_find(f.ed, f.ed.lsp.servers[k].job)
+    ok(mut t, j >= 0, "the job")
+    let kill_no = signal.number(signal.kill()) else 9
+    ok(mut t, f.ed.jobs.v[j].state == edit.JOB_SIGNALED, "signalled")
+    ok(mut t, f.ed.jobs.v[j].termsig == kill_no, "by SIGKILL: {f.ed.jobs.v[j].termsig}")
+    fix_free(mut f)
+}
+
+// test_lsp_life.c:1700-1733
+fn lsp_server_requests_receive_protocol_results(mut t: Tally) {
+    var ed = edit.ed_new()
+    let sid = place_server(mut ed)
+    let k = ed.lsp.servers.len - 1
+    let a = parse(
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"workspace/configuration\",\"params\":{{\"items\":[{{}},{{}},{{}}]}}}}",
+    )
+    edit.lsp_server_dispatch_value(mut ed, sid, a)
+    ok(
+        mut t,
+        bytes_contain(ed.lsp.servers[k].rpc.tx.pending, 0, "\"id\":7,\"result\":[null,null,null]"),
+        "a null per item",
+    )
+    lsp.rpctx_consume(mut ed.lsp.servers[k].rpc.tx, ed.lsp.servers[k].rpc.tx.pending.len)
+    let b = parse(
+        "{{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"window/workDoneProgress/create\",\"params\":{{\"token\":1}}}}",
+    )
+    edit.lsp_server_dispatch_value(mut ed, sid, b)
+    ok(
+        mut t,
+        bytes_contain(ed.lsp.servers[k].rpc.tx.pending, 0, "\"id\":8,\"result\":null"),
+        "null",
+    )
+}
+
+// ---- the document menu's LSP section (`:1735-1794`) -------------------------
+
+fn ctx_index(ed: edit.Ed, label: str) -> int {
+    var i = 0
+    while i < edit.ctx_rows(ed.ctx) {
+        if edit.ctx_row_label(ed.ctx, i) == label {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// test_lsp_life.c:1746-1794
+fn ctxrows_doc_lsp_section_appears_with_a_server(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-features", 1000, "ctxrows")
+    ok(mut t, wait_state(mut f, lsp.LSP_READY, 2000), "ready")
+    ok(mut t, edit.lsp_attached(f.ed, f.bi), "attached")
+    grid_up(mut f)
+    edit.ed_layout(mut f.ed)
+    edit.pane_tables_reset(mut f.ed)
+    let focus = f.ed.focus
+    let leaf = edit.pane_table_add_leaf(mut f.ed, focus)
+    ok(mut t, leaf >= 0, "a leaf")
+    let c = edit.ctxcontext_new(edit.CTX_KIND_DOC, leaf)
+    edit.ctx_close(mut f.ed.ctx)
+    edit.ctx_build(mut f.ed, c)
+    let def = ctx_index(f.ed, "Go to Definition")
+    ok(mut t, def > 0, "Go to Definition, not first")
+    ok(mut t, edit.ctx_row_is_sep(f.ed.ctx, def - 1), "behind its own separator")
+    ok(
+        mut t,
+        edit.ctx_row_label(f.ed.ctx, def + 1) == "Find References...",
+        "then Find References...",
+    )
+    ok(mut t, edit.ctx_row_label(f.ed.ctx, def + 2) == "Rename...", "then Rename...")
+    ok(mut t, edit.ctx_row_label(f.ed.ctx, def + 3) == "Hover", "then Hover")
+    ok(mut t, edit.ctx_row_enabled(f.ed.ctx, def), "Go to Definition enabled")
+    ok(mut t, edit.ctx_row_enabled(f.ed.ctx, def + 3), "Hover enabled")
+    // Rename... is the one LSP row a read-only buffer cannot use.
+    f.ed.bufs[f.bi].flags = f.ed.bufs[f.bi].flags | edit.BUF_READONLY
+    edit.ctx_close(mut f.ed.ctx)
+    edit.ctx_build(mut f.ed, c)
+    ok(mut t, !edit.ctx_row_enabled(f.ed.ctx, def + 2), "Rename... greyed")
+    ok(mut t, edit.ctx_row_enabled(f.ed.ctx, def), "Go to Definition still enabled")
+    f.ed.bufs[f.bi].flags = f.ed.bufs[f.bi].flags & !edit.BUF_READONLY
+    edit.ctx_close(mut f.ed.ctx)
+    fix_free(mut f)
+}
+
+// ---- the registry -----------------------------------------------------------
+
+const CASES: int = 36
+
+fn case_name(i: int) -> str {
+    match i {
+        0 => "lsp_lifecycle_drops_stale_response_before_callback",
+        1 => "lsp_lifecycle_drops_every_stale_feature_response",
+        2 => "lsp_lifecycle_completion_resolve_cancel_and_shadow",
+        3 => "lsp_lifecycle_method_not_found_clears_completion",
+        4 => "lsp_lifecycle_hover_signature_panels_and_auto_trigger",
+        5 => "lsp_lifecycle_method_not_found_clears_panel_capabilities",
+        6 => "lsp_lifecycle_definition_response_jumps_to_single_location",
+        7 => "lsp_lifecycle_references_response_opens_multi_location_picker",
+        8 => "lsp_lifecycle_empty_definition_reports_exact_info_message",
+        9 => "lsp_lifecycle_method_not_found_clears_definition_capability",
+        10 => "lsp_lifecycle_document_symbols_open_nested_picker",
+        11 => "lsp_lifecycle_empty_document_symbols_report_exact_info_message",
+        12 => "lsp_lifecycle_method_not_found_clears_document_symbol_capability",
+        13 => "lsp_lifecycle_document_highlight_waits_for_idle",
+        14 => "lsp_lifecycle_document_highlight_separates_read_and_write_overlays",
+        15 => "lsp_lifecycle_document_highlight_edit_clears_and_cancels_stale_response",
+        16 => "lsp_lifecycle_document_highlight_cursor_rearm_rejects_stale_response",
+        17 => "lsp_lifecycle_document_highlight_focus_return_rearms",
+        18 => "lsp_lifecycle_method_not_found_clears_highlight_capability",
+        19 => "lsp_lifecycle_unfocused_method_not_found_clears_highlight_capability",
+        20 => "lsp_lifecycle_fakelsp_handshake_queue_and_shutdown",
+        21 => "lsp_lifecycle_fakelsp_position_encoding_variants",
+        22 => "lsp_lifecycle_fakelsp_rejects_missing_sync",
+        23 => "lsp_lifecycle_fakelsp_initialize_timeout_kills_child",
+        24 => "lsp_lifecycle_fakelsp_repeated_sessions_do_not_leak_fds",
+        25 => "lsp_lifecycle_fakelsp_open_edit_save_close_sequence",
+        26 => "lsp_lifecycle_language_change_closes_document",
+        27 => "lsp_lifecycle_fakelsp_delayed_response_is_stale",
+        28 => "lsp_lifecycle_editor_free_is_graceful",
+        29 => "lsp_lifecycle_unversioned_diagnostics_track_flush",
+        30 => "lsp_lifecycle_diagnostics_follow_live_document_version",
+        31 => "lsp_lifecycle_automatic_restart_reopens_documents",
+        32 => "lsp_lifecycle_restart_message_severities",
+        33 => "lsp_lifecycle_stop_escalates_to_sigkill",
+        34 => "lsp_server_requests_receive_protocol_results",
+        _ => "ctxrows_doc_lsp_section_appears_with_a_server",
+    }
+}
+
+// Whether case `i` spawns the helper.
+fn needs_helper(i: int) -> bool {
+    !(i == 0 || i == 1 || i == 2 || i == 3 || i == 34)
+}
+
+// 0 a pass, 1 a RED by name (its line printed by the case).
+fn run_case(mut t: Tally, i: int, helper: str) -> int {
+    match i {
+        0 => lsp_lifecycle_drops_stale_response_before_callback(mut t),
+        1 => lsp_lifecycle_drops_every_stale_feature_response(mut t),
+        2 => { return completion_red(mut t, case_name(i), "test_lsp_life.c:663-720") },
+        3 => { return completion_red(mut t, case_name(i), "test_lsp_life.c:722-738") },
+        4 => lsp_lifecycle_hover_signature_panels_and_auto_trigger(mut t, helper),
+        5 => lsp_lifecycle_method_not_found_clears_panel_capabilities(mut t, helper),
+        6 => lsp_lifecycle_definition_response_jumps_to_single_location(mut t, helper),
+        7 => lsp_lifecycle_references_response_opens_multi_location_picker(mut t, helper),
+        8 => lsp_lifecycle_empty_definition_reports_exact_info_message(mut t, helper),
+        9 => lsp_lifecycle_method_not_found_clears_definition_capability(mut t, helper),
+        10 => lsp_lifecycle_document_symbols_open_nested_picker(mut t, helper),
+        11 => lsp_lifecycle_empty_document_symbols_report_exact_info_message(mut t, helper),
+        12 => lsp_lifecycle_method_not_found_clears_document_symbol_capability(mut t, helper),
+        13 => lsp_lifecycle_document_highlight_waits_for_idle(mut t, helper),
+        14 => lsp_lifecycle_document_highlight_separates_read_and_write_overlays(mut t, helper),
+        15 =>
+            lsp_lifecycle_document_highlight_edit_clears_and_cancels_stale_response(mut t, helper),
+        16 => lsp_lifecycle_document_highlight_cursor_rearm_rejects_stale_response(mut t, helper),
+        17 => lsp_lifecycle_document_highlight_focus_return_rearms(mut t, helper),
+        18 => lsp_lifecycle_method_not_found_clears_highlight_capability(mut t, helper),
+        19 => lsp_lifecycle_unfocused_method_not_found_clears_highlight_capability(mut t, helper),
+        20 => lsp_lifecycle_fakelsp_handshake_queue_and_shutdown(mut t, helper),
+        21 => lsp_lifecycle_fakelsp_position_encoding_variants(mut t, helper),
+        22 => lsp_lifecycle_fakelsp_rejects_missing_sync(mut t, helper),
+        23 => lsp_lifecycle_fakelsp_initialize_timeout_kills_child(mut t, helper),
+        24 => lsp_lifecycle_fakelsp_repeated_sessions_do_not_leak_fds(mut t, helper),
+        25 => lsp_lifecycle_fakelsp_open_edit_save_close_sequence(mut t, helper),
+        26 => { return lsp_lifecycle_language_change_closes_document(mut t, helper) },
+        27 => lsp_lifecycle_fakelsp_delayed_response_is_stale(mut t, helper),
+        28 => lsp_lifecycle_editor_free_is_graceful(mut t, helper),
+        29 => lsp_lifecycle_unversioned_diagnostics_track_flush(mut t, helper),
+        30 => lsp_lifecycle_diagnostics_follow_live_document_version(mut t, helper),
+        31 => lsp_lifecycle_automatic_restart_reopens_documents(mut t, helper),
+        32 => lsp_lifecycle_restart_message_severities(mut t, helper),
+        33 => lsp_lifecycle_stop_escalates_to_sigkill(mut t, helper),
+        34 => lsp_server_requests_receive_protocol_results(mut t),
+        35 => ctxrows_doc_lsp_section_appears_with_a_server(mut t, helper),
+        _ => {},
+    }
+    0
+}
+
+const LOG_PATH: str = "target/tests/edit_lsp_life_test.log"
+
+fn main() {
+    fs.create_dir_all("target/tests") else |_| {}
+    fs.remove(LOG_PATH) else |_| {}
+    env_set("YEW_LOG", LOG_PATH) else |_| {}
+    var t = Tally { n: 0 }
+    let helper = edit.fakelsp_path()
+    let pick = env_get("YEW_LSP_LIFE_CASE") else ""
+    var lo = 0
+    var hi = CASES
+    if pick.len != 0 {
+        lo = pick.to_int() else -1
+        hi = lo + 1
+        // One past the last case runs nothing and prints nothing
+        // (`tools/check-test-cases`).
+        if lo < 0 || lo >= CASES {
+            return
+        }
+    }
+    var reds = 0
+    var skips = 0
+    var i = lo
+    while i < hi {
+        if helper.len == 0 && needs_helper(i) {
+            print("SKIP {case_name(i)}: {edit.fakelsp_missing()}")
+            skips += 1
+        } else if run_case(mut t, i, helper) == 0 {
+            print("{case_name(i)}: PASS")
+        } else {
+            reds += 1
+        }
+        i += 1
+    }
+    if pick.len == 0 {
+        print(
+            "edit_lsp_life_test: {CASES - reds - skips} cases pass, {reds} RED by name, {skips} SKIP by name, {t.n} assertions",
+        )
+    }
+}
