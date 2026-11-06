@@ -31,10 +31,11 @@ The feature modes (yw11b) serve full sync and the capabilities named:
              since it was opened (at once if it already has, else at the
              next didChange), then a receipt: the answer is stale on any
              host
-  deadline   definition: MARKER created when the request arrives, the
-             answer (a location on line 1) sent 12 s later, past the
-             editor's 10 s request deadline (jsonrpc.h:20), then a
-             receipt
+  deadline   definition: MARKER created when the request arrives, and
+             the answer (a location on line 1) held until the next
+             didSave, then sent with a receipt. The row saves once the
+             request's 10 s deadline (jsonrpc.h:20) has passed, so the
+             answer comes after it on any host; no timer here
   partial    definition alone: every other feature is absent
   highlight  documentHighlight: a read on line 1 (0-2) and a write on
              line 2 (4-5)
@@ -52,7 +53,6 @@ a row waits on its badge (`W:N`) instead of a quiet gap.
 import json
 import os
 import sys
-import threading
 import time
 import urllib.parse
 
@@ -60,10 +60,6 @@ MODE = sys.argv[1] if len(sys.argv) > 1 else "mirror"
 MARKER = sys.argv[2] if len(sys.argv) > 2 else ""
 IN = sys.stdin.buffer
 OUT = sys.stdout.buffer
-# The deadline mode's late answer is written from a timer thread.
-OUT_LOCK = threading.Lock()
-# The deadline mode's delay: past the editor's 10 s request deadline.
-LATE_S = 12.0
 
 
 def read_message():
@@ -87,9 +83,8 @@ def read_message():
 
 
 def write_raw(data):
-    with OUT_LOCK:
-        OUT.write(data)
-        OUT.flush()
+    OUT.write(data)
+    OUT.flush()
 
 
 def send(obj):
@@ -163,18 +158,19 @@ RECEIPTS = [0]
 def receipt(uri):
     """One more warning on line 1 (see the module's doc): the badge reads
     W:N after the Nth answer the editor shows nothing for."""
-    with OUT_LOCK:
-        RECEIPTS[0] += 1
-        n = RECEIPTS[0]
+    RECEIPTS[0] += 1
+    n = RECEIPTS[0]
     diags = [{"range": span(0, 0, 1), "severity": 2, "source": "fake",
               "message": "answer %d sent" % (k + 1)} for k in range(n)]
     send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
           "params": {"uri": uri, "diagnostics": diags}})
 
 
-# The stale mode's text at didOpen and its hovers waiting for a change.
+# The stale mode's text at didOpen and its hovers waiting for a change;
+# the deadline mode's definitions waiting for a save.
 OPENED = {}
 STALE_WAITING = []
+LATE_WAITING = []
 
 
 def answer_stale(mid, uri):
@@ -207,11 +203,9 @@ def answer_feature(msg, docs):
             STALE_WAITING.append((mid, uri))
     elif MODE == "deadline":
         uri = msg["params"]["textDocument"]["uri"]
+        LATE_WAITING.append((mid, uri))
         if MARKER:
             open(MARKER, "w").close()
-        late = threading.Timer(LATE_S, answer_late, (mid, uri))
-        late.daemon = True
-        late.start()
     elif MODE == "partial":
         loc = {"uri": msg["params"]["textDocument"]["uri"],
                "range": span(0, 0, 0)}
@@ -293,6 +287,10 @@ def main():
             if MODE == "crash":
                 return 3
             write_raw(b"Content-Length: nope\r\n\r\n{}")
+        elif method == "textDocument/didSave" and MODE == "deadline":
+            for waiting in list(LATE_WAITING):
+                LATE_WAITING.remove(waiting)
+                answer_late(*waiting)
         elif method == "textDocument/didSave":
             uri = msg["params"]["textDocument"]["uri"]
             with open(path_of(uri), "rb") as f:
