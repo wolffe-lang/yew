@@ -283,6 +283,31 @@ it is yw11b's, and the rows' config turns it off in both editors. The
 diagnostic list labels a row by the buffer's whole path (`diag.c:639-643`,
 `ed.c:333-340`), so both editors open the same fixed path.
 
+### CI's first run at the rebased head
+
+The pull-request run at `207e7e7` was red in four jobs, for three causes,
+all this branch's (the run's announced advisories, macOS's recorded kill9
+and outside-signal rows and the 2× gates, are not):
+
+- **A bounds trap in the language by path.** The glob match sliced the
+  basename (`base[0..prefix]`, `base[len - suffix..]`), and a slice
+  inside a character that is not ASCII traps. sagitta's CJK tab goldens
+  open `/tmp/漢字.txt` and `/tmp/日本.txt` (`registry.c:5996,6000`), so
+  `s23_click_switches_with_cjk_labels` and `s27_click_cjk_tab` saw the
+  editor exit, and the state fuzz stopped at its first session on both
+  platforms (`edit/lsp.lu:132`). C compares bytes (`defs.c:3466-3474`).
+  `4111b04` `edit_syn_paths_test`, red on the trap; `1d4d538` the halves
+  matched with `starts_with` and `ends_with`.
+- **The perf_cmdcomp build check's fixture** staged the modules
+  `run-perf-cmdcomp` stages, less `lsp`: `33b1807`.
+- **On the hosted macOS runner C's own two runs of the list screen
+  differed** (`lspw_open_diag.3-list: unstable between runs`); the verdict
+  printed no cells. `722f252` waits for the list's count where the row
+  settled blind for 500 ms; `ba3f5dc` holds C's two runs over the cells
+  `same` compares (C's syntax colouring settles on its own clock and is
+  out of the comparison already) and prints the cells that moved, so a
+  repeat names its cause.
+
 ### Decided
 
 - **The language before yw10.** C starts a server only for a buffer
