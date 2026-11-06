@@ -1,0 +1,265 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_lsp_gate.c` (264 lines) at
+//! 9ace98c2: every feature command, its capability absent, says `fakelsp
+//! does not support <feature>` exactly once and sends nothing; a `-32601`
+//! reply clears the bit so the second command says it without a round
+//! trip.
+//!
+//! The server is C's `fakelsp` (`tests/helpers/fakelsp.c`), the oracle's
+//! own build of it (`target/oracle/sagitta/build/tests/helpers/fakelsp`,
+//! made by `tools/oracle` or `tools/build-fakelsp`), spawned through the
+//! port's real `LspServer` and job (C's `gate_fix_init`, `:51-85`).
+//! Without it each case SKIPs by name ("fakelsp is missing") and the file
+//! exits 0; `tools/check-test --fakelsp-ran` refuses any such line. The
+//! scratch files live under `$TMPDIR`, not C's `/tmp`.
+
+use edit
+use lsp
+use std.fs
+
+struct Tally {
+    n: int,
+}
+
+// A failed check says what it was before the trap (a native trap prints
+// only its site).
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    if !cond {
+        eprint("assertion failed: {what}")
+    }
+    assert(cond, what)
+}
+
+struct GateFix {
+    ed: edit.Ed,
+    path: str,
+    marker: str,
+    bi: int,
+}
+
+fn scratch_dir() -> str {
+    let tmp = env_get("TMPDIR") else "target/tests"
+    let base = if tmp.len == 0 then "target/tests" else tmp
+    fs.create_dir_all(base) else |_| {}
+    base
+}
+
+// `gate_fix_init` (`test_lsp_gate.c:51-85`).
+fn fix_init(helper: str, mode: str, tag: str) -> GateFix {
+    let dir = scratch_dir()
+    let path = "{dir}/yew-lsp-gate-{os_pid()}-{tag}"
+    let marker = "{dir}/yew-lsp-gate-marker-{os_pid()}-{tag}"
+    var body = List[byte]()
+    for b in "int value;\n".bytes() {
+        (mut body).push(b)
+    }
+    fs_write_bytes(path, body) else |_| {
+        assert(false, "write {path}")
+    }
+    fs.remove(marker) else |_| {}
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let idx = edit.tab_open(mut ed, path)
+    assert(idx >= 0, "open {path}")
+    assert(edit.tab_hydrate(mut ed, idx) == 0, "load {path}")
+    edit.tab_switch(mut ed, idx)
+    let bi = ed.wins[ed.win].buf
+    ed.buf_languages[ed.bufs[bi].id] = "c"
+    ed.now_ms = edit.now_ms()
+    var args = List[str]()
+    (mut args).push(mode)
+    (mut args).push(marker)
+    let cfg = lsp.LspServerCfg {
+        id: "fakelsp",
+        lang: "c",
+        cmd: helper,
+        args: args,
+        roots: List[str](),
+        init_options: "",
+        has_init_options: false,
+        init_timeout_ms: 1000,
+    }
+    assert(edit.lsp_client_start_cfg(mut ed, bi, cfg), "start fakelsp")
+    GateFix { ed: ed, path: path, marker: marker, bi: bi }
+}
+
+// `gate_server` (`test_lsp_gate.c:103-110`): the server index.
+fn server(f: GateFix) -> int {
+    let (k, _) = edit.lsp_doc_of_buffer(f.ed, f.bi)
+    assert(k >= 0, "the gate fixture lost its document")
+    k
+}
+
+// `gate_wait_ready` (`test_lsp_gate.c:112-124`).
+fn wait_ready(mut f: GateFix, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        let k = server(f)
+        if f.ed.lsp.servers[k].life.state == lsp.LSP_READY &&
+            f.ed.lsp.servers[k].rpc.tx.pending.len == 0 {
+            return true
+        }
+        edit.ed_pump_jobs_once(mut f.ed, 10)
+    }
+    false
+}
+
+// `gate_wait_capability_clear` (`test_lsp_gate.c:126-140`).
+fn wait_capability_clear(mut f: GateFix, cap: int, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        let k = server(f)
+        let s = copy f.ed.lsp.servers[k]
+        if !lsp.lsp_caps_has(s.life.caps, cap) && s.rpc.npending == 0 && s.rpc.tx.pending.len == 0 {
+            return true
+        }
+        edit.ed_pump_jobs_once(mut f.ed, 10)
+    }
+    false
+}
+
+// `gate_fix_free` (`test_lsp_gate.c:142-164`).
+fn fix_free(mut t: Tally, mut f: GateFix) {
+    let k = server(f)
+    let job = f.ed.lsp.servers[k].job
+    edit.lsp_client_stop(mut f.ed, k, true)
+    let start = edit.now_ms()
+    var drained = false
+    while edit.now_ms() - start <= 2000 {
+        let j = edit.job_find(f.ed, job)
+        if j >= 0 && f.ed.jobs.v[j].drained {
+            drained = true
+            break
+        }
+        edit.ed_pump_jobs_once(mut f.ed, 10)
+    }
+    ok(mut t, drained, "the server drained")
+    fs.remove(f.path) else |_| {}
+    fs.remove(f.marker) else |_| {}
+}
+
+// `gate_invoke` (`test_lsp_gate.c:166-177`).
+fn invoke(mut f: GateFix, name: str) -> int {
+    let id = edit.cmd_lookup(f.ed.reg, name)
+    assert(id != 0, "{name} is registered")
+    var cx = edit.cmdctx_new(f.ed.win, edit.SRC_TEST)
+    cx.count = 1
+    edit.ed_cmd_invoke(mut f.ed, id, mut cx)
+}
+
+// test_lsp_gate.c:179-234
+fn lsp_gate_all_feature_commands_message_once_without_round_trip(mut t: Tally, helper: str) {
+    let cases = [
+        ("ed.lsp.goto_def", lsp.LSPC_DEFINITION, "fakelsp does not support definition"),
+        ("ed.lsp.goto_decl", lsp.LSPC_DECLARATION, "fakelsp does not support declaration"),
+        ("ed.lsp.goto_type", lsp.LSPC_TYPE_DEFINITION, "fakelsp does not support type definition"),
+        ("ed.lsp.goto_impl", lsp.LSPC_IMPLEMENTATION, "fakelsp does not support implementation"),
+        ("ed.lsp.references", lsp.LSPC_REFERENCES, "fakelsp does not support references"),
+        ("ed.lsp.hover", lsp.LSPC_HOVER, "fakelsp does not support hover"),
+        ("ed.lsp.signature", lsp.LSPC_SIGNATURE, "fakelsp does not support signature help"),
+        ("ed.lsp.rename", lsp.LSPC_RENAME, "fakelsp does not support rename"),
+        ("ed.lsp.symbols", lsp.LSPC_DOCUMENT_SYMBOL, "fakelsp does not support document symbols"),
+    ]
+    var f = fix_init(helper, "session-utf8", "all")
+    ok(mut t, wait_ready(mut f, 2000), "ready")
+    let k = server(f)
+    f.ed.lsp.servers[k].life.caps.bits = 0
+    f.ed.lsp.servers[k].missing_warned = 0
+    for (command, cap, message) in cases {
+        let next_id = f.ed.lsp.servers[k].rpc.next_id
+        let npending = f.ed.lsp.servers[k].rpc.npending
+        let tx_len = f.ed.lsp.servers[k].rpc.tx.pending.len
+        ok(mut t, invoke(mut f, command) == edit.CMD_ERR_STATE, "{command} refuses")
+        ok(mut t, f.ed.msg.active && f.ed.msg.sev == edit.MSG_INFO, "{command}: an info message")
+        ok(mut t, f.ed.msg.text == message, "{command}: <{f.ed.msg.text}>")
+        ok(mut t, f.ed.lsp.servers[k].missing_warned & cap != 0, "{command}: warned")
+        ok(mut t, f.ed.lsp.servers[k].rpc.next_id == next_id, "{command}: no id spent")
+        ok(mut t, f.ed.lsp.servers[k].rpc.npending == npending, "{command}: nothing pending")
+        ok(mut t, f.ed.lsp.servers[k].rpc.tx.pending.len == tx_len, "{command}: nothing sent")
+        edit.ed_msg_clear(mut f.ed)
+        ok(mut t, invoke(mut f, command) == edit.CMD_ERR_STATE, "{command} refuses again")
+        ok(mut t, !f.ed.msg.active, "{command}: silent the second time")
+        ok(mut t, f.ed.lsp.servers[k].rpc.next_id == next_id, "{command}: still no id")
+        ok(mut t, f.ed.lsp.servers[k].rpc.npending == npending, "{command}: still nothing pending")
+        ok(mut t, f.ed.lsp.servers[k].rpc.tx.pending.len == tx_len, "{command}: still nothing sent")
+    }
+    fix_free(mut t, mut f)
+}
+
+// test_lsp_gate.c:236-264
+fn lsp_gate_method_not_found_blocks_second_command_round_trip(mut t: Tally, helper: str) {
+    var f = fix_init(helper, "session-definition-missing", "mnf")
+    ok(mut t, wait_ready(mut f, 2000), "ready")
+    let k = server(f)
+    ok(
+        mut t,
+        lsp.lsp_caps_has(f.ed.lsp.servers[k].life.caps, lsp.LSPC_DEFINITION),
+        "definition advertised",
+    )
+    ok(mut t, invoke(mut f, "ed.lsp.goto_def") == edit.CMD_OK, "the request goes")
+    ok(mut t, wait_capability_clear(mut f, lsp.LSPC_DEFINITION, 2000), "-32601 clears the bit")
+    ok(mut t, !f.ed.msg.active, "silently")
+    let next_id = f.ed.lsp.servers[k].rpc.next_id
+    let npending = f.ed.lsp.servers[k].rpc.npending
+    let tx_len = f.ed.lsp.servers[k].rpc.tx.pending.len
+    ok(mut t, invoke(mut f, "ed.lsp.goto_def") == edit.CMD_ERR_STATE, "refused")
+    ok(
+        mut t,
+        f.ed.msg.text == "fakelsp does not support definition",
+        "the sentence: {f.ed.msg.text}",
+    )
+    ok(mut t, f.ed.lsp.servers[k].rpc.next_id == next_id, "no id spent")
+    ok(mut t, f.ed.lsp.servers[k].rpc.npending == npending, "nothing pending")
+    ok(mut t, f.ed.lsp.servers[k].rpc.tx.pending.len == tx_len, "nothing sent")
+    fix_free(mut t, mut f)
+}
+
+const CASES: int = 2
+
+fn case_name(i: int) -> str {
+    match i {
+        0 => "lsp_gate_all_feature_commands_message_once_without_round_trip",
+        _ => "lsp_gate_method_not_found_blocks_second_command_round_trip",
+    }
+}
+
+fn run_case(mut t: Tally, i: int, helper: str) {
+    match i {
+        0 => lsp_gate_all_feature_commands_message_once_without_round_trip(mut t, helper),
+        1 => lsp_gate_method_not_found_blocks_second_command_round_trip(mut t, helper),
+        _ => {},
+    }
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var t = Tally { n: 0 }
+    let helper = edit.fakelsp_path()
+    let pick = env_get("YEW_LSP_GATE_CASE") else ""
+    var lo = 0
+    var hi = CASES
+    if pick.len != 0 {
+        lo = pick.to_int() else -1
+        hi = lo + 1
+        // One past the last case runs nothing and prints nothing
+        // (`tools/check-test-cases`).
+        if lo < 0 || lo >= CASES {
+            return
+        }
+    }
+    var i = lo
+    while i < hi {
+        if helper.len == 0 {
+            print("SKIP {case_name(i)}: {edit.fakelsp_missing()}")
+        } else {
+            run_case(mut t, i, helper)
+            print("{case_name(i)}: PASS")
+        }
+        i += 1
+    }
+    if pick.len == 0 {
+        print("edit_lsp_gate_test: {t.n} assertions")
+    }
+}
