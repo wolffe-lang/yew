@@ -702,13 +702,15 @@ static void case_lspw_hover(PtyCtx *c)
     lsprow_wait_ready(c, "wolf");
     /* On the definition's name: wolf lsp answers `fn add` there (on the
      * call it answers the call's type). The document holds that text
-     * too, so the wait is on the panel's title. */
+     * too, so the wait is on the panel's title with its corner: the typed
+     * command line (`:ed.lsp.hover`) holds the bare word, and a wait on it
+     * could pass before the command ran. */
     lsprow_char_right(c, 1, 1, 3);
     lsprow_command(c, "ed.lsp.hover");
-    lsprow_wait(c, "hover", "the hover panel never opened");
+    lsprow_wait(c, "\xe2\x94\x8c hover", "the hover panel never opened");
     lsprow_dump(c, "1-panel");
     ptc_keys(c, "esc");
-    lsprow_wait_gone(c, "hover", "esc did not close the hover panel");
+    lsprow_wait_gone(c, "\xe2\x94\x8c hover", "esc did not close the hover panel");
     lsprow_dump(c, "2-closed");
     force_quit(c);
 }
