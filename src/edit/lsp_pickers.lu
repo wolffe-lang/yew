@@ -1,0 +1,542 @@
+//! edit.lsp_pickers — the location and document-symbol pickers and the
+//! jump (Sprint 47 §4-§5): `PickerSpec` instances over THE picker, which
+//! supply rows, an accept and a preview and invent no chrome.
+//!
+//! Ports sagitta `src/mod/lsp/pickers.c` (722 lines) at 9ace98c2. C's
+//! two file statics (`source`, `symbol_source`: the consumed locations
+//! or symbols and their rows) are `Ed.lsp_pick`, one value: opening
+//! either picker drops both, as C's `source_free`/`symbol_source_free`
+//! pair does. Both are the picker's `PICK_HOST_LSP`, told apart by
+//! `which`. A row's payload is its index into the consumed list (an
+//! identity, s26's law). The local symbol index's picker
+//! (`yew_lsp_symbol_index_open`, `pickers.c:642-722`) needs the index,
+//! which is built from settled syntax (`ws/symidx.c`, Sprint 44 over
+//! yw10's `syn`): it refuses by name until then (R-yw11b-1).
+
+use lsp
+use term
+use text
+use unicode
+
+const LSP_LOC_DETAIL_MAX: int = 512
+
+const LSP_LOC_PREVIEW_BYTES: int = 65536
+
+const LSP_LOC_PREVIEW_LINES: int = 40
+
+// Which list `Ed.lsp_pick` holds.
+const LSP_PICK_NONE: int = 0
+
+const LSP_PICK_LOCATIONS: int = 1
+
+const LSP_PICK_SYMBOLS: int = 2
+
+/// The pickers' state (`LocSrc` and `SymSrc`, `pickers.c:34-53`).
+pub struct LspPickState {
+    which: int,
+    locs: List[lsp.LspLoc],
+    symbols: List[lsp.LspSymbol],
+    pos_enc: int,
+}
+
+/// No list (`memset(&source, 0, …)`).
+pub fn lsp_pick_state_new() -> LspPickState {
+    LspPickState {
+        which: LSP_PICK_NONE,
+        locs: List[lsp.LspLoc](),
+        symbols: List[lsp.LspSymbol](),
+        pos_enc: lsp.POSENC_UTF8,
+    }
+}
+
+/// `yew_lsp_pickers_free` (`pickers.c:96-100`).
+pub fn lsp_pickers_free(mut ed: Ed) {
+    ed.lsp_pick = lsp_pick_state_new()
+}
+
+// `buffer_for_path` (`pickers.c:102-115`): the buffer whose path is
+// `path`, byte for byte, or -1.
+fn buffer_for_path(ed: Ed, path: str) -> int {
+    var i = 0
+    while i < ed.bufs.len {
+        if ed.bufs[i].has_path && ed.bufs[i].path == path {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// A row's text from bytes (C keeps raw bytes; a picker row is a `str`):
+// each byte that is not part of a valid UTF-8 sequence, a character cut
+// at the 512-byte limit included, becomes U+FFFD. The detail column is
+// far narrower than 512 cells, so the cut never shows.
+fn detail_text(b: List[byte], at: int, end: int) -> str {
+    var out = List[byte]()
+    var pos = at
+    while pos < end {
+        let (cp, n) = unicode.utf8_decode(b, pos, end)
+        if n == 1 && cp >= 56448 && cp <= 56575 {
+            for x in "\u{FFFD}".bytes() {
+                (mut out).push(x)
+            }
+        } else {
+            var k = 0
+            while k < n {
+                (mut out).push(b[pos + k])
+                k += 1
+            }
+        }
+        pos += n
+    }
+    str_from_utf8(out) else ""
+}
+
+// `copy_line` (`pickers.c:117-176`): line `line` of `tb` without its line
+// end or its leading blanks, at most 512 bytes.
+fn copy_line(tb: text.TextBuf, line: int) -> str ! {none} {
+    if line >= text.textbuf_line_count(tb) {
+        return none
+    }
+    let span = text.textbuf_line_span(tb, line as text.LineNo)
+    var lo = span.lo
+    var hi = span.hi
+    while hi > lo {
+        let c = text.textbuf_byte_at(tb, hi - 1)
+        if c != 10 && c != 13 {
+            break
+        }
+        hi -= 1
+    }
+    while lo < hi {
+        let c = text.textbuf_byte_at(tb, lo)
+        if c != 32 && c != 9 {
+            break
+        }
+        lo += 1
+    }
+    var len = hi - lo
+    if len > LSP_LOC_DETAIL_MAX {
+        len = LSP_LOC_DETAIL_MAX
+    }
+    let bytes = text.textbuf_copy_range(tb, lo, lo + len)
+    detail_text(bytes, 0, bytes.len)
+}
+
+// `read_line_file` (`pickers.c:178-217`): the same line read from the
+// file, a trailing CR dropped when the content fit.
+fn read_line_file(path: str, line: int) -> str ! {none} {
+    let fd = fs_open(path) else {
+        return none
+    }
+    var text_bytes = List[byte]()
+    var at = 0
+    var off = 0
+    var content_len = 0
+    var started = false
+    var found = false
+    var done = false
+    while !done {
+        let chunk = fs_read_at(fd, off, 65536) else |_| List[byte]()
+        if chunk.len == 0 {
+            break
+        }
+        off += chunk.len
+        for ch in chunk {
+            let c = ch as int
+            if at != line {
+                if c == 10 {
+                    at += 1
+                }
+                continue
+            }
+            found = true
+            if c == 10 {
+                done = true
+                break
+            }
+            if !started && (c == 32 || c == 9) {
+                continue
+            }
+            started = true
+            if text_bytes.len < LSP_LOC_DETAIL_MAX {
+                (mut text_bytes).push(ch)
+            }
+            content_len += 1
+        }
+    }
+    fs_close(fd) else |_| {}
+    if !found {
+        return none
+    }
+    var len = text_bytes.len
+    if content_len <= LSP_LOC_DETAIL_MAX {
+        while len != 0 && text_bytes[len - 1] as int == 13 {
+            len -= 1
+        }
+    }
+    detail_text(text_bytes, 0, len)
+}
+
+// `location_detail` (`pickers.c:219-232`): from the open buffer, else
+// the file, else empty.
+fn location_detail(ed: Ed, loc: lsp.LspLoc) -> str {
+    let bi = buffer_for_path(ed, loc.path)
+    if bi >= 0 && ed.bufs[bi].resident {
+        return copy_line(ed.bufs[bi].ec.tb, loc.line) else ""
+    }
+    read_line_file(loc.path, loc.line) else ""
+}
+
+// `display_path` (`pickers.c:234-243`): relative to the workspace root.
+fn display_path(ed: Ed, path: str) -> str {
+    let root = ws_root(ed)
+    if root.len != 0 &&
+        path.len > root.len &&
+        path.starts_with(root) &&
+        path.bytes()[root.len] as int == 47 {
+        return path[root.len + 1..]
+    }
+    path
+}
+
+// `location_label` (`pickers.c:245-264`): `path:line:column`, 1-based.
+fn location_label(ed: Ed, loc: lsp.LspLoc) -> str {
+    "{display_path(ed, loc.path)}:{loc.line + 1}:{loc.chr + 1}"
+}
+
+// `option_is` (`pickers.c:274-284`): `lsp.open_in`.
+fn open_in_is(ed: Ed, want: str) -> bool {
+    let v = opt_get(ed, ed_doc(ed), ed.win, "lsp.open_in") else {
+        return false
+    }
+    (v.t == OPT_STR || v.t == OPT_ENUM) && v.s == want
+}
+
+// The primary cursor placed at `pos`, the view following it.
+fn jump_place_cursor(mut ed: Ed, pos: int) {
+    let wi = ed.win
+    let p = ed.wins[wi].cs.primary
+    ed.wins[wi].cs.curs[p].pos = pos
+    ed.wins[wi].cs.curs[p].anchor = pos
+    ed.wins[wi].cs.curs[p].goal_col = 0
+    let bi = ed.wins[wi].buf
+    vp_follow(mut ed.wins[wi], ed.bufs[bi].ec.tb)
+    ed_damage_document(mut ed)
+}
+
+// `jump_in_focused` (`pickers.c:286-307`): the jump pushed first, the
+// target shown, the cursor placed.
+fn jump_in_focused(mut ed: Ed, wi: int, target: int, pos: int) -> bool {
+    if wi < 0 || ed.win != wi || target < 0 {
+        return false
+    }
+    let p = ed.wins[wi].cs.primary
+    if p >= ed.wins[wi].cs.curs.len {
+        return false
+    }
+    jump_push(mut ed, wi, ed.wins[wi].cs.curs[p].pos, ed.now_ms)
+    ed_show_buffer(mut ed, target)
+    if ed.wins[ed.win].buf != target {
+        return false
+    }
+    jump_place_cursor(mut ed, pos)
+    true
+}
+
+/// `yew_lsp_location_jump` (`pickers.c:309-360`): the target hydrated
+/// FIRST (a failed hydration pushes nothing), its position converted
+/// against ITS text, then opened as `lsp.open_in` says: here, a vertical
+/// split, or a tab.
+pub fn lsp_location_jump(mut ed: Ed, wi: int, loc: lsp.LspLoc, pos_enc: int) -> bool {
+    if wi < 0 || ed.win != wi || loc.path.len == 0 {
+        return false
+    }
+    let target = ws_file_buf(mut ed, loc.path)
+    if target < 0 || buf_hydrate(mut ed, target) != 0 {
+        return false
+    }
+    let pos = lsp.lsp_off_of_pos(pos_enc, ed.bufs[target].ec.tb, loc.line, loc.chr)
+    if open_in_is(ed, "tab") {
+        let p = ed.wins[wi].cs.primary
+        if p >= ed.wins[wi].cs.curs.len {
+            return false
+        }
+        var tab = tab_find_by_path(ed, loc.path)
+        if tab < 0 {
+            tab = tab_open(mut ed, loc.path)
+        }
+        if tab < 0 {
+            return false
+        }
+        jump_push(mut ed, wi, ed.wins[wi].cs.curs[p].pos, ed.now_ms)
+        tab_switch(mut ed, tab)
+        if ed.win < 0 {
+            return false
+        }
+        let bi = ed.wins[ed.win].buf
+        let tab_pos = lsp.lsp_off_of_pos(pos_enc, ed.bufs[bi].ec.tb, loc.line, loc.chr)
+        jump_place_cursor(mut ed, tab_pos)
+        return true
+    }
+    var w = wi
+    if open_in_is(ed, "split") {
+        let split = cmdctx_new(wi, SRC_KEY)
+        if pane_cmd_split_v(mut ed, split) != CMD_OK {
+            return false
+        }
+        w = ed.win
+    }
+    jump_in_focused(mut ed, w, target, pos)
+}
+
+// `location_accept` (`pickers.c:362-384`): the picker made any split;
+// the focused view takes the jump.
+fn location_accept(mut ed: Ed, payload: int) -> bool {
+    if payload < 0 || payload >= ed.lsp_pick.locs.len || ed.win < 0 {
+        return false
+    }
+    let loc = copy ed.lsp_pick.locs[payload]
+    let target = ws_file_buf(mut ed, loc.path)
+    if target < 0 || buf_hydrate(mut ed, target) != 0 {
+        return false
+    }
+    let pos = lsp.lsp_off_of_pos(ed.lsp_pick.pos_enc, ed.bufs[target].ec.tb, loc.line, loc.chr)
+    jump_in_focused(mut ed, ed.win, target, pos)
+}
+
+// `preview_path` (`pickers.c:386-434`): the file's first 64 KiB, dim,
+// a line per row up to 40, or `binary file` for a NUL in the first 8 KiB.
+fn preview_path(mut ed: Ed, path: str, r: Rect) {
+    if r.w == 0 || r.h == 0 {
+        return
+    }
+    let fd = fs_open(path) else {
+        return
+    }
+    let bytes = fs_read_at(fd, 0, LSP_LOC_PREVIEW_BYTES) else |_| List[byte]()
+    fs_close(fd) else |_| {}
+    let got = bytes.len
+    if got == 0 {
+        return
+    }
+    let dim = term.color_rgb(140, 140, 140)
+    let bg = term.color_default()
+    var i = 0
+    while i < got && i < 8192 {
+        if bytes[i] as int == 0 {
+            let binary = "binary file".bytes()
+            let _ = term.grid_puts(
+                mut ed.grid,
+                r.y,
+                r.x,
+                binary,
+                0,
+                binary.len,
+                copy dim,
+                copy bg,
+                term.ATTR_DIM,
+            )
+            return
+        }
+        i += 1
+    }
+    var at = 0
+    var row = 0
+    while at < got && row < r.h && row < LSP_LOC_PREVIEW_LINES {
+        var eol = at
+        while eol < got && bytes[eol] as int != 10 {
+            eol += 1
+        }
+        let (fit, _) = unicode.str_clip(bytes, at, eol, r.w)
+        let _ = term.grid_puts(
+            mut ed.grid,
+            r.y + row,
+            r.x,
+            bytes,
+            at,
+            at + fit,
+            copy dim,
+            copy bg,
+            term.ATTR_DIM,
+        )
+        row += 1
+        at = eol + 1
+    }
+}
+
+/// `yew_lsp_location_picker_open` (`pickers.c:445-480`): the locations
+/// consumed into rows `path:line:col` beside the line's text; path mode.
+pub fn lsp_location_picker_open(
+    mut ed: Ed,
+    wi: int,
+    locs: List[lsp.LspLoc],
+    pos_enc: int,
+    title: str,
+) {
+    if wi < 0 || locs.len == 0 {
+        return
+    }
+    if picker_active(ed) {
+        picker_close(mut ed, false)
+    }
+    lsp_pickers_free(mut ed)
+    ed.lsp_pick.which = LSP_PICK_LOCATIONS
+    ed.lsp_pick.locs = copy locs
+    ed.lsp_pick.pos_enc = pos_enc
+    var rows = List[PickItem]()
+    var i = 0
+    while i < locs.len {
+        let label = location_label(ed, locs[i])
+        let detail = location_detail(ed, locs[i])
+        (mut rows).push(PickItem {
+            label: label,
+            detail: detail,
+            has_detail: true,
+            payload: i,
+            flags: 0,
+        })
+        i += 1
+    }
+    var spec = picker_spec(PICK_HOST_LSP, if title.len == 0 then "locations" else title, take rows)
+    spec.has_preview = true
+    spec.path_mode = true
+    picker_open(mut ed, spec)
+}
+
+// `symbol_breadcrumb_display` (`pickers.c:482-503`): the canonical
+// separator swapped for the glyph table's (`›`, or `>` as ASCII).
+fn breadcrumb_display(breadcrumb: str) -> str {
+    let canonical = "\u{203A}"
+    let sep = glyph(GLYPH_BREADCRUMB)
+    if sep == canonical {
+        return breadcrumb
+    }
+    var out = ""
+    var rest = breadcrumb
+    loop {
+        let at = rest.find(canonical) else {
+            out = out + rest
+            break
+        }
+        out = out + rest[0..at] + sep
+        rest = rest[at + canonical.len..]
+    }
+    out
+}
+
+// `symbol_label` (`pickers.c:505-518`): the kind's glyph, two spaces, the
+// breadcrumb.
+fn symbol_label(s: lsp.LspSymbol) -> str {
+    "{lsp.compl_kind_glyph(s.kind)}  {breadcrumb_display(s.breadcrumb)}"
+}
+
+// `symbol_detail` (`pickers.c:520-535`): `path:line`.
+fn symbol_detail(ed: Ed, s: lsp.LspSymbol) -> str {
+    let path = if s.path.len == 0 then "(buffer)" else display_path(ed, s.path)
+    "{path}:{s.line + 1}"
+}
+
+// `symbol_search_part` (`pickers.c:545-562`): the leaf first, the
+// breadcrumb second unless it is the leaf.
+fn symbol_search_part(ed: Ed, payload: int, part: int) -> PkAnswer {
+    if payload < 0 || payload >= ed.lsp_pick.symbols.len || part > 1 || part < 0 {
+        return pk_no()
+    }
+    let s = ed.lsp_pick.symbols[payload]
+    let value = if part == 0 then s.name else s.breadcrumb
+    if part == 1 && value == s.name {
+        return pk_no()
+    }
+    PkAnswer { ok: true, text: value }
+}
+
+// `symbol_accept` (`pickers.c:564-586`): a local row by its buffer, a
+// server row by its path, hydrated, converted against its own text.
+fn symbol_accept(mut ed: Ed, payload: int) -> bool {
+    if ed.win < 0 || payload < 0 || payload >= ed.lsp_pick.symbols.len {
+        return false
+    }
+    let s = copy ed.lsp_pick.symbols[payload]
+    let target = if s.buf_id == 0 then ws_file_buf(mut ed, s.path) else ed_buf_index(ed, s.buf_id)
+    if target < 0 {
+        return false
+    }
+    if !ed.bufs[target].resident && buf_hydrate(mut ed, target) != 0 {
+        return false
+    }
+    let pos = lsp.lsp_off_of_pos(ed.lsp_pick.pos_enc, ed.bufs[target].ec.tb, s.line, s.chr)
+    jump_in_focused(mut ed, ed.win, target, pos)
+}
+
+/// `yew_lsp_symbol_picker_open` (`pickers.c:600-640`): the symbols
+/// consumed into rows, filtered by leaf and breadcrumb independently.
+pub fn lsp_symbol_picker_open(mut ed: Ed, wi: int, symbols: List[lsp.LspSymbol], pos_enc: int) {
+    if wi < 0 || symbols.len == 0 {
+        return
+    }
+    if picker_active(ed) {
+        picker_close(mut ed, false)
+    }
+    lsp_pickers_free(mut ed)
+    ed.lsp_pick.which = LSP_PICK_SYMBOLS
+    ed.lsp_pick.symbols = copy symbols
+    ed.lsp_pick.pos_enc = pos_enc
+    var rows = List[PickItem]()
+    var i = 0
+    while i < symbols.len {
+        (mut rows).push(PickItem {
+            label: symbol_label(symbols[i]),
+            detail: symbol_detail(ed, symbols[i]),
+            has_detail: true,
+            payload: i,
+            flags: 0,
+        })
+        i += 1
+    }
+    var spec = picker_spec(PICK_HOST_LSP, "symbols", take rows)
+    spec.has_preview = true
+    spec.has_search_part = true
+    spec.search_parts_independent = true
+    picker_open(mut ed, spec)
+}
+
+/// `yew_lsp_symbol_index_open` (`pickers.c:677-722`): the current
+/// buffer's local index. The index is Sprint 44's over yw10's syntax
+/// engine (R-yw11b-1): refused by name.
+pub fn lsp_symbol_index_open(mut ed: Ed, wi: int) -> bool {
+    let _ = wi
+    ed_msg(mut ed, MSG_ERROR, "not yet ported: the symbol index: sagitta Sprint 44 (yw10)")
+    false
+}
+
+/// THE host (`PickerSpec`'s items, preview, accept and search part for
+/// both lists, `pickers.c:266-272`, `:362-443`, `:537-598`).
+pub fn lsp_pick_host(mut ed: Ed, call: int, payload: int, r: Rect, part: int) -> PkAnswer {
+    if ed.lsp_pick.which == LSP_PICK_LOCATIONS {
+        if call == PK_ACCEPT {
+            return PkAnswer { ok: location_accept(mut ed, payload), text: "" }
+        }
+        if call == PK_PREVIEW && payload >= 0 && payload < ed.lsp_pick.locs.len {
+            let path = ed.lsp_pick.locs[payload].path
+            preview_path(mut ed, path, r)
+        }
+        return pk_no()
+    }
+    if ed.lsp_pick.which == LSP_PICK_SYMBOLS {
+        if call == PK_ACCEPT {
+            return PkAnswer { ok: symbol_accept(mut ed, payload), text: "" }
+        }
+        if call == PK_PART {
+            return symbol_search_part(ed, payload, part)
+        }
+        if call == PK_PREVIEW && payload >= 0 && payload < ed.lsp_pick.symbols.len {
+            let s = copy ed.lsp_pick.symbols[payload]
+            if s.path.len != 0 && s.buf_id == 0 {
+                preview_path(mut ed, s.path, r)
+            }
+        }
+        return pk_no()
+    }
+    pk_no()
+}
