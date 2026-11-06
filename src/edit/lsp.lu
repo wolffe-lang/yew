@@ -4,11 +4,12 @@
 //! buffer hooks, the sync hooks and the commands; and the minimum of
 //! language detection the client needs, by path until yw10.
 //!
-//! Ports sagitta `src/mod/lsp/lsp.c` (467 lines; the feature entry points
-//! — completion, hover, signature, the gotos, references, rename, symbols
-//! and the signature auto-trigger — are Sprint 47's, yw11b, and keep
-//! refusing by name through the registry), `src/mod/lsp/sync.c:398-497`
-//! (the editor hooks), `src/edit/lsp_cmds.c:1-61`, and the path half of
+//! Ports sagitta `src/mod/lsp/lsp.c` (467 lines; completion's entry point
+//! is yw11b1's and keeps refusing by name through the registry; the rest
+//! of Sprint 47's — hover, signature, the gotos, references, rename,
+//! symbols and the signature auto-trigger — are yw11b2's, `:84-95` and
+//! `:248-371`), `src/mod/lsp/sync.c:398-497` (the editor hooks),
+//! `src/edit/lsp_cmds.c`, and the path half of
 //! `yew_syn_lang_for` (`src/syn/defs.c:3440-3510`) with `yew_ed_syn_bind`'s
 //! naming (`src/edit/ed.c:183-232`) at 9ace98c2. `shim.c` (the disabled
 //! module) is not ported: the port is always the full build.
@@ -204,6 +205,10 @@ pub fn lsp_sync_drain(mut ed: Ed, bi: int) {
     if bi < 0 || ed.bufs[bi].ec.lsp_log.len == 0 {
         return
     }
+    // `yew_lsp_note_edit`'s first act (`sync.c:418-419`): an edit clears
+    // the document highlight of every window showing the buffer. The
+    // port's notify hook is this drain of the edit log.
+    lsp_highlight_buffer_clear(mut ed, ed.bufs[bi].id)
     let (k, d) = lsp_doc_of_buffer(ed, bi)
     let log = copy ed.bufs[bi].ec.lsp_log
     let texts = copy ed.bufs[bi].ec.lsp_text
@@ -473,11 +478,14 @@ pub fn lsp_pump(mut ed: Ed) {
 
 /// `yew_lsp_free` (`lsp.c:448-459`): every store dropped, then the client.
 pub fn lsp_free(mut ed: Ed) {
+    lsp_rename_shutdown(mut ed)
+    lsp_highlight_shutdown(mut ed)
     var bi = 0
     while bi < ed.bufs.len {
         diag_store_free(mut ed, bi)
         bi += 1
     }
+    lsp_pickers_free(mut ed)
     lsp_client_free(mut ed)
 }
 
@@ -493,10 +501,198 @@ pub fn lsp_buffer_save(mut ed: Ed, bi: int) {
     lsp_sync_save(mut ed, bi)
 }
 
-/// `yew_lsp_buffer_close` (`lsp.c:475-481`); the document highlight's
-/// clear is yw11b's.
+/// `yew_lsp_buffer_close` (`lsp.c:461-466`).
 pub fn lsp_buffer_close(mut ed: Ed, bi: int) {
+    if bi >= 0 && bi < ed.bufs.len {
+        lsp_highlight_buffer_clear(mut ed, ed.bufs[bi].id)
+    }
     lsp_client_close_buffer(mut ed, bi)
+}
+
+// ---------------------------------------------------------------------
+// The feature entry points (`lsp.c:84-95`, `:248-371`).
+// ---------------------------------------------------------------------
+
+// `feat_require` (`lsp.c:84-95`): false, and once per server and
+// capability the sentence `<id> does not support <what>`.
+fn feat_require(mut ed: Ed, k: int, cap: int, what: str) -> bool {
+    if k >= 0 && lsp.lsp_caps_has(ed.lsp.servers[k].life.caps, cap) {
+        return true
+    }
+    if k >= 0 && ed.lsp.servers[k].missing_warned & cap == 0 {
+        ed.lsp.servers[k].missing_warned = ed.lsp.servers[k].missing_warned | cap
+        ed_msg(mut ed, MSG_INFO, "{ed.lsp.servers[k].cfg.id} does not support {what}")
+    }
+    false
+}
+
+// `ready_feature_server` (`lsp.c:248-266`): the window's server, started
+// if none, READY; -1 with `no ready LSP server for <lang>`.
+fn ready_feature_server(mut ed: Ed, wi: int) -> int {
+    if wi < 0 || wi >= ed.wins.len {
+        return -1
+    }
+    let bi = ed.wins[wi].buf
+    let (k0, _) = lsp_doc_of_buffer(ed, bi)
+    var k = k0
+    if k < 0 && lsp_client_start(mut ed, bi) {
+        let (k1, _) = lsp_doc_of_buffer(ed, bi)
+        k = k1
+    }
+    if k < 0 || ed.lsp.servers[k].life.state != lsp.LSP_READY {
+        let lang = ed.buf_languages[ed.bufs[bi].id] else "this buffer"
+        ed_msg(mut ed, MSG_INFO, "no ready LSP server for {lang}")
+        return -1
+    }
+    k
+}
+
+/// `yew_lsp_hover` (`lsp.c:268-275`).
+pub fn lsp_hover(mut ed: Ed, wi: int) -> bool {
+    let k = ready_feature_server(mut ed, wi)
+    if k < 0 || !feat_require(mut ed, k, lsp.LSPC_HOVER, "hover") {
+        return false
+    }
+    lsp_hover_request(mut ed, wi)
+}
+
+/// `yew_lsp_signature` (`lsp.c:277-284`).
+pub fn lsp_signature(mut ed: Ed, wi: int) -> bool {
+    let k = ready_feature_server(mut ed, wi)
+    if k < 0 || !feat_require(mut ed, k, lsp.LSPC_SIGNATURE, "signature help") {
+        return false
+    }
+    lsp_signature_request(mut ed, wi)
+}
+
+// `navigation_feature` (`lsp.c:286-296`).
+fn navigation_feature(
+    mut ed: Ed,
+    wi: int,
+    method: str,
+    cap: int,
+    what: str,
+    always_picker: bool,
+) -> bool {
+    let k = ready_feature_server(mut ed, wi)
+    if k < 0 || !feat_require(mut ed, k, cap, what) {
+        return false
+    }
+    lsp_navigation_request(mut ed, wi, method, cap, what, always_picker)
+}
+
+/// `yew_lsp_goto_definition` (`lsp.c:298-302`).
+pub fn lsp_goto_definition(mut ed: Ed, wi: int) -> bool {
+    navigation_feature(
+        mut ed,
+        wi,
+        "textDocument/definition",
+        lsp.LSPC_DEFINITION,
+        "definition",
+        false,
+    )
+}
+
+/// `yew_lsp_goto_declaration` (`lsp.c:304-308`).
+pub fn lsp_goto_declaration(mut ed: Ed, wi: int) -> bool {
+    navigation_feature(
+        mut ed,
+        wi,
+        "textDocument/declaration",
+        lsp.LSPC_DECLARATION,
+        "declaration",
+        false,
+    )
+}
+
+/// `yew_lsp_goto_type_definition` (`lsp.c:310-315`).
+pub fn lsp_goto_type_definition(mut ed: Ed, wi: int) -> bool {
+    navigation_feature(
+        mut ed,
+        wi,
+        "textDocument/typeDefinition",
+        lsp.LSPC_TYPE_DEFINITION,
+        "type definition",
+        false,
+    )
+}
+
+/// `yew_lsp_goto_implementation` (`lsp.c:317-322`).
+pub fn lsp_goto_implementation(mut ed: Ed, wi: int) -> bool {
+    navigation_feature(
+        mut ed,
+        wi,
+        "textDocument/implementation",
+        lsp.LSPC_IMPLEMENTATION,
+        "implementation",
+        false,
+    )
+}
+
+/// `yew_lsp_references` (`lsp.c:324-328`): always the picker.
+pub fn lsp_references(mut ed: Ed, wi: int) -> bool {
+    navigation_feature(
+        mut ed,
+        wi,
+        "textDocument/references",
+        lsp.LSPC_REFERENCES,
+        "references",
+        true,
+    )
+}
+
+/// `yew_lsp_rename` (`lsp.c:330-337`).
+pub fn lsp_rename(mut ed: Ed, wi: int) -> bool {
+    let k = ready_feature_server(mut ed, wi)
+    if k < 0 || !feat_require(mut ed, k, lsp.LSPC_RENAME, "rename") {
+        return false
+    }
+    lsp_rename_request(mut ed, wi)
+}
+
+/// `yew_lsp_symbols` (`lsp.c:339-360`): with no ready server, the local
+/// symbol index (R-yw11b-1: refused by name until the index).
+pub fn lsp_symbols(mut ed: Ed, wi: int) -> bool {
+    if wi < 0 || wi >= ed.wins.len {
+        return false
+    }
+    let bi = ed.wins[wi].buf
+    let (k0, _) = lsp_doc_of_buffer(ed, bi)
+    var k = k0
+    if k < 0 && lsp_client_start(mut ed, bi) {
+        let (k1, _) = lsp_doc_of_buffer(ed, bi)
+        k = k1
+    }
+    if k < 0 || ed.lsp.servers[k].life.state != lsp.LSP_READY {
+        let lang = ed.buf_languages[ed.bufs[bi].id] else "this buffer"
+        ed_msg(mut ed, MSG_INFO, "no ready LSP server for {lang}; using local symbol index")
+        return lsp_symbol_index_open(mut ed, wi)
+    }
+    if !feat_require(mut ed, k, lsp.LSPC_DOCUMENT_SYMBOL, "document symbols") {
+        return false
+    }
+    lsp_symbols_request(mut ed, wi)
+}
+
+/// `yew_lsp_signature_maybe_auto_trigger` (`lsp.c:362-381`): a typed
+/// text whose last byte is one of the server's signature triggers.
+pub fn lsp_signature_maybe_auto_trigger(mut ed: Ed, wi: int, typed: List[byte]) {
+    if wi < 0 || wi >= ed.wins.len || typed.len == 0 {
+        return
+    }
+    let (k, _) = lsp_doc_of_buffer(ed, ed.wins[wi].buf)
+    if k < 0 ||
+        ed.lsp.servers[k].life.state != lsp.LSP_READY ||
+        !lsp.lsp_caps_has(ed.lsp.servers[k].life.caps, lsp.LSPC_SIGNATURE) {
+        return
+    }
+    let last = typed[typed.len - 1]
+    for c in ed.lsp.servers[k].life.caps.sig_trigger.bytes() {
+        if c == last {
+            let _ = lsp_signature_request(mut ed, wi)
+            return
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -555,4 +751,90 @@ pub fn lsp_cmd_diag_prev(mut ed: Ed, cx: CmdCtx) -> int {
         return CMD_ERR_STATE
     }
     status_of(lsp_diag_step(mut ed, cx.win, false))
+}
+
+fn win_status(mut ed: Ed, cx: CmdCtx, which: int) -> int {
+    if cx.win < 0 || cx.win >= ed.wins.len {
+        return CMD_ERR_STATE
+    }
+    let ok = match which {
+        0 => lsp_goto_definition(mut ed, cx.win),
+        1 => lsp_goto_declaration(mut ed, cx.win),
+        2 => lsp_goto_type_definition(mut ed, cx.win),
+        3 => lsp_goto_implementation(mut ed, cx.win),
+        4 => lsp_references(mut ed, cx.win),
+        5 => lsp_hover(mut ed, cx.win),
+        6 => lsp_signature(mut ed, cx.win),
+        7 => lsp_rename(mut ed, cx.win),
+        _ => lsp_symbols(mut ed, cx.win),
+    }
+    status_of(ok)
+}
+
+/// `yew_lsp_cmd_goto_def` (`lsp_cmds.c:82-87`).
+pub fn lsp_cmd_goto_def(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 0)
+}
+
+/// `yew_lsp_cmd_goto_decl` (`lsp_cmds.c:89-94`).
+pub fn lsp_cmd_goto_decl(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 1)
+}
+
+/// `yew_lsp_cmd_goto_type` (`lsp_cmds.c:96-101`).
+pub fn lsp_cmd_goto_type(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 2)
+}
+
+/// `yew_lsp_cmd_goto_impl` (`lsp_cmds.c:103-108`).
+pub fn lsp_cmd_goto_impl(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 3)
+}
+
+/// `yew_lsp_cmd_references` (`lsp_cmds.c:110-115`).
+pub fn lsp_cmd_references(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 4)
+}
+
+/// `yew_lsp_cmd_hover` (`lsp_cmds.c:68-73`).
+pub fn lsp_cmd_hover(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 5)
+}
+
+/// `yew_lsp_cmd_signature` (`lsp_cmds.c:75-80`).
+pub fn lsp_cmd_signature(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 6)
+}
+
+/// `yew_lsp_cmd_rename` (`lsp_cmds.c:117-122`).
+pub fn lsp_cmd_rename(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 7)
+}
+
+/// `yew_lsp_cmd_symbols` (`lsp_cmds.c:158-163`).
+pub fn lsp_cmd_symbols(mut ed: Ed, cx: CmdCtx) -> int {
+    win_status(mut ed, cx, 8)
+}
+
+// `rename_answer` (`lsp_cmds.c:124-141`): the message is the callee's.
+fn rename_answer_status(mut ed: Ed, answer: int) -> int {
+    if lsp_rename_answer(mut ed, answer) then CMD_OK else CMD_ERR_STATE
+}
+
+/// `yew_lsp_cmd_rename_apply` (`lsp_cmds.c:143-146`).
+pub fn lsp_cmd_rename_apply(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    rename_answer_status(mut ed, LSP_RENAME_APPLY)
+}
+
+/// `yew_lsp_cmd_rename_diff` (`lsp_cmds.c:148-151`).
+pub fn lsp_cmd_rename_diff(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    rename_answer_status(mut ed, LSP_RENAME_DIFF)
+}
+
+/// `yew_lsp_cmd_rename_cancel` (`lsp_cmds.c:153-156`).
+pub fn lsp_cmd_rename_cancel(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    rename_answer_status(mut ed, LSP_RENAME_CANCEL)
 }
