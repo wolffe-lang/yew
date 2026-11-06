@@ -1,0 +1,411 @@
+//! edit.lsp_highlight — document highlight (Sprint 47 §4): 300 ms after
+//! the cursor stops in the focused window, `textDocument/documentHighlight`
+//! at the cursor, its read and write occurrences painted until the
+//! cursor moves, the buffer changes, the focus leaves or the server
+//! loses the capability.
+//!
+//! Ports sagitta `src/mod/lsp/highlight.c:17-27` and `:145-472` at
+//! 9ace98c2 (the parser, `:29-143`, is `lsp.features`'). C's two
+//! `MatchOverlay`s are two span lists: the draw (`draw.c:604-655`) reads
+//! only their spans, and C's per-overlay generation, scanned range and
+//! completion flag are written and never read. The idle timer is a
+//! `TIMER_LSP_HIGHLIGHT` whose payload is the window's id (C's context is
+//! the `Win`). C's request record is the state itself: while the state
+//! holds a request id, the state's server, buffer, generation, sequence
+//! and cursor are the ones that request was sent with
+//! (`highlight_request_start` copies them, and every change to them
+//! clears the request first).
+
+use lsp
+use text
+
+/// The idle timer's kind (`highlight_timer_fire`).
+pub const TIMER_LSP_HIGHLIGHT: int = 50
+
+/// The highlight request (`highlight_done`, `highlight.c:254-299`).
+pub const LSP_PK_HIGHLIGHT: int = 6
+
+// `YEW_LSP_HIGHLIGHT_IDLE_MS` (`highlight.c:17`).
+const LSP_HIGHLIGHT_IDLE_MS: int = 300
+
+/// `LspHighlightState` (`win.h`).
+pub struct LspHighlightState {
+    timer: int,
+    request: int,
+    server_id: int,
+    buf_id: int,
+    buf_gen: int,
+    seq: int,
+    cursor: int,
+    cursor_valid: bool,
+    read: List[text.Span],
+    write: List[text.Span],
+}
+
+/// No highlight (`yew_overlay_init` twice).
+pub fn lsp_highlight_state_new() -> LspHighlightState {
+    LspHighlightState {
+        timer: TIMER_NONE,
+        request: 0,
+        server_id: 0,
+        buf_id: 0,
+        buf_gen: 0,
+        seq: 0,
+        cursor: 0,
+        cursor_valid: false,
+        read: List[text.Span](),
+        write: List[text.Span](),
+    }
+}
+
+// `highlight_damage` (`highlight.c:145-181`): the visible lines the spans
+// touch, each once, in the focused window.
+fn highlight_damage(mut ed: Ed, wi: int, spans: List[text.Span]) {
+    if wi < 0 || ed.win != wi || spans.len == 0 {
+        return
+    }
+    let bi = ed.wins[wi].buf
+    let line_count = text.textbuf_line_count(ed.bufs[bi].ec.tb)
+    let top = ed.wins[wi].vp.top
+    var bottom = top + (if ed.wins[wi].rect.h == 0 then 1 else ed.wins[wi].rect.h)
+    if bottom > line_count {
+        bottom = line_count
+    }
+    var last = -1
+    for span in spans {
+        var lo = text.textbuf_line_of(ed.bufs[bi].ec.tb, span.lo as text.ByteOff) as int
+        let end = if span.hi > span.lo then span.hi - 1 else span.lo
+        var hi = text.textbuf_line_of(ed.bufs[bi].ec.tb, end as text.ByteOff) as int
+        if hi < top || lo >= bottom {
+            continue
+        }
+        if lo < top {
+            lo = top
+        }
+        if hi >= bottom {
+            hi = bottom - 1
+        }
+        if last >= 0 && lo <= last {
+            lo = last + 1
+        }
+        var line = lo
+        while line <= hi {
+            ed_damage_line(mut ed, line, false)
+            line += 1
+        }
+        if hi > last || last < 0 {
+            last = hi
+        }
+    }
+}
+
+// `highlight_request_cancel` (`highlight.c:183-195`).
+fn highlight_request_cancel(mut ed: Ed, wi: int) {
+    let request = ed.wins[wi].lsp_highlight.request
+    if request == 0 {
+        return
+    }
+    lsp_cancel_request(mut ed, ed.wins[wi].lsp_highlight.server_id, request)
+    ed.wins[wi].lsp_highlight.request = 0
+}
+
+/// `yew_lsp_highlight_clear` (`highlight.c:197-221`): the timer and the
+/// request cancelled, the painted lines damaged, the state reset under a
+/// new sequence.
+pub fn lsp_highlight_clear(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len {
+        return
+    }
+    if ed.wins[wi].lsp_highlight.timer != TIMER_NONE {
+        let _ = timer_cancel(mut ed.timers, ed.wins[wi].lsp_highlight.timer)
+        ed.wins[wi].lsp_highlight.timer = TIMER_NONE
+    }
+    highlight_request_cancel(mut ed, wi)
+    let read = copy ed.wins[wi].lsp_highlight.read
+    let write = copy ed.wins[wi].lsp_highlight.write
+    highlight_damage(mut ed, wi, read)
+    highlight_damage(mut ed, wi, write)
+    if ed.wins[wi].lsp_highlight.read.len != 0 {
+        ed.wins[wi].lsp_highlight.read = List[text.Span]()
+    }
+    if ed.wins[wi].lsp_highlight.write.len != 0 {
+        ed.wins[wi].lsp_highlight.write = List[text.Span]()
+    }
+    ed.wins[wi].lsp_highlight.seq += 1
+    ed.wins[wi].lsp_highlight.server_id = 0
+    ed.wins[wi].lsp_highlight.buf_id = 0
+    ed.wins[wi].lsp_highlight.buf_gen = 0
+    ed.wins[wi].lsp_highlight.cursor = 0
+    ed.wins[wi].lsp_highlight.cursor_valid = false
+}
+
+// `highlight_apply` (`highlight.c:228-252`): write occurrences in one
+// list, text and read in the other.
+fn highlight_apply(mut ed: Ed, wi: int, rows: List[lsp.LspHighlight]) {
+    let old_read = copy ed.wins[wi].lsp_highlight.read
+    let old_write = copy ed.wins[wi].lsp_highlight.write
+    highlight_damage(mut ed, wi, old_read)
+    highlight_damage(mut ed, wi, old_write)
+    var read = List[text.Span]()
+    var write = List[text.Span]()
+    for r in rows {
+        if r.kind == lsp.LSP_HIGHLIGHT_WRITE {
+            (mut write).push(text.Span { lo: r.lo, hi: r.hi })
+        } else {
+            (mut read).push(text.Span { lo: r.lo, hi: r.hi })
+        }
+    }
+    highlight_damage(mut ed, wi, read)
+    highlight_damage(mut ed, wi, write)
+    ed.wins[wi].lsp_highlight.read = read
+    ed.wins[wi].lsp_highlight.write = write
+}
+
+/// `highlight_done` (`highlight.c:254-299`): `-32601` clears the
+/// capability; a response for a state that has moved clears; otherwise
+/// the occurrences are painted.
+pub fn lsp_highlight_done(mut ed: Ed, p: lsp.RpcPending, j: lsp.Json, result: int, error: int) {
+    let wi = ed_win_by_id(ed, p.ctx)
+    if wi < 0 {
+        return
+    }
+    if ed.wins[wi].lsp_highlight.request != p.id || p.id == 0 {
+        return
+    }
+    let k = lsp_server_index(ed, ed.wins[wi].lsp_highlight.server_id)
+    if error >= 0 && k >= 0 && lsp_error_is_method_not_found(j, error) {
+        ed.lsp.servers[k].life.caps.bits = ed.lsp.servers[k].life.caps.bits &
+            !lsp.LSPC_DOCUMENT_HIGHLIGHT
+        ed.wins[wi].lsp_highlight.request = 0
+        lsp_highlight_clear(mut ed, wi)
+        return
+    }
+    let bi = ed.wins[wi].buf
+    let st = copy ed.wins[wi].lsp_highlight
+    let one = ed.wins[wi].cs.curs.len == 1 && ed.wins[wi].cs.primary < ed.wins[wi].cs.curs.len
+    if ed.win != wi ||
+        !st.cursor_valid ||
+        ed.bufs[bi].id != st.buf_id ||
+        ed.bufs[bi].ec.tb.gen != st.buf_gen ||
+        !one ||
+        ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos != st.cursor {
+        ed.wins[wi].lsp_highlight.request = 0
+        lsp_highlight_clear(mut ed, wi)
+        return
+    }
+    ed.wins[wi].lsp_highlight.request = 0
+    if error >= 0 || k < 0 {
+        return
+    }
+    let rows = lsp.lsp_highlights_parse(
+        j,
+        result,
+        ed.bufs[bi].ec.tb,
+        ed.lsp.servers[k].life.pos_enc,
+    )
+    highlight_apply(mut ed, wi, rows)
+}
+
+// `highlight_params` (`highlight.c:301-324`).
+fn highlight_params(uri: str, pos_enc: int, tb: text.TextBuf, cursor: int) -> List[byte] {
+    let (line, character) = lsp.lsp_pos_of_off(pos_enc, tb, cursor)
+    var w = lsp.jsonw_new()
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "textDocument")
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "uri")
+    lsp.jsonw_cstr(mut w, uri)
+    lsp.jsonw_obj_end(mut w)
+    lsp.jsonw_key(mut w, "position")
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "line")
+    lsp.jsonw_int(mut w, line)
+    lsp.jsonw_key(mut w, "character")
+    lsp.jsonw_int(mut w, character)
+    lsp.jsonw_obj_end(mut w)
+    lsp.jsonw_obj_end(mut w)
+    w.out
+}
+
+// `highlight_request_start` (`highlight.c:326-379`): only for the state
+// the timer was armed with, still the window's.
+fn highlight_request_start(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len {
+        return
+    }
+    if ed.win != wi {
+        lsp_highlight_clear(mut ed, wi)
+        return
+    }
+    let bi = ed.wins[wi].buf
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    let st = copy ed.wins[wi].lsp_highlight
+    let one = ed.wins[wi].cs.curs.len == 1 && ed.wins[wi].cs.primary < ed.wins[wi].cs.curs.len
+    if !st.cursor_valid ||
+        k < 0 ||
+        d < 0 ||
+        ed.lsp.servers[k].id != st.server_id ||
+        ed.lsp.servers[k].life.state != lsp.LSP_READY ||
+        !lsp.lsp_caps_has(ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_HIGHLIGHT) ||
+        ed.bufs[bi].id != st.buf_id ||
+        ed.bufs[bi].ec.tb.gen != st.buf_gen ||
+        !one ||
+        ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos != st.cursor {
+        return
+    }
+    lsp_sync_flush(mut ed)
+    let (k2, d2) = lsp_doc_of_buffer(ed, bi)
+    if k2 != k || d2 != d {
+        return
+    }
+    let params = highlight_params(
+        ed.lsp.servers[k].docv[d].uri,
+        ed.lsp.servers[k].life.pos_enc,
+        ed.bufs[bi].ec.tb,
+        st.cursor,
+    )
+    var p = lsp.rpc_pending_new()
+    p.kind = LSP_PK_HIGHLIGHT
+    p.ctx = ed.wins[wi].id
+    p.buf_id = st.buf_id
+    p.gen = st.buf_gen
+    p.sent_ms = ed.now_ms
+    let id = lsp.rpc_call(mut ed.lsp.servers[k].rpc, "textDocument/documentHighlight", params, p)
+    if id == 0 {
+        return
+    }
+    ed.wins[wi].lsp_highlight.request = id
+}
+
+/// `highlight_timer_fire` (`highlight.c:381-389`): the window by its id.
+pub fn lsp_highlight_timer_fire(mut ed: Ed, win_id: int) {
+    let wi = ed_win_by_id(ed, win_id)
+    if wi < 0 {
+        return
+    }
+    ed.wins[wi].lsp_highlight.timer = TIMER_NONE
+    highlight_request_start(mut ed, wi)
+}
+
+// Whether the state holds anything to clear.
+fn highlight_live(st: LspHighlightState) -> bool {
+    st.cursor_valid ||
+        st.timer != TIMER_NONE ||
+        st.request != 0 ||
+        st.read.len != 0 ||
+        st.write.len != 0
+}
+
+/// `yew_lsp_highlight_cursor` (`highlight.c:391-434`), every loop turn:
+/// a focused, single-cursor window on a ready server with the capability
+/// arms the idle timer when its cursor, buffer or generation moved.
+pub fn lsp_highlight_cursor(mut ed: Ed, wi: int) {
+    if wi < 0 || wi >= ed.wins.len {
+        return
+    }
+    let one = ed.wins[wi].cs.curs.len == 1 && ed.wins[wi].cs.primary < ed.wins[wi].cs.curs.len
+    if ed.win != wi || ed.headless || !one {
+        if highlight_live(ed.wins[wi].lsp_highlight) {
+            lsp_highlight_clear(mut ed, wi)
+        }
+        return
+    }
+    let bi = ed.wins[wi].buf
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    if k < 0 ||
+        d < 0 ||
+        ed.lsp.servers[k].life.state != lsp.LSP_READY ||
+        !lsp.lsp_caps_has(ed.lsp.servers[k].life.caps, lsp.LSPC_DOCUMENT_HIGHLIGHT) {
+        if highlight_live(ed.wins[wi].lsp_highlight) {
+            lsp_highlight_clear(mut ed, wi)
+        }
+        return
+    }
+    let pos = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    let st = copy ed.wins[wi].lsp_highlight
+    let sid = ed.lsp.servers[k].id
+    if st.cursor_valid &&
+        st.server_id == sid &&
+        st.buf_id == ed.bufs[bi].id &&
+        st.buf_gen == ed.bufs[bi].ec.tb.gen &&
+        st.cursor == pos {
+        return
+    }
+    lsp_highlight_clear(mut ed, wi)
+    ed.wins[wi].lsp_highlight.server_id = sid
+    ed.wins[wi].lsp_highlight.buf_id = ed.bufs[bi].id
+    ed.wins[wi].lsp_highlight.buf_gen = ed.bufs[bi].ec.tb.gen
+    ed.wins[wi].lsp_highlight.cursor = pos
+    ed.wins[wi].lsp_highlight.cursor_valid = true
+    ed.wins[wi].lsp_highlight.timer = timer_add(
+        mut ed.timers,
+        ed.now_ms + LSP_HIGHLIGHT_IDLE_MS,
+        TIMER_LSP_HIGHLIGHT,
+        ed.wins[wi].id,
+    )
+}
+
+// Every window a tab's tree shows, each once (the walk of
+// `highlight.c:442-453` and `:462-471` over `ed->tabs`).
+fn tab_windows(ed: Ed) -> List[int] {
+    var out = List[int]()
+    var roots = List[int]()
+    for t in ed.tabs {
+        (mut roots).push(t.root)
+    }
+    (mut roots).push(ed.pane_root)
+    for root in roots {
+        if !pane_live(ed, root) {
+            continue
+        }
+        for leaf in pane_collect_leaves(ed, root, PANE_MAX_LEAVES) {
+            let w = ed.panes[leaf].win
+            if w < 0 || w >= ed.wins.len {
+                continue
+            }
+            var seen = false
+            for x in out {
+                if x == w {
+                    seen = true
+                }
+            }
+            if !seen {
+                (mut out).push(w)
+            }
+        }
+    }
+    if ed.win >= 0 && ed.win < ed.wins.len {
+        var seen = false
+        for x in out {
+            if x == ed.win {
+                seen = true
+            }
+        }
+        if !seen {
+            (mut out).push(ed.win)
+        }
+    }
+    out
+}
+
+/// `yew_lsp_highlight_buffer_clear` (`highlight.c:436-454`): every window
+/// showing buffer id `buf_id`. Called by the edit hook (`sync.c:419`) and
+/// a buffer's close (`lsp.c:465`).
+pub fn lsp_highlight_buffer_clear(mut ed: Ed, buf_id: int) {
+    if buf_id == 0 {
+        return
+    }
+    for w in tab_windows(ed) {
+        let bi = ed.wins[w].buf
+        if bi >= 0 && bi < ed.bufs.len && ed.bufs[bi].id == buf_id {
+            lsp_highlight_clear(mut ed, w)
+        }
+    }
+}
+
+/// `yew_lsp_highlight_shutdown` (`highlight.c:456-472`).
+pub fn lsp_highlight_shutdown(mut ed: Ed) {
+    for w in tab_windows(ed) {
+        lsp_highlight_clear(mut ed, w)
+    }
+}
