@@ -1,0 +1,501 @@
+//! edit.lsp_features — the feature requests and their callbacks (Sprint
+//! 47): hover and signature help into the window's panel, the four gotos
+//! and references into a jump or the location picker, document symbols
+//! into the symbol picker.
+//!
+//! Ports sagitta `src/mod/lsp/features.c:1316-1999` (the request
+//! records, the cancel, the position parameters, the panel anchor, the
+//! panel, navigation and symbol requests and their callbacks) at
+//! 9ace98c2. The response decoders are `lsp.features`'. Completion's
+//! requests (`:1316-1535`, `:2001-2372`) are yw11b1's.
+//!
+//! **The request records.** C allocates a record per request (window,
+//! buffer, server, sequence, request id, capability, the noun for the
+//! message, the picker flag) and checks it against the window's
+//! `*_source_*` fields when the response comes. Only the window's latest
+//! request is ever honoured, so the port keeps the record in the window
+//! (`Win.panel_source_*`, `nav_source_*`, `symbol_source_*`) and the
+//! pending row's `ctx` is the window's id: a response is the window's
+//! current request exactly when its id, its server and the window's
+//! buffer still match, which is C's test (the sequence moves only with a
+//! new request, so it adds nothing to the id).
+//!
+//! **A request is queued, not written.** As in C, a request (and the
+//! changes `lsp_sync_flush` sends before it) waits in the connection's
+//! queue for the loop's write turn (`job_pump`'s framed writers, C's
+//! POLLOUT row), so a request made and dropped in one turn never reaches
+//! the server.
+
+use lsp
+use text
+
+/// The panel request (`panel_request_done`, `features.c:1600-1678`).
+pub const LSP_PK_PANEL: int = 3
+
+/// The navigation request (`navigation_done`, `features.c:1784-1829`).
+pub const LSP_PK_NAV: int = 4
+
+/// The symbol request (`symbols_done`, `features.c:1905-1942`).
+pub const LSP_PK_SYMBOLS: int = 5
+
+// `LspPanelKind` (`features.c:1342-1345`).
+const LSP_PANEL_HOVER: int = 0
+
+const LSP_PANEL_SIGNATURE: int = 1
+
+// A `-32601` MethodNotFound reply (s45 §7).
+const METHOD_NOT_FOUND: int = -32601
+
+/// `completion_cancel_id` (`features.c:1420-1431`): `$/cancelRequest` for
+/// a request still pending, and its row dropped.
+pub fn lsp_cancel_request(mut ed: Ed, server_id: int, request: int) {
+    if request == 0 {
+        return
+    }
+    let k = lsp_server_index(ed, server_id)
+    if k < 0 || !ed.lsp.servers[k].rpc_live {
+        return
+    }
+    lsp.rpc_cancel(mut ed.lsp.servers[k].rpc, request)
+    let _ = lsp.rpc_drop(mut ed.lsp.servers[k].rpc, request) else lsp.rpc_pending_new()
+}
+
+/// Whether an error reply is `-32601`.
+pub fn lsp_error_is_method_not_found(j: lsp.Json, error: int) -> bool {
+    lsp.json_int(j, lsp.json_field(j, error, "code"), 0) == METHOD_NOT_FOUND
+}
+
+/// `yew_lsp_sync_flush` (`sync.c:434-452`): every document on a ready
+/// server sent its queued changes, before a request reads positions.
+pub fn lsp_sync_flush(mut ed: Ed) {
+    var bi = 0
+    while bi < ed.bufs.len {
+        let (k, d) = lsp_doc_of_buffer(ed, bi)
+        if k >= 0 && ed.lsp.servers[k].life.state == lsp.LSP_READY {
+            lsp_sync_drain(mut ed, bi)
+            let _ = lsp.lsp_doc_flush(
+                mut ed.lsp.servers[k].rpc,
+                mut ed.lsp.servers[k].docv[d],
+                ed.lsp.servers[k].life.caps.sync_kind,
+                ed.bufs[bi].ec.tb,
+            )
+        }
+        bi += 1
+    }
+}
+
+// The position parameters (`position_params`, `features.c:1536-1567`;
+// `navigation_params`, `:1751-1782`): `context` 1 adds completion's
+// `triggerKind`, 2 references' `includeDeclaration`.
+fn position_params(
+    uri: str,
+    pos_enc: int,
+    tb: text.TextBuf,
+    cursor: int,
+    context: int,
+) -> List[byte] {
+    let (line, character) = lsp.lsp_pos_of_off(pos_enc, tb, cursor)
+    var w = lsp.jsonw_new()
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "textDocument")
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "uri")
+    lsp.jsonw_cstr(mut w, uri)
+    lsp.jsonw_obj_end(mut w)
+    lsp.jsonw_key(mut w, "position")
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "line")
+    lsp.jsonw_int(mut w, line)
+    lsp.jsonw_key(mut w, "character")
+    lsp.jsonw_int(mut w, character)
+    lsp.jsonw_obj_end(mut w)
+    if context == 1 {
+        lsp.jsonw_key(mut w, "context")
+        lsp.jsonw_obj(mut w)
+        lsp.jsonw_key(mut w, "triggerKind")
+        lsp.jsonw_int(mut w, 1)
+        lsp.jsonw_obj_end(mut w)
+    } else if context == 2 {
+        lsp.jsonw_key(mut w, "context")
+        lsp.jsonw_obj(mut w)
+        lsp.jsonw_key(mut w, "includeDeclaration")
+        lsp.jsonw_bool(mut w, true)
+        lsp.jsonw_obj_end(mut w)
+    }
+    lsp.jsonw_obj_end(mut w)
+    w.out
+}
+
+// `document_params` (`features.c:1891-1903`).
+fn document_params(uri: str) -> List[byte] {
+    var w = lsp.jsonw_new()
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "textDocument")
+    lsp.jsonw_obj(mut w)
+    lsp.jsonw_key(mut w, "uri")
+    lsp.jsonw_cstr(mut w, uri)
+    lsp.jsonw_obj_end(mut w)
+    lsp.jsonw_obj_end(mut w)
+    w.out
+}
+
+/// `panel_cursor_anchor` (`features.c:1569-1598`, the same as
+/// `rename_panel_anchor`, `rename.c:828-857`): the primary cursor's cell,
+/// when its row is on screen and its column inside the window.
+pub fn lsp_panel_cursor_anchor(mut ed: Ed, wi: int) -> (bool, int, int) {
+    if wi < 0 ||
+        wi >= ed.wins.len ||
+        ed.wins[wi].cs.curs.len == 0 ||
+        ed.wins[wi].cs.primary >= ed.wins[wi].cs.curs.len {
+        return (false, 0, 0)
+    }
+    let bi = ed.wins[wi].buf
+    let pos = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    let line = text.textbuf_line_of(ed.bufs[bi].ec.tb, pos as text.ByteOff) as int
+    let sub = if ed.wins[wi].vp.wrap then vp_cursor_subrow(ed.wins[wi], ed.bufs[bi].ec.tb) else 0
+    let (visible, row) = vp_row_of_line(mut ed.wins[wi], ed.bufs[bi].ec.tb, line, sub)
+    if !visible || row >= ed.wins[wi].rect.h {
+        return (false, 0, 0)
+    }
+    let displayed = if ed.wins[wi].vp.wrap {
+        wrap_row(mut ed.wins[wi], ed.bufs[bi].ec.tb, line, sub)
+    } else {
+        text.textbuf_line_span(ed.bufs[bi].ec.tb, line as text.LineNo)
+    }
+    let tabw = if ed.bufs[bi].tabwidth == 0 then VP_TABWIDTH else ed.bufs[bi].tabwidth
+    let col = text.off_to_ccol(ed.bufs[bi].ec.tb, displayed, pos as text.ByteOff, tabw) as int
+    let x = vp_gridx_of_ccol(ed.wins[wi], col)
+    let y = ed.wins[wi].rect.y + row
+    (x >= ed.wins[wi].rect.x && x < ed.wins[wi].rect.x + ed.wins[wi].rect.w, x, y)
+}
+
+// The ready server and document of window `wi`'s buffer holding `cap`,
+// or (-1, -1) (the shared guard of every request starter).
+fn ready_doc(ed: Ed, wi: int, cap: int) -> (int, int) {
+    if wi < 0 || wi >= ed.wins.len {
+        return (-1, -1)
+    }
+    let (k, d) = lsp_doc_of_buffer(ed, ed.wins[wi].buf)
+    if k < 0 ||
+        d < 0 ||
+        ed.lsp.servers[k].life.state != lsp.LSP_READY ||
+        !lsp.lsp_caps_has(ed.lsp.servers[k].life.caps, cap) {
+        return (-1, -1)
+    }
+    (k, d)
+}
+
+fn one_cursor(ed: Ed, wi: int) -> bool {
+    ed.wins[wi].cs.curs.len == 1 && ed.wins[wi].cs.primary < ed.wins[wi].cs.curs.len
+}
+
+// ---------------------------------------------------------------------
+// Hover and signature help (`features.c:1600-1749`).
+// ---------------------------------------------------------------------
+
+/// `panel_request_done` (`features.c:1600-1678`).
+pub fn lsp_panel_done(mut ed: Ed, p: lsp.RpcPending, j: lsp.Json, result: int, error: int) {
+    let wi = ed_win_by_id(ed, p.ctx)
+    if wi < 0 ||
+        ed.win != wi ||
+        ed.wins[wi].panel_source_request != p.id ||
+        ed.wins[wi].panel_source_request == 0 {
+        return
+    }
+    let sid = ed.wins[wi].panel_source_server
+    let kind = ed.wins[wi].panel_source_kind
+    ed.wins[wi].panel_source_request = 0
+    ed.wins[wi].panel_source_server = 0
+    let k = lsp_server_index(ed, sid)
+    let cap = if kind == LSP_PANEL_HOVER then lsp.LSPC_HOVER else lsp.LSPC_SIGNATURE
+    if error >= 0 {
+        if k >= 0 && lsp_error_is_method_not_found(j, error) {
+            ed.lsp.servers[k].life.caps.bits = ed.lsp.servers[k].life.caps.bits & !cap
+        }
+        return
+    }
+    if k < 0 {
+        return
+    }
+    let (anchored, x, y) = lsp_panel_cursor_anchor(mut ed, wi)
+    if !anchored {
+        return
+    }
+    let bi = ed.wins[wi].buf
+    let pos_enc = ed.lsp.servers[k].life.pos_enc
+    if kind == LSP_PANEL_HOVER {
+        let h = lsp.lsp_hover_parse(j, result, ed.bufs[bi].ec.tb, pos_enc)
+        if !h.ok {
+            ed_msg(mut ed, MSG_INFO, "no hover information here")
+            return
+        }
+        var spec = panel_spec_new(h.body, x, y, PANEL_BELOW)
+        spec.title = "hover"
+        spec.has_title = true
+        spec.role = "bg"
+        spec.has_role = true
+        if panel_open(mut ed, wi, spec) && h.has_range {
+            let _ = panel_mark(
+                mut ed,
+                wi,
+                ed.bufs[bi].id,
+                ed.bufs[bi].ec.tb.gen,
+                h.range,
+                "lsp.hover_range",
+            )
+        }
+        return
+    }
+    let s = lsp.lsp_signature_parse(j, result)
+    if !s.ok {
+        return
+    }
+    var spec = panel_spec_new(s.body, x, y, PANEL_ABOVE)
+    if s.has_emph {
+        (mut spec.emph).push(copy s.emph)
+    }
+    spec.title = "signature"
+    spec.has_title = true
+    spec.role = "bg"
+    spec.has_role = true
+    let _ = panel_open(mut ed, wi, spec)
+}
+
+// `panel_request_start` (`features.c:1680-1739`).
+fn panel_request_start(mut ed: Ed, wi: int, kind: int) -> bool {
+    if wi < 0 || wi >= ed.wins.len || !one_cursor(ed, wi) {
+        return false
+    }
+    let cap = if kind == LSP_PANEL_HOVER then lsp.LSPC_HOVER else lsp.LSPC_SIGNATURE
+    let (k0, d0) = ready_doc(ed, wi, cap)
+    if k0 < 0 {
+        return false
+    }
+    lsp_cancel_request(mut ed, ed.wins[wi].panel_source_server, ed.wins[wi].panel_source_request)
+    ed.wins[wi].panel_source_request = 0
+    ed.wins[wi].panel_source_server = 0
+    panel_close(mut ed, wi)
+    ed.wins[wi].panel_source_seq += 1
+    lsp_sync_flush(mut ed)
+    let (k, d) = lsp_doc_of_buffer(ed, ed.wins[wi].buf)
+    if k != k0 || d != d0 {
+        return false
+    }
+    let bi = ed.wins[wi].buf
+    let method = if kind == LSP_PANEL_HOVER {
+        "textDocument/hover"
+    } else {
+        "textDocument/signatureHelp"
+    }
+    let cursor = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    let params = position_params(
+        ed.lsp.servers[k].docv[d].uri,
+        ed.lsp.servers[k].life.pos_enc,
+        ed.bufs[bi].ec.tb,
+        cursor,
+        0,
+    )
+    var p = lsp.rpc_pending_new()
+    p.kind = LSP_PK_PANEL
+    p.ctx = ed.wins[wi].id
+    p.buf_id = ed.bufs[bi].id
+    p.gen = ed.bufs[bi].ec.tb.gen
+    p.sent_ms = ed.now_ms
+    let id = lsp.rpc_call(mut ed.lsp.servers[k].rpc, method, params, p)
+    if id == 0 {
+        return false
+    }
+    ed.wins[wi].panel_source_request = id
+    ed.wins[wi].panel_source_server = ed.lsp.servers[k].id
+    ed.wins[wi].panel_source_kind = kind
+    true
+}
+
+/// `yew_lsp_hover_request` (`features.c:1741-1744`).
+pub fn lsp_hover_request(mut ed: Ed, wi: int) -> bool {
+    panel_request_start(mut ed, wi, LSP_PANEL_HOVER)
+}
+
+/// `yew_lsp_signature_request` (`features.c:1746-1749`).
+pub fn lsp_signature_request(mut ed: Ed, wi: int) -> bool {
+    panel_request_start(mut ed, wi, LSP_PANEL_SIGNATURE)
+}
+
+// ---------------------------------------------------------------------
+// Navigation (`features.c:1751-1889`).
+// ---------------------------------------------------------------------
+
+/// `navigation_done` (`features.c:1784-1829`): nothing found says so; one
+/// location jumps (unless references always want the picker); more open
+/// the location picker.
+pub fn lsp_nav_done(mut ed: Ed, p: lsp.RpcPending, j: lsp.Json, result: int, error: int) {
+    let wi = ed_win_by_id(ed, p.ctx)
+    if wi < 0 ||
+        ed.win != wi ||
+        ed.wins[wi].nav_source_request == 0 ||
+        ed.wins[wi].nav_source_request != p.id ||
+        ed.bufs[ed.wins[wi].buf].id != ed.wins[wi].nav_source_buf {
+        return
+    }
+    let sid = ed.wins[wi].nav_source_server
+    let cap = ed.wins[wi].nav_source_cap
+    let what = ed.wins[wi].nav_source_what
+    let always_picker = ed.wins[wi].nav_source_picker
+    ed.wins[wi].nav_source_request = 0
+    ed.wins[wi].nav_source_server = 0
+    let k = lsp_server_index(ed, sid)
+    if error >= 0 {
+        if k >= 0 && lsp_error_is_method_not_found(j, error) {
+            ed.lsp.servers[k].life.caps.bits = ed.lsp.servers[k].life.caps.bits & !cap
+        }
+        return
+    }
+    if k < 0 {
+        return
+    }
+    let id = ed.lsp.servers[k].cfg.id
+    let pos_enc = ed.lsp.servers[k].life.pos_enc
+    let locs = lsp.lsp_locations_parse(j, result)
+    if locs.len == 0 {
+        ed_msg(mut ed, MSG_INFO, "{id}: no {what} found")
+        return
+    }
+    if locs.len == 1 && !always_picker {
+        if !lsp_location_jump(mut ed, wi, locs[0], pos_enc) {
+            ed_msg(mut ed, MSG_ERROR, "cannot open {locs[0].path}")
+        }
+        return
+    }
+    lsp_location_picker_open(mut ed, wi, locs, pos_enc, what)
+}
+
+/// `yew_lsp_navigation_request` (`features.c:1831-1889`).
+pub fn lsp_navigation_request(
+    mut ed: Ed,
+    wi: int,
+    method: str,
+    cap: int,
+    what: str,
+    always_picker: bool,
+) -> bool {
+    if wi < 0 || wi >= ed.wins.len || !one_cursor(ed, wi) {
+        return false
+    }
+    let (k0, d0) = ready_doc(ed, wi, cap)
+    if k0 < 0 {
+        return false
+    }
+    lsp_cancel_request(mut ed, ed.wins[wi].nav_source_server, ed.wins[wi].nav_source_request)
+    ed.wins[wi].nav_source_request = 0
+    ed.wins[wi].nav_source_server = 0
+    ed.wins[wi].nav_source_seq += 1
+    lsp_sync_flush(mut ed)
+    let (k, d) = lsp_doc_of_buffer(ed, ed.wins[wi].buf)
+    if k != k0 || d != d0 {
+        return false
+    }
+    let bi = ed.wins[wi].buf
+    let cursor = ed.wins[wi].cs.curs[ed.wins[wi].cs.primary].pos
+    let params = position_params(
+        ed.lsp.servers[k].docv[d].uri,
+        ed.lsp.servers[k].life.pos_enc,
+        ed.bufs[bi].ec.tb,
+        cursor,
+        if cap == lsp.LSPC_REFERENCES then 2 else 0,
+    )
+    var p = lsp.rpc_pending_new()
+    p.kind = LSP_PK_NAV
+    p.ctx = ed.wins[wi].id
+    p.buf_id = ed.bufs[bi].id
+    p.gen = ed.bufs[bi].ec.tb.gen
+    p.sent_ms = ed.now_ms
+    let id = lsp.rpc_call(mut ed.lsp.servers[k].rpc, method, params, p)
+    if id == 0 {
+        return false
+    }
+    ed.wins[wi].nav_source_request = id
+    ed.wins[wi].nav_source_server = ed.lsp.servers[k].id
+    ed.wins[wi].nav_source_buf = ed.bufs[bi].id
+    ed.wins[wi].nav_source_cap = cap
+    ed.wins[wi].nav_source_what = what
+    ed.wins[wi].nav_source_picker = always_picker
+    true
+}
+
+// ---------------------------------------------------------------------
+// Document symbols (`features.c:1905-1999`).
+// ---------------------------------------------------------------------
+
+/// `symbols_done` (`features.c:1905-1942`).
+pub fn lsp_symbols_done(mut ed: Ed, p: lsp.RpcPending, j: lsp.Json, result: int, error: int) {
+    let wi = ed_win_by_id(ed, p.ctx)
+    if wi < 0 ||
+        ed.win != wi ||
+        ed.wins[wi].symbol_source_request == 0 ||
+        ed.wins[wi].symbol_source_request != p.id ||
+        ed.bufs[ed.wins[wi].buf].id != ed.wins[wi].symbol_source_buf {
+        return
+    }
+    let sid = ed.wins[wi].symbol_source_server
+    let path = ed.wins[wi].symbol_source_path
+    ed.wins[wi].symbol_source_request = 0
+    ed.wins[wi].symbol_source_server = 0
+    let k = lsp_server_index(ed, sid)
+    if error >= 0 {
+        if k >= 0 && lsp_error_is_method_not_found(j, error) {
+            ed.lsp.servers[k].life.caps.bits = ed.lsp.servers[k].life.caps.bits &
+                !lsp.LSPC_DOCUMENT_SYMBOL
+        }
+        return
+    }
+    if k < 0 {
+        return
+    }
+    let symbols = lsp.lsp_symbols_parse(j, result, path)
+    if symbols.len == 0 {
+        ed_msg(mut ed, MSG_INFO, "{ed.lsp.servers[k].cfg.id}: no document symbols found")
+        return
+    }
+    lsp_symbol_picker_open(mut ed, wi, symbols, ed.lsp.servers[k].life.pos_enc)
+}
+
+/// `yew_lsp_symbols_request` (`features.c:1944-1999`).
+pub fn lsp_symbols_request(mut ed: Ed, wi: int) -> bool {
+    if wi < 0 || wi >= ed.wins.len || !ed.bufs[ed.wins[wi].buf].has_path {
+        return false
+    }
+    let (k0, d0) = ready_doc(ed, wi, lsp.LSPC_DOCUMENT_SYMBOL)
+    if k0 < 0 {
+        return false
+    }
+    lsp_cancel_request(mut ed, ed.wins[wi].symbol_source_server, ed.wins[wi].symbol_source_request)
+    ed.wins[wi].symbol_source_request = 0
+    ed.wins[wi].symbol_source_server = 0
+    ed.wins[wi].symbol_source_seq += 1
+    let bi = ed.wins[wi].buf
+    let path = ed.bufs[bi].path
+    if path.len == 0 {
+        return false
+    }
+    lsp_sync_flush(mut ed)
+    let (k, d) = lsp_doc_of_buffer(ed, bi)
+    if k != k0 || d != d0 {
+        return false
+    }
+    let params = document_params(ed.lsp.servers[k].docv[d].uri)
+    var p = lsp.rpc_pending_new()
+    p.kind = LSP_PK_SYMBOLS
+    p.ctx = ed.wins[wi].id
+    p.buf_id = ed.bufs[bi].id
+    p.gen = ed.bufs[bi].ec.tb.gen
+    p.sent_ms = ed.now_ms
+    let id = lsp.rpc_call(mut ed.lsp.servers[k].rpc, "textDocument/documentSymbol", params, p)
+    if id == 0 {
+        return false
+    }
+    ed.wins[wi].symbol_source_request = id
+    ed.wins[wi].symbol_source_server = ed.lsp.servers[k].id
+    ed.wins[wi].symbol_source_buf = ed.bufs[bi].id
+    ed.wins[wi].symbol_source_path = path
+    true
+}
