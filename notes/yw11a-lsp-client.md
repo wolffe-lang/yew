@@ -302,8 +302,10 @@ and outside-signal rows and the 2× gates, are not):
   `run-perf-cmdcomp` stages, less `lsp`: `33b1807`.
 - **On the hosted macOS runner C's own two runs of the list screen
   differed** (`lspw_open_diag.3-list: unstable between runs`); the verdict
-  printed no cells. `722f252` waits for the list's count where the row
-  settled blind for 500 ms; `ba3f5dc` holds C's two runs over the cells
+  printed no cells. A Linux take at the same head showed why: C's second
+  run failed `the diagnostic list did not open`, its kept screen still on
+  the command line's `:`, the command not yet read when the row's blind
+  500 ms settle ended. `722f252` waits for the list's count instead; `ba3f5dc` holds C's two runs over the cells
   `same` compares (C's syntax colouring settles on its own clock and is
   out of the comparison already) and prints the cells that moved, so a
   repeat names its cause.
