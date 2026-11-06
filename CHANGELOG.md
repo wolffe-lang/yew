@@ -5,6 +5,32 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw11b2 — the LSP client's features (2026-11-06)
+
+- sagitta's `src/mod/lsp/` features, pickers, highlight and rename and
+  `src/ui/panel.c` (s47): `lsp.features` (the location, symbol,
+  highlight, hover and signature parsers), `edit.panel` (the floating
+  panel), `edit.lsp_features`, `edit.lsp_pickers`, `edit.lsp_highlight`
+  and `edit.lsp_rename`; hover and signature help with its auto-trigger,
+  definition, declaration, type definition, implementation, references,
+  document symbols, document highlight and rename, each gated on the
+  server's capability by name; the document menu's LSP section.
+- Unit files for the parsers, the panel, navigation, rename, the
+  capability gate, and C's transport and lifecycle files through a real
+  server (`fakelsp`, `tools/build-fakelsp`, `tools/check-test
+  --fakelsp-ran`); C's `lsp_feat_rename_diff` and `_refusal` PTY goldens
+  by name, and `_summary`, `_apply` and `_unknown_key` recorded (their
+  style rows hold the C buffer's syntax colouring, yw10's) with the rest
+  of each screen held to C's by the `lspg_*` rows.
+- The oracle rows grow by the features over `wolf lsp` (definition in
+  this file and another, a missing capability, references, symbols,
+  hover, rename) and the fake server's error paths (null and error
+  replies, a reply after the document changed, a reply past its
+  deadline, a partial capability set, highlights, signature help, a
+  rename that would create a file).
+- Completion, the shadow and the symbol index are yw11b1's (R-yw11b-1,
+  R-yw11b-3).
+
 ### yw11a — the LSP client core and diagnostics (2026-11-05)
 
 - sagitta's `src/mod/lsp/` json, jsonrpc, client, sync and diag, and
