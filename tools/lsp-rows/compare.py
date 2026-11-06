@@ -8,8 +8,11 @@ KEEP holds c/run1, c/run2, port/run1 and port/run2, each a directory of
 goldens' own: a header, `--- text`, `--- style` rows of style tokens and
 the style legend). Three checks, one line each screen:
 
-  stable   each binary's two runs kept the same screens, byte for byte
-           but the header's frame count
+  stable   each binary's two runs kept the same screens: the port's
+           byte for byte but the header's frame count; C's over what
+           `same` compares (C's syntax colouring is left out of both, as
+           it settles on its own clock); an unstable screen prints the
+           cells that moved
   same     C's screen and the port's, cell for cell: every glyph, the
            header (size, cursor, modes; not `sync_pairs`, the count of
            frames so far, since C's syntax engine paints frames of its own
@@ -124,10 +127,14 @@ def main():
             ok = False
         for f in r1:
             if f in r2:
-                same = stable_text(os.path.join(keep, tag, "run1", f)) == \
-                    stable_text(os.path.join(keep, tag, "run2", f))
-                if not same:
+                a = os.path.join(keep, tag, "run1", f)
+                b = os.path.join(keep, tag, "run2", f)
+                moved = compare(a, b)
+                exact = stable_text(a) == stable_text(b)
+                if moved or (tag == "port" and not exact):
                     print("lsp-rows: %s %s: unstable between runs" % (tag, f[:-5]))
+                    for d in (moved or ["the bytes differ outside the compared cells"])[:12]:
+                        print("lsp-rows:   " + d)
                     ok = False
         names[tag] = r1
     if names["c"] != names["port"]:
