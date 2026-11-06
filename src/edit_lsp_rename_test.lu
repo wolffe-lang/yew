@@ -1,0 +1,953 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_lsp_rename.c` (1,261 lines) at
+//! 9ace98c2, one test per C test in registry order: every preflight
+//! refusal with its exact sentence and no byte changed, the two
+//! `WorkspaceEdit` forms planned alike, one `TXN_LSP` node per buffer, a
+//! multi-line delete that leaves the registers alone, descending
+//! application, six files undone one node each with the disk untouched,
+//! the fault-injected rollback (and its no-op variant), and the three
+//! answers through the registry and the PANEL menu.
+//!
+//! C's fixture (`rename_fix_init`, `test_lsp_rename.c:73-101`) makes a
+//! canonical temporary root with six files and a directory, points the
+//! workspace and `XDG_STATE_HOME` at it and opens `a.c`; the port's root
+//! is under `$TMPDIR` (the lane's, never `/tmp`), the editor's workspace
+//! `ed.ws_dir`, and `a.c` opened as a tab. C's `yew_ed_edit_ctx_buffer`
+//! edits are the port's window seam (`edit.ed_edit_*`, `edit.edit_take`).
+//!
+//! The per-case selector `YEW_LSP_RENAME_CASE=N` (0-based, 26 cases) runs
+//! one case, for the checked machine's step budget (G29).
+
+use edit
+use lsp
+use std.fs
+use term
+use text
+
+struct Tally {
+    n: int,
+}
+
+// A failed check says what it was before the trap (a native trap prints
+// only its site).
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    if !cond {
+        eprint("assertion failed: {what}")
+    }
+    assert(cond, what)
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+const A_TEXT: str = "alpha alpha\nA\u{1F332}B\n"
+
+const B_TEXT: str = "alpha beta alpha\n"
+
+const C_TEXT: str = "alpha gamma\n"
+
+const D_TEXT: str = "alpha delta\n"
+
+const E_TEXT: str = "alpha epsilon\n"
+
+const F_TEXT: str = "alpha phi\n"
+
+// `RenameFix` (`test_lsp_rename.c:31-44`).
+struct Fix {
+    ed: edit.Ed,
+    root: str,
+    a: str,
+    b: str,
+    c: str,
+    d: str,
+    e: str,
+    f: str,
+    dir: str,
+}
+
+fn write(path: str, text: str) {
+    fs_write_bytes(path, pb(text)) else |_| {
+        assert(false, "rename fixture write {path}")
+    }
+}
+
+// `rename_fix_init` (`test_lsp_rename.c:73-101`): `tag` names the root,
+// one per fixture a case makes.
+fn fix_init(tag: str) -> Fix {
+    let tmp = env_get("TMPDIR") else "target/tests"
+    let base = if tmp.len == 0 then "target/tests" else tmp
+    fs.create_dir_all(base) else |_| {}
+    let raw = "{base}/yew-lsp-rename-{os_pid()}-{tag}"
+    fs.remove_dir_all(raw) else |_| {}
+    fs.create_dir_all(raw) else |_| {
+        assert(false, "mkdir {raw}")
+    }
+    let root = fs_realpath(raw) else raw
+    let state = "{root}/state"
+    env_set("XDG_STATE_HOME", state) else |_| {}
+    var f = Fix {
+        ed: edit.ed_new(),
+        root: root,
+        a: "{root}/a.c",
+        b: "{root}/b.c",
+        c: "{root}/c.c",
+        d: "{root}/d.c",
+        e: "{root}/e.c",
+        f: "{root}/f.c",
+        dir: "{root}/not-regular",
+    }
+    write(f.a, A_TEXT)
+    write(f.b, B_TEXT)
+    write(f.c, C_TEXT)
+    write(f.d, D_TEXT)
+    write(f.e, E_TEXT)
+    write(f.f, F_TEXT)
+    fs.create_dir_all(f.dir) else |_| {}
+    edit.ed_open_scratch(mut f.ed)
+    f.ed.ws_dir = root
+    let idx = edit.tab_open(mut f.ed, f.a)
+    assert(idx >= 0, "open a.c")
+    assert(edit.tab_hydrate(mut f.ed, idx) == 0, "a.c loads")
+    edit.tab_switch(mut f.ed, idx)
+    f
+}
+
+fn fix_free(f: Fix) {
+    fs.remove_dir_all(f.root) else |_| {}
+}
+
+fn parse(text: str) -> lsp.Json {
+    var err = lsp.json_err_new()
+    let j = lsp.json_parse(text.bytes(), 0, text.len, mut err) else {
+        assert(false, "parse: {err.msg}")
+        return lsp.json_new()
+    }
+    j
+}
+
+fn text_is(tb: text.TextBuf, want: str) -> bool {
+    let got = text.textbuf_bytes(tb)
+    let w = want.bytes()
+    if got.len != w.len {
+        return false
+    }
+    var i = 0
+    while i < got.len {
+        if got[i] != w[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `rename_find_path` (`test_lsp_rename.c:173-184`): the buffer index.
+fn find(f: Fix, path: str) -> int {
+    var i = 0
+    while i < f.ed.bufs.len {
+        if f.ed.bufs[i].has_path && f.ed.bufs[i].path == path {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// `rename_assert_sources_unchanged` (`test_lsp_rename.c:186-200`).
+fn sources_unchanged(mut t: Tally, f: Fix) {
+    let a = find(f, f.a)
+    ok(mut t, a >= 0 && text_is(f.ed.bufs[a].ec.tb, A_TEXT), "a.c unchanged")
+    let b = find(f, f.b)
+    if b >= 0 && f.ed.bufs[b].resident {
+        ok(mut t, text_is(f.ed.bufs[b].ec.tb, B_TEXT), "b.c unchanged")
+    }
+    let c = find(f, f.c)
+    if c >= 0 && f.ed.bufs[c].resident {
+        ok(mut t, text_is(f.ed.bufs[c].ec.tb, C_TEXT), "c.c unchanged")
+    }
+}
+
+fn disk_is(path: str, want: str) -> bool {
+    let got = fs_read_bytes(path) else |_| List[byte]()
+    let w = want.bytes()
+    if got.len != w.len {
+        return false
+    }
+    var i = 0
+    while i < got.len {
+        if got[i] != w[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// `rename_assert_fixture_disk` (`test_lsp_rename.c:226-234`).
+fn fixture_disk(mut t: Tally, f: Fix) {
+    ok(mut t, disk_is(f.a, A_TEXT), "a.c on disk")
+    ok(mut t, disk_is(f.b, B_TEXT), "b.c on disk")
+    ok(mut t, disk_is(f.c, C_TEXT), "c.c on disk")
+    ok(mut t, disk_is(f.d, D_TEXT), "d.c on disk")
+    ok(mut t, disk_is(f.e, E_TEXT), "e.c on disk")
+    ok(mut t, disk_is(f.f, F_TEXT), "f.c on disk")
+}
+
+fn preflight(
+    mut f: Fix,
+    json: str,
+    pos_enc: int,
+    old: str,
+    new: str,
+    mut plan: edit.RenamePlan,
+) -> edit.RenameVerdict {
+    let j = parse(json)
+    edit.lsp_rename_preflight(mut f.ed, j, j.root, pos_enc, old, new, mut plan)
+}
+
+// `rename_expect_reject` (`test_lsp_rename.c:236-249`).
+fn expect_reject(mut t: Tally, mut f: Fix, json: str, pos_enc: int, want: str) {
+    var plan = edit.rename_plan_new()
+    let v = preflight(mut f, json, pos_enc, "alpha", "omega", mut plan)
+    ok(mut t, !v.ok, "refused")
+    ok(mut t, v.err == want, "the sentence: want <{want}>, got <{v.err}>")
+    ok(mut t, plan.files.len == 0, "no plan")
+    sources_unchanged(mut t, f)
+}
+
+// `rename_one_change` (`test_lsp_rename.c:251-279`).
+fn one_change(uri: str, sl: int, sc: int, el: int, ec: int) -> str {
+    "{{\"changes\":{{\"{uri}\":[{{\"range\":{{\"start\":{{\"line\":{sl},\"character\":{sc}}},\"end\":{{\"line\":{el},\"character\":{ec}}}}},\"newText\":\"omega\"}}]}}}}"
+}
+
+fn edit_of(lo_line: int, lo_chr: int, hi_line: int, hi_chr: int, new_text: str) -> str {
+    "{{\"range\":{{\"start\":{{\"line\":{lo_line},\"character\":{lo_chr}}},\"end\":{{\"line\":{hi_line},\"character\":{hi_chr}}}}},\"newText\":\"{new_text}\"}}"
+}
+
+fn lsp_rename_preflight_refuses_non_file_uri_without_mutation(mut t: Tally) {
+    var f = fix_init("f1")
+    expect_reject(
+        mut t,
+        mut f,
+        one_change("https://example.test/a.c", 0, 0, 0, 5),
+        lsp.POSENC_UTF8,
+        "rename touches a non-file URI; refusing",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_resource_operations_without_mutation(mut t: Tally) {
+    var f = fix_init("f2")
+    let json = "{{\"documentChanges\":[{{\"kind\":\"create\",\"uri\":\"file://{f.root}/new.c\"}}]}}"
+    expect_reject(
+        mut t,
+        mut f,
+        json,
+        lsp.POSENC_UTF8,
+        "server asked to create or delete files; refusing (not supported in 1.0)",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_rename_file_without_mutation(mut t: Tally) {
+    var f = fix_init("f3")
+    let json = "{{\"documentChanges\":[{{\"kind\":\"rename\",\"oldUri\":\"file://{f.a}\",\"newUri\":\"file://{f.root}/new.c\"}}]}}"
+    expect_reject(
+        mut t,
+        mut f,
+        json,
+        lsp.POSENC_UTF8,
+        "server asked to create or delete files; refusing (not supported in 1.0)",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_delete_file_without_mutation(mut t: Tally) {
+    var f = fix_init("f4")
+    let json = "{{\"documentChanges\":[{{\"kind\":\"delete\",\"uri\":\"file://{f.a}\"}}]}}"
+    expect_reject(
+        mut t,
+        mut f,
+        json,
+        lsp.POSENC_UTF8,
+        "server asked to create or delete files; refusing (not supported in 1.0)",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_outside_workspace_without_mutation(mut t: Tally) {
+    var f = fix_init("f5")
+    let outside_raw = "{f.root}-outside.c"
+    write(outside_raw, "x\n")
+    let outside = fs_realpath(outside_raw) else outside_raw
+    expect_reject(
+        mut t,
+        mut f,
+        one_change("file://{outside}", 0, 0, 0, 0),
+        lsp.POSENC_UTF8,
+        "rename would edit outside the workspace: {outside}",
+    )
+    fs.remove(outside) else |_| {}
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_nonregular_path_without_mutation(mut t: Tally) {
+    var f = fix_init("f6")
+    expect_reject(
+        mut t,
+        mut f,
+        one_change("file://{f.dir}", 0, 0, 0, 0),
+        lsp.POSENC_UTF8,
+        "cannot edit {f.dir}: Invalid argument",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_unreadable_path_without_mutation(mut t: Tally) {
+    var f = fix_init("f7")
+    fs_set_mode(f.b, 0) else |_| {
+        assert(false, "chmod b.c")
+    }
+    // As root, `access(2)` grants the read anyway: C's case assumes a user
+    // without CAP_DAC_OVERRIDE, and so does this one.
+    if (os_euid() else 1) == 0 {
+        print(
+            "SKIP lsp_rename_preflight_refuses_unreadable_path_without_mutation: running as root, access(2) cannot refuse",
+        )
+    } else {
+        expect_reject(
+            mut t,
+            mut f,
+            one_change("file://{f.b}", 0, 0, 0, 5),
+            lsp.POSENC_UTF8,
+            "cannot edit {f.b}: Permission denied",
+        )
+    }
+    fs_set_mode(f.b, 384) else |_| {}
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_file_cap_without_mutation(mut t: Tally) {
+    var f = fix_init("f8")
+    var json = "{{\"changes\":{{"
+    var i = 0
+    while i <= edit.RENAME_MAX_FILES {
+        let n = if i < 10 then "00{i}" else if i < 100 then "0{i}" else "{i}"
+        let p = "{f.root}/f{n}.c"
+        write(p, "x\n")
+        let sep = if i == 0 then "" else ","
+        json = json + "{sep}\"file://{p}\":[{edit_of(0, 0, 0, 0, "x")}]"
+        i += 1
+    }
+    json = json + "}}}}"
+    expect_reject(
+        mut t,
+        mut f,
+        json,
+        lsp.POSENC_UTF8,
+        "rename spans 201 files; refusing (limit 200)",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_edit_cap_without_mutation(mut t: Tally) {
+    var f = fix_init("f9")
+    var parts = List[byte]()
+    for b in "{{\"changes\":{{\"file://{f.a}\":[".bytes() {
+        (mut parts).push(b)
+    }
+    let one = edit_of(0, 0, 0, 0, "x")
+    var i = 0
+    while i <= edit.RENAME_MAX_EDITS {
+        if i != 0 {
+            (mut parts).push(44 as byte)
+        }
+        for b in one.bytes() {
+            (mut parts).push(b)
+        }
+        i += 1
+    }
+    for b in "]}}}}".bytes() {
+        (mut parts).push(b)
+    }
+    let json = str_from_utf8(parts) else ""
+    expect_reject(
+        mut t,
+        mut f,
+        json,
+        lsp.POSENC_UTF8,
+        "rename spans 20001 edits; refusing (limit 20000)",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_stale_version_without_mutation(mut t: Tally) {
+    var f = fix_init("f10")
+    let json = "{{\"documentChanges\":[{{\"textDocument\":{{\"uri\":\"file://{f.a}\",\"version\":999}},\"edits\":[{edit_of(0, 0, 0, 5, "omega")}]}}]}}"
+    expect_reject(
+        mut t,
+        mut f,
+        json,
+        lsp.POSENC_UTF8,
+        "rename is stale; the buffer changed. try again",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_out_of_range_position_without_mutation(mut t: Tally) {
+    var f = fix_init("f11")
+    expect_reject(
+        mut t,
+        mut f,
+        one_change("file://{f.a}", 99, 0, 99, 1),
+        lsp.POSENC_UTF8,
+        "rename produced an invalid range in {f.a}:100",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_inexact_utf16_position_without_mutation(mut t: Tally) {
+    var f = fix_init("f12")
+    expect_reject(
+        mut t,
+        mut f,
+        one_change("file://{f.a}", 1, 2, 1, 3),
+        lsp.POSENC_UTF16,
+        "rename produced an invalid range in {f.a}:2",
+    )
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_grapheme_splitting_range_without_mutation(mut t: Tally) {
+    var f = fix_init("f13")
+    let combining = "e\u{0301}x\n"
+    write(f.b, combining)
+    var plan = edit.rename_plan_new()
+    let v = preflight(
+        mut f,
+        one_change("file://{f.b}", 0, 1, 0, 3),
+        lsp.POSENC_UTF8,
+        "e",
+        "z",
+        mut plan,
+    )
+    ok(mut t, !v.ok, "refused")
+    ok(mut t, v.err == "rename produced an invalid range in {f.b}:1", "the sentence: {v.err}")
+    let a = edit.ed_doc(f.ed)
+    ok(mut t, text_is(f.ed.bufs[a].ec.tb, A_TEXT), "the open buffer unchanged")
+    let b = find(f, f.b)
+    ok(mut t, b >= 0 && text_is(f.ed.bufs[b].ec.tb, combining), "b.c unchanged")
+    write(f.b, B_TEXT)
+    fix_free(f)
+}
+
+fn lsp_rename_preflight_refuses_overlapping_edits_without_mutation(mut t: Tally) {
+    var f = fix_init("f14")
+    let json = "{{\"changes\":{{\"file://{f.a}\":[{edit_of(0, 0, 0, 5, "x")},{edit_of(0, 4, 0, 11, "y")}]}}}}"
+    expect_reject(
+        mut t,
+        mut f,
+        json,
+        lsp.POSENC_UTF8,
+        "server sent overlapping edits for {f.a}; refusing",
+    )
+    fix_free(f)
+}
+
+// `rename_assert_same_plan` (`test_lsp_rename.c:555-583`).
+fn same_plan(mut t: Tally, a: edit.RenamePlan, b: edit.RenamePlan) {
+    ok(mut t, a.files.len == b.files.len && a.nedits == b.nedits, "the same shape")
+    var i = 0
+    while i < a.files.len {
+        ok(mut t, a.files[i].path == b.files[i].path, "file {i}'s path")
+        ok(mut t, a.files[i].edits.len == b.files[i].edits.len, "file {i}'s edits")
+        var k = 0
+        while k < a.files[i].edits.len {
+            let x = copy a.files[i].edits[k]
+            let y = copy b.files[i].edits[k]
+            ok(
+                mut t,
+                x.lo == y.lo && x.hi == y.hi && x.text.len == y.text.len,
+                "edit {k} of file {i}",
+            )
+            k += 1
+        }
+        i += 1
+    }
+}
+
+fn lsp_rename_preflight_normalizes_changes_and_document_changes_equally(mut t: Tally) {
+    var f = fix_init("f15")
+    let plain = "{{\"changes\":{{\"file://{f.b}\":[{edit_of(0, 0, 0, 5, "one")}],\"file://{f.a}\":[{edit_of(0, 0, 0, 5, "one")},{edit_of(0, 6, 0, 11, "two")}]}}}}"
+    let versioned = "{{\"documentChanges\":[{{\"textDocument\":{{\"uri\":\"file://{f.b}\"}},\"edits\":[{edit_of(0, 0, 0, 5, "one")}]}},{{\"textDocument\":{{\"uri\":\"file://{f.a}\"}},\"edits\":[{edit_of(0, 0, 0, 5, "one")},{edit_of(0, 6, 0, 11, "two")}]}}]}}"
+    var changes = edit.rename_plan_new()
+    var docs = edit.rename_plan_new()
+    ok(mut t, preflight(mut f, plain, lsp.POSENC_UTF8, "alpha", "new", mut changes).ok, "changes")
+    ok(
+        mut t,
+        preflight(mut f, versioned, lsp.POSENC_UTF8, "alpha", "new", mut docs).ok,
+        "documentChanges",
+    )
+    same_plan(mut t, changes, docs)
+    ok(mut t, changes.files[0].path == f.a, "a.c first")
+    ok(mut t, changes.files[0].edits[0].lo == 6 && changes.files[0].edits[1].lo == 0, "descending")
+    fix_free(f)
+}
+
+fn current_reason(ed: edit.Ed, bi: int) -> int {
+    let cur = text.undo_current(ed.bufs[bi].ec.undo)
+    if cur == 0 then -1 else ed.bufs[bi].ec.undo.nodes[cur - 1].reason
+}
+
+fn lsp_rename_apply_commits_one_lsp_undo_node_per_buffer(mut t: Tally) {
+    var f = fix_init("f16")
+    let json = "{{\"changes\":{{\"file://{f.b}\":[{edit_of(0, 0, 0, 5, "omega")}],\"file://{f.a}\":[{edit_of(0, 0, 0, 5, "omega")},{edit_of(0, 6, 0, 11, "omega")}]}}}}"
+    var plan = edit.rename_plan_new()
+    ok(mut t, preflight(mut f, json, lsp.POSENC_UTF8, "alpha", "omega", mut plan).ok, "planned")
+    let a = find(f, f.a)
+    let b = find(f, f.b)
+    ok(mut t, a >= 0 && b >= 0, "both buffers")
+    let a_nodes = f.ed.bufs[a].ec.undo.nodes.len
+    let b_nodes = f.ed.bufs[b].ec.undo.nodes.len
+    let v = edit.lsp_rename_apply(mut f.ed, plan)
+    ok(mut t, v.ok, "applied: {v.err}")
+    ok(mut t, f.ed.bufs[a].ec.undo.nodes.len == a_nodes + 1, "one node in a.c")
+    ok(mut t, f.ed.bufs[b].ec.undo.nodes.len == b_nodes + 1, "one node in b.c")
+    ok(mut t, current_reason(f.ed, a) == text.TXN_LSP, "a.c's is TXN_LSP")
+    ok(mut t, current_reason(f.ed, b) == text.TXN_LSP, "b.c's is TXN_LSP")
+    ok(mut t, text_is(f.ed.bufs[a].ec.tb, "omega omega\nA\u{1F332}B\n"), "a.c renamed")
+    ok(mut t, text_is(f.ed.bufs[b].ec.tb, "omega beta alpha\n"), "b.c renamed")
+    fix_free(f)
+}
+
+fn lsp_rename_multiline_delete_does_not_touch_registers(mut t: Tally) {
+    var f = fix_init("f17")
+    f.ed.regs.clipboard_sync = text.CLIP_SYNC_OFF
+    var numbered = text.regval_new()
+    numbered.kind = text.REG_LINEWISE
+    numbered.bytes = pb("sentinel\n")
+    text.reg_delete(mut f.ed.regs, 0, numbered)
+    var small = text.regval_new()
+    small.kind = text.REG_CHARWISE
+    small.bytes = pb("x")
+    text.reg_delete(mut f.ed.regs, 0, small)
+    ok(mut t, f.ed.regs.ring_len == 2, "two in the ring")
+    let json = "{{\"changes\":{{\"file://{f.a}\":[{edit_of(0, 6, 1, 1, "omega")}]}}}}"
+    var plan = edit.rename_plan_new()
+    ok(mut t, preflight(mut f, json, lsp.POSENC_UTF8, "alpha", "omega", mut plan).ok, "planned")
+    let a = find(f, f.a)
+    let before = text.undo_current(f.ed.bufs[a].ec.undo)
+    let v = edit.lsp_rename_apply(mut f.ed, plan)
+    ok(mut t, v.ok, "applied: {v.err}")
+    ok(mut t, text_is(f.ed.bufs[a].ec.tb, "alpha omega\u{1F332}B\n"), "the join")
+    ok(mut t, text.undo_current(f.ed.bufs[a].ec.undo) == before + 1, "one node")
+    ok(mut t, f.ed.regs.numbered[1].bytes.len == 9, "the numbered register kept")
+    ok(
+        mut t,
+        f.ed.regs.small_del.bytes.len == 1 && f.ed.regs.small_del.bytes[0] as int == 120,
+        "the small delete kept",
+    )
+    ok(
+        mut t,
+        f.ed.regs.unnamed.bytes.len == 1 && f.ed.regs.unnamed.bytes[0] as int == 120,
+        "the unnamed kept",
+    )
+    ok(mut t, f.ed.regs.ring_len == 2, "the ring kept")
+    fix_free(f)
+}
+
+fn undo_buffer(mut ed: edit.Ed, bi: int) -> bool {
+    var w = -1
+    var i = 0
+    while i < ed.wins.len {
+        if ed.wins[i].id != 0 && ed.wins[i].buf == bi {
+            w = i
+            break
+        }
+        i += 1
+    }
+    if w < 0 {
+        return false
+    }
+    edit.edit_take(mut ed, w)
+    let undone = text.undo(mut ed.bufs[bi].ec)
+    edit.edit_give(mut ed, w)
+    edit.ed_finish_edit(mut ed, w)
+    undone
+}
+
+fn redo_buffer(mut ed: edit.Ed, bi: int) -> bool {
+    var w = -1
+    var i = 0
+    while i < ed.wins.len {
+        if ed.wins[i].id != 0 && ed.wins[i].buf == bi {
+            w = i
+            break
+        }
+        i += 1
+    }
+    if w < 0 {
+        return false
+    }
+    edit.edit_take(mut ed, w)
+    let redone = text.redo(mut ed.bufs[bi].ec)
+    edit.edit_give(mut ed, w)
+    redone
+}
+
+fn lsp_rename_apply_uses_descending_original_offsets(mut t: Tally) {
+    var f = fix_init("f18")
+    write(f.c, "one two three\n")
+    let json = "{{\"changes\":{{\"file://{f.c}\":[{edit_of(0, 0, 0, 3, "1")},{edit_of(0, 4, 0, 7, "TWO-TWO")},{edit_of(0, 8, 0, 13, "3")}]}}}}"
+    var plan = edit.rename_plan_new()
+    ok(mut t, preflight(mut f, json, lsp.POSENC_UTF8, "one", "1", mut plan).ok, "planned")
+    let c = find(f, f.c)
+    let before = text.undo_current(f.ed.bufs[c].ec.undo)
+    ok(mut t, edit.lsp_rename_apply(mut f.ed, plan).ok, "applied")
+    ok(mut t, text_is(f.ed.bufs[c].ec.tb, "1 TWO-TWO 3\n"), "every edit at its original offset")
+    ok(mut t, text.undo_current(f.ed.bufs[c].ec.undo) == before + 1, "one node")
+    ok(mut t, undo_buffer(mut f.ed, c), "undo")
+    ok(mut t, text_is(f.ed.bufs[c].ec.tb, "one two three\n"), "restored")
+    write(f.c, C_TEXT)
+    fix_free(f)
+}
+
+fn lsp_rename_apply_six_files_undo_and_leave_disk_unchanged(mut t: Tally) {
+    var f = fix_init("f19")
+    let paths = [f.a, f.b, f.c, f.d, f.e, f.f]
+    let original = [A_TEXT, B_TEXT, C_TEXT, D_TEXT, E_TEXT, F_TEXT]
+    var json = "{{\"changes\":{{"
+    var i = 0
+    while i < 6 {
+        let sep = if i == 0 then "" else ","
+        json = json + "{sep}\"file://{paths[i]}\":[{edit_of(0, 0, 0, 5, "omega")}]"
+        i += 1
+    }
+    json = json + "}}}}"
+    fixture_disk(mut t, f)
+    var plan = edit.rename_plan_new()
+    ok(mut t, preflight(mut f, json, lsp.POSENC_UTF8, "alpha", "omega", mut plan).ok, "planned")
+    ok(mut t, plan.files.len == 6, "six files")
+    var bufs = List[int]()
+    var before = List[int]()
+    i = 0
+    while i < 6 {
+        ok(mut t, plan.files[i].path == paths[i], "file {i} in path order")
+        let b = find(f, paths[i])
+        (mut bufs).push(b)
+        (mut before).push(text.undo_current(f.ed.bufs[b].ec.undo))
+        i += 1
+    }
+    ok(mut t, edit.lsp_rename_apply(mut f.ed, plan).ok, "applied")
+    i = 0
+    while i < 6 {
+        let b = bufs[i]
+        ok(mut t, text.undo_current(f.ed.bufs[b].ec.undo) == before[i] + 1, "one node in file {i}")
+        ok(mut t, current_reason(f.ed, b) == text.TXN_LSP, "TXN_LSP in file {i}")
+        ok(mut t, edit.buf_dirty(f.ed.bufs[b]), "file {i} dirty")
+        i += 1
+    }
+    fixture_disk(mut t, f)
+    i = 0
+    while i < 6 {
+        let b = bufs[i]
+        ok(mut t, undo_buffer(mut f.ed, b), "undo file {i}")
+        ok(mut t, text.undo_current(f.ed.bufs[b].ec.undo) == before[i], "file {i}'s cursor back")
+        ok(mut t, !edit.buf_dirty(f.ed.bufs[b]), "file {i} clean")
+        ok(mut t, text_is(f.ed.bufs[b].ec.tb, original[i]), "file {i} restored")
+        i += 1
+    }
+    fixture_disk(mut t, f)
+    fix_free(f)
+}
+
+fn lsp_rename_apply_failure_rolls_back_committed_buffers(mut t: Tally) {
+    var f = fix_init("f20")
+    let json = "{{\"changes\":{{\"file://{f.c}\":[{edit_of(0, 0, 0, 5, "omega")}],\"file://{f.a}\":[{edit_of(0, 0, 0, 5, "omega")}],\"file://{f.b}\":[{edit_of(0, 0, 0, 5, "omega")}]}}}}"
+    var plan = edit.rename_plan_new()
+    ok(mut t, preflight(mut f, json, lsp.POSENC_UTF8, "alpha", "omega", mut plan).ok, "planned")
+    ok(mut t, plan.files.len == 3, "three files")
+    ok(
+        mut t,
+        plan.files[0].path == f.a && plan.files[1].path == f.b && plan.files[2].path == f.c,
+        "path order",
+    )
+    var bufs = List[int]()
+    var before = List[int]()
+    var i = 0
+    while i < 3 {
+        let b = find(f, plan.files[i].path)
+        (mut bufs).push(b)
+        (mut before).push(text.undo_current(f.ed.bufs[b].ec.undo))
+        i += 1
+    }
+    edit.rename_plan_test_fail_at(mut plan, 2, 0)
+    let v = edit.lsp_rename_apply(mut f.ed, plan)
+    ok(mut t, !v.ok, "aborted")
+    ok(
+        mut t,
+        v.err == "rename aborted: injected edit failure in {f.c}; 2 files rolled back",
+        "the sentence: {v.err}",
+    )
+    sources_unchanged(mut t, f)
+    i = 0
+    while i < 3 {
+        let b = bufs[i]
+        ok(mut t, text.undo_current(f.ed.bufs[b].ec.undo) == before[i], "file {i}'s cursor back")
+        ok(mut t, !edit.buf_dirty(f.ed.bufs[b]), "file {i} clean")
+        ok(mut t, !redo_buffer(mut f.ed, b), "nothing to redo in file {i}")
+        i += 1
+    }
+    fix_free(f)
+
+    var g = fix_init("f21")
+    let a = find(g, g.a)
+    let w = g.ed.win
+    edit.ed_undo_begin(mut g.ed, w, text.TXN_PASTE)
+    ok(
+        mut t,
+        edit.ed_edit_insert(mut g.ed, w, text.textbuf_len(g.ed.bufs[a].ec.tb), pb("!"), 0, 1),
+        "insert !",
+    )
+    edit.ed_undo_end(mut g.ed, w)
+    edit.ed_finish_edit(mut g.ed, w)
+    let user_node = text.undo_current(g.ed.bufs[a].ec.undo)
+    ok(mut t, user_node != 0, "the user's node")
+    let user_text = "{A_TEXT}!"
+    ok(mut t, text_is(g.ed.bufs[a].ec.tb, user_text), "the user's edit")
+    let noop = "{{\"changes\":{{\"file://{g.a}\":[],\"file://{g.b}\":[{edit_of(0, 0, 0, 5, "alpha")}],\"file://{g.c}\":[{edit_of(0, 0, 0, 5, "omega")}],\"file://{g.d}\":[{edit_of(0, 0, 0, 5, "omega")}]}}}}"
+    var noop_plan = edit.rename_plan_new()
+    ok(
+        mut t,
+        preflight(mut g, noop, lsp.POSENC_UTF8, "alpha", "omega", mut noop_plan).ok,
+        "planned",
+    )
+    ok(mut t, noop_plan.files.len == 2 && noop_plan.nedits == 2, "two files, two edits")
+    ok(mut t, noop_plan.files[0].path == g.c && noop_plan.files[1].path == g.d, "c.c and d.c")
+    let b = find(g, g.b)
+    let c = find(g, g.c)
+    let d = find(g, g.d)
+    ok(mut t, b >= 0 && c >= 0 && d >= 0, "hydrated")
+    edit.rename_plan_test_fail_at(mut noop_plan, 1, 0)
+    ok(mut t, !edit.lsp_rename_apply(mut g.ed, noop_plan).ok, "aborted")
+    ok(mut t, text.undo_current(g.ed.bufs[a].ec.undo) == user_node, "the user's node kept")
+    ok(mut t, text_is(g.ed.bufs[a].ec.tb, user_text), "a.c as the user left it")
+    ok(mut t, text_is(g.ed.bufs[b].ec.tb, B_TEXT), "b.c")
+    ok(mut t, text_is(g.ed.bufs[c].ec.tb, C_TEXT), "c.c rolled back")
+    ok(mut t, text_is(g.ed.bufs[d].ec.tb, D_TEXT), "d.c")
+    ok(mut t, undo_buffer(mut g.ed, a), "the user's undo")
+    ok(mut t, text_is(g.ed.bufs[a].ec.tb, A_TEXT), "a.c restored")
+    fix_free(g)
+}
+
+// `rename_confirm_layout` (`test_lsp_rename.c:1006-1013`).
+fn confirm_layout(mut f: Fix) {
+    f.ed.grid = term.grid_new(24, 80)
+    f.ed.grid_ready = true
+    edit.ed_layout(mut f.ed)
+    f.ed.now_ms = 1000
+}
+
+// `rename_confirm_up` (`test_lsp_rename.c:1015-1033`).
+fn confirm_up(mut t: Tally, mut f: Fix) {
+    confirm_layout(mut f)
+    let json = "{{\"changes\":{{\"file://{f.b}\":[{edit_of(0, 0, 0, 5, "omega")}],\"file://{f.a}\":[{edit_of(0, 0, 0, 5, "omega")}]}}}}"
+    let j = parse(json)
+    let w = f.ed.win
+    ok(
+        mut t,
+        edit.lsp_rename_test_confirm(mut f.ed, w, j, j.root, lsp.POSENC_UTF8, "alpha", "omega"),
+        "the confirmation",
+    )
+    ok(mut t, edit.lsp_rename_confirm_active(f.ed), "active")
+    ok(mut t, f.ed.wins[f.ed.win].panel.open, "the panel")
+}
+
+// `rename_run` (`test_lsp_rename.c:1035-1046`).
+// `rename_run` (`test_lsp_rename.c:1038-1049`): the registry's handler
+// called itself (`desc->fn(&cx)`), not through the dispatcher, whose
+// wrapping transaction a TXN_LSP apply could not nest in.
+fn run(mut f: Fix, name: str) -> int {
+    let id = edit.cmd_lookup(f.ed.reg, name)
+    assert(id != 0, "{name} is registered")
+    var cx = edit.cmdctx_new(f.ed.win, edit.SRC_TEST)
+    cx.count = 1
+    edit.run_impl(mut f.ed, f.ed.reg.entries[id - 1].impl_id, id, cx)
+}
+
+fn lsp_rename_answers_refuse_when_no_rename_is_waiting(mut t: Tally) {
+    var f = fix_init("f22")
+    confirm_layout(mut f)
+    ok(mut t, !f.ed.lsp_rename.active, "none")
+    ok(mut t, !edit.lsp_rename_confirm_active(f.ed), "not active")
+    for name in ["ed.lsp.rename.apply", "ed.lsp.rename.diff", "ed.lsp.rename.cancel"] {
+        ok(mut t, run(mut f, name) == edit.CMD_ERR_STATE, "{name} refuses")
+        ok(mut t, !f.ed.lsp_rename.active, "still none")
+    }
+    ok(mut t, !edit.lsp_rename_answer(mut f.ed, edit.LSP_RENAME_APPLY), "apply")
+    ok(mut t, !edit.lsp_rename_answer(mut f.ed, edit.LSP_RENAME_DIFF), "diff")
+    ok(mut t, !edit.lsp_rename_answer(mut f.ed, edit.LSP_RENAME_CANCEL), "cancel")
+    fix_free(f)
+}
+
+fn lsp_rename_apply_command_commits_the_plan_and_ends_the_rename(mut t: Tally) {
+    var f = fix_init("f23")
+    confirm_up(mut t, mut f)
+    ok(mut t, run(mut f, "ed.lsp.rename.apply") == edit.CMD_OK, "applied")
+    let a = find(f, f.a)
+    let b = find(f, f.b)
+    ok(mut t, text_is(f.ed.bufs[a].ec.tb, "omega alpha\nA\u{1F332}B\n"), "a.c renamed")
+    ok(mut t, text_is(f.ed.bufs[b].ec.tb, "omega beta alpha\n"), "b.c renamed")
+    ok(mut t, !f.ed.lsp_rename.active, "the rename is over")
+    ok(mut t, !edit.lsp_rename_confirm_active(f.ed), "not active")
+    ok(mut t, run(mut f, "ed.lsp.rename.apply") == edit.CMD_ERR_STATE, "a second apply refuses")
+    ok(mut t, disk_is(f.a, A_TEXT) && disk_is(f.b, B_TEXT), "disk untouched")
+    fix_free(f)
+}
+
+fn lsp_rename_cancel_command_discards_the_plan_without_mutation(mut t: Tally) {
+    var f = fix_init("f24")
+    let buffers_before = f.ed.bufs.len
+    let tabs_before = f.ed.tabs.len
+    confirm_up(mut t, mut f)
+    ok(mut t, f.ed.bufs.len == buffers_before + 1, "b.c hydrated: {f.ed.bufs.len}")
+    ok(mut t, f.ed.tabs.len == tabs_before + 1, "in a tab")
+    ok(mut t, run(mut f, "ed.lsp.rename.cancel") == edit.CMD_OK, "cancelled")
+    ok(mut t, !f.ed.lsp_rename.active, "gone")
+    ok(mut t, !edit.lsp_rename_confirm_active(f.ed), "not active")
+    ok(mut t, !f.ed.wins[f.ed.win].panel.open, "the panel with it")
+    ok(mut t, f.ed.bufs.len == buffers_before + 1, "the buffer stays")
+    ok(mut t, f.ed.tabs.len == tabs_before + 1, "the tab stays")
+    sources_unchanged(mut t, f)
+    fixture_disk(mut t, f)
+    fix_free(f)
+}
+
+fn lsp_rename_diff_command_keeps_the_rename_waiting(mut t: Tally) {
+    var f = fix_init("f25")
+    confirm_up(mut t, mut f)
+    ok(mut t, run(mut f, "ed.lsp.rename.diff") == edit.CMD_OK, "the diff")
+    ok(mut t, f.ed.lsp_rename.active, "still waiting")
+    ok(mut t, edit.lsp_rename_answer(mut f.ed, edit.LSP_RENAME_CANCEL), "cancel")
+    ok(mut t, !f.ed.lsp_rename.active, "gone")
+    sources_unchanged(mut t, f)
+    fixture_disk(mut t, f)
+    fix_free(f)
+}
+
+fn lsp_rename_confirm_active_is_false_without_the_summary_panel(mut t: Tally) {
+    var f = fix_init("f26")
+    confirm_up(mut t, mut f)
+    let w = f.ed.win
+    edit.panel_close(mut f.ed, w)
+    ok(mut t, !edit.lsp_rename_confirm_active(f.ed), "no panel, not active")
+    ok(mut t, f.ed.lsp_rename.active, "the rename stands")
+    ok(mut t, edit.lsp_rename_answer(mut f.ed, edit.LSP_RENAME_CANCEL), "cancel")
+    sources_unchanged(mut t, f)
+    fix_free(f)
+}
+
+fn lsp_rename_panel_menu_offers_the_three_answers(mut t: Tally) {
+    var f = fix_init("f27")
+    confirm_up(mut t, mut f)
+    let c = edit.ctxcontext_new(edit.CTX_KIND_PANEL, 0)
+    edit.ctx_close(mut f.ed.ctx)
+    edit.ctx_build(mut f.ed, c)
+    let want = ["Apply", "Show Diff", "", "Cancel"]
+    let actions = [edit.CTXA_RENAME_APPLY, edit.CTXA_RENAME_DIFF, edit.CTXA_RENAME_CANCEL]
+    let priorities = [0, 1, 0]
+    ok(mut t, edit.ctx_rows(f.ed.ctx) == 4, "four rows: {edit.ctx_rows(f.ed.ctx)}")
+    var at = 0
+    var i = 0
+    while i < 4 {
+        if want[i].len == 0 {
+            ok(mut t, edit.ctx_row_is_sep(f.ed.ctx, i), "row {i} a separator")
+        } else {
+            ok(mut t, !edit.ctx_row_is_sep(f.ed.ctx, i), "row {i} a row")
+            ok(
+                mut t,
+                edit.ctx_row_label(f.ed.ctx, i) == want[i],
+                "row {i}: {edit.ctx_row_label(f.ed.ctx, i)}",
+            )
+            ok(mut t, edit.ctx_row_action(f.ed.ctx, i) == actions[at], "row {i}'s action")
+            ok(mut t, edit.ctx_priority(f.ed.ctx, i) == priorities[at], "row {i}'s priority")
+            ok(mut t, edit.ctx_row_enabled(f.ed.ctx, i), "row {i} enabled")
+            ok(mut t, edit.ctx_actions(actions[at]).cmd.len != 0, "row {i}'s command")
+            at += 1
+        }
+        i += 1
+    }
+    i = 0
+    while i < edit.ctx_rows(f.ed.ctx) {
+        if !edit.ctx_row_is_sep(f.ed.ctx, i) {
+            ok(mut t, edit.ctx_row_label(f.ed.ctx, i) != "Close", "no Close")
+        }
+        i += 1
+    }
+    edit.ctx_close(mut f.ed.ctx)
+    ok(mut t, edit.lsp_rename_answer(mut f.ed, edit.LSP_RENAME_CANCEL), "cancel")
+    fix_free(f)
+}
+
+fn run_case(mut t: Tally, i: int) {
+    match i {
+        0 => lsp_rename_preflight_refuses_non_file_uri_without_mutation(mut t),
+        1 => lsp_rename_preflight_refuses_resource_operations_without_mutation(mut t),
+        2 => lsp_rename_preflight_refuses_rename_file_without_mutation(mut t),
+        3 => lsp_rename_preflight_refuses_delete_file_without_mutation(mut t),
+        4 => lsp_rename_preflight_refuses_outside_workspace_without_mutation(mut t),
+        5 => lsp_rename_preflight_refuses_nonregular_path_without_mutation(mut t),
+        6 => lsp_rename_preflight_refuses_unreadable_path_without_mutation(mut t),
+        7 => lsp_rename_preflight_refuses_file_cap_without_mutation(mut t),
+        8 => lsp_rename_preflight_refuses_edit_cap_without_mutation(mut t),
+        9 => lsp_rename_preflight_refuses_stale_version_without_mutation(mut t),
+        10 => lsp_rename_preflight_refuses_out_of_range_position_without_mutation(mut t),
+        11 => lsp_rename_preflight_refuses_inexact_utf16_position_without_mutation(mut t),
+        12 => lsp_rename_preflight_refuses_grapheme_splitting_range_without_mutation(mut t),
+        13 => lsp_rename_preflight_refuses_overlapping_edits_without_mutation(mut t),
+        14 => lsp_rename_preflight_normalizes_changes_and_document_changes_equally(mut t),
+        15 => lsp_rename_apply_commits_one_lsp_undo_node_per_buffer(mut t),
+        16 => lsp_rename_multiline_delete_does_not_touch_registers(mut t),
+        17 => lsp_rename_apply_uses_descending_original_offsets(mut t),
+        18 => lsp_rename_apply_six_files_undo_and_leave_disk_unchanged(mut t),
+        19 => lsp_rename_apply_failure_rolls_back_committed_buffers(mut t),
+        20 => lsp_rename_answers_refuse_when_no_rename_is_waiting(mut t),
+        21 => lsp_rename_apply_command_commits_the_plan_and_ends_the_rename(mut t),
+        22 => lsp_rename_cancel_command_discards_the_plan_without_mutation(mut t),
+        23 => lsp_rename_diff_command_keeps_the_rename_waiting(mut t),
+        24 => lsp_rename_confirm_active_is_false_without_the_summary_panel(mut t),
+        25 => lsp_rename_panel_menu_offers_the_three_answers(mut t),
+        _ => {},
+    }
+}
+
+const CASES: int = 26
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var t = Tally { n: 0 }
+    let pick = env_get("YEW_LSP_RENAME_CASE") else ""
+    if pick.len != 0 {
+        let i = pick.to_int() else -1
+        // One past the last case runs nothing and prints nothing
+        // (`tools/check-test-cases`).
+        if i >= 0 && i < CASES {
+            run_case(mut t, i)
+            print("edit_lsp_rename_test: case {i}: PASS, {t.n} assertions")
+        }
+        return
+    }
+    var i = 0
+    while i < CASES {
+        run_case(mut t, i)
+        i += 1
+    }
+    print("edit_lsp_rename_test: {CASES} cases pass, {t.n} assertions")
+}
