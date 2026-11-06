@@ -58,7 +58,7 @@
  *   lspf_null          null definition, hover and symbols: the sentences
  *   lspf_error         error replies dropped silently
  *   lspf_stale         a hover answered after the document changed
- *   lspf_deadline      a definition never answered, past its deadline
+ *   lspf_deadline      a definition answered past its deadline: ignored
  *   lspf_partial       one capability: the others refused by name
  *   lspf_highlight     read and write highlights after the idle wait
  *   lspf_signature     "(" typed: the signature panel above the cursor
@@ -760,6 +760,18 @@ static void case_lspf_null(PtyCtx *c)
     force_quit(c);
 }
 
+/* The fake's answers that the editor shows nothing for are each followed
+ * by a receipt (fakeserver.py): one more warning on line 1, read after
+ * the answer on the same pipe. A row that holds such an answer silent
+ * waits for the badge, W:N after the Nth, never for a quiet gap. */
+static void lsprow_wait_receipt(PtyCtx *c, int n, const char *failure)
+{
+    char badge[16];
+
+    (void)snprintf(badge, sizeof(badge), "W:%d", n);
+    lsprow_wait(c, badge, failure);
+}
+
 static void case_lspf_error(PtyCtx *c)
 {
     if (!lsprow_package(c, lsprow_calls))
@@ -767,13 +779,18 @@ static void case_lspf_error(PtyCtx *c)
     lsprow_open_fake(c, "error", 30000);
     lsprow_wait_ready(c, "fake");
     lsprow_to_call(c);
-    /* An error reply other than -32601 is dropped silently. */
+    /* An error reply other than -32601 is dropped silently, its
+     * capability kept (features.c:1630-1634, :1804-1808). */
     lsprow_command(c, "ed.lsp.hover");
-    ptc_settle(c, 1000);
+    lsprow_wait_receipt(c, 1, "the hover's error reply never came");
+    ptc_check(c, !s43_screen_contains(&c->vt, "boom") &&
+                     !s43_screen_contains(&c->vt, "\xe2\x94\x8c hover"),
+              "an error reply to hover was shown");
     lsprow_dump(c, "1-hover");
     lsprow_command(c, "ed.lsp.references");
-    ptc_settle(c, 1000);
-    ptc_check(c, !s43_screen_contains(&c->vt, "up/down move"),
+    lsprow_wait_receipt(c, 2, "the references' error reply never came");
+    ptc_check(c, !s43_screen_contains(&c->vt, "boom") &&
+                     !s43_screen_contains(&c->vt, "up/down move"),
               "an error reply opened a picker");
     lsprow_dump(c, "2-references");
     force_quit(c);
@@ -787,15 +804,25 @@ static void case_lspf_stale(PtyCtx *c)
     lsprow_wait_ready(c, "fake");
     lsprow_to_call(c);
     lsprow_command(c, "ed.lsp.hover");
-    /* The edit lands before the 1 s reply: it answers a document that has
-     * changed, and is dropped. */
+    /* The fake answers only once the document has changed, so the reply
+     * answers an older generation and is dropped before its callback
+     * (client.c:857-877). */
     ptc_keys(c, "i z esc");
     lsprow_wait(c, "zadd(1, 2)", "the edit did not land");
-    ptc_settle(c, 2000);
+    lsprow_wait_receipt(c, 1, "the late hover reply never came");
     ptc_check(c, !s43_screen_contains(&c->vt, "late"),
               "a reply for a changed document was shown");
     lsprow_dump(c, "1-dropped");
     force_quit(c);
+}
+
+static bool lsprow_fake_marked(const PtyCtx *c, const void *arg)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/fake.marker", c->state_dir);
+
+    (void)arg;
+    return n > 0 && (size_t)n < sizeof(path) && access(path, F_OK) == 0;
 }
 
 static void case_lspf_deadline(PtyCtx *c)
@@ -806,12 +833,18 @@ static void case_lspf_deadline(PtyCtx *c)
     lsprow_wait_ready(c, "fake");
     lsprow_to_call(c);
     lsprow_command(c, "ed.lsp.goto_def");
-    ptc_settle(c, 1000);
+    /* The request at the fake (its marker), the command line closed. */
+    ptc_wait_until(c, lsprow_fake_marked, NULL,
+                   "the definition request never reached the fake");
+    lsprow_wait_gone(c, ":ed.lsp.goto_def", "the command line stayed open");
     lsprow_dump(c, "1-pending");
-    /* Past the request's 10 s deadline (jsonrpc.h:20). */
-    ptc_settle(c, 10500);
-    ptc_keys(c, "esc");
-    ptc_settle(c, LSPROW_QUIET_MS);
+    /* The answer comes 12 s after the request, past its 10 s deadline
+     * (jsonrpc.h:20): the sweep has already called the request back with
+     * the timeout error (jsonrpc.c:682-718), so the answer's id is no
+     * longer pending and it is ignored. Nothing is said, nothing moves. */
+    lsprow_wait_receipt(c, 1, "the late definition reply never came");
+    ptc_check(c, c->vt.cur_r == 6U,
+              "a definition answered past its deadline moved the cursor");
     lsprow_dump(c, "2-expired");
     force_quit(c);
 }
@@ -924,10 +957,8 @@ static void lsprow_s47(PtyCtx *c, const char *keys, const char *wait,
         ptc_keys(c, keys);
     if (wait != NULL)
         lsprow_wait(c, wait, "the rename answer did not show");
-    else if (gone != NULL)
-        lsprow_wait_gone(c, gone, "the rename confirmation stayed open");
     else
-        ptc_settle(c, LSPROW_QUIET_MS);
+        lsprow_wait_gone(c, gone, "the rename confirmation stayed open");
     lsprow_dump(c, label);
     s47_rename_finish(c, &f);
 }
