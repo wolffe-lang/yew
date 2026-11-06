@@ -256,3 +256,272 @@ workspace check); the symbol picker's separator glyph under the `dumb`
 profile; the highlight's 300 ms idle against the port's timer heap; the
 rename summary's `%-40s %5llu` columns; and the rollback's undo-node
 checks against the port's undo tree.
+
+## Forbidden
+
+- No merge, label, tag or release, and no issue closed. No attribution
+  trailer.
+- Clean room: sagitta at the pin was read and is cited `file:line`; no
+  other editor's source and no JSON, JSON-RPC or LSP library's source.
+  `wolf lsp` was run as a black box and read on the wire (its
+  `initialize` reply, probed with the pinned binary); its source was not
+  read. The fake server's feature modes are written from the LSP
+  specification for these rows alone.
+- No golden is edited and no sagitta file changed. `sagitta.pin` and the
+  wolf pin are unchanged.
+- PR#102–#106 and #110 are untouched. No perf row.
+
+## Inputs verified
+
+- **Base:** trunk `7009fb2a` (yew#111, yw11a).
+- **Toolchain:** wolf 0.2.36 (`5adf3d91`), lupin 0.1.58, std
+  `78b9d3cb`, from the pinned archives (`tools/fetch-toolchain`).
+- **C yew:** `sagitta.pin` (`9ace98c2`), built by `tools/oracle` (clang
+  on macOS, gcc in the Linux image), `fakelsp` with it.
+- **The server:** the pinned `wolf lsp` advertises definition,
+  references, document symbols, hover (markdown), signature help
+  (triggers `(` and `,`), rename (with `prepareProvider`, which C never
+  sends) and completion; not declaration, type definition,
+  implementation or document highlight. Full sync, utf-8.
+- **PAX's compiler:** the musl static `wolf` at `v0.2.36` by PAX's
+  recipe, `2df1fb76…` (16,257,584 bytes), the bytes PAX's
+  `user/wolf.sums` records and yw11a's note cites; copied by value from
+  yw11a's build and checked by digest.
+
+| host | role |
+|---|---|
+| Apple M-series Mac, macOS arm64 | builds, the macOS take (units, goldens, rows; C yew built with clang) |
+| x86-64 Linux, rootless podman, a 6-CPU block | the gauntlet in `ubuntu:24.04` with the runner's tools, the static binary and the scratch container |
+
+## Evidence index
+
+Commits, in order (the prediction first, every row red before its code):
+
+- `b22ff1d` note: yw11b's prediction: the map, the split, the capabilities and the rows
+- `4b68be0` lsp_features_test: the location, symbol, highlight, hover and signature parsers' cases (red: no lsp.features)
+- `3a96318` edit_panel_test: test_panel.c's eighteen cases (red: no edit.panel)
+- `90af81a` edit_lsp_rename_test: test_lsp_rename.c's twenty-six cases (red: no edit.lsp_rename)
+- `65374a5` edit_lsp_nav_test: the jumps and the symbol picker (red: no lsp.features, no edit.lsp_pickers)
+- `a4ea713` edit_lsp_gate_test: test_lsp_gate.c over fakelsp (red: no job-turn seam, no features)
+- `a2d069e` edit_lsp_transport_test: test_lsp_transport.c through a real server (red: no framed-turn seam)
+- `818c76e` edit_lsp_life_test: test_lsp_life.c's remaining thirty-six cases (red: no seams, no features)
+- `ce8ff70` lsp-rows: the fake server's feature modes
+- `5e89480` lsp-rows: yw11b's rows over wolf lsp, the fake server and C's rename sessions (red against trunk's port)
+- `f43e565` lsp.features: the location, symbol, highlight, hover and signature parsers
+- `2e99eb0` edit.panel: the floating panel: placement, wrap, keys, draw, the document mark
+- `39a84ee` edit.win: the panel, the request records and the highlight state in the window
+- `830ed82` edit.ed: the picker and rename state; a shown buffer keeps the window's records
+- `14b9539` edit.lsp_client: the features' pending kinds
+- `a8443a9` edit.lsp_features: hover, signature, navigation and symbol requests and callbacks
+- `723636c` edit.lsp_pickers: the location and symbol pickers, the jump, the preview
+- `27943e9` edit_lsp_nav_test: finish the picker's sliced pass before counting, as the loop does
+- `39f89a4` edit.lsp_highlight: the idle request and the read and write overlays
+- `e790e03` edit.lsp_rename: preflight, apply, rollback, the summary, the diff, the prompt
+- `b1df8c4` edit.lsp: the feature entry points, the capability gate, the commands
+- `43a8fc2` edit.impl: dispatch the feature commands and the panel's move
+- `f19575d` draw: the panel last, the hover mark and the highlight overlays
+- `3878cf5` input: the panel and rename keys, the signature auto-trigger
+- `296fd65` layout: resize the focused window's panel
+- `9790e1d` mouse: a click inside the panel, outside it closes
+- `c4e8844` ctxrows: the document menu's LSP section and the rename panel's answers
+- `555f2cc` mods: the LSP module is the port's
+- `8b8b3f6` edit.batchtest: the LSP unit rows' seams: one job turn, the fake server's path
+- `fe6dc72` tools/build-fakelsp: C's fake language server, alone
+- `7ef1cb1` tools/check-test --fakelsp-ran: no LSP row skipped for want of the fake server
+- `f2109bd` check-test-cases: the five cases past the checked machine's budget
+- `1913a69` CI: build fakelsp for the unit lanes; yw11b's rename goldens by name
+- `3588af9` CHANGELOG, MAP: yw11b2
+- `91716ee` lsp-rows: wait on the highlights' cells and on each close, not a quiet gap
+- `84164ec` lsp-rows: hover waits on the panel's corner, not the typed command's word
+- `50939dc` lsp-rows: the fake's silent answers carry a receipt; stale and late answers on a condition, not a clock
+- `d71abca` lsp-rows: error, stale and deadline rows wait on the fake's receipts and marker, not a quiet gap
+- `11a13bf` CHANGELOG: the rename row crosses a file not yet open; silent answers have receipts
+
+**The red witnesses** (each test file built at its own commit, before
+any code, on the Linux block in yew CI's image): every one fails to
+compile on the items its code brings, `E0301` naming them —
+`lsp.LspLoc` and `lsp.lsp_locations_parse` (`lsp_features_test`),
+`edit.PanelSpec` (`edit_panel_test`), `edit.RenamePlan` and
+`edit.lsp_rename_preflight` (`edit_lsp_rename_test`), `lsp.LspLoc` and
+`edit.lsp_location_jump` (`edit_lsp_nav_test`), `edit.ed_pump_jobs_once`
+(`edit_lsp_gate_test`), `edit.ed_pump_framed_once`
+(`edit_lsp_transport_test`), and `edit.ed_pump_jobs_once`,
+`edit.lsp_hover` and `edit.PANEL_BELOW` (`edit_lsp_life_test`).
+
+**The rows** (`tools/run-lsp-rows`, the Linux block, C yew built with
+gcc): 27 rows, each run twice over C yew and twice over the port,
+47 kept screens stable and the same in both editors (syntax
+colouring aside); yw11a's nine and the eighteen new (`lspw_goto_def`,
+`_goto_def_file`, `_goto_unsupported`, `_references`, `_symbols`,
+`_hover`, `_rename`; `lspf_null`, `_error`, `_stale`, `_deadline`,
+`_partial`, `_highlight`, `_signature`, `_rename_files`; and
+`lspg_rename_summary`, `_apply`, `_unknown_key`). Red first: at
+`5e89480`, the rows' commit before any feature code, C yew passed all
+27 and trunk's port failed fourteen by name (`lspw_goto_def`,
+`_goto_def_file`, `_goto_unsupported`, `_references`, `_symbols`,
+`_rename`; `lspf_null`, `_stale`, `_partial`, `_signature`,
+`_rename_files`; the three `lspg_*`), and the other four new rows'
+screens differed from C's (`lspw_hover`'s panel, `lspf_error`'s two,
+`lspf_deadline`'s pending screen, `lspf_highlight`'s two); all five
+rename goldens failed. The four rows made stricter after the first macOS take
+(`lspw_hover`, `lspf_error`, `_stale` and `_deadline`, below) were run
+again at their commit against the same trunk port: C passed each, and
+the port failed each by name (`the hover panel never opened`, `the
+hover's error reply never came`, `the edit did not land` with the
+refused hover's line still open, and `the definition request never
+reached the fake`).
+
+**C's rename goldens**: `lsp_feat_rename_diff` and `_refusal` pass by
+name; `_summary`, `_apply` and `_unknown_key` first differ at the typed
+`!` (below). The gauntlet's record and the macOS take are the PR's.
+
+### What the work found
+
+- **A request is queued, not written.** The first port wrote each
+  request at once; C leaves it in the connection's queue for the loop's
+  write turn (POLLOUT), and `test_lsp_life.c`'s idle-highlight case
+  reads it there. The requests now wait for `job_pump`'s framed writers.
+- **The LSP module was off.** `edit.mods` answered for a module-less
+  build, so `lsp.open_in`, the one option the LSP module owns, refused
+  every write ("this build has no lsp module"); the jump case could not
+  set it. LSP is the port's now; AI, FUSS and plugins still refuse.
+- **The rename answers through the dispatcher.** C's dispatcher opens a
+  `TXN_TYPE` transaction around any command that changes a buffer
+  (`yew_ed_invoke`, `ed.c:1699-1820`), and `ed.lsp.rename.apply` is
+  one; the apply then opens `TXN_LSP` on the same buffer, and
+  `yew_undo_begin` stops on the reason mismatch (`undo.c:434-452`). The
+  port's dispatcher is C's, and it stopped the same way when the unit
+  test went through it; C's test calls the handler itself (`rename_run`,
+  `test_lsp_rename.c:1038-1049`) and so does the port's. Enter on the
+  summary panel applies without the dispatcher, as C's goldens do; the
+  panel menu's Apply row reaches the stop in both editors (R-yw11b-4,
+  below).
+- **Three rename goldens hold syntax colouring.** C's s47 sessions make
+  `alpha.c` dirty by typing `!` (`registry.c:9897-9902`), and C draws it
+  in its operator colour (`#56b6c2`); the port has no highlighting
+  before yw10, so `lsp_feat_rename_summary`, `_apply` and `_unknown_key`
+  first differ at that cell (line 31 of the snapshot, the style row).
+  `_diff` and `_refusal` (no dirty file) pass. The three are recorded as
+  campaign 05's two highlighting goldens are, and the `lspg_*` rows
+  replay the same sessions and hold every other cell to C's (R-yw11b-5).
+- **The transport's capture is the server's reader.** The port releases
+  the reader with the connection when the job settles, where C's capture
+  outlives its owner, so the transport cases read it once the child's
+  stdout has ended and before the drain.
+- **A row's walk waits on each step.** The first rows walked the cursor
+  with arrow keys, and in L mode `<right>` moves by the mode's unit, a
+  line, to its end (`runtime/init.fl:53`): `lspw_goto_def` stood at
+  `6:14`, past the call, and asked for nothing. Seven rows failed that
+  way in both editors, on the Linux block and on the Mac alike. They
+  failed in their first run, and the runner skips a row's second run
+  once the first fails, so "the two runs kept different screens" was
+  the listing of the failed rows' missing second runs; no kept screen
+  moved between runs. The rows now walk with `ed.move.char.right`, one
+  command at a time, each waited for on the statusline's position.
+- **Silence needs a receipt.** The error, stale and deadline rows hold an
+  answer the editor shows nothing for, and held it over a quiet gap,
+  which a slow host can outlast. The fake now follows each such answer
+  with a receipt, one more warning on line 1, which both editors read
+  after the answer on the same pipe, and the rows wait for its badge
+  (`W:1`, `W:2`). The stale answer waits for the document's `didChange`
+  instead of a second's sleep, so it is stale on any host; the deadline
+  mode marks the request's arrival and answers 12 s later, past the
+  10 s deadline (`jsonrpc.h:20`), and the row holds that the late answer
+  is ignored (the sweep has already called the request back,
+  `jsonrpc.c:682-718`). The hover row waits on the panel's corner, since
+  the typed `:ed.lsp.hover` holds the bare word, and the highlight row
+  on the two overlays' cells.
+
+### Decided
+
+- **R-yw11b-1 = A** (the shadow and the index): the shadow framework
+  (Sprint 43's registry, debounce, staleness, draw and accept commands)
+  comes with yw11b1, the LSP provider registered and the index and AI
+  providers refusing by name (yw10, yw12); the index, its completion
+  source and `ed.lsp.symbols`' fallback refuse by name until a lane
+  after yw10 ports `ws/sym*` on settled syntax. yw11b2 ships the
+  fallback's refusal: `not yet ported: the symbol index: sagitta Sprint
+  44 (yw10)`.
+- **R-yw11b-2 = A** (M-YW9's replay): the replay needs a wolf-lsp lane
+  that adds a `yew` capability profile and an editor-side `lspconf
+  serve`. **M-YW9 stays open until it lands**; the rows here hold wolf
+  yew to C yew on the same `wolf lsp`, and they are not counted as
+  M-YW9.
+- **R-yw11b-3** (the split): yw11b2 first, as implemented; this is
+  yw11b2, and yw11b1 (completion) follows as its own change.
+- **R-yw11b-4 = A** (the rename panel's Apply row): the port stays C's,
+  so the menu row reaches the same stop. The finding, exactly: C's
+  dispatcher, `yew_ed_invoke` (`ed.c:1699-1820`), opens a `TXN_TYPE`
+  transaction on the command window's buffer around any command flagged
+  `YEW_CMD_CHANGES_BUFFER`, and `ed.lsp.rename.apply` is one
+  (`cmd.c:1167-1168`); the context menu runs its rows through that
+  dispatcher (`invoke_desc`, `mouse.c:1006-1030`); the apply then opens
+  `TXN_LSP` on the same buffer through an edit context over it
+  (`rename.c:700-706`), and `yew_undo_begin` (`undo.c:434-452`) stops
+  on the nested reason mismatch (`undo: nested transaction reason
+  mismatch`). Enter on the summary panel applies without the dispatcher
+  (`rename.c`'s key route), the path C's goldens take. The finding is
+  sagitta's to decide; the port follows the pin when it moves.
+- **R-yw11b-5** (the three coloured goldens): **A (implemented)**: gate
+  `lsp_feat_rename_diff` and `_refusal` by name, record `_summary`,
+  `_apply` and `_unknown_key` (a `continue-on-error` step that announces
+  them, as campaign 05 records its highlighting goldens) until yw10, and
+  hold the rest of their screens to C's with the `lspg_*` rows. **B**:
+  hold all five until yw10.
+- **The fake server's path is fixed, as the clipboard tool's is.** The
+  LSP rows that spawn C's `fakelsp` find the oracle's build at
+  `target/oracle/sagitta/build/tests/helpers/fakelsp` (the prediction
+  said `YEW_FAKELSP`) and SKIP by name without it; `tools/build-fakelsp`
+  builds it alone for the unit jobs and `tools/check-test
+  --fakelsp-ran` refuses a lane log holding such a SKIP, as yew#42's
+  fakeclip pair does.
+- **The transport through a real server.** Each case places a server in
+  the client by hand (its connection live, no handshake sent) and spawns
+  `fakelsp` with `spawn_server`'s framed spec. C's echoed body is a
+  request; the port's server answers a request it does not know, and
+  that answer's write to an exited child would fail the transport, so
+  the port's body is the same object without its id (a notification).
+- **RED by name.** `test_lsp_life.c`'s two completion cases are
+  yw11b1's: each asserts `ed.lsp.complete`'s refusal and prints RED. The
+  language-change case needs `ed.syn.set` (Sprint 39, yw10): it asserts
+  that refusal, then runs the LSP half C's handler runs
+  (`yew_lsp_buffer_close`) and its transcript, and prints RED.
+- **The rows** differ from the prediction's list where the fake server
+  could show more: `lspf_error` holds an error reply silent (hover and
+  references), `lspf_deadline` holds the late answer ignored as well as
+  the silence, `lspf_rename_files` renames across the open file and one
+  not open; `lspf_stale` holds the dropped answer off the screen, and
+  the drop's count is `test_lsp_life.c`'s delayed-response case
+  (`edit_lsp_life_test`); the stale-version refusal is
+  `test_lsp_rename.c`'s (`edit_lsp_rename_test`), the resource-operation
+  refusal `lsp_feat_rename_refusal`'s.
+- **The rename seam.** C edits a buffer through an `EditCtx` over it
+  (`yew_ed_edit_ctx_buffer`); the port's edit seam is a window that
+  shows the buffer, which the rename has (every file it touches is
+  hydrated into a tab).
+
+## Done-when
+
+- [x] The map, the split, the capabilities, the rows (the prediction).
+- [x] The panel; hover and signature help with the auto-trigger; the
+  four gotos; references; document symbols (the index refusing by name);
+  document highlight; rename with its summary, diff and rollback; each
+  gated on its capability by name.
+- [x] The C tests ported: the parsers, the panel, navigation, rename,
+  the gate, and `test_lsp_transport.c` and `test_lsp_life.c` through a
+  real `LspServer` over `fakelsp` (the completion and language-change
+  cases red by name).
+- [x] C's `lsp_feat_rename_diff` and `_refusal` goldens by name; CI
+  gates them. `_summary`, `_apply` and `_unknown_key` are recorded until
+  yw10 (their style rows hold the C buffer's syntax colouring), the rest
+  of each screen held to C's by the `lspg_*` rows.
+- [x] The oracle rows over `wolf lsp` and the fake server's error paths.
+- [ ] M-YW9's replay: open until a wolf-lsp lane adds the `yew` profile
+  and `lspconf serve` (R-yw11b-2 = A); not counted on the rows.
+- [x] Static for PAX: the digest, and the client going to a definition
+  through `wolf lsp` in a `FROM scratch` container with only the static
+  yew and PAX's musl wolf; the control without `wolf` fails (the
+  gauntlet's `static` and `pax-container` steps; the record is the
+  PR's).
+- [ ] yw11b1 (completion, the menu, resolve, snippets, and the shadow
+  framework per R-yw11b-1 = A): its own change.
