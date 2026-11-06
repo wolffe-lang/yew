@@ -42,6 +42,36 @@
  *   lspf_deaf_quit     shutdown and exit never answered: quitting is
  *                      bounded (client.c:1366-1410: 500 ms, then KILL)
  *
+ * yw11b's rows, over `wolf lsp`:
+ *
+ *   lspw_goto_def      ed.lsp.goto_def from a call to its definition
+ *   lspw_goto_def_file the definition in the package's other file, opened
+ *   lspw_goto_unsupported  ed.lsp.goto_decl: wolf lsp has no declaration
+ *   lspw_references    the two-row references picker, then closed
+ *   lspw_symbols       the document symbol picker
+ *   lspw_hover         the hover panel below the definition's name, then
+ *                      esc
+ *   lspw_rename        g R: the prompt, the summary panel, applied
+ *
+ * and over the fake server's feature modes:
+ *
+ *   lspf_null          null definition, hover and symbols: the sentences
+ *   lspf_error         error replies dropped silently
+ *   lspf_stale         a hover answered after the document changed
+ *   lspf_deadline      a definition never answered, past its deadline
+ *   lspf_partial       one capability: the others refused by name
+ *   lspf_highlight     read and write highlights after the idle wait
+ *   lspf_signature     "(" typed: the signature panel above the cursor
+ *   lspf_rename_files  a rename over the open file and one not open: the
+ *                      summary, then applied to both buffers
+ *
+ * and C's own rename sessions (tests/pty/registry.c's s47 cases), whose
+ * goldens also hold the document's syntax colouring (yw10's):
+ *
+ *   lspg_rename_summary      the summary panel over a dirty file
+ *   lspg_rename_apply        Enter: applied, the sentence
+ *   lspg_rename_unknown_key  another key closes the confirmation
+ *
  * Build and run: tools/run-lsp-rows.
  */
 #define yew_pty_cases yew_pty_cases_registry
@@ -87,9 +117,37 @@ static void lsprow_dump(PtyCtx *c, const char *label)
     }
 }
 
+/* A wait that failed prints the screen it gave up on (the snapshot's text
+ * section, the cursor first), so a red row says what it saw. */
+static void lsprow_show_failure(PtyCtx *c)
+{
+    static const PtyCase *shown_test;
+    static unsigned shown_run;
+    Bytebuf screen;
+    const char *text;
+    const char *style;
+
+    /* Once a run: the waits after the first failure fail at once. */
+    if (!c->failed || (shown_test == c->test && shown_run == lsprow_run))
+        return;
+    shown_test = c->test;
+    shown_run = lsprow_run;
+    bytebuf_init(&screen);
+    snapshot_write(&c->vt, &screen);
+    bytebuf_push_u8(&screen, 0U);
+    text = strstr((const char *)screen.data, "--- text\n");
+    style = text != NULL ? strstr(text, "--- style") : NULL;
+    (void)fprintf(stderr, "lsp-row: %s: the screen (cursor row %d, column %d):\n",
+                  c->test->name, c->vt.cur_r, c->vt.cur_c);
+    if (text != NULL && style != NULL)
+        (void)fprintf(stderr, "%.*s", (int)(style - text), text);
+    bytebuf_free(&screen);
+}
+
 static void lsprow_wait(PtyCtx *c, const char *text, const char *failure)
 {
     s47_wait_screen(c, text, failure);
+    lsprow_show_failure(c);
     ptc_settle(c, LSPROW_QUIET_MS);
 }
 
@@ -101,6 +159,7 @@ static bool lsprow_screen_lacks(const PtyCtx *c, const void *arg)
 static void lsprow_wait_gone(PtyCtx *c, const char *text, const char *failure)
 {
     ptc_wait_until(c, lsprow_screen_lacks, text, failure);
+    lsprow_show_failure(c);
     ptc_settle(c, LSPROW_QUIET_MS);
 }
 
@@ -417,6 +476,419 @@ static void case_lspf_deaf_quit(PtyCtx *c)
     force_quit(c);
 }
 
+/* ---- yw11b: the features ------------------------------------------- */
+
+/* The server's badge without its ellipsis: initialize answered. The badge
+ * can lag a completed handshake until another event repaints it
+ * (registry.c:9886-9888 says so of C), so a quiet ESC (nothing in N mode)
+ * is the repaint the wait asks for. */
+static bool lsprow_badge_ready(const PtyCtx *c, const void *arg)
+{
+    char busy[64];
+
+    (void)snprintf(busy, sizeof(busy), "%s\xe2\x80\xa6", (const char *)arg);
+    return s43_screen_contains(&c->vt, (const char *)arg) &&
+           !s43_screen_contains(&c->vt, busy);
+}
+
+static void lsprow_wait_ready(PtyCtx *c, const char *id)
+{
+    int tries;
+
+    s47_wait_screen(c, id, "the server never showed on the statusline");
+    for (tries = 0; tries < 40 && !c->failed && !lsprow_badge_ready(c, id);
+         tries++) {
+        ptc_keys(c, "esc");
+        ptc_settle(c, 250);
+    }
+    ptc_check(c, lsprow_badge_ready(c, id), "the server never became ready");
+    lsprow_show_failure(c);
+    ptc_settle(c, LSPROW_QUIET_MS);
+}
+
+
+static const char lsprow_calls[] =
+    "fn add(a: int, b: int) -> int {\n"
+    "    a + b\n"
+    "}\n"
+    "\n"
+    "fn main() -> int {\n"
+    "    add(1, 2)\n"
+    "}\n";
+
+static const char lsprow_twice_main[] =
+    "fn main() -> int {\n"
+    "    twice(4)\n"
+    "}\n";
+
+static const char lsprow_twice_util[] =
+    "fn twice(x: int) -> int {\n"
+    "    x * 2\n"
+    "}\n";
+
+static bool lsprow_cursor_on_row(const PtyCtx *c, const void *arg)
+{
+    return c->vt.cur_r == *(const int *)arg;
+}
+
+/* The cursor on screen row ROW (row 0 is the tab strip). */
+static void lsprow_wait_row(PtyCtx *c, int row, const char *failure)
+{
+    ptc_wait_until(c, lsprow_cursor_on_row, &row, failure);
+    lsprow_show_failure(c);
+    ptc_settle(c, LSPROW_QUIET_MS);
+}
+
+/* The cursor at LINE:COL (1-based) by the statusline's position field:
+ * each step of a row's walk is waited for, so a busy host cannot fold the
+ * next command line into the last one. */
+static void lsprow_wait_pos(PtyCtx *c, int line, int col)
+{
+    char pos[32];
+
+    (void)snprintf(pos, sizeof(pos), "lf  %d:%d  ", line, col);
+    lsprow_wait(c, pos, "the cursor did not reach its position");
+}
+
+/* N graphemes right from LINE:COL, one command each: the arrows move by
+ * the mode's unit (L, a line: `<right>` is its end, runtime/init.fl:53),
+ * and the rows need a column. */
+static void lsprow_char_right(PtyCtx *c, int line, int col, int n)
+{
+    int i;
+
+    for (i = 1; i <= n; i++) {
+        lsprow_command(c, "ed.move.char.right");
+        lsprow_wait_pos(c, line, col + i);
+    }
+}
+
+/* On the call `add(1, 2)`: line 6, column 5 (1-based). */
+static void lsprow_to_call(PtyCtx *c)
+{
+    ptc_keys(c, "down down down down down");
+    lsprow_wait_pos(c, 6, 1);
+    lsprow_char_right(c, 6, 1, 4);
+}
+
+static void case_lspw_goto_def(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open(c);
+    lsprow_wait_ready(c, "wolf");
+    lsprow_to_call(c);
+    lsprow_dump(c, "1-call");
+    lsprow_command(c, "ed.lsp.goto_def");
+    lsprow_wait_row(c, 1, "goto_def did not reach add's definition");
+    lsprow_dump(c, "2-def");
+    force_quit(c);
+}
+
+static void case_lspw_goto_def_file(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_twice_main) ||
+        !lsprow_write(c, "src/util.lu", lsprow_twice_util))
+        return;
+    lsprow_open(c);
+    lsprow_wait_ready(c, "wolf");
+    ptc_keys(c, "down");
+    lsprow_wait_pos(c, 2, 1);
+    lsprow_char_right(c, 2, 1, 4);
+    lsprow_command(c, "ed.lsp.goto_def");
+    lsprow_wait(c, "x * 2", "goto_def did not open the other file");
+    lsprow_dump(c, "1-util");
+    force_quit(c);
+}
+
+static void case_lspw_goto_unsupported(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open(c);
+    lsprow_wait_ready(c, "wolf");
+    lsprow_to_call(c);
+    lsprow_command(c, "ed.lsp.goto_decl");
+    lsprow_wait(c, "wolf does not support declaration",
+                "goto_decl did not say the capability is missing");
+    lsprow_dump(c, "1-decl");
+    force_quit(c);
+}
+
+static void case_lspw_references(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open(c);
+    lsprow_wait_ready(c, "wolf");
+    lsprow_char_right(c, 1, 1, 3);
+    lsprow_command(c, "ed.lsp.references");
+    lsprow_wait(c, "2/2", "the references picker never showed two rows");
+    lsprow_dump(c, "1-picker");
+    ptc_keys(c, "esc");
+    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_dump(c, "2-closed");
+    force_quit(c);
+}
+
+static void case_lspw_symbols(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open(c);
+    lsprow_wait_ready(c, "wolf");
+    lsprow_command(c, "ed.lsp.symbols");
+    lsprow_wait(c, "2/2", "the symbol picker never showed two rows");
+    lsprow_dump(c, "1-picker");
+    ptc_keys(c, "esc");
+    ptc_settle(c, LSPROW_QUIET_MS);
+    force_quit(c);
+}
+
+static void case_lspw_hover(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open(c);
+    lsprow_wait_ready(c, "wolf");
+    /* On the definition's name: wolf lsp answers `fn add` there (on the
+     * call it answers the call's type). The document holds that text
+     * too, so the wait is on the panel's title. */
+    lsprow_char_right(c, 1, 1, 3);
+    lsprow_command(c, "ed.lsp.hover");
+    lsprow_wait(c, "hover", "the hover panel never opened");
+    lsprow_dump(c, "1-panel");
+    ptc_keys(c, "esc");
+    lsprow_wait_gone(c, "hover", "esc did not close the hover panel");
+    lsprow_dump(c, "2-closed");
+    force_quit(c);
+}
+
+static void case_lspw_rename(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open(c);
+    lsprow_wait_ready(c, "wolf");
+    lsprow_char_right(c, 1, 1, 3);
+    ptc_keys(c, "g R");
+    lsprow_wait(c, ":add", "the rename prompt never showed the old name");
+    ptc_keys(c, "ctrl+u");
+    ptc_bytes(c, "plus");
+    lsprow_wait(c, ":plus", "the new name was not typed");
+    ptc_keys(c, "enter");
+    lsprow_wait(c, "rename 'add' \xE2\x86\x92 'plus'",
+                "the rename summary never showed");
+    lsprow_dump(c, "1-summary");
+    ptc_keys(c, "enter");
+    lsprow_wait(c, "renamed ", "the rename was not applied");
+    ptc_check(c, s43_screen_contains(&c->vt, "plus(1, 2)"),
+              "the call was not renamed");
+    lsprow_dump(c, "2-applied");
+    force_quit(c);
+}
+
+static void case_lspf_null(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_fake(c, "null", 30000);
+    lsprow_wait_ready(c, "fake");
+    lsprow_to_call(c);
+    lsprow_command(c, "ed.lsp.goto_def");
+    lsprow_wait(c, "fake: no definition found",
+                "a null definition did not say so");
+    lsprow_dump(c, "1-def");
+    lsprow_command(c, "ed.lsp.hover");
+    lsprow_wait(c, "no hover information here", "a null hover did not say so");
+    lsprow_dump(c, "2-hover");
+    lsprow_command(c, "ed.lsp.symbols");
+    lsprow_wait(c, "fake: no document symbols found",
+                "null symbols did not say so");
+    lsprow_dump(c, "3-symbols");
+    force_quit(c);
+}
+
+static void case_lspf_error(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_fake(c, "error", 30000);
+    lsprow_wait_ready(c, "fake");
+    lsprow_to_call(c);
+    /* An error reply other than -32601 is dropped silently. */
+    lsprow_command(c, "ed.lsp.hover");
+    ptc_settle(c, 1000);
+    lsprow_dump(c, "1-hover");
+    lsprow_command(c, "ed.lsp.references");
+    ptc_settle(c, 1000);
+    ptc_check(c, !s43_screen_contains(&c->vt, "up/down move"),
+              "an error reply opened a picker");
+    lsprow_dump(c, "2-references");
+    force_quit(c);
+}
+
+static void case_lspf_stale(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_fake(c, "stale", 30000);
+    lsprow_wait_ready(c, "fake");
+    lsprow_to_call(c);
+    lsprow_command(c, "ed.lsp.hover");
+    /* The edit lands before the 1 s reply: it answers a document that has
+     * changed, and is dropped. */
+    ptc_keys(c, "i z esc");
+    lsprow_wait(c, "zadd(1, 2)", "the edit did not land");
+    ptc_settle(c, 2000);
+    ptc_check(c, !s43_screen_contains(&c->vt, "late"),
+              "a reply for a changed document was shown");
+    lsprow_dump(c, "1-dropped");
+    force_quit(c);
+}
+
+static void case_lspf_deadline(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_fake(c, "deadline", 30000);
+    lsprow_wait_ready(c, "fake");
+    lsprow_to_call(c);
+    lsprow_command(c, "ed.lsp.goto_def");
+    ptc_settle(c, 1000);
+    lsprow_dump(c, "1-pending");
+    /* Past the request's 10 s deadline (jsonrpc.h:20). */
+    ptc_settle(c, 10500);
+    ptc_keys(c, "esc");
+    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_dump(c, "2-expired");
+    force_quit(c);
+}
+
+static void case_lspf_partial(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_fake(c, "partial", 30000);
+    lsprow_wait_ready(c, "fake");
+    lsprow_to_call(c);
+    lsprow_command(c, "ed.lsp.hover");
+    lsprow_wait(c, "fake does not support hover",
+                "an absent hover did not say so");
+    lsprow_dump(c, "1-hover");
+    /* A refused command keeps its line open for an edit: ESC closes it. */
+    ptc_keys(c, "esc");
+    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_command(c, "ed.lsp.goto_def");
+    lsprow_wait_row(c, 1, "the one capability did not answer");
+    lsprow_dump(c, "2-def");
+    force_quit(c);
+}
+
+static void case_lspf_highlight(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_fake(c, "highlight", 30000);
+    lsprow_wait_ready(c, "fake");
+    lsprow_char_right(c, 1, 1, 1);
+    /* The idle 300 ms, the reply, the frame. */
+    ptc_settle(c, 1500);
+    lsprow_dump(c, "1-highlit");
+    ptc_keys(c, "i z esc");
+    lsprow_wait(c, "fzn add", "the edit did not land");
+    lsprow_dump(c, "2-edited");
+    force_quit(c);
+}
+
+static void case_lspf_signature(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_fake(c, "signature", 30000);
+    lsprow_wait_ready(c, "fake");
+    ptc_keys(c, "down down down down down end i");
+    ptc_settle(c, 0);
+    ptc_bytes(c, " add(");
+    lsprow_wait(c, "plus(x: int, y: int)", "the signature panel never showed");
+    lsprow_dump(c, "1-panel");
+    ptc_keys(c, "esc");
+    ptc_settle(c, LSPROW_QUIET_MS);
+    lsprow_dump(c, "2-closed");
+    force_quit(c);
+}
+
+static const char lsprow_other[] =
+    "fn add_one(x: int) -> int {\n"
+    "    add(x, 1)\n"
+    "}\n";
+
+static void case_lspf_rename_files(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls) ||
+        !lsprow_write(c, "src/other.lu", lsprow_other))
+        return;
+    lsprow_open_fake(c, "renamefiles", 30000);
+    lsprow_wait_ready(c, "fake");
+    lsprow_char_right(c, 1, 1, 3);
+    ptc_keys(c, "g R");
+    lsprow_wait(c, ":add", "the rename prompt never showed the old name");
+    ptc_keys(c, "ctrl+u");
+    ptc_bytes(c, "sum");
+    lsprow_wait(c, ":sum", "the new name was not typed");
+    ptc_keys(c, "enter");
+    lsprow_wait(c, "rename 'add' \xE2\x86\x92 'sum'",
+                "the rename summary never showed");
+    lsprow_dump(c, "1-summary");
+    ptc_keys(c, "enter");
+    lsprow_wait(c, "renamed ", "the rename was not applied");
+    ptc_check(c, s43_screen_contains(&c->vt, "sum(1, 2)"),
+              "the open file's call was not renamed");
+    lsprow_dump(c, "2-applied");
+    force_quit(c);
+}
+
+/* C's own s47 rename sessions (registry.c:9820-10042: fakelsp beside the
+ * editor binary, `alpha.c` made dirty first), kept as screens instead of
+ * held to a golden: the goldens also hold the document's syntax colouring
+ * (the typed `!` is C's operator colour), which is yw10's, and these rows
+ * compare everything else. */
+static void lsprow_s47(PtyCtx *c, const char *keys, const char *wait,
+                       const char *label)
+{
+    S47RenameFix f;
+
+    if (!s47_rename_open(c, "session-rename", &f))
+        return;
+    s47_rename_begin(c, true, "rename 'alpha' \xE2\x86\x92 'beta'");
+    if (keys != NULL) {
+        ptc_keys(c, keys);
+        if (wait != NULL)
+            lsprow_wait(c, wait, "the rename answer did not show");
+        else
+            ptc_settle(c, LSPROW_QUIET_MS);
+    } else {
+        ptc_settle(c, LSPROW_QUIET_MS);
+    }
+    lsprow_dump(c, label);
+    s47_rename_finish(c, &f);
+}
+
+static void case_lspg_rename_summary(PtyCtx *c)
+{
+    lsprow_s47(c, NULL, NULL, "1-summary");
+}
+
+static void case_lspg_rename_apply(PtyCtx *c)
+{
+    lsprow_s47(c, "enter", "renamed ", "1-applied");
+}
+
+static void case_lspg_rename_unknown_key(PtyCtx *c)
+{
+    lsprow_s47(c, "left", NULL, "1-left");
+}
+
 /* registry.c #undefs its C() macro at its end, so the rows are spelled
  * out: {name, profile, rows, cols, fn, xfail_id}. */
 static const PtyCase lsprow_cases[] = {
@@ -429,6 +901,24 @@ static const PtyCase lsprow_cases[] = {
     {"lspf_slow", "modern", 24U, 80U, case_lspf_slow, NULL},
     {"lspf_hang", "modern", 24U, 80U, case_lspf_hang, NULL},
     {"lspf_deaf_quit", "modern", 24U, 80U, case_lspf_deaf_quit, NULL},
+    {"lspw_goto_def", "modern", 24U, 80U, case_lspw_goto_def, NULL},
+    {"lspw_goto_def_file", "modern", 24U, 80U, case_lspw_goto_def_file, NULL},
+    {"lspw_goto_unsupported", "modern", 24U, 80U, case_lspw_goto_unsupported, NULL},
+    {"lspw_references", "modern", 24U, 80U, case_lspw_references, NULL},
+    {"lspw_symbols", "modern", 24U, 80U, case_lspw_symbols, NULL},
+    {"lspw_hover", "modern", 24U, 80U, case_lspw_hover, NULL},
+    {"lspw_rename", "modern", 24U, 80U, case_lspw_rename, NULL},
+    {"lspf_null", "modern", 24U, 80U, case_lspf_null, NULL},
+    {"lspf_error", "modern", 24U, 80U, case_lspf_error, NULL},
+    {"lspf_stale", "modern", 24U, 80U, case_lspf_stale, NULL},
+    {"lspf_deadline", "modern", 24U, 80U, case_lspf_deadline, NULL},
+    {"lspf_partial", "modern", 24U, 80U, case_lspf_partial, NULL},
+    {"lspf_highlight", "modern", 24U, 80U, case_lspf_highlight, NULL},
+    {"lspf_signature", "modern", 24U, 80U, case_lspf_signature, NULL},
+    {"lspf_rename_files", "modern", 24U, 80U, case_lspf_rename_files, NULL},
+    {"lspg_rename_summary", "modern", 24U, 80U, case_lspg_rename_summary, NULL},
+    {"lspg_rename_apply", "modern", 24U, 80U, case_lspg_rename_apply, NULL},
+    {"lspg_rename_unknown_key", "modern", 24U, 80U, case_lspg_rename_unknown_key, NULL},
     {NULL, NULL, 0U, 0U, NULL, NULL}
 };
 
