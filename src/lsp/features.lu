@@ -1,0 +1,815 @@
+//! lsp.features — the feature responses' pure decoders (Sprint 47):
+//! exact positions and ranges, hover and signature help, locations,
+//! document symbols and document highlights, and the completion kinds'
+//! vocabulary they map to.
+//!
+//! Ports sagitta `src/mod/lsp/features.c:298-345` (exact positions),
+//! `:347-511` (hover and signature), `:513-633` (locations), `:635-885`
+//! (document symbols), `src/mod/lsp/highlight.c:29-143` (the highlight
+//! parser), and the kind vocabulary of `src/ui/complmenu.h:29-40` with
+//! its glyph table `src/ui/complmenu.c:56-63` (Sprint 44's, pulled
+//! forward for the symbol picker) at 9ace98c2. The requests and their
+//! callbacks take the `Ed` and are `edit.lsp_features`'.
+//!
+//! **Strings.** C keeps a symbol's name, breadcrumb and path and a
+//! location's path as NUL-free bytes; the port keeps them as `str`, so a
+//! name or a decoded path that is not UTF-8 is a malformed row and is
+//! skipped, where C keeps it (G40's shape: std's paths are `str`).
+
+use text
+use unicode
+use util
+
+/// `YEW_COMPLK_*` (`complmenu.h:29-40`).
+pub const COMPLK_WORD: int = 0
+
+/// `YEW_COMPLK_FUNC`.
+pub const COMPLK_FUNC: int = 1
+
+/// `YEW_COMPLK_TYPE`.
+pub const COMPLK_TYPE: int = 2
+
+/// `YEW_COMPLK_MACRO`.
+pub const COMPLK_MACRO: int = 3
+
+/// `YEW_COMPLK_KEYWORD`.
+pub const COMPLK_KEYWORD: int = 4
+
+/// `YEW_COMPLK_VARIABLE`.
+pub const COMPLK_VARIABLE: int = 5
+
+/// `YEW_COMPLK_CONSTANT`.
+pub const COMPLK_CONSTANT: int = 6
+
+/// `YEW_COMPLK_FIELD`.
+pub const COMPLK_FIELD: int = 7
+
+/// `YEW_COMPLK_ENUM`.
+pub const COMPLK_ENUM: int = 8
+
+/// `YEW_COMPLK_MODULE`.
+pub const COMPLK_MODULE: int = 9
+
+/// `YEW_COMPLK_SNIPPET`.
+pub const COMPLK_SNIPPET: int = 10
+
+/// `YEW_COMPLK_NKIND`: the count of kinds.
+pub const COMPLK_NKIND: int = 11
+
+/// `yew_compl_kind_glyph` (`complmenu.c:56-63`): one ASCII letter.
+pub fn compl_kind_glyph(kind: int) -> str {
+    let glyphs = "wftmkvcFeMs"
+    if kind < 0 || kind >= COMPLK_NKIND {
+        return "w"
+    }
+    glyphs[kind..kind + 1]
+}
+
+/// `YEW_LSP_HIGHLIGHT_*` (`highlight.h:15-20`).
+pub const LSP_HIGHLIGHT_TEXT: int = 1
+
+/// `YEW_LSP_HIGHLIGHT_READ`.
+pub const LSP_HIGHLIGHT_READ: int = 2
+
+/// `YEW_LSP_HIGHLIGHT_WRITE`.
+pub const LSP_HIGHLIGHT_WRITE: int = 3
+
+/// `YEW_LSP_HIGHLIGHT_MAX`: the most highlights one reply keeps.
+pub const LSP_HIGHLIGHT_MAX: int = 20000
+
+const LSP_LOCATION_MAX: int = 20000
+
+const LSP_SYMBOL_MAX: int = 20000
+
+const LSP_SYMBOL_DEPTH_MAX: int = 64
+
+const LSP_SYMBOL_TEXT_MAX: int = 4096
+
+// The breadcrumb separator, U+203A between spaces (`features.c:701`).
+const BREADCRUMB_SEP: str = " \u{203A} "
+
+// ---------------------------------------------------------------------
+// Exact positions (`features.c:298-345`).
+// ---------------------------------------------------------------------
+
+/// `lsp_position_exact` (`features.c:298-329`): a `Position` that names
+/// exactly one offset of `tb` on a grapheme boundary, round-tripping
+/// through the encoding; `(false, 0)` otherwise.
+pub fn lsp_position_exact(j: Json, v: int, tb: text.TextBuf, pos_enc: int) -> (bool, int) {
+    if json_kind(j, v) != JS_OBJ {
+        return (false, 0)
+    }
+    let linev = json_field(j, v, "line")
+    let charv = json_field(j, v, "character")
+    if json_kind(j, linev) != JS_INT || json_kind(j, charv) != JS_INT {
+        return (false, 0)
+    }
+    let line = json_int(j, linev, 0)
+    let character = json_int(j, charv, 0)
+    if line < 0 || character < 0 || line >= text.textbuf_line_count(tb) {
+        return (false, 0)
+    }
+    let off = lsp_off_of_pos(pos_enc, tb, line, character)
+    let (check_line, check_character) = lsp_pos_of_off(pos_enc, tb, off)
+    if check_line != line ||
+        check_character != character ||
+        !text.is_grapheme_boundary(tb, off as text.ByteOff) {
+        return (false, 0)
+    }
+    (true, off)
+}
+
+/// `lsp_range_exact` (`features.c:331-345`).
+pub fn lsp_range_exact(j: Json, v: int, tb: text.TextBuf, pos_enc: int) -> (bool, text.Span) {
+    let none = text.Span { lo: 0, hi: 0 }
+    if json_kind(j, v) != JS_OBJ {
+        return (false, none)
+    }
+    let (ok_lo, lo) = lsp_position_exact(j, json_field(j, v, "start"), tb, pos_enc)
+    if !ok_lo {
+        return (false, none)
+    }
+    let (ok_hi, hi) = lsp_position_exact(j, json_field(j, v, "end"), tb, pos_enc)
+    if !ok_hi || lo > hi {
+        return (false, none)
+    }
+    (true, text.Span { lo: lo, hi: hi })
+}
+
+// ---------------------------------------------------------------------
+// Hover and signature help (`features.c:347-511`).
+// ---------------------------------------------------------------------
+
+/// A hover's flattened body and its exact, non-empty range
+/// (`yew_lsp_hover_parse`'s outputs).
+pub struct LspHover {
+    ok: bool,
+    body: List[byte],
+    has_range: bool,
+    range: text.Span,
+}
+
+// `append_hover_piece` (`features.c:347-361`).
+fn append_hover_piece(mut body: List[byte], j: Json, piece: int) -> bool {
+    var v = piece
+    if !json_is_str(j, v) {
+        if json_kind(j, v) != JS_OBJ {
+            return false
+        }
+        v = json_field(j, v, "value")
+    }
+    if !json_is_str(j, v) || json_size(j, v) == 0 {
+        return false
+    }
+    if body.len != 0 {
+        (mut body).push(10 as byte)
+    }
+    let at = json_str_at(j, v)
+    var i = 0
+    while i < json_size(j, v) {
+        (mut body).push(j.bytes[at + i])
+        i += 1
+    }
+    true
+}
+
+/// `yew_lsp_hover_parse` (`features.c:363-389`): the contents (a string,
+/// a `MarkedString`/`MarkupContent` object, or an array of them) joined
+/// by LF; `ok` when any piece had text.
+pub fn lsp_hover_parse(j: Json, result: int, tb: text.TextBuf, pos_enc: int) -> LspHover {
+    var out = LspHover {
+        ok: false,
+        body: List[byte](),
+        has_range: false,
+        range: text.Span { lo: 0, hi: 0 },
+    }
+    if json_kind(j, result) != JS_OBJ {
+        return out
+    }
+    let contents = json_field(j, result, "contents")
+    var any = false
+    if json_kind(j, contents) == JS_ARR {
+        var i = 0
+        while i < json_size(j, contents) {
+            if append_hover_piece(mut out.body, j, json_at(j, contents, i)) {
+                any = true
+            }
+            i += 1
+        }
+    } else {
+        any = append_hover_piece(mut out.body, j, contents)
+    }
+    let server_range = json_field(j, result, "range")
+    if server_range >= 0 {
+        let (exact, range) = lsp_range_exact(j, server_range, tb, pos_enc)
+        if exact {
+            out.range = copy range
+            out.has_range = range.lo != range.hi
+        }
+    }
+    out.ok = any
+    out
+}
+
+// `raw_u16_byte` (`features.c:391-418`): the byte offset of UTF-16 unit
+// `want` in `s`, exactly.
+fn raw_u16_byte(s: List[byte], want: int) -> (bool, int) {
+    var at = 0
+    var units = 0
+    while at < s.len {
+        if units == want {
+            return (true, at)
+        }
+        let (cp, n) = unicode.utf8_decode(s, at, s.len)
+        if n == 0 || n > s.len - at {
+            return (false, 0)
+        }
+        let next = units + (if cp > 65535 then 2 else 1)
+        if want < next {
+            return (false, 0)
+        }
+        units = next
+        at += n
+    }
+    if units != want {
+        return (false, 0)
+    }
+    (true, s.len)
+}
+
+// `raw_find` (`features.c:420-434`): the first occurrence of `needle`.
+fn raw_find(hay: List[byte], j: Json, needle: int) -> (bool, text.Span) {
+    let none = text.Span { lo: 0, hi: 0 }
+    let n = json_size(j, needle)
+    let base = json_str_at(j, needle)
+    if n == 0 || n > hay.len {
+        return (false, none)
+    }
+    var at = 0
+    while at <= hay.len - n {
+        var i = 0
+        while i < n && hay[at + i] == j.bytes[base + i] {
+            i += 1
+        }
+        if i == n {
+            return (true, text.Span { lo: at, hi: at + n })
+        }
+        at += 1
+    }
+    (false, none)
+}
+
+// `signature_parameter_span` (`features.c:436-465`).
+fn signature_parameter_span(j: Json, parameter: int, label: List[byte]) -> (bool, text.Span) {
+    let none = text.Span { lo: 0, hi: 0 }
+    if json_kind(j, parameter) != JS_OBJ {
+        return (false, none)
+    }
+    let value = json_field(j, parameter, "label")
+    if json_is_str(j, value) {
+        return raw_find(label, j, value)
+    }
+    if json_kind(j, value) == JS_ARR && json_size(j, value) == 2 {
+        let lov = json_at(j, value, 0)
+        let hiv = json_at(j, value, 1)
+        if json_kind(j, lov) != JS_INT || json_kind(j, hiv) != JS_INT {
+            return (false, none)
+        }
+        let l = json_int(j, lov, 0)
+        let h = json_int(j, hiv, 0)
+        if l < 0 || h < l {
+            return (false, none)
+        }
+        let (ok_lo, lo) = raw_u16_byte(label, l)
+        let (ok_hi, hi) = raw_u16_byte(label, h)
+        if !ok_lo || !ok_hi || lo == hi {
+            return (false, none)
+        }
+        return (true, text.Span { lo: lo, hi: hi })
+    }
+    (false, none)
+}
+
+/// The active signature's label and its active parameter's byte span
+/// (`yew_lsp_signature_parse`'s outputs).
+pub struct LspSignature {
+    ok: bool,
+    body: List[byte],
+    has_emph: bool,
+    emph: text.Span,
+}
+
+/// `yew_lsp_signature_parse` (`features.c:467-511`): the active
+/// signature (an out-of-range index is the first), its label, and the
+/// active parameter, per-signature first, then the result's.
+pub fn lsp_signature_parse(j: Json, result: int) -> LspSignature {
+    var out = LspSignature {
+        ok: false,
+        body: List[byte](),
+        has_emph: false,
+        emph: text.Span { lo: 0, hi: 0 },
+    }
+    if json_kind(j, result) != JS_OBJ {
+        return out
+    }
+    let signatures = json_field(j, result, "signatures")
+    if json_kind(j, signatures) != JS_ARR || json_size(j, signatures) == 0 {
+        return out
+    }
+    var sig_index = json_int(j, json_field(j, result, "activeSignature"), 0)
+    if sig_index < 0 || sig_index >= json_size(j, signatures) {
+        sig_index = 0
+    }
+    let signature = json_at(j, signatures, sig_index)
+    if json_kind(j, signature) != JS_OBJ {
+        return out
+    }
+    let labelv = json_field(j, signature, "label")
+    if !json_is_str(j, labelv) || json_size(j, labelv) == 0 {
+        return out
+    }
+    out.body = json_str(j, labelv)
+    out.ok = true
+    var active = json_field(j, signature, "activeParameter")
+    if json_kind(j, active) != JS_INT {
+        active = json_field(j, result, "activeParameter")
+    }
+    if json_kind(j, active) != JS_INT || json_int(j, active, 0) < 0 {
+        return out
+    }
+    let param_index = json_int(j, active, 0)
+    let parameters = json_field(j, signature, "parameters")
+    if json_kind(j, parameters) != JS_ARR || param_index >= json_size(j, parameters) {
+        return out
+    }
+    let (has, span) = signature_parameter_span(j, json_at(j, parameters, param_index), out.body)
+    out.has_emph = has
+    if has {
+        out.emph = span
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Locations (`features.c:513-633`).
+// ---------------------------------------------------------------------
+
+/// `LspLoc` (`features.h:16-22`): a file location, 0-based, in the
+/// server's encoding.
+pub struct LspLoc {
+    path: str,
+    line: int,
+    chr: int,
+    end_line: int,
+    end_chr: int,
+}
+
+// `location_position` (`features.c:513-530`).
+fn location_position(j: Json, v: int) -> (bool, int, int) {
+    if json_kind(j, v) != JS_OBJ {
+        return (false, 0, 0)
+    }
+    let linev = json_field(j, v, "line")
+    let chrv = json_field(j, v, "character")
+    if json_kind(j, linev) != JS_INT || json_kind(j, chrv) != JS_INT {
+        return (false, 0, 0)
+    }
+    let line = json_int(j, linev, 0)
+    let chr = json_int(j, chrv, 0)
+    if line < 0 || chr < 0 || line > 4294967295 || chr > 4294967295 {
+        return (false, 0, 0)
+    }
+    (true, line, chr)
+}
+
+// `location_range` (`features.c:532-542`): both ends, the end not before
+// the start.
+fn location_range(j: Json, v: int, mut loc: LspLoc) -> bool {
+    if json_kind(j, v) != JS_OBJ {
+        return false
+    }
+    let (ok_s, line, chr) = location_position(j, json_field(j, v, "start"))
+    if !ok_s {
+        return false
+    }
+    let (ok_e, end_line, end_chr) = location_position(j, json_field(j, v, "end"))
+    if !ok_e {
+        return false
+    }
+    loc.line = line
+    loc.chr = chr
+    loc.end_line = end_line
+    loc.end_chr = end_chr
+    end_line > line || end_line == line && end_chr >= chr
+}
+
+/// A `file:` URI's decoded path, non-empty, NUL-free and UTF-8; `none`
+/// otherwise (`location_one`'s decode, `features.c:565-571`).
+pub fn lsp_file_path_of_uri(j: Json, uriv: int) -> str ! {none} {
+    if !json_is_str(j, uriv) {
+        return none
+    }
+    let uri = json_str(j, uriv)
+    var path = List[byte]()
+    if !lsp_path_of_uri(mut path, uri, 0, uri.len) || path.len == 0 {
+        return none
+    }
+    for b in path {
+        if b as int == 0 {
+            return none
+        }
+    }
+    str_from_utf8(path) else {
+        return none
+    }
+}
+
+// `location_one` (`features.c:544-574`): a `Location` or a
+// `LocationLink` (its selection range, else its range).
+fn location_one(j: Json, v: int) -> LspLoc ! {none} {
+    if json_kind(j, v) != JS_OBJ {
+        return none
+    }
+    var uriv = json_field(j, v, "targetUri")
+    var rangev = json_field(j, v, "targetSelectionRange")
+    if uriv < 0 {
+        uriv = json_field(j, v, "uri")
+        rangev = json_field(j, v, "range")
+    } else if rangev < 0 {
+        rangev = json_field(j, v, "targetRange")
+    }
+    if !json_is_str(j, uriv) {
+        return none
+    }
+    var loc = LspLoc { path: "", line: 0, chr: 0, end_line: 0, end_chr: 0 }
+    if !location_range(j, rangev, mut loc) {
+        return none
+    }
+    loc.path = lsp_file_path_of_uri(j, uriv) else {
+        return none
+    }
+    loc
+}
+
+/// C's `strcmp` over two strings: byte order.
+pub fn lsp_bytes_less(a: str, b: str) -> bool {
+    let x = a.bytes()
+    let y = b.bytes()
+    let n = if x.len < y.len then x.len else y.len
+    var i = 0
+    while i < n {
+        if x[i] != y[i] {
+            return x[i] as int < y[i] as int
+        }
+        i += 1
+    }
+    x.len < y.len
+}
+
+// `location_cmp` (`features.c:576-591`).
+fn location_less(a: LspLoc, b: LspLoc) -> bool {
+    if a.path != b.path {
+        return lsp_bytes_less(a.path, b.path)
+    }
+    if a.line != b.line {
+        return a.line < b.line
+    }
+    a.chr < b.chr
+}
+
+/// `yew_lsp_locations_parse` (`features.c:593-622`): a `Location`,
+/// `Location[]` or `LocationLink[]` (at most 20,000) into file locations
+/// sorted stably by path, line and character; malformed and non-file rows
+/// are skipped. `result` -1 is C's NULL.
+pub fn lsp_locations_parse(j: Json, result: int) -> List[LspLoc] {
+    var out = List[LspLoc]()
+    let kind = json_kind(j, result)
+    if kind == JS_OBJ {
+        let one = location_one(j, result) else {
+            return out
+        }
+        (mut out).push(one)
+    } else if kind == JS_ARR {
+        let n = if json_size(j, result) < LSP_LOCATION_MAX {
+            json_size(j, result)
+        } else {
+            LSP_LOCATION_MAX
+        }
+        var i = 0
+        while i < n {
+            let loc = location_one(j, json_at(j, result, i)) else {
+                i += 1
+                continue
+            }
+            (mut out).push(loc)
+            i += 1
+        }
+    }
+    if out.len > 1 {
+        util.sort_stable(mut out, location_less)
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Document symbols (`features.c:635-885`).
+// ---------------------------------------------------------------------
+
+/// `LspSymbol` (`features.h:24-32`): `buf_id` nonzero for the local
+/// index's rows.
+pub struct LspSymbol {
+    name: str,
+    breadcrumb: str,
+    path: str,
+    buf_id: int,
+    line: int,
+    chr: int,
+    kind: int,
+}
+
+// `symbol_kind` (`features.c:641-666`): SymbolKind 1-26 to the
+// completion vocabulary.
+fn symbol_kind(kind: int) -> int {
+    match kind {
+        6 | 9 | 12 | 24 | 25 => COMPLK_FUNC,
+        5 | 11 | 23 | 26 => COMPLK_TYPE,
+        13 => COMPLK_VARIABLE,
+        14 | 22 => COMPLK_CONSTANT,
+        7 | 8 | 20 => COMPLK_FIELD,
+        10 => COMPLK_ENUM,
+        1 | 2 | 3 | 4 => COMPLK_MODULE,
+        _ => COMPLK_WORD,
+    }
+}
+
+// `symbol_text_copy` (`features.c:668-682`): a non-empty string of at
+// most 4,096 bytes with no NUL (and, here, UTF-8).
+fn symbol_text_copy(j: Json, v: int) -> str ! {none} {
+    if !json_is_str(j, v) {
+        return none
+    }
+    let n = json_size(j, v)
+    if n == 0 || n > LSP_SYMBOL_TEXT_MAX {
+        return none
+    }
+    let b = json_str(j, v)
+    for c in b {
+        if c as int == 0 {
+            return none
+        }
+    }
+    str_from_utf8(b) else {
+        return none
+    }
+}
+
+// `symbol_breadcrumb` (`features.c:699-721`): `parent › name`, each part
+// within 4,096 bytes and the whole within 4,096.
+fn symbol_breadcrumb(parent: str, name: str) -> str ! {none} {
+    let sep_len = if parent.len == 0 then 0 else BREADCRUMB_SEP.len
+    if name.len == 0 ||
+        parent.len > LSP_SYMBOL_TEXT_MAX ||
+        name.len > LSP_SYMBOL_TEXT_MAX ||
+        parent.len + sep_len > LSP_SYMBOL_TEXT_MAX - name.len {
+        return none
+    }
+    if parent.len == 0 {
+        return name
+    }
+    "{parent}{BREADCRUMB_SEP}{name}"
+}
+
+// `symbol_document` (`features.c:734-774`): a `DocumentSymbol` and its
+// children, preorder, at most 64 deep.
+fn symbol_document(
+    j: Json,
+    v: int,
+    doc_path: str,
+    parent: str,
+    mut out: List[LspSymbol],
+    depth: int,
+) {
+    if json_kind(j, v) != JS_OBJ ||
+        doc_path.len == 0 ||
+        depth >= LSP_SYMBOL_DEPTH_MAX ||
+        out.len >= LSP_SYMBOL_MAX {
+        return
+    }
+    let name = symbol_text_copy(j, json_field(j, v, "name")) else {
+        return
+    }
+    let breadcrumb = symbol_breadcrumb(parent, name) else {
+        return
+    }
+    var range = json_field(j, v, "selectionRange")
+    if range < 0 {
+        range = json_field(j, v, "range")
+    }
+    var loc = LspLoc { path: "", line: 0, chr: 0, end_line: 0, end_chr: 0 }
+    if !location_range(j, range, mut loc) {
+        return
+    }
+    (mut out).push(LspSymbol {
+        name: name,
+        breadcrumb: breadcrumb,
+        path: doc_path,
+        buf_id: 0,
+        line: loc.line,
+        chr: loc.chr,
+        kind: symbol_kind(json_int(j, json_field(j, v, "kind"), 0)),
+    })
+    let children = json_field(j, v, "children")
+    if json_kind(j, children) != JS_ARR {
+        return
+    }
+    var i = 0
+    while i < json_size(j, children) && out.len < LSP_SYMBOL_MAX {
+        symbol_document(j, json_at(j, children, i), doc_path, breadcrumb, mut out, depth + 1)
+        i += 1
+    }
+}
+
+// `symbol_information` (`features.c:776-808`): a flat
+// `SymbolInformation`, its `containerName` a one-level breadcrumb.
+fn symbol_information(j: Json, v: int, mut out: List[LspSymbol]) {
+    if json_kind(j, v) != JS_OBJ || out.len >= LSP_SYMBOL_MAX {
+        return
+    }
+    let location = json_field(j, v, "location")
+    if json_kind(j, location) != JS_OBJ {
+        return
+    }
+    let loc = location_one(j, location) else {
+        return
+    }
+    let name = symbol_text_copy(j, json_field(j, v, "name")) else {
+        return
+    }
+    let container = symbol_text_copy(j, json_field(j, v, "containerName")) else ""
+    let breadcrumb = symbol_breadcrumb(container, name) else {
+        return
+    }
+    (mut out).push(LspSymbol {
+        name: name,
+        breadcrumb: breadcrumb,
+        path: loc.path,
+        buf_id: 0,
+        line: loc.line,
+        chr: loc.chr,
+        kind: symbol_kind(json_int(j, json_field(j, v, "kind"), 0)),
+    })
+}
+
+// `symbol_cmp` (`features.c:810-835`).
+fn symbol_less(a: LspSymbol, b: LspSymbol) -> bool {
+    if a.path != b.path {
+        return lsp_bytes_less(a.path, b.path)
+    }
+    if a.line != b.line {
+        return a.line < b.line
+    }
+    if a.chr != b.chr {
+        return a.chr < b.chr
+    }
+    if a.breadcrumb != b.breadcrumb {
+        return lsp_bytes_less(a.breadcrumb, b.breadcrumb)
+    }
+    if a.name != b.name {
+        return lsp_bytes_less(a.name, b.name)
+    }
+    if a.kind != b.kind {
+        return a.kind < b.kind
+    }
+    a.buf_id < b.buf_id
+}
+
+/// `yew_lsp_symbols_parse` (`features.c:837-871`): a `DocumentSymbol[]`
+/// tree or a flat `SymbolInformation[]` (the first row decides; rows of
+/// the other shape are skipped), at most 20,000, sorted stably.
+pub fn lsp_symbols_parse(j: Json, result: int, doc_path: str) -> List[LspSymbol] {
+    var out = List[LspSymbol]()
+    if json_kind(j, result) != JS_ARR {
+        return out
+    }
+    // 0 unknown, 1 tree, 2 flat.
+    var shape = 0
+    var i = 0
+    while i < json_size(j, result) && out.len < LSP_SYMBOL_MAX {
+        let v = json_at(j, result, i)
+        i += 1
+        if json_kind(j, v) != JS_OBJ {
+            continue
+        }
+        let flat = json_field(j, v, "location") >= 0
+        if shape == 0 {
+            shape = if flat then 2 else 1
+        }
+        if flat && shape != 2 || !flat && shape != 1 {
+            continue
+        }
+        if flat {
+            symbol_information(j, v, mut out)
+        } else {
+            symbol_document(j, v, doc_path, "", mut out, 0)
+        }
+    }
+    if out.len > 1 {
+        util.sort_stable(mut out, symbol_less)
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Document highlights (`highlight.c:29-143`).
+// ---------------------------------------------------------------------
+
+/// `LspHighlight` (`highlight.h:22-25`).
+pub struct LspHighlight {
+    lo: int,
+    hi: int,
+    kind: int,
+}
+
+// `highlight_offset` (`highlight.c:48-60`): an exact offset.
+fn highlight_offset(tb: text.TextBuf, pos_enc: int, line: int, chr: int) -> (bool, int) {
+    if line >= text.textbuf_line_count(tb) {
+        return (false, 0)
+    }
+    let off = lsp_off_of_pos(pos_enc, tb, line, chr)
+    let (exact_line, exact_chr) = lsp_pos_of_off(pos_enc, tb, off)
+    (exact_line == line && exact_chr == chr, off)
+}
+
+// `highlight_one` (`highlight.c:62-100`).
+fn highlight_one(j: Json, v: int, tb: text.TextBuf, pos_enc: int) -> LspHighlight ! {none} {
+    if json_kind(j, v) != JS_OBJ {
+        return none
+    }
+    let range = json_field(j, v, "range")
+    if json_kind(j, range) != JS_OBJ {
+        return none
+    }
+    let (ok_s, sl, sc) = location_position(j, json_field(j, range, "start"))
+    let (ok_e, el, ec) = location_position(j, json_field(j, range, "end"))
+    if !ok_s || !ok_e {
+        return none
+    }
+    let (exact_s, start) = highlight_offset(tb, pos_enc, sl, sc)
+    if !exact_s {
+        return none
+    }
+    let (exact_e, end) = highlight_offset(tb, pos_enc, el, ec)
+    if !exact_e || start >= end {
+        return none
+    }
+    var kind = LSP_HIGHLIGHT_TEXT
+    let kindv = json_field(j, v, "kind")
+    if kindv >= 0 {
+        if json_kind(j, kindv) != JS_INT {
+            return none
+        }
+        kind = json_int(j, kindv, 0)
+    }
+    if kind < LSP_HIGHLIGHT_TEXT || kind > LSP_HIGHLIGHT_WRITE {
+        return none
+    }
+    LspHighlight { lo: start, hi: end, kind: kind }
+}
+
+// `highlight_cmp` (`highlight.c:102-115`).
+fn highlight_less(a: LspHighlight, b: LspHighlight) -> bool {
+    if a.lo != b.lo {
+        return a.lo < b.lo
+    }
+    if a.hi != b.hi {
+        return a.hi < b.hi
+    }
+    a.kind < b.kind
+}
+
+/// `yew_lsp_highlights_parse` (`highlight.c:117-137`): at most 20,000
+/// exact, non-empty ranges of kind 1-3, sorted stably.
+pub fn lsp_highlights_parse(
+    j: Json,
+    result: int,
+    tb: text.TextBuf,
+    pos_enc: int,
+) -> List[LspHighlight] {
+    var out = List[LspHighlight]()
+    if json_kind(j, result) != JS_ARR {
+        return out
+    }
+    var i = 0
+    while i < json_size(j, result) && i < LSP_HIGHLIGHT_MAX {
+        let row = highlight_one(j, json_at(j, result, i), tb, pos_enc) else {
+            i += 1
+            continue
+        }
+        (mut out).push(row)
+        i += 1
+    }
+    if out.len > 1 {
+        util.sort_stable(mut out, highlight_less)
+    }
+    out
+}
