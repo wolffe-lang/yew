@@ -336,6 +336,11 @@ Commits, in order (the prediction first, every row red before its code):
 - `50939dc` lsp-rows: the fake's silent answers carry a receipt; stale and late answers on a condition, not a clock
 - `d71abca` lsp-rows: error, stale and deadline rows wait on the fake's receipts and marker, not a quiet gap
 - `11a13bf` CHANGELOG: the rename row crosses a file not yet open; silent answers have receipts
+- `9aef123` note: yw11b2's forbidden, inputs, evidence, findings, decisions and done-when
+- `ccaac2a` lsp-rows: the fake holds a late definition until the next save, not a timer
+- `7ec10b5` lsp-rows: the deadline row saves once the request's own deadline has passed
+- `58ad67e` lsp-rows: a failed run's state moved aside per editor, not removed by the other's run
+- `57c2d13` draw: the highlight and panel-mark overlays read their spans by index; no draw copies a list
 
 **The red witnesses** (each test file built at its own commit, before
 any code, on the Linux block in yew CI's image): every one fails to
@@ -369,7 +374,8 @@ again at their commit against the same trunk port: C passed each, and
 the port failed each by name (`the hover panel never opened`, `the
 hover's error reply never came`, `the edit did not land` with the
 refused hover's line still open, and `the definition request never
-reached the fake`).
+reached the fake`); the deadline row's later change (below) is past that
+first wait, and was run again the same way.
 
 **C's rename goldens**: `lsp_feat_rename_diff` and `_refusal` pass by
 name; `_summary`, `_apply` and `_unknown_key` first differ at the typed
@@ -424,13 +430,32 @@ name; `_summary`, `_apply` and `_unknown_key` first differ at the typed
   with a receipt, one more warning on line 1, which both editors read
   after the answer on the same pipe, and the rows wait for its badge
   (`W:1`, `W:2`). The stale answer waits for the document's `didChange`
-  instead of a second's sleep, so it is stale on any host; the deadline
-  mode marks the request's arrival and answers 12 s later, past the
-  10 s deadline (`jsonrpc.h:20`), and the row holds that the late answer
-  is ignored (the sweep has already called the request back,
-  `jsonrpc.c:682-718`). The hover row waits on the panel's corner, since
-  the typed `:ed.lsp.hover` holds the bare word, and the highlight row
-  on the two overlays' cells.
+  instead of a second's sleep, so it is stale on any host. The hover row
+  waits on the panel's corner, since the typed `:ed.lsp.hover` holds the
+  bare word, and the highlight row on the two overlays' cells.
+- **A draw copies no list.** The first highlight and panel-mark draws
+  copied the window's highlight state and its panel, span lists and
+  rows and all, on every document draw, even with nothing to draw.
+  `edit_drawbufs_test`'s ledger rows, which hold a draw to no
+  allocation, found 7,200 bytes over 30 document draws (the Linux
+  gauntlet's touched units). Both now read their spans from the window
+  by index, as the search overlay does, and every ledger row reads 0.
+- **A late answer comes after a stated deadline, not a timer.** The
+  deadline mode first answered on its own 12 s timer, two seconds past
+  the request's 10 s deadline (`jsonrpc.h:20`). On the Mac, one of C's
+  two runs never saw the receipt within the row's budget, while every
+  other run of both editors on both hosts did. Its state could not say
+  why: the port's run of the same row opens the same path and removed
+  it, so the runner now moves a failed run's state aside per editor. The
+  fake now holds the answer until the next `didSave`. The row reads the
+  clock when the fake's marker shows the request has arrived; the editor
+  stamped the request before sending it (`jsonrpc.c:519-524`), so its
+  deadline is at most 10 s later on the same monotonic clock. Past that,
+  the row saves. The turn that reads the save's key ticks the job
+  before it dispatches the key (`loop.c:602-605`), and the tick sweeps
+  the request with the timeout error (`jsonrpc.c:682-718`), so the
+  answer arrives for an id no longer pending and is ignored: the row
+  holds that the cursor stays on the call.
 
 ### Decided
 
