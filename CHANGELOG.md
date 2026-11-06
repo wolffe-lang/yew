@@ -27,7 +27,8 @@ The format follows Keep a Changelog; the port has no release yet.
   hover, rename) and the fake server's error paths (null and error
   replies, a reply after the document changed, a reply past its
   deadline, a partial capability set, highlights, signature help, a
-  rename that would create a file).
+  rename across a file not yet open), each silent answer waited for by
+  the fake's receipt rather than a quiet gap.
 - Completion, the shadow and the symbol index are yw11b1's (R-yw11b-1,
   R-yw11b-3).
 
