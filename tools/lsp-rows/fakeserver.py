@@ -21,6 +21,22 @@ MODE:
   slow       answers initialize 1500 ms late, then as mirror
   hang       never answers initialize (the editor's deadline fires)
   deaf       serves as mirror but never answers shutdown and ignores exit
+
+The feature modes (yw11b) serve full sync and the capabilities named:
+  null       hover, definition, references, documentSymbol: every one
+             answered `null`
+  error      the same four, every one answered with error -32603
+  stale      hover, answered 1 s late (the row edits the document in
+             between)
+  deadline   definition, never answered (the request's own deadline)
+  partial    definition alone: every other feature is absent
+  highlight  documentHighlight: a read on line 1 (0-2) and a write on
+             line 2 (4-5)
+  signature  signatureHelp, triggered by "(": one signature, its first
+             parameter active
+  renamefiles rename: a workspace edit over the open file (the
+             definition on line 1 and the call on line 6) and
+             src/other.lu, not open (the call on its line 2)
 """
 import json
 import os
@@ -99,6 +115,72 @@ def path_of(uri):
     return urllib.parse.unquote(uri[len("file://"):])
 
 
+FOUR = {"hoverProvider": True, "definitionProvider": True,
+        "referencesProvider": True, "documentSymbolProvider": True}
+FEATURE_CAPS = {
+    "null": FOUR,
+    "error": FOUR,
+    "stale": {"hoverProvider": True},
+    "deadline": {"definitionProvider": True},
+    "partial": {"definitionProvider": True},
+    "highlight": {"documentHighlightProvider": True},
+    "signature": {"signatureHelpProvider": {"triggerCharacters": ["("]}},
+    "renamefiles": {"renameProvider": True},
+}
+FEATURE_METHODS = (
+    "textDocument/hover", "textDocument/definition",
+    "textDocument/references", "textDocument/documentSymbol",
+    "textDocument/documentHighlight", "textDocument/signatureHelp",
+    "textDocument/rename",
+)
+
+
+def span(line, lo, hi):
+    return {"start": {"line": line, "character": lo},
+            "end": {"line": line, "character": hi}}
+
+
+def answer_feature(msg, docs):
+    """A feature request in a feature mode."""
+    mid = msg.get("id")
+    method = msg["method"]
+    if MODE == "null":
+        send({"jsonrpc": "2.0", "id": mid, "result": None})
+    elif MODE == "error":
+        send({"jsonrpc": "2.0", "id": mid,
+              "error": {"code": -32603, "message": "boom"}})
+    elif MODE == "stale":
+        time.sleep(1.0)
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"contents": {"kind": "plaintext", "value": "late"}}})
+    elif MODE == "deadline":
+        return
+    elif MODE == "partial":
+        loc = {"uri": msg["params"]["textDocument"]["uri"],
+               "range": span(0, 0, 0)}
+        send({"jsonrpc": "2.0", "id": mid, "result": loc})
+    elif MODE == "highlight":
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": [{"range": span(0, 0, 2), "kind": 2},
+                         {"range": span(1, 4, 5), "kind": 3}]})
+    elif MODE == "signature":
+        sig = {"label": "plus(x: int, y: int)",
+               "parameters": [{"label": [5, 11]}, {"label": [13, 19]}]}
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"signatures": [sig], "activeSignature": 0,
+                         "activeParameter": 0}})
+    elif MODE == "renamefiles":
+        p = msg["params"]
+        uri = p["textDocument"]["uri"]
+        name = p["newName"]
+        other = uri.rsplit("/", 1)[0] + "/other.lu"
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"changes": {
+                  uri: [{"range": span(0, 3, 6), "newText": name},
+                        {"range": span(5, 4, 7), "newText": name}],
+                  other: [{"range": span(1, 4, 7), "newText": name}]}}})
+
+
 def main():
     docs = {}
     incremental = MODE in ("mirror", "slow", "deaf")
@@ -115,9 +197,13 @@ def main():
                 time.sleep(1.5)
             sync = {"openClose": True, "change": 2 if incremental else 1,
                     "save": {"includeText": False}}
+            caps = {"textDocumentSync": sync}
+            caps.update(FEATURE_CAPS.get(MODE, {}))
             send({"jsonrpc": "2.0", "id": mid,
-                  "result": {"capabilities": {"textDocumentSync": sync},
+                  "result": {"capabilities": caps,
                              "serverInfo": {"name": "fake"}}})
+        elif method in FEATURE_METHODS and MODE in FEATURE_CAPS:
+            answer_feature(msg, docs)
         elif method == "textDocument/didOpen":
             td = msg["params"]["textDocument"]
             docs[td["uri"]] = td["text"]
