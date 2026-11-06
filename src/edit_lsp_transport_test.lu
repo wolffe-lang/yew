@@ -1,0 +1,328 @@
+//! member: false
+//!
+//! The port of sagitta `tests/unit/test_lsp_transport.c` (304 lines) at
+//! 9ace98c2, Sprint 45's real pipe and poll integration of the framed
+//! sink: a frame written one byte at a time arrives whole with the
+//! child's stderr kept apart, a child that exits mid-frame fails the
+//! transport, framed bytes bypass the text-safe prefix, and a pending
+//! request's deadline wakes the job clock.
+//!
+//! **The owner is a real `LspServer`.** C hands the job layer an ops
+//! table over a capture (`transport_ops`, `:103-107`); the port's framed
+//! owner is a server id the job layer matches by kind (`FRAMED_LSP`,
+//! `job.lu`), so each case places a server in the client by hand, its
+//! connection live and its handshake never sent, and spawns C's
+//! `fakelsp` (the oracle's build, `edit.fakelsp_path`) with the spec
+//! `spawn_server` builds. C's capture is the server's reader: `msgs_in`
+//! counts the messages, `keep_bodies` keeps their bytes, and the job's
+//! `framed_destroyed` is C's `capture.destroyed`. The reader goes with the
+//! connection when the job settles, where C's capture outlives its
+//! owner, so a case reads it once stdout has ended and before the drain.
+//!
+//! **The echoed body is a notification.** C queues the request
+//! `{"jsonrpc":"2.0","id":1,"method":"é"}` and `fakelsp` echoes it; C's
+//! capture only records it. A server answers a request it does not know
+//! (`-32601`), and that answer's write to a child that has already
+//! exited would fail the transport the case says stays whole, so the
+//! port's body drops the id: `{"jsonrpc":"2.0","method":"é"}`, still
+//! ending in a complete object after a multibyte codepoint, which the
+//! server ignores. Without the helper each case SKIPs by name and the
+//! file exits 0; `tools/check-test --fakelsp-ran` refuses any such line.
+//!
+//! The per-case selector `YEW_LSP_TRANSPORT_CASE=N` (0-based, 4 cases).
+
+use edit
+use lsp
+use std.signal
+
+struct Tally {
+    n: int,
+}
+
+// A failed check says what it was before the trap (a native trap prints
+// only its site).
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    if !cond {
+        eprint("assertion failed: {what}")
+    }
+    assert(cond, what)
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var i = 0
+    while i < a.len {
+        if a[i] != b[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+const BODY: str = "{{\"jsonrpc\":\"2.0\",\"method\":\"\u{E9}\"}}"
+
+// A server in the client by hand: its connection live, nothing sent.
+fn place_server(mut ed: edit.Ed) -> int {
+    ed.lsp.present = true
+    let sid = ed.lsp.next_id
+    ed.lsp.next_id += 1
+    var cfg = lsp.LspServerCfg {
+        id: "fakelsp",
+        lang: "c",
+        cmd: "",
+        args: List[str](),
+        roots: List[str](),
+        init_options: "",
+        has_init_options: false,
+        init_timeout_ms: 1000,
+    }
+    (mut ed.lsp.servers).push(edit.LspServer {
+        id: sid,
+        cfg: cfg,
+        root: os_cwd() else ".",
+        job: 0,
+        rpc: lsp.rpc_conn_new(),
+        rpc_live: true,
+        life: lsp.lsp_life_new(),
+        docv: List[lsp.LspDoc](),
+        exit_sent: false,
+        missing_warned: 0,
+        dropped_stale: 0,
+        shadow_request: 0,
+        shadow_buf_id: 0,
+        shadow_seq: 0,
+    })
+    sid
+}
+
+// `spawn_fakelsp` (`test_lsp_transport.c:150-190`): the body queued, then
+// the helper spawned with the server's framed spec.
+fn spawn_fakelsp(mut ed: edit.Ed, helper: str, mode: str) -> (int, int, str) {
+    let sid = place_server(mut ed)
+    let k = ed.lsp.servers.len - 1
+    ed.lsp.servers[k].rpc.rx.keep_bodies = true
+    lsp.rpctx_send(mut ed.lsp.servers[k].rpc.tx, pb(BODY))
+    var argv = List[str]()
+    (mut argv).push(helper)
+    (mut argv).push(mode)
+    var spec = edit.job_spec_new()
+    spec.argv = argv
+    spec.sink = edit.SINK_FRAMED
+    spec.framed = edit.FRAMED_LSP
+    spec.framed_owner = sid
+    let (id, err) = edit.job_spawn(mut ed, mut spec)
+    ed.lsp.servers[k].job = id
+    edit.job_write_framed(mut ed, edit.job_find(ed, id))
+    (k, id, err)
+}
+
+// `run_framed` (`:109-130`): pump, reap and settle until the job drains;
+// C's loop runs neither the clock nor the client.
+fn run_framed(mut ed: edit.Ed, id: int) -> bool {
+    let start = edit.now_ms()
+    loop {
+        let j = edit.job_find(ed, id)
+        if j < 0 {
+            return false
+        }
+        if ed.jobs.v[j].drained {
+            return true
+        }
+        edit.ed_pump_framed_once(mut ed, 20, true)
+        if edit.now_ms() - start > 10000 {
+            return false
+        }
+    }
+    false
+}
+
+// `wait_for_message` (`:132-148`): pump and reap until one message is in.
+fn wait_for_message(mut ed: edit.Ed, k: int, id: int) -> bool {
+    let start = edit.now_ms()
+    while ed.lsp.servers[k].rpc.rx.msgs_in == 0 {
+        if edit.job_find(ed, id) < 0 {
+            return false
+        }
+        edit.ed_pump_framed_once(mut ed, 20, false)
+        if edit.now_ms() - start > 1000 {
+            return false
+        }
+    }
+    true
+}
+
+// Pump and reap, not settle, until the child's stdout has ended (the
+// transport finished): the server's reader is C's capture, and the
+// settle that follows releases it with the connection, where C's
+// capture outlives its owner.
+fn pump_to_eof(mut ed: edit.Ed, id: int) -> bool {
+    let start = edit.now_ms()
+    loop {
+        let j = edit.job_find(ed, id)
+        if j < 0 {
+            return false
+        }
+        if ed.jobs.v[j].out_fd < 0 {
+            return true
+        }
+        edit.ed_pump_framed_once(mut ed, 20, false)
+        if edit.now_ms() - start > 10000 {
+            return false
+        }
+    }
+    false
+}
+
+// test_lsp_transport.c:192-218
+fn lsp_transport_one_byte_and_stderr_isolation(mut t: Tally, helper: str) {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let (k, id, err) = spawn_fakelsp(mut ed, helper, "onebyte")
+    ok(mut t, id != 0, "spawned")
+    ok(mut t, err.len == 0, "no error: {err}")
+    ok(mut t, pump_to_eof(mut ed, id), "stdout ended")
+    ok(
+        mut t,
+        ed.lsp.servers[k].rpc.rx.msgs_in == 1,
+        "one message: {ed.lsp.servers[k].rpc.rx.msgs_in}",
+    )
+    ok(
+        mut t,
+        ed.lsp.servers[k].rpc.rx.bodies.len == 1 &&
+            same(ed.lsp.servers[k].rpc.rx.bodies[0], pb(BODY)),
+        "the body, whole",
+    )
+    ok(mut t, run_framed(mut ed, id), "drained")
+    let j = edit.job_find(ed, id)
+    ok(mut t, j >= 0, "the job")
+    ok(mut t, !ed.jobs.v[j].framed_failed, "the transport held")
+    ok(mut t, same(ed.jobs.v[j].framed_err, pb("fake-lsp stderr\n")), "stderr apart")
+    ok(mut t, ed.jobs.v[j].framed_destroyed, "the owner released")
+    edit.lsp_free(mut ed)
+}
+
+// test_lsp_transport.c:220-241
+fn lsp_transport_reports_midframe_exit(mut t: Tally, helper: str) {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let (k, id, _) = spawn_fakelsp(mut ed, helper, "mid")
+    ok(mut t, id != 0, "spawned")
+    ok(mut t, pump_to_eof(mut ed, id), "stdout ended")
+    ok(mut t, ed.lsp.servers[k].rpc.rx.msgs_in == 0, "no message")
+    ok(mut t, ed.lsp.servers[k].rpc.rx.state == lsp.RPCRX_DEAD, "the reader dead mid-frame")
+    ok(mut t, run_framed(mut ed, id), "drained")
+    let j = edit.job_find(ed, id)
+    ok(mut t, j >= 0, "the job")
+    ok(mut t, ed.jobs.v[j].framed_failed, "the transport failed")
+    ok(mut t, ed.jobs.v[j].framed_destroyed, "the owner released")
+    edit.lsp_free(mut ed)
+}
+
+// test_lsp_transport.c:243-268
+fn lsp_transport_bypasses_text_safe_prefix(mut t: Tally, helper: str) {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let (k, id, _) = spawn_fakelsp(mut ed, helper, "live")
+    ok(mut t, id != 0, "spawned")
+    // The helper keeps stdout open after the complete frame: a text-safe
+    // path would keep the last grapheme back until EOF, and this wait
+    // would time out.
+    ok(mut t, wait_for_message(mut ed, k, id), "the message, before EOF")
+    ok(mut t, ed.lsp.servers[k].rpc.rx.msgs_in == 1, "one message")
+    ok(mut t, edit.job_signal(mut ed, id, signal.terminate()), "SIGTERM")
+    ok(mut t, run_framed(mut ed, id), "drained")
+    edit.lsp_free(mut ed)
+}
+
+// test_lsp_transport.c:270-304
+fn lsp_transport_rpc_deadline_wakes_job_clock(mut t: Tally) {
+    var ed = edit.ed_new()
+    let sid = place_server(mut ed)
+    let k = ed.lsp.servers.len - 1
+    var p = lsp.rpc_pending_new()
+    p.sent_ms = 10
+    p.deadline_ms = 75
+    ok(mut t, lsp.rpc_call(mut ed.lsp.servers[k].rpc, "deadline", List[byte](), p) == 1, "id 1")
+    var job = edit.job_test_blank()
+    job.id = 1
+    job.state = edit.JOB_RUNNING
+    job.sink = edit.SINK_FRAMED
+    job.framed = edit.FRAMED_LSP
+    job.framed_owner = sid
+    (mut ed.jobs.v).push(job)
+    ed.lsp.servers[k].job = 1
+    ok(mut t, edit.job_deadline(ed, 74) == 1, "1 ms before")
+    ok(mut t, edit.job_deadline(ed, 75) == 0, "due")
+    edit.job_tick(mut ed, 75)
+    ok(mut t, ed.lsp.servers[k].rpc.npending == 0, "swept")
+    ok(mut t, edit.job_deadline(ed, 75) == -1, "nothing left to wake for")
+    // C's `yew_ed_free` releases the owner: the connection here.
+    let _ = lsp.rpc_conn_free(mut ed.lsp.servers[k].rpc)
+    ed.lsp.servers[k].rpc_live = false
+    ok(mut t, edit.lsp_framed_deadline(ed, sid) == -1, "the owner released")
+}
+
+const CASES: int = 4
+
+fn case_name(i: int) -> str {
+    match i {
+        0 => "lsp_transport_one_byte_and_stderr_isolation",
+        1 => "lsp_transport_reports_midframe_exit",
+        2 => "lsp_transport_bypasses_text_safe_prefix",
+        _ => "lsp_transport_rpc_deadline_wakes_job_clock",
+    }
+}
+
+fn run_case(mut t: Tally, i: int, helper: str) {
+    match i {
+        0 => lsp_transport_one_byte_and_stderr_isolation(mut t, helper),
+        1 => lsp_transport_reports_midframe_exit(mut t, helper),
+        2 => lsp_transport_bypasses_text_safe_prefix(mut t, helper),
+        3 => lsp_transport_rpc_deadline_wakes_job_clock(mut t),
+        _ => {},
+    }
+}
+
+fn main() {
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    var t = Tally { n: 0 }
+    let helper = edit.fakelsp_path()
+    let pick = env_get("YEW_LSP_TRANSPORT_CASE") else ""
+    var lo = 0
+    var hi = CASES
+    if pick.len != 0 {
+        lo = pick.to_int() else -1
+        hi = lo + 1
+        // One past the last case runs nothing and prints nothing
+        // (`tools/check-test-cases`).
+        if lo < 0 || lo >= CASES {
+            return
+        }
+    }
+    var i = lo
+    while i < hi {
+        // The deadline case spawns nothing.
+        if helper.len == 0 && i != 3 {
+            print("SKIP {case_name(i)}: {edit.fakelsp_missing()}")
+        } else {
+            run_case(mut t, i, helper)
+            print("{case_name(i)}: PASS")
+        }
+        i += 1
+    }
+    if pick.len == 0 {
+        print("edit_lsp_transport_test: {t.n} assertions")
+    }
+}
