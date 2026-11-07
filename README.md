@@ -59,7 +59,9 @@ language and workspace root as a job on pipes, its handshake, shutdown,
 crash restart and deadlines, document sync (incremental when the server
 asks for it), and diagnostics in the gutter, under the text, on the
 statusline, as the cursor's hint and in a list with jumps, so `wolf lsp`
-works in the editor; completion, hover, navigation and rename follow.
+works in the editor; and its features: hover and signature help in a
+floating panel, the four gotos, references, document symbols, document
+highlight and rename. Completion follows.
 Each campaign's reachable PTY goldens are gated by name against C yew's
 (campaign 05's eleven that need FUSS or syntax
 highlighting are recorded under the lane that lands them); every path
@@ -116,6 +118,26 @@ the row above and wraps at the top to the true last row, beyond the visible
 page if necessary. Up before entering the table still walks history.
 Down at the bottom still returns focus to the command line, keeping the
 last candidate.
+
+## Keys
+
+`A-?` (Alt and `?`; a kitty-protocol terminal reports the same keys as
+`A-S-/`, and both are bound) opens the keys help, `:ed.keys`: every
+mode's bindings in one list, each row the mode, the keys, the command
+and its one-line help, and `(unsupported: sagitta Sprint N, ywNN)` on a
+binding the port still refuses, naming the sagitta sprint and the lane
+that land it. Type to filter; Enter shows the row whole on the message
+line; Esc closes. The keys help is yew's own (sagitta's nearest is
+`ed.map`, the current mode's configured bindings), and an `init.fl`
+binding of the same key wins over it.
+
+The language-server keys: in L mode `K` hover, `g d` definition, `g D`
+declaration, `g y` type definition, `g i` implementation, `g r`
+references, `g R` rename and `g s` document symbols; in I mode `A-k`
+signature help. For a `.lu` file yew starts `wolf lsp` from `PATH` with
+no configuration (sagitta's default server table), rooted at the
+nearest directory up to the workspace that holds `wolf.pkg` or `.git`,
+else at the workspace root: the startup directory, or `--workspace DIR`.
 
 ## The rules in brief
 
