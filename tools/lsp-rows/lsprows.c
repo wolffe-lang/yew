@@ -1140,6 +1140,13 @@ static bool lsprow_is_port(void)
     return tag != NULL && strcmp(tag + 1, "port") == 0;
 }
 
+/* The keys help's footer: its own words (keyshelp.lu's spec.footer), on
+ * the picker's last row. The title row is not a detector: opened from the
+ * command line, the line's hint for the typed name (`ed.keys \xe2\x86\x92
+ * keys`, cmdline.c:810-857) is drawn over it, as the diagnostic list's
+ * title is in lspw_open_diag. */
+#define LSPROW_KEYS_FOOTER "enter show the row"
+
 static void case_lspw_keys_help(PtyCtx *c)
 {
     if (!lsprow_package(c, lsprow_calls))
@@ -1152,25 +1159,28 @@ static void case_lspw_keys_help(PtyCtx *c)
         /* C has neither the key nor the command: nothing opens, and the
          * command line does not know the name. */
         ptc_settle(c, 500);
-        ptc_check(c, !s43_screen_contains(&c->vt, " Keys "),
+        ptc_check(c, !s43_screen_contains(&c->vt, LSPROW_KEYS_FOOTER) &&
+                         !s43_screen_contains(&c->vt, " Keys "),
                   "C yew opened a keys help");
         lsprow_command(c, "ed.keys");
         lsprow_wait(c, "unknown command", "C yew knows ed.keys");
         force_quit(c);
         return;
     }
-    lsprow_wait(c, " Keys ", "ESC ? did not open the keys help");
+    lsprow_wait(c, LSPROW_KEYS_FOOTER, "ESC ? did not open the keys help");
+    ptc_check(c, s43_screen_contains(&c->vt, " Keys "),
+              "the keys help opened by its key has no title");
     ptc_bytes(c, "lsp.goto");
     lsprow_wait(c, " 4/", "the filter did not leave the four gotos");
     ptc_check(c, s43_screen_contains(&c->vt, "ed.lsp.goto_def"),
               "the gotos are not listed");
     ptc_keys(c, "esc");
-    lsprow_wait_gone(c, " Keys ", "esc did not close the keys help");
+    lsprow_wait_gone(c, LSPROW_KEYS_FOOTER, "esc did not close the keys help");
     /* The command line names it too. */
     lsprow_command(c, "ed.keys");
-    lsprow_wait(c, " Keys ", ":ed.keys did not open the keys help");
+    lsprow_wait(c, LSPROW_KEYS_FOOTER, ":ed.keys did not open the keys help");
     ptc_keys(c, "esc");
-    lsprow_wait_gone(c, " Keys ", "esc did not close the keys help");
+    lsprow_wait_gone(c, LSPROW_KEYS_FOOTER, "esc did not close the keys help");
     force_quit(c);
 }
 
