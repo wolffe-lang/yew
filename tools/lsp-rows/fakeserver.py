@@ -45,6 +45,11 @@ The feature modes (yw11b) serve full sync and the capabilities named:
              definition on line 1 and the call on line 6) and
              src/other.lu, not open (the call on its line 2)
 
+yw15's mode:
+  root       full sync, no features: initialize's rootUri (and rootPath)
+             written to MARKER, one per line, before it is answered: the
+             root the editor resolved for the document it opens with
+
 A receipt follows an answer the editor is to show nothing for: the
 document's diagnostics republished as one warning on line 1 per such
 answer so far. The editor reads it after the answer on the same pipe, so
@@ -244,6 +249,10 @@ def main():
         if method == "initialize":
             if MODE == "hang":
                 continue
+            if MODE == "root" and MARKER:
+                p = msg.get("params") or {}
+                with open(MARKER, "w") as fh:
+                    fh.write("%s\n%s\n" % (p.get("rootUri"), p.get("rootPath")))
             if MODE == "slow":
                 time.sleep(1.5)
             sync = {"openClose": True, "change": 2 if incremental else 1,
