@@ -1070,3 +1070,24 @@ One paragraph each; yw01's is drafted in full
   built out (`Makefile:671`), R-yw06-1; `trust*` is `flconf.c`'s (yw09,
   R-yw06-5); G4 is closed at 0.2.34; all 48 `chrome_*` cases are Sprint
   27 §7's.
+
+## 9. yew's own additions
+
+What the port has that sagitta does not. Each is named here, in its
+command's help text and in its unit's header, holds no sagitta golden
+(every C golden stays byte-identical), and is held by rows of its own.
+
+- **`ed.keys`, the keys help** (yw15, `src/edit/keyshelp.lu`): every
+  mode's bindings in the list picker (`PICK_HOST_KEYS`), each row its
+  mode, keys, command, help and, for a binding the port refuses, the
+  sagitta sprint and yew lane that own it — read from the functions the
+  refusals are written from (`cmd_entry_owner`, `cmd_plugin_owner`,
+  `cmd_deferred_sprint`, `mode_unported_owner`), never from a list. Its
+  registry row is yew's (`src/edit/cmdtab_yew.lu`, after C's 408, so every
+  C command keeps C's id). Its key, `A-?` and `A-S-/`, is in the user
+  layer every mode's stack shares, which C builds empty
+  (`keys_default.c:107-111`): `runtime/init.fl` stays sagitta's byte for
+  byte, and an `init.fl` binding of the key wins. sagitta's nearest is
+  `ed.map` (`bind.c:475-522`), the current mode's configured layer as one
+  message; it is unchanged. Rows: `src/edit_keys_help_test.lu`, and
+  `lspw_keys_help` in `tools/run-lsp-rows`.
