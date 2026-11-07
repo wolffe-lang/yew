@@ -53,6 +53,16 @@ def validate(text):
         assert len(re.findall(r"^        family:", block, re.M)) == 1
         assert "include:" not in block and "exclude:" not in block
     assert "    timeout-minutes: 270\n" in oracle
+    # yw11b: the port job's Linux legs are its `tools/build --all` and a
+    # minute of checks. At 8967813 (run 42362461870) the ubuntu leg was cut
+    # at its 60-minute cap mid-build on the first attempt and took 49
+    # minutes on the second; 92e49f5's took 55, trunk's 7009fb2 37
+    # (42190104067), the aarch64 leg 46. The cap clears the cut 60 by half
+    # again; macOS keeps its 240.
+    port = job(text, "port")
+    cap = re.search(r"^    timeout-minutes: \$\{\{ matrix\.os == 'macos-latest' && (\d+) \|\| (\d+) \}\}$", port, re.M)
+    assert cap is not None and int(cap.group(1)) == 240
+    assert int(cap.group(2)) >= 90
     fs = [(n, b) for n, b in steps(fuzz) if n.startswith("fuzz_")]
     assert len(fs) == len(FUZZ) == 7
     assert not any(n.startswith("fuzz_") for n, _ in steps(oracle))
