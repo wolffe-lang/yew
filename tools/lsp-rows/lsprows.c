@@ -86,8 +86,9 @@
  *   lspw_keys_help     the port: ESC ? (Alt-? as a legacy terminal sends
  *                      it, the dumb profile, PAX's console) opens the keys
  *                      help; typing lsp.goto leaves the four gotos; esc
- *                      closes it. C has no such key: its half holds
- *                      "unbound: A-?"
+ *                      closes it; :ed.keys opens it again. C has neither:
+ *                      its half holds that ESC ? opens nothing and that
+ *                      :ed.keys is an unknown command
  *
  * Build and run: tools/run-lsp-rows.
  */
@@ -1148,15 +1149,26 @@ static void case_lspw_keys_help(PtyCtx *c)
     /* Alt-? as a legacy terminal sends it. */
     ptc_bytes(c, "\x1b?");
     if (!lsprow_is_port()) {
-        lsprow_wait(c, "unbound: A-?", "C yew bound A-?");
+        /* C has neither the key nor the command: nothing opens, and the
+         * command line does not know the name. */
+        ptc_settle(c, 500);
+        ptc_check(c, !s43_screen_contains(&c->vt, " Keys "),
+                  "C yew opened a keys help");
+        lsprow_command(c, "ed.keys");
+        lsprow_wait(c, "unknown command", "C yew knows ed.keys");
         force_quit(c);
         return;
     }
     lsprow_wait(c, " Keys ", "ESC ? did not open the keys help");
     ptc_bytes(c, "lsp.goto");
-    lsprow_wait(c, "4/", "the filter did not leave the four gotos");
+    lsprow_wait(c, " 4/", "the filter did not leave the four gotos");
     ptc_check(c, s43_screen_contains(&c->vt, "ed.lsp.goto_def"),
               "the gotos are not listed");
+    ptc_keys(c, "esc");
+    lsprow_wait_gone(c, " Keys ", "esc did not close the keys help");
+    /* The command line names it too. */
+    lsprow_command(c, "ed.keys");
+    lsprow_wait(c, " Keys ", ":ed.keys did not open the keys help");
     ptc_keys(c, "esc");
     lsprow_wait_gone(c, " Keys ", "esc did not close the keys help");
     force_quit(c);
