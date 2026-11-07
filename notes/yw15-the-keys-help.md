@@ -146,7 +146,7 @@ failing before the code that turns it green.
     yet ported" message, and the label names the message's sprint and
     lane. One command is not invoked, `ed.suspend`, which stops the
     process it runs in (`tty.lu`'s `stop_self` raises SIGTSTP on itself,
-    and the lane rules keep signals off a host's process table); the row
+    and no row signals a process on the host's own table); the row
     holds it ported by its implementation id instead, and
     `check-cmd-dispatch`'s second rule gives that id its arm;
   - `keys_status_names_sprint_and_lane`: `f` in L reads `(unsupported:
