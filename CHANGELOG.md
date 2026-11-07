@@ -29,8 +29,8 @@ The format follows Keep a Changelog; the port has no release yet.
   deadline, a partial capability set, highlights, signature help, a
   rename across a file not yet open), each silent answer waited for by
   the fake's receipt rather than a quiet gap.
-- Completion, the shadow and the symbol index are yw11b1's (R-yw11b-1,
-  R-yw11b-3).
+- Completion and the shadow are yw11b1's, a change of their own; the
+  symbol index waits for yw10's syntax and refuses by name until then.
 
 ### yw11a — the LSP client core and diagnostics (2026-11-05)
 
