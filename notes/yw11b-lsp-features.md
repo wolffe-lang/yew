@@ -341,6 +341,13 @@ Commits, in order (the prediction first, every row red before its code):
 - `7ec10b5` lsp-rows: the deadline row saves once the request's own deadline has passed
 - `58ad67e` lsp-rows: a failed run's state moved aside per editor, not removed by the other's run
 - `57c2d13` draw: the highlight and panel-mark overlays read their spans by index; no draw copies a list
+- `92e49f5` note: the deadline row's stated deadline, the kept state, and the draw that copied no list
+- `332d7df` edit_lsp_life_test: the scratch directory is absolute without TMPDIR (fakelsp's file:// URIs)
+- `63d72a1` lsp, tests, CHANGELOG: the deferred halves in plain words, no ruling numbers in printed lines
+- `fda813c` ci/legs-test: checked-cases builds C's fake language server before its cases (red: it does not)
+- `5dc3435` CI: checked-cases builds C's fake language server before its cases
+- `e4ecec8` ci/macos-split-test: the oracle job's cap is 270 minutes on both legs (red: 180 and 210)
+- `589c493` CI: the oracle job's cap is 270 minutes, the LSP features' longer release builds
 
 **The red witnesses** (each test file built at its own commit, before
 any code, on the Linux block in yew CI's image): every one fails to
@@ -440,6 +447,21 @@ name; `_summary`, `_apply` and `_unknown_key` first differ at the typed
   allocation, found 7,200 bytes over 30 document draws (the Linux
   gauntlet's touched units). Both now read their spans from the window
   by index, as the search overlay does, and every ledger row reads 0.
+- **The hosted runner has no `$TMPDIR`.** The life file's scratch
+  directory then fell back to the relative `target/tests`, and
+  `fakelsp` writes the marker's path into a `file://%s` URI
+  (`fakelsp.c:338`); from a relative path that URI has no `/` after
+  `file://`, the client refuses it (`lsp.lsp_path_of_uri`), and the
+  definition case never reached its target (`assertion failed: at the
+  target`, CI run 42346339007). Every local take had set `$TMPDIR`. The
+  directory is absolute now, and the case is red at the old head with
+  `$TMPDIR` unset and green at the new one. In the same run the
+  checked-cases job ran the LSP cases without the fake server, which
+  they SKIP by name and a case run alone reads as exit(0); that job
+  builds it now, and `ci/legs-test.py` holds it there. The oracle job
+  ran past its cap: the features make each release build of the editor
+  about half again as long (the port 33 to 50 minutes on ubuntu), and
+  both legs' caps move to 270 minutes (`ci/macos-split-test.py`).
 - **A late answer comes after a stated deadline, not a timer.** The
   deadline mode first answered on its own 12 s timer, two seconds past
   the request's 10 s deadline (`jsonrpc.h:20`). On the Mac, one of C's
