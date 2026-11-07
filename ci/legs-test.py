@@ -175,6 +175,12 @@ say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-latest$", cc,
     and "        shard: [1, 2, 3, 4]\n" in cc and not re.search(r"^\s+(os|include):", cc, re.M)
     and "run: python3 -I tools/check-test-cases --shard ${{ matrix.shard }}/4\n" in cc,
     "L4 checked-cases needs the legs and runs tools/check-test-cases in four shards on ubuntu")
+# yw11b (run 42346339007): the LSP unit files' cases spawn C's fake server
+# and SKIP by name without it, which the one-case-at-a-time table reads as
+# exit(0); the job builds it before the table runs.
+fl = "run: tools/build-fakelsp --cc gcc\n"
+say(fl in cc and cc.index(fl) < cc.index("run: python3 -I tools/check-test-cases --shard"),
+    "L4 checked-cases builds C's fake language server before its cases run")
 say(re.search(r"^  push:\n    branches: \[trunk\]\n", wf, re.M) is not None and re.search(r"^  pull_request:\s*$", wf, re.M) is not None
     and re.search(r"^  schedule:\n(\s+#.*\n)*\s+- cron: ", wf, re.M) is not None and re.search(r"^  workflow_dispatch:\s*$", wf, re.M) is not None,
     "L4 the trunk push, the pull request, the nightly and the dispatch are there")
