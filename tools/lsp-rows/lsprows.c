@@ -72,6 +72,23 @@
  *   lspg_rename_apply        Enter: applied, the sentence
  *   lspg_rename_unknown_key  another key closes the confirmation
  *
+ * yw15's rows: wolf lsp with no setup at all (no --config: the harness's
+ * own XDG_CONFIG_HOME holds no init.fl), through the default keys, and
+ * the keys help:
+ *
+ *   lspw_keys_default  K over add's definition: the hover panel; g d from
+ *                      the call: the definition's line
+ *   lspw_keys_bare     the same over a lone notes/bare.lu, no wolf.pkg and
+ *                      no .git in the workspace
+ *   lspf_bare_root     the fake server as the wolf row: the root the
+ *                      client gives a lone notes/bare.lu is the workspace
+ *                      root (the startup cwd), not the file's directory
+ *   lspw_keys_help     the port: ESC ? (Alt-? as a legacy terminal sends
+ *                      it, the dumb profile, PAX's console) opens the keys
+ *                      help; typing lsp.goto leaves the four gotos; esc
+ *                      closes it. C has no such key: its half holds
+ *                      "unbound: A-?"
+ *
  * Build and run: tools/run-lsp-rows.
  */
 #define yew_pty_cases yew_pty_cases_registry
@@ -239,8 +256,28 @@ static void lsprow_open(PtyCtx *c)
     ptc_wait_kitty_push(c, 21U);
 }
 
+/* No --config at all: the editor as a user starts it, `FILE` opened. The
+ * harness's XDG_CONFIG_HOME is the state directory, which holds no
+ * init.fl. */
+static void lsprow_open_plain(PtyCtx *c, const char *file, bool kitty)
+{
+    ptc_spawn(c, ptc_yew_bin(c), file, NULL);
+    if (kitty)
+        ptc_wait_kitty_push(c, 21U);
+}
+
+static void lsprow_open_fake_file(PtyCtx *c, const char *mode, int timeout_ms,
+                                  const char *file);
+
 /* The fake server as the `wolf` row of init.fl's table, opened. */
 static void lsprow_open_fake(PtyCtx *c, const char *mode, int timeout_ms)
+{
+    lsprow_open_fake_file(c, mode, timeout_ms, "src/main.lu");
+}
+
+/* The same, over FILE. */
+static void lsprow_open_fake_file(PtyCtx *c, const char *mode, int timeout_ms,
+                                  const char *file)
 {
     const char *python = getenv("YEW_LSPROW_PYTHON");
     const char *fake = getenv("YEW_LSPROW_FAKE");
@@ -264,7 +301,7 @@ static void lsprow_open_fake(PtyCtx *c, const char *mode, int timeout_ms)
     }
     if (!lsprow_config(c, source, config, sizeof(config)))
         return;
-    ptc_spawn(c, ptc_yew_bin(c), "--config", config, "src/main.lu", NULL);
+    ptc_spawn(c, ptc_yew_bin(c), "--config", config, file, NULL);
     ptc_wait_kitty_push(c, 21U);
 }
 
@@ -999,6 +1036,132 @@ static void case_lspg_rename_unknown_key(PtyCtx *c)
     lsprow_s47(c, "left", NULL, "enter apply", "1-left");
 }
 
+/* yw15: a lone file, no wolf.pkg and no .git in the workspace (the
+ * harness's GIT_CEILING_DIRECTORIES stops git at the state directory, and
+ * the client's root walk stops at the workspace root, client.c:391-433). */
+static bool lsprow_bare(PtyCtx *c)
+{
+    char dir[PATH_MAX];
+    int n;
+
+    if (c->workspace_dir == NULL) {
+        ptc_check(c, false, "lsp row lacks a workspace");
+        return false;
+    }
+    n = snprintf(dir, sizeof(dir), "%s/notes", c->workspace_dir);
+    if (n <= 0 || (size_t)n >= sizeof(dir) ||
+        (mkdir(dir, 0700) != 0 && errno != EEXIST)) {
+        ptc_check(c, false, "could not create the bare row's directory");
+        return false;
+    }
+    c->exec_path = getenv("YEW_LSPROW_PATH");
+    return lsprow_write(c, "notes/bare.lu", lsprow_calls);
+}
+
+/* K over add's name, then g d from the call: the real keys, no command
+ * line. */
+static void lsprow_default_keys(PtyCtx *c)
+{
+    lsprow_wait_ready(c, "wolf");
+    lsprow_char_right(c, 1, 1, 3);
+    ptc_keys(c, "K");
+    lsprow_wait(c, "\xe2\x94\x8c hover", "K did not open the hover panel");
+    ptc_check(c, s43_screen_contains(&c->vt, "fn add"),
+              "the hover panel does not hold add's signature");
+    ptc_keys(c, "esc");
+    lsprow_wait_gone(c, "\xe2\x94\x8c hover", "esc did not close the hover panel");
+    ptc_keys(c, "g g");
+    lsprow_wait_pos(c, 1, 1);
+    lsprow_to_call(c);
+    ptc_keys(c, "g d");
+    lsprow_wait_row(c, 1, "g d did not reach add's definition");
+}
+
+static void case_lspw_keys_default(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_plain(c, "src/main.lu", true);
+    lsprow_default_keys(c);
+    force_quit(c);
+}
+
+static void case_lspw_keys_bare(PtyCtx *c)
+{
+    if (!lsprow_bare(c))
+        return;
+    lsprow_open_plain(c, "notes/bare.lu", true);
+    lsprow_default_keys(c);
+    force_quit(c);
+}
+
+static void case_lspf_bare_root(PtyCtx *c)
+{
+    char marker[PATH_MAX];
+    char want[PATH_MAX + 16];
+    char *root;
+    Bytebuf got;
+    int n;
+
+    if (!lsprow_bare(c))
+        return;
+    lsprow_open_fake_file(c, "root", 30000, "notes/bare.lu");
+    lsprow_wait_ready(c, "fake");
+    ptc_wait_until(c, lsprow_fake_marked, NULL,
+                   "the fake never saw initialize");
+    root = realpath(c->workspace_dir, NULL);
+    n = snprintf(marker, sizeof(marker), "%s/fake.marker", c->state_dir);
+    bytebuf_init(&got);
+    if (root == NULL || n <= 0 || (size_t)n >= sizeof(marker) ||
+        !read_path_bytes(marker, &got)) {
+        ptc_check(c, false, "could not read the fake's marker");
+    } else {
+        n = snprintf(want, sizeof(want), "file://%s\n", root);
+        ptc_check(c, n > 0 && (size_t)n < sizeof(want) && got.len >= (size_t)n &&
+                         memcmp(got.data, want, (size_t)n) == 0,
+                  "the root is not the workspace root");
+        if (c->failed)
+            (void)fprintf(stderr, "lsp-row: lspf_bare_root: want %s got %.*s",
+                          want, (int)got.len, (const char *)got.data);
+    }
+    bytebuf_free(&got);
+    free(root);
+    force_quit(c);
+}
+
+/* Which editor this run drives: run-lsp-rows names the output directory
+ * after it (`.../c` or `.../port`). */
+static bool lsprow_is_port(void)
+{
+    const char *out = getenv("YEW_LSPROW_OUT");
+    const char *tag = out != NULL ? strrchr(out, '/') : NULL;
+
+    return tag != NULL && strcmp(tag + 1, "port") == 0;
+}
+
+static void case_lspw_keys_help(PtyCtx *c)
+{
+    if (!lsprow_package(c, lsprow_calls))
+        return;
+    lsprow_open_plain(c, "src/main.lu", false);
+    lsprow_wait_ready(c, "wolf");
+    /* Alt-? as a legacy terminal sends it. */
+    ptc_bytes(c, "\x1b?");
+    if (!lsprow_is_port()) {
+        lsprow_wait(c, "unbound: A-?", "C yew bound A-?");
+        force_quit(c);
+        return;
+    }
+    lsprow_wait(c, " Keys ", "ESC ? did not open the keys help");
+    ptc_bytes(c, "lsp.goto");
+    lsprow_wait(c, "4/", "the filter did not leave the four gotos");
+    ptc_check(c, s43_screen_contains(&c->vt, "ed.lsp.goto_def"),
+              "the gotos are not listed");
+    ptc_keys(c, "esc");
+    lsprow_wait_gone(c, " Keys ", "esc did not close the keys help");
+    force_quit(c);
+}
+
 /* registry.c #undefs its C() macro at its end, so the rows are spelled
  * out: {name, profile, rows, cols, fn, xfail_id}. */
 static const PtyCase lsprow_cases[] = {
@@ -1029,6 +1192,10 @@ static const PtyCase lsprow_cases[] = {
     {"lspg_rename_summary", "modern", 24U, 80U, case_lspg_rename_summary, NULL},
     {"lspg_rename_apply", "modern", 24U, 80U, case_lspg_rename_apply, NULL},
     {"lspg_rename_unknown_key", "modern", 24U, 80U, case_lspg_rename_unknown_key, NULL},
+    {"lspw_keys_default", "modern", 24U, 80U, case_lspw_keys_default, NULL},
+    {"lspw_keys_bare", "modern", 24U, 80U, case_lspw_keys_bare, NULL},
+    {"lspf_bare_root", "modern", 24U, 80U, case_lspf_bare_root, NULL},
+    {"lspw_keys_help", "dumb", 24U, 80U, case_lspw_keys_help, NULL},
     {NULL, NULL, 0U, 0U, NULL, NULL}
 };
 
