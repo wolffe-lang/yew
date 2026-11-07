@@ -5,6 +5,26 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw15 — the keys help, and wolf lsp by default (2026-11-07)
+
+- `ed.keys` (`A-?`, or `A-S-/` from a kitty-protocol terminal), yew's own:
+  every mode's bindings in the list picker, each row the mode, the keys,
+  the command, its help and, on a binding the port still refuses,
+  `(unsupported: sagitta Sprint N, ywNN)`, read from the same functions
+  the refusals are written from. Type to filter; Enter shows the row whole
+  on the message line. The key lives in the user layer (C builds it
+  empty), so `runtime/init.fl` stays sagitta's and an `init.fl` binding of
+  it wins; the command is yew's first registry row, after C's.
+- The refusal of F mode and of a plugin command name their owners
+  through `mode_unported_owner` and `cmd_plugin_owner`, which the keys help
+  reads too; their messages are unchanged.
+- `wolf lsp` for `.lu` files was already the default (sagitta's server
+  table, `src/lsp/client.lu`); new rows drive it with no configuration
+  through `K` and `g d`, over a package and over a lone file with no
+  `wolf.pkg` or `.git`, whose root is the workspace root (the fake
+  server's `root` mode reads it).
+- `tools/check-cmd-dispatch` reads yew's rows file beside the pin's.
+
 ### yw11b2 — the LSP client's features (2026-11-06)
 
 - sagitta's `src/mod/lsp/` features, pickers, highlight and rename and
