@@ -267,6 +267,8 @@ Commits, in order (the prediction first, every row red before its code):
 - `dcfdbd8` check-test-cases: the keys help's four cases past the checked machine's budget
 - `5a325a5` edit_keys_help_test: the key route and the init.fl case boot without the shipped runtime
 - `8cba7b1` check-test-cases: the key route's allowance says what it runs
+- `3c126e1` note: yw15's forbidden, inputs, evidence, findings, decisions and done-when
+- `080fa1e` lsp-rows: the keys help row waits on the picker's footer; the command line's hint covers its title
 
 ### What the work found
 
@@ -317,6 +319,16 @@ Commits, in order (the prediction first, every row red before its code):
   prediction had C's half of `lspw_keys_help` reading `unbound: A-?`; C
   (and trunk's port) show nothing after `ESC ?`. C's half now holds that
   nothing opens and that `:ed.keys` is an unknown command.
+- **The keys help's title is not a detector when `:` opens it.** The first
+  macOS take at `3c126e1` passed every unit file, the release build and
+  30 of the 31 rows, and failed `lspw_keys_help` in the port at its second
+  open (`:ed.keys did not open the keys help`) with the picker open on the
+  screen (`526/526`, its footer and L's rows). The command line's hint for
+  the typed name, `ed.keys → keys` (`cmdline.c:810-857`, the port's
+  `cl_hint_value`), is drawn over the picker's title row, as the
+  diagnostic list's title is in `lspw_open_diag`. The row now waits on the
+  keys help's footer (`enter show the row`) for every open and close, and
+  holds the title only where the key opened it.
 - **A filtered row run keeps no screens and compares RED.** `run-lsp-rows
   --filter bare_root` passed in both editors and printed `lsp-rows: RED`
   for `no screens kept` (`compare.py`): the new rows hold their own
@@ -328,9 +340,11 @@ Commits, in order (the prediction first, every row red before its code):
   macOS, trunk's port built at it): `lspw_keys_default`, `lspw_keys_bare`
   and `lspf_bare_root` pass in both editors (yew already starts `wolf lsp`
   and resolves the root as C does); `lspw_keys_help` fails in the port by
-  name (`ESC ? did not open the keys help`). `tools/check-cmd-dispatch` at
-  trunk refuses the new handler (`map: yew_keys_cmd_open names no row of
-  cmdtab.lu`).
+  name (`ESC ? did not open the keys help`); that runner's C half was the
+  wrong one (above). With the runner at `3c126e1` against the same trunk
+  port, C's half passes and the port's fails by name as before. `tools/
+  check-cmd-dispatch` at trunk refuses the new handler (`map:
+  yew_keys_cmd_open names no row of cmdtab.lu`).
 
 ### Decided
 
