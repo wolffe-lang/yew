@@ -92,6 +92,12 @@ boundary, then the quiet. Every later repaint, C's discovery's included,
 draws the same frame again. The condition is observable, so no longer
 delay is needed.
 
+HOME is a convergence, not a retry. It is pressed once, on a row it
+cannot move, and it forces the one repaint that every later event would
+cause anyway; from that frame on, the screen is a function of the
+editor's state alone. Nothing is pressed again until something changes,
+and no outcome of the wait depends on how long anything took.
+
 Probe (the same Mac): with the step so, C's screen with the real git, C's
 with the 2 s git, and the port's are the same cell for cell
 (`compare.py`), and so is each screen 3 s later.
@@ -158,6 +164,17 @@ between keystrokes in `lspf_mirror_sync`, `lspw_multicursor` and
 `lsprow_command` (the editor reads keys in order, and nothing is kept
 there); the `lspg_*` rows (C's own `s47_*` helpers in `registry.c`, which
 wait on markers and screen text).
+
+### Not in this lane: the selftest's red (yew#117)
+
+This branch's earlier fix for the goldens selftest (`startup_` cases at
+four times the harness's quiet) answers a red of the same shape: C yew's
+own `startup_multiple_files` opens its `:buffers` picker from the command
+line right after startup, where C's repository discovery is most likely
+to land in the snapshot's window. Four times the quiet narrows that race
+and does not close it. The case is C's own (`tests/pty/registry.c`), so
+the lever is not this file's; yew#117 holds the follow-up, a slow-git row
+for it included. Nothing here changes it.
 
 ### Rows expected
 
