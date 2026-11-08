@@ -562,15 +562,29 @@ static void case_lspf_mirror_sync(PtyCtx *c)
     force_quit(c);
 }
 
-/* Save (the fake's trigger), let the restart's 250 ms delay pass
- * (client.c:768), then one key: C's loop wakes for a running job's
- * deadline only (job.c:1879-1915), so a dead server is restarted at the
- * editor's next turn. */
+static bool lsprow_fake_marked(const PtyCtx *c, const void *arg);
+
+/* Save (the fake's trigger: it writes its marker, then dies or breaks its
+ * transport), then turns until the second server's diagnostic shows. C
+ * restarts a dead server at the editor's first turn once the restart's
+ * 250 ms delay has passed (client.c:766-797), and its loop wakes for a
+ * running job's deadline only (job.c:1879-1915), so the row gives it
+ * turns: an ESC (nothing in N mode) each, after 250 ms of quiet, as
+ * lsprow_wait_ready nudges the badge. Not one key after a fixed 600 ms,
+ * which a slow host's late crash could beat. */
 static void lsprow_after_trigger(PtyCtx *c)
 {
+    int tries;
+
     ptc_keys(c, "s");
-    ptc_settle(c, 600);
-    ptc_keys(c, "esc");
+    ptc_wait_until(c, lsprow_fake_marked, NULL,
+                   "the save never reached the fake server");
+    for (tries = 0; tries < 40 && !c->failed &&
+                    !s43_screen_contains(&c->vt, "after the restart");
+         tries++) {
+        ptc_keys(c, "esc");
+        ptc_settle(c, 250);
+    }
     lsprow_wait(c, "after the restart",
                 "the restarted server's diagnostic never arrived");
 }
