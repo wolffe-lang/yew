@@ -847,7 +847,7 @@ static void case_lspw_references(PtyCtx *c)
     lsprow_wait_ready(c, "wolf");
     lsprow_char_right(c, 1, 1, 3);
     lsprow_command(c, "ed.lsp.references");
-    lsprow_wait(c, "2/2", "the references picker never showed two rows");
+    lsprow_wait_list(c, "2/2", "the references picker never showed two rows");
     lsprow_dump(c, "1-picker");
     ptc_keys(c, "esc");
     lsprow_wait_gone(c, "up/down move", "esc did not close the references picker");
@@ -862,7 +862,7 @@ static void case_lspw_symbols(PtyCtx *c)
     lsprow_open(c);
     lsprow_wait_ready(c, "wolf");
     lsprow_command(c, "ed.lsp.symbols");
-    lsprow_wait(c, "2/2", "the symbol picker never showed two rows");
+    lsprow_wait_list(c, "2/2", "the symbol picker never showed two rows");
     lsprow_dump(c, "1-picker");
     ptc_keys(c, "esc");
     lsprow_wait_gone(c, "up/down move", "esc did not close the symbol picker");
