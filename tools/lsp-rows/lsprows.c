@@ -330,12 +330,40 @@ static const char lsprow_two_lets[] =
     "    a + b\n"
     "}\n";
 
-/* A picker the command line opened, waited for by its count. */
+/* The footer's command line: `:` at the start of the screen's last row. */
+static bool lsprow_footer_is_cmdline(const PtyCtx *c, const void *arg)
+{
+    const VtCell *cell;
+
+    (void)arg;
+    if (c->vt.cells == NULL || c->vt.rows < 1 || c->vt.cols < 1)
+        return false;
+    cell = &c->vt.cells[(size_t)(c->vt.rows - 1) * (size_t)c->vt.cols];
+    return cell->nb == 1U && cell->g[0] == (u8)':';
+}
+
+/* A picker the command line opened, waited for as any repaint draws it.
+ * The frame that opens it draws the footer before the picker opens its
+ * filter line, the editor's one command line (ed.c:2728-2748, picker.c:
+ * 204-210 and 963-965; the port's draw.lu:1299-1313): there the footer is
+ * still the message row, and the next frame that redraws the footer draws
+ * the command line in it too (draw.c:1071-1072). C yew redraws the footer
+ * by itself whenever a job starts or ends (loop.c:615-621), its repository
+ * discovery's git calls among them, which a slow runner's git can finish
+ * after the picker opened (yw11c). So the step waits for the count, presses
+ * HOME (on row 0, where the picker opens, it moves nothing and repaints the
+ * whole screen in both editors: picker.c:790-793, picker.lu:1081-1085) and
+ * waits for the footer's command line. Any later repaint draws the same
+ * frame. */
 static void lsprow_wait_list(PtyCtx *c, const char *count, const char *failure)
 {
-    /* The list's count, not a blind settle: a slow host can leave a quiet
-     * gap between the picker's frame and its populated list. */
-    lsprow_wait(c, count, failure);
+    s47_wait_screen(c, count, failure);
+    lsprow_show_failure(c);
+    ptc_keys(c, "home");
+    ptc_wait_until(c, lsprow_footer_is_cmdline, NULL,
+                   "the list's repaint never drew the footer's command line");
+    lsprow_show_failure(c);
+    ptc_settle(c, LSPROW_QUIET_MS);
 }
 
 static bool lsprow_is_port(void);
