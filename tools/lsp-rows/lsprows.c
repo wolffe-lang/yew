@@ -23,6 +23,11 @@
  *                      undo takes it away (the server's view follows)
  *   lspw_multicursor   one insert at two cursors breaks two lines (E:2);
  *                      undo mends both
+ *   lspw_open_diag_lategit  lspw_open_diag with C yew's repository
+ *                      discovery (two git calls) held by tools/lsp-rows/
+ *                      lategit/git: answered before the badge in run 2 and
+ *                      only once the list is open in run 1, as a fast host
+ *                      and a slow one order them (yw11c)
  *
  * The error paths: tools/lsp-rows/fakeserver.py ($YEW_LSPROW_PYTHON,
  * $YEW_LSPROW_FAKE), configured as the `wolf` server by --config:
@@ -325,11 +330,101 @@ static const char lsprow_two_lets[] =
     "    a + b\n"
     "}\n";
 
-static void case_lspw_open_diag(PtyCtx *c)
+/* A picker the command line opened, waited for by its count. */
+static void lsprow_wait_list(PtyCtx *c, const char *count, const char *failure)
 {
-    if (!lsprow_package(c, lsprow_typed_error))
+    /* The list's count, not a blind settle: a slow host can leave a quiet
+     * gap between the picker's frame and its populated list. */
+    lsprow_wait(c, count, failure);
+}
+
+static bool lsprow_is_port(void);
+
+/* yw11c: the late-git row's PATH, tools/lsp-rows/lategit first
+ * ($YEW_LSPROW_LATEGIT), so its git holds each call until the case opens
+ * the gate. */
+static bool lsprow_lategit_path(PtyCtx *c)
+{
+    static char path[PATH_MAX * 2U];
+    const char *shim = getenv("YEW_LSPROW_LATEGIT");
+    const char *rest = getenv("YEW_LSPROW_PATH");
+    int n;
+
+    if (shim == NULL || rest == NULL) {
+        ptc_check(c, false, "YEW_LSPROW_LATEGIT and YEW_LSPROW_PATH unset");
+        return false;
+    }
+    n = snprintf(path, sizeof(path), "%s:%s", shim, rest);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        ptc_check(c, false, "the late-git row's PATH overflows");
+        return false;
+    }
+    c->exec_path = path;
+    return true;
+}
+
+/* The shim's receipt names the discovery's last call, `rev-parse`
+ * (git.c:1572-1576), once the real git has answered it. */
+static bool lsprow_git_answered(const PtyCtx *c, const void *arg)
+{
+    char path[PATH_MAX];
+    Bytebuf got;
+    bool found;
+    int n = snprintf(path, sizeof(path), "%s/git.receipt", c->state_dir);
+
+    (void)arg;
+    if (n <= 0 || (size_t)n >= sizeof(path))
+        return false;
+    bytebuf_init(&got);
+    found = read_path_bytes(path, &got);
+    if (found) {
+        bytebuf_push_u8(&got, 0U);
+        found = strstr((const char *)got.data, " rev-parse ") != NULL;
+    }
+    bytebuf_free(&got);
+    return found;
+}
+
+/* The shim's gate, opened on every path so that no call outlives the
+ * case. */
+static bool lsprow_git_gate(PtyCtx *c)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/git.gate", c->state_dir);
+
+    return n > 0 && (size_t)n < sizeof(path) &&
+           write_bytes(path, (const u8 *)"open\n", 5U);
+}
+
+/* Open the gate; in C, wait until the discovery has answered. The port
+ * has no git module yet (src/mod/git/ is yw13's): nothing of it calls the
+ * shim. */
+static void lsprow_git_release(PtyCtx *c)
+{
+    if (!lsprow_git_gate(c)) {
+        ptc_check(c, false, "could not open the late git's gate");
+        return;
+    }
+    if (!lsprow_is_port())
+        ptc_wait_until(c, lsprow_git_answered, NULL,
+                       "C yew's repository discovery never answered");
+    lsprow_show_failure(c);
+}
+
+/* lspw_open_diag, and with LATEGIT its late-git twin. C yew's repository
+ * discovery (git.c:1481-1483, :1572-1576) starts at its first idle turn,
+ * and its jobs redraw the footer (loop.c:615-621). Run 2 lets it answer
+ * before the badge, as a fast host does; run 1 holds it until the list is
+ * open, as a slow runner's git can: the list's screen must not depend on
+ * which. */
+static void lsprow_open_diag(PtyCtx *c, bool lategit)
+{
+    if (!lsprow_package(c, lsprow_typed_error) ||
+        (lategit && !lsprow_lategit_path(c)))
         return;
     lsprow_open(c);
+    if (lategit && lsprow_run == 2U)
+        lsprow_git_release(c);
     lsprow_wait(c, "E:1", "wolf lsp's diagnostic never reached the badge");
     lsprow_dump(c, "1-open");
     lsprow_command(c, "ed.lsp.diag_next");
@@ -339,17 +434,31 @@ static void case_lspw_open_diag(PtyCtx *c)
     ptc_check(c, c->vt.cur_r == 2U, "diag_next did not reach line 2");
     lsprow_dump(c, "2-next");
     lsprow_command(c, "ed.lsp.diagnostics");
-    /* The list's count, not a blind settle: a slow host can leave a quiet
-     * gap between the picker's frame and its populated list. */
-    lsprow_wait(c, "1/1", "the diagnostic list never showed its one row");
+    if (lategit && lsprow_run == 1U) {
+        s47_wait_screen(c, "1/1", "the diagnostic list never showed its one row");
+        lsprow_git_release(c);
+    }
+    lsprow_wait_list(c, "1/1", "the diagnostic list never showed its one row");
     lsprow_dump(c, "3-list");
     /* The picker's footer: the alias hint for the long command name
      * covers its title row in both editors. */
     ptc_check(c, s43_screen_contains(&c->vt, "tab scope"),
               "the diagnostic list did not open");
+    if (lategit)
+        (void)lsprow_git_gate(c);
     ptc_keys(c, "esc");
     ptc_settle(c, LSPROW_QUIET_MS);
     force_quit(c);
+}
+
+static void case_lspw_open_diag(PtyCtx *c)
+{
+    lsprow_open_diag(c, false);
+}
+
+static void case_lspw_open_diag_lategit(PtyCtx *c)
+{
+    lsprow_open_diag(c, true);
 }
 
 static void case_lspw_edit_undo(PtyCtx *c)
@@ -1188,6 +1297,7 @@ static void case_lspw_keys_help(PtyCtx *c)
  * out: {name, profile, rows, cols, fn, xfail_id}. */
 static const PtyCase lsprow_cases[] = {
     {"lspw_open_diag", "modern", 24U, 80U, case_lspw_open_diag, NULL},
+    {"lspw_open_diag_lategit", "modern", 24U, 80U, case_lspw_open_diag_lategit, NULL},
     {"lspw_edit_undo", "modern", 24U, 80U, case_lspw_edit_undo, NULL},
     {"lspw_multicursor", "modern", 24U, 80U, case_lspw_multicursor, NULL},
     {"lspf_mirror_sync", "modern", 24U, 80U, case_lspf_mirror_sync, NULL},
