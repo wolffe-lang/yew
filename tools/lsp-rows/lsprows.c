@@ -1320,13 +1320,14 @@ static void case_lspw_keys_help(PtyCtx *c)
     ptc_bytes(c, "\x1b?");
     if (!lsprow_is_port()) {
         /* C has neither the key nor the command: nothing opens, and the
-         * command line does not know the name. */
-        ptc_settle(c, 500);
+         * command line does not know the name. The editor reads its input
+         * in order, so once `:ed.keys` is answered ESC ? has been read too:
+         * the check is made then, not after 500 ms. */
+        lsprow_command(c, "ed.keys");
+        lsprow_wait(c, "unknown command", "C yew knows ed.keys");
         ptc_check(c, !s43_screen_contains(&c->vt, LSPROW_KEYS_FOOTER) &&
                          !s43_screen_contains(&c->vt, " Keys "),
                   "C yew opened a keys help");
-        lsprow_command(c, "ed.keys");
-        lsprow_wait(c, "unknown command", "C yew knows ed.keys");
         force_quit(c);
         return;
     }
