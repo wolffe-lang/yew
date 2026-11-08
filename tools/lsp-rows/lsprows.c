@@ -367,6 +367,7 @@ static void lsprow_wait_list(PtyCtx *c, const char *count, const char *failure)
 }
 
 static bool lsprow_is_port(void);
+static void lsprow_wait_ready(PtyCtx *c, const char *id);
 
 /* yw11c: the late-git row's PATH, tools/lsp-rows/lategit first
  * ($YEW_LSPROW_LATEGIT), so its git holds each call until the case opens
@@ -609,10 +610,11 @@ static void case_lspf_slow(PtyCtx *c)
     s47_wait_screen(c, "abcfn main", "the editor did not take keys while "
                                       "initialize was pending");
     lsprow_dump(c, "1-pending");
-    /* Past the 1.5 s reply. The badge keeps its ellipsis until the next
-     * repaint (registry.c:9886-9888 says as much of C), so the save is
-     * what the row waits on. */
-    ptc_settle(c, 2000);
+    /* The 1.5 s reply, waited for as the feature rows wait for theirs:
+     * the badge without its ellipsis, which keeps it until the next
+     * repaint (registry.c:9886-9888 says as much of C), so an ESC (nothing
+     * in N mode) is the repaint asked for. Then the save. */
+    lsprow_wait_ready(c, "fake");
     ptc_keys(c, "s g g");
     lsprow_wait(c, "view ", "the late server never answered the save");
     ptc_check(c, s43_screen_contains(&c->vt, "view matches disk"),
@@ -653,8 +655,8 @@ static void case_lspf_deaf_quit(PtyCtx *c)
     if (!lsprow_package(c, lsprow_clean))
         return;
     lsprow_open_fake(c, "deaf", 30000);
-    lsprow_wait(c, "fake", "the fake server never showed on the statusline");
-    ptc_settle(c, 500);
+    /* Ready (initialize answered), not 500 ms after the badge showed. */
+    lsprow_wait_ready(c, "fake");
     ptc_keys(c, "s");
     lsprow_wait(c, "view matches disk", "the deaf server never answered the save");
     lsprow_dump(c, "1-ready");
