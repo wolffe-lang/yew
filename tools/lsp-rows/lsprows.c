@@ -621,19 +621,29 @@ static void case_lspf_slow(PtyCtx *c)
     force_quit(c);
 }
 
+/* Past the initialize deadline: the server is still the buffer's (its
+ * badge), no longer initializing (no ellipsis) and no longer a job (no
+ * <1> badge): killed, and nothing said (client.c:833-844). */
+static bool lsprow_hang_ended(const PtyCtx *c, const void *arg)
+{
+    (void)arg;
+    return s43_screen_contains(&c->vt, "fake") &&
+           !s43_screen_contains(&c->vt, "fake\xe2\x80\xa6") &&
+           !s43_screen_contains(&c->vt, "\xe2\x9f\xa8" "1\xe2\x9f\xa9");
+}
+
 static void case_lspf_hang(PtyCtx *c)
 {
     if (!lsprow_package(c, lsprow_clean))
         return;
     lsprow_open_fake(c, "hang", 1000);
-    ptc_settle(c, 2000);
-    /* Past the deadline: the server is still the buffer's (its badge),
-     * no longer initializing (no ellipsis) and no longer a job (no
-     * <1> badge): killed, and nothing said (client.c:833-844). */
-    ptc_check(c, s43_screen_contains(&c->vt, "fake") &&
-                     !s43_screen_contains(&c->vt, "fake\xe2\x80\xa6") &&
-                     !s43_screen_contains(&c->vt, "\xe2\x9f\xa8" "1\xe2\x9f\xa9"),
-              "the initialize deadline did not end the server");
+    /* The deadline fires on the editor's clock and the kill's job exit
+     * redraws the footer (loop.c:615-621): the row waits for that screen,
+     * not for 2 s of quiet. */
+    ptc_wait_until(c, lsprow_hang_ended, NULL,
+                   "the initialize deadline did not end the server");
+    lsprow_show_failure(c);
+    ptc_settle(c, LSPROW_QUIET_MS);
     lsprow_dump(c, "1-deadline");
     force_quit(c);
 }
