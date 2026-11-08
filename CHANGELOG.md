@@ -5,6 +5,19 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw11c — the LSP rows wait for what they capture (2026-11-08)
+
+- A picker the LSP rows open from the command line (the diagnostic list,
+  references, symbols) is kept as any repaint draws it: HOME, then the
+  footer's command line. Its first frame still has the message row in the
+  footer, and C yew's repository discovery repaints it on its own clock,
+  which made `lspw_open_diag`'s list unstable on hosted macOS runners.
+- `lspw_open_diag_lategit` holds that discovery with a git of the rows'
+  own (`tools/lsp-rows/lategit/git`) until the list is open in one run
+  and answers it before the badge in the other.
+- The hang, slow, deaf, crash and edit-and-undo rows and C's half of the
+  keys help row wait on what they check instead of fixed delays.
+
 ### yw13 — FUSS: the git layer and F mode (2026-10-29 to 11-09)
 
 - Built on r41q's pin (wolf 0.2.36 / lupin 0.1.58, trunk `1218169e`),
