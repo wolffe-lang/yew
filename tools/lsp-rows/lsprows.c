@@ -495,7 +495,9 @@ static void case_lspw_edit_undo(PtyCtx *c)
     if (!lsprow_package(c, lsprow_clean))
         return;
     lsprow_open(c);
-    lsprow_wait(c, "wolf", "the wolf server never showed on the statusline");
+    /* Kept once the server is ready: `wolf` alone is also the initializing
+     * badge's (`wolf…`), whose ellipsis stays until a repaint. */
+    lsprow_wait_ready(c, "wolf");
     lsprow_dump(c, "1-open");
     ptc_keys(c, "down down end i y esc");
     lsprow_wait(c, "E:1", "the edit's error never came back from wolf lsp");
