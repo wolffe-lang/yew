@@ -31,8 +31,9 @@ number from the same run, and a 2x gate holds from the first paint.
 
 ## Status
 
-Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), and campaign
-11's git layer and F mode (yw13), at wolf
+Campaigns 00 to 07 of sagitta's fifteen (yw00 to yw09), campaign 09's
+language server client (yw11) and campaign 11's git layer and F mode
+(yw13), at wolf
 0.2.36 (lupin 0.1.58): `util` and `unicode` (tables generated from `ucd/16.0.0/`,
 identical to sagitta's); the terminal (raw mode, the input decoder, the
 cell grid and damage renderer, the restore on every exit path); the text
@@ -84,7 +85,10 @@ allocation/filesystem work remain open in the map. The start-up and tab-switch
 rows meet the 2× gate again (yew#55); first Backspace stays named under
 yew#53. Eleven of Fletch's thirteen release
 bench rows are over 2× and named under yew#77, and its native tier is a
-named backend MISS. Other host/metric rows keep the 2× gate.
+named backend MISS. Of the five gated editor rows, four are named under
+yew#89 and `macrolib_scan_200`, which sits on the 2× line, under yew#77;
+every row is also held to its own regression baseline, re-measured at trunk
+on the current lane host. Other host/metric rows keep the 2× gate.
 
 ## Build and test
 
