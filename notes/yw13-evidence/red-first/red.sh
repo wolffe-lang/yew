@@ -34,12 +34,12 @@ variant() {
     echo "APPLIED $name"
 }
 probe() {
-    local name=$1 test=$2 case=$3
+    local name=$1 test=$2 case=$3 sel=${4:-YEW_PICK_CASE}
     local bin=$work/var/$name/$test
     if ! .wolf-bin/wolf build --deny-warnings "$work/var/$name/src/$test.lu" -o "$bin" > "$work/red/$name-$test.build.log" 2>&1; then
         echo "END variant $name test $test build=FAIL (a plant must compile)"; tail -5 "$work/red/$name-$test.build.log"; red=$((red + 1)); return
     fi
-    if [ -n "$case" ]; then YEW_PICK_CASE=$case "$bin" > "$work/red/$name-$test.log" 2>&1; else "$bin" > "$work/red/$name-$test.log" 2>&1; fi
+    if [ -n "$case" ]; then env "$sel=$case" "$bin" > "$work/red/$name-$test.log" 2>&1; else "$bin" > "$work/red/$name-$test.log" 2>&1; fi
     local rc=$?
     grep -E "RED|SKIP|wolf-trap|^  at " "$work/red/$name-$test.log" | sort -u | head -8
     if [ $rc -ne 0 ]; then
@@ -89,14 +89,17 @@ old = "if !sw_executable_in_path(\"git\") {"
 assert old in s
 open(p, "w").write(s.replace(old, "if sw_executable_in_path(\"git\") {"))
 ' && { probe mut-symwalk edit_symwalk_test 0; probe mut-symwalk edit_symwalk_test 1; }
+# The panel is yw11b's since the rebase onto trunk 3a9983e (yw13r): the
+# fence mutation breaks its fence line, and its test selects by
+# YEW_PANEL_CASE.
 variant mut-fence py '
 import sys
 p = sys.argv[1] + "/edit/panel.lu"
 s = open(p).read()
-old = "    len == 3 && b[lo] as int == 96 && b[lo + 1] as int == 96 && b[lo + 2] as int == 96\n"
+old = "    len == 3 && body[lo] as int == 96 && body[lo + 1] as int == 96 && body[lo + 2] as int == 96\n"
 assert old in s
 open(p, "w").write(s.replace(old, "    len < 0\n"))
-' && probe mut-fence edit_panel_test 15
+' && probe mut-fence edit_panel_test 15 YEW_PANEL_CASE
 variant mut-selection py '
 import sys
 p = sys.argv[1] + "/edit/fussmode.lu"
