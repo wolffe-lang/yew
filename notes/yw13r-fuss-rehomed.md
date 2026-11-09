@@ -161,8 +161,13 @@ At `5f60ccc` (the code of every later head), in yew CI's image on one
   the LSP rows are green beside them; the record's PTY step copies it.
 - On macOS (arm64), natively: `edit_keys_help_test`, `edit_ctxrows_test`,
   `edit_modes_test`, `edit_panel_test` and `edit_fussdrawer_test` at
-  `ed04767`; `red.sh` at `40cd36c`, three plants and five mutations red by
-  name over 11 rows (`notes/yw13r-evidence/red-first/macos-40cd36c.txt`).
+  `ed04767`; `red.sh` at `40cd36c`, three plants and five mutations red over
+  11 rows (`notes/yw13r-evidence/red-first/macos-40cd36c.txt`). **Corrected:**
+  three of those 11 rows were red for the wrong reason. The three
+  `edit_gitlayer_test` probes (the porcelain plant's cases 0 and 7,
+  `mut-literal-env`'s case 5) stopped at "mkxy.sh builds" before any case
+  ran, because that fixture could not be built on APFS (below). Re-probed at
+  `540bd26`, all three are red by their faults' own checks.
 
 ### The fifth name on APFS (the macOS take at `7ee9fe4`)
 
@@ -199,6 +204,62 @@ The evidence is in `notes/yw13r-evidence/fusscmds-apfs/`:
   written, so the path is not taken;
 - `c-fuss-commands-macos.txt`: C's `fuss_commands` at `sagitta.pin`, 544
   assertions ok on APFS.
+
+### The non-UTF-8 records on APFS (the macOS take at `e0d6cb0`)
+
+The macOS take at `e0d6cb0` went red in `edit_gitlayer_test` at "mkxy.sh
+builds", before any case ran. The twelve test files before it were green,
+the filename matrix's fix among them.
+
+**The cause is the same refusal, in the port's own fixture.**
+`tests/fixtures/git/mkxy.sh` (yw13's, not sagitta's) writes two names that
+are not UTF-8 into its `mix` repository: `bad\376name.txt`, which it
+commits and then renames to `bad\375renamed.txt` with `git mv`, and the untracked
+`raw\377.txt`. Run by hand on the Mac, it stops at the first of them
+(`line 120: ... Illegal byte sequence`, exit 1). C has no case to follow
+here: its git-layer fixture (`mkrepo.sh`) has no such name, and C's
+`git_layer` passes on the same Mac (15,371 assertions). The two records
+cannot exist on APFS. An untracked record needs the file itself, and a
+rename kept in the index only reads as `RD`, not `R.`.
+
+**So the two checks SKIP by name where the name is refused, and nothing
+else does:**
+- `c3d4c50`: `mkxy.sh` probes the destination first. Where a non-UTF-8 name
+  is refused, it leaves those two records out, builds every other record as
+  on Linux, and writes the shell's reason to `DEST/raw-names-refused`.
+- `f8a6e73`: the mix case then prints `SKIP port_gitlayer_mix_records: the
+  non-UTF-8 rename and untracked records: the file system refuses a name
+  that is not UTF-8 (Illegal byte sequence)`. It also checks that neither
+  record exists, and runs its other checks.
+- That first cut was still red on the Mac. The reason file quoted the
+  refused name, so the test's text read of it failed and the SKIP never
+  fired. `1cdb775` writes the reason alone, in ASCII; `540bd26` lets the
+  file's presence decide.
+- On Linux the name is written, no reason file exists, and every check runs
+  as before.
+
+**Every other fixture was checked before the retake.** `mkrepo.sh` and
+`mkxy.sh` are the only fixture scripts under `tests/fixtures`. Both run
+clean on the Mac at `540bd26`. None of the other test files the macOS take
+runs writes a name that is not UTF-8: `edit_job_test` sends such bytes
+through a job's stdin and stdout, and `git_porcelain_test` parses them from
+memory, neither as a file name.
+
+The evidence is in `notes/yw13r-evidence/gitlayer-apfs/`:
+- `red-e0d6cb0-macos.txt` and `mkxy-by-hand-e0d6cb0-macos.txt`: the red,
+  and the fixture's own refusal;
+- `red-f8a6e73-macos.txt`: the first cut, still red;
+- `green-540bd26-macos.txt`: the fixture scripts' dry run, the test green
+  with the SKIP by name (8 cases run), and C's `git_layer`;
+- `green-540bd26-linux.txt`: both changed test files green on Linux, with no
+  SKIP;
+- `red-first-540bd26-macos.txt`: the three re-probed rows.
+
+The three re-probed rows are red by their faults:
+- the porcelain plant's case 0, at "rename-new.txt is an entry";
+- its case 7, at "a C. copy";
+- `mut-literal-env`'s case 5, at "the child's GIT_LITERAL_PATHSPECS: want
+  `1`, got absent".
 
 ## Rulings asked
 
@@ -430,6 +491,24 @@ branch merged before it. **Decided A:** the three are carried unchanged
 (`09335f0`, `fe8edc7`, `7d6d2b7`, each the same patch as yew#115's
 `c06fc57`, `03171fd`, `c8443c7`), and this branch merges first.
 
+### R-yw13r-4: the refused fifth name, C's path or a SKIP (decided: A)
+
+The filename matrix's fifth name cannot be written on APFS (above). There
+were two ways to handle it.
+
+- **(A) Do what C does.** C's case permits the refusal, keeps the name in
+  the index only, and indexes it again after every stage. The port had
+  dropped that re-add, and putting it back is the fix. The printed path line
+  keeps a pass on APFS from reading as the pass on Linux.
+- **(B) SKIP the case by name wherever the name is refused.** This was the
+  first proposal. It assumed the snapshot could not hold the name on APFS,
+  but it can: C's case holds it and passes on the same Mac (544 assertions).
+
+**Decided A:** a SKIP would hide a case C runs and passes on APFS. The
+fix is `ab2b54b`. The non-UTF-8 records of `mkxy.sh` are the opposite case.
+C has no such records, and they cannot exist on APFS, so their two checks
+SKIP by name with the measured reason (above).
+
 ## yw13b's contract, what moved (s53, at this lane's merge)
 
 yw13b ports s53 (git in the editor: hunks, blame, the diff view, the
@@ -479,7 +558,9 @@ the editor runtime). Since yw13's contract named it:
   differential, CI's 320 gated PTY cases and the LSP rows; macOS natively
   on the files the rebase touched by hand.
 - [x] The keys help's rows red first (`3ec1663`) and green (`ed04767`).
-- [x] `red.sh`: three plants and five mutations red by name on macOS.
+- [x] `red.sh`: three plants and five mutations red by name on macOS. The
+  three `edit_gitlayer_test` rows were red only at the fixture at
+  `40cd36c`; they are red by their faults at `540bd26`.
 - [x] The Fletch baseline re-homed: five quiet sessions at trunk, rows not
   sets dropping a blip, every row on three or more (`68e6a0c`).
 - [x] yew#115's CI caps carried unchanged.
@@ -487,6 +568,9 @@ the editor runtime). Since yw13's contract named it:
   the status line, the editor's Fletch rows and their re-measured baseline.
 - [x] The filename matrix on APFS: red on macOS at `7ee9fe4`, green at
   `ab2b54b` on macOS and on Linux, as C's own case is on APFS.
+- [x] The non-UTF-8 records on APFS: red on macOS at `e0d6cb0`, green at
+  `540bd26` with their two checks SKIPped by name, and every check run on
+  Linux. Every fixture script was dry-run on the Mac.
 - [ ] The record at this branch's head, the three plants re-cut onto it and
   red by name, the macOS take, and CI: in the PR body, since a commit after
   them would move the head they were taken at.
