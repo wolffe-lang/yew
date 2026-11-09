@@ -77,7 +77,9 @@ if raw_err=$( (printf 'probe\n' >"$raw_probe") 2>&1 ); then
     rm -f "$raw_probe"
 else
     raw_names=no
-    printf '%s\n' "$raw_err" >"$dest_abs/raw-names-refused"
+    # The shell's reason, after its last `: ` (the refused name before it
+    # is not UTF-8), in printable ASCII.
+    printf '%s\n' "${raw_err##*: }" | tr -cd '\11\12\40-\176' >"$dest_abs/raw-names-refused"
 fi
 
 # --- every unmerged XY ------------------------------------------------
