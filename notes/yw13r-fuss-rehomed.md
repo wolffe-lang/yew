@@ -133,6 +133,140 @@ The rule: trunk's behaviour, except where yw13 is the change itself.
 
 ## Rulings asked
 
+### R-yw13r-1: the Fletch perf gate's baseline, on a new host (asked)
+
+**The gate** (`tools/fl-headless/compare.py`) has two halves.
+
+- **The ratio half** fails a row whose port/C median is over 2x, unless
+  `tools/perf-fletch-misses.txt` names it for the host. The host string is
+  `linux-x86_64`, which every Linux x86-64 host shares.
+- **The regression half** fails a row whose median is over its baseline by
+  15 % and whose minimum is over it by 10 % (`tools/perf-fletch-baseline.txt`).
+  It is what holds a named row to the number it was named at.
+
+Of the 17 rows the gate holds, 16 are named at this head
+(`macrolib_scan_200` among them, R-yw13-11). So the ratio half by itself
+gates one row (`parse_only`) and the concat-join ratio. The baseline was
+measured on a pool host that is no longer a lane host: the VM rows at
+yw08's head, the editor rows at yw09's. The tool can't hold the two halves
+apart: `--advisory`, which hosted CI uses, relaxes both at once
+(`compare.py:177`, `:186-191`), a missing baseline fails (`:183-187`), and
+`--host` selects only the named-MISS rows (`:138`).
+
+**Measured** on the new host: an Intel Core i7-12700KF, one block of three
+P-cores and their hyperthreads, yew CI's image, the release tier, the
+block's two locks and its light lock held (nothing else on the block),
+host load 5 to 6 from the other blocks. Three sessions of `compare.py`
+exactly as the gauntlet's perf steps run it, at trunk `3a9983e`
+(`notes/yw13r-evidence/perf/`):
+
+| row | old baseline median / min (ns) | trunk medians, % of it | trunk mins, % of it | spread of medians | port/C |
+|---|---|---|---|---|---|
+| `fib24` | 28,027,820 / 25,210,081 | 76 75 75 | 83 83 83 | 0.7 % | 4.25-4.27x |
+| `map10k` | 4,722,112 / 4,118,359 | 77 78 77 | 87 88 87 | 1.0 % | 3.03-3.09x |
+| `motion100k` | 47,251,312 / 41,272,080 | 76 75 74 | 86 85 84 | 3.4 % | 2.24-2.29x |
+| `startup` | 116,695 / 108,904 | 93 97 92 | 97 99 97 | 4.9 % | 2.35-2.54x |
+| `parse_only` | 261,712 / 226,421 | 92 83 82 | 103 94 92 | 13.1 % | 1.09-1.23x |
+| `motion_dispatch` | 536,317,270 / 487,700,021 | 82 82 82 | 89 90 87 | 1.1 % | 2.63-2.70x |
+| `fib27` | 117,187,698 / 112,993,264 | 80 80 81 | 82 83 83 | 0.9 % | 4.31-4.56x |
+| `map_heavy` | 482,685,732 / 389,998,012 | 83 82 83 | 103 101 101 | 1.2 % | 7.27-7.44x |
+| `strbuild_join` | 12,302,599 / 11,922,394 | 82 82 82 | 83 84 84 | 0.7 % | 3.93-4.05x |
+| `strbuild_concat` | 192,663,813 / 181,508,787 | 87 87 86 | 92 92 92 | 1.0 % | 3.67-3.72x |
+| `join5k` | 2,722,344 / 2,507,045 | 76 76 78 | 83 83 85 | 2.6 % | 3.27-3.33x |
+| `list_sort` | 130,514,469 / 124,292,345 | 84 84 85 | 87 87 89 | 1.5 % | 4.04-4.13x |
+| `config_load` | 2,299,722 / 2,263,908 | 107 103 105 | 102 104 106 | 3.5 % | 2.74-2.83x |
+| `config_reload_500` | 6,414,120 / 6,333,094 | 113 111 110 | 111 110 109 | 3.1 % | 3.32-3.43x |
+| `macrolib_scan_200` | 1,854,969 / 1,819,383 | 111 114 114 | 111 112 110 | 2.7 % | 2.01-2.06x |
+| `motion_editor` | 1,074,012,631 / 1,060,999,975 | 101 101 100 | 101 102 101 | 0.7 % | 7.32-7.42x |
+| `query_cur_pos` | 521,180,129 / 519,939,057 | 106 104 105 | 106 104 105 | 2.1 % | 35.20-36.19x |
+
+- **The old baseline is stale both ways.** The VM rows run at 74-87 % of it,
+  so a regression of 15-25 % there would pass. The editor rows run at
+  100-114 %. Two of them (`config_reload_500`, `macrolib_scan_200`)
+  already read their minimum past the +10 % condition and their median
+  within two points of +15 %. The editor rows were measured at yw09's
+  head, before the LSP client landed, so some of that is trunk's own drift.
+  The old host can't separate the two now.
+- **The sessions agree.** Every row's three medians are within 3.5 % of
+  each other, except the two shortest rows: `startup` (4.9 %) and
+  `parse_only` (13 %, a 0.24 ms row whose first session ran slow).
+- **The ratio half** reads as it did on the old host: the sixteen named
+  rows are over 2x, and `parse_only` is under it. At trunk,
+  `macrolib_scan_200` reads 2.01-2.06x and is not named there, so trunk
+  itself is red on this host by the ratio half (`failures=1` in every
+  session). yw13's head names it (R-yw13-11).
+
+**The head against trunk**, three more trunk sessions interleaved with
+three at this branch (`5f60ccc`), on the same block an hour later, host
+load 5 to 6:
+
+| row | head / trunk, paired sessions (%) | head against the old baseline | head against a baseline from trunk's first three sessions |
+|---|---|---|---|
+| `fib24` | 100 102 99 | ok,ok,ok | ok,ok,ok (100 102 100 %) |
+| `map10k` | 100 104 100 | ok,ok,ok | ok,ok,ok (101 103 100 %) |
+| `motion100k` | 98 100 98 | ok,ok,ok | ok,ok,ok (98 99 98 %) |
+| `startup` | 37 98 102 | ok,ok,ok | ok,ok,ok (95 96 94 %) |
+| `parse_only` | 102 102 97 | ok,ok,ok | ok,ok,ok (91 91 89 %) |
+| `motion_dispatch` | 98 101 101 | ok,ok,ok | ok,ok,ok (100 99 100 %) |
+| `fib27` | 98 98 99 | ok,ok,ok | ok,ok,ok (101 100 101 %) |
+| `map_heavy` | 98 103 102 | ok,ok,ok | ok,ok,ok (101 103 104 %) |
+| `strbuild_join` | 102 99 101 | ok,ok,ok | ok,ok,ok (103 101 101 %) |
+| `strbuild_concat` | 100 101 101 | ok,ok,ok | ok,ok,ok (101 101 102 %) |
+| `join5k` | 101 100 101 | ok,ok,ok | ok,ok,ok (102 98 99 %) |
+| `list_sort` | 100 87 99 | ok,ok,ok | ok,ok,ok (99 97 98 %) |
+| `config_load` | 105 103 97 | ok,ok,ok | ok,ok,ok (103 103 98 %) |
+| `config_reload_500` | 104 98 102 | REGRESSION,ok,ok | ok,ok,ok (102 101 102 %) |
+| `macrolib_scan_200` | 103 89 104 | REGRESSION,ok,REGRESSION | ok,ok,ok (101 99 103 %) |
+| `motion_editor` | 101 103 104 | ok,ok,ok | ok,ok,ok (102 103 104 %) |
+| `query_cur_pos` | 100 101 100 | ok,ok,ok | ok,ok,ok (101 102 101 %) |
+
+- **yw13 costs the editor rows 0-3 % and the VM rows nothing measurable.**
+  Paired by session, the means are `motion_editor` +2.7 %,
+  `config_reload_500` +1.6 %, `config_load` +1.4 %, `query_cur_pos`
+  +0.4 % and `macrolib_scan_200` -1.3 %. The editor's perf driver also
+  takes 21 % longer to build (2,896 s, against trunk's 2,391 s: G62).
+- **Against the old baseline the head goes red** in two of three sessions,
+  on the two editor rows that trunk already crowds. **Against trunk's own
+  numbers on this host it is green** in all three, every row within 4 %.
+  Trunk's two sets of sessions, an hour apart, agree within 3 % by row.
+- **Host blips are real here.** Two of the three later trunk sessions had
+  rows run slow: `startup` at 2.8x its usual median in one, and
+  `list_sort` and `macrolib_scan_200` at +14 % in the other. Of all nine
+  sessions, those two had blips, and the head's three had none. Against a baseline from the first three
+  sessions, the `startup` blip alone fails the regression half. So a
+  record, whose three perf steps must each pass, can go red on a blip
+  that is no regression, as yw13's first take did on the old host.
+
+**Options.**
+
+- **(A) Re-home the baseline.** Each row is the maximum of three quiet
+  sessions at trunk on one P-core block of the new host, as yw08's and
+  yw09's rows were the maximum of three; the why column names the host by
+  its hardware and block. The bar is unchanged, and no source changes. The
+  perf steps run on a P-core block, never on the block that mixes in
+  E-cores. The cost: a host move means a re-measure again, and other
+  blocks' load sits inside the bar (sessions agree within 3.5 % on all
+  but the two shortest rows).
+- **(B) The ratio half gates alone, the baseline advisory.** This needs a
+  source change: a flag that relaxes the regression half only. It does not
+  depend on the host. But the named rows skip the ratio half by design, so
+  16 of the 17 rows would have no gate at all, and a VM slowed to twice its
+  time would pass.
+
+**Recommended: (A).** It keeps both halves, needs no source change, and
+on this host it separates yw13's 0-3 % from the old baseline's 11-15 %.
+If ruled A:
+
+- the committed numbers are re-measured at trunk before the record, three
+  sessions under one P-core block's three locks, kept only if every row's
+  medians agree within 5 % (the two shortest rows within 10 %); a set that
+  doesn't is retaken;
+- each of the record's perf steps waits, in a printing loop of at most an
+  hour, for the host's one-minute load to fall to 3 or under (the
+  other blocks' work) before it measures. A perf step that still goes red
+  names its row, and the record says so; the head is then measured against
+  trunk interleaved, as above, before any rerun.
+
 ## yw13b's contract, what moved (s53, at this lane's merge)
 
 yw13b ports s53 (git in the editor: hunks, blame, the diff view, the
