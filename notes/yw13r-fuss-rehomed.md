@@ -301,14 +301,15 @@ If ruled A:
 - the committed numbers are re-measured at trunk before the record, three
   sessions under one P-core block's three locks, kept only if every row's
   medians agree within 5 % (the two shortest rows within 10 %); a set that
-  doesn't is retaken;
+  doesn't is retaken (superseded by R-yw13r-3: rows, not sets, drop a
+  blip);
 - each of the record's perf steps waits, in a printing loop of at most an
   hour, for the host's one-minute load to fall to 3 or under (the
   other blocks' work) before it measures. A perf step that still goes red
   names its row, and the record says so; the head is then measured against
   trunk interleaved, as above, before any rerun.
 
-### R-yw13r-3: the baseline's agreement rule, measured (asked)
+### R-yw13r-3: the baseline's agreement rule, measured (decided: c)
 
 **A correction to R-yw13r-1.** It claimed the sessions agree within 3.5 %
 on every row but the two shortest. That was one set. Over the 18 quiet
@@ -345,8 +346,30 @@ keep rule does not.
   has three such sessions. A blip costs one row of one session, not the
   set, and the numbers stay as tight as the rule meant.
 
-Recommended: **(c)**. Under (a) a loop retakes sets meanwhile, ten at most,
-and stops at the first kept set.
+Recommended: **(c)**. Under (a) a loop retook sets meanwhile.
+
+**Decided (c)**, with one condition: no choosing among sessions already
+taken. The loop under (a) was stopped in its first set and its files
+voided. Tonight's earlier sessions stay as evidence only, since picking a
+favourable group after the fact biases the gate. Five fresh consecutive
+sessions came next, each its own take of the block's three locks, each
+after the printing load wait, with at most three groups of five
+(`notes/yw13r-evidence/perf/rule-c-group1.txt`, `basecheck_c.py`).
+**Group 1 was kept.** Every row keeps three or more sessions:
+
+- 14 rows keep all five;
+- `config_reload_500` drops session 2 (+6.8 %);
+- `config_load` drops sessions 1 and 2 (+11.1 %, +12.5 %);
+- `macrolib_scan_200` drops sessions 1 and 2 (+16.1 %, +15.8 %).
+
+Sessions 1 and 2 ran back to back while another lane's light step worked
+on the same host, and only the file-system editor rows moved. Each row of
+`tools/perf-fletch-baseline.txt` (`68e6a0c`) is now the maximum over its
+kept sessions.
+
+Against these numbers, this branch's three sessions from the A/B above
+regress on no row; the closest is at 104 % of its baseline median
+(`config_load`, `motion_editor`).
 
 ### R-yw13r-2: yew#115's CI caps under this branch's record (decided: A)
 
@@ -404,3 +427,28 @@ the editor runtime). Since yw13's contract named it:
   lands.
 
 ## Done-when
+
+- [x] yw13 on trunk `3a9983e`: 109 commits replayed, 2 dropped (the panel
+  and its test, now trunk's), every clean-merged file equal to a plain
+  three-way merge; what moved is listed above.
+- [x] Prediction scored: the conflicts, the panel's resolution, the shared
+  input kind and the duplicate command arm, `--version`, and the keys
+  help's row as the first red, all as predicted. Missed: "the new host runs
+  every row faster than the old baseline". The VM rows do; the editor rows
+  run level or slower. Missed by omission: the fake LSP server beside the
+  editor, which the rename goldens need and a gauntlet's PTY step must
+  copy as CI does.
+- [x] Dev-green: the whole unit set natively (232 of 232), the checked
+  machine on every changed test file, yw13's FUSS goldens and porcelain
+  differential, CI's 320 gated PTY cases and the LSP rows; macOS natively
+  on the files the rebase touched by hand.
+- [x] The keys help's rows red first (`3ec1663`) and green (`ed04767`).
+- [x] `red.sh`: three plants and five mutations red by name on macOS.
+- [x] The Fletch baseline re-homed: five quiet sessions at trunk, rows not
+  sets dropping a blip, every row on three or more (`68e6a0c`).
+- [x] yew#115's CI caps carried unchanged.
+- [x] README read and refreshed (`1ea45d9`, README only): campaign 09 in
+  the status line, the editor's Fletch rows and their re-measured baseline.
+- [ ] The record at this branch's head, the three plants re-cut onto it and
+  red by name, the macOS take, and CI: in the PR body, since a commit after
+  them would move the head they were taken at.
