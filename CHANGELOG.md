@@ -21,6 +21,11 @@ The format follows Keep a Changelog; the port has no release yet.
   row's median (10 % for the two shortest), so a host blip drops a row of
   one session, not the set. The record's perf steps wait for a quiet host
   before they measure.
+- On APFS, which refuses a name that is not UTF-8: the filename matrix
+  keeps C's fifth name in the index only, indexing it again after each
+  stage as C does, and `mkxy.sh` leaves out its two non-UTF-8 records,
+  whose checks SKIP by name with the shell's reason. On Linux both run in
+  full.
 - s51, the git layer (`edit.git`, the pure `git` module): the
   availability probe, the verb table as the only argv path, the pinned
   environment, repository detection, the `status --porcelain=v2
