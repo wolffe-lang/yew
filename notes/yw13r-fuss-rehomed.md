@@ -180,11 +180,13 @@ exactly as the gauntlet's perf steps run it, at trunk `3a9983e`
 | `motion_editor` | 1,074,012,631 / 1,060,999,975 | 101 101 100 | 101 102 101 | 0.7 % | 7.32-7.42x |
 | `query_cur_pos` | 521,180,129 / 519,939,057 | 106 104 105 | 106 104 105 | 2.1 % | 35.20-36.19x |
 
-- **The old baseline is stale both ways.** The VM rows run at 74-87 % of it,
-  so a regression of 15-25 % there would pass. The editor rows run at
-  100-114 %. Two of them (`config_reload_500`, `macrolib_scan_200`)
-  already read their minimum past the +10 % condition and their median
-  within two points of +15 %. The editor rows were measured at yw09's
+- **The old baseline is stale both ways.** A row regresses only when its
+  median and its minimum both cross their bars, so a row can hide a
+  slowdown as large as the bigger of its two margins. The VM rows run at
+  74-97 % of the old numbers, and could slow by 19-52 % unseen (`fib24`
+  52 %, `startup` 19 %). The editor rows run at 100-114 %:
+  `config_reload_500` and `macrolib_scan_200` have 2 % and 1 % of room
+  left, `config_load` 7 %, `query_cur_pos` 8 %, `motion_editor` 14 %. The editor rows were measured at yw09's
   head, before the LSP client landed, so some of that is trunk's own drift.
   The old host can't separate the two now.
 - **The sessions agree.** Every row's three medians are within 3.5 % of
@@ -232,8 +234,9 @@ load 5 to 6:
 - **Host blips are real here.** Two of the three later trunk sessions had
   rows run slow: `startup` at 2.8x its usual median in one, and
   `list_sort` and `macrolib_scan_200` at +14 % in the other. Of all nine
-  sessions, those two had blips, and the head's three had none. Against a baseline from the first three
-  sessions, the `startup` blip alone fails the regression half. So a
+  sessions, those two had blips, and the head's three had none. Against
+  a baseline from the first three sessions, the `startup` blip alone
+  fails the regression half. So a
   record, whose three perf steps must each pass, can go red on a blip
   that is no regression, as yw13's first take did on the old host.
 
@@ -254,7 +257,9 @@ load 5 to 6:
   time would pass.
 
 **Recommended: (A).** It keeps both halves, needs no source change, and
-on this host it separates yw13's 0-3 % from the old baseline's 11-15 %.
+on this host it separates yw13's 0-3 % from the old baseline's 11-15 %
+(the old numbers fail the head on rows where trunk itself has 1-2 % of
+room, and pass slowdowns of up to half on the VM rows).
 If ruled A:
 
 - the committed numbers are re-measured at trunk before the record, three
