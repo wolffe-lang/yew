@@ -55,10 +55,114 @@ hyperthreads, in yew CI's image):
 
 ## Forbidden
 
+- No golden, C test, runtime asset, sagitta file or pin changed. sagitta read
+  at the pin and cited; git's source never read.
+- No label, merge, tag, release or issue. No attribution trailers.
+- Every take ran from a fresh clone at its head, pinned to its commit; every
+  PTY run used a fresh root; every run set its own `HOME`, `XDG_*` and
+  `TMPDIR`.
+- yw13's six commit messages that cite a ruling id are its own, already
+  public on its branch, and were replayed as written; this lane's commits
+  cite none.
+
 ## Inputs, verified
+
+- **Base:** trunk `3a9983ee` (yw15's note), wolf 0.2.36 / lupin 0.1.58,
+  `sagitta.pin` `9ace98c2`; the pins are the same on both sides of the
+  rebase. yw13's head `4912fe0` (111 commits on `1218169e`).
+- **The rebase:** 109 of yw13's commits replayed onto this note's prediction
+  (`595e8ba`): 78 as the same patch, 31 with a conflict or a moved context
+  resolved, and 2 dropped (below). Each file that merged cleanly is
+  identical to a plain three-way merge of the two heads; each of the 27 that
+  conflicted is resolved by hand. The map from each yw13 sha to its rebased
+  sha is in `notes/yw13r-evidence/sha-map.tsv`, so yw13's note, which cites
+  its pre-rebase shas, can be followed on this branch.
+
+### What the rebase changed
+
+The rule: trunk's behaviour, except where yw13 is the change itself.
+
+- **The floating panel is yw11b's.** yw13 had pulled C's `ui/panel.c`
+  forward for F mode's viewer (R-yw13-5); yw11b then ported it whole, with
+  hover's emphasis spans and the document mark. yw13's copy (`53063e9`) and
+  its test (`a8c48ce`) are dropped, and the viewer opens trunk's panel with
+  C's spec: the body copied at open, the title and the `git.ignored` role
+  flagged as set (`03d9542`). The panel's key route, its draw as the last
+  overlay, its close on a window release or retarget and its one command
+  (`ed.ui.panel.move`, trunk's arm 1119) are trunk's; yw13's duplicates of
+  each are gone. F mode's frame keeps yw13's guard before it reads the
+  window (`draw.lu`).
+- **Shared numbers.** LSP rename had taken input kind 2 for the command
+  line's typed answers; F mode's prompt answers as kind 3 (`cmdline.lu`).
+  The picker hosts were already distinct (FUSS 8).
+- **Where both sides added a call, C's order.** A save is
+  `yew_lsp_buffer_save`, then `yew_git_invalidate` (`ed.c:2061-2062`). A
+  window release and a retarget clear the LSP highlight, then close the
+  panel (`ed.c:1171-1172`, `:1192-1203`). The loop's job turn keeps
+  trunk's guard (jobs or a child pending) with yw13's settle inside it,
+  then `lsp_pump` (`loop.c:598-614`). The document menu shows the LSP
+  section, then the git section (`ctxrows.c:405-426`), and
+  `ctxrows_doc_optional_sections_are_absent_not_greyed` asserts both
+  queries with no SKIP left.
+- **Modules.** `mod_enabled` answers for LSP and FUSS; `--version`'s
+  modules line is C's already (`modules: lsp ai fuss plugins`).
+- **The keys help (yw15).** It read F mode and every git command as
+  yw13's and unported. F mode is entered now, so `mode_unported_owner`
+  answers no owner for F and its row carries no status. The git commands
+  still refused are the twelve of `src/mod/git/editor.c`, all s53's (hunks,
+  blame, the diff view, the conflict commands), so a refusal names
+  `sagitta Sprint 53 (git in the editor) (yw13b)` in place of Sprint 51
+  and yw13 (`ed04767`). `edit_keys_help_test` moved first (`3ec1663`): red
+  at that commit on the hunk rows, which still named Sprint 51, and green at
+  `ed04767`.
+- **Lists both sides extended.** The five staged harness trees and the
+  cmdcomp fixture copy `lsp` and `git`; `tools/check-test-cases.txt` keeps
+  trunk's rows and yw13's (trunk's `edit_panel_test` row, by
+  `YEW_PANEL_CASE`, in place of yw13's); `ctxrows_test` keeps every trunk
+  case, and yw13's port case (the FUSS kinds' refusal) is gone with the
+  refusal.
+- **CI.** The oracle job keeps trunk's 270-minute cap on both legs, and
+  yw13's `oracle-cmdcomp` job keeps the linux leg's perf_cmdcomp build and
+  2x gate; the split tests and `nightly-red`'s `needs` name trunk's
+  `macos-unit` and yw13's `oracle-cmdcomp` both.
+- **Unchanged:** yw13's start-up turn for the git layer's first poll
+  (`git_first_poll_deadline`, R-yw13-4) stays, since yw11b deferred the
+  symbol index, which would give that turn, to yw10.
 
 ## Evidence index
 
 ## Rulings asked
+
+## yw13b's contract, what moved (s53, at this lane's merge)
+
+yw13b ports s53 (git in the editor: hunks, blame, the diff view, the
+statusline's branch segment, `ed.group.from_dir`, the cat-file batch and
+the editor runtime). Since yw13's contract named it:
+
+- **Its refusals are its own now.** The twelve `editor.c` commands refuse
+  naming `Sprint 53 (git in the editor) (yw13b)` (`cmd_owner`'s first row);
+  yw13b retires that row as it ports them, and moves
+  `edit_keys_help_test`'s two hunk assertions to a ported status. The
+  three conflict commands hard-error with C's own words (`conflict
+  resolution is not a 1.0 feature (F mode's diff and your editor are)`,
+  `editor.c:1443`, `s53-editor-git.md:464-468`), a scope statement to
+  port as C's message, not an unported refusal.
+- **Its window state lands on trunk's `Win`,** which carries yw11b's panel,
+  request records and highlight; C's `Win` adds `git_sign_gen`,
+  `git_sign_buf`, `git_diff_rows` and `git_diff_intra` (`ed.c:1177-1180`).
+  G62 still holds (a field read through `mut ed` loads the whole root
+  aggregate): measure a native build of `edit_block_test` before and after,
+  as yw13 did, and box what moves it.
+- **Two of yw13's goldens are yw13b's to gate:**
+  `fuss_status_conflict_ignored_incoming` and its `_ascii` twin differ from
+  C only on s53's `▎` sign column (with highlighting off); with yw10's
+  highlighting they join the gated set.
+- **Its 23 `git_editor_*` goldens** (blame 3, diff 2, sign 7, status 11;
+  4 wait on yw10), `test_gitcache`'s seven s53 cases, `test_blamecache`,
+  `test_diffview`, `test_hunk`, `test_diff` and `test_git_editor`, as
+  yw13's inventory lists them (`notes/yw13-evidence/inventory/`).
+- **Hosts and the perf gate** as this note's rulings leave them; the
+  start-up turn (`git_first_poll_deadline`) stays until the symbol index
+  lands.
 
 ## Done-when
