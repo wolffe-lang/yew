@@ -272,6 +272,27 @@ If ruled A:
   names its row, and the record says so; the head is then measured against
   trunk interleaved, as above, before any rerun.
 
+### R-yw13r-2: yew#115's CI caps under this branch's record (asked)
+
+yew#115 (open, on the same trunk) raises the port job's Linux cap to 90
+minutes and scales the goldens selftest's quiet windows by 4. This branch
+makes each release build of the editor longer still (the perf driver's
+build: +21 %), so its own PR run wants those caps. A merge reorders heads:
+whichever of the two lands second is rebased, and a rebased head voids its
+local record.
+
+- **(A) Carry yew#115's three commits here, unchanged, before the record.**
+  They apply cleanly onto this branch, and `ci/macos-split-test.py` and
+  `ci/legs-test.py` pass with yw13's `oracle-cmdcomp` job beside them. If
+  this branch merges first, yew#115 has nothing left to merge; if yew#115
+  merges first, this branch's rebase drops the three as already applied,
+  but the head moves.
+- **(B) Merge yew#115 first, then rebase here before the record.** It is
+  the cleaner history, but it waits on yew#115's own red macOS oracle job.
+
+Recommended: **(A)**, so the record doesn't wait on yew#115, with this
+branch merged before it.
+
 ## yw13b's contract, what moved (s53, at this lane's merge)
 
 yw13b ports s53 (git in the editor: hunks, blame, the diff view, the
