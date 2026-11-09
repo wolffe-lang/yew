@@ -164,6 +164,42 @@ At `5f60ccc` (the code of every later head), in yew CI's image on one
   `ed04767`; `red.sh` at `40cd36c`, three plants and five mutations red by
   name over 11 rows (`notes/yw13r-evidence/red-first/macos-40cd36c.txt`).
 
+### The fifth name on APFS (the macOS take at `7ee9fe4`)
+
+The macOS take at `7ee9fe4` went red in `edit_fusscommands_test`, case 2
+(the filename matrix), on "the snapshot holds a\x80b". The two hostile-path
+cases before it passed.
+
+**The cause is the test, on a file system that refuses the name.** APFS
+refuses a name that is not valid UTF-8: creating `a\x80b` fails with EILSEQ
+("Illegal byte sequence"), so the fifth name is never written there. C's
+case allows exactly this (`fuss_commands.c:591`: only the fifth name may
+fail to materialize). It indexes the blob without a worktree file
+(`index_blob_without_worktree_file`, `:334-364`), and it indexes it again
+after each of its stages (`:604`, `:618`, `:624`). That is needed because,
+with no file in the worktree, `git add -- <name>` stages the removal.
+
+The port indexed the blob once, then staged the name with its own `git add`
+(F mode refuses the name, G59) and never indexed it again. So the status
+had no entry for it, and the snapshot could not hold it. On Linux the name
+is written, so this path never ran there.
+
+**The fix (`ab2b54b`, the test only)** indexes the blob again after that
+add when the file system refused the name, as C does. It also prints that
+it took this path ("the file system refused a\x80b: indexed without a
+worktree file"), so a pass on such a file system names what it ran. It is
+not a SKIP: on APFS the case now runs every check C's case runs there, and
+C's own case passes on the same Mac.
+
+The evidence is in `notes/yw13r-evidence/fusscmds-apfs/`:
+- `red-7ee9fe4-macos.txt`: red on macOS before the fix;
+- `green-ab2b54b-macos.txt`: green on macOS after it, 24 cases run, through
+  the index-only path;
+- `green-ab2b54b-linux.txt`: still green on Linux, 24 cases run, the name
+  written, so the path is not taken;
+- `c-fuss-commands-macos.txt`: C's `fuss_commands` at `sagitta.pin`, 544
+  assertions ok on APFS.
+
 ## Rulings asked
 
 ### R-yw13r-1: the Fletch perf gate's baseline, on a new host (decided: A)
@@ -449,6 +485,8 @@ the editor runtime). Since yw13's contract named it:
 - [x] yew#115's CI caps carried unchanged.
 - [x] README read and refreshed (`1ea45d9`, README only): campaign 09 in
   the status line, the editor's Fletch rows and their re-measured baseline.
+- [x] The filename matrix on APFS: red on macOS at `7ee9fe4`, green at
+  `ab2b54b` on macOS and on Linux, as C's own case is on APFS.
 - [ ] The record at this branch's head, the three plants re-cut onto it and
   red by name, the macOS take, and CI: in the PR body, since a commit after
   them would move the head they were taken at.
