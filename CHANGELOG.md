@@ -5,9 +5,16 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
-### yw13 — FUSS: the git layer and F mode (2026-10-29 to 11-02)
+### yw13 — FUSS: the git layer and F mode (2026-10-29 to 11-09)
 
-- Rebased onto r41q's pin (wolf 0.2.36 / lupin 0.1.58, trunk `1218169e`).
+- Built on r41q's pin (wolf 0.2.36 / lupin 0.1.58, trunk `1218169e`),
+  then rebased onto trunk `3a9983e` (yw13r) with the LSP client, the
+  sweep and the keys help in. The diff viewer opens yw11b's floating
+  panel, so yw13's own copy of it and of `test_panel` are gone; F mode's
+  prompt answers as input kind 3 (LSP rename has 2); the document menu
+  shows the LSP section, then the git section, as C does; the keys help
+  lists F mode as entered, and a git command still refused names Sprint
+  53 and yw13b.
 - s51, the git layer (`edit.git`, the pure `git` module): the
   availability probe, the verb table as the only argv path, the pinned
   environment, repository detection, the `status --porcelain=v2
@@ -23,10 +30,10 @@ The format follows Keep a Changelog; the port has no release yet.
   refresh keeping the collapsed state and the selection, untracked
   directories on demand, the drawer, the typed confirmations, the
   commit editor, the pickers, the actions palette and the diff viewer
-  over the floating panel (pulled forward, R-yw13-5); the three FUSS
-  context-menu builders (R-yw06-11 closed); `test_fussdrawer` 27,
-  `test_fussjump` 13, `test_ctxrows`' FUSS cases, `test_fusstheme`,
-  `test_panel` 18, `fuss_commands.c`'s 24 over real git.
+  over the floating panel; the three FUSS context-menu builders
+  (R-yw06-11 closed); `test_fussdrawer` 27, `test_fussjump` 13,
+  `test_ctxrows`' FUSS cases, `test_fusstheme`, `fuss_commands.c`'s 24
+  over real git.
 - Goldens: ten FUSS cases gated by name; the 26 that wait on yw10's
   highlighting recorded, 24 of them matched cell for cell against C with
   highlighting off (R-yw13-1/2). G59–G62 met by name.
