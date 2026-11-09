@@ -15,6 +15,12 @@ The format follows Keep a Changelog; the port has no release yet.
   shows the LSP section, then the git section, as C does; the keys help
   lists F mode as entered, and a git command still refused names Sprint
   53 and yw13b.
+- The Fletch perf gate's regression baseline is re-measured at trunk on
+  the lane host that replaced the old one: five quiet sessions on one
+  P-core block, each row the maximum over its sessions within 5 % of the
+  row's median (10 % for the two shortest), so a host blip drops a row of
+  one session, not the set. The record's perf steps wait for a quiet host
+  before they measure.
 - s51, the git layer (`edit.git`, the pure `git` module): the
   availability probe, the verb table as the only argv path, the pinned
   environment, repository detection, the `status --porcelain=v2
