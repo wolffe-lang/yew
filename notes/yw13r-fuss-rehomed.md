@@ -131,9 +131,42 @@ The rule: trunk's behaviour, except where yw13 is the change itself.
 
 ## Evidence index
 
+### The dev-green run (no record is claimed from it)
+
+At `5f60ccc` (the code of every later head), in yew CI's image on one
+6-CPU block of the new host, from a fresh clone:
+
+- the front end of `src/yew.lu` clean; `check-fmt` green (a first take
+  went red there on `edit_keys_help_test.lu`, fixed by `5f60ccc`);
+- **the whole unit set natively: 232 of 232 test files green** (two takes
+  of 116), every SKIP by name (s53's diff rows for yw13b, G60's terminal
+  legs, the image's missing fish, the torture shim, the symbol index for
+  yw11 and yw10, the syntax engine for yw10, the profiler), none for want
+  of C's fake clipboard tool or language server;
+- **the checked machine** over the 23 test files the branch changes: 20
+  green (per case where `tools/check-test-cases.txt` lists them), 3 past the
+  step budget as whole files and green natively (`edit_draw_test`,
+  `edit_job_test`, `edit_modes_test`);
+- yw13's 36 FUSS goldens: the ten gated ok, 24 of the 26 that wait on yw10
+  equal to C with highlighting off (`fuss_diff_viewer_restores_layout`
+  among them, the viewer over trunk's panel), the two conflict cases on
+  s53's sign column, as before;
+- the porcelain differential: 40 of 40 streams and 2,461 of 2,461 prefixes
+  equal;
+- **CI's gated PTY cases: 320 of 320.** The take's own step went red on
+  two, `lsp_feat_rename_diff` and `_refusal` ("fake LSP did not become
+  ready"): C's rename cases find the fake server beside the editor binary
+  (`tests/pty/registry.c:9857-9858`), which ci.yml's LSP features gate
+  copies there and the take's step had not. With it copied, both pass, and
+  the LSP rows are green beside them; the record's PTY step copies it.
+- On macOS (arm64), natively: `edit_keys_help_test`, `edit_ctxrows_test`,
+  `edit_modes_test`, `edit_panel_test` and `edit_fussdrawer_test` at
+  `ed04767`; `red.sh` at `40cd36c`, three plants and five mutations red by
+  name over 11 rows (`notes/yw13r-evidence/red-first/macos-40cd36c.txt`).
+
 ## Rulings asked
 
-### R-yw13r-1: the Fletch perf gate's baseline, on a new host (asked)
+### R-yw13r-1: the Fletch perf gate's baseline, on a new host (decided: A)
 
 **The gate** (`tools/fl-headless/compare.py`) has two halves.
 
@@ -256,6 +289,8 @@ load 5 to 6:
   16 of the 17 rows would have no gate at all, and a VM slowed to twice its
   time would pass.
 
+**Decided: (A)**, with the rule below committed with the numbers.
+
 **Recommended: (A).** It keeps both halves, needs no source change, and
 on this host it separates yw13's 0-3 % from the old baseline's 11-15 %
 (the old numbers fail the head on rows where trunk itself has 1-2 % of
@@ -272,7 +307,7 @@ If ruled A:
   names its row, and the record says so; the head is then measured against
   trunk interleaved, as above, before any rerun.
 
-### R-yw13r-2: yew#115's CI caps under this branch's record (asked)
+### R-yw13r-2: yew#115's CI caps under this branch's record (decided: A)
 
 yew#115 (open, on the same trunk) raises the port job's Linux cap to 90
 minutes and scales the goldens selftest's quiet windows by 4. This branch
@@ -291,7 +326,9 @@ local record.
   the cleaner history, but it waits on yew#115's own red macOS oracle job.
 
 Recommended: **(A)**, so the record doesn't wait on yew#115, with this
-branch merged before it.
+branch merged before it. **Decided A:** the three are carried unchanged
+(`09335f0`, `fe8edc7`, `7d6d2b7`, each the same patch as yew#115's
+`c06fc57`, `03171fd`, `c8443c7`), and this branch merges first.
 
 ## yw13b's contract, what moved (s53, at this lane's merge)
 
