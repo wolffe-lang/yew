@@ -222,9 +222,10 @@ exactly as the gauntlet's perf steps run it, at trunk `3a9983e`
   left, `config_load` 7 %, `query_cur_pos` 8 %, `motion_editor` 14 %. The editor rows were measured at yw09's
   head, before the LSP client landed, so some of that is trunk's own drift.
   The old host can't separate the two now.
-- **The sessions agree.** Every row's three medians are within 3.5 % of
-  each other, except the two shortest rows: `startup` (4.9 %) and
-  `parse_only` (13 %, a 0.24 ms row whose first session ran slow).
+- **The sessions agree** in this set: every row's three medians are within
+  3.5 % of each other, except the two shortest rows, `startup` (4.9 %)
+  and `parse_only` (13 %, a 0.24 ms row whose first session ran slow).
+  Later sets show this is not typical (R-yw13r-3).
 - **The ratio half** reads as it did on the old host: the sixteen named
   rows are over 2x, and `parse_only` is under it. At trunk,
   `macrolib_scan_200` reads 2.01-2.06x and is not named there, so trunk
@@ -306,6 +307,46 @@ If ruled A:
   other blocks' work) before it measures. A perf step that still goes red
   names its row, and the record says so; the head is then measured against
   trunk interleaved, as above, before any rerun.
+
+### R-yw13r-3: the baseline's agreement rule, measured (asked)
+
+**A correction to R-yw13r-1.** It claimed the sessions agree within 3.5 %
+on every row but the two shortest. That was one set. Over the 18 quiet
+trunk sessions taken on one block (load 1.5-3 for the twelve taken under
+the rule):
+
+- ten have no row more than 5 % (10 % for `startup` and `parse_only`)
+  from that row's median;
+- the other eight each have one or two rows slow by 5-15 %, on rows that
+  change from session to session (`macrolib_scan_200` 4 times,
+  `map_heavy` twice, and `startup`, `parse_only`, `fib27`,
+  `strbuild_join`, `list_sort`, `config_load` and `config_reload_500`
+  once each). One `startup` session ran at 2.7x its median.
+- The VM-heavy rows `fib24`, `map10k`, `motion100k`, `motion_dispatch`,
+  `strbuild_concat`, `motion_editor` and `query_cur_pos` never left 3.3 %.
+
+So a set of three passes the ruled 5 % rule only 9 % of the time (72 of
+the 816 sets of three these 18 sessions make). Four sets were taken under
+the rule, and none was kept; one failed on a single row at 5.4 %. Against
+a baseline from any three clean sessions, the regression half (+15 %
+median and +10 % min, both) would have failed one of the 18 sessions: the
+2.7x `startup` one. The gate's own bar absorbs this host's noise; the 5 %
+keep rule does not.
+
+- **(a) Keep the rule:** retake sets until one is kept. About one set in
+  eleven passes; each set is three takes of the block, minutes each when
+  it is free.
+- **(b) Widen it to 10 % (15 % for the two shortest):** half the sets
+  pass. A kept set can carry a blip of up to 10 % into a row's maximum,
+  which loosens that row's gate by as much.
+- **(c) Keep 5 %, but reject by row, not by set:** take five sessions;
+  each row's baseline is the maximum over the sessions within 5 % (10 %)
+  of that row's median of the five, and the set is kept only if every row
+  has three such sessions. A blip costs one row of one session, not the
+  set, and the numbers stay as tight as the rule meant.
+
+Recommended: **(c)**. Under (a) a loop retakes sets meanwhile, ten at most,
+and stops at the first kept set.
 
 ### R-yw13r-2: yew#115's CI caps under this branch's record (decided: A)
 
