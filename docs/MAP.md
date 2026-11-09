@@ -85,7 +85,7 @@ on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 | `src/syn/` | 14 | 13,064 | yw10 | `syn` | none known |
 | `src/mod/lsp/` | 21 | 11,283 | **yw11a** (json, jsonrpc, client, sync, diag and lsp.c's boundary: the pure halves in `lsp` — `lsp.json`, `lsp.jsonrpc`, `lsp.client`, `lsp.sync` — and the halves that take the `Ed` in `edit` — `edit.lsp_client`, `edit.lsp_diag`, `edit.lsp`; the language by path only, `edit.syn_paths`, generated from the pin, until yw10), **yw11b2** (features, rename, pickers, highlight: the parsers in `lsp.features`, the halves that take the `Ed` in `edit.lsp_features`, `edit.lsp_pickers`, `edit.lsp_highlight`, `edit.lsp_rename`; a request's record kept in its window, C's callbacks a kind matched in one place), yw11b1 (completion) | `lsp` | none met: sagitta's JSON is ported (its writer fixes the wire bytes), not `std.json`; incremental `didChange` is logged at the text choke point and replayed into the document |
 | `src/mod/ai/` | 37 | 12,093 | yw12 | `ai` | an HTTP/1.1 client over `std.net` (the port's own; a std candidate, G9) |
-| `src/mod/git/` | 19 | 15,680 | **yw13** (s51's layer: `git.c`'s probe, verbs, environment, detection, cache and taxonomy as `edit.git`; `porcelain.c`'s status grammar and `fusstree.c` as the pure `git` module; s52's F mode: `fussmode.c` as `edit.fussmode`, `edit.fusscmds`, `edit.fussdraw`; pulled forward, R-yw13-3..5: the statusline's git badge, the editor clock anchor, `ui/panel.c` for the diff viewer, `ws/symwalk.c`'s discovery notice), yw13b (s53: hunks, blame, the diff view, the cat-file batch, the editor runtime) | `git` (pure), `edit` | G59 (no byte argv: a non-UTF-8 path cannot reach git), G60 (no pty opener: the handover's terminal legs), G61 (the process-relative clock), G62 (a field read loads the whole `Ed`: `ed.git` and `ed.fuss` boxed) |
+| `src/mod/git/` | 19 | 15,680 | **yw13** (s51's layer: `git.c`'s probe, verbs, environment, detection, cache and taxonomy as `edit.git`; `porcelain.c`'s status grammar and `fusstree.c` as the pure `git` module; s52's F mode: `fussmode.c` as `edit.fussmode`, `edit.fusscmds`, `edit.fussdraw`; pulled forward, R-yw13-3..4: the statusline's git badge, the editor clock anchor, `ws/symwalk.c`'s discovery notice; the diff viewer opens yw11b's `edit.panel`, R-yw13-5), yw13b (s53: hunks, blame, the diff view, the cat-file batch, the editor runtime) | `git` (pure), `edit` | G59 (no byte argv: a non-UTF-8 path cannot reach git), G60 (no pty opener: the handover's terminal legs), G61 (the process-relative clock), G62 (a field read loads the whole `Ed`: `ed.git` and `ed.fuss` boxed) |
 | `src/mod/plug/` | 13 | 7,030 | yw14 | `plug` | none known |
 | `src/mod/mods.c` | 2 | 81 | yw01 | `util.base` (`MODULES_LINE`) | the port is always the full build: `MODULES=""` is a sagitta build shape, not a port shape (a ruling if a `minimal` wolf yew is ever wanted) |
 
@@ -856,12 +856,18 @@ maintainer.
   `src/edit_symwalk_test.lu`'s three rows), the walk and the `ls-files`
   job yw11's; (B) port the walk now. The buffer index's start-up turn
   (`loop.c:244-279`) is yw11's too: until it lands, `git_first_poll_deadline`
-  asks for that turn, and yw11 retires it with the index.
+  asks for that turn, and the index's lane retires it. yw11b deferred the
+  index to yw10's syntax, so at the rebase onto trunk `3a9983e` (yw13r) the
+  turn is still `git_first_poll_deadline`'s.
 - **R-yw13-5 — the floating panel, implemented A.** F mode's diff
   viewer is C's `ui/panel.c` (Sprint 47, yw11's campaign). (A) port the
   panel (`edit.panel`; `test_panel.c`'s eighteen cases in
   `src/edit_panel_test.lu`, LSP's emphasis spans and `yew_panel_mark`
-  SKIP by name as yw11's); (B) a viewer of the port's own.
+  SKIP by name as yw11's); (B) a viewer of the port's own. **Superseded
+  at the rebase onto trunk `3a9983e` (yw13r):** yw11b ported the panel
+  whole (`edit.panel`, every one of `test_panel.c`'s cases, the emphasis
+  and the document mark), so yw13's copy and its test were dropped and
+  the viewer opens yw11b's panel with C's spec.
 - **R-yw13-6 — F mode's opening frame before the loop, implemented A**
   (G61). (A) a frame entered while `ed.now_ms` is still 0 ends at the
   loop's first turn, what C's `0 + 16` against a boot-relative clock
