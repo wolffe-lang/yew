@@ -6,6 +6,12 @@
 # typechange, a submodule in each of its states, ignored files and
 # directories, and paths that are not UTF-8. Deterministic as mkrepo.sh
 # is: no host git configuration, fixed identities and dates.
+#
+# A file system that refuses a name that is not UTF-8 (APFS answers
+# EILSEQ) cannot hold the two non-UTF-8 records (a rename and an untracked
+# file, which needs the file): there they are left out, the rest is built
+# as everywhere else, and DEST/raw-names-refused holds the shell's words
+# for the refusal, so the test SKIPs those two checks by name.
 set -eu
 CDPATH=
 export CDPATH
@@ -65,6 +71,14 @@ git_init()
 
 mkdir -p "$dest"
 dest_abs=$(cd "$dest" && pwd)
+raw_probe=$dest_abs/$(printf 'probe\376')
+if raw_err=$( (printf 'probe\n' >"$raw_probe") 2>&1 ); then
+    raw_names=yes
+    rm -f "$raw_probe"
+else
+    raw_names=no
+    printf '%s\n' "$raw_err" >"$dest_abs/raw-names-refused"
+fi
 
 # --- every unmerged XY ------------------------------------------------
 # UU both modified, AA both added, UD modified here and deleted there, DU
@@ -117,7 +131,9 @@ git_init "$dest_abs/mix"
     printf 'deleted in the worktree\n' >gone-worktree.txt
     printf 'deleted in the index\n' >gone-index.txt
     printf 'regular before symlink\n' >typechange.txt
-    printf 'bytes\n' >"$(printf 'bad\376name.txt')"
+    if [ "$raw_names" = yes ]; then
+        printf 'bytes\n' >"$(printf 'bad\376name.txt')"
+    fi
     git add -- .
     git -c protocol.file.allow=always submodule add -q ../subsrc sub \
         >/dev/null 2>&1
@@ -135,8 +151,10 @@ git_init "$dest_abs/mix"
     ln -s copy-src.txt typechange.txt
     git add -- typechange.txt
     # A non-UTF-8 path renamed in the index, and one left untracked.
-    git mv -- "$(printf 'bad\376name.txt')" "$(printf 'bad\375renamed.txt')"
-    printf 'untracked bytes\n' >"$(printf 'raw\377.txt')"
+    if [ "$raw_names" = yes ]; then
+        git mv -- "$(printf 'bad\376name.txt')" "$(printf 'bad\375renamed.txt')"
+        printf 'untracked bytes\n' >"$(printf 'raw\377.txt')"
+    fi
     printf 'untracked\n' >untracked.txt
     printf 'ignored\n' >ignored.log
     mkdir ignored-dir
