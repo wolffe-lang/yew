@@ -10,13 +10,24 @@ yw13 split the linux oracle leg too: its perf_cmdcomp harness build and the
 linux oracle leg runs; macOS still builds the harness in oracle for
 macos-perf. The controls also refuse the harness built on linux in both
 jobs and the gate dropped from the new job.
+
+yw13s: the git layer and F mode made the editor's builds heavier, and run
+42921677875 (yew#120 at 157841a) cut against-c-1 at its 120-minute cap on
+both hosts: linux fuzz_cmdparse 61.3 minutes, then fuzz_panes cut at 57.8;
+macOS fuzz_cmdparse 55.1, fuzz_state 16.5, fuzz_mouse 3.7, then fuzz_panes
+cut at 43.7. fuzz_panes is now a family of its own on both hosts
+(against-c-4 on linux, against-c-3 on macOS). The linux harness build took
+55.4 minutes on that run and was cut at its 60-minute step cap on run
+42922808966 (60.2); its step cap is 90 and its job's 120. Every cap is at
+least 30 % over the slowest time measured for what it holds (a cut time is
+a lower bound, so the cap clears it by more).
 """
 from pathlib import Path
 import re
 
 FUZZ = {
     "fuzz_cmdparse": ("against-c-1", "tools/run-fuzz-cmdparse --campaign --against-oracle"),
-    "fuzz_panes": ("against-c-1", "tools/run-fuzz-panes --campaign --against-oracle"),
+    "fuzz_panes": ("against-c-3", "tools/run-fuzz-panes --campaign --against-oracle"),
     "fuzz_state": ("against-c-1", "tools/run-fuzz-state --native --campaign --against-oracle --sessions=2000"),
     "fuzz_mouse": ("against-c-1", "tools/run-fuzz-mouse --native --campaign --against-oracle"),
     "fuzz_tabs": ("against-c-2", "tools/run-fuzz-tabs --campaign --against-oracle"),
@@ -31,6 +42,23 @@ PERF = {
     "panes, many buffers": ("editor", "tools/run-perf-panes-tabs", 35),
     "the job stream": ("components", "tools/run-perf-jobstream", 10),
 }
+
+
+# Minutes measured on runs 42921677875 and 42922808966 for what each family
+# holds now (setup included); a family whose step was cut counts its cut.
+MEASURED = {
+    ("fuzz", "against-c-1"): 1.0 + 61.3,             # C's drivers, fuzz_cmdparse
+    ("fuzz", "against-c-4"): 1.0 + 57.8,             # fuzz_panes, cut: a lower bound
+    ("macos-fuzz", "against-c-1"): 0.8 + 55.1 + 16.5 + 3.7,
+    ("macos-fuzz", "against-c-3"): 0.8 + 43.7,       # fuzz_panes, cut: a lower bound
+}
+CMDCOMP_BUILD = 60.2                                 # cut at the old 60: a lower bound
+
+
+def job_cap(block):
+    m = re.search(r"^    timeout-minutes: (\d+)$", block, re.M)
+    assert m, "no job cap"
+    return int(m.group(1))
 
 
 def job(text, key):
@@ -54,7 +82,7 @@ def validate(text):
     linux = steps(oracle) + steps(cmdcomp)
     assert "    needs: legs\n" in fuzz
     assert "    needs: [legs, oracle]\n" in perf
-    assert "family: [against-c-1, against-c-2]" in fuzz
+    assert "family: [against-c-1, against-c-2, against-c-3]" in fuzz
     assert "family: [editor, components]" in perf
     for block in (fuzz, perf):
         assert "    runs-on: macos-latest\n" in block
@@ -73,6 +101,15 @@ def validate(text):
     cap = re.search(r"^    timeout-minutes: \$\{\{ matrix\.os == 'macos-latest' && (\d+) \|\| (\d+) \}\}$", port, re.M)
     assert cap is not None and int(cap.group(1)) == 240
     assert int(cap.group(2)) >= 90
+    # yw13s: fuzz_panes alone in its family on both hosts, fuzz_cmdparse
+    # without it, every cap at least 30 % over the measured time.
+    linux_fuzz = job(text, "fuzz")
+    assert "        family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4]\n" in linux_fuzz
+    for name, fam in (("fuzz_cmdparse", "against-c-1"), ("fuzz_panes", "against-c-4")):
+        lb = [b for n, b in steps(linux_fuzz) if n.startswith(name + ",")]
+        assert len(lb) == 1 and "matrix.family == '" + fam + "'" in lb[0], "linux " + name
+    for key, minutes in MEASURED.items():
+        assert job_cap(job(text, key[0])) >= 1.3 * minutes, key
     fs = [(n, b) for n, b in steps(fuzz) if n.startswith("fuzz_")]
     assert len(fs) == len(FUZZ) == 7
     assert not any(n.startswith("fuzz_") for n, _ in steps(oracle))
@@ -107,7 +144,10 @@ def validate(text):
     assert len(built) == 1 and "if: matrix.port && runner.os == 'macOS'\n" in built[0], "linux harness built twice"
     moved = [b for n, b in steps(cmdcomp) if n == "build perf_cmdcomp harnesses (hard gate)"]
     assert len(moved) == 1 and "tools/run-perf-cmdcomp --build-only\n" in moved[0]
-    assert "python3 -I tools/check-perf-cmdcomp-build\n" in moved[0] and "        timeout-minutes: 60\n" in moved[0]
+    step_cap = re.search(r"^        timeout-minutes: (\d+)$", moved[0], re.M)
+    assert "python3 -I tools/check-perf-cmdcomp-build\n" in moved[0] and step_cap is not None
+    assert int(step_cap.group(1)) >= 1.3 * CMDCOMP_BUILD and int(step_cap.group(1)) == 90
+    assert job_cap(cmdcomp) >= int(step_cap.group(1)) + 15 + 10, "the job's cap holds the build, the gate and setup"
     assert "    needs: legs\n" in cmdcomp and "    runs-on: ubuntu-latest\n" in cmdcomp
     assert "    if: ${{ contains(needs.legs.outputs.matrix_oracle, 'ubuntu-latest') }}\n" in cmdcomp
     assert "actions/upload-artifact@v4" in oracle and "if-no-files-found: error" in oracle
@@ -124,7 +164,7 @@ def main():
     validate(text)
     mutations = [
         ("--sessions=2000", "--sessions=20"),
-        ("family: [against-c-1, against-c-2]", "family: [against-c-1]"),
+        ("family: [against-c-1, against-c-2, against-c-3]", "family: [against-c-1, against-c-2]"),
         ("family: [editor, components]", "family: [editor, components, extra]"),
         ('test "$(cat target/macos-oracle-head)" = "$(git rev-parse HEAD)"', "true"),
         ("        timeout-minutes: 60\n", "        timeout-minutes: 15\n"),
@@ -154,7 +194,30 @@ def main():
         except AssertionError:
             continue
         raise AssertionError("control accepted regression: " + old)
-    print("macos-split-test: seven campaigns, six measurements, five added jobs and seven negative controls PASS")
+    # yw13s's controls: fuzz_panes back beside fuzz_cmdparse on linux, and
+    # the harness build's step cap back at 60.
+    for old, new in (
+        ("family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4]", "family: [port, port-2, against-c-1, against-c-2, against-c-3]"),
+        ("        if: ${{ !cancelled() && matrix.family == 'against-c-4' }}\n", "        if: ${{ !cancelled() && matrix.family == 'against-c-1' }}\n"),
+    ):
+        assert old in text, old
+        broken = text.replace(old, new, 1)
+        try:
+            validate(broken)
+        except AssertionError:
+            continue
+        raise AssertionError("control accepted regression: " + old)
+    start = text.index("  oracle-cmdcomp:\n")
+    old = "      - name: build perf_cmdcomp harnesses (hard gate)\n        timeout-minutes: 90\n"
+    assert old in text[start:], old
+    broken = text[:start] + text[start:].replace(old, old.replace("90", "60"), 1)
+    try:
+        validate(broken)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("control accepted regression: the harness build's cap at 60")
+    print("macos-split-test: seven campaigns, six measurements, five added jobs, the measured caps and ten negative controls PASS")
 
 
 if __name__ == "__main__":
