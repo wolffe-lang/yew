@@ -21,6 +21,13 @@ cut at 43.7. fuzz_panes is now a family of its own on both hosts
 42922808966 (60.2); its step cap is 90 and its job's 120. Every cap is at
 least 30 % over the slowest time measured for what it holds (a cut time is
 a lower bound, so the cap clears it by more).
+
+yw13s, again: runs 42996095311 and 42996771451 cut linux against-c-2 at
+its 120 (fuzz_tabs 66.7, then fuzz_groups cut at 52.3) and ran macOS
+against-c-2 in 119 (fuzz_tabs 55.1, fuzz_groups 56.8). fuzz_groups is a
+family of its own on both hosts (against-c-5 on linux, against-c-4 on
+macOS). ci/legs-test.py's L6 holds every job's cap against its slowest
+measured time.
 """
 from pathlib import Path
 import re
@@ -31,7 +38,7 @@ FUZZ = {
     "fuzz_state": ("against-c-1", "tools/run-fuzz-state --native --campaign --against-oracle --sessions=2000"),
     "fuzz_mouse": ("against-c-1", "tools/run-fuzz-mouse --native --campaign --against-oracle"),
     "fuzz_tabs": ("against-c-2", "tools/run-fuzz-tabs --campaign --against-oracle"),
-    "fuzz_groups": ("against-c-2", "tools/run-fuzz-groups --campaign --against-oracle"),
+    "fuzz_groups": ("against-c-4", "tools/run-fuzz-groups --campaign --against-oracle"),
     "fuzz_gitignore": ("against-c-2", "tools/run-fuzz-gitignore --native --campaign --against-oracle"),
 }
 PERF = {
@@ -49,16 +56,23 @@ PERF = {
 MEASURED = {
     ("fuzz", "against-c-1"): 1.0 + 61.3,             # C's drivers, fuzz_cmdparse
     ("fuzz", "against-c-4"): 1.0 + 57.8,             # fuzz_panes, cut: a lower bound
+    ("fuzz", "against-c-2"): 1.0 + 66.7,             # fuzz_tabs
+    ("fuzz", "against-c-5"): 1.0 + 55.1,             # fuzz_groups
+    ("macos-fuzz", "against-c-2"): 0.8 + 57.1 + 6.9, # fuzz_tabs, fuzz_gitignore
+    ("macos-fuzz", "against-c-4"): 0.8 + 56.8,       # fuzz_groups
     ("macos-fuzz", "against-c-1"): 0.8 + 55.1 + 16.5 + 3.7,
     ("macos-fuzz", "against-c-3"): 0.8 + 43.7,       # fuzz_panes, cut: a lower bound
 }
 CMDCOMP_BUILD = 60.2                                 # cut at the old 60: a lower bound
 
 
-def job_cap(block):
+def job_cap(block, family=None):
     m = re.search(r"^    timeout-minutes: (\d+)$", block, re.M)
-    assert m, "no job cap"
-    return int(m.group(1))
+    if m:
+        return int(m.group(1))
+    e = re.search(r"^    timeout-minutes: \$\{\{ matrix\.family == '([^']+)' && (\d+) \|\| (\d+) \}\}$", block, re.M)
+    assert e, "no job cap"
+    return int(e.group(2)) if family == e.group(1) else int(e.group(3))
 
 
 def job(text, key):
@@ -82,15 +96,17 @@ def validate(text):
     linux = steps(oracle) + steps(cmdcomp)
     assert "    needs: legs\n" in fuzz
     assert "    needs: [legs, oracle]\n" in perf
-    assert "family: [against-c-1, against-c-2, against-c-3]" in fuzz
+    assert "family: [against-c-1, against-c-2, against-c-3, against-c-4]" in fuzz
     assert "family: [editor, components]" in perf
     for block in (fuzz, perf):
         assert "    runs-on: macos-latest\n" in block
-        assert "    timeout-minutes: 120\n" in block
+        assert re.search(r"^    timeout-minutes: (\d+)$", block, re.M) and job_cap(block) >= 120
         assert "      fail-fast: false\n" in block
         assert len(re.findall(r"^        family:", block, re.M)) == 1
         assert "include:" not in block and "exclude:" not in block
-    assert "    timeout-minutes: 270\n" in oracle
+    # yw13s: 310. The linux leg took 231 minutes in the nightly 42862922049
+    # (270 left 17 %); macOS 198.
+    assert "    timeout-minutes: 310\n" in oracle
     # yw11b: the port job's Linux legs are its `tools/build --all` and a
     # minute of checks. At 8967813 (run 42362461870) the ubuntu leg was cut
     # at its 60-minute cap mid-build on the first attempt and took 49
@@ -99,17 +115,18 @@ def validate(text):
     # again; macOS keeps its 240.
     port = job(text, "port")
     cap = re.search(r"^    timeout-minutes: \$\{\{ matrix\.os == 'macos-latest' && (\d+) \|\| (\d+) \}\}$", port, re.M)
-    assert cap is not None and int(cap.group(1)) == 240
+    # yw13s: macOS 250 (its leg took 189 in the nightly 42862922049).
+    assert cap is not None and int(cap.group(1)) == 250
     assert int(cap.group(2)) >= 90
     # yw13s: fuzz_panes alone in its family on both hosts, fuzz_cmdparse
     # without it, every cap at least 30 % over the measured time.
     linux_fuzz = job(text, "fuzz")
-    assert "        family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4]\n" in linux_fuzz
-    for name, fam in (("fuzz_cmdparse", "against-c-1"), ("fuzz_panes", "against-c-4")):
+    assert "        family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4, against-c-5]\n" in linux_fuzz
+    for name, fam in (("fuzz_cmdparse", "against-c-1"), ("fuzz_panes", "against-c-4"), ("fuzz_tabs", "against-c-2"), ("fuzz_groups", "against-c-5")):
         lb = [b for n, b in steps(linux_fuzz) if n.startswith(name + ",")]
         assert len(lb) == 1 and "matrix.family == '" + fam + "'" in lb[0], "linux " + name
     for key, minutes in MEASURED.items():
-        assert job_cap(job(text, key[0])) >= 1.3 * minutes, key
+        assert job_cap(job(text, key[0]), key[1]) >= 1.3 * minutes, key
     fs = [(n, b) for n, b in steps(fuzz) if n.startswith("fuzz_")]
     assert len(fs) == len(FUZZ) == 7
     assert not any(n.startswith("fuzz_") for n, _ in steps(oracle))
@@ -164,7 +181,7 @@ def main():
     validate(text)
     mutations = [
         ("--sessions=2000", "--sessions=20"),
-        ("family: [against-c-1, against-c-2, against-c-3]", "family: [against-c-1, against-c-2]"),
+        ("family: [against-c-1, against-c-2, against-c-3, against-c-4]", "family: [against-c-1, against-c-2, against-c-3]"),
         ("family: [editor, components]", "family: [editor, components, extra]"),
         ('test "$(cat target/macos-oracle-head)" = "$(git rev-parse HEAD)"', "true"),
         ("        timeout-minutes: 60\n", "        timeout-minutes: 15\n"),
@@ -197,7 +214,7 @@ def main():
     # yw13s's controls: fuzz_panes back beside fuzz_cmdparse on linux, and
     # the harness build's step cap back at 60.
     for old, new in (
-        ("family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4]", "family: [port, port-2, against-c-1, against-c-2, against-c-3]"),
+        ("family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4, against-c-5]", "family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4]"),
         ("        if: ${{ !cancelled() && matrix.family == 'against-c-4' }}\n", "        if: ${{ !cancelled() && matrix.family == 'against-c-1' }}\n"),
     ):
         assert old in text, old
