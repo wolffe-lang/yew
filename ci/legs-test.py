@@ -16,8 +16,9 @@
   L4  the wiring of .github/workflows/ci.yml: `legs` is the first job and
       runs this file before ci/legs.py; `port` and `oracle` need it and
       take their hosts from it, read with a default, with no host list of
-      their own; `unit` (the Linux unit lanes in six shards, yw09) and `fuzz`
-      (the Linux fuzzers in five families, yw09) need it and run on ubuntu;
+      their own; `unit` (the Linux unit lanes in eight shards, yw13s) and
+      `fuzz` (the Linux fuzzers in six families, yw13s) need it and run on
+      ubuntu;
       `macos-unit` (yw14: the macOS unit lanes in eight shards, 180 minutes each) needs it and
       runs on macOS exactly where the port's macOS leg runs, the port job
       running neither lane; both unit jobs build C's fake clipboard tool first
@@ -136,11 +137,22 @@ for j in ("port", "oracle"):
     say("    needs: legs\n" in b and ("        include: ${{ fromJSON(needs.legs.outputs.matrix_%s || '[]') }}\n" % j) in b
         and "    runs-on: ${{ matrix.os }}\n" in b and not re.search(r"^          - os: ", b, re.M),
         "L4 %s needs the legs and takes its hosts from them, with a default, and no host list of its own" % j)
+# yw13s: eight shards, as macOS has. The git layer and F mode made the
+# editor's test builds heavier: run 42921677875 (yew#120 at 157841a) cut
+# shard 4/6 at its 120-minute cap (wolf test 57 minutes, the native lane
+# 63 when cut) and ran 5/6 in 114. That run's per-file times, the files
+# its cut lane never reached taken from the other lane at the shard's own
+# ratio, put the longest eight-way shard at 77.6 minutes; the 120 cap
+# stays, 55 % over it (at least 30 % over the slowest measured).
+UNIT_MEASURED_8 = 77.6
 un = blocks["unit"]
+ucap = re.search(r"^    timeout-minutes: (\d+)$", un, re.M)
 say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-latest$", un, re.M) is not None
-    and "        shard: [1, 2, 3, 4, 5, 6]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/6\n" in un
-    and "run: tools/check-test --native --shard ${{ matrix.shard }}/6\n" in un,
-    "L4 unit needs the legs and runs both unit lanes in six shards on ubuntu")
+    and "        shard: [1, 2, 3, 4, 5, 6, 7, 8]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/8\n" in un
+    and "run: tools/check-test --native --shard ${{ matrix.shard }}/8\n" in un
+    and "    name: unit (linux x86-64, shard ${{ matrix.shard }}/8)\n" in un
+    and ucap is not None and int(ucap.group(1)) >= 1.3 * UNIT_MEASURED_8,
+    "L4 unit needs the legs and runs both unit lanes in eight shards on ubuntu, capped at least 30 % over the longest measured eight-way shard")
 # yw14 (yew#49): the macOS unit lanes left the port job for macos-unit, eight
 # round-robin shards on macOS (the partition the Linux unit job uses), run
 # exactly where the port's macOS leg runs, each capped at 180 minutes: at
@@ -162,9 +174,9 @@ say(all("run: tools/build-fakeclip --cc " in b and b.index("tools/build-fakeclip
     "L4 unit and macos-unit build the fake clipboard tool first and check no clipboard row SKIPped for it last")
 fz = blocks["fuzz"]
 say("    needs: legs\n" in fz and re.search(r"^    runs-on: ubuntu-latest$", fz, re.M) is not None
-    and "        family: [port, port-2, against-c-1, against-c-2, against-c-3]\n" in fz
+    and "        family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4]\n" in fz
     and "        if: matrix.family != 'port' && matrix.family != 'port-2'\n        run: tools/oracle --cc gcc --build-only\n" in fz,
-    "L4 fuzz needs the legs and runs five fuzzer families on ubuntu, C's drivers built for three")
+    "L4 fuzz needs the legs and runs six fuzzer families on ubuntu, C's drivers built for four")
 # Every macOS campaign is still a Linux fuzz step. The oracle campaigns now
 # live in macos-fuzz; the nightly port-only fuzzers and unit steps stay put.
 moved = [m.group(1) for j in ("port", "oracle") for m in re.finditer(
