@@ -17,7 +17,7 @@
       runs this file before ci/legs.py; `port` and `oracle` need it and
       take their hosts from it, read with a default, with no host list of
       their own; `unit` (the Linux unit lanes in eight shards, yw13s) and
-      `fuzz` (the Linux fuzzers in six families, yw13s) need it and run on
+      `fuzz` (the Linux fuzzers in seven families, yw13s) need it and run on
       ubuntu;
       `macos-unit` (yw14: the macOS unit lanes in eight shards, 180 minutes each) needs it and
       runs on macOS exactly where the port's macOS leg runs, the port job
@@ -140,11 +140,10 @@ for j in ("port", "oracle"):
 # yw13s: eight shards, as macOS has. The git layer and F mode made the
 # editor's test builds heavier: run 42921677875 (yew#120 at 157841a) cut
 # shard 4/6 at its 120-minute cap (wolf test 57 minutes, the native lane
-# 63 when cut) and ran 5/6 in 114. That run's per-file times, the files
-# its cut lane never reached taken from the other lane at the shard's own
-# ratio, put the longest eight-way shard at 77.6 minutes; the 120 cap
-# stays, 55 % over it (at least 30 % over the slowest measured).
-UNIT_MEASURED_8 = 77.6
+# 63 when cut) and ran 5/6 in 114. At eight shards the slowest ran 111
+# minutes (run 42996095311's shard 2/8; a hosted runner's speed varies by
+# up to about 40 % from run to run), so the cap is 150 (L6).
+UNIT_MEASURED_8 = 111
 un = blocks["unit"]
 ucap = re.search(r"^    timeout-minutes: (\d+)$", un, re.M)
 say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-latest$", un, re.M) is not None
@@ -174,9 +173,9 @@ say(all("run: tools/build-fakeclip --cc " in b and b.index("tools/build-fakeclip
     "L4 unit and macos-unit build the fake clipboard tool first and check no clipboard row SKIPped for it last")
 fz = blocks["fuzz"]
 say("    needs: legs\n" in fz and re.search(r"^    runs-on: ubuntu-latest$", fz, re.M) is not None
-    and "        family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4]\n" in fz
+    and "        family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4, against-c-5]\n" in fz
     and "        if: matrix.family != 'port' && matrix.family != 'port-2'\n        run: tools/oracle --cc gcc --build-only\n" in fz,
-    "L4 fuzz needs the legs and runs six fuzzer families on ubuntu, C's drivers built for four")
+    "L4 fuzz needs the legs and runs seven fuzzer families on ubuntu, C's drivers built for five")
 # Every macOS campaign is still a Linux fuzz step. The oracle campaigns now
 # live in macos-fuzz; the nightly port-only fuzzers and unit steps stay put.
 moved = [m.group(1) for j in ("port", "oracle") for m in re.finditer(
@@ -223,6 +222,70 @@ case "$1 $2" in
 esac
 exit 0
 """
+
+
+# L6 (yw13s): every job's cap is at least 30 % over the slowest time any
+# of its legs, shards or families took in five runs: the nightly
+# 42862922049 and the pull request runs 42921677875, 42922808966,
+# 42996095311 and 42996771451. A job cut at its cap counts its cut, a lower
+# bound. A family a split made counts the sum of its steps' slowest times
+# there, and its setup. Minutes; a key is (job, the matrix value its cap
+# depends on, or None).
+SLOWEST = {
+    ("legs", None): 1,
+    ("port", "ubuntu-latest"): 66, ("port", "ubuntu-24.04-arm"): 57, ("port", "macos-latest"): 189,
+    ("unit", None): 111,
+    ("macos-unit", None): 102,
+    ("fuzz", "port"): 120,            # cut on 42996771451: its one long step, 115.2 when cut
+    ("fuzz", "port-2"): 66,
+    ("fuzz", "against-c-1"): 62.3,    # fuzz_cmdparse 61.3 and the C build
+    ("fuzz", "against-c-2"): 67.7,    # fuzz_tabs 66.7 and the C build
+    ("fuzz", "against-c-3"): 72,
+    ("fuzz", "against-c-4"): 65,      # fuzz_panes
+    ("fuzz", "against-c-5"): 56.1,    # fuzz_groups 55.1 (cut at 52.3 once) and the C build
+    ("checked-cases", None): 45,
+    ("oracle", "ubuntu-latest"): 231, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 198,
+    ("oracle-cmdcomp", None): 63,
+    ("macos-fuzz", "against-c-1"): 75,
+    ("macos-fuzz", "against-c-2"): 64.8,  # fuzz_tabs 57.1, fuzz_gitignore 6.9 and the C build
+    ("macos-fuzz", "against-c-3"): 61,    # fuzz_panes
+    ("macos-fuzz", "against-c-4"): 57.6,  # fuzz_groups 56.8 and the C build
+    ("macos-perf", "editor"): 32, ("macos-perf", "components"): 7,
+    ("nightly-red", None): 1,
+}
+
+
+def cap_for(block, value):
+    m = re.search(r"^    timeout-minutes: (.+)$", block, re.M)
+    if m is None:
+        return None
+    v = m.group(1).strip()
+    if v.isdigit():
+        return int(v)
+    e = re.fullmatch(r"\$\{\{ matrix\.([a-z]+) == '([^']+)' && (\d+) \|\| (\d+) \}\}", v)
+    if e is None:
+        return None
+    return int(e.group(3)) if value == e.group(2) else int(e.group(4))
+
+
+short = []
+for j in JOBS:
+    b = blocks[j]
+    fam = re.search(r"^        family: \[([^\]]+)\]$", b, re.M)
+    values = [None]
+    if fam:
+        values = [x.strip() for x in fam.group(1).split(",")]
+    elif j in ("port", "oracle"):
+        values = ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest"]
+    for v in values:
+        key = (j, v)
+        if key not in SLOWEST:
+            short.append("%s %s: no measured time" % key)
+            continue
+        c = cap_for(b, v)
+        if c is None or c < 1.3 * SLOWEST[key]:
+            short.append("%s %s: cap %s under 1.3 x %s" % (j, v, c, SLOWEST[key]))
+say(not short, "L6 every job's cap is at least 30 % over its slowest measured time" + ("" if not short else ": " + "; ".join(short)))
 
 
 def nightly_red(existing="", label_rc=0):
