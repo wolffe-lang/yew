@@ -1,0 +1,120 @@
+# Contributing to yew
+
+yew is a modal terminal editor ("tmux and vim had a baby"), ported to
+[wolf](https://github.com/wolffe-lang/wolf-lang) from its C source,
+[tenseleyFlow/sagitta](https://github.com/tenseleyFlow/sagitta), byte for byte.
+C yew built from the commit in `sagitta.pin` is the oracle: the wolf binary
+must pass C yew's own PTY goldens and its script, Fletch, syntax and torture
+suites unchanged.
+
+## What may be read
+
+- **Reading sagitta is allowed and expected**: sagitta and yew have the same
+  owner. Each wolf unit cites, in its header, the `file:line` of the C it
+  ports.
+- **Everything else is clean-room.** Never read the source of vim, neovim,
+  emacs, helix, kakoune, nano, micro or any other editor, nor fackr's crates,
+  nor the source of any regex, JSON, HTTP or VT library.
+- yew's one outside input is the Unicode 16.0.0 data files in `ucd/`, under
+  the Unicode licence.
+
+sagitta's `.docs/plan/00-decisions.md` binds the port as it binds C yew. Read
+it, then `01-architecture.md` and `02-fletch.md` beside it, and the sagitta
+sprint file for the part you port. Then read this repository's `docs/MAP.md`:
+the idiom every unit is written in (binding), where each sagitta directory
+goes, and every gap in wolf the port has met.
+
+## The invariants
+
+sagitta's ten invariants, as the port holds them:
+
+1. No data loss, ever: atomic saves, `kill -9` never corrupts, the crash
+   journal recovers.
+2. No byte confusion: grapheme and width correctness; invalid UTF-8
+   round-trips losslessly (it rides as U+DC80-DCFF escapes only in the decoded
+   stream; storage stays byte-verbatim).
+3. No silent stubs: an unported path refuses with an error naming the sagitta
+   sprint it waits on, exit 1. Never a no-op, never a guess.
+4. Latency budgets are CI gates.
+5. Deterministic rendering: the same state gives a byte-identical cell grid.
+   Maps keep insertion order (`util.Strmap`), sorts are stable
+   (`util.sort_stable`), no hash order reaches any output, and no clock or
+   locale is read in a code path a golden sees.
+6. The terminal is restored on every exit path.
+7. Bespoke first: no dependency but wolf-std.
+8. A single-threaded core: the event loop and its subprocesses. Module state
+   is a `var` behind `unsafe`, its `// # Safety:` comment naming this
+   invariant; add one only with a stated reason.
+9. Modal paradigm first: every feature is reachable from the keyboard.
+10. The recorder/Fletch round-trip law: a recorded macro is valid, readable
+    Fletch.
+
+Invariants 1, 2 and 6 outrank everything else, speed included.
+
+## The toolchain
+
+`wolf-toolchain.toml` pins the wolf compiler and the lupin interpreter by the
+sha256 digest of their release archives, and wolf-std as a tree at a commit.
+`sagitta.pin` pins the oracle's commit.
+
+```sh
+tools/fetch-toolchain    # stages all three into .wolf-bin/, refusing a mismatch
+tools/oracle --unit      # fetches and builds C yew at the pin (gcc and clang), runs its unit suite
+```
+
+`tools/lib-toolchain.sh` refuses a toolchain whose identity drifts from the
+pin. Builds and tests run on Linux x86-64 and macOS arm64.
+
+## Building and running the checks
+
+```sh
+tools/build                            # target/native/yew and target/release/yew
+tools/check-fmt                        # wolf fmt --check
+tools/check-test                       # the unit tests on the checked machine
+tools/check-test --native              # every unit test file built and run natively
+tools/check-tables                     # src/unicode/tables.lu is the generator's, and sagitta's
+tools/goldens --yew target/release/yew # C yew's suites against the port
+tools/goldens-selftest                 # the harness can still see a difference
+```
+
+The README's "Build and test" section lists the rest (the Fletch goldens and
+coverage, the clipboard rows).
+
+## What a change must bring
+
+- **Tests land with the code they cover.** sagitta's unit tests port one for
+  one: `src/<dir>/<unit>_test.lu`, one file per C test file. A test that
+  imports a sibling module sits at the package root instead, as
+  `src/<dir>_<unit>_test.lu` with `//! member: false`, because `use` resolves
+  beside the entry file. A test that runs itself again checks `os_exe()` first
+  and skips loudly under `wolf test`, where `os_exe()` is `wolf`.
+- **No golden is edited here.** A golden that disagrees with the port is a
+  stop: open an issue with the diff. A change sagitta needs is proposed to
+  sagitta, never made here. The differences already approved are listed in
+  `tools/goldens-divergences.txt`, each pinned to the C golden's SHA-256.
+- **Performance is a gate.** A change to a subsystem with a quality gate
+  (keypress to paint, cold start, a large file, binary size, memory) records
+  the wolf/C ratio for that gate, measured on one host beside C yew's number
+  from the same run (`tools/run-perf-*`). The port stays within 2x of C.
+- `src/unicode/tables.lu` is generated by `tools/gen-unicode-tables` from
+  `ucd/16.0.0/` and checked in; never edit it by hand.
+- A bug or a gap in wolf, wolf-std or lupin is filed upstream with a small
+  program that shows it, named in the code where a reader meets it and listed
+  in `docs/MAP.md`. It is never worked around silently.
+- `sagitta.pin` moves in a commit of its own that says why.
+
+## Commits
+
+- Commit often, in coherent chunks: one file or one change a commit, so the
+  history tells how the work was done.
+- A terse, imperative subject, usually led by the file or tool it touches
+  (`lsp-rows: ...`).
+- No trailers: no co-author, sign-off or "generated with" lines.
+
+## Pull requests
+
+Open a pull request from a branch against `trunk`. Its CI runs every job on
+every host but the macOS port, which runs nightly. The description says which
+sagitta files and sprint the change ports, and carries the evidence: the checks
+above as you ran them, and the wolf/C ratios for any quality gate the change
+touches. Pull requests are merged by fast-forward after review.
