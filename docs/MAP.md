@@ -12,7 +12,7 @@ yw02–yw16.
 
 ## 1. The idiom: how wolf stands in for C
 
-Settled by yw00 and binding on later lanes (CLAUDE.md), each measured
+Settled by yw00 and binding on later work (CONTRIBUTING.md), each measured
 on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 
 | C yew | the port | why |
