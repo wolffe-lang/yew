@@ -159,7 +159,7 @@ never a regex, JSON, HTTP or VT library's source. No dependencies but
 wolf-std. Unicode tables are generated from `ucd/` by a wolf program,
 checked in, with a drift check. Every wolf, std or lupin gap is filed
 upstream with a witness and listed in the map; the port never works
-around a compiler bug silently. `CLAUDE.md` has the rest.
+around a compiler bug silently. `CONTRIBUTING.md` has the rest.
 
 ## Licence
 
