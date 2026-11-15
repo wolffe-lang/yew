@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""execfail-pax: tools/execfail-row's question on PAX, under QEMU (yew#127).
+
+    python3 -I tools/execfail-pax ISO WORK [--firmware uefi|bios]
+
+ISO a PAX live image whose PATH holds no bash-language-server, WORK a new
+directory. The machine: KVM, q35, two CPUs, 2 GiB, no network card, the
+ISO as a CD, the framebuffer drawn and not shown, and COM1 a slow UART
+(QEMU's pipe character device drained at 115200 baud, as a real machine's
+COM1 sends; a little every 10 ms, nothing banked past 20 ms), whose bytes
+are kept in WORK/serial. The console mirrors every byte a program writes
+to its terminal to COM1 and drops what the line cannot take, counting it:
+`/proc/pax-boot`'s `serial present tty mirrored dropped N`. COM1 is also
+the console's keyboard: the check types at the shell's `$ ` prompt there.
+
+For a `.txt` file (the control) and then a `.sh` file (whose server,
+`bashls`, cannot start), one session each:
+
+  - `yew FILE` in the foreground, its pid kept, and beside it a sampler
+    that reads `/proc/pax-boot`'s serial line and `/proc/<yew>/stat`
+    (utime and stime in clock ticks, which PAX leaves at 0 today, and
+    the resident set in 4 KiB pages) at 8 s, 13 s and 19 s;
+  - nothing typed from 0 s to 14 s: the idle window is 8 s to 13 s;
+  - at 14 s, 200 SGR mouse-motion reports with no button held, 5 ms apart,
+    typed on COM1 as a terminal would send them (the console's own
+    pointer reports only with a button held); the motion window is 13 s
+    to 19 s;
+  - at 21 s, `ESC :q`; the samples are printed at the next prompt.
+
+Per session and window: the growth of the dropped count, the bytes COM1
+carried, yew's CPU ticks and the growth of its resident set. Verdict:
+the `.sh` session's dropped count does not grow while idle (`FAIL
+pax_idle_dropped`), and in each window its dropped growth, its ticks and
+its resident growth are no more than the control's plus a margin (`FAIL
+pax_<window>_dropped`, `_ticks`, `_memory`: 512 bytes, 5 ticks, 64 KiB).
+Then `execfail-pax: GREEN` or `RED`; exit 2 when the check cannot run.
+QEMU is ended through its QMP socket, never signalled.
+"""
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ANSI = re.compile(rb'\x1b\[[0-9;?<>=]*[A-Za-z]|\x1b[()][A-Za-z0-9]|\x1b[=>]|\x1b\][^\x07]*\x07')
+OVMF = Path('/usr/share/OVMF')
+
+
+class Uart:
+    """tests/mpx3-conspeed.d/uart.py's far end (pax px129), as pax's px137
+    check copied it: PATH.out shrunk to a page and read at BAUD/10 bytes a
+    second; the bytes appended to OUT. Typing goes to PATH.in."""
+
+    def __init__(self, path, out, baud=115200):
+        self.rate = baud / 10.0
+        self.out = out
+        self.stop = threading.Event()
+        self.bytes = 0
+        self.lock = threading.Lock()
+        self.buf = bytearray()
+        self.fin = os.open(str(path) + '.in', os.O_RDWR)
+        self.fout = os.open(str(path) + '.out', os.O_RDWR | os.O_NONBLOCK)
+        try:
+            import fcntl
+            fcntl.fcntl(self.fout, 1031, 4096)  # F_SETPIPE_SZ
+        except OSError:
+            pass
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.t.start()
+
+    def run(self):
+        owed, last = 0.0, time.monotonic()
+        with open(self.out, 'ab') as f:
+            while not self.stop.is_set():
+                time.sleep(0.01)
+                now = time.monotonic()
+                owed += (now - last) * self.rate
+                last = now
+                want = int(owed)
+                if want <= 0:
+                    continue
+                try:
+                    b = os.read(self.fout, want)
+                except BlockingIOError:
+                    b = b''
+                if b:
+                    f.write(b)
+                    f.flush()
+                    with self.lock:
+                        self.buf += b
+                        self.bytes += len(b)
+                owed = min(owed - len(b), self.rate * 0.02)
+
+    def count(self):
+        with self.lock:
+            return self.bytes
+
+    def text(self, since=0):
+        with self.lock:
+            raw = bytes(self.buf[since:])
+        return ANSI.sub(b'', raw).replace(b'\r', b'').decode('latin-1')
+
+    def type(self, data, gap=0.02):
+        # One byte at a time, as a person types: the console's line
+        # discipline takes COM1's input a byte an interrupt.
+        for i in range(len(data)):
+            os.write(self.fin, data[i:i + 1])
+            time.sleep(gap)
+
+    def close(self):
+        self.stop.set()
+        self.t.join(2)
+        os.close(self.fin)
+        os.close(self.fout)
+
+
+class Qmp:
+    def __init__(self, sock):
+        t0 = time.monotonic()
+        while not sock.exists() and time.monotonic() - t0 < 15:
+            time.sleep(.1)
+        self.c = socket.socket(socket.AF_UNIX)
+        self.c.settimeout(30)
+        self.c.connect(str(sock))
+        self.r = self.c.makefile('rb')
+        json.loads(self.r.readline())
+        self.execute('qmp_capabilities')
+
+    def execute(self, name):
+        self.c.sendall(json.dumps({'execute': name}).encode() + b'\n')
+        while True:
+            reply = json.loads(self.r.readline())
+            if 'error' in reply:
+                raise RuntimeError(reply)
+            if 'return' in reply:
+                return reply['return']
+
+
+def main():
+    iso, work = Path(sys.argv[1]), Path(sys.argv[2])
+    fw = 'uefi'
+    if len(sys.argv) > 4 and sys.argv[3] == '--firmware':
+        fw = sys.argv[4]
+    work.mkdir(parents=True, exist_ok=False)
+    pipe = work / 'com1'
+    for p in (str(pipe) + '.in', str(pipe) + '.out'):
+        os.mkfifo(p, 0o600)
+    uart = Uart(pipe, work / 'serial')
+    time.sleep(0.5)
+    sock = work / 'qmp.sock'
+    a = ['qemu-system-x86_64', '-enable-kvm', '-machine', 'q35', '-cpu', 'host', '-smp', '2', '-m', '2048',
+         '-drive', f'file={iso},media=cdrom,readonly=on', '-nic', 'none', '-display', 'none', '-monitor', 'none',
+         '-qmp', f'unix:{sock},server=on,wait=off', '-chardev', f'pipe,id=com1,path={pipe}', '-serial', 'chardev:com1']
+    if fw == 'uefi':
+        vars_fd = work / 'vars.fd'
+        shutil.copy(OVMF / 'OVMF_VARS_4M.fd', vars_fd)
+        a += ['-drive', f'if=pflash,format=raw,unit=0,readonly=on,file={OVMF / "OVMF_CODE_4M.fd"}',
+              '-drive', f'if=pflash,format=raw,unit=1,file={vars_fd}']
+    print('execfail-pax: qemu ' + ' '.join(a), flush=True)
+    q = subprocess.Popen(a, stdin=subprocess.DEVNULL, stdout=open(work / 'qemu.log', 'wb'), stderr=subprocess.STDOUT)
+    qmp = Qmp(sock)
+    status = 2
+    try:
+        status = drive(uart, q)
+    finally:
+        try:
+            qmp.execute('quit')
+        except (OSError, RuntimeError, ValueError):
+            pass
+        try:
+            q.wait(30)
+        except subprocess.TimeoutExpired:
+            print('execfail-pax: QEMU did not end on QMP quit', flush=True)
+        uart.close()
+    sys.exit(status)
+
+
+def prompt(uart, since, timeout):
+    """Wait for the shell's `$ ` at the end of COM1's text after byte
+    `since`; answer the byte count then, or -1."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if uart.text(since).rstrip('\n').endswith('$ '):
+            return uart.count()
+        time.sleep(0.2)
+    return -1
+
+
+def run(uart, line, timeout=60):
+    at = uart.count()
+    uart.type(line.encode() + b'\r')
+    end = prompt(uart, at + len(line), timeout)
+    return end, uart.text(at)
+
+
+def motions(n):
+    out = []
+    for i in range(n):
+        x = 5 + (i * 7) % 60
+        y = 3 + (i * 3) % 15
+        out.append(f'\x1b[<35;{x};{y}M'.encode())
+    return out
+
+
+def drive(uart, q):
+    if prompt(uart, 0, 300) < 0:
+        print('execfail-pax: no shell prompt on COM1 within 300 s', flush=True)
+        return 2
+    print('execfail-pax: the console prompted', flush=True)
+    _, out = run(uart, "mkdir -p /tmp/yw18 && cd /tmp/yw18 && printf '#!/bin/sh\\necho hello\\nexit 0\\n' > a.sh"
+                       " && cp a.sh a.txt && echo YW18-READY")
+    if 'YW18-READY' not in out:
+        print('execfail-pax: the files were not made: ' + out[-300:], flush=True)
+        return 2
+    _, out = run(uart, 'command -v bash-language-server; echo YW18-BLS=$?; yew --version | head -n 1;'
+                       ' grep serial /proc/pax-boot')
+    print('execfail-pax: ' + ' | '.join(l for l in out.splitlines() if l.strip() and not l.startswith('$')),
+          flush=True)
+    if 'YW18-BLS=0' in out:
+        print('execfail-pax: bash-language-server is on the PATH: the check cannot run', flush=True)
+        return 2
+    results = {}
+    for name in ('a.txt', 'a.sh'):
+        tag = name.split('.')[1]
+        sampler = (f'( sleep 8; P=$(cat yp-{tag}); grep serial /proc/pax-boot > s-{tag}; cat /proc/$P/stat >> s-{tag};'
+                   f' sleep 5; grep serial /proc/pax-boot >> s-{tag}; cat /proc/$P/stat >> s-{tag};'
+                   f' sleep 6; grep serial /proc/pax-boot >> s-{tag}; cat /proc/$P/stat >> s-{tag} ) &'
+                   f" sh -c 'echo $$ > yp-{tag}; exec yew {name}'")
+        uart.type(sampler.encode() + b'\r', gap=0.005)
+        t0 = time.monotonic()
+        marks = {}
+        for at, what in ((8, 'b1'), (13, 'b2'), (14, 'motion'), (19, 'b3'), (21, 'quit')):
+            while time.monotonic() - t0 < at:
+                time.sleep(0.01)
+            if what == 'motion':
+                # One report a write, 5 ms apart: a report is a dozen bytes,
+                # within the 16550's receive FIFO.
+                for rep in motions(200):
+                    os.write(uart.fin, rep)
+                    time.sleep(0.005)
+            elif what == 'quit':
+                uart.type(b'\x1b', gap=0.2)
+                uart.type(b':q\r')
+            else:
+                marks[what] = uart.count()
+        if prompt(uart, marks['b3'], 30) < 0:
+            print(f'execfail-pax: {tag}: yew did not quit to the prompt', flush=True)
+            return 2
+        time.sleep(1)
+        _, out = run(uart, f'cat s-{tag}; echo YW18-END')
+        drops = [int(m) for m in re.findall(r'serial present tty mirrored dropped (\d+)', out)]
+        ticks, rss = [], []
+        for line in out.splitlines():
+            m = re.match(r'\d+ \(.*\) \S (.*)', line.strip())
+            if m:
+                f = m.group(1).split()
+                ticks.append(int(f[10]) + int(f[11]))
+                rss.append(int(f[20]) * 4)
+        if len(drops) != 3 or len(ticks) != 3:
+            print(f'execfail-pax: {tag}: the samples were not read: {out[-600:]!r}', flush=True)
+            return 2
+        r = {'idle': (drops[1] - drops[0], marks['b2'] - marks['b1'], ticks[1] - ticks[0], rss[1] - rss[0]),
+             'motion': (drops[2] - drops[1], marks['b3'] - marks['b2'], ticks[2] - ticks[1], rss[2] - rss[1])}
+        results[tag] = r
+        for w, (d, b, t, m) in r.items():
+            print(f'execfail-pax: {tag} {w}: dropped+={d} com1_bytes={b} ticks={t} rss_kib+={m}'
+                  f' (dropped {drops}, rss_kib {rss})', flush=True)
+    reds = []
+    sh, txt = results['sh'], results['txt']
+    if sh['idle'][0] > 0:
+        reds.append('pax_idle_dropped')
+    for w in ('idle', 'motion'):
+        if sh[w][0] > txt[w][0] + 512 and 'pax_idle_dropped' not in reds:
+            reds.append(f'pax_{w}_dropped')
+        if sh[w][2] > txt[w][2] + 5:
+            reds.append(f'pax_{w}_ticks')
+        if sh[w][3] > txt[w][3] + 64:
+            reds.append(f'pax_{w}_memory')
+    run(uart, 'exit', timeout=5)
+    for r in reds:
+        print(f'FAIL {r}', flush=True)
+    print('execfail-pax: ' + ('RED' if reds else 'GREEN'), flush=True)
+    return 1 if reds else 0
+
+
+if __name__ == '__main__':
+    main()
