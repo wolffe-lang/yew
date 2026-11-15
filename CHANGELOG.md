@@ -31,8 +31,11 @@ The format follows Keep a Changelog; the port has no release yet.
 - `active_tab` always names a tab record the state wrote, also past the
   record cap.
 - `tools/nested-open-row` (a pty row over a 26-file workspace),
-  `tools/nested-open-pax` and `tools/nested-open-pax-image` (the same on a
-  PAX image under QEMU) and `src/edit_nested_open_test.lu` hold it.
+  `tools/nested-open-pax` (the same on a PAX image under QEMU, the image
+  made by yew#127's `tools/execfail-pax-image`) and
+  `src/edit_nested_open_test.lu` hold it. The self-open reads yew's words
+  itself, as `args_parse` does, so `edit` still builds without the
+  command-line module (`tools/build-demo`).
 
 ### yw11c — the LSP rows wait for what they capture (2026-11-08)
 
