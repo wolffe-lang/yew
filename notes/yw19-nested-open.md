@@ -290,3 +290,74 @@ The R-list (decisions taken as recommended):
   byte); (B) not written at all.
 - **R-yw19-6** — `active_tab` past the record cap: (A) the last written
   record's id — taken; (B) 0, which restore reads as its first record.
+
+Commits, in order (the prediction first, every row before the code it
+holds; the red at trunk's code is the branch `yw19-red`, `7d7bc7a`):
+
+- `7c0a07c` note: the prediction, before the first change
+- `5f34ae3` nested-open-row: :!yew PATH in a pty, 26+ tabs: where it opens, what is saved, who owns the state
+- `a4f5509` nested-open-pax: the row's cases on PAX under QEMU, typed on COM1
+- `c17f05a` edit_nested_open_test: session directory, refusals by name, the untitled record, active_tab
+- `b21e24d` edit_nested_open_test: the owner lock: a held one makes a reader, a stale lease is taken over, a pid-only lease still owns
+- `631412b` nested-open-row: a reader saves nothing and a third editor owns once the first quits; a stale lease naming pid 1
+- `3aebe83` nested-open-pax: a stale lease naming pid 1, the console's pelt
+- `26a1257` self_open_path: a relative :!yew operand is the session's, after :!cd as the shell would read it
+- `84afd1e` shc_run: a :!yew line that would start an editor opens its plain files here or is refused by name
+- `df8697d` sp_tabs: the untitled tab's nil-path record is skipped by design, not counted dropped
+- `bd68ebd` state_emit_at: active_tab names a written record, past the record cap too
+- `5368d7e` state_lock_claim: an owner lock held for the session's life; a stale lease naming a reused pid owns nothing
+- `9ca8b81` edit_nested_open_test: a line left to the shell is a job or a spawn's refusal, never a refusal by name or a tab
+- `7f57bdd` check-test-cases: edit_nested_open_test's nine cases, one at a time on the checked machine
+- `2c6bae4` nested-open-pax-image: image 3's ISO with another yew, yw18's tool copied by value
+- `66ade48` nested-open-row: the yew under test is the one a :! line finds on PATH; passthru reads its version line
+- `48b0c11` nested-open-row: the terminal guard and the session's --yew-env0 are not editors
+- `5139a31` nested-open-row: quit with :q!, which a focused job's output does not stop
+- `ebb59d7` nested-open-pax: quit with :q!; the editors are the sampler's pids, not the quits
+- `c9236c6` nested-open-row: refuse to run where there is no /proc
+- `364b56c` nested-open-row: .txt files, so no language server's failure covers the message line; the seed holds N+1 files and the untitled tab
+- `bf7c81d` nested-open-pax: .txt files, as the pty row's
+- `b5bd567` edit_nested_open_test: drop the unused std.fs import (E0305); stop_child names the sleep's end
+- `a4900f1` self_label: the cut in a local, not inside the interpolation
+- `0f46423` nested-open-row: bangbang holds the saved state to what it was before the nested editor
+- `2b758fa` edit_nested_open_test: a line left to the shell is a job labelled with it (the session adds its own shell job too)
+- `9d3f06b` fmt: wolf fmt's layout for shell.lu and edit_nested_open_test.lu
+- `c2685f5` nested-open-row: cd reads the quit's save; dropped matches the log line, not the scratch path
+- `34cc3bf` nested-open-pax: the sampler greps each cmdline for a typed yew, its errors kept; no tr
+- `a322141` note: hits and misses, what yew#129's evidence needs, the change as made, inputs, the R-list
+- `5e1ed03` MAP: yew's own additions: :!yew past the recognizer and the owner lock
+- `fa223e8` CHANGELOG: yw19
+
+The local evidence (the records' paths and every `END` line are the PR's):
+
+- the unit file at trunk's code (`7d7bc7a`) and at the fix (`2b758fa`);
+- the pty row from this branch over trunk's release yew (`727b605`) and
+  over the fix's native yew;
+- `tools/nested-open-pax` on image 3's ISO as built (trunk's yew);
+- the gauntlet at the head and the plant on it.
+
+## Done-when
+
+- [x] The prediction, before the first change (`7c0a07c`).
+- [x] The handoff found and listed: `shell_try_self_open`, then
+  `shell_self_open_words`, both in the editor; the session carries only
+  its directory and exports back. Every fallback named (the table under
+  Prediction; the recognizer's own list in `edit_shell_self_test.lu`).
+- [x] The loss reproduced as far as it reproduces: the owner's lines open
+  in the running editor at trunk on Linux and on image 3; a second editor
+  with a terminal is a reader on both; a stale lease naming a live pid
+  makes every editor a reader on both (red at trunk, by name).
+- [x] `:!yew PATH` opens in the running editor in every case the session
+  can carry (the session's directory, several plain files) and is
+  otherwise refused by name.
+- [x] A second editor never replaces the first one's saved state: the
+  owner lock, the reader kept a reader (R-yw19-4), and the check working
+  on PAX across a reboot's pid reuse.
+- [x] `active_tab` cannot name a record past `tabs`; it is an id, and the
+  three-record state with `active_tab: 21` is consistent with a writer
+  that opened 21 tabs.
+- [x] The one record dropped on every start named and fixed: the resume's
+  untitled tab, written with `path: nil` by design and no longer counted.
+- [x] CHANGELOG under Unreleased; `docs/MAP.md` §9 lists the additions;
+  README read, current (its state sentence, a saved session byte-identical
+  to C's state file, still holds).
+- [ ] The gauntlet, the plant and the PAX legs at the head: the PR's.
