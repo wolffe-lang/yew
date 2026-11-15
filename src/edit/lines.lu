@@ -1,0 +1,179 @@
+//! edit.lines — yew's line dedent and transposition commands.
+//! Uses sagitta src/edit/sel_actions.c:106-160's disjoint edit-plan seam,
+//! but preserves mode, selection and caret rather than collapsing to L.
+//! Commands are aggregate, with their own undo boundary in edit.invoke.
+
+use text
+
+fn lines_context(ed: Ed, cx: CmdCtx) -> (bool, int, int) {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len || ed.wins[w].buf < 0 || ed.wins[w].cs.curs.len == 0 {
+        return (false, 0, 0)
+    }
+    let b = ed.wins[w].buf
+    (ed.bufs[b].resident && !ed.cmdline.active, w, b)
+}
+
+fn lines_covered(ed: Ed, w: int, b: int) -> List[bool] {
+    let tb = ed.bufs[b].ec.tb
+    var covered = List[bool]()
+    for _ in 0..text.textbuf_line_count(tb) { (mut covered).push(false) }
+    for c in ed.wins[w].cs.curs {
+        var lo = if c.pos < c.anchor then c.pos else c.anchor
+        var hi = if c.pos > c.anchor then c.pos else c.anchor
+        if ed.mode == MODE_H && ed.wins[w].h.kind == SEL_LINE {
+            let sp = sel_span(tb, SEL_LINE, c)
+            lo = sp.lo
+            hi = sp.hi
+        }
+        let first = text.textbuf_line_of(tb, lo as text.ByteOff) as int
+        // Character selections are half-open: ending at column zero
+        // does not include the next line.
+        if hi > lo { hi -= 1 }
+        let last = text.textbuf_line_of(tb, hi as text.ByteOff) as int
+        for line in first..=last { covered[line] = true }
+    }
+    covered
+}
+
+/// Shift+Tab: one leading tab or up to tabwidth leading spaces per line.
+/// Edit primitives remap all cursor endpoints; no selection is collapsed.
+pub fn lines_cmd_dedent(mut ed: Ed, cx: CmdCtx) -> int {
+    let (ok, w, b) = lines_context(ed, cx)
+    if !ok { return CMD_ERR_STATE }
+    let covered = lines_covered(ed, w, b)
+    let width = if ed.bufs[b].tabwidth == 0 then 4 else ed.bufs[b].tabwidth
+    var edits = List[SelEdit]()
+    for line in 0..covered.len {
+        if !covered[line] { continue }
+        let sp = text.textbuf_line_span(ed.bufs[b].ec.tb, line as text.LineNo)
+        var end = sp.lo
+        if end < sp.hi && text.textbuf_byte_at(ed.bufs[b].ec.tb, end) == 9 {
+            end += 1
+        } else {
+            while end < sp.hi && end - sp.lo < width && text.textbuf_byte_at(ed.bufs[b].ec.tb, end) == 32 {
+                end += 1
+            }
+        }
+        if end != sp.lo { let _ = sel_edit_push(mut edits, text.span(sp.lo, end)) }
+    }
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if applied then CMD_OK else CMD_ERR_IO
+}
+
+fn lines_content_end(tb: text.TextBuf, sp: text.Span) -> int {
+    var end = sp.hi
+    if end > sp.lo && text.textbuf_byte_at(tb, end - 1) == 10 {
+        end -= 1
+        if end > sp.lo && text.textbuf_byte_at(tb, end - 1) == 13 { end -= 1 }
+    }
+    end
+}
+
+// A and B are adjacent blocks of complete lines. Exchange their content,
+// preserving the separator between them and the outer block's final EOL.
+// In particular, moving a line to EOF must not introduce a final newline.
+fn lines_swap_plan(tb: text.TextBuf, lo: int, split: int, hi: int) -> SelEdit {
+    let a = text.span(lo, split)
+    let z = text.span(split, hi)
+    let ae = lines_content_end(tb, a)
+    let ze = lines_content_end(tb, z)
+    var bytes = List[byte]()
+    text.textbuf_append_range(mut bytes, tb, split, ze)
+    text.textbuf_append_range(mut bytes, tb, ae, split)
+    text.textbuf_append_range(mut bytes, tb, lo, ae)
+    text.textbuf_append_range(mut bytes, tb, ze, hi)
+    SelEdit { span: text.span(lo, hi), replacement: bytes }
+}
+
+struct LinePoint {
+    line: int,
+    col: int,
+    after: bool,
+}
+
+fn lines_point(tb: text.TextBuf, at: int, exclusive_end: bool) -> LinePoint {
+    var line = text.textbuf_line_of(tb, at as text.ByteOff) as int
+    var start = text.textbuf_line_start(tb, line as text.LineNo) as int
+    let after = exclusive_end && at == start && line > 0
+    if after {
+        line -= 1
+        start = text.textbuf_line_start(tb, line as text.LineNo) as int
+    }
+    LinePoint { line: line, col: at - start, after: after }
+}
+
+fn lines_place(tb: text.TextBuf, p: LinePoint, moved: List[int]) -> int {
+    let sp = text.textbuf_line_span(tb, moved[p.line] as text.LineNo)
+    if p.after { return sp.hi }
+    let end = lines_content_end(tb, sp)
+    sp.lo + (if p.col > end - sp.lo then end - sp.lo else p.col)
+}
+
+fn lines_move(mut ed: Ed, cx: CmdCtx, down: bool) -> int {
+    let (ok, w, b) = lines_context(ed, cx)
+    if !ok { return CMD_ERR_STATE }
+    let tb = ed.bufs[b].ec.tb
+    let covered = lines_covered(ed, w, b)
+    var moved = List[int]()
+    for line in 0..covered.len { (mut moved).push(line) }
+    // A trailing newline terminates the final real line; the virtual
+    // empty row is not a neighbour to exchange it with.
+    var real = covered.len
+    let len = text.textbuf_len(tb)
+    if len > 0 && text.textbuf_byte_at(tb, len - 1) == 10 { real -= 1 }
+    var edits = List[SelEdit]()
+    var first = 0
+    while first < real {
+        if !covered[first] { first += 1; continue }
+        var last = first
+        while last + 1 < real && covered[last + 1] { last += 1 }
+        if down && last + 1 < real {
+            let lo = text.textbuf_line_start(tb, first as text.LineNo) as int
+            let split = text.textbuf_line_start(tb, (last + 1) as text.LineNo) as int
+            let hi = text.textbuf_line_span(tb, (last + 1) as text.LineNo).hi
+            (mut edits).push(lines_swap_plan(tb, lo, split, hi))
+            for line in first..=last { moved[line] = line + 1 }
+            moved[last + 1] = first
+        } else if !down && first > 0 {
+            let lo = text.textbuf_line_start(tb, (first - 1) as text.LineNo) as int
+            let split = text.textbuf_line_start(tb, first as text.LineNo) as int
+            let hi = text.textbuf_line_span(tb, last as text.LineNo).hi
+            (mut edits).push(lines_swap_plan(tb, lo, split, hi))
+            for line in first..=last { moved[line] = line - 1 }
+            moved[first - 1] = last
+        }
+        first = last + 1
+    }
+    if edits.len == 0 { return CMD_OK }
+    var heads = List[LinePoint]()
+    var anchors = List[LinePoint]()
+    let cursors = copy ed.wins[w].cs.curs
+    for c in cursors {
+        let half_open = ed.mode == MODE_H && ed.wins[w].h.kind != SEL_LINE
+        (mut heads).push(lines_point(tb, c.pos, half_open && c.pos > c.anchor))
+        (mut anchors).push(lines_point(tb, c.anchor, half_open && c.anchor > c.pos))
+    }
+    let (applied, _) = sel_apply_edits(mut ed, cx, edits)
+    if !applied { return CMD_ERR_IO }
+    // A replacement collapses cursors inside it. Restore the original
+    // topology using the permutation of logical lines, not byte lengths.
+    ed.wins[w].cs.curs = cursors
+    for i in 0..heads.len {
+        ed.wins[w].cs.curs[i].pos = lines_place(ed.bufs[b].ec.tb, heads[i], moved)
+        ed.wins[w].cs.curs[i].anchor = lines_place(ed.bufs[b].ec.tb, anchors[i], moved)
+        ed.wins[w].cs.curs[i].goal_col = text.CCOL_HERE
+    }
+    text.cset_normalize(ed.bufs[b].ec.tb, mut ed.wins[w].cs)
+    CMD_OK
+}
+
+/// Alt+Up: line or selected lines with the previous line, one undo step.
+pub fn lines_cmd_up(mut ed: Ed, cx: CmdCtx) -> int {
+    lines_move(mut ed, cx, false)
+}
+
+/// Alt+Down: line or selected lines with the next line, one undo step.
+pub fn lines_cmd_down(mut ed: Ed, cx: CmdCtx) -> int {
+    lines_move(mut ed, cx, true)
+}
