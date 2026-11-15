@@ -157,7 +157,8 @@ re-report.
   else: after `:lsp.info` answered, one motion report put the failure
   back on the message row. A key clears an error message, and the next
   turn without a key sets it again, so the message cannot be dismissed:
-  the owner's "the status message about it stayed up".
+  the issue's "the message stayed up for as long as a `.sh` buffer was
+  open".
 - **Every turn keeps what it builds.** The message's strings are made in
   the loop's ambient region, which frees nothing; on Linux the resident
   set is too noisy to show it (the control's own phases moved it by
@@ -188,11 +189,11 @@ sampler as committed at `7a862a0`, whose verdict adds it):
 
 ### What this says about the PAX report
 
-The rows do not reproduce the owner's lag, and they say what the
+The rows do not reproduce the lag seen on the PAX machine, and they say what the
 re-report does and does not do. It cannot make the loop spin, and it
 writes nothing to the console while the message is unchanged. It does
 cost every turn CPU and memory, and it holds the message up. The
-`dropped 399856` the owner saw is not the re-report's: with nothing
+`dropped 399856` seen there is not the re-report's: with nothing
 changed on the screen the re-report writes no byte. Image 3's console
 mirrors every byte a program draws to COM1 and drops what the line's
 11.5 KB a second cannot carry, so ordinary drawing (a scroll, a
@@ -241,8 +242,8 @@ document is dropped, the server is not), so the re-report goes on.
   `:lsp.info`, and its job is kept, because its message sends the user
   to `:lsp.log`, which reads that job's stderr.
 - **R-yw18-4, sagitta.** C yew has the same re-report at the pin
-  (`client.c:1287-1295`). Recommended: the owner hears of it (a yew lane
-  never changes sagitta); the port's divergence is named in
+  (`client.c:1287-1295`). Recommended: it is reported to sagitta (a yew
+  lane never changes sagitta); the port's divergence is named in
   docs/MAP.md §9.
 - **R-yw18-5, CI.** The unit row runs in CI as it is (`tools/check-test`
   finds every `*_test.lu`; `tools/check-test-cases.txt` has its
@@ -302,8 +303,8 @@ PTY goldens, and the plant beside it.
 
 ## What this lane did not do
 
-- It did not reproduce the pointer's lag on the owner's machine (never
-  touched): the rows measure what the re-report costs and show it is not
+- It did not reproduce the pointer's lag on the PAX machine it was seen
+  on (not touched): the rows measure what the re-report costs and show it is not
   a spin and writes nothing while the screen is unchanged.
 - It did not change sagitta, which has the same branch at the pin.
 - It did not wire the pty and PAX rows into CI (R-yw18-5).
