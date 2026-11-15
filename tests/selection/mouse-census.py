@@ -44,6 +44,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--terminal', default=os.getenv('TERM_PROGRAM', 'unknown'),
                    help='terminal name and version, when known')
+    p.add_argument('--shift-escape', action='store_true',
+                   help='request Shift mouse reports with XTSHIFTESCAPE; restore its default on exit')
     a = p.parse_args()
     fd = os.open('/dev/tty', os.O_RDWR)
     old = termios.tcgetattr(fd)
@@ -53,7 +55,7 @@ def main():
         previous[sig] = signal.signal(sig, interrupted)
     try:
         tty.setraw(fd)
-        os.write(fd, ENABLE + PROMPT)
+        os.write(fd, ENABLE + (b'\x1b[>1s' if a.shift_escape else b'') + PROMPT)
         done = False
         while not done:
             chunk = os.read(fd, 4096)
@@ -94,7 +96,7 @@ def main():
     finally:
         # Restore even if writing the final escape sequence fails on a closed tty.
         try:
-            os.write(fd, DISABLE + b'\r\n')
+            os.write(fd, (b'\x1b[>0s' if a.shift_escape else b'') + DISABLE + b'\r\n')
         finally:
             try:
                 termios.tcsetattr(fd, termios.TCSANOW, old)
@@ -105,6 +107,7 @@ def main():
     print('MOUSE-CENSUS-JSON ' + json.dumps({'terminal':a.terminal,
           'TERM':os.getenv('TERM'), 'TERM_PROGRAM':os.getenv('TERM_PROGRAM'),
           'TERM_PROGRAM_VERSION':os.getenv('TERM_PROGRAM_VERSION'),
+          'shift_escape_requested':a.shift_escape,
           'exit_reason':reason, 'pending_hex':pending.hex(), 'events':events}), flush=True)
     return 0
 
