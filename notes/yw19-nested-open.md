@@ -137,7 +137,7 @@ pass of the loop, over the message line the row reads.
   `yew` reached from `:!` has no terminal and stops at
   `tty_require_terminal` before it reads any state (seen: `not a terminal;
   use --batch SCRIPT for headless execution`, exit 1, in a `*job:N*`
-  buffer). Both starts had a terminal. See "What yew#129's evidence needs".
+  buffer). Both starts had a terminal. See "What yew#129's evidence shows".
 - `cd`: red at trunk (hit): after `:!cd sub`, `:!yew x.txt` opened the
   root's `x.txt`, a new empty buffer.
 - `refuse`: red at trunk (hit): each line ran as a job whose yew said it
@@ -171,25 +171,55 @@ pass of the loop, over the message line the row reads.
   record cap, a held owner lock, a stale lease naming a live pid; green:
   the lines left to the shell, and a pid-only lease of a live process
   still owning (C's lease kept).
+- The first gauntlet at `73fa098` (two misses). `build-demo` was red:
+  `use args` could not be resolved (E0301). `tools/build-demo` stages
+  `edit` and what it uses without `args`, which `shell_self_open_words`
+  had imported, so the PTY goldens it gates did not run (R-yw19-7). Its
+  PAX image step was red on xorriso's SORRY 32: `-boot_image any replay`
+  cannot replay image 3's boot records once Limine's `bios-install` has
+  rewritten its GPT as an MBR. yw18 met the same and fixed its tool,
+  which this branch now uses.
 
-### What yew#129's evidence needs
+### What yew#129's evidence shows
 
 The rows do not reproduce a second editor from the owner's lines, on
-Linux or on image 3. What fits the machine's evidence is the gap above:
+Linux or on image 3. The note first offered the gap above (a reader that
+saves nothing) as the cause; the machine's log, read after the change,
+rules that out, and the loss is not reproduced:
 
-1. the twenty-tab editor was itself a **reader** from its start: the
-   lease named a pid that was alive then (the earlier `owned by pid N`
-   line in the log would be that start's own), so none of its tabs ever
-   reached the saved state;
-2. the two starts 51 s apart found that pid gone, took the lease and
-   saved their own small states, the last one with three records.
-
-`active_tab: 21` is not past the list: `active_tab` is a tab **id**, and
-ids grow through one editor's life, so the last writer had opened 21
-tabs. Three things on the machine would settle it, read-only: the pid and
-time of the earlier ownership line against the twenty-tab editor's start;
-the three records' `id` fields (is one of them 21?); and how the two
-starts at 01:27 were begun (a second console or session, or `:!!`).
+- **No editor that day was a reader.** None of the four starts in the
+  log (one at the console, two 51 s apart, one over ssh, the current
+  owner) logged `owned by pid N`; the ownership lines are all from
+  earlier days. A `:!yew` line writes nothing to the log: one the
+  recognizer opens starts no process, and one it declines starts a `yew`
+  with no terminal, which returns at `tty_require_terminal` in
+  `run_driver` before `ed_run` loads a configuration, opens the state or
+  logs. Every start in the log had a terminal of its own.
+- **The tabs left the editor in memory before its save.** Every
+  workspace state on the machine was read: none holds the twenty-odd
+  tabs, no other was written that day, there is no `state.fl.corrupt-*`
+  file and no `unusable`, `written for` or `restoring into` line. A
+  writer saves about 2 s after a change it marks and at quit, and writes
+  every tab it holds (up to 512); tab ids start at 1 in each editor, so
+  the writer of the three records with `active_tab: 21` had made at least
+  21 tabs and held three at its save.
+- **Dev rows over trunk's yew kept every tab**, with one editor, through
+  the owner's lines and its own `:w` and plain `:q`: on Linux, 22 `.lu`
+  files flat, 18 of them in a tab group on a subdirectory, all of them in
+  a group on the root (the new files joined it), `:!touch` of two open
+  files, `:q` with a job's output in view; on image 3, 27 `.lu` files,
+  30 records saved.
+- **What closes several tabs of a running editor** is an explicit close
+  only: `t o` in L mode or `:tabonly` (every tab but the active one,
+  refused only when another is modified), `:gclose` (the active group's
+  members), the group picker's confirm (`t g`, `t e`, `:gnew`,
+  `:gedit`), and the same entries on the context menu (`t m`). None is
+  reached from a `:!` line; `t o` and the menu leave no history line and
+  no log line. A dev row with `t o` before the owner's lines ends as the
+  machine did (three records, a high `active_tab`), but `t o` closes the
+  untitled tab too, so the next start would log no dropped record, where
+  the machine's logged one. Nothing read shows which close, if any, was
+  used; the machine keeps no shell history.
 
 ### The change, as made
 
@@ -199,7 +229,10 @@ starts at 01:27 were begun (a second console or session, or `:!!`).
   `shell.session fresh`, as C does.
 - `shell_self_open_words` (`src/edit/shell.lu`), asked by `shc_run` once
   the recognizer has declined: a `:!yew` line whose words, read as
-  `args_parse` reads them, start an editor never reaches a shell. Plain
+  `args_parse` reads them, start an editor never reaches a shell. The
+  reading is edit's own (`shell_self_argv_class`): `edit` does not depend
+  on the command-line module, and `tools/build-demo` stages `edit`
+  without it; the unit file holds the two readings to one answer. Plain
   files open here (several as several tabs, the last active); a
   directory, a word the shell would expand and an editor option are
   refused on the message line by name (`:!LINE is not opened here:
@@ -245,9 +278,10 @@ starts at 01:27 were begun (a second console or session, or `:!!`).
 
 - **Base:** trunk `727b605`, still trunk's head. yw18 (yew#127) is open in
   parallel; it changes `src/edit/lsp_client.lu` and the LSP rows, none of
-  this branch's files, and adds `tools/execfail-pax-image`, which
-  `tools/nested-open-pax-image` copies by value (one of the two can go
-  once both are in).
+  this branch's files, and adds `tools/execfail-pax-image`. This branch
+  makes the PAX row's image with it: yw18's two commits of it are
+  cherry-picked (`fdcc00c`, `2325291`), so a rebase after yew#127's merge
+  drops them, and this branch's own copy is gone (`d0b66c7`).
 - **Toolchain:** wolf 0.2.36 (`5adf3d91`), lupin 0.1.58, std `78b9d3cb`,
   from the pinned archives (`tools/fetch-toolchain`).
 - **C yew:** `sagitta.pin` (`9ace98c2`), read for the recognizer, the
@@ -257,7 +291,9 @@ starts at 01:27 were begun (a second console or session, or `:!!`).
   `32fe1a14834a530eb790d56c224bebbe3b697fa93c4587b22bf1c556b99f3836`, its
   yew `1.0.0-dev` at `727b6056` (trunk), booted by UEFI under QEMU with
   KVM. The fix's legs swap its `/bin/yew` for this branch's static build
-  (`tools/nested-open-pax-image`) and keep every other member.
+  (`tools/execfail-pax-image`: the build stripped, as the image's own
+  yew is, and the ISO made again by pax's `tools/mkimage` line) and keep
+  every other member.
 
 | host | role |
 |---|---|
@@ -290,6 +326,12 @@ The R-list (decisions taken as recommended):
   byte); (B) not written at all.
 - **R-yw19-6** — `active_tab` past the record cap: (A) the last written
   record's id — taken; (B) 0, which restore reads as its first record.
+- **R-yw19-7** — the self-open's reading of yew's words, once the first
+  gauntlet found `tools/build-demo` red (`use args` in `edit`, which the
+  demo stages without `args`): (A) edit reads the words itself, held to
+  `args_parse` by a unit case — taken; (B) stage `args` in
+  `tools/build-demo` too (a CI tool: cross-cutting, and `edit` would
+  depend on the command line).
 
 Commits, in order (the prediction first, every row before the code it
 holds; the red at trunk's code is the branch `yw19-red`, `7d7bc7a`):
@@ -329,6 +371,12 @@ holds; the red at trunk's code is the branch `yw19-red`, `7d7bc7a`):
 - `a5efc48` note: the evidence index and done-when
 - `04de592` check-test-cases: edit_nested_open_test's 512-tab case is past the checked budget, as the tab-cap case is
 - `e7b4787` nested-open-pax: the sampler takes /bin/yew too, and leaves out the guard and the env helper
+- `73fa098` note: the commits after the first gauntlet
+- `b1033f9` shell_self_open_words: read yew's words here, not through args (tools/build-demo stages edit without it)
+- `058a943` edit_nested_open_test: the self-open reads yew's words as args_parse does
+- `1261b94` check-test-cases: edit_nested_open_test has ten cases
+- `fdcc00c`, `2325291` execfail-pax-image: yw18's tool and its fix (the ISO made by mkimage's xorriso line, the yew stripped), cherry-picked
+- `d0b66c7` nested-open-pax-image: removed; the PAX row's image is yw18's execfail-pax-image, the same tool
 
 The local evidence (the records' paths and every `END` line are the PR's):
 
