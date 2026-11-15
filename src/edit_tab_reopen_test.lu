@@ -1,0 +1,490 @@
+//! member: false
+//!
+//! yw20 (yew#129): closing many tabs at once can be undone — yew's own
+//! (docs/MAP.md §9). sagitta closes several tabs in one gesture in three
+//! places — `ed.tab.close_others` (`t o`, `:tabonly`, the tab menu's
+//! "close others"; `tabs.c:2066-2116`), `ed.group.close` on a group
+//! (`:gclose`; `groupnav.c:259-308`) and the group picker's Edit, whose
+//! unticked members' tabs close (`grouppicker.c:934-1007`) — silently,
+//! keeping nothing. These rows hold the port's record of such a close, its
+//! message and `ed.tab.reopen` (`t u`, `:tabreopen`).
+//!
+//! The files are written under `$TMPDIR` (else `/tmp`), forty fixed-width
+//! lines each, so a cursor and a view can be placed anywhere in them.
+//! The per-case selector `YEW_REOPEN_CASE=N` (0-based, the order of
+//! `main`) runs one case; no selector runs them all.
+
+use edit
+use text
+
+// One line of a fixture file: "fNN line KK\n".
+const LINE_LEN: int = 12
+
+const LINES: int = 40
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn fresh_dir() -> str {
+    let base = env_get("TMPDIR") else "/tmp"
+    var tries = 0
+    while tries < 100 {
+        var suffix = ""
+        for r in os_random(6) {
+            suffix = suffix + "{r % 10}"
+        }
+        let dir = "{base}/yew-reopen-{suffix}"
+        fs_create_dir_mode(dir, 448) else |e| match e {
+            exists => {
+                tries += 1
+                continue
+            },
+            denied => { assert(false, "mkdtemp denied") },
+            invalid => { assert(false, "mkdtemp invalid") },
+            not_found => { assert(false, "mkdtemp not found") },
+            unsupported => { assert(false, "mkdtemp unsupported") },
+            io => { assert(false, "mkdtemp io") },
+        }
+        return text.file_realpath(dir) else dir
+    }
+    assert(false, "mkdtemp exhausted")
+    ""
+}
+
+fn two(n: int) -> str {
+    if n < 10 then "0{n}" else "{n}"
+}
+
+fn body_of(n: int) -> List[byte] {
+    var s = ""
+    var k = 0
+    while k < LINES {
+        s = s + "f{two(n)} line {two(k)}\n"
+        k += 1
+    }
+    bytes_of(s)
+}
+
+struct Files {
+    dir: str,
+    paths: List[str],
+}
+
+// `n` files f01.txt .. fNN.txt in a fresh directory.
+fn files_make(n: int) -> Files {
+    let dir = fresh_dir()
+    var paths = List[str]()
+    var i = 1
+    while i <= n {
+        let p = "{dir}/f{two(i)}.txt"
+        fs_write_bytes(p, body_of(i)) else |_| { assert(false, "write {p}") }
+        (mut paths).push(p)
+        i += 1
+    }
+    Files { dir: dir, paths: paths }
+}
+
+fn file_add(fx: Files, name: str) -> str {
+    let p = "{fx.dir}/{name}"
+    fs_write_bytes(p, body_of(99)) else |_| { assert(false, "write {p}") }
+    p
+}
+
+fn files_remove(fx: Files) {
+    let entries = fs_read_dir(fx.dir) else { return }
+    for name in entries {
+        fs_remove("{fx.dir}/{name}") else |_| {}
+    }
+    fs_remove_dir(fx.dir) else |_| {}
+}
+
+// The scratch tab and one tab per file: [untitled, f01, …].
+fn fixture(fx: Files) -> edit.Ed {
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    for p in fx.paths {
+        assert(edit.tab_open(mut ed, p) >= 0, "open {p}")
+    }
+    ed
+}
+
+fn invoke(mut ed: edit.Ed, name: str) -> int {
+    let id = edit.cmd_lookup(ed.reg, name)
+    assert(id != 0, "{name} is registered")
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    edit.ed_cmd_invoke(mut ed, id, mut cx)
+}
+
+// A selection ending at column 4 of line `line` in tab `idx`'s focused
+// window, its view scrolled to two lines above.
+fn place(mut ed: edit.Ed, idx: int, line: int) {
+    edit.tab_switch(mut ed, idx)
+    let w = edit.tab_focus_win(ed, idx)
+    assert(w >= 0, "tab {idx} has a window")
+    let off = line * LINE_LEN + 4
+    var c = text.cursor_at(off as text.ByteOff)
+    c.anchor = off - 3
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p] = c
+    ed.wins[w].vp.top = if line >= 2 then line - 2 else 0
+}
+
+// A dirty edit at offset 0 through the focused window of tab `idx`.
+fn dirty(mut ed: edit.Ed, idx: int, s: str) {
+    edit.tab_switch(mut ed, idx)
+    let w = ed.win
+    let b = bytes_of(s)
+    edit.ed_undo_begin(mut ed, w, text.TXN_TYPE)
+    assert(edit.ed_edit_insert(mut ed, w, 0, b, 0, b.len), "insert {s}")
+    edit.ed_undo_end(mut ed, w)
+    assert(edit.tab_modified(ed, idx), "tab {idx} is modified")
+}
+
+fn tab_name(ed: edit.Ed, i: int) -> str {
+    if ed.tabs[i].has_path then ed.tabs[i].path else "untitled"
+}
+
+fn group_of(ed: edit.Ed, i: int) -> str {
+    let g = ed.tabs[i].group_id
+    if g == 0 {
+        return "-"
+    }
+    let at = edit.group_find(ed, g)
+    if at < 0 then "dangling" else "{ed.groups[at].label}#{ed.tabs[i].group_ordinal}"
+}
+
+fn win_line(ed: edit.Ed, w: int) -> str {
+    let p = ed.wins[w].cs.primary
+    let c = ed.wins[w].cs.curs[p]
+    "pos={c.pos} anchor={c.anchor} top={ed.wins[w].vp.top}"
+}
+
+// Every tab, in order: its name, its group, its focused window's cursor
+// and view, and each leaf's when it has more than one.
+fn snapshot(ed: edit.Ed) -> List[str] {
+    var out = List[str]()
+    var i = 0
+    while i < ed.tabs.len {
+        let w = edit.tab_focus_win(ed, i)
+        var line = "{i} {tab_name(ed, i)} {group_of(ed, i)} {win_line(ed, w)}"
+        let leaves = edit.pane_collect_leaves(ed, ed.tabs[i].root, 16)
+        if leaves.len > 1 {
+            for l in leaves {
+                line = line + " | {win_line(ed, ed.panes[l].win)}"
+            }
+        }
+        (mut out).push(line)
+        i += 1
+    }
+    (mut out).push("active {ed.tab_active}")
+    out
+}
+
+fn same_lines(before: List[str], after: List[str]) {
+    var i = 0
+    while i < before.len && i < after.len {
+        assert(before[i] == after[i], "before [{before[i]}] after [{after[i]}]")
+        i += 1
+    }
+    assert(before.len == after.len, "{before.len} lines before, {after.len} after")
+}
+
+fn names(ed: edit.Ed) -> List[str] {
+    var out = List[str]()
+    var i = 0
+    while i < ed.tabs.len {
+        (mut out).push(tab_name(ed, i))
+        i += 1
+    }
+    out
+}
+
+// 22 tabs, a cursor and a view in each file tab, `t o` from the sixth:
+// the message names the count and the key; the reopen puts every tab back
+// in its place, the sixth active, every cursor and view as it was.
+fn close_others_reopens_every_tab_in_place() {
+    let fx = files_make(21)
+    var ed = fixture(fx)
+    assert(ed.tabs.len == 22, "22 tabs: {ed.tabs.len}")
+    var i = 1
+    while i < 22 {
+        place(mut ed, i, (i * 7) % 35 + 3)
+        i += 1
+    }
+    edit.tab_switch(mut ed, 5)
+    let before = snapshot(ed)
+    assert(invoke(mut ed, "ed.tab.close_others") == edit.CMD_OK, "t o")
+    assert(ed.tabs.len == 1, "one tab left: {ed.tabs.len}")
+    assert(ed.msg.text == "closed 21 tabs — t u to reopen", "the message: [{ed.msg.text}]")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_OK, "t u")
+    assert(ed.msg.text == "reopened 21 tabs", "the answer: [{ed.msg.text}]")
+    same_lines(before, snapshot(ed))
+    files_remove(fx)
+}
+
+// `:gclose` on a group of three between other tabs; the group dissolves
+// with its last member. The reopen makes it again, its label kept, its
+// members in their ordinals and their places, the member that was active
+// active again.
+fn group_close_reopens_the_group() {
+    let fx = files_make(8)
+    var ed = fixture(fx)
+    let g = edit.group_create(mut ed, fx.dir, "grp/")
+    edit.group_add_member(mut ed, g, 3)
+    edit.group_add_member(mut ed, g, 4)
+    edit.group_add_member(mut ed, g, 5)
+    edit.group_set_ordinal(mut ed, 5, 1)
+    place(mut ed, 3, 9)
+    place(mut ed, 5, 17)
+    place(mut ed, 4, 30)
+    assert(edit.active_group_id(ed) == g, "inside the group")
+    let before = snapshot(ed)
+    assert(invoke(mut ed, "ed.group.close") == edit.CMD_OK, ":gclose")
+    assert(ed.tabs.len == 6, "three closed: {ed.tabs.len}")
+    assert(ed.groups.len == 0, "the group dissolved")
+    assert(ed.msg.text == "closed 3 tabs — t u to reopen", "the message: [{ed.msg.text}]")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_OK, "t u")
+    assert(ed.msg.text == "reopened 3 tabs", "the answer: [{ed.msg.text}]")
+    assert(ed.groups.len == 1, "the group is back")
+    same_lines(before, snapshot(ed))
+    files_remove(fx)
+}
+
+// The group picker's Edit closes the unticked members, modified or not
+// (C's: the dialog bullets the modified row before Enter). The modified
+// buffer stays in memory, unwritten; the reopen shows it again in its
+// tab, its text unsaved, and the file on disk is as it was.
+fn picker_close_keeps_an_unsaved_buffer() {
+    let fx = files_make(6)
+    var ed = fixture(fx)
+    let g = edit.group_create(mut ed, fx.dir, "grp/")
+    var i = 1
+    while i <= 4 {
+        edit.group_add_member(mut ed, g, i)
+        i += 1
+    }
+    dirty(mut ed, 2, "UNSAVED ")
+    place(mut ed, 3, 12)
+    edit.tab_switch(mut ed, 1)
+    let before = snapshot(ed)
+    let buffer = ed.tabs[2].buffer_id
+    assert(invoke(mut ed, "ed.group.edit") == edit.CMD_OK, "t e")
+    edit.gp_close(mut ed)
+    assert(edit.gp_show_edit(mut ed, fx.dir, "grp/"), "the Edit dialog")
+    edit.gp_preselect(mut ed, fx.paths[0])
+    edit.gp_preselect(mut ed, fx.paths[3])
+    assert(invoke(mut ed, "ed.group.pick.confirm") == edit.CMD_OK, "Enter")
+    assert(ed.tabs.len == 5, "two closed: {ed.tabs.len}")
+    assert(edit.tab_find_by_path(ed, fx.paths[1]) < 0, "the modified member's tab closed")
+    let bi = edit.ed_buf_index(ed, buffer)
+    assert(bi >= 0 && edit.buf_dirty(ed.bufs[bi]), "its buffer is still in memory, unsaved")
+    assert(ed.msg.text == "closed 2 tabs — t u to reopen", "the message: [{ed.msg.text}]")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_OK, "t u")
+    same_lines(before, snapshot(ed))
+    let back = edit.tab_find_by_path(ed, fx.paths[1])
+    assert(back == 2 && edit.tab_modified(ed, back), "the modified tab is back, still modified")
+    assert(ed.tabs[back].buffer_id == buffer, "on the same buffer")
+    let disk = fs_read_bytes(fx.paths[1]) else List[byte]()
+    let want = body_of(2)
+    assert(disk.len == want.len, "the file on disk is unchanged")
+    files_remove(fx)
+}
+
+// After a record is made, a close of one tab (`t c`, a group of one)
+// neither replaces it nor says anything: the reopen still brings back the
+// first gesture's tabs, in their places.
+fn one_tab_close_keeps_the_record() {
+    let fx = files_make(5)
+    var ed = fixture(fx)
+    edit.tab_switch(mut ed, 2)
+    let before = names(ed)
+    assert(invoke(mut ed, "ed.tab.close_others") == edit.CMD_OK, "t o")
+    assert(ed.tabs.len == 1, "one left")
+    let g_path = file_add(fx, "g.txt")
+    let h_path = file_add(fx, "h.txt")
+    assert(edit.tab_open(mut ed, g_path) == 1, "g")
+    assert(edit.tab_open(mut ed, h_path) == 2, "h")
+    edit.ed_msg_clear(mut ed)
+    edit.tab_switch(mut ed, 2)
+    assert(invoke(mut ed, "ed.tab.close") == edit.CMD_OK, "t c")
+    assert(ed.msg.text == "", "a one-tab close says nothing: [{ed.msg.text}]")
+    assert(edit.tab_open(mut ed, h_path) == 2, "h again")
+    let g = edit.group_create(mut ed, fx.dir, "one/")
+    edit.group_add_member(mut ed, g, 2)
+    edit.tab_switch(mut ed, 2)
+    assert(invoke(mut ed, "ed.group.close") == edit.CMD_OK, ":gclose on one member")
+    assert(ed.msg.text == "", "a one-member group close says nothing: [{ed.msg.text}]")
+    assert(ed.tabs.len == 2, "f02 and g")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_OK, "t u")
+    assert(ed.msg.text == "reopened 5 tabs", "the answer: [{ed.msg.text}]")
+    let after = names(ed)
+    assert(after.len == 7, "seven tabs: {after.len}")
+    var i = 0
+    while i < before.len {
+        assert(after[i] == before[i], "tab {i}: {after[i]}, want {before[i]}")
+        i += 1
+    }
+    assert(after[6] == g_path, "g after them")
+    files_remove(fx)
+}
+
+// A recorded path opened again by hand is not opened twice: the reopen
+// skips it and says so.
+fn reopen_skips_a_path_open_again() {
+    let fx = files_make(4)
+    var ed = fixture(fx)
+    edit.tab_switch(mut ed, 1)
+    assert(invoke(mut ed, "ed.tab.close_others") == edit.CMD_OK, "t o")
+    assert(edit.tab_open(mut ed, fx.paths[2]) >= 0, "f03 by hand")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_OK, "t u")
+    assert(ed.msg.text == "reopened 3 tabs; 1 already open", "the answer: [{ed.msg.text}]")
+    assert(ed.tabs.len == 5, "five tabs: {ed.tabs.len}")
+    for p in fx.paths {
+        var n = 0
+        for t in ed.tabs {
+            if t.has_path && t.path == p {
+                n += 1
+            }
+        }
+        assert(n == 1, "{p} once: {n}")
+    }
+    files_remove(fx)
+}
+
+// Nothing recorded: the command refuses by name, before the first close
+// and after a reopen has used the record.
+fn reopen_twice_has_nothing_to_reopen() {
+    let fx = files_make(3)
+    var ed = fixture(fx)
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_ERR_STATE, "nothing yet")
+    assert(ed.msg.text == "no closed tabs to reopen", "[{ed.msg.text}]")
+    assert(invoke(mut ed, "ed.tab.close_others") == edit.CMD_OK, "t o")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_OK, "t u")
+    assert(ed.tabs.len == 4, "four tabs")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_ERR_STATE, "used up")
+    assert(ed.msg.text == "no closed tabs to reopen", "[{ed.msg.text}]")
+    assert(ed.tabs.len == 4, "still four")
+    files_remove(fx)
+}
+
+// C's refusal is unchanged — a modified other tab refuses the whole
+// gesture — and a refused gesture records nothing.
+fn refused_close_records_nothing() {
+    let fx = files_make(3)
+    var ed = fixture(fx)
+    dirty(mut ed, 2, "x")
+    edit.tab_switch(mut ed, 1)
+    assert(invoke(mut ed, "ed.tab.close_others") == edit.CMD_ERR_STATE, "refused")
+    assert(ed.msg.text == "unsaved changes in another tab; save or force first", "C's: [{ed.msg.text}]")
+    assert(ed.tabs.len == 4, "nothing closed")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_ERR_STATE, "nothing recorded")
+    assert(ed.msg.text == "no closed tabs to reopen", "[{ed.msg.text}]")
+    files_remove(fx)
+}
+
+fn effective(ed: edit.Ed, seq: str) -> str {
+    let keys = edit.key_parse_seq(seq, 8)
+    assert(keys.len != 0, "parse {seq}")
+    let km = edit.bind_keys(ed, edit.MODE_L)
+    let (m, _, bi) = edit.keymap_lookup(km, keys, keys.len)
+    if m != edit.MATCH_FULL && m != edit.MATCH_FULL_PREFIX {
+        return ""
+    }
+    ed.reg.entries[km.binds[bi].cmd - 1].name
+}
+
+fn parses_to(mut ed: edit.Ed, line: str, want: str) {
+    let r = edit.cmd_parse(mut ed, bytes_of(line))
+    assert(edit.cmd_parse_ok(r), "{line} parses")
+    assert(r.argv.len == 1, "{line}: one word")
+    let got = str_from_utf8(r.argv[0]) else ""
+    assert(got == want, "{line}: {got}, want {want}")
+}
+
+// `t u` is L's key once the shipped configuration has run (the yew row
+// under it; `runtime/init.fl` is sagitta's, byte for byte), and `t o` is
+// still C's. `:tabreopen` and `:tab.reopen` name the command. A configured
+// `t u` wins, and the message then names the command line.
+fn key_and_command_name() {
+    let fx = files_make(3)
+    var ed = fixture(fx)
+    let source = fs_read_bytes("runtime/init.fl") else {
+        assert(false, "read runtime/init.fl")
+        List[byte]()
+    }
+    edit.bind_batch_begin(mut ed)
+    assert(edit.fl_runtime_eval(mut ed, source) == edit.CMD_OK, "init.fl runs")
+    edit.bind_batch_end(mut ed)
+    assert(effective(ed, "t u") == "ed.tab.reopen", "L t u: [{effective(ed, "t u")}]")
+    assert(effective(ed, "t o") == "ed.tab.close_others", "L t o")
+    parses_to(mut ed, ":tabreopen", "ed.tab.reopen")
+    parses_to(mut ed, ":tab.reopen", "ed.tab.reopen")
+    parses_to(mut ed, ":ed.tab.reopen", "ed.tab.reopen")
+    let mine = bytes_of("bind(\"L\", \"t u\", \"ed.nop\")\n")
+    assert(edit.fl_runtime_eval(mut ed, mine) == edit.CMD_OK, "a configured t u")
+    assert(effective(ed, "t u") == "ed.nop", "the configured row wins")
+    edit.tab_switch(mut ed, 1)
+    assert(invoke(mut ed, "ed.tab.close_others") == edit.CMD_OK, "t o")
+    assert(ed.msg.text == "closed 3 tabs — :tabreopen to reopen", "the message: [{ed.msg.text}]")
+    files_remove(fx)
+}
+
+// A tab split in two: both panes come back, each window's cursor and view,
+// the split's direction, and the focused leaf.
+fn split_panes_come_back() {
+    let fx = files_make(3)
+    var ed = fixture(fx)
+    place(mut ed, 1, 4)
+    assert(invoke(mut ed, "ed.pane.split_v") == edit.CMD_OK, "C-w v")
+    let leaves = edit.pane_collect_leaves(ed, ed.tabs[1].root, 16)
+    assert(leaves.len == 2, "two panes")
+    let w = ed.win
+    let p = ed.wins[w].cs.primary
+    ed.wins[w].cs.curs[p] = text.cursor_at((25 * LINE_LEN + 2) as text.ByteOff)
+    ed.wins[w].vp.top = 20
+    let dir = ed.panes[ed.tabs[1].root].dir
+    let focus_at = if ed.tabs[1].focus == leaves[0] then 0 else 1
+    edit.tab_switch(mut ed, 2)
+    let before = snapshot(ed)
+    assert(invoke(mut ed, "ed.tab.close_others") == edit.CMD_OK, "t o")
+    assert(ed.msg.text == "closed 3 tabs — t u to reopen", "the message: [{ed.msg.text}]")
+    assert(invoke(mut ed, "ed.tab.reopen") == edit.CMD_OK, "t u")
+    same_lines(before, snapshot(ed))
+    let again = edit.pane_collect_leaves(ed, ed.tabs[1].root, 16)
+    assert(again.len == 2, "two panes again")
+    assert(ed.panes[ed.tabs[1].root].dir == dir, "the split's direction")
+    assert(ed.tabs[1].focus == again[focus_at], "the focused leaf")
+    files_remove(fx)
+}
+
+fn main() {
+    let chosen = (env_get("YEW_REOPEN_CASE") else "-1").to_int() else -1
+    var ran = 0
+    var n = 0
+    while n < 9 {
+        if chosen < 0 || chosen == n {
+            match n {
+                0 => { close_others_reopens_every_tab_in_place() },
+                1 => { group_close_reopens_the_group() },
+                2 => { picker_close_keeps_an_unsaved_buffer() },
+                3 => { one_tab_close_keeps_the_record() },
+                4 => { reopen_skips_a_path_open_again() },
+                5 => { reopen_twice_has_nothing_to_reopen() },
+                6 => { refused_close_records_nothing() },
+                7 => { key_and_command_name() },
+                8 => { split_panes_come_back() },
+                _ => { assert(false, "unregistered case") },
+            }
+            print("tab_reopen case {n}: PASS")
+            ran += 1
+        }
+        n += 1
+    }
+    print("tab_reopen_test: {ran} cases run, 0 SKIP")
+}
