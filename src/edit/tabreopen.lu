@@ -1,0 +1,468 @@
+//! edit.tabreopen — closing many tabs at once can be undone. yew's own
+//! (yw20, yew#129; docs/MAP.md §9): sagitta has no counterpart.
+//!
+//! sagitta closes several tabs in one gesture in three places, each
+//! silently and keeping nothing: `ed.tab.close_others` (`t o`, `:tabonly`,
+//! the tab menu's "close others"; `tabs.c:2066-2116`), `ed.group.close` on
+//! a group (`:gclose`, the group menu's close; `groupnav.c:259-308`) and
+//! the group picker's Edit, whose unticked members' tabs close
+//! (`grouppicker.c:934-1007`). A closed tab's buffer stays in the editor's
+//! list (`tab_destroy`), so its text survives in memory; its windows
+//! (cursors, view, jumps), its place on the strip and its group do not,
+//! and nothing brings it back. On the owner's machine twenty tabs went to
+//! three that way, or some other way, with no road back (yew#129).
+//!
+//! Here each of the three takes a record of the tabs it is about to close,
+//! by id, BEFORE the first close (`tab_undo_capture`: the compaction moves
+//! every index above a closed tab), and keeps the ones that went
+//! (`tab_undo_keep`) as the editor's ONE record, `Ed.tab_undo`: in memory
+//! only, never written to the workspace state, replaced by the next
+//! gesture that closes two or more tabs, gone with the session. Such a
+//! gesture says so: `closed 21 tabs — t u to reopen`. A gesture that
+//! closes one tab (a group of one) keeps the record there was and leaves
+//! the message row as C's: a stray one-tab close must not discard a
+//! twenty-tab record.
+//!
+//! `ed.tab.reopen` (`t u`, `:tabreopen`) puts every recorded tab back at
+//! its index, in ascending order, with its pane tree rebuilt node for node,
+//! each window's cursors, view and jumps, and its group (made again with
+//! its label, directory and resume path when the close dissolved it) and
+//! ordinal; the tab that was active before the gesture is active again.
+//! A recorded path open again meanwhile is not opened twice; a tab whose
+//! buffer was closed since reads its path again (an untitled one cannot
+//! come back). The record is used up.
+//!
+//! The key: a chord stays in the layer its first key matched
+//! (`dispatch_key`), and L's `t` is the configured layer's, so `t u` is a
+//! yew row of L's configured keymap (`keys_yew_config_rows`, added under
+//! every configured row by `bind_rows_for_mode` and `ed_new`), never a
+//! line of `runtime/init.fl`, which stays sagitta's byte for byte.
+
+use text
+
+/// One window of a closed tab: the buffer it showed, by id, and its view.
+pub struct ClosedWin {
+    buffer_id: int,
+    cs: text.CursorSet,
+    top: int,
+    top_sub: int,
+    left: int,
+    wrap: bool,
+    jumps: text.JumpList,
+}
+
+/// One node of a closed tab's pane tree, in pre-order; `a`, `b` and
+/// `win` index the record's own lists (-1 for none).
+pub struct ClosedPane {
+    is_leaf: bool,
+    dir: int,
+    ratio: int,
+    a: int,
+    b: int,
+    win: int,
+}
+
+/// A closed tab: its id and index when it closed, what it showed, its
+/// group membership, and its pane tree (`root` and `focus` index `panes`).
+pub struct ClosedTab {
+    tab_id: int,
+    index: int,
+    buffer_id: int,
+    path: str,
+    display_path: str,
+    has_path: bool,
+    group_id: int,
+    group_ordinal: int,
+    panes: List[ClosedPane],
+    wins: List[ClosedWin],
+    root: int,
+    focus: int,
+}
+
+/// A recorded tab's group, as it was: what it takes to make it again.
+pub struct ClosedGroup {
+    id: int,
+    label: str,
+    dir_path: str,
+    last_active_member: str,
+    has_last: bool,
+}
+
+/// The record of one multi-tab close (`Ed.tab_undo`'s one element): the
+/// closed tabs in their order, their groups, and the tab active before.
+pub struct TabUndo {
+    tabs: List[ClosedTab],
+    groups: List[ClosedGroup],
+    active_id: int,
+}
+
+/// yew's own rows of mode `m`'s configured keymap: `t u` in L.
+pub fn keys_yew_config_rows(m: int) -> List[BindRow] {
+    var r = List[BindRow]()
+    if m == MODE_L {
+        (mut r).push(bindrow("t u", "ed.tab.reopen"))
+    }
+    r
+}
+
+fn tu_has_group(gs: List[ClosedGroup], id: int) -> bool {
+    for g in gs {
+        if g.id == id {
+            return true
+        }
+    }
+    false
+}
+
+// The tree under `p` appended to `rec.panes` in pre-order, each leaf's
+// window to `rec.wins`; answers the node's index, -1 for no live node.
+fn tu_take_panes(ed: Ed, p: int, focus: int, mut rec: ClosedTab, depth: int) -> int {
+    if !pane_live(ed, p) || depth > PANE_MAX_LEAVES {
+        return -1
+    }
+    let at = rec.panes.len
+    (mut rec.panes).push(ClosedPane {
+        is_leaf: ed.panes[p].is_leaf,
+        dir: ed.panes[p].dir,
+        ratio: ed.panes[p].ratio,
+        a: -1,
+        b: -1,
+        win: -1,
+    })
+    if p == focus {
+        rec.focus = at
+    }
+    if ed.panes[p].is_leaf {
+        let wi = ed.panes[p].win
+        if wi >= 0 && wi < ed.wins.len {
+            let bi = ed.wins[wi].buf
+            rec.panes[at].win = rec.wins.len
+            (mut rec.wins).push(ClosedWin {
+                buffer_id: if bi >= 0 && bi < ed.bufs.len then ed.bufs[bi].id else 0,
+                cs: copy ed.wins[wi].cs,
+                top: ed.wins[wi].vp.top,
+                top_sub: ed.wins[wi].vp.top_sub,
+                left: ed.wins[wi].vp.left,
+                wrap: ed.wins[wi].vp.wrap,
+                jumps: copy ed.wins[wi].jumps,
+            })
+        }
+        return at
+    }
+    let a = tu_take_panes(ed, ed.panes[p].a, focus, mut rec, depth + 1)
+    let b = tu_take_panes(ed, ed.panes[p].b, focus, mut rec, depth + 1)
+    rec.panes[at].a = a
+    rec.panes[at].b = b
+    at
+}
+
+/// The record of the tabs `ids` name, taken BEFORE any of them closes, in
+/// the tabs' order: each one's index, path, buffer, group and ordinal,
+/// pane tree and windows; each of their groups as it is; the active tab.
+pub fn tab_undo_capture(ed: Ed, ids: List[int]) -> TabUndo {
+    let active = ed.tab_active
+    var rec = TabUndo {
+        tabs: List[ClosedTab](),
+        groups: List[ClosedGroup](),
+        active_id: if active >= 0 && active < ed.tabs.len then ed.tabs[active].tab_id else 0,
+    }
+    var i = 0
+    while i < ed.tabs.len {
+        let t = copy ed.tabs[i]
+        var doomed = false
+        for id in ids {
+            if id == t.tab_id {
+                doomed = true
+            }
+        }
+        if doomed {
+            var ct = ClosedTab {
+                tab_id: t.tab_id,
+                index: i,
+                buffer_id: t.buffer_id,
+                path: t.path,
+                display_path: t.display_path,
+                has_path: t.has_path,
+                group_id: t.group_id,
+                group_ordinal: t.group_ordinal,
+                panes: List[ClosedPane](),
+                wins: List[ClosedWin](),
+                root: -1,
+                focus: -1,
+            }
+            ct.root = tu_take_panes(ed, t.root, t.focus, mut ct, 0)
+            (mut rec.tabs).push(ct)
+            let at = group_find(ed, t.group_id)
+            if at >= 0 && !tu_has_group(rec.groups, t.group_id) {
+                (mut rec.groups).push(ClosedGroup {
+                    id: t.group_id,
+                    label: ed.groups[at].label,
+                    dir_path: ed.groups[at].dir_path,
+                    last_active_member: ed.groups[at].last_active_member,
+                    has_last: ed.groups[at].has_last,
+                })
+            }
+        }
+        i += 1
+    }
+    rec
+}
+
+/// After a gesture's closes: when two or more of the recorded tabs went,
+/// they are the editor's one record, replacing the last, and the message
+/// says how many went and how to bring them back. Fewer, and the record
+/// there was stands and the message row is the gesture's own (C's).
+pub fn tab_undo_keep(mut ed: Ed, rec: TabUndo) {
+    var gone = List[ClosedTab]()
+    for ct in rec.tabs {
+        if tab_index_of_id(ed, ct.tab_id) < 0 {
+            (mut gone).push(copy ct)
+        }
+    }
+    if gone.len < 2 {
+        return
+    }
+    let n = gone.len
+    var kept = copy rec
+    kept.tabs = gone
+    ed.tab_undo = List[TabUndo]()
+    (mut ed.tab_undo).push(kept)
+    let hint = tab_reopen_hint(ed)
+    ed_msg(mut ed, MSG_INFO, "closed {n} tabs — {hint} to reopen")
+}
+
+/// What the close message names: the first key L's configured keymap
+/// binds to `ed.tab.reopen` (`t u` unless a configuration took it), else
+/// the command line's short name.
+pub fn tab_reopen_hint(ed: Ed) -> str {
+    let id = cmd_lookup(ed.reg, "ed.tab.reopen")
+    if id != 0 {
+        let (_, entries) = keymap_list(ed.keymaps[km_bind(MODE_L)])
+        for e in entries {
+            if e.bind.cmd == id {
+                return key_format_str(e.seq)
+            }
+        }
+    }
+    ":tabreopen"
+}
+
+// Recorded node `node` built again: a leaf as a window on its recorded
+// buffer (else `bi`, the tab's) holding its cursors, view and jumps; a
+// split as C's, its ratio kept. `made[node]` names the pane; every window
+// made is in `wins`. -1 when nothing could be made; a split with one side
+// missing is that side (as the state restore's `sp_panes`).
+fn tu_build(
+    mut ed: Ed,
+    ct: ClosedTab,
+    node: int,
+    bi: int,
+    mut made: List[int],
+    mut wins: List[int],
+    depth: int,
+) -> int {
+    if node < 0 || node >= ct.panes.len || depth > PANE_MAX_LEAVES {
+        return -1
+    }
+    let pn = copy ct.panes[node]
+    if pn.is_leaf {
+        if pn.win < 0 || pn.win >= ct.wins.len {
+            return -1
+        }
+        let cw = copy ct.wins[pn.win]
+        var wb = ed_buf_index(ed, cw.buffer_id)
+        if wb < 0 {
+            wb = bi
+        }
+        let wi = ed_win_clone(mut ed, ed.win)
+        if wi < 0 {
+            return -1
+        }
+        (mut wins).push(wi)
+        ed_win_set_buffer(mut ed, wi, wb)
+        apply_win_opts(ed.opts, mut ed.wins[wi])
+        ed.wins[wi].cs = copy cw.cs
+        ed.wins[wi].vp.top = cw.top
+        ed.wins[wi].vp.top_sub = cw.top_sub
+        ed.wins[wi].vp.left = cw.left
+        ed.wins[wi].vp.wrap = cw.wrap
+        ed.wins[wi].jumps = copy cw.jumps
+        if ed.bufs[wb].resident {
+            text.cset_normalize(ed.bufs[wb].ec.tb, mut ed.wins[wi].cs)
+        }
+        let p = pane_new_leaf(mut ed, wi)
+        made[node] = p
+        return p
+    }
+    let p = pane_alloc(mut ed)
+    ed.panes[p].is_leaf = false
+    ed.panes[p].dir = pn.dir
+    ed.panes[p].ratio = pn.ratio
+    let a = tu_build(mut ed, ct, pn.a, bi, mut made, mut wins, depth + 1)
+    let b = tu_build(mut ed, ct, pn.b, bi, mut made, mut wins, depth + 1)
+    if a < 0 || b < 0 {
+        pane_release(mut ed, p)
+        return if a >= 0 then a else b
+    }
+    ed.panes[p].a = a
+    ed.panes[p].b = b
+    ed.panes[a].parent = p
+    ed.panes[b].parent = p
+    made[node] = p
+    p
+}
+
+// One recorded tab made again, at the end of the list (the caller moves
+// it to its place), ungrouped: on its buffer while the buffer is still
+// there (its unsaved text with it), else on its path read again, else
+// nothing (-1: an untitled tab whose buffer was closed).
+fn tu_reopen_one(mut ed: Ed, ct: ClosedTab) -> int {
+    var bi = ed_buf_index(ed, ct.buffer_id)
+    if bi < 0 {
+        if !ct.has_path {
+            return -1
+        }
+        bi = ws_file_buf(mut ed, ct.path)
+        if bi < 0 {
+            return -1
+        }
+    }
+    var made = List[int]()
+    for _ in ct.panes {
+        (mut made).push(-1)
+    }
+    var wins = List[int]()
+    let root = tu_build(mut ed, ct, ct.root, bi, mut made, mut wins, 0)
+    if root < 0 {
+        for w in wins {
+            ed_win_release(mut ed, w)
+        }
+        return -1
+    }
+    var focus = if ct.focus >= 0 && ct.focus < made.len then made[ct.focus] else -1
+    if !pane_live(ed, focus) || !ed.panes[focus].is_leaf {
+        focus = pane_first_leaf(ed, root)
+    }
+    let tid = ed.next_tab_id
+    ed.next_tab_id += 1
+    var t = tab_value(tid, ed.bufs[bi].id, root, ct.path, ct.display_path)
+    t.has_path = ct.has_path
+    t.focus = focus
+    (mut ed.tabs).push(t)
+    ed.tabs.len - 1
+}
+
+fn tu_live_group(old: List[int], live: List[int], id: int) -> int {
+    var i = 0
+    while i < old.len {
+        if old[i] == id {
+            return live[i]
+        }
+        i += 1
+    }
+    0
+}
+
+/// `ed.tab.reopen` (yew's own; `t u`, `:tabreopen`): the last multi-tab
+/// close undone — every recorded tab back in its place, its panes and
+/// views, its group and ordinal; the tab active before the close active
+/// again; the record used up.
+pub fn tab_cmd_reopen(mut ed: Ed, cx: CmdCtx) -> int {
+    let _ = cx.win
+    if ed.tab_undo.len == 0 || ed.win < 0 {
+        ed_msg(mut ed, MSG_ERROR, "no closed tabs to reopen")
+        return CMD_ERR_STATE
+    }
+    let rec = copy ed.tab_undo[0]
+    ed.tab_undo = List[TabUndo]()
+    // A recorded group the close dissolved is made again; one still
+    // here takes its members back.
+    var old_g = List[int]()
+    var live_g = List[int]()
+    for g in rec.groups {
+        var live = g.id
+        if group_find(ed, g.id) < 0 {
+            live = group_create(mut ed, g.dir_path, g.label)
+            if g.has_last {
+                group_set_last_member(mut ed, live, g.last_active_member, true)
+            }
+        }
+        (mut old_g).push(g.id)
+        (mut live_g).push(live)
+    }
+    var reopened = 0
+    var already = 0
+    var refused = 0
+    var active_id = 0
+    var member_ids = List[int]()
+    var member_ords = List[int]()
+    for ct in rec.tabs {
+        if ct.has_path && tab_find_by_path(ed, ct.path) >= 0 {
+            already += 1
+            continue
+        }
+        if ed.tabs.len >= TAB_MAX {
+            refused += 1
+            continue
+        }
+        let made = tu_reopen_one(mut ed, ct)
+        if made < 0 {
+            refused += 1
+            continue
+        }
+        let to = if ct.index < ed.tabs.len - 1 then ct.index else ed.tabs.len - 1
+        tab_reorder(mut ed, made, to)
+        let id = ed.tabs[to].tab_id
+        let gid = tu_live_group(old_g, live_g, ct.group_id)
+        if gid != 0 && group_find(ed, gid) >= 0 {
+            group_add_member(mut ed, gid, to)
+            (mut member_ids).push(id)
+            (mut member_ords).push(ct.group_ordinal)
+        }
+        if ct.tab_id == rec.active_id {
+            active_id = id
+        }
+        reopened += 1
+    }
+    // Each member back at its ordinal, the lowest first, so every one lands
+    // where it was among the members that stayed.
+    var done = List[bool]()
+    for _ in member_ids {
+        (mut done).push(false)
+    }
+    var k = 0
+    while k < member_ids.len {
+        var best = -1
+        var j = 0
+        while j < member_ids.len {
+            if !done[j] && (best < 0 || member_ords[j] < member_ords[best]) {
+                best = j
+            }
+            j += 1
+        }
+        done[best] = true
+        let idx = tab_index_of_id(ed, member_ids[best])
+        if idx >= 0 && member_ords[best] > 0 {
+            group_set_ordinal(mut ed, idx, member_ords[best])
+        }
+        k += 1
+    }
+    group_prune_empty(mut ed)
+    mouse_tabs_changed(mut ed)
+    let back = if active_id != 0 then tab_index_of_id(ed, active_id) else -1
+    tab_switch(mut ed, if back >= 0 then back else ed.tab_active)
+    fuss_windows_changed(mut ed)
+    state_mark_dirty(mut ed)
+    ed.layout_dirty = true
+    ed.full_damage = true
+    let plural = if reopened == 1 then "" else "s"
+    var msg = "reopened {reopened} tab{plural}"
+    if already != 0 {
+        msg = msg + "; {already} already open"
+    }
+    if refused != 0 {
+        msg = msg + "; {refused} could not be reopened"
+    }
+    ed_msg(mut ed, MSG_INFO, msg)
+    CMD_OK
+}
