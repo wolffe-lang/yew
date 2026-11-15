@@ -25,10 +25,22 @@ def run_case(root, via_script=False, control_c=False):
     def controlling_tty():
         os.setsid()
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-    proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave,
-                            pass_fds=(slave,), preexec_fn=controlling_tty,
+    done_read, done_write = os.pipe()
+    release_read, release_write = os.pipe()
+    # Keep the controlling session leader alive while checking restored attrs.
+    # Darwin invalidates the slave ioctl after its session leader has exited.
+    wrapper = ('import os,subprocess,sys; '
+               'rc=subprocess.run(sys.argv[3:]).returncode; '
+               'os.write(int(sys.argv[1]),b"done"); '
+               'os.read(int(sys.argv[2]),1); sys.exit(rc)')
+    proc = subprocess.Popen([sys.executable, '-I', '-c', wrapper,
+                             str(done_write), str(release_read)] + cmd,
+                            stdin=slave, stdout=slave, stderr=slave,
+                            pass_fds=(slave, done_write, release_read), preexec_fn=controlling_tty,
                             cwd=root, env={'PATH':'/usr/bin:/bin','HOME':str(root),
                                            'SHELL':'/bin/sh','TERM':'xterm-256color'})
+    os.close(done_write)
+    os.close(release_read)
     raw = bytearray()
     def wait_for(needle, seconds=8):
         deadline = time.monotonic()+seconds
@@ -59,8 +71,8 @@ def run_case(root, via_script=False, control_c=False):
             ready,_,_=select.select([master],[],[],2)
             if not ready:raise AssertionError('incomplete JSON line')
             raw.extend(os.read(master,65536))
-        proc.wait(timeout=8)
-        assert proc.returncode==0, proc.returncode
+        ready,_,_=select.select([done_read],[],[],8)
+        assert ready and os.read(done_read,4)==b'done', 'census did not finish'
         payload=json.loads(raw.split(b'MOUSE-CENSUS-JSON ',1)[1].splitlines()[0])
         mouse=[x for x in payload['events'] if x['kind'] in ('press','release')]
         assert len(mouse)==12, payload
@@ -71,9 +83,14 @@ def run_case(root, via_script=False, control_c=False):
         assert payload['exit_reason']==('ctrl-c' if control_c else 'q'), payload
         assert b'\x1b[?1000l\x1b[?1002l\x1b[?1006l' in raw
         assert termios.tcgetattr(slave)==before, 'terminal settings not restored exactly'
+        os.write(release_write,b'x')
+        proc.wait(timeout=8)
+        assert proc.returncode==0, proc.returncode
         (root/'result.json').write_text(json.dumps(payload,indent=2))
     finally:
         (root/'raw.bin').write_bytes(raw)
+        os.close(release_write)
+        os.close(done_read)
         os.close(master)
         os.close(slave)
         if proc.poll() is None:
