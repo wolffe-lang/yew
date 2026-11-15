@@ -1202,9 +1202,22 @@ One paragraph each; yw01's is drafted in full
 
 ## 9. yew's own additions
 
-What the port has that sagitta does not. Each is named here, in its
-command's help text and in its unit's header, holds no sagitta golden
-(every C golden stays byte-identical), and is held by rows of its own.
+What the port adds or intentionally changes relative to sagitta. Original C
+goldens are never rewritten; any changed visual expectation is named through
+the pinned divergence mechanism. Each extension has rows of its own.
+
+- **Selection visibility and Shift mouse capture** (`src/edit/draw.lu`,
+  `src/term/input.lu`, `src/term/tty.lu`): 16-color and monochrome selection
+  have a reverse-video floor; equal styles receive visible emphasis; empty
+  ranges mark their boundary without selecting bytes. Selection follows
+  search/diagnostic backgrounds and precedes secondary cursors. The input
+  setup requests XTSHIFTESCAPE and all shared restore blobs reset it.
+  Rows: `src/edit_selection_visibility_test.lu` and the rendering cases in
+  `tests/selection/run.py`. The other selection contracts remain literal
+  reds until their implementation stages; the observer and physical-census
+  driver have independent tests. The protocol is documented in
+  [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html);
+  application overrides can be forbidden by terminal configuration.
 
 - **`ed.keys`, the keys help** (yw15, `src/edit/keyshelp.lu`): every
   mode's bindings in the list picker (`PICK_HOST_KEYS`), each row its
