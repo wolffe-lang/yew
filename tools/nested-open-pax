@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""nested-open-pax: tools/nested-open-row's cases on PAX, under QEMU (yew#129).
+
+    python3 -I tools/nested-open-pax ISO WORK [--firmware uefi|bios]
+                                     [--tabs N] [--case NAME]...
+
+ISO a PAX live image, WORK a new directory. The machine: KVM, q35, two
+CPUs, 2 GiB, no network card, the ISO as a CD, the framebuffer drawn and
+not shown, and COM1 a pipe whose far end is read at 115200 baud (the
+console mirrors what programs write to the terminal there, and COM1 is
+also the console's keyboard: this check types at the shell's `$ `
+prompt and into yew through it). QEMU is ended through its QMP socket,
+never signalled.
+
+The shell makes a scratch HOME, a log (`YEW_LOG`, info) and a workspace
+of N files (default 26) plus `paths_test.lu`, runs `yew` with every file
+once and quits (the first start), then each case starts `yew` with no
+file (a resume: N + 2 tabs, the untitled buffer and the N + 1 files) and
+types its `:` lines. A sampler started beside it lists, once a second,
+the processes whose command line starts with `yew` (`/proc/PID/cmdline`).
+yew is quit with `:q` until the shell prompts; the number of quits it
+took is the number of editors that were running. Then the shell prints
+the log, the saved state's tab records and `active_tab`, and the
+sampler's list.
+
+  newdir    `:!mkdir identity`, `:!yew identity/identity.lu`, `:!touch
+            identity_test.lu`, `:!yew identity_test.lu`: one editor (one
+            quit, one yew in every sample); both files saved as tabs
+            beside the N + 2; one restore in the log.
+  bangbang  `:!!yew identity.lu`: a second editor in the same workspace
+            on the console. It logs that the first editor's pid owns the
+            state; after both quit, the N + 2 tabs are the saved state.
+  refuse    `:!yew identity` (a directory), `:!yew $HOME/x.lu`: one
+            editor, and no `*job:` buffer drawn for either.
+
+`FAIL pax_<case>_<check>` for each red, then `nested-open-pax: GREEN` or
+`RED` (exit 1); exit 2 when the check cannot run.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ANSI = re.compile(rb'\x1b\[[0-9;?<>=]*[A-Za-z]|\x1b[()][A-Za-z0-9]|\x1b[=>]|\x1b\][^\x07]*\x07')
+OVMF = Path('/usr/share/OVMF')
+CASES = ['newdir', 'bangbang', 'refuse']
+ROOT = '/tmp/yw19'
+
+
+class Uart:
+    """tools/execfail-pax's far end of COM1 (from pax's px129 check):
+    PATH.out read at BAUD/10 bytes a second, appended to OUT; typing goes
+    to PATH.in."""
+
+    def __init__(self, path, out, baud=115200):
+        self.rate = baud / 10.0
+        self.out = out
+        self.stop = threading.Event()
+        self.bytes = 0
+        self.lock = threading.Lock()
+        self.buf = bytearray()
+        self.fin = os.open(str(path) + '.in', os.O_RDWR)
+        self.fout = os.open(str(path) + '.out', os.O_RDWR | os.O_NONBLOCK)
+        try:
+            import fcntl
+            fcntl.fcntl(self.fout, 1031, 4096)  # F_SETPIPE_SZ
+        except OSError:
+            pass
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.t.start()
+
+    def run(self):
+        owed, last = 0.0, time.monotonic()
+        with open(self.out, 'ab') as f:
+            while not self.stop.is_set():
+                time.sleep(0.01)
+                now = time.monotonic()
+                owed += (now - last) * self.rate
+                last = now
+                want = int(owed)
+                if want <= 0:
+                    continue
+                try:
+                    b = os.read(self.fout, want)
+                except BlockingIOError:
+                    b = b''
+                if b:
+                    f.write(b)
+                    f.flush()
+                    with self.lock:
+                        self.buf += b
+                        self.bytes += len(b)
+                owed = min(owed - len(b), self.rate * 0.02)
+
+    def count(self):
+        with self.lock:
+            return self.bytes
+
+    def raw(self, since=0):
+        with self.lock:
+            return bytes(self.buf[since:])
+
+    def text(self, since=0):
+        return ANSI.sub(b'', self.raw(since)).replace(b'\r', b'').decode('latin-1')
+
+    def type(self, data, gap=0.02):
+        for i in range(len(data)):
+            os.write(self.fin, data[i:i + 1])
+            time.sleep(gap)
+
+    def close(self):
+        self.stop.set()
+        self.t.join(2)
+        os.close(self.fin)
+        os.close(self.fout)
+
+
+class Qmp:
+    def __init__(self, sock):
+        t0 = time.monotonic()
+        while not sock.exists() and time.monotonic() - t0 < 15:
+            time.sleep(.1)
+        self.c = socket.socket(socket.AF_UNIX)
+        self.c.settimeout(30)
+        self.c.connect(str(sock))
+        self.r = self.c.makefile('rb')
+        json.loads(self.r.readline())
+        self.execute('qmp_capabilities')
+
+    def execute(self, name):
+        self.c.sendall(json.dumps({'execute': name}).encode() + b'\n')
+        while True:
+            reply = json.loads(self.r.readline())
+            if 'error' in reply:
+                raise RuntimeError(reply)
+            if 'return' in reply:
+                return reply['return']
+
+
+class Cant(Exception):
+    pass
+
+
+def prompt(uart, since, timeout):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if uart.text(since).rstrip('\n').endswith('$ '):
+            return uart.count()
+        time.sleep(0.2)
+    return -1
+
+
+def run(uart, line, timeout=60):
+    at = uart.count()
+    uart.type(line.encode() + b'\r', gap=0.005)
+    end = prompt(uart, at + len(line), timeout)
+    if end < 0:
+        raise Cant(f'no prompt after: {line[:60]}')
+    return uart.text(at)
+
+
+def ex(uart, line, wait):
+    """`:LINE` and Enter typed into yew, then `wait` seconds."""
+    uart.type(b'\x1b', gap=0.3)
+    uart.type(b':' + line.encode() + b'\r', gap=0.03)
+    time.sleep(wait)
+
+
+def quit_all(uart, most=4):
+    """`:q` until the shell prompts; the number of quits it took."""
+    for n in range(1, most + 1):
+        at = uart.count()
+        uart.type(b'\x1b', gap=0.3)
+        uart.type(b':q\r', gap=0.05)
+        if prompt(uart, at, 12) >= 0:
+            return n
+    raise Cant(f'yew did not quit to the prompt after {most} quits')
+
+
+def start_yew(uart, tag, argv=''):
+    """yew in the foreground, its sampler beside it in the background."""
+    sampler = (f'( j=0; while [ $j -lt 60 ]; do for p in /proc/[0-9]*; do c=$(tr "\\000" " " < $p/cmdline 2>/dev/null);'
+               f' case "$c" in yew*) echo "$j ${{p#/proc/}} $c";; esac; done; sleep 1; j=$((j+1)); done'
+               f' > {ROOT}/procs-{tag}.txt ) &')
+    uart.type(sampler.encode() + b'\r', gap=0.005)
+    time.sleep(1)
+    uart.type(f'yew {argv}'.encode() + b'\r', gap=0.01)
+    time.sleep(8)
+
+
+def evidence(uart, tag):
+    st = f'$(ls -d {ROOT}/home/.local/state/yew/workspaces/*)'
+    out = run(uart, f"echo YW19-LOG-{tag}; cat {ROOT}/yew.log; echo YW19-STATE-{tag};"
+                    f" grep -E '^      (id|path):|^  active_tab:' {st}/state.fl; echo YW19-LOCK-{tag} $(cat {st}/lock 2>/dev/null);"
+                    f" echo YW19-PROCS-{tag}; cut -d' ' -f2 {ROOT}/procs-{tag}.txt | sort -u | tr '\\n' ' '; echo;"
+                    f" sort -n {ROOT}/procs-{tag}.txt | tail -n 3; echo YW19-END-{tag}", timeout=90)
+    m = re.search(rf'YW19-LOG-{tag}\n(.*?)YW19-STATE-{tag}\n(.*?)YW19-LOCK-{tag} ?([0-9]*)\n.*?YW19-PROCS-{tag}\n(.*?)\n(.*?)YW19-END-{tag}',
+                  out, re.S)
+    if not m:
+        raise Cant(f'{tag}: the evidence was not read: {out[-800:]!r}')
+    log = [l for l in m.group(1).splitlines() if l.strip()]
+    tabs, active, rid = [], None, None
+    for line in m.group(2).splitlines():
+        a = re.match(r'^\s*id: (\d+),', line)
+        b = re.match(r'^\s*path: (nil|"(.*)"),', line)
+        c = re.match(r'^\s*active_tab: (\d+),', line)
+        if a:
+            rid = int(a.group(1))
+        elif b and rid is not None:
+            tabs.append((rid, None if b.group(1) == 'nil' else b.group(2)))
+            rid = None
+        elif c:
+            active = int(c.group(1))
+    pids = m.group(4).split()
+    for l in log:
+        print(f'  log {tag}: {l}', flush=True)
+    print(f'  state {tag}: {len(tabs)} tab records, active_tab {active}, lock {m.group(3)}', flush=True)
+    for t in tabs:
+        print(f'    {t}', flush=True)
+    print(f'  procs {tag}: pids {pids}; last samples: {m.group(5).strip()!r}', flush=True)
+    return log, tabs, active, pids
+
+
+def drive(uart, args, reds):
+    if prompt(uart, 0, 300) < 0:
+        raise Cant('no shell prompt on COM1 within 300 s')
+    print('nested-open-pax: the console prompted', flush=True)
+    n = args.tabs
+    out = run(uart, f'export HOME={ROOT}/home XDG_STATE_HOME={ROOT}/home/.local/state YEW_LOG={ROOT}/yew.log'
+                    f' YEW_LOG_LEVEL=info SHELL=/bin/sh; mkdir -p $XDG_STATE_HOME {ROOT}/ws && cd {ROOT}/ws &&'
+                    f' i=1; while [ $i -le {n} ]; do f=$(printf "f%02d.lu" $i); printf "// %s\\n" $f > $f; i=$((i+1)); done;'
+                    f' printf "// p\\n" > paths_test.lu; echo YW19-READY $(ls | wc -l)')
+    if 'YW19-READY' not in out:
+        raise Cant('the workspace was not made: ' + out[-300:])
+    out = run(uart, 'yew --version | head -n 1; echo TERM=$TERM SHELL=$SHELL; uname -a')
+    print('nested-open-pax: ' + ' | '.join(l for l in out.splitlines() if l.strip() and not l.rstrip().endswith('$')),
+          flush=True)
+    files = ' '.join([f'f{i:02d}.lu' for i in range(1, n + 1)] + ['paths_test.lu'])
+    start_yew(uart, 'seed', files)
+    if quit_all(uart) != 1:
+        raise Cant('the seeding editor took more than one quit')
+    _, tabs, _, _ = evidence(uart, 'seed')
+    if len(tabs) < n + 1:
+        raise Cant(f'the seed saved {len(tabs)} tab records')
+    ws = f'{ROOT}/ws'
+    for case in args.case or CASES:
+        run(uart, f': > {ROOT}/yew.log; rm -rf {ws}/identity {ws}/identity_test.lu {ws}/identity.lu; echo // id > {ws}/identity.lu')
+        if case == 'refuse':
+            run(uart, f'mkdir -p {ws}/identity')
+        at = uart.count()
+        start_yew(uart, case)
+        if case == 'newdir':
+            ex(uart, '!mkdir identity', 3)
+            ex(uart, '!yew identity/identity.lu', 5)
+            ex(uart, '!touch identity_test.lu', 3)
+            ex(uart, '!yew identity_test.lu', 5)
+        elif case == 'bangbang':
+            ex(uart, '!!yew identity.lu', 8)
+        elif case == 'refuse':
+            ex(uart, '!yew identity', 4)
+            ex(uart, '!yew $HOME/x.lu', 4)
+        time.sleep(3)
+        drawn = uart.raw(at)
+        quits = quit_all(uart)
+        log, tabs, active, pids = evidence(uart, case)
+        paths = [p for _, p in tabs]
+        restores = [l for l in log if 'tab record(s) dropped' in l or 'workspace state' in l]
+        owned = [l for l in log if 'owned by pid' in l]
+        print(f'  {case}: quits {quits}, restores {len(restores)}, ownership lines {len(owned)}', flush=True)
+
+        def check(name, ok, detail):
+            print(f'{case}: {name}: {"ok" if ok else "RED"} ({detail})', flush=True)
+            if not ok:
+                reds.append(f'pax_{case}_{name}')
+
+        if case == 'newdir':
+            check('one_editor', quits == 1 and len(pids) == 1, f'{quits} quits, yew pids {pids}')
+            check('opened_here', f'{ws}/identity/identity.lu' in paths and f'{ws}/identity_test.lu' in paths,
+                  f'{len(paths)} saved tabs')
+            check('kept_tabs', len(paths) >= n + 3, f'{len(paths)} saved tabs, {n + 1} files seeded')
+        elif case == 'bangbang':
+            check('second_is_reader', quits == 2 and len(owned) == 1,
+                  f'{quits} quits, {owned[0] if owned else "no ownership line"}')
+            check('first_tabs_kept', len(paths) >= n + 2, f'{len(paths)} saved tabs')
+        elif case == 'refuse':
+            check('one_editor', quits == 1 and len(pids) == 1, f'{quits} quits, yew pids {pids}')
+            check('no_job', b'*job:' not in drawn, 'no job buffer drawn' if b'*job:' not in drawn else 'a job buffer was drawn')
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('iso')
+    ap.add_argument('work')
+    ap.add_argument('--firmware', default='uefi', choices=['uefi', 'bios'])
+    ap.add_argument('--tabs', type=int, default=26)
+    ap.add_argument('--case', action='append', choices=CASES)
+    args = ap.parse_args()
+    iso, work = Path(args.iso), Path(args.work)
+    work.mkdir(parents=True, exist_ok=False)
+    pipe = work / 'com1'
+    for p in (str(pipe) + '.in', str(pipe) + '.out'):
+        os.mkfifo(p, 0o600)
+    uart = Uart(pipe, work / 'serial')
+    time.sleep(0.5)
+    sock = work / 'qmp.sock'
+    a = ['qemu-system-x86_64', '-enable-kvm', '-machine', 'q35', '-cpu', 'host', '-smp', '2', '-m', '2048',
+         '-drive', f'file={iso},media=cdrom,readonly=on', '-nic', 'none', '-display', 'none', '-monitor', 'none',
+         '-qmp', f'unix:{sock},server=on,wait=off', '-chardev', f'pipe,id=com1,path={pipe}', '-serial', 'chardev:com1']
+    if args.firmware == 'uefi':
+        vars_fd = work / 'vars.fd'
+        shutil.copy(OVMF / 'OVMF_VARS_4M.fd', vars_fd)
+        a += ['-drive', f'if=pflash,format=raw,unit=0,readonly=on,file={OVMF / "OVMF_CODE_4M.fd"}',
+              '-drive', f'if=pflash,format=raw,unit=1,file={vars_fd}']
+    print('nested-open-pax: qemu ' + ' '.join(a), flush=True)
+    q = subprocess.Popen(a, stdin=subprocess.DEVNULL, stdout=open(work / 'qemu.log', 'wb'), stderr=subprocess.STDOUT)
+    qmp = Qmp(sock)
+    status = 2
+    reds = []
+    try:
+        drive(uart, args, reds)
+        for r in reds:
+            print(f'FAIL {r}', flush=True)
+        print('nested-open-pax: ' + ('RED' if reds else 'GREEN'), flush=True)
+        status = 1 if reds else 0
+    except Cant as e:
+        print(f'nested-open-pax: cannot run: {e}', flush=True)
+        status = 2
+    finally:
+        try:
+            qmp.execute('quit')
+        except (OSError, RuntimeError, ValueError):
+            pass
+        try:
+            q.wait(30)
+        except subprocess.TimeoutExpired:
+            print('nested-open-pax: QEMU did not end on QMP quit', flush=True)
+        uart.close()
+    sys.exit(status)
+
+
+if __name__ == '__main__':
+    main()
