@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""execfail-row: what a language server that cannot start costs (yew#127).
+
+    python3 -I tools/execfail-row YEW_BIN [--keep DIR] [--idle-s S]
+                                  [--motions N] [--path PATH]
+
+yew in a pseudo-terminal, 24 by 80, with a scratch HOME (and XDG
+directories under it), SHELL=/bin/sh and a PATH that holds no
+bash-language-server (the row refuses one that does). One session opens
+a `.sh` file, whose server (`bashls`) cannot start; the control opens a
+`.txt` file, which has no server. Each session, once its first frames
+are drawn and the start-up clocks have passed, is measured in phases:
+
+  idle     S seconds (default 5) with no input
+  motion   N SGR mouse-motion reports with no button held (default 200),
+           one every 5 ms, as a pointer moved across the text
+  keys     N/2 pairs of `l` `h` (the cursor right and back), one key
+           every 5 ms
+  message  `:lsp.info`, then one motion report: does the failure's
+           message come back over the command's answer?
+
+Each phase records the bytes yew wrote to the terminal, the BEL bytes
+among them, and yew's CPU time (`/proc/<pid>/schedstat`, else
+`/proc/<pid>/stat`; `-` where the host has neither). The two files run
+twice, once with the defaults and once after `:set errorbells true`
+(every error message rings the bell, so the bells count the reports).
+The `.txt` control and the `.sh` session are interleaved.
+
+Verdict, per phase and configuration, the `.sh` session against its
+control:
+  - idle: the `.sh` session writes no more than 64 bytes and no more
+    than 20 ms of CPU above the control;
+  - motion and keys: no more than 10% + 256 bytes, and no more than 50% +
+    30 ms of CPU, above the control;
+  - errorbells: no bell in any phase (the one report happened before);
+  - message: the failure's text is not drawn again.
+One line per measurement, `FAIL <row>` for each red, then
+`execfail-row: GREEN` or `execfail-row: RED` (exit 1). Exit 2 when the
+row cannot run (no failure message, a server on PATH, a session that
+does not quit).
+
+yew's process is only read (`/proc`) and spoken to through the
+terminal; it is never signalled. It quits by `:q`.
+"""
+import argparse
+import fcntl
+import os
+import pty
+import select
+import shutil
+import struct
+import sys
+import termios
+import time
+
+ROWS, COLS = 24, 80
+FAIL_TEXT = b"bashls: "
+QUIET_S = 0.4
+
+
+def cpu_ns(pid):
+    try:
+        with open(f"/proc/{pid}/schedstat") as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            tail = f.read().rsplit(")", 1)[1].split()
+        ticks = int(tail[11]) + int(tail[12])
+        return ticks * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class Session:
+    def __init__(self, yew, ws, env, path, log):
+        self.raw = bytearray()
+        self.log = log
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(ws)
+            os.execve(yew, [yew, path], env)
+        self.pid, self.fd = pid, fd
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+        self.status = None
+
+    def pump(self, seconds):
+        end = time.monotonic() + seconds
+        got = 0
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return got
+            r, _, _ = select.select([self.fd], [], [], left)
+            if not r:
+                return got
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                return got
+            if not data:
+                return got
+            self.raw += data
+            self.log.write(data)
+            got += len(data)
+
+    def settle(self, quiet=QUIET_S, limit=10.0):
+        start = time.monotonic()
+        while time.monotonic() - start < limit:
+            if self.pump(quiet) == 0:
+                return True
+        return False
+
+    def wait_for(self, needle, limit):
+        start = time.monotonic()
+        while time.monotonic() - start < limit:
+            if needle in self.raw:
+                return True
+            self.pump(0.05)
+        return needle in self.raw
+
+    def send(self, data):
+        os.write(self.fd, data)
+
+    def measure(self, feed, quiet=QUIET_S):
+        """Bytes, bells and CPU ns over `feed` (a list of (bytes, pause)
+        pairs) and the quiet after it."""
+        at = len(self.raw)
+        c0 = cpu_ns(self.pid)
+        for data, pause in feed:
+            if data:
+                self.send(data)
+            self.pump(pause)
+        self.settle(quiet)
+        c1 = cpu_ns(self.pid)
+        out = bytes(self.raw[at:])
+        cpu = None if c0 is None or c1 is None else c1 - c0
+        return len(out), out.count(b"\x07"), cpu, out
+
+    def quit(self):
+        self.send(b"\x1b")
+        self.pump(0.1)
+        self.send(b":q\r")
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            self.pump(0.05)
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid == self.pid:
+                self.status = status
+                break
+        os.close(self.fd)
+        return self.status is not None
+
+
+def motions(n, button_code=35):
+    feed = []
+    for i in range(n):
+        x = 5 + (i * 7) % 60
+        y = 3 + (i * 3) % 15
+        feed.append((f"\x1b[<{button_code};{x};{y}M".encode(), 0.005))
+    return feed
+
+
+def env_for(scratch, path):
+    home = os.path.join(scratch, "home")
+    env = {
+        "HOME": home,
+        "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+        "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
+        "XDG_DATA_HOME": os.path.join(home, ".local", "share"),
+        "XDG_CACHE_HOME": os.path.join(home, ".cache"),
+        "TMPDIR": os.path.join(home, "tmp"),
+        "PATH": path,
+        "SHELL": "/bin/sh",
+        "TERM": "xterm-256color",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "YEW_TTY_PROBE": "0",
+        "YEW_CLIPBOARD": "none",
+        "YEW_COLORS": "16",
+        "YEW_LOG": os.path.join(scratch, "yew.log"),
+        "COLUMNS": str(COLS),
+        "LINES": str(ROWS),
+    }
+    for k in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMPDIR"):
+        os.makedirs(env[k], exist_ok=True)
+    return env
+
+
+def fmt_cpu(ns):
+    return "-" if ns is None else f"{ns / 1e6:.1f}"
+
+
+def run(args):
+    scratch = os.path.abspath(args.keep)
+    if os.path.exists(scratch):
+        shutil.rmtree(scratch)
+    ws = os.path.join(scratch, "ws")
+    os.makedirs(ws)
+    with open(os.path.join(ws, "a.sh"), "w") as f:
+        f.write("#!/bin/sh\necho hello\nexit 0\n")
+    with open(os.path.join(ws, "a.txt"), "w") as f:
+        f.write("#!/bin/sh\necho hello\nexit 0\n")
+    for d in args.path.split(":"):
+        if d and os.access(os.path.join(d, "bash-language-server"), os.X_OK):
+            print(f"execfail-row: bash-language-server is on the PATH ({d}): the row cannot run")
+            return 2
+    print(f"execfail-row: {args.yew}, PATH={args.path}, idle {args.idle_s} s, {args.motions} motions")
+    results = {}
+    with open(os.path.join(scratch, "pty.bytes"), "wb") as log:
+        for bells in (False, True):
+            for name in ("a.txt", "a.sh"):
+                cfg = "bells" if bells else "plain"
+                tag = f"{cfg}.{name.split('.')[1]}"
+                env = env_for(os.path.join(scratch, tag), args.path)
+                s = Session(args.yew, ws, env, name, log)
+                s.settle(limit=10.0)
+                if name == "a.sh" and not s.wait_for(FAIL_TEXT, 10.0):
+                    print(f"execfail-row: {tag}: the failure's message never showed")
+                    s.quit()
+                    return 2
+                if bells:
+                    s.send(b":set errorbells true\r")
+                    s.settle()
+                # Past the start-up clocks: the probe, git's first poll and
+                # ed.idle's 500 ms (src/edit/loop.lu, loop_deadline).
+                s.pump(1.0)
+                s.settle()
+                row = {}
+                row["idle"] = s.measure([(b"", args.idle_s)])
+                row["motion"] = s.measure(motions(args.motions))
+                keys = []
+                for _ in range(args.motions // 2):
+                    keys.append((b"l", 0.005))
+                    keys.append((b"h", 0.005))
+                row["keys"] = s.measure(keys)
+                s.send(b":lsp.info\r")
+                s.settle()
+                row["message"] = s.measure(motions(1), quiet=1.0)
+                if not s.quit():
+                    print(f"execfail-row: {tag}: yew did not quit")
+                    return 2
+                results[tag] = row
+                for phase, (n, bel, cpu, _) in row.items():
+                    print(f"execfail-row: {tag} {phase}: bytes={n} bells={bel} cpu_ms={fmt_cpu(cpu)}")
+    reds = []
+    for cfg in ("plain", "bells"):
+        sh, txt = results[f"{cfg}.sh"], results[f"{cfg}.txt"]
+        for phase in ("idle", "motion", "keys"):
+            (n, bel, cpu, _), (n0, _, cpu0, _) = sh[phase], txt[phase]
+            if phase == "idle":
+                over_bytes = n > n0 + 64
+                over_cpu = cpu is not None and cpu0 is not None and cpu > cpu0 + 20_000_000
+            else:
+                over_bytes = n > n0 * 1.1 + 256
+                over_cpu = cpu is not None and cpu0 is not None and cpu > cpu0 * 1.5 + 30_000_000
+            if over_bytes:
+                reds.append(f"{cfg}_{phase}_bytes")
+            if over_cpu:
+                reds.append(f"{cfg}_{phase}_cpu")
+            if cfg == "bells" and bel != 0:
+                reds.append(f"bells_{phase}_rings")
+        if FAIL_TEXT in sh["message"][3]:
+            reds.append(f"{cfg}_message_redrawn")
+    for r in reds:
+        print(f"FAIL execfail_{r}")
+    if reds:
+        print("execfail-row: RED")
+        return 1
+    print("execfail-row: GREEN")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("yew")
+    p.add_argument("--keep", default=os.path.join(os.getcwd(), "target", "execfail-row"))
+    p.add_argument("--idle-s", type=float, default=5.0)
+    p.add_argument("--motions", type=int, default=200)
+    p.add_argument("--path", default="/usr/bin:/bin")
+    args = p.parse_args()
+    args.yew = os.path.abspath(args.yew)
+    sys.exit(run(args))
+
+
+if __name__ == "__main__":
+    main()
