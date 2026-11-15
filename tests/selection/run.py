@@ -36,6 +36,7 @@ CASES = [
     'alt-click-add-cursor', 'ctrl-alt-down-I', 'ctrl-alt-up-I',
     'ctrl-alt-repeat-frontier', 'keyboard-definition-control',
     'ctrl-click-definition', 'ctrl-shift-click-menu', 'right-click-menu',
+    'ctrl-shift-duplicate-menu',
 ]
 
 class Infra(Exception):
@@ -240,6 +241,19 @@ def contract(name,s):
         s.take('type-at-cursors',b'Z')
         require(s.body()=='Zalpha beta gamma' and s.body(1)=='Zsecond line','edit did not reach both independent carets')
         if name=='ctrl-alt-repeat-frontier':require(s.body(2)=='Zthird line','repeated add did not grow to third line')
+    elif name=='ctrl-shift-duplicate-menu':
+        s.selected()
+        x,y=s.x+1,s.y+1
+        press=f'\x1b[<20;{x};{y}M'.encode()
+        release=f'\x1b[<20;{x};{y}m'.encode()
+        s.take('first-press',press)
+        if not all(k in '\n'.join(s.vt.rows()) for k in ('Cut','Copy','Paste')):
+            raise Infra('first context press control missing')
+        s.take('duplicate-press',press)
+        still_open=all(k in '\n'.join(s.vt.rows()) for k in ('Cut','Copy','Paste'))
+        s.take('release',release)
+        require(still_open and all(k in '\n'.join(s.vt.rows()) for k in ('Cut','Copy','Paste')),
+                'identical repeated press toggled or invoked the menu')
     else:
         if name=='keyboard-definition-control':s.take('definition-key',b'gd',.8)
         else:s.click({'ctrl-click-definition':16,'ctrl-shift-click-menu':20,'right-click-menu':2}[name],line=1,col=2)
