@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""editing-row: byte-exact editing comfort regressions, through a PTY.
+
+Usage: python3 -I tools/editing-row YEW [--case NAME]... [--term TERM]
+Every case owns a scratch workspace, HOME/XDG/TMPDIR and log, sets
+SHELL=/bin/sh, types real terminal bytes, saves, quits through :q!, and
+compares the saved bytes. X witnesses the insertion caret. No signals,
+owner state or external shell sessions. Artifacts stay in target/editing-row.
+Legacy CSI/SS3 keys and kitty CSI-u redo are both exercised. Mouse rows
+use an uncluttered pane (tab strip off), so screen row 1 is text row 1.
+FAIL names are stable for the off-line plant. A timeout is RED, not SKIP.
+"""
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import pty
+import re
+import select
+import struct
+import sys
+import termios
+import time
+
+ESC = b"\x1b"
+RIGHT = b"\x1b[C"
+DOWN = b"\x1b[B"
+SUP = b"\x1b[1;2A"
+SDOWN = b"\x1b[1;2B"
+STAB = b"\x1b[Z"
+AUP = b"\x1b[1;3A"
+ADOWN = b"\x1b[1;3B"
+UNDO = b"\x1a"
+REDO = b"\x1b/"
+KITTY_REDO = b"\x1b[122;6u"
+CMDLINE = re.compile(rb"\x1b\[24;1H(?:\x1b\[[0-9;]*m)*:")
+
+# name, original, input after entering Insert, saved bytes, suffix
+CASES = []
+
+def case(name, original, keys, expected, suffix="txt"):
+    def enc(s):
+        return s.encode() if isinstance(s, str) else s
+    CASES.append((name, enc(original), keys, enc(expected), suffix))
+
+case("pair-backtick-code", "", b"`X", "`X`", "js")
+case("pair-backtick-prose", "", b"`X", "`X`", "md")
+case("pair-backtick-plain", "", b"`X", "`X`")
+case("pair-close-open-quote", '"', RIGHT + b'"X', '""X')
+case("pair-close-quote-with-text", '"words', RIGHT * 6 + b'"X', '"words"X')
+case("pair-close-apostrophe", "'", RIGHT + b"'X", "''X")
+case("pair-close-backtick", "`words", RIGHT * 6 + b"`X", "`words`X")
+for opener, closer, tag in [("(", ")", "paren"), ("[", "]", "square"), ("{", "}", "brace"), ('"', '"', "quote"), ("'", "'", "apostrophe"), ("`", "`", "backtick")]:
+    case("pair-before-text-" + tag, "sometext", (opener + "X").encode(), opener + "Xsometext")
+    case("pair-before-dot-" + tag, ".sometext", (opener + "X").encode(), opener + "X" + closer + ".sometext")
+for opener, closer, tag in [("(", ")", "paren"), ("[", "]", "square"), ("{", "}", "brace")]:
+    case("pair-unmatched-right-" + tag, " some text" + closer, (opener + "X").encode(), opener + "X some text" + closer)
+    case("pair-balanced-right-" + tag, " " + opener + closer, (opener + "X").encode(), opener + "X" + closer + " " + opener + closer)
+case("pair-contraction", "dont", RIGHT * 3 + b"'X", "don'Xt")
+case("pair-remembered-quote", "", b'""X', '""X')
+case("pair-empty-backspace", "", b"`\x7fX", "X")
+case("dedent-line", "    abc\n", RIGHT * 6 + STAB + b"X", "abXc\n")
+case("dedent-tab", "\tabc\n", RIGHT * 2 + STAB + b"X", "aXbc\n")
+case("dedent-short", "  abc\n", RIGHT * 3 + STAB + b"X", "aXbc\n")
+case("dedent-noop", "abc\n", RIGHT + STAB + b"X", "aXbc\n")
+case("dedent-selection", "    one\n    two\nend\n", SDOWN * 2 + STAB, "one\ntwo\nend\n")
+case("dedent-selection-twice", "        one\n        two\nend\n", SDOWN * 2 + STAB * 2, "one\ntwo\nend\n")
+case("dedent-undo", "    abc\n", RIGHT * 6 + STAB + UNDO, "    abc\n")
+case("insert-undo", "", b"abc" + UNDO + b"X", "X")
+case("insert-redo-legacy", "", b"abc" + UNDO + REDO + b"X", "abcX")
+case("insert-redo-kitty", "", b"abc" + UNDO + KITTY_REDO + b"X", "abcX")
+case("insert-undo-existing", "", b"abc\x1fX", "X")
+case("move-up", "aa\nbb\ncc", DOWN + AUP + b"X", "Xbb\naa\ncc")
+case("move-down-no-final-eol", "aa\nbb\ncc", DOWN + ADOWN + b"X", "aa\ncc\nXbb")
+case("move-down-final-eol", "aa\nbb\ncc\n", DOWN + ADOWN + b"X", "aa\ncc\nXbb\n")
+case("move-crlf", "aa\r\nbb\r\ncc", DOWN + ADOWN + b"X", "aa\r\ncc\r\nXbb")
+case("move-undo", "aa\nbb\ncc", DOWN + ADOWN + UNDO, "aa\nbb\ncc")
+case("move-redo", "aa\nbb\ncc", DOWN + ADOWN + UNDO + REDO, "aa\ncc\nbb")
+case("move-top-noop", "aa\nbb", AUP + b"X", "Xaa\nbb")
+case("move-bottom-noop", "aa\nbb", DOWN + ADOWN + b"X", "aa\nXbb")
+case("move-selection", "aa\nbb\ncc\ndd", SDOWN * 2 + ADOWN, "cc\naa\nbb\ndd")
+case("move-selection-twice", "aa\nbb\ncc\ndd", SDOWN * 2 + ADOWN * 2, "cc\ndd\naa\nbb")
+case("move-unicode-column", "ab\n漢é\ncd", DOWN + RIGHT + ADOWN + b"X", "ab\ncd\n漢Xé")
+# Tabstrip off leaves pane origin at grid row 0; reports use 1-based cells.
+def click(row):
+    return f"\x1b[<0;40;{row}M\x1b[<0;40;{row}m".encode()
+for tag, initial, row, expected in [
+    ("last-closer", "aa\n}", 2, "aa\n}X"),
+    ("last-letter", "aa\nx", 2, "aa\nxX"),
+    ("last-long", "aa\nlong}", 2, "aa\nlong}X"),
+    ("nonlast-single", "}\naa", 1, "}X\naa"),
+    ("nonlast-letter", "x\naa", 1, "xX\naa"),
+    ("last-with-eol", "aa\n}\n", 2, "aa\n}X\n"),
+    ("last-unicode", "aa\n漢é", 2, "aa\n漢éX"),
+    ("last-combining", "aa\né", 2, "aa\néX"),
+    ("empty-final", "aa\n", 2, "aa\nX"),
+]:
+    case("click-" + tag, initial, click(row) + b"X", expected)
+
+class Session:
+    def __init__(self, yew, cwd, env, log):
+        self.raw = bytearray()
+        self.log = log
+        self.status = None
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(cwd)
+            os.execve(yew, [yew, "fixture." + env.pop("ROW_SUFFIX")], env)
+        self.pid, self.fd = pid, fd
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+
+    def pump(self, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if not select.select([self.fd], [], [], max(0, end - time.monotonic()))[0]:
+                break
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            self.raw += data
+            self.log.write(data)
+
+    def send(self, data):
+        os.write(self.fd, data)
+        self.pump(0.12)
+
+    def alive(self):
+        if self.status is None:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self.status = status
+        return self.status is None
+
+    def ex(self, command):
+        for _ in range(3):
+            if not self.alive():
+                return False
+            self.send(ESC)
+            mark = len(self.raw)
+            self.send(b":")
+            end = time.monotonic() + 3
+            while not CMDLINE.search(self.raw, mark) and self.alive() and time.monotonic() < end:
+                self.pump(0.05)
+            if CMDLINE.search(self.raw, mark):
+                self.send(command.encode() + b"\r")
+                self.pump(0.25)
+                return True
+        return False
+
+    def quit(self):
+        for _ in range(3):
+            if not self.alive():
+                break
+            self.ex("q!")
+            end = time.monotonic() + 2
+            while self.alive() and time.monotonic() < end:
+                self.pump(0.05)
+        gone = not self.alive()
+        os.close(self.fd)  # hang up only this row's own terminal
+        if not gone:
+            os.waitpid(self.pid, 0)
+        return gone
+
+
+def run(args, row):
+    name, original, keys, expected, suffix = row
+    root = Path(args.keep).resolve() / name
+    root.mkdir(parents=True, exist_ok=True)
+    fixture = root / ("fixture." + suffix)
+    fixture.write_bytes(original)
+    for d in ["home", "state", "config", "cache", "tmp"]:
+        (root / d).mkdir(exist_ok=True)
+    env = os.environ.copy()
+    env.update(HOME=str(root / "home"), XDG_STATE_HOME=str(root / "state"),
+               XDG_CONFIG_HOME=str(root / "config"), XDG_CACHE_HOME=str(root / "cache"),
+               TMPDIR=str(root / "tmp"), SHELL="/bin/sh", TERM=args.term,
+               YEW_LOG=str(root / "yew.log"), ROW_SUFFIX=suffix)
+    ok = True
+    with (root / "pty.raw").open("wb") as log:
+        s = Session(str(Path(args.yew).resolve()), str(root), env, log)
+        try:
+            s.pump(0.8)
+            # No startup config from HOME; these settings isolate comfort
+            # from syntax, automatic indentation, and layout chrome.
+            for cmd in ["set tabstrip false", "set autoindent false"]:
+                ok = s.ex(cmd) and ok
+            s.send(b"i")
+            # Keep ESC chords in one write, but distinct user actions in
+            # separate turns (especially multiple Alt keys and Ctrl+Z).
+            parts = re.findall(rb"\x1b(?:\[[0-9;]*[A-Za-z~]|\[<\d+;\d+;\d+[Mm]|.)|[^\x1b]", keys)
+            for part in parts:
+                s.send(part)
+            ok = s.ex("w") and ok
+        finally:
+            ok = s.quit() and ok
+    actual = fixture.read_bytes()
+    if actual != expected or not ok:
+        print(f"FAIL {name} expected={expected!r} actual={actual!r} session_ok={ok} artifacts={root}", flush=True)
+        return False
+    print(f"PASS {name}", flush=True)
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("yew")
+    ap.add_argument("--keep", default="target/editing-row")
+    ap.add_argument("--case", action="append", default=[])
+    ap.add_argument("--term", default="xterm-256color")
+    ap.add_argument("--list", action="store_true")
+    args = ap.parse_args()
+    if args.list:
+        print("\n".join(r[0] for r in CASES))
+        return 0
+    unknown = set(args.case) - {r[0] for r in CASES}
+    if unknown:
+        ap.error("unknown cases: " + ", ".join(sorted(unknown)))
+    red = 0
+    for row in CASES:
+        if not args.case or row[0] in args.case:
+            red += not run(args, row)
+    print(f"editing-row: {'RED' if red else 'GREEN'} ({red} failed)", flush=True)
+    return int(bool(red))
+
+if __name__ == "__main__":
+    sys.exit(main())
