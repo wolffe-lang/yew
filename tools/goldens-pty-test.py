@@ -52,6 +52,21 @@ class Divergences(unittest.TestCase):
         self.assertEqual(calls[1][1]["YEW_PTY_FILTER"], "ruled")
         self.assertEqual(self.cgold.read_text(), "C snapshot\n")
 
+    def test_plain_prose_authorization_is_preserved(self):
+        reason = "approved: Keep 16-colour selection visible."
+        self.listing.write_text(self.row.replace("ruling #135", reason))
+        names, rows = harness.entries(self.tree, self.listing)
+        self.assertIn("ruled", names)
+        self.assertEqual(rows["ruled"][0], reason)
+        self.assertEqual(rows["ruled"][1], self.expected)
+
+    def test_empty_or_control_character_authorization_is_refused(self):
+        for reason in ("approved:", "approved: ", "approved:    ", "approved: hidden\x01reason"):
+            with self.subTest(reason=reason):
+                self.listing.write_text(self.row.replace("ruling #135", reason))
+                with self.assertRaisesRegex(ValueError, "invalid"):
+                    harness.entries(self.tree, self.listing)
+
     def test_changed_c_golden_is_fatal(self):
         self.cgold.write_text("new C rule\n")
         with self.assertRaisesRegex(ValueError, "C golden changed for ruled"):
