@@ -1,0 +1,406 @@
+//! syn.state — canonical qualified-frame states and bounded interning.
+//!
+//! Ports sagitta src/syn/engine.c:1728–1912 and engine.h at 9ace98c2.
+//! The authoritative state is an 84-byte tuple (16 four-byte frames,
+//! four u32 aux slots, depth/lost/ndef/flags). The interner owns one flat
+//! byte vector, not 84-byte heap objects per retained line. Ids and hash
+//! slots use the packed four-byte vector. Hot callers can copy a tuple
+//! into reusable scratch with syn_state_read instead of allocating a get.
+
+/// Maximum qualified context depth.
+pub const SYN_DEPTH_MAX: int = 16
+/// Maximum nested definition/aux levels.
+pub const SYN_DEF_MAX: int = 4
+/// Canonical state tuple size, including zeroed unused tails.
+pub const SYN_STATE_BYTES: int = 84
+/// Id zero has no retained entry.
+pub const SYN_STATE_UNKNOWN: int = 0
+/// The root tuple is reserved at id one.
+pub const SYN_STATE_ROOT: int = 1
+/// Maximum count includes UNKNOWN and ROOT.
+pub const SYN_MAX_STATES: int = 65536
+/// Stateful value predicate.
+pub const SYN_F_VALUE: int = 1
+/// Strip leading TABs for a heredoc.
+pub const SYN_F_STRIP: int = 2
+/// Saturation/bound exhaustion made styling approximate.
+pub const SYN_F_DEGRADED: int = 4
+/// First physical line has been consumed.
+pub const SYN_F_PAST_FIRST: int = 8
+/// Protected debt from a refused embedded frame pair.
+pub const SYN_F_EMBED_LOST: int = 16
+/// A guest definition is not resident yet.
+pub const SYN_F_EMBED_PEND: int = 32
+/// A guest lost its host boundary.
+pub const SYN_F_EMBED_ORPHAN: int = 64
+/// A qualified frame owns an embed boundary.
+pub const SYN_FR_BRIDGE: int = 1
+/// A frame defers activation to the next physical line.
+pub const SYN_FR_DEFER: int = 2
+
+/// A canonicalizable, packed qualified state. Use the accessors below.
+pub struct SynState {
+    tuple: List[byte],
+}
+
+/// State storage, bounded at 65,536 tuples; UNKNOWN occupies tuple zero.
+pub struct SynStateTab {
+    tuples: List[byte],
+    slots: SynIds,
+    exhausted: bool,
+}
+
+fn zero_tuple() -> List[byte] {
+    var bytes = List[byte]()
+    var i = 0
+    while i < SYN_STATE_BYTES {
+        (mut bytes).push(0 as byte)
+        i += 1
+    }
+    bytes
+}
+
+fn state_validate(state: SynState) {
+    if state.tuple.len != SYN_STATE_BYTES || state.tuple[80] as int < 1 ||
+        state.tuple[80] as int > SYN_DEPTH_MAX || state.tuple[82] as int < 1 ||
+        state.tuple[82] as int > SYN_DEF_MAX {
+        bug("syntax: invalid qualified state")
+    }
+}
+
+/// Root tuple, allowing a qualified definition in unit/embedding seams.
+pub fn syn_state_root(ctx: int, definition: int) -> SynState {
+    var state = SynState { tuple: zero_tuple() }
+    state.tuple[80] = 1 as byte
+    state.tuple[82] = 1 as byte
+    syn_state_set_frame(mut state, 0, ctx, definition, 0)
+    state
+}
+
+/// Packed tuple bytes, independent of host aggregate layout.
+pub fn syn_state_bytes(state: SynState) -> int {
+    state.tuple.len
+}
+
+/// Number of active qualified frames.
+pub fn syn_state_depth(state: SynState) -> int {
+    state.tuple[80] as int
+}
+
+/// Refused pushes awaiting balancing pops.
+pub fn syn_state_lost(state: SynState) -> int {
+    state.tuple[81] as int
+}
+
+/// Number of active aux/definition levels.
+pub fn syn_state_ndef(state: SynState) -> int {
+    state.tuple[82] as int
+}
+
+/// State flags participate in tuple identity.
+pub fn syn_state_flags(state: SynState) -> int {
+    state.tuple[83] as int
+}
+
+fn frame_offset(frame: int) -> int {
+    if frame < 0 || frame >= SYN_DEPTH_MAX {
+        bug("syntax: frame index out of range")
+    }
+    frame * 4
+}
+
+/// Context id, including a tail frame for canonicalization tests.
+pub fn syn_state_ctx(state: SynState, frame: int) -> int {
+    let p = frame_offset(frame)
+    state.tuple[p] as int | (state.tuple[p + 1] as int << 8)
+}
+
+/// Qualified resident definition id.
+pub fn syn_state_def(state: SynState, frame: int) -> int {
+    state.tuple[frame_offset(frame) + 2] as int
+}
+
+/// Per-frame bridge/deferred bits.
+pub fn syn_state_frame_flags(state: SynState, frame: int) -> int {
+    state.tuple[frame_offset(frame) + 3] as int
+}
+
+/// Set a frame; zeroed tails are enforced at interning, not mutation.
+pub fn syn_state_set_frame(mut state: SynState, frame: int, ctx: int, definition: int, flags: int) {
+    let p = frame_offset(frame)
+    if ctx < 0 || ctx > 65535 || definition < 0 || definition > 255 || flags < 0 || flags > 255 {
+        bug("syntax: qualified frame exceeds field range")
+    }
+    state.tuple[p] = ctx as byte
+    state.tuple[p + 1] = (ctx >> 8) as byte
+    state.tuple[p + 2] = definition as byte
+    state.tuple[p + 3] = flags as byte
+}
+
+/// Preserve a frame's context and definition while replacing its flags.
+pub fn syn_state_set_frame_flags(mut state: SynState, frame: int, flags: int) {
+    if flags < 0 || flags > 255 {
+        bug("syntax: frame flags exceed byte")
+    }
+    state.tuple[frame_offset(frame) + 3] = flags as byte
+}
+
+/// Read one of the four u32 aux slots.
+pub fn syn_state_aux(state: SynState, level: int) -> int {
+    if level < 0 || level >= SYN_DEF_MAX {
+        bug("syntax: aux index out of range")
+    }
+    let p = 64 + level * 4
+    state.tuple[p] as int | (state.tuple[p + 1] as int << 8) |
+        (state.tuple[p + 2] as int << 16) | (state.tuple[p + 3] as int << 24)
+}
+
+/// Replace an aux slot, including an inactive tail slot for test seams.
+pub fn syn_state_set_aux(mut state: SynState, level: int, value: int) {
+    if level < 0 || level >= SYN_DEF_MAX || value < 0 || value > 4294967295 {
+        bug("syntax: aux assignment exceeds u32")
+    }
+    let p = 64 + level * 4
+    state.tuple[p] = value as byte
+    state.tuple[p + 1] = (value >> 8) as byte
+    state.tuple[p + 2] = (value >> 16) as byte
+    state.tuple[p + 3] = (value >> 24) as byte
+}
+
+/// Replace state flags (always a byte).
+pub fn syn_state_set_flags(mut state: SynState, flags: int) {
+    if flags < 0 || flags > 255 {
+        bug("syntax: state flags exceed byte")
+    }
+    state.tuple[83] = flags as byte
+}
+
+/// Replace refused-push debt (always saturating in normal transitions).
+pub fn syn_state_set_lost(mut state: SynState, lost: int) {
+    if lost < 0 || lost > 255 {
+        bug("syntax: lost count exceeds byte")
+    }
+    state.tuple[81] = lost as byte
+}
+
+/// Set active stack/aux lengths for qualified embedding transitions.
+pub fn syn_state_set_depths(mut state: SynState, depth: int, ndef: int) {
+    if depth < 1 || depth > SYN_DEPTH_MAX || ndef < 1 || ndef > SYN_DEF_MAX {
+        bug("syntax: qualified depth exceeds bounds")
+    }
+    state.tuple[80] = depth as byte
+    state.tuple[82] = ndef as byte
+}
+
+/// Exact byte equality; inactive tails are significant until interned.
+pub fn syn_state_equal(a: SynState, b: SynState) -> bool {
+    if a.tuple.len != b.tuple.len {
+        return false
+    }
+    var i = 0
+    while i < a.tuple.len {
+        if a.tuple[i] != b.tuple[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// Push inherits the active definition; refused pushes accrue debt.
+pub fn syn_state_push(mut state: SynState, ctx: int) {
+    state_validate(state)
+    let depth = syn_state_depth(state)
+    if depth < SYN_DEPTH_MAX {
+        let definition = syn_state_def(state, depth - 1)
+        syn_state_set_frame(mut state, depth, ctx, definition, 0)
+        state.tuple[80] = (depth + 1) as byte
+        return
+    }
+    let lost = syn_state_lost(state)
+    if lost < 255 {
+        state.tuple[81] = (lost + 1) as byte
+    }
+    if syn_state_lost(state) == 255 {
+        state.tuple[83] = (syn_state_flags(state) | SYN_F_DEGRADED) as byte
+    }
+}
+
+/// Pop pays ordinary debt before active frames; root is never removed.
+pub fn syn_state_pop(mut state: SynState, count: int) {
+    state_validate(state)
+    if count < 0 || count > 255 {
+        bug("syntax: pop count exceeds byte")
+    }
+    var i = 0
+    while i < count {
+        let protected = if (syn_state_flags(state) & SYN_F_EMBED_LOST) != 0 then 2 else 0
+        let lost = syn_state_lost(state)
+        let depth = syn_state_depth(state)
+        if lost > protected {
+            state.tuple[81] = (lost - 1) as byte
+        } else if depth > 1 {
+            state.tuple[80] = (depth - 1) as byte
+            syn_state_set_frame(mut state, depth - 1, 0, 0, 0)
+        }
+        i += 1
+    }
+}
+
+/// Replace only the current context, preserving qualification/bridge flags.
+pub fn syn_state_set(mut state: SynState, ctx: int) {
+    state_validate(state)
+    if ctx < 0 || ctx > 65535 {
+        bug("syntax: set context exceeds u16")
+    }
+    let p = (syn_state_depth(state) - 1) * 4
+    state.tuple[p] = ctx as byte
+    state.tuple[p + 1] = (ctx >> 8) as byte
+}
+
+// Canonical tails are read as zero without allocating a temporary tuple.
+fn canonical_byte(state: SynState, at: int) -> byte {
+    if at < 64 && at >= syn_state_depth(state) * 4 ||
+        at >= 64 && at < 80 && at >= 64 + syn_state_ndef(state) * 4 {
+        return 0 as byte
+    }
+    state.tuple[at]
+}
+
+// FNV-1a, as C: slots are an implementation detail, ids insertion-ordered.
+fn state_hash(state: SynState) -> int {
+    var hash: wrapping[u64] = 1469598103934665603
+    var i = 0
+    while i < SYN_STATE_BYTES {
+        hash = (hash ^ (canonical_byte(state, i) as wrapping[u64])) * 1099511628211
+        i += 1
+    }
+    (hash & 4294967295) as int
+}
+
+fn stored_hash(tab: SynStateTab, id: int) -> int {
+    var hash: wrapping[u64] = 1469598103934665603
+    var i = id * SYN_STATE_BYTES
+    let end = i + SYN_STATE_BYTES
+    while i < end {
+        hash = (hash ^ (tab.tuples[i] as wrapping[u64])) * 1099511628211
+        i += 1
+    }
+    (hash & 4294967295) as int
+}
+
+/// Count includes both reserved ids.
+pub fn syn_state_count(tab: SynStateTab) -> int {
+    tab.tuples.len / SYN_STATE_BYTES
+}
+
+fn state_rehash(mut tab: SynStateTab, capacity: int) {
+    var slots = syn_ids_new()
+    var i = 0
+    while i < capacity {
+        syn_ids_push(mut slots, 0)
+        i += 1
+    }
+    i = 1
+    while i < syn_state_count(tab) {
+        var at = stored_hash(tab, i) & (capacity - 1)
+        while syn_ids_get(slots, at) != 0 {
+            at = (at + 1) & (capacity - 1)
+        }
+        syn_ids_set(mut slots, at, i)
+        i += 1
+    }
+    tab.slots = slots
+}
+
+/// Empty table with UNKNOWN and the requested ROOT already reserved.
+pub fn syn_state_tab_new(root_ctx: int) -> SynStateTab {
+    let root = syn_state_root(root_ctx, 0)
+    var bytes = zero_tuple()
+    var i = 0
+    while i < SYN_STATE_BYTES {
+        (mut bytes).push(root.tuple[i])
+        i += 1
+    }
+    var tab = SynStateTab { tuples: bytes, slots: syn_ids_new(), exhausted: false }
+    state_rehash(mut tab, 32)
+    tab
+}
+
+fn stored_equal(tab: SynStateTab, id: int, state: SynState) -> bool {
+    let offset = id * SYN_STATE_BYTES
+    var i = 0
+    while i < SYN_STATE_BYTES {
+        if tab.tuples[offset + i] != canonical_byte(state, i) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// Intern without a canonical scratch allocation; never copy caller tails.
+pub fn syn_state_intern(mut tab: SynStateTab, state: SynState) -> int {
+    state_validate(state)
+    let hash = state_hash(state)
+    var capacity = syn_ids_len(tab.slots)
+    var at = hash & (capacity - 1)
+    while syn_ids_get(tab.slots, at) != 0 {
+        let id = syn_ids_get(tab.slots, at)
+        if stored_equal(tab, id, state) {
+            return id
+        }
+        at = (at + 1) & (capacity - 1)
+    }
+    let n = syn_state_count(tab)
+    if n >= SYN_MAX_STATES {
+        tab.exhausted = true
+        return SYN_STATE_ROOT
+    }
+    if (n + 1) * 10 >= capacity * 7 {
+        capacity *= 2
+        state_rehash(mut tab, capacity)
+        at = hash & (capacity - 1)
+        while syn_ids_get(tab.slots, at) != 0 {
+            at = (at + 1) & (capacity - 1)
+        }
+    }
+    var i = 0
+    while i < SYN_STATE_BYTES {
+        (mut tab.tuples).push(canonical_byte(state, i))
+        i += 1
+    }
+    syn_ids_set(mut tab.slots, at, n)
+    n
+}
+
+/// UNKNOWN and out-of-range ids never name a tuple.
+pub fn syn_state_has(tab: SynStateTab, id: int) -> bool {
+    id > SYN_STATE_UNKNOWN && id < syn_state_count(tab)
+}
+
+/// Copy into existing scratch; the line matcher uses this allocation-free seam.
+pub fn syn_state_read(mut out: SynState, tab: SynStateTab, id: int) -> bool {
+    if !syn_state_has(tab, id) {
+        return false
+    }
+    if out.tuple.len != SYN_STATE_BYTES {
+        bug("syntax: state scratch must hold 84 bytes")
+    }
+    var i = 0
+    while i < SYN_STATE_BYTES {
+        out.tuple[i] = tab.tuples[id * SYN_STATE_BYTES + i]
+        i += 1
+    }
+    true
+}
+
+/// Owned copy for callers that retain an independent tuple (not the hot path).
+pub fn syn_state_get(tab: SynStateTab, id: int) -> SynState ! {none} {
+    if !syn_state_has(tab, id) {
+        return none
+    }
+    var out = syn_state_root(0, 0)
+    let _ = syn_state_read(mut out, tab, id)
+    out
+}
