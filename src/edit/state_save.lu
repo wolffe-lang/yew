@@ -1,7 +1,9 @@
 //! edit.state_save — workspace owner, pid lease and coalesced atomic save.
 //! Ports sagitta src/ws/state_save.c:56-325 and state.h:115-174 at
-//! 9ace98c2. Fatal paths never call this module. All writes reuse
-//! text.file_write_atomic; a failed save leaves dirty set.
+//! 9ace98c2. Fatal paths never call this module. Every write of the lease
+//! and the state reuses text.file_write_atomic; a failed save leaves dirty
+//! set. The owner lock beside the lease (yw19) is the port's own: its file
+//! is never replaced, and only the pid it records is written in place.
 
 use text
 use util
@@ -42,6 +44,7 @@ pub struct WsState {
     missing_count: int,
     byte_paths: List[StatePath],
     wire: List[StateWire],
+    owner_fd: int,
 }
 
 /// Empty state does not read or write anything.
@@ -59,6 +62,7 @@ pub fn state_new() -> WsState {
         missing_count: 0,
         byte_paths: List[StatePath](),
         wire: List[StateWire](),
+        owner_fd: -1,
     }
 }
 
@@ -92,34 +96,100 @@ fn state_pid_alive(pid: int) -> bool {
     true
 }
 
+// yw19 (yew#129): the owner lock, `lock.owner` beside the pid lease. The
+// owner takes an advisory lock on it once (s254's `fs_lock`, `flock(2)`:
+// tried, never waited for) and holds it for the session's life, so the
+// kernel says whether an owner lives: the lock goes with the process,
+// however it ended. A pid alone cannot say so. Pids start again after a
+// reboot (on PAX at 1, in boot order, `kernel/sched/sched.lu`'s
+// `take_pid`), so a lease its session never removed (a power-off, a
+// `kill -9`) can name a process that is no editor at all, and every later
+// session was a reader that saved nothing. The file is never replaced or
+// removed: a lock belongs to the open file, and a new file under the name
+// would be a second lock, free to take. It records the last pid that took
+// it.
+fn state_owner_path(lease: str) -> str { "{lease}.owner" }
+
+// The owner lock: (free, handle). (false, -1) while another session holds
+// it; (true, handle) once it is this session's; (true, -1) where the host
+// keeps no such lock or the file will not open, which leaves C's pid lease
+// to decide alone.
+fn state_owner_take(path: str) -> (bool, int) {
+    let fd = fs_open_mode(path, 3) else { return (true, -1) }
+    fs_lock(fd, 2) else |e| match e {
+        busy => {
+            fs_close(fd) else |_| {}
+            return (false, -1)
+        },
+        _ => {
+            fs_close(fd) else |_| {}
+            return (true, -1)
+        },
+    }
+    (true, fd)
+}
+
+fn state_owner_release(fd: int) {
+    if fd < 0 { return }
+    fs_unlock(fd) else |_| {}
+    fs_close(fd) else |_| {}
+}
+
+// The pid that took the owner lock, written over the last one through a
+// second handle (closing it releases nothing: the lock is the first
+// handle's).
+fn state_owner_record(path: str, pid: int) {
+    let w = fs_open_mode(path, 1) else { return }
+    fs_write_chunk(w, "{pid}\n".bytes()) else |_| {}
+    fs_close(w) else |_| {}
+}
+
 fn state_lock_claim(mut s: WsState) {
     s.writer = false
     s.owner_pid = 0
     let path = ws.ws_lock_path(s.key)
     if path.len == 0 { return }
     let mine = os_pid()
+    let owner = state_owner_path(path)
+    let (free, fd) = state_owner_take(owner)
     let held = state_lock_read(path)
-    if held != 0 && held != mine && state_pid_alive(held) {
+    if !free {
+        s.owner_pid = held
+        util.log_info("workspace state is owned by pid {held}; this session will not save it")
+        return
+    }
+    // The owner lock is free. A lease naming the pid that took it last is
+    // that session's, which holds the lock no longer: stale, whatever holds
+    // the pid now. Any other live pid is a session from before the owner
+    // lock, and owns by C's lease (`state_save.c:115-121`).
+    let last = if fd >= 0 then state_lock_read(owner) else 0
+    if held != 0 && held != mine && held != last && state_pid_alive(held) {
+        state_owner_release(fd)
         s.owner_pid = held
         util.log_info("workspace state is owned by pid {held}; this session will not save it")
         return
     }
     let line = "{mine}\n"
     if text.file_write_atomic(path, line.bytes(), 384) != text.SAVE_OK {
+        state_owner_release(fd)
         util.log_warn("cannot write {path}; this session will not save workspace state")
         return
     }
     let readback = state_lock_read(path)
     if readback != mine {
+        state_owner_release(fd)
         s.owner_pid = readback
         util.log_info("workspace state is owned by pid {readback}; this session will not save it")
         return
     }
+    if fd >= 0 { state_owner_record(owner, mine) }
+    s.owner_fd = fd
     s.writer = true
 }
 
 /// Compute identity and claim its pid lease; clean sessions return before I/O.
 pub fn state_open(mut ed: Ed) {
+    state_owner_release(ed.state.owner_fd)
     ed.state = state_new()
     if !ws.ws_key_session(mut ed.state.key, ws_root(ed), ed.clean) { return }
     if !ws.ws_ensure_dir(mut ed.state.key) { return }
@@ -207,6 +277,8 @@ pub fn state_dispose(mut ed: Ed) {
         let path = ws.ws_lock_path(ed.state.key)
         if path.len != 0 && state_lock_read(path) == os_pid() { fs_remove(path) else |_| {} }
     }
+    state_owner_release(ed.state.owner_fd)
+    ed.state.owner_fd = -1
     state_retained_clear(mut ed)
     ed.state.literals = ws.state_literals()
     ed.state.ready = false
