@@ -5,6 +5,35 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw19 — `:!yew PATH` opens in the running editor (2026-11-15)
+
+- `:!yew PATH` with a relative PATH is read where the shell would read it:
+  in the directory the persistent session last reported (after `:!cd
+  sub`, `:!yew x.lu` is `sub/x.lu`), and from the workspace root while the
+  session has reported none, as before.
+- A `:!yew` line that would start an editor is never handed to the shell,
+  which has no terminal to give one. Several plain files open here, the
+  last one active, as `yew A B` starts; a directory, a word the shell would
+  expand (`$F`, `*.lu`, `~/x`) and an editor option are refused on the
+  message line by name, and nothing runs. A `yew` that starts no editor
+  (`--version`, `--help`, `--batch`, `fl`, a usage error), a compound line
+  and any other first word still run in the session.
+- The workspace's owner holds an advisory lock (`lock.owner`, beside the
+  pid lease) for its whole session. A second editor in the workspace is a
+  reader while the lock is held, whatever its pid says, and a lease left
+  behind by a session that ended without removing it (a power-off, `kill
+  -9`) no longer makes every later editor a reader when a later boot gave
+  its pid to another program. A lease written before the lock existed is
+  still honoured by its pid.
+- The untitled tab a resume keeps is written with no path and skipped at
+  restore, as before, and no longer logged as a dropped tab record; a
+  record that names no file still is.
+- `active_tab` always names a tab record the state wrote, also past the
+  record cap.
+- `tools/nested-open-row` (a pty row over a 26-file workspace),
+  `tools/nested-open-pax` and `tools/nested-open-pax-image` (the same on a
+  PAX image under QEMU) and `src/edit_nested_open_test.lu` hold it.
+
 ### yw11c — the LSP rows wait for what they capture (2026-11-08)
 
 - A picker the LSP rows open from the command line (the diagnostic list,
