@@ -31,6 +31,7 @@ CA_UP, CA_DOWN = b'\x1b[1;7A', b'\x1b[1;7B'
 CASES = [
     'escape-origin-I', 'escape-origin-W', 'escape-origin-B',
     'selection-visible-256', 'selection-visible-truecolor', 'selection-visible-16',
+    'empty-selection-marker',
     'copy-retains-selection', 'copy-internal-paste', 'cut-internal-paste',
     'cut-origin-I', 'replace-typing-origin-I', 'h-selects-current-line',
     'alt-click-add-cursor', 'ctrl-alt-down-I', 'ctrl-alt-up-I',
@@ -199,6 +200,20 @@ def contract(name,s):
         if not s.mode('H'):raise Infra('highlight control missing')
         s.take('escape',ESC,.4)
         require(s.mode(origin),'Escape did not restore '+origin)
+    elif name=='empty-selection-marker':
+        s.take('buffer-end',b'G')
+        s.take('insert-at-end',b'i')
+        if not s.mode('I') or '4:1' not in s.vt.rows()[23]:
+            raise Infra('EOF insertion control missing')
+        at=(s.vt.y,s.vt.x)
+        before=s.vt.cells[at]
+        s.take('empty-highlight',b'\x1bh')
+        if not s.mode('H'):raise Infra('empty highlight mode control missing')
+        after=s.vt.cells[at]
+        s.take('empty-cut',b'\x18')
+        if any(s.body(i)!=line for i,line in enumerate(SEED.splitlines())):
+            raise Infra('empty selection incorrectly cut text')
+        require(before!=after,'armed empty selection has no visible boundary marker')
     elif name.startswith('selection-visible-'):
         before=[s.vt.cells[s.y,s.x+i] for i in range(6)]
         s.selected()
