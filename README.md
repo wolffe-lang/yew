@@ -132,6 +132,24 @@ page if necessary. Up before entering the table still walks history.
 Down at the bottom still returns focus to the command line, keeping the
 last candidate.
 
+## Selection display
+
+Selections use the theme's `sel` role, with reverse video as the 16-color and
+monochrome floor. An equal text/selection style receives additional emphasis.
+Selection is painted after search and diagnostic backgrounds and styles both
+cells of a wide glyph. An armed empty selection marks its insertion boundary
+without adding any bytes to the selected range.
+
+When mouse reporting starts, yew requests Shift-modified reports with
+XTSHIFTESCAPE (`CSI > 1 s`) and restores the default handling (`CSI > 0 s`)
+when leaving the terminal, including suspend and fatal restoration. A terminal
+can forbid that request; right-click and keyboard commands remain available.
+`YEW_MOUSE=0` disables the request along with mouse reporting.
+
+The broader selection-mode redesign has held contracts in
+[`tests/selection/README.md`](tests/selection/README.md); their remaining reds
+are not a claim that new clipboard or cursor behavior is implemented.
+
 ## Keys
 
 `A-?` (Alt and `?`; a kitty-protocol terminal reports the same keys as
