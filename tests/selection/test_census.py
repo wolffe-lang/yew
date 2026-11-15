@@ -15,11 +15,13 @@ import time
 HERE = Path(__file__).resolve().parent
 
 
-def run_case(root, via_script=False, control_c=False):
+def run_case(root, via_script=False, control_c=False, shift_escape=False):
     root.mkdir(parents=True, exist_ok=False)
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     cmd = [sys.executable, '-I', str(HERE/'mouse-census.py'), '--terminal', 'automated-pty']
+    if shift_escape:
+        cmd.append('--shift-escape')
     if via_script:
         cmd = ['/usr/bin/script', '-q', str(root/'script.typescript')] + cmd
     def controlling_tty():
@@ -55,6 +57,7 @@ def run_case(root, via_script=False, control_c=False):
     try:
         wait_for(b'press q when done')
         assert b'\x1b[?1000h\x1b[?1002h\x1b[?1006h' in raw
+        assert (b'\x1b[?1006h\x1b[>1s' in raw)==shift_escape
         current=termios.tcgetattr(slave)
         assert not (current[3] & termios.ICANON), 'not raw: ICANON'
         assert not (current[3] & termios.ECHO), 'not raw: ECHO'
@@ -82,6 +85,8 @@ def run_case(root, via_script=False, control_c=False):
         assert [x['release'] for x in mouse]==[False,True]*6
         assert payload['exit_reason']==('ctrl-c' if control_c else 'q'), payload
         assert b'\x1b[?1000l\x1b[?1002l\x1b[?1006l' in raw
+        assert (b'\x1b[>0s\x1b[?1000l' in raw)==shift_escape
+        assert payload['shift_escape_requested']==shift_escape
         restored=termios.tcgetattr(slave)
         # Darwin sets PENDIN while returning to canonical input. It is a
         # kernel retype-pending flag, not a changed terminal policy setting.
@@ -113,7 +118,10 @@ if __name__=='__main__':
     a.output.mkdir(parents=True,exist_ok=True)
     run_case(a.output/'direct-q')
     run_case(a.output/'direct-ctrl-c',control_c=True)
+    run_case(a.output/'shift-q',shift_escape=True)
+    run_case(a.output/'shift-ctrl-c',control_c=True,shift_escape=True)
     if sys.platform=='darwin':
         run_case(a.output/'mac-script-q',via_script=True)
+        run_case(a.output/'mac-script-shift-q',via_script=True,shift_escape=True)
     else:
         print('SKIP mac-script-q reason=macos-specific-script-cli')
