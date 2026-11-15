@@ -1209,13 +1209,22 @@ own. Any changed C golden is separately listed and pinned in
 
 - **Editing comfort** (`src/edit/lines.lu`, `pairs.lu`, `pane_cmds.lu`):
   Shift+Tab dedents the current/selected lines without collapsing the
-  caret/selection; Alt+Up/Down transposes those lines, retaining cursor
-  topology and remembered pair marks, in one undo step. The new commands
+  caret/selection. Insert-only Alt+Up/Down transposes lines, retaining
+  cursor topology and remembered pair marks, in one undo step. The named
+  commands also cover selected lines when explicitly invoked.
+  The new commands
   are `ed.edit.lines.dedent`, `.up` and `.down`, with recorder words
   `line_dedent`, `line_up` and `line_down`. Insert gains Ctrl+Z undo,
   Ctrl+Shift+Z kitty redo, and Alt+/ legacy redo; Ctrl+Y remains yank.
-  These defaults deliberately replace the vertical Alt hunk/selection
-  motions and Insert's suggestion-line acceptance. Backticks join the
+  These defaults leave L/W/B's hunk keys and H's vertical Alt motions
+  unchanged. Insert Alt+Down uses `ed.shadow.accept_or_line`: the shared
+  visibility seam in `shadow_context.lu` selects the existing named
+  `ed.shadow.accept_line` or the line move, and records the selected child.
+  There are no shadow providers at this pin, so the predicate answers no
+  and the key currently always moves; both routes have probe coverage,
+  while **visible-shadow acceptance is unmeasured until the shadow/AI
+  port**. The acceptance handler retains its named deferred status.
+  Backticks join the
   default pair set in every filetype; an unbalanced quote before the
   caret closes literally, and text or an unmatched closer to the right
   suppresses a new closer (a leading dot still permits it). Sagitta's

@@ -151,10 +151,15 @@ Default editing keys, independently of the command prompt:
   and Ctrl+/ still undo. Ctrl+Z in L mode still suspends.
 - **Insert and selections:** Shift+Tab removes one indent unit from the
   current or selected lines, retaining the caret or selection.
-- **L, W, B, Insert and selections:** Alt+Up/Down moves the current or
-  selected lines by one line, as one undo step. These keys replace the
-  old git-hunk and vertical unit motions, and Insert's suggestion-line
-  acceptance; word/all suggestion acceptance remains available.
+- **Insert only:** Alt+Up moves the line up, as one undo step. Alt+Down
+  moves it down when no shadow suggestion is visible; otherwise it
+  dispatches to shadow-line acceptance. L/W/B keep their git-hunk keys,
+  and H keeps its unit-specific vertical Alt motions.
+
+Shadow suggestions are not implemented at this pin, so Insert Alt+Down
+currently always moves the line. Probe rows verify both routing branches;
+actual visible-shadow acceptance is **unmeasured until the shadow/AI port**.
+The existing named acceptance command still reports its deferred status.
 
 Backticks pair in code and prose. Quotes close literally when their
 matching opener is unbalanced earlier on the line, including with text

@@ -16,9 +16,15 @@ The format follows Keep a Changelog; the port has no release yet.
 - Insert mode gains Ctrl+Z undo, Ctrl+Shift+Z redo with the kitty
   keyboard protocol, and Alt+/ legacy redo. Existing undo and yank
   bindings remain.
-- Alt+Up/Down moves current or selected lines as one undo step. It
-  replaces those keys' old hunk/selection motions and Insert's suggestion
-  line acceptance. Final newlines and CRLF separators are preserved.
+- Alt+Up/Down moves lines as one undo step in Insert mode only, preserving
+  final newlines and CRLF. L/W/B retain hunk jumps; H retains its motions.
+  Alt+Down dispatches to shadow-line acceptance when a shadow is visible,
+  otherwise moving the line. Shadows are not implemented at this pin:
+  both routes are probe-tested, but visible acceptance is unmeasured
+  until the shadow/AI port; its existing named handler remains deferred.
+- Multi-line dedent invalidates pre-edit selection-render coordinates,
+  avoiding an out-of-buffer lookup after a partial redraw. PTY crashes
+  and startup failures are named and no longer hide subsequent rows.
 - A click past an unterminated final line lands after its last grapheme,
   as it already did on terminated lines, rather than before it.
 - These intentional differences from C yew have unit and PTY regression
