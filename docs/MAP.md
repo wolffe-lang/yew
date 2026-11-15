@@ -1220,3 +1220,19 @@ command's help text and in its unit's header, holds no sagitta golden
   `ed.map` (`bind.c:475-522`), the current mode's configured layer as one
   message; it is unchanged. Rows: `src/edit_keys_help_test.lu`, and
   `lspw_keys_help` in `tools/run-lsp-rows`.
+- **A language server that cannot start is reported once** (yw18,
+  yew#127, `lsp_client_pump` in `src/edit/lsp_client.lu`). C reports an
+  exec failure again on every pump (`client.c:1287-1295`): the failed job
+  stays in the table, so every turn of the loop sets the message again,
+  redraws the footer, replaces any message raised after it, and keeps
+  the strings it builds (the ambient region frees none), and
+  `:lsp.restart` meets the same branch before the respawn, so a server
+  installed later never starts. The port reports once, releases the
+  failed job, and keeps the server off until `:lsp.restart`, which tries
+  again. A server that gave up keeps why (`LspLife.off_why`: the exec
+  failure's reason, or "crashed 5 times in 5 minutes"), and `:lsp.info`
+  ends with `; off until :lsp.restart: <why>`; while a server may run
+  the line is C's. The status badge is C's. No C golden or LSP row shows
+  an exec failure. Rows: `src/edit_lsp_execfail_test.lu`,
+  `tools/execfail-row` (a pty, `.sh` against a `.txt` control) and
+  `tools/execfail-pax` (the same on PAX under QEMU).
