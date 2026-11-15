@@ -286,6 +286,45 @@ release (`1fa887b`) and the reorder that lets the plant be one hunk
 unit, pty and PAX rows there, with the LSP rows against C and the gated
 PTY goldens, and the plant beside it.
 
+## The first record at `d53d308`
+
+It went red at two steps, neither of them the change; every other step
+was green (the six unit cases and their checked runs, both pty rows,
+the LSP rows against C, the touched LSP and job units, the release and
+static builds).
+
+- **`pty-gates`: `FAIL osc52_reply`** (`unsolicited OSC 52 reply did not
+  log WARN`; 319 of 320 gated goldens ok). The case reads the editor's
+  default log, `$state_dir/yew/log` (sagitta `tests/pty/registry.c:
+  310-329`), and C's PTY harness hands the runner's own `YEW_LOG` to the
+  editor (`tests/pty/harness.c:731`). The record's container set
+  `YEW_LOG=/dev/null` for every step, so the warning went there. Taken
+  alone at `d53d308`: red with `YEW_LOG=/dev/null`, `ok` with it unset
+  (the same pair at trunk `727b605` was still being taken when this was
+  written; the pull request has its answer). The container no longer
+  sets it.
+- **`pax-image`: xorriso exit 32**, `SORRY : Cannot make proposal to mark
+  data file as MBR partition without being in GPT :
+  '/boot/limine/limine-uefi-cd.bin'`, after it wrote the ISO. The first
+  form of `tools/execfail-pax-image` replayed image 3's boot records
+  with `-boot_image any replay`; Limine's `bios-install` had rewritten
+  the image's GPT as an MBR after xorriso made it, so the replay could
+  not propose the EFI image as a partition. The tool printed only the
+  tail of xorriso's output, which lost the SORRY line. It now extracts
+  the image's tree and makes the ISO with the `xorriso -as mkisofs` line
+  pax's `tools/mkimage` runs (`6da78e9`), stops on any SORRY with
+  xorriso's whole log, and prints every line of severity NOTE and above.
+- **The yew it carried** was right in kind and twice the bytes: a static
+  glibc executable, the shape pax's `tools/mkyew` builds and image 3
+  carries, but linked by the system linker in yew CI's image, which kept
+  its DWARF and symbol table (26,771,672 bytes); image 3's yew has
+  neither (12,746,296 bytes, linked by lld). Stripped, trunk's own
+  static build is 12,745,640 bytes. The tool now strips its copy before
+  it goes in. With that, the fix's yew booted on image 3's tree under
+  QEMU and the PAX row was green: the `.sh` session's resident set
+  stayed at 27,260 KiB through the motion window (+0, where trunk's grew
+  356 KiB), and the dropped count stayed 0.
+
 ## Evidence index
 
 - The prediction: `85b4d85`, before the first change.
@@ -295,7 +334,8 @@ PTY goldens, and the plant beside it.
   `tools/execfail-pax-image` (`96144e0`), and the row's two corrections
   after it, the resident set printed and not judged (`d24d2a0`) and the
   message phase measured from the command (`f1ac43b`).
-- The fix: `68e1678`, `f2f5b17`, `b9c784d`, `1fa887b`, `7558c64`.
+- The fix: `68e1678`, `f2f5b17`, `b9c784d`, `1fa887b`, `7558c64`;
+  the image tool's rebuild after the first record, `6da78e9`.
 - The trunk takes above: the unit row and the pty row at `7a862a0`, the
   PAX row over image 3's ISO (sha256 `32fe1a14…`, from the image's build
   directory) with the tool as committed at `7a862a0`.
