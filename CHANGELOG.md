@@ -5,6 +5,28 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw18 — a language server that cannot start is reported once (2026-11-15)
+
+- yew#127: with a file open whose language server is not installed (a
+  `.sh` file and no `bash-language-server`), the failure was reported
+  again on every turn of the main loop. Each turn set the message again,
+  redrew the footer, replaced any message raised after it, rang the bell
+  under `errorbells`, and kept the strings it built, so memory grew with
+  every key, click or report the editor read; `:lsp.restart` never
+  started the server again. The failure is now reported once, its job is
+  released, and the server stays off until `:lsp.restart`, which tries
+  again. C yew does the same at the pin; this is a divergence (docs/MAP.md
+  §9).
+- `:lsp.info` ends with `; off until :lsp.restart: <why>` for a server
+  that gave up: the exec failure's reason, or "crashed 5 times in 5
+  minutes". The five-crash give-up was already reported once.
+- Rows: `src/edit_lsp_execfail_test.lu` (the client pumped in-process),
+  `tools/execfail-row` (yew in a pty, a `.sh` session against a `.txt`
+  control: bytes, bells, CPU and resident memory over idle, mouse
+  motion, keys and a message) and `tools/execfail-pax` with
+  `tools/execfail-pax-image` (the same question on a PAX live image under
+  QEMU, COM1 a slow UART, reading `/proc/pax-boot`'s dropped count).
+
 ### yw11c — the LSP rows wait for what they capture (2026-11-08)
 
 - A picker the LSP rows open from the command line (the diagnostic list,
