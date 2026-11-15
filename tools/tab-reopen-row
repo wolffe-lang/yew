@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""tab-reopen-row: closing many tabs at once can be undone (yew#129).
+
+    python3 -I tools/tab-reopen-row YEW_BIN [--keep DIR] [--case NAME]...
+                                    [--files N] [--term TERM] [--list]
+
+Each case runs yew in a pseudo-terminal, 24 by 80, with a scratch HOME
+(and XDG directories under it), SHELL=/bin/sh, YEW_LOG a scratch file, and
+a scratch workspace of N files (default 21) `f01.txt` .. `fNN.txt`, forty
+fixed-width lines each (`.txt`: no language server serves it, so no
+failure message covers the message line, yew#127). yew starts as `yew
+f01.txt … fNN.txt` in that workspace: the untitled tab and the N files.
+A case reads:
+
+  - the screen's bytes since a mark, for a message (`closed 21 tabs — t u
+    to reopen`, `reopened 21 tabs`) or a buffer's text, waited for up to
+    8 s (a quiet screen is not an answer: a stalled loop draws nothing);
+  - the workspace's saved state after `:wssave` (whose answer, `wrote
+    …`, is waited for): each tab record with its id taken out (a reopened
+    tab has a fresh id) — path, group, ordinal, panes, every window's
+    cursors, view and jumps — and `active_tab`;
+  - each file's bytes after the editor quits by `:q!`.
+
+The cases (`--case`, repeatable; every case by default):
+
+  tabonly   the owner's case: the N + 1 tabs, `t n` to each in turn and a
+            count of `<down>` there (a cursor line of its own), an
+            unsaved edit typed into the sixth, then `t o` from it. The
+            message names the count and the key; one tab is left; `t u`
+            answers `reopened N tabs`, and the saved state is the one
+            before `t o`, record for record, the sixth tab active; the
+            unsaved text is drawn again; every file on disk is as it was.
+  cmdline   the same through the command line, five tabs: `:tabonly`,
+            then `:tabreopen`.
+  picker    a group of f03, f04, f05 made in the group picker (`t g`);
+            an unsaved edit in f04; the group's Edit dialog (`t e`)
+            unticks f04 and f05 and confirms: two tabs close, the
+            modified one among them (C's: the dialog bullets it first).
+            The message; `t u`; the saved state is the one before the
+            edit; f04's unsaved text is drawn again; f04 on disk is as it
+            was.
+
+One line per check, `FAIL <case>_<check>` for each red, then
+`tab-reopen-row: GREEN` or `tab-reopen-row: RED` (exit 1). Exit 2 when
+the row cannot run (no saved state, the wrong number of tabs at the
+start, an editor that does not quit) and nothing is red; every red is
+printed by name first. When a row is red the scratch directory (each
+case's `pty.raw`, log and states) is kept and named.
+
+yew is only spoken to through its terminal and never signalled. Each `:`
+line waits to see the command line drawn before it is typed (an ESC read
+together with the `:` is Alt-:, yew#129's comment). The session harness
+is yw19's (`tools/nested-open-row`), copied by value.
+"""
+import argparse
+import fcntl
+import glob
+import os
+import pty
+import re
+import select
+import shutil
+import struct
+import sys
+import tempfile
+import termios
+import time
+
+ROWS, COLS = 24, 80
+QUIET_S = 0.5
+LINES = 40
+CASES = ["tabonly", "cmdline", "picker"]
+CMDLINE_OPEN = re.compile(rb"\x1b\[%d;1H(?:\x1b\[[0-9;]*m)*:" % ROWS)
+DASH = "—".encode()
+
+
+class Cant(Exception):
+    """The row cannot run: exit 2."""
+
+
+class Session:
+    def __init__(self, yew, cwd, env, argv, log):
+        self.raw = bytearray()
+        self.log = log
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(cwd)
+            os.execve(yew, [yew] + argv, env)
+        self.pid, self.fd = pid, fd
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+        self.status = None
+
+    def pump(self, seconds):
+        end = time.monotonic() + seconds
+        got = 0
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return got
+            r, _, _ = select.select([self.fd], [], [], left)
+            if not r:
+                return got
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                return got
+            if not data:
+                return got
+            self.raw += data
+            self.log.write(data)
+            got += len(data)
+
+    def settle(self, quiet=QUIET_S, limit=10.0):
+        start = time.monotonic()
+        while time.monotonic() - start < limit:
+            if self.pump(quiet) == 0:
+                return True
+        return False
+
+    def send(self, data):
+        os.write(self.fd, data)
+
+    def keys(self, data, settle=0.15):
+        """Bytes typed in L mode, then a short settle."""
+        self.send(data)
+        self.settle(settle)
+
+    def open_cmdline(self, tries=3, wait=3.0):
+        for _ in range(tries):
+            if not self.alive():
+                return False
+            self.send(b"\x1b")
+            self.pump(0.3)
+            mark = len(self.raw)
+            self.send(b":")
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                self.pump(0.05)
+                if CMDLINE_OPEN.search(self.raw, mark):
+                    return True
+        return False
+
+    def ex(self, line, settle=QUIET_S):
+        if not self.open_cmdline():
+            print(f"  the command line did not open for :{line}", flush=True)
+            return False
+        for i in range(0, len(line), 16):
+            self.send(line[i:i + 16].encode())
+            self.pump(0.02)
+        self.send(b"\r")
+        self.settle(settle)
+        return True
+
+    def mark(self):
+        return len(self.raw)
+
+    def since(self, mark):
+        return bytes(self.raw[mark:])
+
+    def wait_for(self, mark, needles, limit=8.0):
+        end = time.monotonic() + limit
+        while True:
+            got = self.since(mark)
+            if any(n in got for n in needles):
+                return True
+            if time.monotonic() >= end:
+                return False
+            self.pump(0.05)
+
+    def alive(self):
+        if self.status is not None:
+            return False
+        pid, status = os.waitpid(self.pid, os.WNOHANG)
+        if pid == self.pid:
+            self.status = status
+            return False
+        return True
+
+    def quit(self, limit=12.0):
+        """`:q!` until the editor exits, within `limit` seconds; its
+        terminal is then closed (a hangup), never signalled."""
+        end = time.monotonic() + limit
+        while self.alive() and time.monotonic() < end:
+            if self.open_cmdline(tries=1):
+                self.send(b"q!\r")
+            gone = time.monotonic() + 3.0
+            while time.monotonic() < min(gone, end):
+                self.pump(0.05)
+                if not self.alive():
+                    break
+        quit = not self.alive()
+        os.close(self.fd)
+        return quit
+
+
+def env_for(scratch, term):
+    home = os.path.join(scratch, "home")
+    for d in ("", ".config", ".local/state", ".local/share", ".cache", "tmp"):
+        os.makedirs(os.path.join(home, d), exist_ok=True)
+    return {
+        "HOME": home,
+        "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+        "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
+        "XDG_DATA_HOME": os.path.join(home, ".local", "share"),
+        "XDG_CACHE_HOME": os.path.join(home, ".cache"),
+        "TMPDIR": os.path.join(home, "tmp"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "SHELL": "/bin/sh",
+        "TERM": term,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "YEW_TTY_PROBE": "0",
+        "YEW_CLIPBOARD": "none",
+        "YEW_COLORS": "16",
+        "YEW_LOG": os.path.join(scratch, "yew.log"),
+        "YEW_LOG_LEVEL": "info",
+        "COLUMNS": str(COLS),
+        "LINES": str(ROWS),
+    }
+
+
+def body_of(n):
+    return "".join(f"f{n:02d} line {k:02d}\n" for k in range(LINES)).encode()
+
+
+def make_workspace(scratch, n):
+    ws = os.path.join(scratch, "ws")
+    os.makedirs(ws, exist_ok=True)
+    names = []
+    for i in range(1, n + 1):
+        name = f"f{i:02d}.txt"
+        with open(os.path.join(ws, name), "wb") as f:
+            f.write(body_of(i))
+        names.append(name)
+    return ws, names
+
+
+def state_file(env):
+    found = glob.glob(os.path.join(env["XDG_STATE_HOME"], "yew", "workspaces", "*", "state.fl"))
+    return found[0] if len(found) == 1 else None
+
+
+def read_state(env):
+    """([tab record text, its `id:` line taken out], active_tab) or None."""
+    path = state_file(env)
+    if path is None:
+        return None
+    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    tabs, active, inside, rec = [], None, False, None
+    for line in lines:
+        if line == "  tabs: [":
+            inside = True
+            continue
+        if inside and line == "  ],":
+            inside = False
+            continue
+        if inside:
+            if line == "    {":
+                rec = []
+            elif line == "    },":
+                tabs.append("\n".join(rec))
+                rec = None
+            elif rec is not None and not re.match(r"^      id: \d+,$", line):
+                rec.append(line)
+            continue
+        m = re.match(r"^  active_tab: (\d+),$", line)
+        if m:
+            active = int(m.group(1))
+    return tabs, active
+
+
+def rec_path(rec):
+    m = re.search(r'^      path: (nil|"(.*)"),$', rec, re.M)
+    return "untitled" if m is None or m.group(1) == "nil" else os.path.basename(m.group(2))
+
+
+def rec_pos(rec):
+    m = re.search(r"^              pos: (\d+),$", rec, re.M)
+    return int(m.group(1)) if m else -1
+
+
+class Row:
+    def __init__(self, args):
+        self.args = args
+        self.red = []
+
+    def check(self, case, name, ok, detail):
+        tag = f"{case}_{name}"
+        print(f"{'ok  ' if ok else 'FAIL'} {tag}: {detail}", flush=True)
+        if not ok:
+            print(f"FAIL {tag}", flush=True)
+            self.red.append(tag)
+        return ok
+
+
+def save(s, env):
+    """`:wssave`, its answer waited for; the saved state."""
+    mark = s.mark()
+    if not s.ex("wssave"):
+        return None
+    if not s.wait_for(mark, [b"wrote "]):
+        return None
+    return read_state(env)
+
+
+def same_state(row, case, before, after):
+    btabs, bact = before
+    atabs, aact = after
+    row.check(case, "tab_count", len(atabs) == len(btabs), f"{len(atabs)} tabs back, {len(btabs)} before")
+    diff = [i for i in range(min(len(atabs), len(btabs))) if atabs[i] != btabs[i]]
+    shown = ", ".join(f"{i} {rec_path(btabs[i])} -> {rec_path(atabs[i])}" for i in diff[:4])
+    row.check(case, "records", not diff and len(atabs) == len(btabs),
+              "every record as before (path, group, panes, cursors, view, jumps)" if not diff
+              else f"{len(diff)} records differ: {shown}")
+    row.check(case, "active", aact == bact, f"active_tab {aact}, {bact} before")
+
+
+def unchanged_on_disk(row, case, ws, names):
+    bad = [n for i, n in enumerate(names, 1) if open(os.path.join(ws, n), "rb").read() != body_of(i)]
+    row.check(case, "disk", not bad, "every file as it was" if not bad else f"changed: {bad}")
+
+
+def start(yew, scratch, case, files, term):
+    d = os.path.join(scratch, case)
+    os.makedirs(d, exist_ok=True)
+    env = env_for(d, term)
+    ws, names = make_workspace(d, files)
+    log = open(os.path.join(d, "pty.raw"), "wb")
+    s = Session(yew, ws, env, names, log)
+    s.settle(1.0)
+    return d, env, ws, names, s
+
+
+def walk_and_place(s, total):
+    """`t n` to each tab in turn, a count of `<down>` in each (the k-th
+    visited moves k mod 30 + 1 lines)."""
+    for k in range(total):
+        s.keys(b"tn", 0.1)
+        s.keys(f"{k % 30 + 1}".encode() + b"\x1b[B", 0.1)
+    s.settle()
+
+
+def case_tabonly(row, yew, scratch, args):
+    c = "tabonly"
+    n = args.files
+    d, env, ws, names, s = start(yew, scratch, c, n, args.term)
+    first = save(s, env)
+    if first is None or len(first[0]) != n + 1:
+        s.quit()
+        raise Cant(f"{c}: {n + 1} tabs expected at the start, the state shows "
+                   f"{'none' if first is None else len(first[0])}")
+    walk_and_place(s, n + 1)
+    # The sixth tab, by A-6 (ESC 6 in one write: a legacy Alt key).
+    s.keys(b"\x1b6", 0.3)
+    s.keys(b"i", 0.2)
+    s.keys(b"UNSAVED-yw20 ", 0.2)
+    s.keys(b"\x1b", 0.4)
+    before = save(s, env)
+    placed = sum(1 for r in before[0] if rec_pos(r) > 0) if before else 0
+    if before is None or placed < n:
+        s.quit()
+        raise Cant(f"{c}: cursors were not placed ({placed} of {n + 1} tabs off line 1)")
+    row.check(c, "placed", True, f"{placed} of {n + 1} tabs hold a cursor off offset 0, tab {before[1]} active")
+    mark = s.mark()
+    s.keys(b"to", 0.3)
+    want = f"closed {n} tabs ".encode() + DASH + b" t u to reopen"
+    row.check(c, "message", s.wait_for(mark, [want]), f"`{want.decode()}` drawn after `t o`")
+    mid = save(s, env)
+    row.check(c, "closed", mid is not None and len(mid[0]) == 1,
+              f"{len(mid[0]) if mid else '?'} tab(s) left after `t o`")
+    mark = s.mark()
+    s.keys(b"tu", 0.3)
+    row.check(c, "answer", s.wait_for(mark, [f"reopened {n} tabs".encode()]), f"`reopened {n} tabs` drawn after `t u`")
+    row.check(c, "unsaved_drawn", s.wait_for(mark, [b"UNSAVED-yw20"], 3.0), "the unsaved text drawn again")
+    after = save(s, env)
+    if after is None:
+        row.check(c, "state", False, "no state saved after `t u`")
+    else:
+        same_state(row, c, before, after)
+    quit = s.quit()
+    row.check(c, "quits", quit, "`:q!` ends the editor")
+    unchanged_on_disk(row, c, ws, names)
+
+
+def case_cmdline(row, yew, scratch, args):
+    c = "cmdline"
+    d, env, ws, names, s = start(yew, scratch, c, 4, args.term)
+    walk_and_place(s, 5)
+    s.keys(b"\x1b3", 0.3)
+    before = save(s, env)
+    if before is None or len(before[0]) != 5:
+        s.quit()
+        raise Cant(f"{c}: five tabs expected, the state shows {'none' if before is None else len(before[0])}")
+    mark = s.mark()
+    s.ex("tabonly")
+    want = b"closed 4 tabs " + DASH + b" t u to reopen"
+    row.check(c, "message", s.wait_for(mark, [want]), f"`{want.decode()}` drawn after `:tabonly`")
+    mark = s.mark()
+    s.ex("tabreopen")
+    row.check(c, "answer", s.wait_for(mark, [b"reopened 4 tabs"]), "`reopened 4 tabs` drawn after `:tabreopen`")
+    after = save(s, env)
+    if after is None:
+        row.check(c, "state", False, "no state saved after `:tabreopen`")
+    else:
+        same_state(row, c, before, after)
+    row.check(c, "quits", s.quit(), "`:q!` ends the editor")
+    unchanged_on_disk(row, c, ws, names)
+
+
+def case_picker(row, yew, scratch, args):
+    c = "picker"
+    d, env, ws, names, s = start(yew, scratch, c, 6, args.term)
+    walk_and_place(s, 7)
+    # The New dialog at the workspace: rows `..`, f01 … f06; tick f03-f05.
+    mark = s.mark()
+    s.keys(b"tg", 0.3)
+    if not s.wait_for(mark, [b"New Tab Group"]):
+        s.quit()
+        raise Cant(f"{c}: `t g` drew no New Tab Group dialog")
+    s.keys(b"\x1b[B" * 3, 0.2)
+    s.keys(b" ", 0.2)
+    s.keys(b"\x1b[B", 0.2)
+    s.keys(b" ", 0.2)
+    s.keys(b"\x1b[B", 0.2)
+    s.keys(b" ", 0.2)
+    mark = s.mark()
+    s.keys(b"\r", 0.4)
+    s.ex("tabedit f04.txt")
+    s.keys(b"i", 0.2)
+    s.keys(b"UNSAVED-yw20 ", 0.2)
+    s.keys(b"\x1b", 0.4)
+    before = save(s, env)
+    grouped = [rec_path(r) for r in before[0] if re.search(r"^      group: [1-9]", r, re.M)] if before else []
+    if before is None or grouped != ["f03.txt", "f04.txt", "f05.txt"]:
+        s.quit()
+        raise Cant(f"{c}: the group should hold f03-f05, the state shows {grouped}")
+    row.check(c, "grouped", True, f"group of {grouped}, tab {before[1]} active")
+    mark = s.mark()
+    s.keys(b"te", 0.3)
+    if not s.wait_for(mark, [b"Edit Tab Group"]):
+        row.check(c, "edit_dialog", False, "`t e` drew no Edit Tab Group dialog")
+        s.quit()
+        return
+    s.keys(b"\x1b[B" * 4, 0.2)
+    s.keys(b" ", 0.2)
+    s.keys(b"\x1b[B", 0.2)
+    s.keys(b" ", 0.2)
+    mark = s.mark()
+    s.keys(b"\r", 0.4)
+    want = b"closed 2 tabs " + DASH + b" t u to reopen"
+    row.check(c, "message", s.wait_for(mark, [want]), f"`{want.decode()}` drawn after the dialog's Enter")
+    mid = save(s, env)
+    left = [rec_path(r) for r in mid[0]] if mid else []
+    row.check(c, "closed", "f04.txt" not in left and "f05.txt" not in left and len(left) == 5,
+              f"tabs left: {left}")
+    mark = s.mark()
+    s.keys(b"tu", 0.3)
+    row.check(c, "answer", s.wait_for(mark, [b"reopened 2 tabs"]), "`reopened 2 tabs` drawn after `t u`")
+    row.check(c, "unsaved_drawn", s.wait_for(mark, [b"UNSAVED-yw20"], 3.0), "f04's unsaved text drawn again")
+    after = save(s, env)
+    if after is None:
+        row.check(c, "state", False, "no state saved after `t u`")
+    else:
+        same_state(row, c, before, after)
+    row.check(c, "quits", s.quit(), "`:q!` ends the editor")
+    unchanged_on_disk(row, c, ws, names)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("yew")
+    ap.add_argument("--keep")
+    ap.add_argument("--case", action="append", choices=CASES)
+    ap.add_argument("--files", type=int, default=21)
+    ap.add_argument("--term", default="xterm-256color")
+    ap.add_argument("--list", action="store_true")
+    args = ap.parse_args()
+    if args.list:
+        print("\n".join(CASES))
+        return 0
+    yew = os.path.abspath(args.yew)
+    if args.keep:
+        os.makedirs(args.keep, exist_ok=True)
+        scratch = tempfile.mkdtemp(prefix="tab-reopen-", dir=args.keep)
+    else:
+        scratch = tempfile.mkdtemp(prefix="tab-reopen-")
+    print(f"tab-reopen-row: {yew}, {args.term}, scratch {scratch}", flush=True)
+    row = Row(args)
+    cant = None
+    for case in args.case or CASES:
+        try:
+            {"tabonly": case_tabonly, "cmdline": case_cmdline, "picker": case_picker}[case](row, yew, scratch, args)
+        except Cant as e:
+            print(f"tab-reopen-row: cannot run: {e}", flush=True)
+            cant = e
+            break
+    if row.red:
+        print(f"tab-reopen-row: scratch kept: {scratch}")
+        print("tab-reopen-row: RED")
+        return 1
+    if cant is not None:
+        print(f"tab-reopen-row: scratch kept: {scratch}")
+        return 2
+    if not args.keep:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("tab-reopen-row: GREEN")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
