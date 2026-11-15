@@ -20,11 +20,12 @@ control or infrastructure failure. The JSON result, raw terminal bytes and
 child metrics remain in the output directory. A process exit of zero alone is
 not a contract pass. No real clipboard backend or network server is used.
 
-The 20 rows cover mode restoration from Insert/Word/Block, 16/256/truecolor
+The 22 rows cover mode restoration from Insert/Word/Block, 16/256/truecolor
 selection visibility, copy/cut and internal paste without a system clipboard,
 insert-origin replacement, initial line selection, Alt-click cursors,
 Ctrl+Alt+Up/Down and repeated vertical additions, keyboard and Ctrl-click
-navigation, and context menus on Ctrl+Shift+click and right-click. Existing
+navigation, empty-selection boundaries, duplicate-press idempotence, and context
+menus on Ctrl+Shift+click and right-click. Existing
 correct behavior is a positive control, not a manufactured failure. The fake
 language server records requested positions and returns a local target file.
 
@@ -56,7 +57,10 @@ Each complete input event prints immediately with button, modifier bits,
 press/release, coordinates and its raw bytes. Press `q` or Ctrl+C when done;
 the script restores raw mode/reporting and prints all events as JSON. Paste
 that JSON with terminal name/version and settings that affect reporting.
-It changes no terminal preferences or clipboard.
+It changes no terminal preferences or clipboard. Add `--shift-escape` to request
+Shift reports with `CSI > 1 s`; the restore path sends `CSI > 0 s`. A terminal
+configured to forbid Shift capture can ignore the request. The JSON states
+whether it was requested.
 
 The transport regression runs the actual census process in a PTY, injects all
 six press/release pairs (including split escape sequences), checks live output
