@@ -1237,7 +1237,7 @@ command's help text and in its unit's header, holds no sagitta golden
   `tools/execfail-row` (a pty, `.sh` against a `.txt` control) and
   `tools/execfail-pax` (the same on PAX under QEMU).
 - **`:!yew` past the recognizer, and the workspace's owner lock** (yw19,
-  yew#129; `notes/yw19-nested-open.md`). Four changes on top of C, each
+  yew#129). Four changes on top of C, each
   held by `src/edit_nested_open_test.lu` and `tools/nested-open-row`
   (with `tools/nested-open-pax` on a PAX image):
   - `self_open_path` (`src/edit/shell.lu`) resolves a relative operand
