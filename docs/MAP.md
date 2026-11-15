@@ -1246,3 +1246,34 @@ command's help text and in its unit's header, holds no sagitta golden
   an exec failure. Rows: `src/edit_lsp_execfail_test.lu`,
   `tools/execfail-row` (a pty, `.sh` against a `.txt` control) and
   `tools/execfail-pax` (the same on PAX under QEMU).
+- **Closing many tabs at once can be undone** (yw20, yew#129,
+  `src/edit/tabreopen.lu`). C closes several tabs in one gesture in three
+  places, each silently and keeping nothing: `ed.tab.close_others` (`t o`,
+  `:tabonly`, the tab menu's "close others"; `tabs.c:2066-2116`),
+  `ed.group.close` on a group (`:gclose`; `groupnav.c:259-308`) and the
+  group picker's Edit, whose unticked members' tabs close, modified or not
+  (`grouppicker.c:934-1007`). A closed tab's buffer stays in memory there
+  as here; its windows, place and group are gone. The port records each
+  such close before its first close (each tab's index, path, buffer,
+  group and ordinal, pane tree, and every window's cursors, view and
+  jumps), keeps it in memory only (never in the workspace state; the
+  next close of two or more tabs replaces it), and says so: `closed 21
+  tabs — t u to reopen`. `ed.tab.reopen` (`t u`, `:tabreopen`; a row of
+  `src/edit/cmdtab_yew.lu`, after C's, and the verb `reopen` beside C's)
+  puts every recorded tab back at its index, its group made again when
+  the close dissolved it, the tab active before the close active again.
+  A close of one tab (`t c`, a group of one) keeps the record and the
+  message row as C's. C's refusals are unchanged (`t o` and `:gclose`
+  refuse a modified tab), and no confirmation is added: the picker's Edit
+  is the one gesture that closes a modified tab, its row is bulleted
+  before Enter, and its text stays in memory and comes back with the
+  reopen. `t u` is a yew row of L's configured keymap
+  (`keys_yew_config_rows`), under every configured row and dropped when
+  a configuration binds `t u`, `t` alone or a longer `t u …`: a chord
+  stays in the layer its first key matched, and L's `t` is the configured
+  layer's, so `runtime/init.fl` stays sagitta's byte for byte. `ed.map`
+  in L lists it. No C golden presses `t u`, runs `ed.map`, or closes more
+  than one tab with a message on screen. Rows:
+  `src/edit_tab_reopen_test.lu` and `tools/tab-reopen-row` (a pty: 22
+  tabs, `t o`, `t u`; `:tabonly`, `:tabreopen`; the picker's Edit closing
+  a modified member, then `t u`).
