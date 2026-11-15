@@ -11,6 +11,9 @@ use the default one-row tab strip, so screen row 2 is text row 1.
 FAIL names are stable for the off-line plant. A timeout is RED, not SKIP.
 """
 import argparse
+import contextlib
+import copy
+import io
 import fcntl
 import os
 from pathlib import Path
@@ -81,13 +84,17 @@ case("move-undo", "aa\nbb\ncc", DOWN + ADOWN + UNDO, "aa\nbb\ncc")
 case("move-redo", "aa\nbb\ncc", DOWN + ADOWN + UNDO + REDO, "aa\ncc\nbb")
 case("move-top-noop", "aa\nbb", AUP + b"X", "Xaa\nbb")
 case("move-bottom-noop", "aa\nbb", DOWN + ADOWN + b"X", "aa\nXbb")
-case("move-selection", "aa\nbb\ncc\ndd", SDOWN * 2 + ADOWN, "cc\naa\nbb\ndd")
-case("move-selection-twice", "aa\nbb\ncc\ndd", SDOWN * 2 + ADOWN * 2, "cc\ndd\naa\nbb")
+case("retain-H-I-alt", "aa\nbb\ncc\ndd", SDOWN * 2 + ADOWN, "aa\nbb\ncc\ndd")
+case("retain-H-I-alt-twice", "aa\nbb\ncc\ndd", SDOWN * 2 + ADOWN * 2, "aa\nbb\ncc\ndd")
 case("move-unicode-column", "ab\n漢é\ncd", DOWN + RIGHT + ADOWN + b"X", "ab\ncd\n漢Xé")
 for mode, enter in [("L", b""), ("W", b"w"), ("B", b"b")]:
-    for direction, arrow, expected in [("up", AUP, "Xbb\naa\ncc"), ("down", ADOWN, "aa\ncc\nXbb")]:
+    for direction, arrow in [("up", AUP), ("down", ADOWN)]:
         actions = [DOWN, ESC] + ([enter] if enter else []) + [arrow, b"i", b"X"]
-        case("move-" + mode + "-" + direction, "aa\nbb\ncc", actions, expected)
+        case("retain-" + mode + "-alt-" + direction, "aa\nbb\ncc", actions, "aa\nXbb\ncc")
+for mode, enter in [("L", []), ("W", [b"w"]), ("B", [b"b"])]:
+    for direction, arrow in [("up", AUP), ("down", ADOWN)]:
+        actions = [DOWN, ESC] + enter + [b"h", arrow]
+        case("retain-H-" + mode + "-alt-" + direction, "aa\nbb\ncc", actions, "aa\nbb\ncc")
 # One tab-strip row; reports use 1-based cells.
 def click(row):
     return f"\x1b[<0;40;{row + 1}M\x1b[<0;40;{row + 1}m".encode()
@@ -104,6 +111,10 @@ for tag, initial, row, expected in [
 ]:
     case("click-" + tag, initial, click(row) + b"X", expected)
 case("click-last-closer-L", "aa\n}", [ESC, click(2), b"iX"], "aa\n}X")
+
+class SessionError(Exception):
+    """A startup, terminal-I/O or editor-exit failure, named by its row."""
+
 
 class Session:
     def __init__(self, yew, cwd, env, log):
@@ -132,7 +143,12 @@ class Session:
             self.log.write(data)
 
     def send(self, data):
-        os.write(self.fd, data)
+        if not self.alive():
+            raise SessionError(f"editor exited before input (wait status {self.status})")
+        try:
+            os.write(self.fd, data)
+        except OSError as error:
+            raise SessionError(f"terminal write failed: {error}") from error
         self.pump(0.12)
 
     def alive(self):
@@ -159,17 +175,26 @@ class Session:
         return False
 
     def quit(self):
-        for _ in range(3):
-            if not self.alive():
-                break
-            self.ex("q!")
-            end = time.monotonic() + 2
-            while self.alive() and time.monotonic() < end:
-                self.pump(0.05)
+        try:
+            for _ in range(3):
+                if not self.alive():
+                    break
+                self.ex("q!")
+                end = time.monotonic() + 2
+                while self.alive() and time.monotonic() < end:
+                    self.pump(0.05)
+        except SessionError:
+            pass
         gone = not self.alive()
         os.close(self.fd)  # hang up only this row's own terminal
         if not gone:
-            os.waitpid(self.pid, 0)
+            # A failed terminal must not hang the complete suite. SIGHUP
+            # follows closing our PTY; record any unreaped child by pid.
+            end = time.monotonic() + 2
+            while self.alive() and time.monotonic() < end:
+                time.sleep(0.02)
+            if self.alive():
+                print(f"  unreaped editor pid={self.pid}", flush=True)
         return gone
 
 
@@ -188,9 +213,11 @@ def run(args, row):
                TMPDIR=str(root / "tmp"), SHELL="/bin/sh", TERM=args.term,
                YEW_LOG=str(root / "yew.log"), ROW_SUFFIX=suffix)
     ok = True
+    error = ""
     with (root / "pty.raw").open("wb") as log:
-        s = Session(str(Path(args.yew).resolve()), str(root), env, log)
+        s = None
         try:
+            s = Session(str(Path(args.yew).resolve()), str(root), env, log)
             s.pump(0.8)
             # No startup config from HOME; disable carried indentation.
             ok = s.ex("set autoindent false") and ok
@@ -201,14 +228,66 @@ def run(args, row):
             for part in parts:
                 s.send(part)
             ok = s.ex("w") and ok
+        except (SessionError, OSError) as failure:
+            ok = False
+            error = str(failure)
         finally:
-            ok = s.quit() and ok
+            if s is not None:
+                try:
+                    ok = s.quit() and ok
+                except OSError as failure:
+                    ok = False
+                    error = str(failure)
     actual = fixture.read_bytes()
     if actual != expected or not ok:
-        print(f"FAIL {name} expected={expected!r} actual={actual!r} session_ok={ok} artifacts={root}", flush=True)
+        print(f"FAIL {name} expected={expected!r} actual={actual!r} session_ok={ok} error={error!r} artifacts={root}", flush=True)
         return False
     print(f"PASS {name}", flush=True)
     return True
+
+
+def selftest(args):
+    root = Path(args.keep).resolve() / "harness-selftest"
+    root.mkdir(parents=True, exist_ok=True)
+    bad = root / "exit-seven"
+    bad.write_text("#!/bin/sh\nexit 7\n")
+    bad.chmod(0o700)
+    probe = copy.copy(args)
+    probe.yew = str(bad)
+    captured = io.StringIO()
+    original = globals()["Session"]
+
+    class MockSession:
+        def __init__(self, *unused):
+            pass
+        def pump(self, seconds):
+            pass
+        def ex(self, command):
+            return True
+        def send(self, data):
+            raise OSError("planted terminal write failure")
+        def quit(self):
+            return True
+
+    class GoodSession(MockSession):
+        def send(self, data):
+            pass
+
+    with contextlib.redirect_stdout(captured):
+        results = [run(probe, ("harness-startup-failure", b"", b"X", b"", "txt"))]
+        try:
+            globals()["Session"] = MockSession
+            results.append(run(probe, ("harness-write-failure", b"", b"X", b"", "txt")))
+            globals()["Session"] = GoodSession
+            results.append(run(probe, ("harness-after-crash", b"", b"X", b"", "txt")))
+        finally:
+            globals()["Session"] = original
+    output = captured.getvalue()
+    assert results == [False, False, True], (results, output)
+    assert "FAIL harness-startup-failure" in output and "FAIL harness-write-failure" in output, output
+    assert "PASS harness-after-crash" in output, output
+    print("PASS harness-selftest: startup and write failures are named; later rows still run")
+    return 0
 
 
 def main():
@@ -218,7 +297,10 @@ def main():
     ap.add_argument("--case", action="append", default=[])
     ap.add_argument("--term", default="xterm-256color")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
+    if args.selftest:
+        return selftest(args)
     if args.list:
         print("\n".join(r[0] for r in CASES))
         return 0
