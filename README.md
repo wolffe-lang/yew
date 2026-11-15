@@ -149,6 +149,9 @@ signature help. For a `.lu` file yew starts `wolf lsp` from `PATH` with
 no configuration (sagitta's default server table), rooted at the
 nearest directory up to the workspace that holds `wolf.pkg` or `.git`,
 else at the workspace root: the startup directory, or `--workspace DIR`.
+A server that cannot be started (its program is not installed) is
+reported once on the message line and stays off until `:lsp.restart`,
+which tries again; `:lsp.info` says why it is off.
 
 ## The rules in brief
 
