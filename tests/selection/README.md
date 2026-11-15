@@ -50,12 +50,22 @@ In each terminal, run:
 python3 -I tests/selection/mouse-census.py --terminal 'NAME VERSION'
 ```
 
-Allow about two minutes. For each prompt, release modifiers, press Space, then
-click the plain TARGET once within eight seconds. The gestures are plain-left
-(control), Ctrl-left, Ctrl+Shift-left, Alt-left, Shift-left and right-click.
-`q` aborts. Paste the resulting JSON with terminal name/version and settings
-that affect reporting. The script restores raw mode and reporting on exit and
-changes no terminal preferences or clipboard.
+Capture is free-form: no steps, Space prompts or timers. Click with no
+modifier, Ctrl, Ctrl+Shift, Alt, Shift, and the right button, in any order.
+Each complete input event prints immediately with button, modifier bits,
+press/release, coordinates and its raw bytes. Press `q` or Ctrl+C when done;
+the script restores raw mode/reporting and prints all events as JSON. Paste
+that JSON with terminal name/version and settings that affect reporting.
+It changes no terminal preferences or clipboard.
+
+The transport regression runs the actual census process in a PTY, injects all
+six press/release pairs (including split escape sequences), checks live output
+and the final JSON, and compares terminal settings before and after `q` and
+Ctrl+C. On macOS it also runs through `/usr/bin/script`:
+
+```sh
+python3 -I tests/selection/test_census.py --output /path/to/new-census-test
+```
 
 A missing report is **not received**, not proof of why it was intercepted. A
 secondary-click report for physical Ctrl-click is different from a Ctrl-modified
