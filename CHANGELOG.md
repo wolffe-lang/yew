@@ -5,6 +5,27 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Editing comfort (2026-11-15)
+
+- Backticks auto-pair in every filetype. An unbalanced quote before the
+  caret closes literally, even with text between; openers do not create
+  a second closer before text or an unmatched closer on the same line.
+  A dot before text still permits a pair. Remembered closers still skip.
+- Shift+Tab dedents the current or selected lines by one indent unit,
+  retaining the caret or selection.
+- Insert mode gains Ctrl+Z undo, Ctrl+Shift+Z redo with the kitty
+  keyboard protocol, and Alt+/ legacy redo. Existing undo and yank
+  bindings remain.
+- Alt+Up/Down moves current or selected lines as one undo step. It
+  replaces those keys' old hunk/selection motions and Insert's suggestion
+  line acceptance. Final newlines and CRLF separators are preserved.
+- A click past an unterminated final line lands after its last grapheme,
+  as it already did on terminated lines, rather than before it.
+- These intentional differences from C yew have unit and PTY regression
+  rows. Every default-runtime binding difference is declared by key,
+  old/new row and reason, and checked exactly against the pinned oracle.
+
+
 ### yw18 — a language server that cannot start is reported once (2026-11-15)
 
 - yew#127: with a file open whose language server is not installed (a

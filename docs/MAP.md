@@ -1203,8 +1203,32 @@ One paragraph each; yw01's is drafted in full
 ## 9. yew's own additions
 
 What the port has that sagitta does not. Each is named here, in its
-command's help text and in its unit's header, holds no sagitta golden
-(every C golden stays byte-identical), and is held by rows of its own.
+command's help text and in its unit's header, and is held by rows of its
+own. Any changed C golden is separately listed and pinned in
+`tools/goldens-divergences.txt`.
+
+- **Editing comfort** (`src/edit/lines.lu`, `pairs.lu`, `pane_cmds.lu`):
+  Shift+Tab dedents the current/selected lines without collapsing the
+  caret/selection; Alt+Up/Down transposes those lines, retaining cursor
+  topology and remembered pair marks, in one undo step. The new commands
+  are `ed.edit.lines.dedent`, `.up` and `.down`, with recorder words
+  `line_dedent`, `line_up` and `line_down`. Insert gains Ctrl+Z undo,
+  Ctrl+Shift+Z kitty redo, and Alt+/ legacy redo; Ctrl+Y remains yank.
+  These defaults deliberately replace the vertical Alt hunk/selection
+  motions and Insert's suggestion-line acceptance. Backticks join the
+  default pair set in every filetype; an unbalanced quote before the
+  caret closes literally, and text or an unmatched closer to the right
+  suppresses a new closer (a leading dot still permits it). Sagitta's
+  remembered-closer and empty-pair Backspace mechanics remain. The mouse
+  uses the existing padded cell-to-offset conversion: beyond every
+  unterminated final line, not just a one-character `}` line, the caret
+  now lands at EOF. C's `src/ui/win.c:41-77` uses the non-padded form.
+  Rows: `src/edit_editing_ergonomics_test.lu` and `tools/editing-row`.
+  `tests/runtime-defaults.delta.json` records each key's old/new row and
+  reason. `tools/check-runtime-delta` reconstructs the complete runtime
+  file from the pinned oracle plus those entries, rejects undeclared
+  differences, and has mutation selftests; `tools/check-runtime` still
+  compares every other runtime file and regenerates the embedded copy.
 
 - **Linux console F1–F5** (yew#118, `src/term/input.lu`): the legacy
   decoder accepts `ESC [ [ A` through `ESC [ [ E`, as documented in
@@ -1225,8 +1249,9 @@ command's help text and in its unit's header, holds no sagitta golden
   registry row is yew's (`src/edit/cmdtab_yew.lu`, after C's 408, so every
   C command keeps C's id). Its key, `A-?` and `A-S-/`, is in the user
   layer every mode's stack shares, which C builds empty
-  (`keys_default.c:107-111`): `runtime/init.fl` stays sagitta's byte for
-  byte, and an `init.fl` binding of the key wins. sagitta's nearest is
+  (`keys_default.c:107-111`): these help bindings leave `runtime/init.fl`
+  alone, and an `init.fl` binding of the key wins. The editing-comfort
+  defaults above are checked as an exact delta. sagitta's nearest is
   `ed.map` (`bind.c:475-522`), the current mode's configured layer as one
   message; it is unchanged. Rows: `src/edit_keys_help_test.lu`, and
   `lspw_keys_help` in `tools/run-lsp-rows`.
