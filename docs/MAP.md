@@ -1206,6 +1206,16 @@ What the port has that sagitta does not. Each is named here, in its
 command's help text and in its unit's header, holds no sagitta golden
 (every C golden stays byte-identical), and is held by rows of its own.
 
+- **Linux console F1–F5** (yew#118, `src/term/input.lu`): the legacy
+  decoder accepts `ESC [ [ A` through `ESC [ [ E`, as documented in
+  `console_codes(4)`, alongside the existing SS3 and tilde spellings.
+  The second `[` is retained until its final arrives, rather than
+  dropped as an unknown CSI with a literal letter left behind. The
+  spelling accepts no parameters or intermediates. Rows:
+  `t_input_linux_function_keys` in `src/term_input_test.lu`, every byte
+  split and one-byte feeds, including modified arrows and malformed
+  Linux sequences. This is an input alias, not a new binding.
+
 - **`ed.keys`, the keys help** (yw15, `src/edit/keyshelp.lu`): every
   mode's bindings in the list picker (`PICK_HOST_KEYS`), each row its
   mode, keys, command, help and, for a binding the port refuses, the
