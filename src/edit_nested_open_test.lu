@@ -1,0 +1,337 @@
+//! member: false
+//! yw19 (yew#129): `:!yew PATH` opens in the running editor or is refused
+//! by name, and the workspace state a resume reads and writes parses
+//! whole. Not a port: sagitta's `test_shell_self.c` and `test_ws_save.c`
+//! hold C's shape (`edit_shell_self_test.lu`, `edit_ws_save_test.lu`);
+//! these cases hold what yw19 changed on top of it. One case per run under
+//! `YEW_NESTED_CASE` (every case when unset). `$SHELL` is a path that does
+//! not exist, so a line the editor hands to a shell becomes one job that
+//! failed to start, and no process runs.
+
+use std.fs
+use edit
+use term
+use text
+use util
+use ws
+
+struct Fix { root: str, work: str, saved_state: str, had_state: bool, saved_shell: str, had_shell: bool }
+
+fn fixture() -> Fix {
+    let saved_state = env_get("XDG_STATE_HOME") else ""
+    let saved_shell = env_get("SHELL") else ""
+    assert(util.mkdirs("target/nested-open-fixtures", 448))
+    var root = ""
+    loop {
+        var suffix = ""
+        for r in os_random(8) { suffix = "{suffix}{r % 10}" }
+        root = "target/nested-open-fixtures/{suffix}"
+        fs_create_dir_mode(root, 448) else |e| match e {
+            exists => { continue },
+            _ => { assert(false, "mkdir fixture: {e}") },
+        }
+        break
+    }
+    root = fs_realpath(root) else {
+        assert(false)
+        return Fix { root: "", work: "", saved_state: "", had_state: false, saved_shell: "", had_shell: false }
+    }
+    let work = "{root}/work"
+    assert(util.mkdirs(work, 448))
+    env_set("XDG_STATE_HOME", "{root}/state") else { assert(false) }
+    env_set("YEW_LOG", "{root}/yew.log") else { assert(false) }
+    env_set("SHELL", "{root}/no-such-shell/sh") else { assert(false) }
+    Fix {
+        root: root,
+        work: work,
+        saved_state: saved_state,
+        had_state: saved_state.len != 0,
+        saved_shell: saved_shell,
+        had_shell: saved_shell.len != 0,
+    }
+}
+
+fn remove_tree(path: str) {
+    let entries = fs_read_dir(path) else { return }
+    for name in entries {
+        let p = "{path}/{name}"
+        fs_remove(p) else |_| {
+            remove_tree(p)
+            fs_remove_dir(p) else { assert(false, "remove dir {p}") }
+        }
+    }
+}
+
+fn finish(f: Fix) {
+    if f.had_state {
+        env_set("XDG_STATE_HOME", f.saved_state) else { assert(false) }
+    } else {
+        env_unset("XDG_STATE_HOME") else { assert(false) }
+    }
+    if f.had_shell {
+        env_set("SHELL", f.saved_shell) else { assert(false) }
+    } else {
+        env_unset("SHELL") else { assert(false) }
+    }
+    env_unset("YEW_LOG") else { assert(false) }
+    remove_tree(f.root)
+    fs_remove_dir(f.root) else { assert(false) }
+}
+
+fn fresh(f: Fix) -> edit.Ed {
+    var ed = edit.ed_new()
+    assert(edit.ed_set_workspace_root(mut ed, f.work))
+    edit.ed_open_scratch(mut ed)
+    ed.grid = term.grid_new(24, 80)
+    edit.layout_compute(mut ed, ed.pane_root, edit.rect(0, 0, 80, 24))
+    ed
+}
+
+fn file(f: Fix, name: str, body: str) -> str {
+    let path = "{f.work}/{name}"
+    assert(text.file_write_atomic(path, body.bytes(), 384) == text.SAVE_OK)
+    path
+}
+
+fn active_path(ed: edit.Ed) -> str { ed.tabs[ed.tab_active].path }
+
+// `:LINE` as the registry runs it: the `!` command's argument.
+fn bang(mut ed: edit.Ed, line: str) -> int {
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_KEY)
+    cx.sarg = line
+    cx.has_sarg = true
+    edit.shc_run(mut ed, cx)
+}
+
+fn log_has(sub: str) -> bool { util.log_capture_has(util.LOG_INFO, sub.bytes()) }
+
+fn log_clear(f: Fix) {
+    fs_write_bytes("{f.root}/yew.log", "".bytes()) else |e| { assert(false, "clear log: {e}") }
+}
+
+// A relative operand is the session's: after `:!cd sub` the shell would
+// open `sub/x.lu`, and so does the editor.
+fn t_self_open_follows_the_session_directory() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    assert(util.mkdirs("{f.work}/sub", 448))
+    let want = file(f, "sub/x.lu", "// sub\n")
+    ed.shsession.cwd = "{f.work}/sub"
+    ed.shsession.has_cwd = true
+    let (r, why) = edit.shell_try_self_open(mut ed, "yew x.lu")
+    assert(r == edit.SHELL_SELF_OPENED, why)
+    assert(active_path(ed) == want, active_path(ed))
+    // With no directory reported, the workspace root, as C resolves it.
+    ed.shsession.has_cwd = false
+    let root_x = file(f, "x.lu", "// root\n")
+    let (r2, _) = edit.shell_try_self_open(mut ed, "yew x.lu")
+    assert(r2 == edit.SHELL_SELF_OPENED && active_path(ed) == root_x)
+    // `shell.session fresh` keeps no directory: the root again.
+    ed.shsession.has_cwd = true
+    assert(edit.opt_set(mut ed, edit.OPT_SCOPE_DECLARED, "shell.session", edit.optv_enum("fresh")).len == 0)
+    let (r3, _) = edit.shell_try_self_open(mut ed, "yew x.lu")
+    assert(r3 == edit.SHELL_SELF_OPENED && active_path(ed) == root_x)
+    assert(ed.jobs.v.len == 0)
+}
+
+// Every `:!yew` line that would start an editor and that this editor
+// cannot open is refused on the message line by name; nothing runs it.
+fn refused(mut ed: edit.Ed, line: str, why: str) {
+    let jobs = ed.jobs.v.len
+    let tabs = ed.tabs.len
+    let rc = bang(mut ed, line)
+    assert(rc != edit.CMD_OK, "{line}: ran")
+    assert(ed.jobs.v.len == jobs, "{line}: a job ran it")
+    assert(ed.tabs.len == tabs, "{line}: a tab opened")
+    assert(ed.msg.text.contains("not opened here"), "{line}: message {ed.msg.text}")
+    assert(ed.msg.text.contains(why), "{line}: message {ed.msg.text} lacks {why}")
+}
+
+fn t_self_open_refuses_by_name() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    assert(util.mkdirs("{f.work}/adir", 448))
+    let _ = file(f, "x.lu", "// x\n")
+    refused(mut ed, "yew adir", "a directory")
+    refused(mut ed, "yew $HOME/x.lu", "the shell would expand")
+    refused(mut ed, "yew \"$F\"", "the shell would expand")
+    refused(mut ed, "yew *.lu", "the shell would expand")
+    refused(mut ed, "yew ~/x.lu", "the shell would expand")
+    refused(mut ed, "yew --theme dark x.lu", "an option")
+    refused(mut ed, "yew --workspace adir x.lu", "an option")
+    refused(mut ed, "yew --clean", "an option")
+}
+
+// Several plain operands open here, the last one active, as `yew A B`
+// starts an editor.
+fn t_self_open_opens_every_plain_operand() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    let a = file(f, "a.lu", "// a\n")
+    let b = file(f, "b b.lu", "// b\n")
+    let before = ed.tabs.len
+    assert(bang(mut ed, "yew a.lu 'b b.lu'") == edit.CMD_OK)
+    assert(ed.tabs.len == before + 2)
+    assert(edit.tab_find_by_path(ed, a) >= 0 && active_path(ed) == b)
+    assert(ed.jobs.v.len == 0)
+    // A directory among them refuses the whole line: nothing opens.
+    assert(util.mkdirs("{f.work}/adir", 448))
+    let c = file(f, "c.lu", "// c\n")
+    refused(mut ed, "yew c.lu adir", "a directory")
+    assert(edit.tab_find_by_path(ed, c) < 0)
+}
+
+// What is not an editor start still runs in the shell: one job each.
+fn t_self_open_leaves_other_lines_to_the_shell() {
+    let f = fixture()
+    defer finish(f)
+    var ed = fresh(f)
+    let _ = file(f, "note.txt", "note\n")
+    for line in [
+        "yew --version",
+        "yew --help",
+        "yew -R x.lu",
+        "yew fl run.fl",
+        "yew --batch s.fl",
+        "yew note.txt | sed -n 1p",
+        "yew note.txt; echo done",
+        "yew note.txt >out",
+        "command yew note.txt",
+        "./yew note.txt",
+        "yew 'unterminated",
+    ] {
+        let jobs = ed.jobs.v.len
+        let _ = bang(mut ed, line)
+        assert(ed.jobs.v.len == jobs + 1, "{line}: no job")
+        assert(!ed.msg.text.contains("not opened here"), "{line}: refused")
+    }
+}
+
+// The untitled tab a resume keeps is written with no path and skipped at
+// restore by design (sagitta `state_emit.c:600-605`): not a dropped record.
+// A record that names no file is still dropped, and said so.
+fn t_untitled_record_is_not_dropped() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    let pa = file(f, "a.txt", "alpha\n")
+    assert(edit.tab_open(mut a, pa) == 1)
+    edit.tab_switch(mut a, 0)
+    let doc = edit.state_emit_at(a, 0)
+    log_clear(f)
+    var b = fresh(f)
+    assert(ws.ws_key(mut b.state.key, f.work) && ws.ws_ensure_dir(mut b.state.key))
+    b.state.ready = true
+    b.state.writer = true
+    assert(edit.state_apply(mut b, doc) == edit.WS_RESTORED)
+    assert(b.tabs.len == 2 && b.tabs[1].path == pa)
+    assert(!log_has("dropped"), "the untitled record was logged as dropped")
+    // A record whose path is "" names nothing: dropped, and logged.
+    let text0 = str_from_utf8(doc) else ""
+    let broken = text0.replace("path: \"{pa}\"", "path: \"\"")
+    log_clear(f)
+    var c = fresh(f)
+    assert(ws.ws_key(mut c.state.key, f.work) && ws.ws_ensure_dir(mut c.state.key))
+    c.state.ready = true
+    c.state.writer = true
+    let _ = edit.state_apply(mut c, copy broken.bytes())
+    assert(log_has("workspace state: 1 tab record(s) dropped"))
+}
+
+// `active_tab` is a tab id: whatever is active, it names a written record.
+fn ids_of(doc: List[byte]) -> (List[int], int) {
+    let t = str_from_utf8(doc) else ""
+    var ids = List[int]()
+    var active = -1
+    var inside = false
+    for line in t.lines() {
+        if line == "  tabs: [" { inside = true; continue }
+        if inside && line == "  ]," { inside = false; continue }
+        if inside && line.starts_with("      id: ") {
+            (mut ids).push(line[10..line.len - 1].to_int() else -1)
+        }
+        if line.starts_with("  active_tab: ") {
+            active = line[14..line.len - 1].to_int() else -1
+        }
+    }
+    (ids, active)
+}
+
+fn names_a_record(doc: List[byte]) -> bool {
+    let (ids, active) = ids_of(doc)
+    for i in ids { if i == active { return true } }
+    false
+}
+
+fn t_active_tab_names_a_written_record() {
+    let f = fixture()
+    defer finish(f)
+    var a = fresh(f)
+    var i = 0
+    while i < 30 {
+        assert(edit.tab_open(mut a, file(f, "t{i}.txt", "{i}\n")) > 0)
+        i += 1
+    }
+    for at in [0, 1, 15, 30] {
+        edit.tab_switch(mut a, at)
+        assert(names_a_record(edit.state_emit_at(a, 0)), "active {at}")
+    }
+    // Closing tabs never leaves the active id behind.
+    while a.tabs.len > 3 {
+        let _ = edit.tab_close(mut a, 1)
+        assert(names_a_record(edit.state_emit_at(a, 0)), "after a close, {a.tabs.len} tabs")
+    }
+    // Past the record cap (the tab cap keeps a live editor under it): the
+    // active tab beyond the written records is never named.
+    var big = fresh(f)
+    while big.tabs.len < ws.STATE_MAX_TABS {
+        assert(edit.tab_open(mut big, "{f.root}/cap-{big.tabs.len}.txt") >= 0)
+    }
+    (mut big.tabs).push(copy big.tabs[1])
+    big.tabs[big.tabs.len - 1].tab_id = big.next_tab_id
+    big.next_tab_id += 1
+    big.tab_active = big.tabs.len - 1
+    let (ids, active) = ids_of(edit.state_emit_at(big, 0))
+    assert(ids.len == ws.STATE_MAX_TABS)
+    assert(names_a_record(edit.state_emit_at(big, 0)), "active_tab {active} past {ids.len} records")
+    // A document whose active_tab names no record restores its first tab.
+    let doc = edit.state_emit_at(a, 0)
+    let t = (str_from_utf8(doc) else "").replace("  active_tab: ", "  active_tab: 9999")
+    var b = fresh(f)
+    assert(ws.ws_key(mut b.state.key, f.work) && ws.ws_ensure_dir(mut b.state.key))
+    b.state.ready = true
+    b.state.writer = true
+    assert(edit.state_apply(mut b, copy t.bytes()) == edit.WS_RESTORED)
+    assert(b.tab_active == 1, "restored active {b.tab_active}")
+}
+
+fn main() {
+    let chosen = (env_get("YEW_NESTED_CASE") else "-1").to_int() else -1
+    if chosen < 0 || chosen == 0 {
+        t_self_open_follows_the_session_directory()
+        print("nested_self_open_follows_the_session_directory: PASS")
+    }
+    if chosen < 0 || chosen == 1 {
+        t_self_open_refuses_by_name()
+        print("nested_self_open_refuses_by_name: PASS")
+    }
+    if chosen < 0 || chosen == 2 {
+        t_self_open_opens_every_plain_operand()
+        print("nested_self_open_opens_every_plain_operand: PASS")
+    }
+    if chosen < 0 || chosen == 3 {
+        t_self_open_leaves_other_lines_to_the_shell()
+        print("nested_self_open_leaves_other_lines_to_the_shell: PASS")
+    }
+    if chosen < 0 || chosen == 4 {
+        t_untitled_record_is_not_dropped()
+        print("nested_untitled_record_is_not_dropped: PASS")
+    }
+    if chosen < 0 || chosen == 5 {
+        t_active_tab_names_a_written_record()
+        print("nested_active_tab_names_a_written_record: PASS")
+    }
+}
