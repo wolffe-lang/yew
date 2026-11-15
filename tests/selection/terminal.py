@@ -13,7 +13,7 @@ def sgr_events(data):
         cb, x, y = map(int, m.group(1, 2, 3))
         if not x or not y:
             raise ValueError('zero SGR coordinate')
-        mods = cb & 28
+        mods = cb & 24
         events.append({'button': cb & ~28, 'mods': mods, 'x': x, 'y': y,
                        'release': m.group(4) == b'm', 'raw': m.group().hex()})
     return events
