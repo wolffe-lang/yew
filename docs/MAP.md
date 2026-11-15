@@ -1220,3 +1220,24 @@ command's help text and in its unit's header, holds no sagitta golden
   `ed.map` (`bind.c:475-522`), the current mode's configured layer as one
   message; it is unchanged. Rows: `src/edit_keys_help_test.lu`, and
   `lspw_keys_help` in `tools/run-lsp-rows`.
+- **`:!yew` past the recognizer, and the workspace's owner lock** (yw19,
+  yew#129; `notes/yw19-nested-open.md`). Four changes on top of C, each
+  held by `src/edit_nested_open_test.lu` and `tools/nested-open-row`
+  (with `tools/nested-open-pax` on a PAX image):
+  - `self_open_path` (`src/edit/shell.lu`) resolves a relative operand
+    from the persistent session's reported directory when it has one; C
+    resolves it from the workspace root always (`shell.c:504-526`).
+  - `shell_self_open_words`: a `:!yew` line C's recognizer leaves to the
+    shell, and that would start an editor, opens its plain files here or
+    is refused by name, where C runs it as a job whose yew stops at "not a
+    terminal". C's recognizer and `test_shell_self.c`'s port are
+    unchanged.
+  - The owner lock, `lock.owner` beside the pid lease (`state_save.lu`):
+    an advisory lock the owner holds for its session's life. C's lease
+    (`state_save.c:56-140`) is kept, text and all; a lease is stale when
+    the owner record names its pid and the lock is free, which C's pid
+    test cannot see after a reboot gives that pid to another program.
+  - The untitled tab's `path: nil` record (`state_emit.c:600-605`) is
+    skipped at restore without being logged as dropped (C logs it), and
+    `active_tab` names a written record past the record cap too. The
+    state file stays C's byte for byte below that cap.
