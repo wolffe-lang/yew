@@ -1,0 +1,152 @@
+//! syn.spans — bounded reusable output with an eight-byte span stride.
+//! Ports sagitta src/syn/engine.c:2389–2436 at 9ace98c2. Byte offsets
+//! are relative to the line; graphemes and theme colors belong to drawing.
+
+/// Maximum spans emitted for one physical line.
+pub const SYN_MAX_SPANS: int = 4096
+/// The matcher completed normally.
+pub const SYN_STOP_OK: int = 0
+/// Caller output capacity or the hard span count was exhausted.
+pub const SYN_STOP_SPANS: int = 1
+/// Line matching stopped at the byte cap.
+pub const SYN_STOP_BYTES: int = 2
+/// Line matching exhausted the bounded attempt count.
+pub const SYN_STOP_STEPS: int = 3
+/// This is the last known or a deliberately unstyled truncated fragment.
+pub const SYN_SPAN_TRUNCATED: int = 1
+
+/// Caller-owned packed (u32 start, u16 length, u8 attr, u8 flags) output.
+/// Reset changes only metadata; repeated matching reuses the same storage.
+pub struct SynSpans {
+    data: List[byte],
+    n: int,
+    cap: int,
+    exit_state: int,
+    stop: int,
+}
+
+/// Allocate bounded reusable output, outside the renderer's hot loop.
+pub fn syn_spans_new(capacity: int) -> SynSpans {
+    if capacity < 0 || capacity > SYN_MAX_SPANS {
+        syn_bug("syntax: span capacity out of range")
+    }
+    var bytes = List[byte]()
+    var i = 0
+    while i < capacity * 8 {
+        (mut bytes).push(0 as byte)
+        i += 1
+    }
+    SynSpans { data: bytes, n: 0, cap: capacity, exit_state: SYN_STATE_ROOT, stop: SYN_STOP_OK }
+}
+
+/// Exposes the payload budget, not the vector header/capacity overhead.
+pub fn syn_spans_storage_bytes(out: SynSpans) -> int {
+    out.data.len
+}
+
+/// Reuse the output without allocating or clearing unreachable payload bytes.
+pub fn syn_spans_clear(mut out: SynSpans, entry: int) {
+    out.n = 0
+    out.stop = SYN_STOP_OK
+    out.exit_state = entry
+}
+
+fn span_offset(out: SynSpans, index: int) -> int {
+    if index < 0 || index >= out.n {
+        syn_bug("syntax: span index out of range")
+    }
+    index * 8
+}
+
+/// Relative line byte offset.
+pub fn syn_span_start(out: SynSpans, index: int) -> int {
+    let p = span_offset(out, index)
+    out.data[p] as int | (out.data[p + 1] as int << 8) |
+        (out.data[p + 2] as int << 16) | (out.data[p + 3] as int << 24)
+}
+
+/// Length of one fragment, at most 65,535 bytes.
+pub fn syn_span_len(out: SynSpans, index: int) -> int {
+    let p = span_offset(out, index) + 4
+    out.data[p] as int | (out.data[p + 1] as int << 8)
+}
+
+/// Semantic id, not a terminal color.
+pub fn syn_span_attr(out: SynSpans, index: int) -> int {
+    out.data[span_offset(out, index) + 6] as int
+}
+
+/// Truncation/provenance bits.
+pub fn syn_span_flags(out: SynSpans, index: int) -> int {
+    out.data[span_offset(out, index) + 7] as int
+}
+
+fn span_write(mut out: SynSpans, index: int, start: int, len: int, attr: int, flags: int) {
+    let p = index * 8
+    out.data[p] = start as byte
+    out.data[p + 1] = (start >> 8) as byte
+    out.data[p + 2] = (start >> 16) as byte
+    out.data[p + 3] = (start >> 24) as byte
+    out.data[p + 4] = len as byte
+    out.data[p + 5] = (len >> 8) as byte
+    out.data[p + 6] = attr as byte
+    out.data[p + 7] = flags as byte
+}
+
+/// Emit/coalesce fragments exactly in pinned C order, bounded by capacity.
+pub fn syn_spans_emit(mut out: SynSpans, start: int, len: int, attr: int, flags: int) {
+    if start < 0 || start > 4294967295 || len < 0 || len > 4294967295 ||
+        attr < 0 || attr >= SYN_ATTR_COUNT || flags < 0 || flags > 255 {
+        syn_bug("syntax: span field out of range")
+    }
+    var pos = start
+    var remaining = len
+    while remaining != 0 {
+        let take_len = if remaining > 65535 then 65535 else remaining
+        if out.n != 0 {
+            let last = out.n - 1
+            let old_len = syn_span_len(out, last)
+            if syn_span_attr(out, last) == attr && syn_span_flags(out, last) == flags &&
+                syn_span_start(out, last) + old_len == pos && old_len + take_len <= 65535 {
+                let p = last * 8 + 4
+                out.data[p] = (old_len + take_len) as byte
+                out.data[p + 1] = ((old_len + take_len) >> 8) as byte
+                pos += take_len
+                remaining -= take_len
+                continue
+            }
+        }
+        if out.n >= out.cap || out.n >= SYN_MAX_SPANS {
+            if out.n != 0 {
+                let p = (out.n - 1) * 8 + 7
+                out.data[p] = (out.data[p] as int | SYN_SPAN_TRUNCATED) as byte
+            }
+            if out.stop == SYN_STOP_OK {
+                out.stop = SYN_STOP_SPANS
+            }
+            return
+        }
+        let at = out.n
+        span_write(mut out, at, pos, take_len, attr, flags)
+        out.n += 1
+        pos += take_len
+        remaining -= take_len
+    }
+}
+
+/// Plain truncated fragments; caller retains its BYTES/STEPS stop reason.
+pub fn syn_spans_emit_truncated(mut out: SynSpans, len: int) {
+    if len < 0 || len > 4294967295 {
+        syn_bug("syntax: truncated length out of range")
+    }
+    var start = 0
+    var remaining = len
+    while remaining != 0 && out.n < out.cap && out.n < SYN_MAX_SPANS {
+        let take_len = if remaining > 65535 then 65535 else remaining
+        let at = out.n
+        span_write(mut out, at, start, take_len, SYN_ATTR_TEXT, SYN_SPAN_TRUNCATED)
+        out.n += 1
+        start += take_len
+        remaining -= take_len
+    }
+}
