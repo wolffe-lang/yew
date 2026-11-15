@@ -5,6 +5,23 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw20 — closing many tabs at once can be undone (2026-11-15)
+
+- yew#129: one gesture could close twenty tabs with no way back. `t o`
+  (`:tabonly`, the tab menu's "close others"), `:gclose` on a group and
+  the group picker's Edit now record the tabs they close, in memory, and
+  say so: `closed 21 tabs — t u to reopen`. `t u` (`:tabreopen`,
+  `ed.tab.reopen`) puts them back in their places, with their split
+  panes, cursors, views and jump lists, their group and its order, and
+  the tab that was active before. The record lasts until the next such
+  close or the end of the session. A close of one tab is unchanged. C yew
+  has no such record; this is a divergence (docs/MAP.md §9).
+- The group picker's Edit can close a modified member, as C's does; its
+  unsaved text stays in memory and comes back with `t u`.
+- Rows: `src/edit_tab_reopen_test.lu` and `tools/tab-reopen-row` (yew in
+  a pty: 22 tabs through `t o` and `t u`, the command-line forms, and the
+  picker closing a modified member).
+
 ### yw18 — a language server that cannot start is reported once (2026-11-15)
 
 - yew#127: with a file open whose language server is not installed (a
