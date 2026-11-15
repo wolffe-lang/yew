@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run C's PTY runner; named, digest-pinned divergences use port snapshots.
 
-The oracle checkout is read-only. Only divergent cases run in a shadow cwd,
-whose golden entries point at the port's snapshots. Every other case runs
-in the original oracle cwd against the original C golden.
+This runner treats the prepared oracle checkout as read-only. Only divergent
+cases run in a shadow cwd, whose golden entries point at the port's snapshots.
+Every other case runs in the original oracle cwd against the original C golden.
 """
 import hashlib
 import os
