@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Check a named, exhaustive partition of the pinned syntax goldens.
+
+    tools/check-syntax-cohort --yew BIN --oracle TREE --work NEW_DIR
+                              [--cohort first|deferred|all]
+    tools/check-syntax-cohort --self-test
+
+The first cohort is 132 unchanged pairs. The remaining 300 are explicitly
+recorded, not silently skipped. Both ledgers together must equal the pinned
+oracle's complete manifest expansion, and input/golden bytes are pinned too.
+Each selected fixture is dumped twice and compared byte for byte. No golden
+update mode exists. Work directories must be new and remain available after
+failure. Run the editor under the enclosing gate's memory/CPU limits.
+"""
+import argparse
+import csv
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+PIN = '9ace98c2adfeb9d63e7da4bdb4fd6e29ae5c3e4a'
+COUNTS = {'first': 132, 'deferred': 300}
+BASE = {'wolf', 'markdown', 'c', 'python', 'sh', 'toml', 'json'}
+MD = {'01-fence-c', '10-fence-json', '13-fence-markdown', '14-fence-python',
+      '16-fence-sh', '17-fence-toml', '20-fence-unknown',
+      '23-longer-closing-run', '24-empty-info-fallback'}
+HEADER = ['cohort', 'definition', 'language', 'input', 'input_sha256', 'golden', 'golden_sha256']
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def pinned_revision(tree):
+    rev = subprocess.run(['git', '-C', str(tree), 'rev-parse', 'HEAD'],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    if rev != PIN:
+        raise ValueError(f'oracle HEAD is {rev}, need {PIN}')
+
+
+def manifest_pairs(tree):
+    """Same source globs and replace/append rule as check-syn-assets.sh."""
+    pairs = {}
+    manifest = tree / 'tests/syn/manifest.tsv'
+    for fields in csv.reader(manifest.read_text().splitlines(), delimiter='\t'):
+        if not fields or fields[0].startswith('#'):
+            continue
+        if len(fields) != 7:
+            raise ValueError('oracle manifest schema changed')
+        definition, language, patterns, rule, scope, _, minimum = fields
+        sources = []
+        for pattern in patterns.split(','):
+            if not pattern.startswith('tests/syn/') or '..' in Path(pattern).parts:
+                raise ValueError(f'unsafe manifest pattern {pattern}')
+            matches = sorted(p for p in tree.glob(pattern) if p.is_file())
+            if not matches:
+                raise ValueError(f'empty source pattern {pattern}')
+            sources.extend(matches)
+        if len(sources) < int(minimum):
+            raise ValueError(f'manifest minimum not met: {definition}/{scope}')
+        for source in sources:
+            relative = source.relative_to(tree).as_posix()
+            if relative in pairs:
+                raise ValueError(f'duplicate input {relative}')
+            if rule == 'replace-extension':
+                golden = source.with_suffix('.spans')
+            elif rule == 'append-spans':
+                golden = Path(str(source) + '.spans')
+            else:
+                raise ValueError(f'unknown golden rule {rule}')
+            cohort = 'deferred'
+            if language in BASE and (scope == 'base' or language == 'sh' or
+                                      language == 'markdown' and source.stem in MD):
+                cohort = 'first'
+            pairs[relative] = [cohort, definition, language, relative,
+                               digest(source.read_bytes()),
+                               golden.relative_to(tree).as_posix(), digest(golden.read_bytes())]
+    if len(pairs) != 432:
+        raise ValueError(f'oracle has {len(pairs)} pairs, need 432')
+    goldens = {p.relative_to(tree).as_posix() for p in (tree / 'tests/syn').rglob('*.spans')}
+    if goldens != {v[5] for v in pairs.values()}:
+        raise ValueError('oracle has an orphan or unlisted golden')
+    return pairs
+
+
+def load_ledger(tree):
+    pinned_revision(tree)
+    expected = manifest_pairs(tree)
+    ledger = ROOT / 'tools/syntax-cohorts.tsv'
+    lines = [s for s in ledger.read_text().splitlines() if s and not s.startswith('#')]
+    rows = list(csv.reader(lines, delimiter='\t'))
+    if not rows or rows.pop(0) != HEADER:
+        raise ValueError('cohort ledger schema changed')
+    seen, counts = set(), dict.fromkeys(COUNTS, 0)
+    for row in rows:
+        if len(row) != len(HEADER):
+            raise ValueError('malformed cohort row')
+        cohort, _, _, source, _, _, _ = row
+        if source in seen:
+            raise ValueError(f'duplicate cohort input {source}')
+        seen.add(source)
+        if expected.get(source) != row:
+            raise ValueError(f'cohort or pinned fixture bytes changed: {source}')
+        counts[cohort] += 1
+    if seen != expected.keys() or counts != COUNTS:
+        raise ValueError(f'cohort shrank or changed: {counts}; total {len(seen)}')
+    if rows != sorted(rows, key=lambda r: r[3]):
+        raise ValueError('cohort ledger is not in input-path order')
+    print(f'cohort inventory: first=132 deferred=300 total=432 pin={PIN}'
+          f' ledger_sha256={digest(ledger.read_bytes())}', flush=True)
+    return rows
+
+
+def difference(expected, first_status, first, second_status, second):
+    if first_status or second_status:
+        return 'dump-exit'
+    if first != second:
+        return 'nondeterministic'
+    if first != expected:
+        return 'span-mismatch'
+    return ''
+
+
+def selftest():
+    golden = b'line 1 entry=wolf:main exit=wolf:main\n  0..3 keyword\n'
+    assert difference(golden, 0, golden, 0, golden) == ''
+    assert difference(golden, 1, golden, 0, golden) == 'dump-exit'
+    assert difference(golden, 0, golden, 1, golden) == 'dump-exit'
+    assert difference(golden, 0, golden, 0, b'') == 'nondeterministic'
+    assert difference(golden, 0, b'', 0, b'') == 'span-mismatch'
+    print('PASS syntax_cohort_runner_controls (good, exit, second-exit, unstable, wrong-span)')
+    return 0
+
+
+def check(args):
+    tree, binary, work = args.oracle.resolve(), args.yew.resolve(), args.work.resolve()
+    rows = load_ledger(tree)
+    work.mkdir(parents=True, exist_ok=False)
+    home = work / 'home'
+    home.mkdir()
+    tmp = work / 'tmp'
+    tmp.mkdir()
+    env = dict(os.environ, HOME=str(home), SHELL='/bin/sh', LC_ALL='C',
+               TMPDIR=str(tmp), XDG_CONFIG_HOME=str(home / 'config'),
+               XDG_CACHE_HOME=str(home / 'cache'), XDG_DATA_HOME=str(home / 'data'),
+               XDG_STATE_HOME=str(home / 'state'), YEW_RUNTIME_DIR=str(tree / 'runtime'),
+               YEW_NO_SYN_CACHE='1')
+    env.pop('YEW_PTY_UPDATE', None)
+    good, bad, selected = 0, 0, 0
+    for row in rows:
+        cohort, definition, language, source, _, golden, _ = row
+        if args.cohort != 'all' and cohort != args.cohort:
+            continue
+        selected += 1
+        name = 'syntax_' + source.removeprefix('tests/syn/').replace('/', '_').replace('.', '_')
+        command = [str(binary), 'syn', 'dump', 'runtime/syntax/' + definition + '.fl', '--spans', source]
+        observations = []
+        for take in (1, 2):
+            result = subprocess.run(command, cwd=tree, env=env, capture_output=True)
+            (work / f'{name}.{take}.stdout').write_bytes(result.stdout)
+            (work / f'{name}.{take}.stderr').write_bytes(result.stderr)
+            observations.append(result)
+        a, b = observations
+        reason = difference((tree / golden).read_bytes(), a.returncode, a.stdout, b.returncode, b.stdout)
+        if reason:
+            bad += 1
+            print(f'FAIL {name} reason={reason} exits={a.returncode},{b.returncode}'
+                  f' expected_sha256={row[6]} actual_sha256={digest(a.stdout)}', flush=True)
+        else:
+            good += 1
+            print(f'PASS {name} language={language} cohort={cohort}', flush=True)
+    expected_count = 432 if args.cohort == 'all' else COUNTS[args.cohort]
+    if selected != expected_count:
+        raise ValueError(f'selected {selected}, need {expected_count}')
+    print(f'syntax cohort {args.cohort}: pass={good} fail={bad} deferred='
+          f'{432 - selected} selected={selected} total=432', flush=True)
+    return 1 if bad else 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--self-test', action='store_true')
+    p.add_argument('--inventory', action='store_true')
+    p.add_argument('--yew', type=Path)
+    p.add_argument('--oracle', type=Path)
+    p.add_argument('--work', type=Path)
+    p.add_argument('--cohort', choices=('first', 'deferred', 'all'), default='first')
+    args = p.parse_args()
+    if args.self_test:
+        return selftest()
+    if args.oracle is None:
+        p.error('--oracle is required')
+    if args.inventory:
+        load_ledger(args.oracle.resolve())
+        return 0
+    if args.yew is None or args.work is None:
+        p.error('--yew and --work are required')
+    try:
+        return check(args)
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        print(f'FAIL syntax_cohort_inventory {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
