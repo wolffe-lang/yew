@@ -326,6 +326,9 @@ holds; the red at trunk's code is the branch `yw19-red`, `7d7bc7a`):
 - `a322141` note: hits and misses, what yew#129's evidence needs, the change as made, inputs, the R-list
 - `5e1ed03` MAP: yew's own additions: :!yew past the recognizer and the owner lock
 - `fa223e8` CHANGELOG: yw19
+- `a5efc48` note: the evidence index and done-when
+- `04de592` check-test-cases: edit_nested_open_test's 512-tab case is past the checked budget, as the tab-cap case is
+- `e7b4787` nested-open-pax: the sampler takes /bin/yew too, and leaves out the guard and the env helper
 
 The local evidence (the records' paths and every `END` line are the PR's):
 
