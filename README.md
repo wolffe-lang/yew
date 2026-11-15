@@ -12,13 +12,15 @@ built in its own language and wolf has its largest real program. Track
 ## The oracle
 
 C yew built from the commit in `sagitta.pin` is the oracle. The wolf
-binary is held to C yew's own tests, unchanged: its PTY goldens
+binary is held to C yew's own suites with their original expected results: its PTY goldens
 (`tests/pty/runner --yew <binary>`), script, Fletch, syntax and torture
 suites. `tools/oracle` fetches and builds it; `tools/goldens --yew
 <binary>` runs its suites against any binary and prints one
 `pass/fail/skip` line per suite with a diff per failure. A golden that
-disagrees with the port is a STOP and a ruling, never a golden edit; no
-sagitta change is made here. Explicitly approved differences are listed in
+disagrees with the port requires an explicit decision, never an edit to the
+original golden or C editor. The copied test VT alone has a
+[digest-pinned non-visual protocol extension](tests/oracle-vt/README.md) for
+Shift mouse capture. Explicitly approved visual differences are listed in
 `tools/goldens-divergences.txt`: each names the port's expected snapshot and
 pins the unchanged C golden's SHA-256. The harness prints each divergence
 by name; a changed C golden requires re-evaluation. Fletch stays Fletch: its scripts, data
