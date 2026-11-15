@@ -179,6 +179,19 @@ pass of the loop, over the message line the row reads.
   cannot replay image 3's boot records once Limine's `bios-install` has
   rewritten its GPT as an MBR. yw18 met the same and fixed its tool,
   which this branch now uses.
+- The plant at `a3fc681` (a miss of the row's). `nested-row-refuse` gave
+  up with exit 2 in 23 s (`cannot run: refuse: the editor did not quit`)
+  instead of failing by name, and its `home_x_txt_no_job` came out ok
+  under the same hunk that made it red on `73fa098`. The row typed each
+  `:` line as ESC, then `:` 0.15 s later; under the plant every refused
+  line runs a job, and a loop busy with one reads the ESC and the `:`
+  together, as Alt-:. That line's keys then go to L mode and no job runs
+  (the ok), and the final `:q!` is lost the same way (the give-up). The
+  row printed its `FAIL` lines only after every case, so the give-up hid
+  them too. Since `b646be9` a `:` line waits to see the command line
+  drawn and tries again, `:q!` is tried until the editor exits or 12 s
+  pass, an editor that does not quit is a red row of its own
+  (`<case>_quits`), and every red prints by name before any give-up.
 
 ### What yew#129's evidence shows
 
@@ -377,6 +390,11 @@ holds; the red at trunk's code is the branch `yw19-red`, `7d7bc7a`):
 - `1261b94` check-test-cases: edit_nested_open_test has ten cases
 - `fdcc00c`, `2325291` execfail-pax-image: yw18's tool and its fix (the ISO made by mkimage's xorriso line, the yew stripped), cherry-picked
 - `d0b66c7` nested-open-pax-image: removed; the PAX row's image is yw18's execfail-pax-image, the same tool
+- `0d9852e` note: the machine's reads and the dev rows, the args reading, yw18's image tool, R-yw19-7
+- `c9b9206` CHANGELOG: yw19's PAX image is yew#127's tool; edit reads yew's words itself
+- `ebc4570` shell: a doc comment for each SELF_ARGV answer (W0313)
+- `a3fc681` fmt: wolf fmt's layout for edit_nested_open_test.lu's tenth case
+- `b646be9` nested-open-row: a : line waits to see the command line drawn; an editor that will not quit is a red row, and every red prints by name before any give-up
 
 The local evidence (the records' paths and every `END` line are the PR's):
 
