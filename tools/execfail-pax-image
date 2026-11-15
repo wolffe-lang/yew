@@ -3,27 +3,76 @@
 
     python3 -I tools/execfail-pax-image ISO YEW WORK
 
-ISO a PAX image as tools/mkdistribution makes it (its initramfs at
+ISO a PAX image as pax's tools/mkdistribution makes it (its initramfs at
 /boot/initramfs.cpio, a newc archive), YEW the yew to put in it (a
-static build, `tools/build --static`), WORK a new directory. Writes
-WORK/initramfs.cpio, the image's archive with the member `bin/yew`'s
-bytes replaced by YEW's (every other member, every header field but the
-size, and the order kept), and WORK/image.iso, ISO with that archive in
-place of its own (`xorriso -boot_image any replay`: the boot records as
-they were). Prints both files' sha256 and the members' before and after.
-The UEFI entry boots it; the BIOS stage would need Limine's
-`bios-install` again, which this does not run.
+static build, `tools/build --static`: the shape pax's tools/mkyew builds
+and the image carries), WORK a new directory.
+
+- The yew goes in stripped of its symbols and DWARF (`strip -o`), as the
+  image's own yew is (its link kept neither; yew's `tools/build --static`
+  links with the system linker, which keeps both: twice the bytes, the
+  same code). It must be a static executable (`readelf`: type EXEC, no
+  PT_INTERP).
+- WORK/tree: the ISO's whole tree, extracted, with its archive's member
+  `bin/yew` replaced by that copy (every other member, every header field
+  but the size, and the order kept).
+- WORK/image.iso: the tree made into an ISO by the `xorriso -as mkisofs`
+  line pax's tools/mkimage runs at the image's head (BIOS El Torito,
+  UEFI El Torito with the EFI image as a partition, HFS+, a protective
+  MBR). Not `-boot_image any replay` over the old image: Limine's
+  `bios-install` rewrote image 3's GPT as an MBR after xorriso made it,
+  so the replay cannot propose the EFI image as an MBR partition and
+  exits 32 on a SORRY. mkimage's `limine bios-install` is not run either
+  (it needs Limine's host tool): the result boots from a CD under UEFI
+  and BIOS firmware, not as a hard disk under BIOS.
+
+Every xorriso line of severity NOTE or above is printed. A SORRY,
+FAILURE or FATAL line, or a nonzero exit, stops it with xorriso's whole
+log printed. Prints the yew's sizes and digests and the outputs'.
 """
 import hashlib
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 MEMBER = 'bin/yew'
+SEVERE = re.compile(r'^xorriso : (SORRY|FAILURE|FATAL|ABORT) : ', re.M)
+NOTED = re.compile(r'^xorriso : (NOTE|HINT|WARNING|SORRY|FAILURE|FATAL|ABORT) : .*$', re.M)
+NEEDED = ('boot/pax', 'boot/initramfs.cpio', 'boot/limine/limine.conf', 'boot/limine/limine-bios-cd.bin',
+          'boot/limine/limine-uefi-cd.bin', 'EFI/BOOT/BOOTX64.EFI')
 
 
-def swap(src, dst, data):
-    blob = src.read_bytes()
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def xorriso(argv, log):
+    r = subprocess.run(['xorriso'] + argv, capture_output=True, text=True, errors='replace')
+    text = r.stdout + r.stderr
+    log.write_text(text)
+    for m in NOTED.finditer(text):
+        print('execfail-pax-image: ' + m.group(0))
+    if r.returncode != 0 or SEVERE.search(text):
+        print(f'execfail-pax-image: xorriso exit {r.returncode}; its whole log ({log.name}):')
+        for line in text.splitlines():
+            print('  | ' + line)
+        raise SystemExit(1)
+
+
+def stripped(yew, work):
+    hdr = subprocess.run(['readelf', '-hlW', str(yew)], capture_output=True, text=True, check=True).stdout
+    if not re.search(r'Type:\s+EXEC', hdr) or 'INTERP' in hdr:
+        raise SystemExit(f'execfail-pax-image: {yew} is not a static executable')
+    out = work / 'yew'
+    subprocess.run(['strip', '-o', str(out), str(yew)], check=True)
+    a, b = yew.read_bytes(), out.read_bytes()
+    print(f'execfail-pax-image: yew {len(a)} bytes sha256 {sha(a)}; stripped, {len(b)} bytes sha256 {sha(b)}')
+    return b
+
+
+def swap(cpio, data):
+    blob = cpio.read_bytes()
     out = bytearray()
     off = 0
     hit = 0
@@ -40,7 +89,7 @@ def swap(src, dst, data):
         if name.lstrip('./') == MEMBER:
             hit += 1
             old = blob[start:end]
-            print(f'execfail-pax-image: {MEMBER} was {len(old)} bytes sha256 {hashlib.sha256(old).hexdigest()}')
+            print(f'execfail-pax-image: {MEMBER} was {len(old)} bytes sha256 {sha(old)}')
             hdr = bytearray(h)
             hdr[6 + 6 * 8:6 + 7 * 8] = b'%08X' % len(data)
             out += hdr + blob[off + 110:start]
@@ -53,27 +102,35 @@ def swap(src, dst, data):
             break
     if hit != 1:
         raise SystemExit(f'execfail-pax-image: {MEMBER} found {hit} times')
-    dst.write_bytes(out)
-    print(f'execfail-pax-image: {MEMBER} now {len(data)} bytes sha256 {hashlib.sha256(data).hexdigest()}')
+    cpio.write_bytes(out)
+    print(f'execfail-pax-image: {MEMBER} now {len(data)} bytes sha256 {sha(data)}')
 
 
 def main():
     iso, yew, work = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
     work.mkdir(parents=True, exist_ok=False)
-    orig = work / 'orig.cpio'
-    subprocess.run(['xorriso', '-osirrox', 'on', '-indev', str(iso), '-extract', '/boot/initramfs.cpio', str(orig)],
-                   check=True, capture_output=True)
-    cpio = work / 'initramfs.cpio'
-    swap(orig, cpio, yew.read_bytes())
-    orig.unlink()
+    data = stripped(yew, work)
+    tree = work / 'tree'
+    xorriso(['-osirrox', 'on', '-indev', str(iso), '-extract', '/', str(tree)], work / 'extract.log')
+    for p in sorted(tree.rglob('*')):
+        p.chmod(0o755 if p.is_dir() else 0o644)
+        if p.is_file():
+            print(f'execfail-pax-image: tree {p.relative_to(tree)} {p.stat().st_size}')
+    tree.chmod(0o755)
+    for need in NEEDED:
+        if not (tree / need).is_file():
+            raise SystemExit(f'execfail-pax-image: the image has no {need}')
+    cpio = tree / 'boot' / 'initramfs.cpio'
+    swap(cpio, data)
     out = work / 'image.iso'
-    r = subprocess.run(['xorriso', '-indev', str(iso), '-outdev', str(out), '-boot_image', 'any', 'replay',
-                        '-map', str(cpio), '/boot/initramfs.cpio', '-end'], capture_output=True, text=True)
-    (work / 'xorriso.log').write_text(r.stdout + r.stderr)
-    if r.returncode != 0:
-        raise SystemExit(f'execfail-pax-image: xorriso exit {r.returncode}: {r.stderr[-600:]}')
+    # pax's tools/mkimage at the image's head, its xorriso line as it stands.
+    xorriso(['-as', 'mkisofs', '-R', '-r', '-J',
+             '-b', 'boot/limine/limine-bios-cd.bin', '-no-emul-boot', '-boot-load-size', '4', '-boot-info-table',
+             '-hfsplus', '-apm-block-size', '2048',
+             '--efi-boot', 'boot/limine/limine-uefi-cd.bin', '-efi-boot-part', '--efi-boot-image',
+             '--protective-msdos-label', str(tree), '-o', str(out)], work / 'xorriso.log')
     for p in (cpio, out):
-        print(f'execfail-pax-image: {p.name} {p.stat().st_size} bytes sha256 {hashlib.sha256(p.read_bytes()).hexdigest()}')
+        print(f'execfail-pax-image: {p.name} {p.stat().st_size} bytes sha256 {sha(p.read_bytes())}')
 
 
 if __name__ == '__main__':
