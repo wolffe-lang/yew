@@ -55,12 +55,20 @@ The cases (`--case`, repeatable; every case by default):
               record, and a saved `active_tab` names a saved tab.
 
 One line per check, `FAIL <case>_<check>` for each red, then
-`nested-open-row: GREEN` or `nested-open-row: RED` (exit 1). Exit 2 when
-the row cannot run (no saved state, a session that does not quit).
+`nested-open-row: GREEN` or `nested-open-row: RED` (exit 1). An editor a
+case is done with that does not quit is a red of its own (`<case>_quits`,
+`bangbang_first_quits`, `reader_first_quits`, ...), and the case stops
+there. Exit 2 when the row cannot run (no saved state, a seeding editor
+that does not quit) and nothing is red; every red is printed by name
+first, whatever stopped the row.
 
 yew's processes are only read (`/proc`) and spoken to through their
-terminals; none is ever signalled. Each quits by `:q!` (a plain `:q`
-first hides a focused job's output).
+terminals; none is ever signalled. Each `:` line waits to see the command
+line drawn before it is typed: an ESC read together with the `:` (a
+loop busy with a job reads both at once) is Alt-:, and the line would go
+to L mode as keys. Each editor quits by `:q!` (a plain `:q` first hides a
+focused job's output), tried again until it exits or 12 s pass; one
+still running then has its terminal closed.
 """
 import argparse
 import fcntl
@@ -81,6 +89,9 @@ ROWS, COLS = 24, 80
 QUIET_S = 0.5
 SAVE_WAIT_S = 2.8
 CASES = ["newdir", "cd", "refuse", "passthru", "bangbang", "reader", "stale", "dropped"]
+# yew draws its command line's `:` at the last row's first column; L mode
+# draws the mode there (` L `), so this is the command line opening.
+CMDLINE_OPEN = re.compile(rb"\x1b\[%d;1H(?:\x1b\[[0-9;]*m)*:" % ROWS)
 
 
 class Cant(Exception):
@@ -129,17 +140,37 @@ class Session:
     def send(self, data):
         os.write(self.fd, data)
 
+    def open_cmdline(self, tries=3, wait=3.0):
+        """ESC, then `:` until the command line is drawn. An ESC the
+        editor reads together with the `:` is Alt-: (a busy loop reads
+        both at once), and the line typed after it would land in L mode as
+        keys; so each try waits to see the command line drawn."""
+        for _ in range(tries):
+            if not self.alive():
+                return False
+            self.send(b"\x1b")
+            self.pump(0.3)
+            mark = len(self.raw)
+            self.send(b":")
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                self.pump(0.05)
+                if CMDLINE_OPEN.search(self.raw, mark):
+                    return True
+        return False
+
     def ex(self, line, settle=QUIET_S):
-        """Type `:LINE` and Enter in L mode."""
-        self.send(b"\x1b")
-        self.pump(0.15)
-        self.send(b":")
-        self.pump(0.1)
+        """Type `:LINE` and Enter in L mode; False (nothing typed) when the
+        command line never opened."""
+        if not self.open_cmdline():
+            print(f"  the command line did not open for :{line}", flush=True)
+            return False
         for i in range(0, len(line), 16):
             self.send(line[i:i + 16].encode())
             self.pump(0.02)
         self.send(b"\r")
         self.settle(settle)
+        return True
 
     def since(self, mark):
         return bytes(self.raw[mark:])
@@ -153,22 +184,23 @@ class Session:
             return False
         return True
 
-    def quit(self, limit=8.0):
-        if not self.alive():
-            os.close(self.fd)
-            return True
-        self.send(b"\x1b")
-        self.pump(0.15)
-        # `:q!`: a plain `:q` first hides a focused job's output.
-        self.send(b":q!\r")
+    def quit(self, limit=12.0):
+        """`:q!` until the editor exits (a plain `:q` first hides a focused
+        job's output), within `limit` seconds. False when it is still
+        running: its terminal is then closed (a hangup), never signalled."""
         end = time.monotonic() + limit
-        while time.monotonic() < end:
-            self.pump(0.05)
-            if not self.alive():
-                break
+        while self.alive() and time.monotonic() < end:
+            if self.open_cmdline(tries=1):
+                self.send(b"q!\r")
+            gone = time.monotonic() + 3.0
+            while time.monotonic() < min(gone, end):
+                self.pump(0.05)
+                if not self.alive():
+                    break
             # A modified buffer asks; the row's buffers are never modified.
+        quit = not self.alive()
         os.close(self.fd)
-        return self.status is not None
+        return quit
 
 
 def env_for(scratch, term, yew=None):
@@ -298,6 +330,14 @@ class Row:
             self.reds.append(f"{case}_{name}")
 
 
+def quits(row, case, s, who="quits"):
+    """A row of its own: an editor the case is done with quits by `:q!`.
+    False (the case stops there) when it does not."""
+    ok = s.quit()
+    row.check(case, who, ok, "quit by :q!" if ok else "still running after :q!; its terminal was closed")
+    return ok
+
+
 def seed(yew, scratch, args, log):
     env = env_for(scratch, args.term, yew)
     ws = os.path.join(scratch, "ws")
@@ -343,8 +383,8 @@ def case_newdir(row, yew, scratch, args, log):
     after = [l for l in log_lines(env) if "tab record(s) dropped" in l or "workspace state" in l]
     row.check("newdir", "one_editor", seen == {s.pid} and len(after) == before,
               f"yew pids {sorted(seen)}, first {s.pid}; state lines {before} -> {len(after)}")
-    if not s.quit():
-        raise Cant("newdir: the first editor did not quit")
+    if not quits(row, "newdir", s):
+        return
     st = read_state(env)
     row.check("newdir", "saved_after_quit", len(tab_paths(st)) >= n + 3, f"{len(tab_paths(st))} saved tabs")
 
@@ -356,8 +396,8 @@ def case_cd(row, yew, scratch, args, log):
     s.pump(SAVE_WAIT_S)
     # The quit's save is the state of record: the debounced one may come
     # before the last line's tab.
-    if not s.quit():
-        raise Cant("cd: the editor did not quit")
+    if not quits(row, "cd", s):
+        return
     st = read_state(env)
     want = os.path.join(ws, "sub", "x.txt")
     active = [p for i, p in st[0] if i == st[1]]
@@ -382,8 +422,7 @@ def case_refuse(row, yew, scratch, args, log):
         row.check("refuse", f"{tag}_named", named, "the message names the refusal" if named else "no refusal on the screen")
         row.check("refuse", f"{tag}_no_job", not jobbuf and seen == {s.pid},
                   f"job buffer {jobbuf}, yew pids {sorted(seen)}")
-    if not s.quit():
-        raise Cant("refuse: the editor did not quit")
+    quits(row, "refuse", s)
 
 
 def case_passthru(row, yew, scratch, args, log):
@@ -394,8 +433,7 @@ def case_passthru(row, yew, scratch, args, log):
     out = s.since(mark)
     row.check("passthru", "version_runs", b"*job:" in out and want in out,
               f"a job buffer with {want.decode(errors='replace')!r}")
-    if not s.quit():
-        raise Cant("passthru: the editor did not quit")
+    quits(row, "passthru", s)
 
 
 def case_bangbang(row, yew, scratch, args, log):
@@ -412,17 +450,14 @@ def case_bangbang(row, yew, scratch, args, log):
     row.check("bangbang", "second_started", len(nested) == 1, f"nested yew pids {nested}")
     row.check("bangbang", "second_is_reader", len(owned) == 1, owned[0] if owned else "no ownership line: " + " | ".join(new[-4:]))
     # The nested editor quits; the first takes the terminal back.
-    s.send(b"\x1b")
-    s.pump(0.2)
-    s.send(b":q!\r")
-    s.settle(1.5)
+    s.ex("q!", settle=1.5)
     s.pump(SAVE_WAIT_S)
     st = read_state(env)
     row.check("bangbang", "nested_saved_nothing", tab_paths(st) == before,
               f"{len(tab_paths(st))} saved tabs after the nested quit, {len(before)} before it")
     row.check("bangbang", "lock_is_first", st[2] == s.pid, f"lock {st[2]}, first {s.pid}")
-    if not s.quit():
-        raise Cant("bangbang: the first editor did not quit")
+    if not quits(row, "bangbang", s, "first_quits"):
+        return
     st = read_state(env)
     row.check("bangbang", "saved_after_quit", len(tab_paths(st)) >= n + 1, f"{len(tab_paths(st))} saved tabs")
 
@@ -442,8 +477,9 @@ def case_reader(row, yew, scratch, args, log):
     st = read_state(env)
     row.check("reader", "reader_saves_nothing", late not in tab_paths(st) and st[2] == first.pid,
               f"late.txt saved {late in tab_paths(st)}, lock {st[2]}, first {first.pid}")
-    if not first.quit():
-        raise Cant("reader: the first editor did not quit")
+    if not quits(row, "reader", first, "first_quits"):
+        quits(row, "reader", reader, "reader_quits")
+        return
     st = read_state(env)
     row.check("reader", "first_saved", len(tab_paths(st)) >= n + 1 and late not in tab_paths(st),
               f"{len(tab_paths(st))} saved tabs, late.txt {late in tab_paths(st)}")
@@ -455,13 +491,13 @@ def case_reader(row, yew, scratch, args, log):
     st = read_state(env)
     row.check("reader", "third_owns", not any("owned by pid" in l for l in new) and st[2] == third.pid,
               f"lock {st[2]}, third {third.pid}; " + " | ".join(new[-3:]))
-    if not reader.quit():
-        raise Cant("reader: the reader did not quit")
+    if not quits(row, "reader", reader, "reader_quits"):
+        quits(row, "reader", third, "third_quits")
+        return
     st2 = read_state(env)
     row.check("reader", "reader_quit_saves_nothing", tab_paths(st2) == tab_paths(st) and late not in tab_paths(st2),
               f"{len(tab_paths(st2))} saved tabs after the reader quit, late.txt {late in tab_paths(st2)}")
-    if not third.quit():
-        raise Cant("reader: the third editor did not quit")
+    quits(row, "reader", third, "third_quits")
 
 
 def case_stale(row, yew, scratch, args, log):
@@ -492,14 +528,13 @@ def case_stale(row, yew, scratch, args, log):
     st = read_state(env)
     row.check("stale", "owns_the_state", not any("owned by pid 1;" in l for l in new) and st[2] == e.pid,
               f"lock {st[2]}, editor {e.pid}; " + " | ".join(new[-3:]))
-    if not e.quit():
-        raise Cant("stale: the editor did not quit")
+    quits(row, "stale", e)
 
 
 def case_dropped(row, yew, scratch, args, log):
     env, ws, s, n = seed(yew, scratch, args, log)
-    if not s.quit():
-        raise Cant("dropped: the editor did not quit")
+    if not quits(row, "dropped", s):
+        return
     st = read_state(env)
     ids = [i for i, _ in st[0]]
     row.check("dropped", "active_saved", st[1] in ids, f"active_tab {st[1]}, record ids {ids[:4]}...{ids[-2:]}")
@@ -509,8 +544,7 @@ def case_dropped(row, yew, scratch, args, log):
     new = log_lines(env)[lines0:]
     drops = [l for l in new if "tab record(s) dropped" in l]
     row.check("dropped", "no_drop_logged", not drops, drops[0] if drops else "no dropped record logged")
-    if not again.quit():
-        raise Cant("dropped: the second resume did not quit")
+    quits(row, "dropped", again, "second_quits")
 
 
 def main():
@@ -546,12 +580,17 @@ def main():
     finally:
         if not args.keep:
             shutil.rmtree(top, ignore_errors=True)
-    if status == 2:
-        sys.exit(2)
+    # A red row is printed by name whatever stopped the row; a row that
+    # could not run with nothing red is exit 2, never a pass.
     for r in row.reds:
         print(f"FAIL {r}", flush=True)
-    print("nested-open-row: " + ("RED" if row.reds else "GREEN"), flush=True)
-    sys.exit(1 if row.reds else 0)
+    if row.reds:
+        print("nested-open-row: RED", flush=True)
+        sys.exit(1)
+    if status == 2:
+        sys.exit(2)
+    print("nested-open-row: GREEN", flush=True)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
