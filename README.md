@@ -3,7 +3,8 @@
 yew — a modal terminal editor ("tmux and vim had a baby":
 C11 + POSIX, zero dependencies, 218 KLOC at
 [tenseleyFlow/sagitta](https://github.com/tenseleyFlow/sagitta), with
-its scripting language Fletch) — ported to wolf, **byte-identical**, so
+its scripting language Fletch) — ported to wolf, **oracle-tested with
+explicit interaction improvements**, so
 that [PAX](https://github.com/wolffe-lang/pax)'s console has an editor
 built in its own language and wolf has its largest real program. Track
 12 of the planning repo (`sprints/yew/index.md`, ruling #89).
@@ -105,6 +106,7 @@ tools/check-tables               # tables.lu is the generator's, and sagitta's
 tools/oracle --unit              # C yew at the pin, gcc and clang, its unit suite
 tools/goldens --yew target/release/yew
 tools/check-fletch-goldens target/release/yew   # Fletch: 39 units, stressed and twice
+python3 -I tools/editing-row target/native/yew # byte-exact editing regressions through a PTY
 tools/check-fletch-coverage target/release/yew  # the coverage gate and its ledger
 ```
 
@@ -141,6 +143,30 @@ that land it. Type to filter; Enter shows the row whole on the message
 line; Esc closes. The keys help is yew's own (sagitta's nearest is
 `ed.map`, the current mode's configured bindings), and an `init.fl`
 binding of the same key wins over it.
+
+Default editing keys, independently of the command prompt:
+
+- **Insert:** Ctrl+Z undoes; Ctrl+Shift+Z redoes with the kitty keyboard
+  protocol, or Alt+/ on a legacy terminal. Ctrl+Y still yanks; Ctrl+_
+  and Ctrl+/ still undo. Ctrl+Z in L mode still suspends.
+- **Insert and selections:** Shift+Tab removes one indent unit from the
+  current or selected lines, retaining the caret or selection.
+- **L, W, B, Insert and selections:** Alt+Up/Down moves the current or
+  selected lines by one line, as one undo step. These keys replace the
+  old git-hunk and vertical unit motions, and Insert's suggestion-line
+  acceptance; word/all suggestion acceptance remains available.
+
+Backticks pair in code and prose. Quotes close literally when their
+matching opener is unbalanced earlier on the line, including with text
+between. Openers do not add a closer directly before text (a dot is the
+exception), or when an unmatched corresponding closer already lies to
+the right on the line. A remembered automatic closer still skips when
+typed, and Backspace still removes an empty pair.
+
+These are intentional differences from C yew. The default-runtime delta
+in `tests/runtime-defaults.delta.json` names each changed binding and
+its reason; `tools/check-runtime` verifies the entire file against the
+oracle plus exactly that delta.
 
 The language-server keys: in L mode `K` hover, `g d` definition, `g D`
 declaration, `g y` type definition, `g i` implementation, `g r`
