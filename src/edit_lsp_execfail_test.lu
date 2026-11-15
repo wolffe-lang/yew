@@ -1,0 +1,359 @@
+//! member: false
+//! yw18 (yew#127): a language server that cannot be started is reported
+//! once. yew's own rows, not a sagitta port: C reports the exec failure
+//! again on every pump at the pin (`client.c:1288-1295`), and so did the
+//! port (`lsp_client_pump`'s `JOB_EXECFAIL` branch); docs/MAP.md §9 has
+//! the divergence. The client is pumped in-process, as the life rows pump
+//! it (`edit.ed_pump_jobs_once`), over a server whose program is not on
+//! PATH and over one that exits at once (`/bin/sh -c 'exit 3'`):
+//!
+//! 0. execfail_reported_once: the failure's message is set once, and a
+//!    message raised after it is never replaced by it again;
+//! 1. execfail_job_released: the failed job leaves the job table, the
+//!    server is dead and given up, and no job is started for it again;
+//! 2. execfail_info_says_why: `:lsp.info` names the failure;
+//! 3. execfail_restart_tries_again: `:lsp.restart` starts the server
+//!    again (a program installed after the failure runs), and a second
+//!    failure is reported once more;
+//! 4. crash_giveup_reported_once: the five-crash give-up is reported once
+//!    (it always was: the crash branch runs only while the server is
+//!    alive), and its job is kept for `:lsp.log`;
+//! 5. crash_giveup_info_says_why: `:lsp.info` names the give-up.
+//!
+//! `YEW_LSP_EXECFAIL_CASE=N` runs case N alone (the checked machine's
+//! per-case run).
+
+use edit
+use lsp
+use std.fs
+
+struct Tally {
+    n: int,
+}
+
+// A failed check says what it was before the trap (a native trap prints
+// only its site).
+fn ok(mut t: Tally, cond: bool, what: str) {
+    t.n += 1
+    if !cond {
+        eprint("assertion failed: {what}")
+    }
+    assert(cond, what)
+}
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+// The scratch directory, an absolute path: `$TMPDIR` when it is one,
+// else the root's `target/tests` (`src/edit_lsp_life_test.lu`'s rule).
+fn scratch_dir() -> str {
+    let tmp = env_get("TMPDIR") else ""
+    var base = tmp
+    if tmp.len == 0 || !tmp.starts_with("/") {
+        let cwd = os_cwd() else "."
+        base = "{cwd}/target/tests"
+    }
+    fs.create_dir_all(base) else |_| {}
+    base
+}
+
+struct Fix {
+    ed: edit.Ed,
+    path: str,
+    bi: int,
+}
+
+// A `.sh` file open in an editor and a server for it started with
+// command `cmd` and arguments `args` (the life fixture's shape,
+// `src/edit_lsp_life_test.lu`'s `fix_init`).
+fn fix_init(cmd: str, args: List[str], tag: str) -> Fix {
+    let dir = scratch_dir()
+    let path = "{dir}/yew-lsp-execfail-{os_pid()}-{tag}.sh"
+    fs_write_bytes(path, pb("echo hello\n")) else |_| {
+        assert(false, "write {path}")
+    }
+    var ed = edit.ed_new()
+    edit.ed_open_scratch(mut ed)
+    let idx = edit.tab_open(mut ed, path)
+    assert(idx >= 0, "open {path}")
+    assert(edit.tab_hydrate(mut ed, idx) == 0, "load {path}")
+    edit.tab_switch(mut ed, idx)
+    let bi = ed.wins[ed.win].buf
+    ed.buf_languages[ed.bufs[bi].id] = "sh"
+    ed.now_ms = edit.now_ms()
+    let cfg = lsp.LspServerCfg {
+        id: "bashls",
+        lang: "sh",
+        cmd: cmd,
+        args: args,
+        roots: List[str](),
+        init_options: "",
+        has_init_options: false,
+        init_timeout_ms: 1000,
+    }
+    let _ = edit.lsp_client_start_cfg(mut ed, bi, cfg)
+    let (k, _) = edit.lsp_doc_of_buffer(ed, bi)
+    assert(k >= 0, "the document attached")
+    Fix { ed: ed, path: path, bi: bi }
+}
+
+fn fix_free(mut f: Fix) {
+    edit.lsp_free(mut f.ed)
+    fs.remove(f.path) else |_| {
+        assert(false, "unlink {f.path}")
+    }
+}
+
+fn server(f: Fix) -> int {
+    let (k, _) = edit.lsp_doc_of_buffer(f.ed, f.bi)
+    assert(k >= 0, "the fixture lost its document")
+    k
+}
+
+fn pump(mut f: Fix) {
+    edit.ed_pump_jobs_once(mut f.ed, 5)
+}
+
+// Pump until the message line holds an error that contains `needle`.
+fn wait_error(mut f: Fix, needle: str, timeout_ms: int) -> bool {
+    let start = edit.now_ms()
+    while edit.now_ms() - start <= timeout_ms {
+        if f.ed.msg.active && f.ed.msg.sev == edit.MSG_ERROR && f.ed.msg.text.contains(needle) {
+            return true
+        }
+        pump(mut f)
+    }
+    false
+}
+
+// Jobs in the table in state `state`.
+fn jobs_in(f: Fix, state: int) -> int {
+    var n = 0
+    for j in f.ed.jobs.v {
+        if j.state == state {
+            n += 1
+        }
+    }
+    n
+}
+
+const MISSING: str = "yw18-no-such-language-server"
+
+fn missing_fix(tag: str) -> Fix {
+    var args = List[str]()
+    (mut args).push("start")
+    fix_init(MISSING, args, tag)
+}
+
+fn failure_text() -> str {
+    "bashls: {os_error_text(2)} \u{2014} install {MISSING} or set lsp.servers.sh.cmd"
+}
+
+fn execfail_reported_once(mut t: Tally) {
+    var f = missing_fix("once")
+    ok(mut t, wait_error(mut f, "install {MISSING}", 2000), "the failure reported")
+    ok(mut t, f.ed.msg.text == failure_text(), "the sentence: {f.ed.msg.text}")
+    edit.ed_msg_clear(mut f.ed)
+    var i = 0
+    while i < 20 {
+        pump(mut f)
+        i += 1
+    }
+    ok(mut t, !f.ed.msg.active, "not reported again: {f.ed.msg.text}")
+    edit.ed_msg(mut f.ed, edit.MSG_INFO, "a message of mine")
+    i = 0
+    while i < 20 {
+        pump(mut f)
+        i += 1
+    }
+    ok(mut t, f.ed.msg.active && f.ed.msg.text == "a message of mine", "mine kept: {f.ed.msg.text}")
+    fix_free(mut f)
+}
+
+fn execfail_job_released(mut t: Tally) {
+    var f = missing_fix("released")
+    ok(mut t, wait_error(mut f, "install {MISSING}", 2000), "the failure reported")
+    pump(mut f)
+    let k = server(f)
+    ok(mut t, f.ed.lsp.servers[k].life.state == lsp.LSP_DEAD, "dead")
+    ok(mut t, f.ed.lsp.servers[k].life.gave_up, "given up")
+    ok(mut t, edit.job_find(f.ed, f.ed.lsp.servers[k].job) < 0, "the server has no job")
+    ok(mut t, jobs_in(f, edit.JOB_EXECFAIL) == 0, "no failed job in the table: {f.ed.jobs.v.len}")
+    var i = 0
+    while i < 20 {
+        pump(mut f)
+        i += 1
+    }
+    ok(mut t, f.ed.jobs.v.len == 0, "none started again: {f.ed.jobs.v.len}")
+    ok(mut t, f.ed.lsp.servers[k].life.gave_up, "still off")
+    fix_free(mut f)
+}
+
+fn execfail_info_says_why(mut t: Tally) {
+    var f = missing_fix("info")
+    ok(mut t, wait_error(mut f, "install {MISSING}", 2000), "the failure reported")
+    pump(mut f)
+    edit.ed_msg_clear(mut f.ed)
+    ok(mut t, edit.lsp_info(mut f.ed), "lsp.info answers")
+    let text = f.ed.msg.text
+    ok(mut t, f.ed.msg.sev == edit.MSG_INFO, "an info line")
+    ok(mut t, text.starts_with("bashls dead; "), "the server and its state: {text}")
+    ok(
+        mut t,
+        text.ends_with(
+            "; off until :lsp.restart: {os_error_text(2)} \u{2014} install {MISSING} or set lsp.servers.sh.cmd",
+        ),
+        "why it is off: {text}",
+    )
+    fix_free(mut f)
+}
+
+fn execfail_restart_tries_again(mut t: Tally) {
+    let late = "{scratch_dir()}/yw18-late-server-{os_pid()}"
+    fs.remove(late) else |_| {}
+    var args = List[str]()
+    (mut args).push("start")
+    var f = fix_init(late, args, "restart")
+    ok(mut t, wait_error(mut f, "install {late}", 2000), "the failure reported")
+    pump(mut f)
+    // The program arrives after the failure: a server that reads its input
+    // and never answers, alive until its stdin closes.
+    let fd = fs_open_perm(late, 4, 0o700) else {
+        assert(false, "create {late}")
+        return
+    }
+    fs_write_chunk(fd, "#!/bin/sh\nexec cat >/dev/null\n".bytes()) else {
+        assert(false, "write {late}")
+    }
+    fs_close(fd) else { assert(false, "close {late}") }
+    ok(mut t, edit.lsp_start(mut f.ed, f.bi), ":lsp.restart")
+    let k = server(f)
+    var i = 0
+    while i < 50 && jobs_in(f, edit.JOB_RUNNING) == 0 {
+        pump(mut f)
+        i += 1
+    }
+    ok(mut t, jobs_in(f, edit.JOB_RUNNING) == 1, "started again: {f.ed.jobs.v.len} jobs")
+    ok(mut t, !f.ed.lsp.servers[k].life.gave_up, "no longer off")
+    edit.ed_msg_clear(mut f.ed)
+    ok(mut t, edit.lsp_info(mut f.ed), "lsp.info answers")
+    ok(mut t, !f.ed.msg.text.contains("off until"), "no reason while it runs: {f.ed.msg.text}")
+    edit.lsp_client_stop(mut f.ed, k, false)
+    i = 0
+    while i < 200 && jobs_in(f, edit.JOB_RUNNING) != 0 {
+        pump(mut f)
+        i += 1
+    }
+    fs.remove(late) else |_| {}
+    // A second failure, after a restart, is reported again, and once.
+    edit.ed_msg_clear(mut f.ed)
+    ok(mut t, edit.lsp_start(mut f.ed, f.bi), ":lsp.restart again")
+    ok(mut t, wait_error(mut f, "install {late}", 2000), "the second failure reported")
+    edit.ed_msg_clear(mut f.ed)
+    i = 0
+    while i < 20 {
+        pump(mut f)
+        i += 1
+    }
+    ok(mut t, !f.ed.msg.active, "and once: {f.ed.msg.text}")
+    ok(mut t, jobs_in(f, edit.JOB_EXECFAIL) == 0, "its job released")
+    fix_free(mut f)
+}
+
+// A server that exits at once, one crash short of the give-up.
+fn crashing_fix(mut t: Tally, tag: str) -> Fix {
+    var args = List[str]()
+    (mut args).push("-c")
+    (mut args).push("exit 3")
+    var f = fix_init("/bin/sh", args, tag)
+    let k = server(f)
+    f.ed.lsp.servers[k].life.restarts = 4
+    f.ed.lsp.servers[k].life.first_restart_ms = f.ed.now_ms
+    ok(mut t, wait_error(mut f, "crashed 5 times", 3000), "the give-up reported")
+    f
+}
+
+fn crash_giveup_reported_once(mut t: Tally) {
+    var f = crashing_fix(mut t, "giveup")
+    let k = server(f)
+    ok(mut t, f.ed.lsp.servers[k].life.gave_up, "given up")
+    edit.ed_msg_clear(mut f.ed)
+    var i = 0
+    while i < 20 {
+        pump(mut f)
+        i += 1
+    }
+    ok(mut t, !f.ed.msg.active, "not reported again: {f.ed.msg.text}")
+    ok(mut t, edit.job_find(f.ed, f.ed.lsp.servers[k].job) >= 0, "its job kept for :lsp.log")
+    ok(mut t, jobs_in(f, edit.JOB_RUNNING) == 0, "none started again")
+    fix_free(mut f)
+}
+
+fn crash_giveup_info_says_why(mut t: Tally) {
+    var f = crashing_fix(mut t, "giveup-info")
+    edit.ed_msg_clear(mut f.ed)
+    ok(mut t, edit.lsp_info(mut f.ed), "lsp.info answers")
+    let text = f.ed.msg.text
+    ok(mut t, text.starts_with("bashls dead; "), "the server and its state: {text}")
+    ok(
+        mut t,
+        text.ends_with("; off until :lsp.restart: crashed 5 times in 5 minutes"),
+        "why it is off: {text}",
+    )
+    fix_free(mut f)
+}
+
+const CASES: int = 6
+
+fn case_name(i: int) -> str {
+    match i {
+        0 => "execfail_reported_once",
+        1 => "execfail_job_released",
+        2 => "execfail_info_says_why",
+        3 => "execfail_restart_tries_again",
+        4 => "crash_giveup_reported_once",
+        _ => "crash_giveup_info_says_why",
+    }
+}
+
+fn run_case(mut t: Tally, i: int) {
+    match i {
+        0 => execfail_reported_once(mut t),
+        1 => execfail_job_released(mut t),
+        2 => execfail_info_says_why(mut t),
+        3 => execfail_restart_tries_again(mut t),
+        4 => crash_giveup_reported_once(mut t),
+        5 => crash_giveup_info_says_why(mut t),
+        _ => {},
+    }
+}
+
+fn main() {
+    var t = Tally { n: 0 }
+    let pick = env_get("YEW_LSP_EXECFAIL_CASE") else ""
+    var lo = 0
+    var hi = CASES
+    if pick.len != 0 {
+        lo = pick.to_int() else -1
+        hi = lo + 1
+        // One past the last case runs nothing and prints nothing
+        // (`tools/check-test-cases`).
+        if lo < 0 || lo >= CASES {
+            return
+        }
+    }
+    var i = lo
+    while i < hi {
+        run_case(mut t, i)
+        print("{case_name(i)}: PASS")
+        i += 1
+    }
+    if pick.len == 0 {
+        print("edit_lsp_execfail_test: {CASES} cases pass, {t.n} assertions")
+    }
+}
