@@ -82,7 +82,14 @@ def run_case(root, via_script=False, control_c=False):
         assert [x['release'] for x in mouse]==[False,True]*6
         assert payload['exit_reason']==('ctrl-c' if control_c else 'q'), payload
         assert b'\x1b[?1000l\x1b[?1002l\x1b[?1006l' in raw
-        assert termios.tcgetattr(slave)==before, 'terminal settings not restored exactly'
+        restored=termios.tcgetattr(slave)
+        # Darwin sets PENDIN while returning to canonical input. It is a
+        # kernel retype-pending flag, not a changed terminal policy setting.
+        stable_before=list(before)
+        stable_after=list(restored)
+        stable_before[3] &= ~getattr(termios,'PENDIN',0)
+        stable_after[3] &= ~getattr(termios,'PENDIN',0)
+        assert stable_after==stable_before, f'terminal settings not restored: before={before!r}, after={restored!r}'
         os.write(release_write,b'x')
         proc.wait(timeout=8)
         assert proc.returncode==0, proc.returncode
