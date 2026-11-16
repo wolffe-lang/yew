@@ -58,13 +58,19 @@ int main(int argc, char **argv) {
         b.budget = GATE_CONFIG_NS;
     }
     else if (!strcmp(argv[1], "config_reload_500")) {
-        static char reload_path[] = "/tmp/yew-perf-config.XXXXXX";
+        const char *tmp = getenv("TMPDIR");
+        size_t size;
         static ConfigArg config;
-        make_reload_fixture(reload_path);
-        config.user_path = reload_path;
+        if (!tmp || !*tmp) tmp = "/tmp";
+        size = strlen(tmp) + sizeof("/yew-perf-config.XXXXXX");
+        owned = malloc(size);
+        if (!owned) return 2;
+        (void)snprintf(owned, size, "%s/yew-perf-config.XXXXXX", tmp);
+        make_reload_fixture(owned);
+        config.user_path = owned;
         r.sample = sample_config_reload; r.arg = &config; b.budget = GATE_CONFIG_RELOAD_NS;
         measure(&b, recorded_sample, &r);
-        (void)unlink(reload_path);
+        (void)unlink(owned);
         goto report;
     }
     else if (!strcmp(argv[1], "macrolib_scan_200")) {
