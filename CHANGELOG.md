@@ -10,7 +10,9 @@ The format follows Keep a Changelog; the port has no release yet.
 - Backticks auto-pair in every filetype. An unbalanced quote before the
   caret closes literally, even with text between; openers do not create
   a second closer before text or an unmatched closer on the same line.
-  A dot before text still permits a pair. Remembered closers still skip.
+  A dot before text still permits a pair. Closers are balanced across the
+  whole line, preserving nested pairs such as `((|))` and `[(|)]` and
+  balanced quoted groups to the right. Remembered closers still skip.
 - Shift+Tab dedents the current or selected lines by one indent unit,
   retaining the caret or selection.
 - Insert mode gains Ctrl+Z undo, Ctrl+Shift+Z redo with the kitty

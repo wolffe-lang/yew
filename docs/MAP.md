@@ -1227,7 +1227,11 @@ own. Any changed C golden is separately listed and pinned in
   Backticks join the
   default pair set in every filetype; an unbalanced quote before the
   caret closes literally, and text or an unmatched closer to the right
-  suppresses a new closer (a leading dot still permits it). Sagitta's
+  suppresses a new closer (a leading dot still permits it). The closer
+  must be unmatched across the whole line: in `(|)` and `[(|)]`, existing
+  right-hand closers belong to openers on the left, so normal nested
+  pairing remains available. Complete quoted pairs on the right do not
+  count as unmatched either. Sagitta's
   remembered-closer and empty-pair Backspace mechanics remain. The mouse
   uses the existing padded cell-to-offset conversion: beyond every
   unterminated final line, not just a one-character `}` line, the caret

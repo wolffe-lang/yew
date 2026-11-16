@@ -164,9 +164,12 @@ The existing named acceptance command still reports its deferred status.
 Backticks pair in code and prose. Quotes close literally when their
 matching opener is unbalanced earlier on the line, including with text
 between. Openers do not add a closer directly before text (a dot is the
-exception), or when an unmatched corresponding closer already lies to
-the right on the line. A remembered automatic closer still skips when
-typed, and Backspace still removes an empty pair.
+exception), or when a corresponding closer to the right is unmatched
+across the **whole line**. A closer that already belongs to an opener on
+the left does not block a nested pair: `(|)` + `(` becomes `((|))`.
+Balanced quoted terms on the right also remain balanced. A remembered
+automatic closer still skips when typed, and Backspace still removes an
+empty pair.
 
 These are intentional differences from C yew. The default-runtime delta
 in `tests/runtime-defaults.delta.json` names each changed binding and
