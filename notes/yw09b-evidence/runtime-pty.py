@@ -81,12 +81,26 @@ try:
         send(b"e")
         send(b"ed.config.reload\r")
         send(b"e")
+        quit_started = time.monotonic()
         send(b"ed.quit_force\r")
     else:
+        quit_started = time.monotonic()
         send(b"Z")
-    drain(0.5)
-    got, status = os.waitpid(pid, os.WNOHANG)
-    exited = got == pid
+    # The terminal may close before waitpid can reap the process. A single
+    # WNOHANG sample after drain() mistakes that shutdown race for a lost key.
+    exited = False
+    deadline = quit_started + 5.0
+    while True:
+        got, status = os.waitpid(pid, os.WNOHANG)
+        if got == pid:
+            exited = True
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: break
+        drain(min(0.01, remaining))
+        time.sleep(min(0.001, max(0.0, deadline-time.monotonic())))
+    quit_latency_ms = (time.monotonic() - quit_started) * 1000
+    print(f"quit_latency_ms={quit_latency_ms:.3f} exited={exited}", flush=True)
     moved = file.read_bytes() == b"first\nproofsecond\n"
     plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", startup)
     (root / "wire.bin").write_bytes(wire)
@@ -110,6 +124,12 @@ try:
         assert exited and os.waitstatus_to_exitcode(status) == 0, f"{row}: quit binding did not answer"
         assert moved, f"{row}: motion, Insert and save did not answer"
         print("runtime_prefix_skew: ok; runtime_prefix_warn_once: ok" if a.prefix else "runtime_locked_mode: ok", flush=True)
+except Exception:
+    # Startup alone cannot show whether reload, command entry or quit failed.
+    final_frame = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", bytes(wire))
+    print("final_frame=" + final_frame.decode("utf-8", "replace"), flush=True)
+    print("wire_bytes=" + repr(bytes(wire)), flush=True)
+    raise
 finally:
     os.close(fd)
     if not locals().get("exited", False):
