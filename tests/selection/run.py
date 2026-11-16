@@ -214,6 +214,7 @@ def contract(name,s):
         if not s.mode('I'):raise Infra('insert control missing')
         before={at:s.vt.cells[at] for at in positions}
         s.take('empty-highlight',b'\x1bh')
+        s.take('full-redraw',b':ed.redraw\r',.5)
         if not s.mode('H'):raise Infra('highlight control missing')
         active=(s.vt.y,s.vt.x)
         if active not in positions:raise Infra('active caret not at a pane start')
