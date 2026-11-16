@@ -20,11 +20,12 @@ control or infrastructure failure. The JSON result, raw terminal bytes and
 child metrics remain in the output directory. A process exit of zero alone is
 not a contract pass. No real clipboard backend or network server is used.
 
-The 22 rows cover mode restoration from Insert/Word/Block, 16/256/truecolor
+The 23 rows cover mode restoration from Insert/Word/Block, 16/256/truecolor
 selection visibility, copy/cut and internal paste without a system clipboard,
 insert-origin replacement, initial line selection, Alt-click cursors,
 Ctrl+Alt+Up/Down and repeated vertical additions, keyboard and Ctrl-click
-navigation, empty-selection boundaries, duplicate-press idempotence, and context
+navigation, empty-selection boundaries confined to the active pane,
+duplicate-press idempotence, and context
 menus on Ctrl+Shift+click and right-click. Existing
 correct behavior is a positive control, not a manufactured failure. The fake
 language server records requested positions and returns a local target file.
