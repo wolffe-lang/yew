@@ -14,11 +14,15 @@ spec = importlib.util.spec_from_file_location("goldens_pty", Path(__file__).with
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
 
+PROJECT = Path(__file__).resolve().parents[1]
+
 class Divergences(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        target = PROJECT / "target"
+        target.mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="divergence-test-", dir=target)
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         harness.ROOT = self.root
         self.tree = self.root / "oracle"
         for d in ("tests/pty/goldens", "build", ".docs"):
@@ -59,6 +63,13 @@ class Divergences(unittest.TestCase):
         self.assertIn("ruled", names)
         self.assertEqual(rows["ruled"][0], reason)
         self.assertEqual(rows["ruled"][1], self.expected)
+
+    def test_root_alias_returns_canonical_snapshot(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with patch.object(harness, "ROOT", alias):
+            _, rows = harness.entries(self.tree, self.listing)
+        self.assertEqual(rows["ruled"][1], self.expected.resolve())
 
     def test_empty_or_control_character_authorization_is_refused(self):
         for reason in ("approved:", "approved: ", "approved:    ", "approved: hidden\x01reason"):
