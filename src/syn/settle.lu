@@ -1,0 +1,131 @@
+//! syn.settle — budgeted propagation over real TextBuf lines.
+//! Ports sagitta engine.c:5143–5376 at 9ace98c2. Loading a guest remains
+//! an owner/registry operation; only already-loaded programs install here.
+use text
+
+/// Work, timing and damage of one propagation slice. lines counts actual
+/// syn_line calls, not byte spans or an estimate of work.
+pub struct SynSettleReport {
+    lines: int,
+    us: int,
+    fixpoint: bool,
+    hit_view: bool,
+    provisional: bool,
+    damage_lo: int,
+    damage_hi: int,
+}
+
+/// Install a queued guest outside matching, then rewind its opener without
+/// raising an earlier edit wave. The old tail cannot prove a fixpoint until
+/// it has been recomputed with the now-resident definition.
+pub fn syn_buffer_install_guest(mut buffer: SynBuffer, mut engine: SynEngine, pool: SynPool, program: int) -> bool {
+    if program < 0 || program >= pool.programs.len { return false }
+    let language = pool.programs[program].language.id
+    var index = -1
+    var i = 0
+    while i < buffer.pending_langs.len {
+        if buffer.pending_langs[i] == language { index = i; break }
+        i += 1
+    }
+    if index < 0 || !syn_engine_install(mut engine, pool, program) { return false }
+    let line = buffer.pending_lines[index]
+    i = index + 1
+    while i < buffer.pending_langs.len {
+        buffer.pending_langs[i - 1] = buffer.pending_langs[i]
+        buffer.pending_lines[i - 1] = buffer.pending_lines[i]
+        i += 1
+    }
+    let _ = (mut buffer.pending_langs).pop() else 0
+    let _ = (mut buffer.pending_lines).pop() else 0
+    let count = syn_ids_len(buffer.lines.entry)
+    if line < count {
+        i = (line + 1) * 4
+        while i < buffer.lines.entry.bytes.len { buffer.lines.entry.bytes[i] = 0 as byte; i += 1 }
+        if buffer.lines.wave > line { buffer.lines.wave = line }
+        if buffer.lines.settled_to > line + 1 { buffer.lines.settled_to = line + 1 }
+        buffer.lines.must_reach = count
+        buffer.lines.settling = true
+        buffer.lines.spec_valid = false
+        buffer_cache_invalidate(mut buffer.cache)
+    }
+    true
+}
+
+/// Spend at most a line-granular budget, retaining a wave across calls.
+/// budget_us <= 0 runs to a verified fixpoint. Real clocks observe every
+/// four lines with 64-us headroom; injected clocks preserve C's 256-line
+/// observation quantum. A single line has its own byte/span/attempt caps.
+pub fn syn_settle(
+    mut buffer: SynBuffer,
+    mut engine: SynEngine,
+    mut pool: SynPool,
+    tb: text.TextBuf,
+    view_lo: int,
+    view_hi: int,
+    budget_us: int,
+) -> SynSettleReport {
+    var report = SynSettleReport {
+        lines: 0, us: 0, fixpoint: false, hit_view: false,
+        provisional: false, damage_lo: 9223372036854775807, damage_hi: 0,
+    }
+    let started = buffer_now(mut buffer)
+    let quantum = if buffer.fake_clock then 256 else 4
+    var deadline = budget_us
+    if !buffer.fake_clock && deadline > 64 { deadline -= 64 }
+    buffer_reconcile(mut buffer, engine, tb)
+    if budget_us >= 4000 && buffer.pending_langs.len != 0 {
+        let loaded = pool_for_language(pool, buffer.pending_langs[0])
+        if loaded >= 0 { let _ = syn_buffer_install_guest(mut buffer, mut engine, pool, loaded) }
+    }
+    let count = syn_ids_len(buffer.lines.entry)
+    if !buffer.enabled || count == 0 {
+        buffer.lines.settling = false; buffer.lines.wave = count
+        buffer.lines.settled_to = count
+        report.fixpoint = true; report.damage_lo = 0; report.damage_hi = 0
+        return report
+    }
+    if buffer.lines.wave >= count { buffer.lines.wave = count - 1 }
+    buffer.lines.settling = true
+    var elapsed: int = 0
+    while buffer.lines.wave < count {
+        let line = buffer.lines.wave
+        let entry = syn_lines_next_entry(buffer.lines)
+        let len = buffer_line(mut buffer, tb, line)
+        syn_line(mut engine, mut pool, entry, buffer.line_bytes, len, mut buffer.scratch, false)
+        let _ = buffer_cache_store(mut buffer.cache, line, tb.gen, entry, buffer.scratch)
+        report.lines += 1
+        buffer_note_stop(mut buffer, engine, buffer.scratch.stop)
+        if engine.pending_lang != 0 { buffer_pending_add(mut buffer, engine.pending_lang, line) }
+        if engine.refused_lang != 0 { buffer.refused_lang = engine.refused_lang }
+        if report.damage_lo == 9223372036854775807 { report.damage_lo = line }
+        report.damage_hi = line + 1
+        if line >= view_lo && line < view_hi { report.hit_view = true }
+        let corrections = buffer.lines.provisional_corrections
+        let finished = syn_lines_accept(mut buffer.lines, buffer.scratch.exit_state)
+        if buffer.lines.provisional_corrections != corrections { report.provisional = true }
+        if finished { report.fixpoint = true; break }
+        if line + 1 >= view_lo && line + 1 < view_hi {
+            report.hit_view = true; report.damage_hi = line + 2
+        }
+        if line & (quantum - 1) == 0 && budget_us > 0 { elapsed = buffer_now(mut buffer) - started }
+        if elapsed >= deadline && budget_us > 0 {
+            if buffer.lines.wave < view_lo {
+                buffer.lines.spec_from = view_lo
+                buffer.lines.spec_valid = true
+                report.provisional = true
+            }
+            break
+        }
+    }
+    if report.fixpoint { elapsed = buffer_now(mut buffer) - started }
+    report.us = if elapsed > 0 then elapsed else 0
+    if report.damage_lo == 9223372036854775807 { report.damage_lo = 0; report.damage_hi = 0 }
+    buffer.gen = tb.gen
+    report
+}
+
+/// The settling badge is delayed by 250 ms and degraded highlighting is
+/// sticky. This reads the same monotonic clock as the propagation budget.
+pub fn syn_buffer_status_visible(mut buffer: SynBuffer) -> bool {
+    buffer.enabled && (buffer.degraded || buffer.lines.settling && buffer_now(mut buffer) - buffer.edit_us >= 250000)
+}
