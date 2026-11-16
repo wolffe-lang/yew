@@ -31,7 +31,7 @@ CA_UP, CA_DOWN = b'\x1b[1;7A', b'\x1b[1;7B'
 CASES = [
     'escape-origin-I', 'escape-origin-W', 'escape-origin-B',
     'selection-visible-256', 'selection-visible-truecolor', 'selection-visible-16',
-    'empty-selection-marker',
+    'empty-selection-marker', 'empty-selection-active-pane',
     'copy-retains-selection', 'copy-internal-paste', 'cut-internal-paste',
     'cut-origin-I', 'replace-typing-origin-I', 'h-selects-current-line',
     'alt-click-add-cursor', 'ctrl-alt-down-I', 'ctrl-alt-up-I',
@@ -200,6 +200,26 @@ def contract(name,s):
         if not s.mode('H'):raise Infra('highlight control missing')
         s.take('escape',ESC,.4)
         require(s.mode(origin),'Escape did not restore '+origin)
+    elif name=='empty-selection-active-pane':
+        s.take('split',b'\x17v',.5)
+        positions=[]
+        for y,line in enumerate(s.vt.rows()):
+            start=0
+            while True:
+                x=line.find('alpha beta gamma',start)
+                if x<0:break
+                positions.append((y,x));start=x+1
+        if len(positions)!=2:raise Infra('two-pane fixture control missing')
+        s.take('insert',b'i')
+        if not s.mode('I'):raise Infra('insert control missing')
+        before={at:s.vt.cells[at] for at in positions}
+        s.take('empty-highlight',b'\x1bh')
+        if not s.mode('H'):raise Infra('highlight control missing')
+        active=(s.vt.y,s.vt.x)
+        if active not in positions:raise Infra('active caret not at a pane start')
+        require(before[active]!=s.vt.cells[active],'active empty boundary is unmarked')
+        require(all(before[at]==s.vt.cells[at] for at in positions if at!=active),
+                'inactive pane received an armed empty-selection marker')
     elif name=='empty-selection-marker':
         s.take('buffer-end',b'G')
         s.take('insert-at-end',b'i')
