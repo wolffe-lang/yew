@@ -1,0 +1,178 @@
+//! syn.engine_model — qualified runtime ownership and trace scratch.
+//! Ports sagitta src/syn/engine.c's SynEngine/resident seams at 9ace98c2.
+//! Matching has no filesystem access and cannot synchronously load a guest.
+
+/// Maximum resident definitions, including the root; frame indices are u8.
+pub const SYN_RESIDENT_MAX: int = 255
+
+/// One root's interned states and shared-pool references. All mutable
+/// scratch is reused. trace_data grows only for explicit trace requests;
+/// interactive highlighting never needs a per-byte state trace.
+pub struct SynEngine {
+    root: int,
+    residents: List[int],
+    known_ids: List[int],
+    known_names: List[List[byte]],
+    states: SynStateTab,
+    state: SynState,
+    before: SynState,
+    matcher: SynMatchScratch,
+    generation: int,
+    has_first_line: bool,
+    line_calls: int,
+    last_attempts: int,
+    pending_lang: int,
+    refused_lang: int,
+    unknown_start: int,
+    unknown_len: int,
+    unknown_program: int,
+    unknown_literal: int,
+    deferred_slot: int,
+    mask_key: int,
+    mask_bol: List[byte],
+    mask_other: List[byte],
+    trace_data: List[byte],
+    trace_len: int,
+    trace_valid: bool,
+}
+
+/// Construct an engine from an already compiled root. Name metadata is
+/// snapshotted as C's engine_snapshot_lang_names; later discovery must not
+/// silently change the identity of an existing engine's selectors.
+pub fn syn_engine_new(pool: SynPool, root: int) -> SynEngine {
+    if root < 0 || root >= pool.programs.len || pool.programs[root].contexts.len == 0 ||
+        pool.programs[root].root < 0 || pool.programs[root].root >= pool.programs[root].contexts.len {
+        syn_bug("syntax: invalid engine root")
+    }
+    let ctx = pool.programs[root].root
+    var residents = List[int]()
+    (mut residents).push(root)
+    var first = false
+    for rule in pool.programs[root].rules {
+        if rule.flags & SYN_RULE_FIRST_LINE != 0 { first = true }
+    }
+    SynEngine {
+        root: root, residents: residents,
+        known_ids: copy pool.known_ids, known_names: copy pool.known_names,
+        states: syn_state_tab_new(ctx), state: syn_state_root(ctx, 0),
+        before: syn_state_root(ctx, 0), matcher: syn_match_scratch_new(),
+        generation: 1, has_first_line: first, line_calls: 0, last_attempts: 0,
+        pending_lang: 0, refused_lang: 0, unknown_start: -1, unknown_len: 0,
+        unknown_program: -1, unknown_literal: 0, deferred_slot: -1,
+        mask_key: -1, mask_bol: syn_first_new(false), mask_other: syn_first_new(false),
+        trace_data: List[byte](), trace_len: 0, trace_valid: false,
+    }
+}
+
+fn engine_resident(engine: SynEngine, pool: SynPool, language: int) -> int {
+    var i = 0
+    while i < engine.residents.len {
+        if pool.programs[engine.residents[i]].language.id == language { return i }
+        i += 1
+    }
+    -1
+}
+
+/// Install only already-loaded tables. The loader calls this off the draw
+/// path, then replays pending opener lines; installation itself does no I/O.
+pub fn syn_engine_install(mut engine: SynEngine, pool: SynPool, program: int) -> bool {
+    if program < 0 || program >= pool.programs.len || pool.programs[program].language.id == 0 { return false }
+    if engine_resident(engine, pool, pool.programs[program].language.id) >= 0 { return true }
+    if engine.residents.len >= SYN_RESIDENT_MAX { return false }
+    (mut engine.residents).push(program)
+    engine.mask_key = -1
+    true
+}
+
+fn engine_program(engine: SynEngine, slot: int) -> int {
+    if slot < 0 || slot >= engine.residents.len { syn_bug("syntax: qualified definition slot out of range") }
+    engine.residents[slot]
+}
+
+fn engine_ctx(engine: SynEngine, pool: SynPool, depth: int) -> int {
+    let slot = syn_state_def(engine.state, depth)
+    let program = engine_program(engine, slot)
+    let ctx = syn_state_ctx(engine.state, depth)
+    if ctx >= pool.programs[program].contexts.len { syn_bug("syntax: context outside qualified definition") }
+    ctx
+}
+
+fn trace_write(mut storage: List[byte], state: SynState, lo: int, hi: int) {
+    var p = lo
+    while p <= hi {
+        var i = 0
+        while i < SYN_STATE_BYTES { storage[p * SYN_STATE_BYTES + i] = state.tuple[i]; i += 1 }
+        p += 1
+    }
+}
+
+fn engine_trace_begin(mut engine: SynEngine, len: int, enabled: bool) {
+    engine.trace_valid = enabled && len <= SYN_LINE_BYTE_CAP
+    engine.trace_len = if engine.trace_valid then len + 1 else 0
+    if !engine.trace_valid { return }
+    while engine.trace_data.len < (len + 1) * SYN_STATE_BYTES { (mut engine.trace_data).push(0 as byte) }
+    trace_write(mut engine.trace_data, engine.state, 0, 0)
+}
+
+/// Copy a pre-EOL state at one byte boundary from the last explicit trace.
+/// False means tracing was disabled, capped or the position is out of range.
+pub fn syn_engine_trace_at(mut out: SynState, engine: SynEngine, position: int) -> bool {
+    if !engine.trace_valid || position < 0 || position >= engine.trace_len { return false }
+    syn_state_load_bytes(mut out, engine.trace_data, position * SYN_STATE_BYTES)
+    true
+}
+
+fn engine_bridge(engine: SynEngine) -> int {
+    var depth = syn_state_depth(engine.state)
+    while depth > 0 {
+        depth -= 1
+        if syn_state_frame_flags(engine.state, depth) & SYN_FR_BRIDGE != 0 { return depth }
+    }
+    -1
+}
+
+fn engine_masks(mut engine: SynEngine, pool: SynPool, program: int, ctx: int) {
+    let depth = syn_state_depth(engine.state)
+    let top = depth - 1
+    let bridge = engine_bridge(engine)
+    var bridge_slot = 0
+    var bridge_ctx = 0
+    if bridge >= 0 {
+        bridge_slot = syn_state_def(engine.state, bridge)
+        bridge_ctx = engine_ctx(engine, pool, bridge)
+    }
+    let key = depth | (syn_state_ndef(engine.state) << 5) |
+        (syn_state_def(engine.state, top) << 8) | (ctx << 16) |
+        ((syn_state_frame_flags(engine.state, top) & 3) << 28) |
+        ((bridge + 1) << 32) | (bridge_slot << 37) | (bridge_ctx << 45)
+    if engine.mask_key == key { return }
+    engine.mask_key = key
+    var i = 0
+    while i < 32 {
+        engine.mask_bol[i] = pool.programs[program].contexts[ctx].first[i]
+        engine.mask_other[i] = engine.mask_bol[i]
+        i += 1
+    }
+    if bridge < 0 { return }
+    let host = engine_program(engine, bridge_slot)
+    let kind = pool.programs[host].contexts[bridge_ctx].embed.end_kind
+    let line_end = kind == SYN_EMBED_END_LINE || kind == SYN_EMBED_END_LINE_CONTINUATION
+    if !line_end && kind != SYN_EMBED_END_INLINE && kind != SYN_EMBED_END_INLINE_ROOT { return }
+    if kind == SYN_EMBED_END_INLINE_ROOT && bridge + 1 < depth && depth != bridge + 2 { return }
+    let first = pool.programs[host].contexts[bridge_ctx].first_rule
+    var r = 0
+    while r < pool.programs[host].contexts[bridge_ctx].nrules {
+        let index = first + r
+        if index >= pool.programs[host].rules.len { syn_bug("syntax: bridge rule outside host definition") }
+        if pool.programs[host].rules[index].end_boundary {
+            i = 0
+            while i < 32 {
+                let bits = pool.programs[host].rules[index].first[i] as int
+                engine.mask_bol[i] = (engine.mask_bol[i] as int | bits) as byte
+                if !line_end { engine.mask_other[i] = (engine.mask_other[i] as int | bits) as byte }
+                i += 1
+            }
+        }
+        r += 1
+    }
+}

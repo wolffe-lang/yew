@@ -1,0 +1,231 @@
+//! syn.engine_embed — bounded qualified-definition transitions.
+//! Ports sagitta engine.c:3231–3388 and :3740–3841 at 9ace98c2.
+//! Selecting a nonresident guest reports work for the loader; it never
+//! opens a file or compiles a pattern in the matching path.
+
+fn engine_name(engine: SynEngine, name: List[byte], lo: int, hi: int) -> int {
+    var i = 0
+    while i < engine.known_ids.len {
+        if engine.known_names[i].len == hi - lo {
+            var j = 0
+            var same = true
+            while j < hi - lo {
+                if engine.known_names[i][j] != name[lo + j] { same = false; break }
+                j += 1
+            }
+            if same { return engine.known_ids[i] }
+        }
+        i += 1
+    }
+    0
+}
+
+fn engine_lost(mut state: SynState, count: int) {
+    let old = syn_state_lost(state)
+    let next = if old > 255 - count then 255 else old + count
+    syn_state_set_lost(mut state, next)
+    if next == 255 { syn_state_set_flags(mut state, syn_state_flags(state) | SYN_F_DEGRADED) }
+}
+
+fn engine_guest_context(pool: SynPool, host: int, guest: int, embed: SynEmbed) -> int {
+    if embed.ctx == 0 { return pool.programs[guest].root }
+    if embed.ctx >= pool.aux[host].items.len { return -1 }
+    let len = pool.aux[host].items[embed.ctx].len
+    var i = 0
+    while i < pool.programs[guest].context_names.len {
+        var n = 0
+        while n < pool.programs[guest].context_names[i].len && pool.programs[guest].context_names[i][n] as int != 0 { n += 1 }
+        if n == len {
+            var j = 0
+            var same = true
+            while j < n {
+                if pool.programs[guest].context_names[i][j] != pool.aux[host].items[embed.ctx][j] { same = false; break }
+                j += 1
+            }
+            if same { return i }
+        }
+        i += 1
+    }
+    -1
+}
+
+fn engine_push_guest(mut engine: SynEngine, pool: SynPool, slot: int, host: int, embed: SynEmbed) -> bool {
+    let guest = engine_program(engine, slot)
+    let ctx = engine_guest_context(pool, host, guest, embed)
+    let depth = syn_state_depth(engine.state)
+    let ndef = syn_state_ndef(engine.state)
+    if ctx < 0 || depth >= SYN_DEPTH_MAX || ndef >= SYN_DEF_MAX { return false }
+    syn_state_set_frame(mut engine.state, depth, ctx, slot, 0)
+    syn_state_set_aux(mut engine.state, ndef, 0)
+    syn_state_set_depths(mut engine.state, depth + 1, ndef + 1)
+    syn_state_set_flags(mut engine.state, syn_state_flags(engine.state) & !SYN_F_EMBED_PEND)
+    true
+}
+
+fn engine_apply_embed(mut engine: SynEngine, pool: SynPool, host: int, rule: int, line: List[byte]) {
+    let top = syn_state_depth(engine.state) - 1
+    let host_slot = syn_state_def(engine.state, top)
+    let kind = pool.programs[host].rules[rule].embed.lang_kind
+    var selected = 0
+    var literal = 0
+    var lo = -1
+    var hi = -1
+    if kind == SYN_EMBED_LANG_SELF { selected = pool.programs[host].language.id }
+    else if kind == SYN_EMBED_LANG_LITERAL {
+        literal = pool.programs[host].rules[rule].embed.lang
+        if literal > 0 && literal < pool.aux[host].items.len {
+            selected = engine_name(engine, pool.aux[host].items[literal], 0, pool.aux[host].items[literal].len)
+        }
+    } else if kind == SYN_EMBED_LANG_CAPTURE {
+        let group = pool.programs[host].rules[rule].embed.lang_group
+        if group < engine.matcher.matched.ngroups {
+            lo = engine.matcher.matched.lo[group]
+            hi = engine.matcher.matched.hi[group]
+            if lo >= 0 && hi >= lo && hi <= line.len { selected = engine_name(engine, line, lo, hi) }
+        }
+    }
+    if selected == 0 {
+        if literal > 0 && literal < pool.aux[host].items.len {
+            engine.unknown_program = host; engine.unknown_literal = literal
+            engine.unknown_start = -1; engine.unknown_len = pool.aux[host].items[literal].len
+        } else if lo >= 0 && hi >= lo && hi <= line.len {
+            engine.unknown_program = -1; engine.unknown_literal = 0
+            engine.unknown_start = lo; engine.unknown_len = hi - lo
+        }
+    }
+    let depth = syn_state_depth(engine.state)
+    if depth >= SYN_DEPTH_MAX {
+        if syn_state_flags(engine.state) & SYN_F_EMBED_LOST == 0 { engine_lost(mut engine.state, 2) }
+        syn_state_set_flags(mut engine.state, syn_state_flags(engine.state) | SYN_F_EMBED_LOST | SYN_F_EMBED_ORPHAN)
+        if selected != 0 { engine.refused_lang = selected }
+        return
+    }
+    let deferred = pool.programs[host].rules[rule].embed.flags & SYN_EMBED_DEFER != 0
+    syn_state_set_frame(mut engine.state, depth, pool.programs[host].rules[rule].target, host_slot,
+        SYN_FR_BRIDGE | (if deferred then SYN_FR_DEFER else 0))
+    syn_state_set_depths(mut engine.state, depth + 1, syn_state_ndef(engine.state))
+    if selected == 0 { return }
+    let slot = if kind == SYN_EMBED_LANG_SELF then host_slot else engine_resident(engine, pool, selected)
+    if syn_state_ndef(engine.state) >= SYN_DEF_MAX || syn_state_depth(engine.state) >= SYN_DEPTH_MAX {
+        engine_lost(mut engine.state, 2)
+        syn_state_set_flags(mut engine.state, syn_state_flags(engine.state) | SYN_F_EMBED_LOST)
+        engine.refused_lang = selected
+        return
+    }
+    if slot < 0 {
+        if engine.residents.len >= SYN_RESIDENT_MAX {
+            engine_lost(mut engine.state, 2)
+            syn_state_set_flags(mut engine.state, syn_state_flags(engine.state) | SYN_F_EMBED_LOST)
+            engine.refused_lang = selected
+        } else {
+            syn_state_set_flags(mut engine.state, syn_state_flags(engine.state) | SYN_F_EMBED_PEND)
+            if engine.pending_lang == 0 { engine.pending_lang = selected }
+        }
+        return
+    }
+    if deferred { engine.deferred_slot = slot; return }
+    if !engine_push_guest(mut engine, pool, slot, host, pool.programs[host].rules[rule].embed) {
+        engine_lost(mut engine.state, 2)
+        syn_state_set_flags(mut engine.state, syn_state_flags(engine.state) | SYN_F_EMBED_LOST)
+        engine.refused_lang = selected
+    }
+}
+
+fn engine_leave(mut state: SynState, bridge: int) {
+    let guest = bridge + 1 < syn_state_depth(state)
+    if guest {
+        var depth = syn_state_depth(state)
+        while depth > bridge + 1 {
+            depth -= 1
+            syn_state_set_frame(mut state, depth, 0, 0, 0)
+        }
+        let ndef = syn_state_ndef(state)
+        syn_state_set_aux(mut state, ndef - 1, 0)
+        syn_state_set_depths(mut state, depth, ndef - 1)
+    } else if syn_state_flags(state) & SYN_F_EMBED_PEND != 0 || syn_state_frame_flags(state, bridge) & SYN_FR_DEFER != 0 {
+        if syn_state_ndef(state) < SYN_DEF_MAX { syn_state_set_aux(mut state, syn_state_ndef(state), 0) }
+    }
+    if syn_state_flags(state) & SYN_F_EMBED_LOST != 0 {
+        let lost = syn_state_lost(state)
+        syn_state_set_lost(mut state, if lost > 2 then lost - 2 else 0)
+        syn_state_set_flags(mut state, syn_state_flags(state) & !SYN_F_EMBED_LOST)
+    }
+    syn_state_set_flags(mut state, syn_state_flags(state) & !SYN_F_EMBED_PEND)
+}
+
+fn engine_boundary(mut engine: SynEngine, pool: SynPool, line: List[byte], at: int) -> (int, int, int, int) ! {none} {
+    let bridge = engine_bridge(engine)
+    if bridge < 0 { return none }
+    let depth = syn_state_depth(engine.state)
+    let host = engine_program(engine, syn_state_def(engine.state, bridge))
+    let ctx = engine_ctx(engine, pool, bridge)
+    let kind = pool.programs[host].contexts[ctx].embed.end_kind
+    if (kind == SYN_EMBED_END_LINE || kind == SYN_EMBED_END_LINE_CONTINUATION) && at != 0 { return none }
+    if kind != SYN_EMBED_END_LINE && kind != SYN_EMBED_END_LINE_CONTINUATION && kind != SYN_EMBED_END_INLINE && kind != SYN_EMBED_END_INLINE_ROOT { return none }
+    if kind == SYN_EMBED_END_INLINE_ROOT && bridge + 1 < depth && depth != bridge + 2 { return none }
+    let level = if bridge + 1 < depth then syn_state_ndef(engine.state) - 2 else syn_state_ndef(engine.state) - 1
+    let first = pool.programs[host].contexts[ctx].first_rule
+    var i = 0
+    while i < pool.programs[host].contexts[ctx].nrules {
+        let rule = first + i
+        if rule >= pool.programs[host].rules.len { syn_bug("syntax: bridge rule outside host definition") }
+        if pool.programs[host].rules[rule].end_boundary &&
+            rule_match_raw(mut engine.matcher, pool.programs[host], pool.aux[host], engine.state, level,
+                pool.programs[host].rules[rule], line, at) {
+            return (host, rule, bridge, level)
+        }
+        i += 1
+    }
+    none
+}
+
+fn engine_local_op(mut engine: SynEngine, pool: SynPool, program: int, rule: int, line: List[byte]) {
+    if pool.programs[program].rules[rule].op == SYN_OP_EMBED { engine_apply_embed(mut engine, pool, program, rule, line) }
+    else { syn_apply_local_op(mut engine.state, pool.programs[program].rules[rule]) }
+}
+
+fn line_continues(line: List[byte]) -> bool {
+    var n = 0
+    while n < line.len && line[line.len - n - 1] as int == 92 { n += 1 }
+    n & 1 != 0
+}
+
+fn engine_eol(mut engine: SynEngine, pool: SynPool, line: List[byte]) {
+    let top = syn_state_depth(engine.state) - 1
+    let program = engine_program(engine, syn_state_def(engine.state, top))
+    let ctx = engine_ctx(engine, pool, top)
+    let flags = syn_state_frame_flags(engine.state, top)
+    if flags & (SYN_FR_BRIDGE | SYN_FR_DEFER) == (SYN_FR_BRIDGE | SYN_FR_DEFER) && syn_state_flags(engine.state) & SYN_F_EMBED_PEND == 0 {
+        syn_state_set_frame_flags(mut engine.state, top, flags & !SYN_FR_DEFER)
+        if engine.deferred_slot >= 0 && !engine_push_guest(mut engine, pool, engine.deferred_slot, program, pool.programs[program].contexts[ctx].embed) {
+            engine_lost(mut engine.state, 2)
+            syn_state_set_flags(mut engine.state, syn_state_flags(engine.state) | SYN_F_EMBED_LOST)
+        }
+    } else {
+        let guest_was_active = flags & SYN_FR_BRIDGE == 0 && syn_state_ndef(engine.state) > 1
+        let op = pool.programs[program].contexts[ctx].eol_op
+        if flags & SYN_FR_BRIDGE != 0 && op == SYN_OP_POP { engine_leave(mut engine.state, top) }
+        syn_apply_op(mut engine.state, op, pool.programs[program].contexts[ctx].eol_nop, pool.programs[program].contexts[ctx].eol_target)
+        if guest_was_active {
+            let bridge = engine_bridge(engine)
+            if bridge >= 0 {
+                let host = engine_program(engine, syn_state_def(engine.state, bridge))
+                let host_ctx = engine_ctx(engine, pool, bridge)
+                let kind = pool.programs[host].contexts[host_ctx].embed.end_kind
+                let host_op = pool.programs[host].contexts[host_ctx].eol_op
+                if (kind == SYN_EMBED_END_LINE || kind == SYN_EMBED_END_LINE_CONTINUATION && !line_continues(line)) && host_op != SYN_OP_STAY {
+                    engine_leave(mut engine.state, bridge)
+                    syn_apply_op(mut engine.state, host_op, pool.programs[host].contexts[host_ctx].eol_nop, pool.programs[host].contexts[host_ctx].eol_target)
+                }
+            }
+        }
+    }
+    var flags_out = syn_state_flags(engine.state) & !SYN_F_VALUE
+    if flags_out & SYN_F_EMBED_ORPHAN != 0 {
+        let lost = syn_state_lost(engine.state)
+        syn_state_set_lost(mut engine.state, if lost > 2 then lost - 2 else 0)
+        flags_out = flags_out & !(SYN_F_EMBED_LOST | SYN_F_EMBED_ORPHAN)
+    }
+    if engine.has_first_line { flags_out = flags_out | SYN_F_PAST_FIRST }
+    syn_state_set_flags(mut engine.state, flags_out)
+}
