@@ -205,8 +205,8 @@ const DRAW_SELECTION: int = 8
 
 // Apply the selection to whole glyphs. A theme can name the same style as
 // the text/search/diagnostic underneath it; that must not erase selection.
-// No temporary list or glyph replacement is needed, and overlapping spans
-// only add emphasis rather than toggling a cell back out of selection.
+// No temporary list or glyph replacement is needed. A reused paint mask
+// makes overlapping expanded ranges idempotent, including emphasis fallbacks.
 fn overlay_selection_cells(mut ed: Ed, row: int, x0: int, x1: int, style: term.Cell, fields: int) {
     if row < 0 || row >= ed.grid.rows || x0 < 0 || x0 >= ed.grid.cols || x0 >= x1 {
         return
@@ -219,11 +219,18 @@ fn overlay_selection_cells(mut ed: Ed, row: int, x0: int, x1: int, style: term.C
     while col < end {
         let before = term.grid_back(ed.grid, row, col)
         let width = if before.w == 2 then 2 else 1
+        let slot = row * ed.grid.cols + col
+        if ed.dbuf.selection_seen[slot] as int != 0 {
+            col += width
+            continue
+        }
+        ed.dbuf.selection_seen[slot] = 1 as byte
+        if width == 2 && col + 1 < ed.grid.cols {
+            ed.dbuf.selection_seen[slot + 1] = 1 as byte
+        }
         term.grid_overlay(mut ed.grid, row, col, col + width, copy style, fields)
         let after = term.grid_back(ed.grid, row, col)
-        if term.color_equal(before.fg, after.fg) &&
-            term.color_equal(before.bg, after.bg) &&
-            before.attrs == after.attrs {
+        if term.render_style_equal(ed.render, before, after) {
             var floor = copy after
             floor.attrs = floor.attrs | term.ATTR_REVERSE
             if before.attrs & (term.ATTR_REVERSE | term.ATTR_INVALID_BYTE) != 0 {
@@ -251,7 +258,16 @@ fn overlay_span(
     let bi = ed.wins[wi].buf
     let lo = if selected.lo > displayed.lo then selected.lo else displayed.lo
     let hi = if selected.hi < displayed.hi then selected.hi else displayed.hi
-    if lo >= hi {
+    var selected_break = false
+    if fields & DRAW_SELECTION != 0 && selected.lo <= displayed.hi && selected.hi > displayed.hi {
+        let at = displayed.hi
+        let size = text.textbuf_len(ed.bufs[bi].ec.tb)
+        selected_break = at < size && text.textbuf_byte_at(ed.bufs[bi].ec.tb, at) == 10 ||
+            at + 1 < size &&
+                text.textbuf_byte_at(ed.bufs[bi].ec.tb, at) == 13 &&
+                text.textbuf_byte_at(ed.bufs[bi].ec.tb, at + 1) == 10
+    }
+    if lo >= hi && !selected_break {
         return
     }
     let tabw = draw_tabwidth(ed.bufs[bi])
@@ -262,13 +278,14 @@ fn overlay_span(
         lo as text.ByteOff,
         tabw,
     ) as int
-    let c1 = text.off_to_ccol_with(
+    var c1 = text.off_to_ccol_with(
         mut ed.dbuf.reader,
         ed.bufs[bi].ec.tb,
         displayed,
         hi as text.ByteOff,
         tabw,
     ) as int
+    if selected_break { c1 += 1 }
     var x0 = grid_x(ed.wins[wi], c0)
     var x1 = grid_x(ed.wins[wi], c1)
     let right = row_right(ed.grid, ed.wins[wi])
@@ -381,8 +398,27 @@ fn draw_empty_selection(
 
 // `draw_selection_rows` (`draw.c:358-411`).
 fn draw_selection_rows(mut ed: Ed, wi: int, lo: int, hi: int) {
-    if ed.mode != MODE_H {
+    if ed.mode != MODE_H || lo >= hi {
         return
+    }
+    let size = ed.grid.rows * ed.grid.cols
+    while ed.dbuf.selection_seen.len < size {
+        (mut ed.dbuf.selection_seen).push(0 as byte)
+    }
+    var row = ed.wins[wi].rect.y + lo
+    if row < 0 { row = 0 }
+    let end = if ed.wins[wi].rect.y + hi < ed.grid.rows {
+        ed.wins[wi].rect.y + hi
+    } else {
+        ed.grid.rows
+    }
+    while row < end {
+        var col = 0
+        while col < ed.grid.cols {
+            ed.dbuf.selection_seen[row * ed.grid.cols + col] = 0 as byte
+            col += 1
+        }
+        row += 1
     }
     let bi = ed.wins[wi].buf
     let (style, fields) = draw_sel_style(ed)
@@ -392,20 +428,29 @@ fn draw_selection_rows(mut ed: Ed, wi: int, lo: int, hi: int) {
     while i < ed.wins[wi].cs.curs.len {
         let c = copy ed.wins[wi].cs.curs[i]
         i += 1
-        if c.pos == c.anchor {
-            draw_empty_selection(mut ed, wi, c.pos, lo, hi, copy style, fields)
+        if c.pos == c.anchor && kind != SEL_LINE {
+            if wi == ed.win {
+                draw_empty_selection(mut ed, wi, c.pos, lo, hi, copy style, fields)
+            }
             continue
         }
-        var rect_spans = List[text.Span]()
         var rect_first = 0
+        var rect_last = -1
+        var rect_line = -1
         var selected = text.span(0, 0)
         if kind == SEL_RECT {
             let pl = text.textbuf_line_of(ed.bufs[bi].ec.tb, c.pos as text.ByteOff) as int
             let al = text.textbuf_line_of(ed.bufs[bi].ec.tb, c.anchor as text.ByteOff) as int
             rect_first = if pl < al then pl else al
-            rect_spans = sel_rect_spans(ed.bufs[bi].ec.tb, kind, tabw, c)
+            rect_last = if pl > al then pl else al
         } else {
             selected = sel_span(ed.bufs[bi].ec.tb, kind, c)
+            if selected.lo == selected.hi {
+                if wi == ed.win {
+                    draw_empty_selection(mut ed, wi, c.pos, lo, hi, copy style, fields)
+                }
+                continue
+            }
         }
         var srow = lo
         while srow < hi && srow < ed.wins[wi].rect.h {
@@ -414,10 +459,19 @@ fn draw_selection_rows(mut ed: Ed, wi: int, lo: int, hi: int) {
                 let displayed = displayed_of(mut ed, wi, bi, line, sub)
                 var keep = true
                 if kind == SEL_RECT {
-                    if line < rect_first || line - rect_first >= rect_spans.len {
+                    if line < rect_first || line > rect_last {
                         keep = false
-                    } else {
-                        selected = copy rect_spans[line - rect_first]
+                    } else if line != rect_line {
+                        let (covered, span, _, _) = sel_rect_row(
+                            ed.bufs[bi].ec.tb,
+                            kind,
+                            tabw,
+                            c,
+                            line,
+                        )
+                        if !covered { bug("draw: covered rectangle row rejected") }
+                        selected = span
+                        rect_line = line
                     }
                 }
                 if keep {
