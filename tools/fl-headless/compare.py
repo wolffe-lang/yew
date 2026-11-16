@@ -22,7 +22,7 @@ is NAMED (owner and issue printed) and does not fail; any other MISS, any
 regression and any error fails unless --advisory, which relaxes timing
 verdicts only (sanity failures and errors stay hard, as C's --gate-budgets).
 """
-import argparse, json, pathlib, platform, re, statistics, subprocess, sys
+import argparse, json, os, pathlib, platform, re, statistics, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SMOKE = ('fib24', 'map10k', 'motion100k')
@@ -154,9 +154,13 @@ def main():
     errors = []
     failures = 0
 
-    def run(label, cmd, timeout=600):
+    def run(label, cmd, who, timeout=600):
+        # Reload resolves its built-in through YEW_RUNTIME_DIR. Port-only
+        # commands in our defaults must never be fed to the pinned C editor.
+        runtime = a.oracle_tree / 'runtime' if who == 'C' else ROOT / 'runtime'
+        env = dict(os.environ, YEW_RUNTIME_DIR=str(runtime.resolve()))
         proc = subprocess.run([str(x) for x in cmd], cwd=ROOT, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, env=env)
         (output / (label + '.stdout')).write_text(proc.stdout)
         (output / (label + '.stderr')).write_text(proc.stderr)
         if proc.returncode:
@@ -210,7 +214,7 @@ def main():
             for rep in range(12):
                 for who, bin in [('C', a.oracle_tree / 'build/fl_smoke'),
                                  ('port', ROOT / f'target/tools/fl-core-{a.tier}')]:
-                    text = run(f'smoke-{who}-{rep:02d}', [bin, '--perf', '1'])
+                    text = run(f'smoke-{who}-{rep:02d}', [bin, '--perf', '1'], who)
                     found = {}
                     for line in text.splitlines():
                         if who == 'C':
@@ -249,7 +253,7 @@ def main():
         try:
             for who, bin in [('C', ROOT / 'target/tools/fl-headless-oracle'),
                              ('port', ROOT / f'target/tools/{driver}-{a.tier}')]:
-                text = run(f'{name}-{who}', [bin, name, a.oracle_tree / 'runtime/init.fl'])
+                text = run(f'{name}-{who}', [bin, name, a.oracle_tree / 'runtime/init.fl'], who)
                 m = re.search(r'^' + re.escape(name) +
                               r' median_ns=(\d+) min_ns=(\d+) budget_ns=(\d+)(?: gc=(\d+))? raw=([0-9,]+)$',
                               text, re.M)
