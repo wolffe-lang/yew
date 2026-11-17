@@ -5,6 +5,14 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw25 — a diagnostics publication repaints its rows (2026-11-17)
+
+- Every publication set a full repaint. It now damages the rows the old
+  and the new diagnostics touch (gutter sign and underline) and the
+  footer. A wrapped view, a split, a panel, or another buffer in the
+  window keeps the full repaint.
+- Rows: `src/edit_lsp_diag_damage_test.lu`.
+
 ### yw25 — a whole-text server's didChange waits for a pause (2026-11-17)
 
 - `wolf lsp` takes the whole text on every change, so each key sent 42 KB
