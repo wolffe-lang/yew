@@ -59,6 +59,18 @@ The format follows Keep a Changelog; the port has no release yet.
   footer. A wrapped view, a split, a panel, or another buffer in the
   window keeps the full repaint.
 - Rows: `src/edit_lsp_diag_damage_test.lu`.
+### yw25 — a whole-text server's didChange waits for a pause (2026-11-17)
+
+- `wolf lsp` takes the whole text on every change, so each key sent 42 KB
+  of a 40 KB file and started one analysis, about five a second while
+  typing. A server that syncs the whole text is now sent the document at
+  once for the first edit after a pause (250 ms), then when the typing
+  has been quiet for 250 ms, and at the latest a second after the first
+  held edit. Requests, saves and closes still send first; a server that
+  takes incremental changes keeps its per-turn flush. The loop's wait ends
+  by the held edit's deadline.
+- Rows: `src/lsp_sync_debounce_test.lu` (the clocks, simulated) and
+  `tools/lsp-typing-row` (didChange per second and bytes per key).
 ### Editing comfort (2026-11-15)
 
 - Backticks auto-pair in every filetype. An unbalanced quote before the
