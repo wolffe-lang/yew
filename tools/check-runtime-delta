@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Verify exactly the declared default-key differences from the C oracle.
+
+check-runtime-delta ORACLE_INIT PORT_INIT DELTA_JSON [--selftest]
+Each entry names a key, its old/new binding rows, and a reason. Added
+bindings name a unique preceding row; optional comments are literal
+lines immediately before that new row. Applying every declared change
+to the oracle must reproduce the entire port file byte for byte. No
+normalization, whitespace elision, ignored lines or wholesale exceptions.
+"""
+import argparse
+import copy
+import difflib
+import json
+from pathlib import Path
+import re
+import sys
+
+BINDING = re.compile(r'^bind\("([A-Z])", "([^"\n]+)", .+\)$')
+
+
+def transform(oracle, changes):
+    if not isinstance(changes, list) or not changes:
+        raise ValueError("delta must be a nonempty list")
+    text = oracle
+    seen = set()
+    for item in changes:
+        if not isinstance(item, dict) or set(item) - {"key", "old", "new", "after", "comments", "reason"}:
+            raise ValueError("unknown delta fields")
+        if not {"key", "old", "new", "reason"} <= set(item):
+            raise ValueError("delta entry lacks key, old, new or reason")
+        key, old, new = item["key"], item["old"], item["new"]
+        match = BINDING.fullmatch(new) if isinstance(new, str) else None
+        if not match or key != match[1] + " " + match[2] or key in seen:
+            raise ValueError(f"invalid or duplicate key: {key!r}")
+        seen.add(key)
+        if not isinstance(item["reason"], str) or not item["reason"].strip():
+            raise ValueError(f"{key}: missing reason")
+        comments = item.get("comments", [])
+        if not isinstance(comments, list) or any(not isinstance(c, str) or not c.startswith("#") or "\n" in c for c in comments):
+            raise ValueError(f"{key}: comments must be literal single comment lines")
+        insertion = "".join(c + "\n" for c in comments) + new + "\n"
+        if old is None:
+            anchor = item.get("after")
+            if not isinstance(anchor, str) or not BINDING.fullmatch(anchor):
+                raise ValueError(f"{key}: new key needs a binding anchor")
+            needle = anchor + "\n"
+            replacement = needle + insertion
+            if any(BINDING.fullmatch(line) and BINDING.fullmatch(line).groups() == match.groups() for line in text.splitlines()):
+                raise ValueError(f"{key}: added key already exists")
+        else:
+            before = BINDING.fullmatch(old) if isinstance(old, str) else None
+            if not before or before.groups() != match.groups() or "after" in item or old == new:
+                raise ValueError(f"{key}: replacement must change the same existing key")
+            needle = old + "\n"
+            replacement = insertion
+        lines = text.splitlines(keepends=True)
+        if lines.count(needle) != 1:
+            raise ValueError(f"{key}: old row/anchor is not unique and present")
+        at = lines.index(needle)
+        lines[at] = replacement
+        text = "".join(lines)
+    return text
+
+
+def verify(oracle, port, changes):
+    expected = transform(oracle, changes)
+    if expected != port:
+        diff = "".join(difflib.unified_diff(expected.splitlines(keepends=True), port.splitlines(keepends=True),
+                                            fromfile="oracle + declared delta", tofile="runtime/init.fl"))
+        raise ValueError("undeclared runtime difference:\n" + diff)
+
+
+def selftest(oracle, port, changes):
+    tests = [
+        ("extra-binding", oracle, port + 'bind("I", "A-0", "ed.nop")\n', changes),
+        ("extra-comment", oracle, port + "# undeclared\n", changes),
+        ("changed-option", oracle, port.replace("tabwidth: 4,", "tabwidth: 8,", 1), changes),
+        ("missing-entry", oracle, port, changes[:-1]),
+        ("duplicate-entry", oracle, port, changes + [changes[0]]),
+        ("changed-oracle", "# changed oracle\n" + oracle, port, changes),
+    ]
+    stale = copy.deepcopy(changes)
+    target = "old" if stale[0]["old"] is not None else "after"
+    stale[0][target] += " "
+    tests.append(("stale-old-row-or-anchor", oracle, port, stale))
+    for name, old, new, delta in tests:
+        try:
+            verify(old, new, delta)
+        except ValueError:
+            print(f"PASS runtime-delta-reject-{name}")
+        else:
+            raise ValueError(f"selftest accepted {name}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("oracle")
+    ap.add_argument("port")
+    ap.add_argument("delta")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+    try:
+        # newline='' preserves CRLF so a line-ending drift is a difference.
+        with open(args.oracle, newline="") as f:
+            oracle = f.read()
+        with open(args.port, newline="") as f:
+            port = f.read()
+        changes = json.loads(Path(args.delta).read_text())
+        verify(oracle, port, changes)
+        if args.selftest:
+            selftest(oracle, port, changes)
+    except (OSError, ValueError, TypeError) as error:
+        print(f"FAIL runtime-defaults-delta: {error}", file=sys.stderr)
+        return 1
+    for item in changes:
+        print(f"runtime-defaults-delta: {item['key']}: {item['reason']}")
+    print(f"PASS runtime-defaults-delta ({len(changes)} declared binding changes, exact file comparison)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,9 +7,10 @@
 //! `runtime/init.fl` sets `autopair: true`, so every I-mode bracket or
 //! quote a campaign-03 user types goes through it; ported here so typing
 //! is byte-identical). The remembered closers ride the buffer's marks
-//! with right bias; the per-language tables key on the buffer's language,
-//! which is none until yw10, so the default table holds; the string-or-
-//! comment query is the syntax engine's (inert until yw10, `block.lu`).
+//! with right bias. Yew's context rules additionally close an unbalanced
+//! quote literally, avoid opening before text or an unmatched closer,
+//! and pair backticks in every filetype. String/comment exclusion still
+//! uses the syntax engine (`block.lu`).
 
 use text
 
@@ -67,6 +68,7 @@ fn table_close(open: int) -> int {
         123 => 125,
         34 => 34,
         39 => 39,
+        96 => 96,
         _ => -1,
     }
 }
@@ -78,6 +80,7 @@ fn table_open_of(close: int) -> int {
         125 => 123,
         34 => 34,
         39 => 39,
+        96 => 96,
         _ => -1,
     }
 }
@@ -145,8 +148,108 @@ fn in_string_or_comment(mut b: Buffer, at: int) -> bool {
     b.pairs.syn_in
 }
 
-/// `yew_pairs_decide` (`pairs.c:160-212`): what typing `byte` at `at`
-/// does. Answers (action, closer).
+// The line-local lexical guard is deliberately independent of syntax
+// settling: an unfinished string is precisely where it must work.
+fn quote_unbalanced(tb: text.TextBuf, lo: int, at: int, quote: int) -> (bool, bool) {
+    var open = false
+    var escaped = false
+    var p = lo
+    while p < at {
+        let ch = byte_at(tb, p)
+        if escaped {
+            escaped = false
+        } else if ch == 92 {
+            escaped = true
+        } else if ch == quote {
+            // An apostrophe in a word is not the start of a string, but
+            // an open string may end immediately after a word.
+            if open || quote != 39 || !word_byte(byte_at(tb, p - 1)) {
+                open = !open
+            }
+        }
+        p += 1
+    }
+    (open, escaped)
+}
+
+// Match only this bracket kind, ignoring escaped bytes and quoted text.
+// Unmatched closers before `at` do not belong to the right-hand context.
+fn bracket_unmatched(
+    tb: text.TextBuf,
+    start: int,
+    at: int,
+    end: int,
+    open: int,
+    close: int,
+) -> bool {
+    var depth = 0
+    var quote = 0
+    var escaped = false
+    var p = start
+    while p < end {
+        let ch = byte_at(tb, p)
+        if escaped {
+            escaped = false
+        } else if ch == 92 {
+            escaped = true
+        } else if quote != 0 {
+            if ch == quote { quote = 0 }
+        } else if ch == 34 || ch == 96 || ch == 39 && !word_byte(byte_at(tb, p - 1)) {
+            quote = ch
+        } else if ch == open {
+            depth += 1
+        } else if ch == close {
+            if depth != 0 {
+                depth -= 1
+            } else if p >= at {
+                return true
+            }
+        }
+        p += 1
+    }
+    false
+}
+
+fn unmatched_right(tb: text.TextBuf, lo: int, at: int, end: int, open: int, close: int) -> bool {
+    if open != close {
+        // EOF and a suffix without this closer need no prefix scan.
+        // Otherwise balance the WHOLE line, including quote/escape state:
+        // in (|), ')' already belongs to the opener on the left.
+        var p = at
+        while p < end {
+            if byte_at(tb, p) == close {
+                return bracket_unmatched(tb, lo, at, end, open, close)
+            }
+            p += 1
+        }
+        return false
+    }
+    // The prefix quote guard already established balanced left context.
+    // Complete quoted pairs on the right must not suppress a new pair.
+    var odd = false
+    var escaped = false
+    var p = at
+    while p < end {
+        let ch = byte_at(tb, p)
+        if escaped {
+            escaped = false
+        } else if ch == 92 {
+            escaped = true
+        } else if ch == close {
+            let contraction = close == 39 &&
+                word_byte(byte_at(tb, p - 1)) &&
+                word_byte(byte_at(tb, p + 1))
+            if odd || !contraction { odd = !odd }
+        }
+        p += 1
+    }
+    odd
+}
+
+/// `yew_pairs_decide` (`pairs.c:160-212`), with yew's context guards:
+/// remembered skip; closing/escaped quote; word on left; text on right;
+/// unmatched closer on right; syntax exclusion; otherwise open a pair.
+/// Answers (action, closer).
 pub fn pairs_decide(mut b: Buffer, autopair: bool, at: int, byte_value: int) -> (int, int) {
     if !b.resident || !pairs_interesting(byte_value) || !autopair {
         return (PAIR_LITERAL, 0)
@@ -172,7 +275,28 @@ pub fn pairs_decide(mut b: Buffer, autopair: bool, at: int, byte_value: int) -> 
     if close < 0 {
         return (PAIR_LITERAL, 0)
     }
-    if close == byte_value && at != 0 && word_byte(byte_at(b.ec.tb, at - 1)) {
+    let line = text.textbuf_line_of(b.ec.tb, at as text.ByteOff)
+    let span = text.textbuf_line_span(b.ec.tb, line)
+    if close == byte_value {
+        let (unbalanced, escaped) = quote_unbalanced(b.ec.tb, span.lo, at, byte_value)
+        if unbalanced || escaped || at != 0 && word_byte(byte_at(b.ec.tb, at - 1)) {
+            return (PAIR_LITERAL, 0)
+        }
+    }
+    let next = byte_at(b.ec.tb, at)
+    if next >= 0 &&
+        next != 9 &&
+        next != 10 &&
+        next != 13 &&
+        next != 32 &&
+        next != 46 &&
+        next != 41 &&
+        next != 93 &&
+        next != 125 &&
+        next != close {
+        return (PAIR_LITERAL, 0)
+    }
+    if unmatched_right(b.ec.tb, span.lo, at, span.hi, byte_value, close) {
         return (PAIR_LITERAL, 0)
     }
     if in_string_or_comment(mut b, at) {
