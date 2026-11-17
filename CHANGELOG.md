@@ -10,8 +10,8 @@ The format follows Keep a Changelog; the port has no release yet.
 - `wolf lsp` takes the whole text on every change, so each key sent 42 KB
   of a 40 KB file and started one analysis, about five a second while
   typing. A server that syncs the whole text is now sent the document at
-  once for the first edit after a pause (250 ms), then when the typing
-  has been quiet for 250 ms, and at the latest a second after the first
+  once for the first edit after a pause (500 ms), then when the typing
+  has been quiet for 500 ms, and at the latest a second after the first
   held edit. Requests, saves and closes still send first; a server that
   takes incremental changes keeps its per-turn flush. The loop's wait ends
   by the held edit's deadline.
