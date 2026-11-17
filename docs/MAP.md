@@ -1253,6 +1253,23 @@ own. Any changed C golden is separately listed and pinned in
   split and one-byte feeds, including modified arrows and malformed
   Linux sequences. This is an input alias, not a new binding.
 
+What the port adds or intentionally changes relative to sagitta. Original C
+goldens are never rewritten; any changed visual expectation is named through
+the pinned divergence mechanism. Each extension has rows of its own.
+
+- **Selection visibility and Shift mouse capture** (`src/edit/draw.lu`,
+  `src/term/input.lu`, `src/term/tty.lu`): 16-color and monochrome selection
+  have a reverse-video floor; equal styles receive visible emphasis; empty
+  ranges mark their boundary without selecting bytes. Selection follows
+  search/diagnostic backgrounds and precedes secondary cursors. The input
+  setup requests XTSHIFTESCAPE and all shared restore blobs reset it.
+  Rows: `src/edit_selection_visibility_test.lu` and the rendering cases in
+  `tests/selection/run.py`. The other selection contracts remain literal
+  reds until their implementation stages; the observer and physical-census
+  driver have independent tests. The protocol is documented in
+  [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html);
+  application overrides can be forbidden by terminal configuration.
+
 - **`ed.keys`, the keys help** (yw15, `src/edit/keyshelp.lu`): every
   mode's bindings in the list picker (`PICK_HOST_KEYS`), each row its
   mode, keys, command, help and, for a binding the port refuses, the

@@ -3,8 +3,7 @@
 yew — a modal terminal editor ("tmux and vim had a baby":
 C11 + POSIX, zero dependencies, 218 KLOC at
 [tenseleyFlow/sagitta](https://github.com/tenseleyFlow/sagitta), with
-its scripting language Fletch) — ported to wolf, **oracle-tested with
-explicit interaction improvements**, so
+its scripting language Fletch) — ported to wolf, oracle-tested with documented UI differences, so
 that [PAX](https://github.com/wolffe-lang/pax)'s console has an editor
 built in its own language and wolf has its largest real program. Track
 12 of the planning repo (`sprints/yew/index.md`, ruling #89).
@@ -12,13 +11,15 @@ built in its own language and wolf has its largest real program. Track
 ## The oracle
 
 C yew built from the commit in `sagitta.pin` is the oracle. The wolf
-binary is held to C yew's own tests, unchanged: its PTY goldens
+binary is held to C yew's own suites with their original expected results: its PTY goldens
 (`tests/pty/runner --yew <binary>`), script, Fletch, syntax and torture
 suites. `tools/oracle` fetches and builds it; `tools/goldens --yew
 <binary>` runs its suites against any binary and prints one
 `pass/fail/skip` line per suite with a diff per failure. A golden that
-disagrees with the port is a STOP and a ruling, never a golden edit; no
-sagitta change is made here. Explicitly approved differences are listed in
+disagrees with the port requires an explicit decision, never an edit to the
+original golden or C editor. The copied test VT alone has a
+[digest-pinned non-visual protocol extension](tests/oracle-vt/README.md) for
+Shift mouse capture. Explicitly approved visual differences are listed in
 `tools/goldens-divergences.txt`: each names the port's expected snapshot and
 pins the unchanged C golden's SHA-256. The harness prints each divergence
 by name; a changed C golden requires re-evaluation. Fletch stays Fletch: its scripts, data
@@ -131,6 +132,24 @@ the row above and wraps at the top to the true last row, beyond the visible
 page if necessary. Up before entering the table still walks history.
 Down at the bottom still returns focus to the command line, keeping the
 last candidate.
+
+## Selection display
+
+Selections use the theme's `sel` role, with reverse video as the 16-color and
+monochrome floor. An equal text/selection style receives additional emphasis.
+Selection is painted after search and diagnostic backgrounds and styles both
+cells of a wide glyph. An armed empty selection marks its insertion boundary
+without adding any bytes to the selected range.
+
+When mouse reporting starts, yew requests Shift-modified reports with
+XTSHIFTESCAPE (`CSI > 1 s`) and restores the default handling (`CSI > 0 s`)
+when leaving the terminal, including suspend and fatal restoration. A terminal
+can forbid that request; right-click and keyboard commands remain available.
+`YEW_MOUSE=0` disables the request along with mouse reporting.
+
+The broader selection-mode redesign has held contracts in
+[`tests/selection/README.md`](tests/selection/README.md); their remaining reds
+are not a claim that new clipboard or cursor behavior is implemented.
 
 ## Keys
 
