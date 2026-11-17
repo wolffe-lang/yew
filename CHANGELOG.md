@@ -5,6 +5,13 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw25 — a diagnostics publication repaints its rows (2026-11-17)
+
+- Every publication set a full repaint. It now damages the rows the old
+  and the new diagnostics touch (gutter sign and underline) and the
+  footer. A wrapped view, a split, a panel, or another buffer in the
+  window keeps the full repaint.
+- Rows: `src/edit_lsp_diag_damage_test.lu`.
 ### Editing comfort (2026-11-15)
 
 - Backticks auto-pair in every filetype. An unbalanced quote before the
