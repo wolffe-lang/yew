@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""nested-open-row: `:!yew PATH` opens in the running editor (yew#129).
+
+    python3 -I tools/nested-open-row YEW_BIN [--keep DIR] [--case NAME]...
+                                     [--tabs N] [--term TERM] [--list]
+
+Every case runs yew in a pseudo-terminal, 24 by 80, with a scratch HOME
+(and XDG directories under it), SHELL=/bin/sh, YEW_LOG a scratch file at
+the info level, and a workspace of N files (default 26) plus
+`paths_test.txt` (`.txt`, which no language server serves: a `.lu` file
+starts `wolf lsp`, which the host may lack, and its failure is reported
+on every pass of the loop, yew#127, over the message line this row
+reads). The seed: `yew` with every file (the workspace's first
+start), `:q`, then `yew` with no file (a resume, as a day's editor
+starts), so the first editor holds N + 2 tabs: the untitled buffer a
+resume keeps and the N + 1 files. Each case then types its `:` lines into
+that editor, one at a time, waiting for the screen to settle, and reads:
+
+  - the workspace's saved state (`tabs`' records, `active_tab`), after the
+    debounced save;
+  - yew's log: the restores (`tab record(s) dropped` and the `workspace
+    state` lines) and the ownership lines;
+  - the processes running this yew binary below the row (`/proc`): a
+    second editor is one more of them.
+
+The cases (`--case`, repeatable; every case by default):
+
+  newdir      the owner's lines: `:!mkdir identity`, `:!yew
+              identity/identity.txt`, `:!touch identity_test.txt`, `:!yew
+              identity_test.txt`. Both files are tabs of the first editor;
+              it keeps every tab; no second editor starts.
+  cd          `:!mkdir sub`, `:!cd sub`, `:!touch x.txt`, `:!yew x.txt`: the
+              operand is the session's, so the tab is `sub/x.txt`.
+  refuse      `:!yew sub` (a directory), `:!yew $HOME/x.txt` (a word the
+              shell must expand), `:!yew --clean x.txt` (an editor option): each is
+              refused by name on the message line, no job runs it, and
+              no yew starts.
+  passthru    `:!yew --version`: not an editor start, so it still runs in
+              the session (its job buffer holds `yew `).
+  bangbang    `:!!yew identity.txt`: the terminal handed to a second
+              editor in the same workspace. It logs that pid N owns the
+              state and saves nothing (the saved state after it quits is
+              the one before it started, the lease still the first's);
+              after the first quits, its tabs are the saved state.
+  reader      a second editor started beside the first in another
+              terminal is a reader: it says so, and saves nothing while the
+              first runs or after; once the first quits (its tabs saved),
+              a third editor owns the state, and the reader's quit leaves
+              the third's state as it was.
+  stale       a lease and an owner record naming pid 1 (alive, and no
+              editor: a pid a reboot gave to another program) before the
+              resume: the editor owns the state, logs no owner, and its
+              pid is the lease.
+  dropped     the resume's untitled tab is not logged as a dropped
+              record, and a saved `active_tab` names a saved tab.
+
+One line per check, `FAIL <case>_<check>` for each red, then
+`nested-open-row: GREEN` or `nested-open-row: RED` (exit 1). An editor a
+case is done with that does not quit is a red of its own (`<case>_quits`,
+`bangbang_first_quits`, `reader_first_quits`, ...), and the case stops
+there. Exit 2 when the row cannot run (no saved state, a seeding editor
+that does not quit) and nothing is red; every red is printed by name
+first, whatever stopped the row.
+
+yew's processes are only read (`/proc`) and spoken to through their
+terminals; none is ever signalled. Each `:` line waits to see the command
+line drawn before it is typed: an ESC read together with the `:` (a
+loop busy with a job reads both at once) is Alt-:, and the line would go
+to L mode as keys. A line's answer (a refusal, a job buffer, a version
+line) is waited for on the screen, up to 8 s, not taken from a quiet
+screen: a stalled loop draws nothing either. A refusal is known by its
+reason, since yew redraws only the cells that change. When a row is red
+the scratch directory (each case's `pty.raw`, log and state) is kept and
+named, `--keep` or not. Each editor quits by `:q!` (a plain `:q` first hides a
+focused job's output), tried again until it exits or 12 s pass; one
+still running then has its terminal closed.
+"""
+import argparse
+import fcntl
+import glob
+import os
+import pty
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+
+ROWS, COLS = 24, 80
+QUIET_S = 0.5
+SAVE_WAIT_S = 2.8
+CASES = ["newdir", "cd", "refuse", "passthru", "bangbang", "reader", "stale", "dropped"]
+# yew draws its command line's `:` at the last row's first column; L mode
+# draws the mode there (` L `), so this is the command line opening.
+CMDLINE_OPEN = re.compile(rb"\x1b\[%d;1H(?:\x1b\[[0-9;]*m)*:" % ROWS)
+
+
+class Cant(Exception):
+    """The row cannot run: exit 2."""
+
+
+class Session:
+    def __init__(self, yew, cwd, env, argv, log):
+        self.raw = bytearray()
+        self.log = log
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(cwd)
+            os.execve(yew, [yew] + argv, env)
+        self.pid, self.fd = pid, fd
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+        self.status = None
+
+    def pump(self, seconds):
+        end = time.monotonic() + seconds
+        got = 0
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return got
+            r, _, _ = select.select([self.fd], [], [], left)
+            if not r:
+                return got
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                return got
+            if not data:
+                return got
+            self.raw += data
+            self.log.write(data)
+            got += len(data)
+
+    def settle(self, quiet=QUIET_S, limit=10.0):
+        start = time.monotonic()
+        while time.monotonic() - start < limit:
+            if self.pump(quiet) == 0:
+                return True
+        return False
+
+    def send(self, data):
+        os.write(self.fd, data)
+
+    def open_cmdline(self, tries=3, wait=3.0):
+        """ESC, then `:` until the command line is drawn. An ESC the
+        editor reads together with the `:` is Alt-: (a busy loop reads
+        both at once), and the line typed after it would land in L mode as
+        keys; so each try waits to see the command line drawn."""
+        for _ in range(tries):
+            if not self.alive():
+                return False
+            self.send(b"\x1b")
+            self.pump(0.3)
+            mark = len(self.raw)
+            self.send(b":")
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                self.pump(0.05)
+                if CMDLINE_OPEN.search(self.raw, mark):
+                    return True
+        return False
+
+    def ex(self, line, settle=QUIET_S):
+        """Type `:LINE` and Enter in L mode; False (nothing typed) when the
+        command line never opened."""
+        if not self.open_cmdline():
+            print(f"  the command line did not open for :{line}", flush=True)
+            return False
+        for i in range(0, len(line), 16):
+            self.send(line[i:i + 16].encode())
+            self.pump(0.02)
+        self.send(b"\r")
+        self.settle(settle)
+        return True
+
+    def since(self, mark):
+        return bytes(self.raw[mark:])
+
+    def wait_for(self, mark, needles, limit=8.0):
+        """Until one of `needles` is on the screen since `mark`, within
+        `limit` seconds. A quiet screen is not an answer: a loop that
+        stalls draws nothing either."""
+        end = time.monotonic() + limit
+        while True:
+            got = self.since(mark)
+            if any(n in got for n in needles):
+                return True
+            if time.monotonic() >= end:
+                return False
+            self.pump(0.05)
+
+    def alive(self):
+        if self.status is not None:
+            return False
+        pid, status = os.waitpid(self.pid, os.WNOHANG)
+        if pid == self.pid:
+            self.status = status
+            return False
+        return True
+
+    def quit(self, limit=12.0):
+        """`:q!` until the editor exits (a plain `:q` first hides a focused
+        job's output), within `limit` seconds. False when it is still
+        running: its terminal is then closed (a hangup), never signalled."""
+        end = time.monotonic() + limit
+        while self.alive() and time.monotonic() < end:
+            if self.open_cmdline(tries=1):
+                self.send(b"q!\r")
+            gone = time.monotonic() + 3.0
+            while time.monotonic() < min(gone, end):
+                self.pump(0.05)
+                if not self.alive():
+                    break
+            # A modified buffer asks; the row's buffers are never modified.
+        quit = not self.alive()
+        os.close(self.fd)
+        return quit
+
+
+def env_for(scratch, term, yew=None):
+    home = os.path.join(scratch, "home")
+    for d in ("", ".config", ".local/state", ".local/share", ".cache", "tmp"):
+        os.makedirs(os.path.join(home, d), exist_ok=True)
+    return {
+        "HOME": home,
+        "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+        "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
+        "XDG_DATA_HOME": os.path.join(home, ".local", "share"),
+        "XDG_CACHE_HOME": os.path.join(home, ".cache"),
+        "TMPDIR": os.path.join(home, "tmp"),
+        # The binary under test is the `yew` a `:!` line finds.
+        "PATH": (os.path.dirname(yew) + ":" if yew else "") + os.environ.get("PATH", "/usr/bin:/bin"),
+        "SHELL": "/bin/sh",
+        "TERM": term,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "YEW_TTY_PROBE": "0",
+        "YEW_CLIPBOARD": "none",
+        "YEW_COLORS": "16",
+        "YEW_LOG": os.path.join(scratch, "yew.log"),
+        "YEW_LOG_LEVEL": "info",
+        "COLUMNS": str(COLS),
+        "LINES": str(ROWS),
+    }
+
+
+def state_dir(env):
+    found = glob.glob(os.path.join(env["XDG_STATE_HOME"], "yew", "workspaces", "*", "state.fl"))
+    return os.path.dirname(found[0]) if len(found) == 1 else None
+
+
+TAB_ID = re.compile(r"^      id: (\d+),$")
+TAB_PATH = re.compile(r'^      path: (nil|"(.*)"),$')
+
+
+def read_state(env):
+    """(tab records [(id, path or None)], active_tab, lock pid) or None."""
+    d = state_dir(env)
+    if d is None:
+        return None
+    text = open(os.path.join(d, "state.fl"), encoding="utf-8", errors="replace").read().splitlines()
+    tabs, active, inside, rid = [], None, False, None
+    for line in text:
+        if line == "  tabs: [":
+            inside = True
+            continue
+        if inside and line == "  ],":
+            inside = False
+            continue
+        if inside:
+            m = TAB_ID.match(line)
+            if m:
+                rid = int(m.group(1))
+                continue
+            m = TAB_PATH.match(line)
+            if m and rid is not None:
+                tabs.append((rid, None if m.group(1) == "nil" else m.group(2)))
+                rid = None
+            continue
+        m = re.match(r"^  active_tab: (\d+),$", line)
+        if m:
+            active = int(m.group(1))
+    lock = None
+    try:
+        lock = int(open(os.path.join(d, "lock")).read().strip() or "0")
+    except (OSError, ValueError):
+        pass
+    return tabs, active, lock
+
+
+def log_lines(env):
+    try:
+        return open(env["YEW_LOG"], encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return []
+
+
+def yews_below(root_pid, yew):
+    """Pids running `yew` as an editor (by /proc/PID/exe; not its terminal
+    guard, `--guard`, nor the session's `--yew-env0`) that descend from
+    root_pid."""
+    want = os.path.realpath(yew)
+    parent, exe = {}, {}
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                parent[int(p)] = int(f.read().rsplit(")", 1)[1].split()[1])
+            exe[int(p)] = os.path.realpath(f"/proc/{p}/exe")
+        except OSError:
+            continue
+    out = []
+    for p, e in exe.items():
+        if e != want:
+            continue
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if len(argv) > 1 and argv[1] in (b"--guard", b"--yew-env0"):
+            continue
+        q, hops = p, 0
+        while q in parent and hops < 64:
+            if q == root_pid:
+                out.append(p)
+                break
+            q = parent[q]
+            hops += 1
+    return sorted(out)
+
+
+class Row:
+    def __init__(self, args):
+        self.args = args
+        self.reds = []
+        self.lines = []
+
+    def check(self, case, name, ok, detail):
+        self.lines.append(f"{case}: {name}: {'ok' if ok else 'RED'} ({detail})")
+        print(self.lines[-1], flush=True)
+        if not ok:
+            self.reds.append(f"{case}_{name}")
+
+
+def quits(row, case, s, who="quits"):
+    """A row of its own: an editor the case is done with quits by `:q!`.
+    False (the case stops there) when it does not."""
+    ok = s.quit()
+    row.check(case, who, ok, "quit by :q!" if ok else "still running after :q!; its terminal was closed")
+    return ok
+
+
+def seed(yew, scratch, args, log):
+    env = env_for(scratch, args.term, yew)
+    ws = os.path.join(scratch, "ws")
+    os.makedirs(ws)
+    names = [f"f{i:02d}.txt" for i in range(1, args.tabs + 1)] + ["paths_test.txt"]
+    for n in names:
+        with open(os.path.join(ws, n), "w") as f:
+            f.write(f"// {n}\nfn main() {{}}\n")
+    s = Session(yew, ws, env, names, log)
+    s.settle(1.0)
+    s.pump(SAVE_WAIT_S)
+    if not s.quit():
+        raise Cant("the seeding editor did not quit")
+    st = read_state(env)
+    if st is None or len(st[0]) < args.tabs:
+        raise Cant(f"the seed saved no state of {args.tabs}+ tabs: {st}")
+    first = Session(yew, ws, env, [], log)
+    first.settle(1.0)
+    first.pump(SAVE_WAIT_S)
+    return env, ws, first, len(names)
+
+
+def tab_paths(st):
+    return [p for _, p in st[0]]
+
+
+def case_newdir(row, yew, scratch, args, log):
+    env, ws, s, n = seed(yew, scratch, args, log)
+    before = len([l for l in log_lines(env) if "tab record(s) dropped" in l or "workspace state" in l])
+    seen = set()
+    for line in ("!mkdir identity", "!yew identity/identity.txt", "!touch identity_test.txt", "!yew identity_test.txt"):
+        s.ex(line)
+        seen.update(yews_below(os.getpid(), yew))
+        s.pump(0.3)
+        seen.update(yews_below(os.getpid(), yew))
+    s.pump(SAVE_WAIT_S)
+    st = read_state(env)
+    paths = tab_paths(st)
+    a = os.path.join(ws, "identity", "identity.txt")
+    b = os.path.join(ws, "identity_test.txt")
+    row.check("newdir", "opened_here", a in paths and b in paths, f"{len(paths)} saved tabs, identity tabs {a in paths} {b in paths}")
+    row.check("newdir", "kept_tabs", len(paths) >= n + 3, f"{len(paths)} saved tabs, {n} files seeded")
+    after = [l for l in log_lines(env) if "tab record(s) dropped" in l or "workspace state" in l]
+    row.check("newdir", "one_editor", seen == {s.pid} and len(after) == before,
+              f"yew pids {sorted(seen)}, first {s.pid}; state lines {before} -> {len(after)}")
+    if not quits(row, "newdir", s):
+        return
+    st = read_state(env)
+    row.check("newdir", "saved_after_quit", len(tab_paths(st)) >= n + 3, f"{len(tab_paths(st))} saved tabs")
+
+
+def case_cd(row, yew, scratch, args, log):
+    env, ws, s, n = seed(yew, scratch, args, log)
+    for line in ("!mkdir sub", "!cd sub", "!touch x.txt", "!yew x.txt"):
+        s.ex(line)
+    s.pump(SAVE_WAIT_S)
+    # The quit's save is the state of record: the debounced one may come
+    # before the last line's tab.
+    if not quits(row, "cd", s):
+        return
+    st = read_state(env)
+    want = os.path.join(ws, "sub", "x.txt")
+    active = [p for i, p in st[0] if i == st[1]]
+    row.check("cd", "session_cwd", active == [want], f"active {active}, wanted {want}")
+    row.check("cd", "no_root_file", os.path.join(ws, "x.txt") not in tab_paths(st), "no tab for the root's x.txt")
+
+
+def case_refuse(row, yew, scratch, args, log):
+    env, ws, s, n = seed(yew, scratch, args, log)
+    os.makedirs(os.path.join(ws, "sub"))
+    # Each line and the reason its refusal gives. The check reads the
+    # reason, not `:!yew`: yew redraws only the cells that change, and the
+    # message's first cells can match the command line typed under it.
+    for line, word, why in (("!yew sub", "sub", b"sub is a directory"),
+                            ("!yew $HOME/x.txt", "$HOME/x.txt", b"the shell would expand $HOME/x.txt"),
+                            ("!yew --clean x.txt", "--clean", b"an option starts a new editor")):
+        mark = len(s.raw)
+        seen = set()
+        s.ex(line, settle=0.3)
+        seen.update(yews_below(os.getpid(), yew))
+        # The editor answers with a refusal or a job buffer; wait for one.
+        answered = s.wait_for(mark, (b"not opened here", b"*job:"))
+        seen.update(yews_below(os.getpid(), yew))
+        s.settle(0.6)
+        seen.update(yews_below(os.getpid(), yew))
+        out = s.since(mark)
+        named = b"not opened here" in out and why in out
+        jobbuf = b"*job:" in out
+        tag = word.strip("$-/").replace("/", "_").replace(".", "_").lower()
+        row.check("refuse", f"{tag}_named", named,
+                  "the message names the refusal" if named
+                  else "no refusal on the screen" if answered else "no answer on the screen within 8 s")
+        row.check("refuse", f"{tag}_no_job", not jobbuf and seen == {s.pid},
+                  f"job buffer {jobbuf}, yew pids {sorted(seen)}")
+    quits(row, "refuse", s)
+
+
+def case_passthru(row, yew, scratch, args, log):
+    env, ws, s, n = seed(yew, scratch, args, log)
+    want = subprocess.run([yew, "--version"], capture_output=True).stdout.splitlines()[0]
+    mark = len(s.raw)
+    s.ex("!yew --version", settle=1.0)
+    s.wait_for(mark, (want,))
+    out = s.since(mark)
+    row.check("passthru", "version_runs", b"*job:" in out and want in out,
+              f"a job buffer with {want.decode(errors='replace')!r}")
+    quits(row, "passthru", s)
+
+
+def case_bangbang(row, yew, scratch, args, log):
+    env, ws, s, n = seed(yew, scratch, args, log)
+    with open(os.path.join(ws, "identity.txt"), "w") as f:
+        f.write("// identity\n")
+    before = tab_paths(read_state(env))
+    lines0 = len(log_lines(env))
+    s.ex("!!yew identity.txt", settle=1.5)
+    s.pump(SAVE_WAIT_S)
+    nested = [p for p in yews_below(os.getpid(), yew) if p != s.pid]
+    new = log_lines(env)[lines0:]
+    owned = [l for l in new if f"owned by pid {s.pid}" in l]
+    row.check("bangbang", "second_started", len(nested) == 1, f"nested yew pids {nested}")
+    row.check("bangbang", "second_is_reader", len(owned) == 1, owned[0] if owned else "no ownership line: " + " | ".join(new[-4:]))
+    # The nested editor quits; the first takes the terminal back.
+    s.ex("q!", settle=1.5)
+    s.pump(SAVE_WAIT_S)
+    st = read_state(env)
+    row.check("bangbang", "nested_saved_nothing", tab_paths(st) == before,
+              f"{len(tab_paths(st))} saved tabs after the nested quit, {len(before)} before it")
+    row.check("bangbang", "lock_is_first", st[2] == s.pid, f"lock {st[2]}, first {s.pid}")
+    if not quits(row, "bangbang", s, "first_quits"):
+        return
+    st = read_state(env)
+    row.check("bangbang", "saved_after_quit", len(tab_paths(st)) >= n + 1, f"{len(tab_paths(st))} saved tabs")
+
+
+def case_reader(row, yew, scratch, args, log):
+    env, ws, first, n = seed(yew, scratch, args, log)
+    lines0 = len(log_lines(env))
+    reader = Session(yew, ws, env, [], log)
+    reader.settle(1.0)
+    new = log_lines(env)[lines0:]
+    row.check("reader", "reader_told", any(f"owned by pid {first.pid}" in l for l in new), " | ".join(new[-3:]))
+    with open(os.path.join(ws, "late.txt"), "w") as f:
+        f.write("// late\n")
+    late = os.path.join(ws, "late.txt")
+    reader.ex("e late.txt", settle=1.0)
+    reader.pump(SAVE_WAIT_S)
+    st = read_state(env)
+    row.check("reader", "reader_saves_nothing", late not in tab_paths(st) and st[2] == first.pid,
+              f"late.txt saved {late in tab_paths(st)}, lock {st[2]}, first {first.pid}")
+    if not quits(row, "reader", first, "first_quits"):
+        quits(row, "reader", reader, "reader_quits")
+        return
+    st = read_state(env)
+    row.check("reader", "first_saved", len(tab_paths(st)) >= n + 1 and late not in tab_paths(st),
+              f"{len(tab_paths(st))} saved tabs, late.txt {late in tab_paths(st)}")
+    lines1 = len(log_lines(env))
+    third = Session(yew, ws, env, [], log)
+    third.settle(1.0)
+    third.pump(SAVE_WAIT_S)
+    new = log_lines(env)[lines1:]
+    st = read_state(env)
+    row.check("reader", "third_owns", not any("owned by pid" in l for l in new) and st[2] == third.pid,
+              f"lock {st[2]}, third {third.pid}; " + " | ".join(new[-3:]))
+    if not quits(row, "reader", reader, "reader_quits"):
+        quits(row, "reader", third, "third_quits")
+        return
+    st2 = read_state(env)
+    row.check("reader", "reader_quit_saves_nothing", tab_paths(st2) == tab_paths(st) and late not in tab_paths(st2),
+              f"{len(tab_paths(st2))} saved tabs after the reader quit, late.txt {late in tab_paths(st2)}")
+    quits(row, "reader", third, "third_quits")
+
+
+def case_stale(row, yew, scratch, args, log):
+    env = env_for(scratch, args.term, yew)
+    ws = os.path.join(scratch, "ws")
+    os.makedirs(ws)
+    names = [f"f{i:02d}.txt" for i in range(1, args.tabs + 1)] + ["paths_test.txt"]
+    for n in names:
+        with open(os.path.join(ws, n), "w") as f:
+            f.write(f"// {n}\nfn main() {{}}\n")
+    s = Session(yew, ws, env, names, log)
+    s.settle(1.0)
+    s.pump(SAVE_WAIT_S)
+    if not s.quit():
+        raise Cant("stale: the seeding editor did not quit")
+    d = state_dir(env)
+    if d is None:
+        raise Cant("stale: the seed saved no state")
+    for name in ("lock", "lock.owner"):
+        with open(os.path.join(d, name), "w") as f:
+            f.write("1\n")
+    lines0 = len(log_lines(env))
+    e = Session(yew, ws, env, [], log)
+    e.settle(1.0)
+    e.ex("e paths_test.txt", settle=0.5)
+    e.pump(SAVE_WAIT_S)
+    new = log_lines(env)[lines0:]
+    st = read_state(env)
+    row.check("stale", "owns_the_state", not any("owned by pid 1;" in l for l in new) and st[2] == e.pid,
+              f"lock {st[2]}, editor {e.pid}; " + " | ".join(new[-3:]))
+    quits(row, "stale", e)
+
+
+def case_dropped(row, yew, scratch, args, log):
+    env, ws, s, n = seed(yew, scratch, args, log)
+    if not quits(row, "dropped", s):
+        return
+    st = read_state(env)
+    ids = [i for i, _ in st[0]]
+    row.check("dropped", "active_saved", st[1] in ids, f"active_tab {st[1]}, record ids {ids[:4]}...{ids[-2:]}")
+    lines0 = len(log_lines(env))
+    again = Session(yew, ws, env, [], log)
+    again.settle(1.0)
+    new = log_lines(env)[lines0:]
+    drops = [l for l in new if "tab record(s) dropped" in l]
+    row.check("dropped", "no_drop_logged", not drops, drops[0] if drops else "no dropped record logged")
+    quits(row, "dropped", again, "second_quits")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("yew")
+    ap.add_argument("--keep")
+    ap.add_argument("--case", action="append", choices=CASES)
+    ap.add_argument("--tabs", type=int, default=26)
+    ap.add_argument("--term", default="xterm-256color")
+    args = ap.parse_args()
+    yew = os.path.realpath(args.yew)
+    cases = args.case or CASES
+    top = args.keep or tempfile.mkdtemp(prefix="nested-open-row.")
+    os.makedirs(top, exist_ok=True)
+    row = Row(args)
+    status = 0
+    if not os.path.isdir("/proc/self/fd"):
+        print("nested-open-row: cannot run: the row reads /proc (Linux)", flush=True)
+        sys.exit(2)
+    try:
+        for c in cases:
+            scratch = os.path.join(top, c)
+            if os.path.exists(scratch):
+                shutil.rmtree(scratch)
+            os.makedirs(scratch)
+            with open(os.path.join(scratch, "pty.raw"), "wb") as log:
+                globals()["case_" + c](row, yew, scratch, args, log)
+            for l in log_lines(env_for(scratch, args.term)):
+                print(f"  log {c}: {l}", flush=True)
+    except Cant as e:
+        print(f"nested-open-row: cannot run: {e}", flush=True)
+        status = 2
+    finally:
+        if not args.keep and not row.reds:
+            shutil.rmtree(top, ignore_errors=True)
+        elif not args.keep:
+            print(f"nested-open-row: a red row's scratch (pty bytes, logs, state) is kept at {top}", flush=True)
+    # A red row is printed by name whatever stopped the row; a row that
+    # could not run with nothing red is exit 2, never a pass.
+    for r in row.reds:
+        print(f"FAIL {r}", flush=True)
+    if row.reds:
+        print("nested-open-row: RED", flush=True)
+        sys.exit(1)
+    if status == 2:
+        sys.exit(2)
+    print("nested-open-row: GREEN", flush=True)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
