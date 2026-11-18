@@ -323,5 +323,16 @@ r = subprocess.run(["bash", RED], capture_output=True, text=True, env=clean_env(
 say(r.returncode != 0, "L5 the script refuses to run without REPO, WORKFLOW and RUN_URL")
 say(re.search(r"^name: ci$", wf, re.M) is not None, "L5 the workflow's name is ci, the title's")
 
+# L7: the hosted runner's image moves under "latest" (ubuntu-26.04, glibc 2.43, broke
+# the oracle's docker trials, which run a host-built binary inside ubuntu:24.04).
+# No workflow and no planner leg may say ubuntu-latest.
+import glob
+stale = []
+for path in sorted(glob.glob(os.path.join(ROOT, ".github", "workflows", "*")) + [os.path.join(ROOT, "ci", "legs.py")]):
+    for n, line in enumerate(open(path, encoding="utf-8"), 1):
+        if "ubuntu-latest" in line:
+            stale.append("%s:%d" % (os.path.relpath(path, ROOT), n))
+say(not stale, "L7 no workflow or planner leg says ubuntu-latest, the runner image is pinned" + ("" if not stale else ": " + ", ".join(stale)))
+
 print("legs-test: %s" % ("PASS" if fails == 0 else "FAIL (%d)" % fails))
 sys.exit(1 if fails else 0)
