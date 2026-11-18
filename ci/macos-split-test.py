@@ -210,7 +210,7 @@ def main():
     # (twice per run), and the moved 2x gate dropped from oracle-cmdcomp.
     cmd_start = text.index("  oracle-cmdcomp:\n")
     linux_controls = [
-        (0, "        if: matrix.port && runner.os == 'macOS'\n        timeout-minutes: 60\n", "        if: matrix.port\n        timeout-minutes: 60\n"),
+        (0, "        if: matrix.port && runner.os == 'macOS'\n        timeout-minutes: 90\n", "        if: matrix.port\n        timeout-minutes: 90\n"),
         (cmd_start, "          PERF_PREBUILT=1 tools/run-perf-cmdcomp --trials 100\n", "          true\n"),
     ]
     for start, old, new in linux_controls:
