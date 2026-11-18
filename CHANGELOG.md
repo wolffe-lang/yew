@@ -5,6 +5,15 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### macOS oracle leg: a longer harness build cap and a slower pty quiet window (2026-11-18)
+
+- The macOS oracle leg's `build perf_cmdcomp harnesses` step has a 90-minute cap,
+  up from 60: twelve runs took 39 to 58 minutes and a trunk run was cut at 60
+  (#144).
+- The yw06 pty cases step sets `YEW_PTY_QUIET_SCALE=4`, as the goldens selftest
+  does, so `startup_multiple_files` waits longer for its picker on a slow runner
+  (#145). `ci/macos-split-test.py` holds both settings.
+
 ### CI runs on ubuntu-24.04, not ubuntu-latest (2026-11-18)
 
 - Every workflow job and the leg planner name `ubuntu-24.04`. `ubuntu-latest`
