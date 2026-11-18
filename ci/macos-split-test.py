@@ -63,6 +63,9 @@ MEASURED = {
     ("macos-fuzz", "against-c-1"): 0.8 + 55.1 + 16.5 + 3.7,
     ("macos-fuzz", "against-c-3"): 0.8 + 43.7,       # fuzz_panes, cut: a lower bound
 }
+# The macOS oracle leg builds the same harness (yew#144): 39 to 58 minutes on twelve
+# runs, and 60+ (cut) on trunk run 44206088511, so the cap must clear 58 by 30 %.
+MACOS_CMDCOMP_BUILD = 58.0
 CMDCOMP_BUILD = 60.2                                 # cut at the old 60: a lower bound
 
 
@@ -159,6 +162,13 @@ def validate(text):
     # The harness is built once per leg: oracle on macOS, oracle-cmdcomp on linux.
     built = [b for n, b in steps(oracle) if n == "build perf_cmdcomp harnesses (hard gate)"]
     assert len(built) == 1 and "if: matrix.port && runner.os == 'macOS'\n" in built[0], "linux harness built twice"
+    mcap = re.search(r"^        timeout-minutes: (\d+)$", built[0], re.M)
+    assert mcap is not None and int(mcap.group(1)) >= 1.3 * MACOS_CMDCOMP_BUILD, "the macOS harness build's cap"
+    # yew#145: startup_multiple_files snapshots 50 ms after the last output; the
+    # yw06 cases step waits four times as long, as tools/goldens-selftest does. This
+    # guards the setting only; it cannot show the flake gone on a slow runner.
+    yw06 = [b for n, b in steps(oracle) if n.startswith("goldens, campaign 05's workspace, finder and mouse")]
+    assert len(yw06) == 1 and "        env:\n          YEW_PTY_QUIET_SCALE: 4\n" in yw06[0], "the yw06 cases step's quiet scale"
     moved = [b for n, b in steps(cmdcomp) if n == "build perf_cmdcomp harnesses (hard gate)"]
     assert len(moved) == 1 and "tools/run-perf-cmdcomp --build-only\n" in moved[0]
     step_cap = re.search(r"^        timeout-minutes: (\d+)$", moved[0], re.M)
@@ -234,6 +244,18 @@ def main():
         pass
     else:
         raise AssertionError("control accepted regression: the harness build's cap at 60")
+    # yew#144: the macOS harness build's cap back at 60; yew#145: the scale removed.
+    old = "        if: matrix.port && runner.os == 'macOS'\n        timeout-minutes: 90\n"
+    assert old in text, old
+    controls = [text.replace(old, old.replace("90", "60"), 1),
+                text.replace("        env:\n          YEW_PTY_QUIET_SCALE: 4\n", "", 1)]
+    for broken in controls:
+        assert broken != text
+        try:
+            validate(broken)
+        except AssertionError:
+            continue
+        raise AssertionError("control accepted regression: the macOS cap at 60 or the quiet scale dropped")
     print("macos-split-test: seven campaigns, six measurements, five added jobs, the measured caps and ten negative controls PASS")
 
 
