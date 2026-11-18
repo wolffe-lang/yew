@@ -78,7 +78,7 @@ def plan(event=None):
 
 
 # The hosts before tl30: .github/workflows/ci.yml at trunk 9bd219c.
-U, M, A = "ubuntu-latest", "macos-latest", "ubuntu-24.04-arm"
+U, M, A = "ubuntu-24.04", "macos-latest", "ubuntu-24.04-arm"
 BEFORE = {
     "matrix_port": [{"os": U, "builds": True}, {"os": M, "builds": True}, {"os": A, "builds": False}],
     "matrix_oracle": [{"os": U, "ccs": "--cc clang --cc gcc", "port": True}, {"os": M, "ccs": "--cc clang", "port": True},
@@ -129,7 +129,7 @@ for j in JOBS:
 lg = blocks["legs"]
 say("        run: python3 ci/legs-test.py\n" in lg and 'run: python3 ci/legs.py --github-output "$GITHUB_OUTPUT"\n' in lg
     and lg.index("ci/legs-test.py") < lg.index("ci/legs.py --github-output") and "EVENT: ${{ github.event_name }}" in lg
-    and re.search(r"^    runs-on: ubuntu-latest$", lg, re.M) is not None,
+    and re.search(r"^    runs-on: ubuntu-24.04$", lg, re.M) is not None,
     "L4 the legs job runs this file, then plans from the event, on ubuntu")
 say(all(("      %s: ${{ steps.legs.outputs.%s }}\n" % (k, k)) in lg for k in BEFORE), "L4 the legs job declares each matrix")
 for j in ("port", "oracle"):
@@ -146,7 +146,7 @@ for j in ("port", "oracle"):
 UNIT_MEASURED_8 = 111
 un = blocks["unit"]
 ucap = re.search(r"^    timeout-minutes: (\d+)$", un, re.M)
-say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-latest$", un, re.M) is not None
+say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-24.04$", un, re.M) is not None
     and "        shard: [1, 2, 3, 4, 5, 6, 7, 8]\n" in un and "run: tools/check-test --shard ${{ matrix.shard }}/8\n" in un
     and "run: tools/check-test --native --shard ${{ matrix.shard }}/8\n" in un
     and "    name: unit (linux x86-64, shard ${{ matrix.shard }}/8)\n" in un
@@ -172,7 +172,7 @@ say(all("run: tools/build-fakeclip --cc " in b and b.index("tools/build-fakeclip
         for b in (un, mu)),
     "L4 unit and macos-unit build the fake clipboard tool first and check no clipboard row SKIPped for it last")
 fz = blocks["fuzz"]
-say("    needs: legs\n" in fz and re.search(r"^    runs-on: ubuntu-latest$", fz, re.M) is not None
+say("    needs: legs\n" in fz and re.search(r"^    runs-on: ubuntu-24.04$", fz, re.M) is not None
     and "        family: [port, port-2, against-c-1, against-c-2, against-c-3, against-c-4, against-c-5]\n" in fz
     and "        if: matrix.family != 'port' && matrix.family != 'port-2'\n        run: tools/oracle --cc gcc --build-only\n" in fz,
     "L4 fuzz needs the legs and runs seven fuzzer families on ubuntu, C's drivers built for five")
@@ -185,7 +185,7 @@ fuzz_names = re.findall(r"^      - name: (.*)$", fz, re.M)
 say(len(moved) == 13 and all(n in fuzz_names for n in moved),
     "L4 every step the port and oracle jobs leave on Linux is a fuzz step there (%d moved)" % len(moved))
 cc = blocks["checked-cases"]
-say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-latest$", cc, re.M) is not None
+say("    needs: legs\n" in cc and re.search(r"^    runs-on: ubuntu-24.04$", cc, re.M) is not None
     and "        shard: [1, 2, 3, 4]\n" in cc and not re.search(r"^\s+(os|include):", cc, re.M)
     and "run: python3 -I tools/check-test-cases --shard ${{ matrix.shard }}/4\n" in cc,
     "L4 checked-cases needs the legs and runs tools/check-test-cases in four shards on ubuntu")
@@ -196,8 +196,8 @@ fl = "run: tools/build-fakelsp --cc gcc\n"
 say(fl in cc and cc.index(fl) < cc.index("run: python3 -I tools/check-test-cases --shard"),
     "L4 checked-cases builds C's fake language server before its cases run")
 oc = blocks["oracle-cmdcomp"]
-say("    needs: legs\n" in oc and re.search(r"^    runs-on: ubuntu-latest$", oc, re.M) is not None
-    and "    if: ${{ contains(needs.legs.outputs.matrix_oracle, 'ubuntu-latest') }}\n" in oc
+say("    needs: legs\n" in oc and re.search(r"^    runs-on: ubuntu-24.04$", oc, re.M) is not None
+    and "    if: ${{ contains(needs.legs.outputs.matrix_oracle, 'ubuntu-24.04') }}\n" in oc
     and "          tools/run-perf-cmdcomp --build-only\n" in oc and "          PERF_PREBUILT=1 tools/run-perf-cmdcomp --trials 100\n" in oc,
     "L4 oracle-cmdcomp needs the legs and runs the linux oracle leg's perf_cmdcomp rows on ubuntu, where that leg runs")
 say(re.search(r"^  push:\n    branches: \[trunk\]\n", wf, re.M) is not None and re.search(r"^  pull_request:\s*$", wf, re.M) is not None
@@ -233,7 +233,7 @@ exit 0
 # depends on, or None).
 SLOWEST = {
     ("legs", None): 1,
-    ("port", "ubuntu-latest"): 66, ("port", "ubuntu-24.04-arm"): 57, ("port", "macos-latest"): 189,
+    ("port", "ubuntu-24.04"): 66, ("port", "ubuntu-24.04-arm"): 57, ("port", "macos-latest"): 189,
     ("unit", None): 111,
     ("macos-unit", None): 102,
     ("fuzz", "port"): 120,            # cut on 42996771451: its one long step, 115.2 when cut
@@ -244,7 +244,7 @@ SLOWEST = {
     ("fuzz", "against-c-4"): 65,      # fuzz_panes
     ("fuzz", "against-c-5"): 56.1,    # fuzz_groups 55.1 (cut at 52.3 once) and the C build
     ("checked-cases", None): 45,
-    ("oracle", "ubuntu-latest"): 231, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 198,
+    ("oracle", "ubuntu-24.04"): 231, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 198,
     ("oracle-cmdcomp", None): 63,
     ("macos-fuzz", "against-c-1"): 75,
     ("macos-fuzz", "against-c-2"): 64.8,  # fuzz_tabs 57.1, fuzz_gitignore 6.9 and the C build
@@ -276,7 +276,7 @@ for j in JOBS:
     if fam:
         values = [x.strip() for x in fam.group(1).split(",")]
     elif j in ("port", "oracle"):
-        values = ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest"]
+        values = ["ubuntu-24.04", "ubuntu-24.04-arm", "macos-latest"]
     for v in values:
         key = (j, v)
         if key not in SLOWEST:

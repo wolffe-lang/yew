@@ -165,8 +165,8 @@ def validate(text):
     assert "python3 -I tools/check-perf-cmdcomp-build\n" in moved[0] and step_cap is not None
     assert int(step_cap.group(1)) >= 1.3 * CMDCOMP_BUILD and int(step_cap.group(1)) == 90
     assert job_cap(cmdcomp) >= int(step_cap.group(1)) + 15 + 10, "the job's cap holds the build, the gate and setup"
-    assert "    needs: legs\n" in cmdcomp and "    runs-on: ubuntu-latest\n" in cmdcomp
-    assert "    if: ${{ contains(needs.legs.outputs.matrix_oracle, 'ubuntu-latest') }}\n" in cmdcomp
+    assert "    needs: legs\n" in cmdcomp and "    runs-on: ubuntu-24.04\n" in cmdcomp
+    assert "    if: ${{ contains(needs.legs.outputs.matrix_oracle, 'ubuntu-24.04') }}\n" in cmdcomp
     assert "actions/upload-artifact@v4" in oracle and "if-no-files-found: error" in oracle
     assert "target/perf-cmdcomp/perf-cmdcomp" in oracle and "target/oracle/sagitta" in oracle
     assert "tar -czf target/macos-oracle.tar.gz" in oracle

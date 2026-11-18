@@ -39,12 +39,12 @@ import os
 import sys
 
 PORT = [
-    {"os": "ubuntu-latest", "builds": True},
+    {"os": "ubuntu-24.04", "builds": True},
     {"os": "macos-latest", "builds": True},
     {"os": "ubuntu-24.04-arm", "builds": False},
 ]
 ORACLE = [
-    {"os": "ubuntu-latest", "ccs": "--cc clang --cc gcc", "port": True},
+    {"os": "ubuntu-24.04", "ccs": "--cc clang --cc gcc", "port": True},
     {"os": "macos-latest", "ccs": "--cc clang", "port": True},
     {"os": "ubuntu-24.04-arm", "ccs": "--cc clang --cc gcc", "port": False},
 ]

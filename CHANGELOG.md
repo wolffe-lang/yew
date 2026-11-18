@@ -5,6 +5,13 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### CI runs on ubuntu-24.04, not ubuntu-latest (2026-11-18)
+
+- Every workflow job and the leg planner name `ubuntu-24.04`. `ubuntu-latest`
+  moved to 26.04 (glibc 2.43), where the oracle job's host-built trials runner
+  failed inside its `ubuntu:24.04` container with `GLIBC_2.42` not found
+  (#142). `ci/legs-test.py` L7 now fails on any floating `ubuntu-latest`.
+
 ### yw19 — `:!yew PATH` opens in the running editor (2026-11-15)
 
 - `:!yew PATH` with a relative PATH is read where the shell would read it:
