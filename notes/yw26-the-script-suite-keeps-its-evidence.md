@@ -145,3 +145,24 @@ The cure at the source is two lines in the runner: the child and the
 parent each treat `EPERM` as success when the child's group is already
 its own pid. With that in the pinned oracle the rerun has nothing left
 to do and can go.
+
+## After
+
+The probe's second run (44595044151, the same runner image) looped the
+suite through `tools/goldens` at the head of this change:
+
+| loop | runs | red | runs with a rerun |
+|---|---|---|---|
+| quiet, 25 minutes | 157 | 0 | 7 |
+| four busy loops beside it, 15 minutes | 71 | 0 | 6 |
+
+228 runs, none red. Thirteen runs had one case the runner never started
+(some `(exit 126)`, some `(runner setup failed)`), each was run once
+more and passed, and each is named in the output. Before the change
+those thirteen runs would have been red; the first probe's loops were
+red in 3 of 95.
+
+The selftest on the same runner was green, and it met the race itself:
+under the `version-only` plant one case came back `(exit 126)` with no
+output, was run again, failed again as every case of that plant does,
+and stayed red.
