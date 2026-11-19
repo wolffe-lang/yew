@@ -28,7 +28,10 @@
 #             `57_embedded_gate` excluded as sagitta's Makefile always
 #             excludes it from this harness (it needs a file argument);
 #             --script-exclude adds names (the runner's comma list of
-#             substrings): yw09's gate passes tools/scripts-deferred.txt's
+#             substrings): yw09's gate passes tools/scripts-deferred.txt's;
+#             a case the runner never started (a silent `exit 126`
+#             or `runner setup failed`) is run once more by name and
+#             reported as a `RERUN` line, red twice is red
 #   fletch    tests/fletch/run --yew BIN: `PASS`/`FAIL <unit>` lines and
 #             its `fletch: total=… pass=… fail=… skip=…` summary
 #   syn       scripts/check-syn-assets.sh BIN: the 432 syntax goldens
@@ -141,23 +144,70 @@ for suite in $(echo "$suites" | tr ',' ' '); do
         [ "$fail" = 0 ] || grep -E '^pty: ' "$log" | grep -vE ': ok$' | head -5 | sed 's/^/goldens:   /'
         ;;
     script)
+        excl="57_embedded_gate${script_exclude:+,$script_exclude}"
         ( cd "$tree" && LC_ALL=C YEW_SCRIPT_BUDGET_MS=600000 \
-          "$build/script_runner" --exclude "57_embedded_gate${script_exclude:+,$script_exclude}" \
+          "$build/script_runner" --exclude "$excl" \
           --yew "$bin" --fakelsp "$build/tests/helpers/fakelsp" ) >"$log" 2>&1; rc=$?
         fail=$(count '^FAIL ' "$log")
         total=$(sed -nE 's/^script: ([0-9]+) tests.*/\1/p' "$log" | tail -1)
-        pass=$(( ${total:-0} - fail ))
-        [ $pass -ge 0 ] || pass=0
-        report script "$pass" "$fail" 0 $rc
         # The first five red cases, each with the block the runner printed
         # under it: the child's stdout and stderr and the sandbox it kept
         # (tests/script/runner.c:2518-2529). The log is gone with a hosted
         # job, and a bare `(exit 126)` can't say which of the runner's three
         # steps before execv had failed (runner.c:990-1009).
-        [ "$fail" = 0 ] || awk '
+        blocks=$(awk '
             /^FAIL / { open = 0; if (++cases > 5) exit; open = 1; kept = 0; print; next }
             open && /^  / { if (++kept <= 24) print; else if (kept == 25) print "  [more in script.log]"; next }
-            { open = 0 }' "$log" | sed 's/^/goldens:   /'
+            { open = 0 }' "$log" | sed 's/^/goldens:   /')
+        # A case the runner never started is run once more, by name. The
+        # runner and its child both call setpgid for the child (runner.c:990,
+        # 1228); on macOS the two calls race and one of them is refused with
+        # EPERM, about once in 700 children on a hosted runner. The child's
+        # refusal is a silent `(exit 126)`, the runner's is `(runner setup
+        # failed)`; the editor was never executed either way. Only those two
+        # shapes are run again, at most three in a suite and once each, and
+        # every one is named below. A 126 with any output, and any case red
+        # twice, stays red.
+        reruns=
+        summary=$(sed -nE 's/^script: .*, ([0-9]+) failures?, .*/\1/p' "$log" | tail -1)
+        if [ "$rc" = 1 ] && [ "$fail" != 0 ] && [ "$summary" = "$fail" ]; then
+            unstarted=$(awk '
+                function flush() { if (name != "" && (why == "(runner setup failed)" || (why == "(exit 126)" && !said))) print name "\t" why }
+                /^FAIL / { flush(); name = $2; why = $0; sub(/^FAIL +[^ ]+ +/, "", why); said = 0; open = 1; next }
+                open && /^  child / { said = 1; next }
+                open && /^  / { next }
+                { flush(); name = ""; open = 0 }
+                END { flush() }' "$log")
+            if [ -n "$unstarted" ] && [ "$(echo "$unstarted" | wc -l)" -le 3 ]; then
+                : >"$logs/script-rerun.log"
+                while IFS=$(printf '\t') read -r name why; do
+                    others=$( (cd "$tree" && LC_ALL=C "$build/script_runner" --list --filter "$name" --exclude "$excl") 2>/dev/null | grep -vx -- "$name" | paste -sd, -)
+                    ( cd "$tree" && LC_ALL=C YEW_SCRIPT_BUDGET_MS=600000 \
+                      "$build/script_runner" --filter "$name" --exclude "$excl${others:+,$others}" \
+                      --yew "$bin" --fakelsp "$build/tests/helpers/fakelsp" ) >"$logs/script-rerun.one" 2>&1; rc2=$?
+                    cat "$logs/script-rerun.one" >>"$logs/script-rerun.log"
+                    if [ $rc2 -eq 0 ] && grep -q '^script: 1 tests, ' "$logs/script-rerun.one" && ! grep -q '^FAIL ' "$logs/script-rerun.one"; then
+                        fail=$((fail - 1))
+                        reruns="${reruns}goldens:   RERUN $name $why: the runner never started the editor; not red on a second run
+"
+                    else
+                        reruns="${reruns}goldens:   RERUN $name $why: red again on a second run
+"
+                    fi
+                done <<EOF_UNSTARTED
+$unstarted
+EOF_UNSTARTED
+                [ "$fail" != 0 ] || rc=0
+            fi
+        fi
+        pass=$(( ${total:-0} - fail ))
+        [ $pass -ge 0 ] || pass=0
+        report script "$pass" "$fail" 0 $rc
+        [ -z "$blocks" ] || echo "$blocks"
+        if [ -n "$reruns" ]; then
+            printf '%s' "$reruns"
+            [ -z "${GITHUB_ACTIONS:-}" ] || printf '%s' "$reruns" | sed 's/^goldens:   /::warning::goldens script suite: /'
+        fi
         ;;
     fletch)
         ( cd "$tree" && LC_ALL=C "$build/fletch_run" --yew "$bin" ) >"$log" 2>&1; rc=$?
