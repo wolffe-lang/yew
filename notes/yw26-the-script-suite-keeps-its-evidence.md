@@ -80,11 +80,23 @@ from `pipe` to `execv` of `/usr/bin/true`:
 | no | 99,579 | 0 |
 
 Every failure was `setpgid` refused with `EPERM`, in the child's
-`setpgid(0, 0)` or in the parent's `setpgid(child, child)`, never both
-for one child. No `dup2`, `realpath`, `setenv`, `chdir` or `execv`
-failed in either mode. So it's a race between the two calls for the
-same new process group, about once in 700 children with four copies
-running, and it needs both calls.
+`setpgid(0, 0)` or in the parent's `setpgid(child, child)`. No `dup2`,
+`realpath`, `setenv`, `chdir` or `execv` failed in either mode. So it's
+a race between the two calls for the same new process group, about once
+in 700 children with four copies running, and it needs both calls.
+
+A third run (44596757519) counted the two sides and read the child's
+group after each refusal: 59,216 children with the parent's call, 79
+refusals; 58,314 without, none.
+
+| refused | count | the child's group was already its own pid |
+|---|---|---|
+| the child's call | 43 | 31 |
+| the parent's call | 36 | 36 |
+
+No child had both calls refused. The other call always goes through,
+but 12 of the child's 43 refusals came back before it had: the refusal
+can arrive while the group is still being made.
 
 ### What each side's refusal looks like in the suite
 
@@ -141,10 +153,13 @@ the plant's stderr, a plant that exits 126 once for one case must come
 out green with its `RERUN` line, and a plant that does so every time
 must stay red.
 
-The cure at the source is two lines in the runner: the child and the
-parent each treat `EPERM` as success when the child's group is already
-its own pid. With that in the pinned oracle the rerun has nothing left
-to do and can go.
+The cure at the source is in the runner's two calls. The parent can
+take `EPERM` as success when the child's group is its own pid, which it
+always was. The child can't use the same test, since its refusal
+sometimes comes first; it needs to stop treating its own refused call as
+fatal while the parent makes the same one, or to wait until its group is
+its own. With that in the pinned oracle the rerun has nothing left to do
+and can go.
 
 ## After
 
@@ -162,7 +177,9 @@ more and passed, and each is named in the output. Before the change
 those thirteen runs would have been red; the first probe's loops were
 red in 3 of 95.
 
-The selftest on the same runner was green, and it met the race itself:
+The selftest on the same runner was green at the head and red at each
+of the two commits that add a row before the change it holds (the third
+run, and the same four takes on Linux). It also met the race itself:
 under the `version-only` plant one case came back `(exit 126)` with no
 output, was run again, failed again as every case of that plant does,
 and stayed red.
