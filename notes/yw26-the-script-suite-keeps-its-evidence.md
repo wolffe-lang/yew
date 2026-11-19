@@ -63,3 +63,85 @@ prepare sandbox`, and with which errno, was written and thrown away.
   this note says so.
 - **No golden moves, and the oracle tree is never written** outside the
   probe's own throwaway job.
+
+## What the probe found
+
+The probe ran on a hosted macOS runner (macOS 26.7.2, arm64; run
+44588221629), from its own branch, which is not part of this change.
+
+### The bare sequence
+
+Four copies at once for 150 seconds, each repeating the runner's steps
+from `pipe` to `execv` of `/usr/bin/true`:
+
+| the parent also calls `setpgid(child, child)` | children | failures |
+|---|---|---|
+| yes, as `runner.c:1228` does | 99,724 | 137 |
+| no | 99,579 | 0 |
+
+Every failure was `setpgid` refused with `EPERM`, in the child's
+`setpgid(0, 0)` or in the parent's `setpgid(child, child)`, never both
+for one child. No `dup2`, `realpath`, `setenv`, `chdir` or `execv`
+failed in either mode. So it's a race between the two calls for the
+same new process group, about once in 700 children with four copies
+running, and it needs both calls.
+
+### What each side's refusal looks like in the suite
+
+- **The child's**: `_exit(126)` at `runner.c:991`, before the
+  descriptors are redirected and with no message: `FAIL <case> (exit
+  126)`. This is the red the hosted run showed.
+- **The parent's**: `runner.c:1228-1238` accepts only `EACCES` and
+  `ESRCH`, so it kills the child and reports `FAIL <case> (runner setup
+  failed)`.
+
+In both, the editor was never executed, and the case that takes the
+blame is whichever one the runner happened to be starting.
+
+### The suite itself
+
+The same job then looped the script suite through `tools/goldens`, as
+the gate runs it, against the oracle's own editor:
+
+| loop | runs | red | the red cases |
+|---|---|---|---|
+| quiet, 15 minutes | 88 | 2 | `39_skip_protocol`, `plug_examples_notes`, both `(runner setup failed)` |
+| four busy loops beside it | 7 | 1 | `07_functions (runner setup failed)` |
+
+The loaded loop stopped at its first red (a mistake in the probe's
+script, not a finding). Three reds in 95 runs of 93 cases is about one
+child in 2,900.
+
+The prediction held on the cause (the parent and child racing to create
+one group) and was wrong on the rate: I expected the suite loop to stay
+green, and it went red three times.
+
+## The change
+
+The race is in sagitta's script runner, which this repository builds
+and runs and never changes. Two things change here, both in
+`tools/goldens`:
+
+1. **A red script case shows its evidence.** The first five red cases
+   are printed with the block the runner wrote under each.
+2. **A case the runner never started is run once more, by name.** Only
+   the two shapes above qualify: `(runner setup failed)`, and `(exit
+   126)` with no output from the child at all. A 126 that says anything
+   (`cannot prepare sandbox` included) stays red. At most three cases in
+   one suite run, once each; more than three is left red as it is. Each
+   is reported as a `RERUN` line, and as a warning on a hosted run, so a
+   rerun is never silent. A case red on its second run is red.
+
+The rerun is narrower than a retry of a flaky test: it can't turn an
+assertion failure, a wrong byte, a timeout, a signal or any exit status
+other than a wordless 126 green, since none of those is run again.
+
+`tools/goldens-selftest` holds both: its `version-only` plant must show
+the plant's stderr, a plant that exits 126 once for one case must come
+out green with its `RERUN` line, and a plant that does so every time
+must stay red.
+
+The cure at the source is two lines in the runner: the child and the
+parent each treat `EPERM` as success when the child's group is already
+its own pid. With that in the pinned oracle the rerun has nothing left
+to do and can go.
