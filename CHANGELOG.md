@@ -5,6 +5,23 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### goldens: a script case the runner never started is run once more (2026-11-19)
+
+- The oracle's script suite went red on macOS with `FAIL 07_functions (exit
+  126)` (run 44441894655, green on its rerun). The script runner and its child
+  both call `setpgid` for the child; on macOS the two calls race and one is
+  refused with `EPERM`, about once in 700 children on a hosted runner. The
+  child's refusal is a wordless `exit 126`, the runner's is `runner setup
+  failed`. The editor is never executed in either.
+- `tools/goldens` runs such a case once more, by name: at most three in a suite
+  run, once each, every one named in a `RERUN` line (a warning on a hosted
+  run). A 126 with any output, and a case red twice, stay red.
+- `tools/goldens` prints the first five red script cases with the block the
+  runner wrote under each (the child's stdout and stderr, the sandbox kept).
+  Before, only the `FAIL` line outlived a hosted job.
+- `tools/goldens-selftest` holds all three with plants
+  (`notes/yw26-the-script-suite-keeps-its-evidence.md`).
+
 ### macOS oracle leg: a longer harness build cap and a slower pty quiet window (2026-11-18)
 
 - The macOS oracle leg's `build perf_cmdcomp harnesses` step has a 90-minute cap,
