@@ -71,6 +71,18 @@ parsed byte for byte, a status cache on the wall clock; F mode's tree and
 drawer, depth navigation, type-to-jump, the verbs with their typed
 confirmations, the commit editor, the pickers, the actions palette and the
 diff viewer; s53's hunks, blame and diff view are yw13b's.
+Highlighting's engine (campaign 08, first stage): syntax definitions are
+compiled as data into the same tables C builds (each first-stage
+definition's `yew syn dump FILE --tables` is byte for byte C's), and an
+incremental line-state engine interprets them: one interned state per line
+start, re-highlighting from an edited line only until the old states agree
+again, settling on a time budget, and embedded languages such as fenced code
+and command substitutions. `yew syn list`, `compile`, `check` and `dump`
+work; the syntax goldens of the seven first modes (wolf, Markdown, C,
+Python, shell, TOML and JSON: 132 of the 432) pass through `yew syn dump`,
+and the other 300 are listed by name for the full language pack. The editor
+does not draw syntax colours yet, and there is no on-disk definition cache:
+`yew syn cache` refuses by name.
 Each campaign's reachable PTY goldens are gated by name against C yew's
 (the cases that draw source text in syntax colours, campaign 05's four
 and campaign 11's 24, are recorded until yw10 lands highlighting); every path
@@ -108,6 +120,10 @@ tools/goldens --yew target/release/yew
 tools/check-fletch-goldens target/release/yew   # Fletch: 39 units, stressed and twice
 python3 -I tools/editing-row target/native/yew # byte-exact editing regressions through a PTY
 tools/check-fletch-coverage target/release/yew  # the coverage gate and its ledger
+python3 -I tools/check-syntax-cohort --yew target/release/yew --oracle target/oracle/sagitta --work NEW_DIR
+                                 # the first 132 syntax goldens, each dumped twice
+python3 -I tools/check-syntax-cohort --yew target/release/yew --oracle target/oracle/sagitta --work NEW_DIR --tables target/oracle/sagitta/build/yew
+                                 # the seven definitions' compiled tables against C's
 ```
 
 Builds and tests run on linux x86-64 and macOS arm64; on linux aarch64

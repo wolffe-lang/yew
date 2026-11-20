@@ -5,6 +5,31 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Highlighting, stage one: the syntax engine, its compiler and `yew syn` (2026-11-20)
+
+- `src/syn/` ports sagitta's `src/syn/` engine and definition compiler. A
+  syntax definition is literal Fletch data, parsed without running Fletch and
+  compiled to ordered context and rule tables with first-byte masks, capture
+  overlays, aux matchers (heredoc delimiters, fence runs, indentation) and
+  embedding bridges. For the seven first-stage definitions the compiled tables
+  are byte for byte C's (`yew syn dump FILE --tables`, compared in CI).
+- The line interpreter keeps one interned 84-byte state per line start (ids in
+  four bytes each), caps a line at 64 KiB, 4,096 spans and a bounded number of
+  rule attempts, and degrades to plain text by name when a cap is reached. An
+  edit re-highlights from the edited line only until the retained states agree
+  again; settling runs on a time budget, and a span cache serves an unchanged
+  screen without re-highlighting.
+- `src/syncli/` ports `src/syncli.c`: `yew syn list`, `compile`, `check` and
+  `dump FILE --tables|--spans INPUT`. The on-disk cache (`yew syn cache`) and
+  the coverage and embed reports refuse by name until the full language pack.
+- `tools/check-syntax-cohort` runs the first cohort: 132 of the pin's 432
+  syntax goldens (the seven modes' base fixtures, the eight shell embeddings
+  and the nine Markdown fences whose guests are in the cohort), each dumped
+  twice and compared byte for byte; the other 300 are named in
+  `tools/syntax-cohorts.tsv`. The oracle job runs it and the tables check.
+- `tools/gen-syn-registry` generates the 48-language registry and detection
+  indexes from the pinned `langs_gen.c`.
+
 ### goldens: a script case the runner never started is run once more (2026-11-19)
 
 - The oracle's script suite went red on macOS with `FAIL 07_functions (exit
