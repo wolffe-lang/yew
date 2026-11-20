@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# run-perf-syntax — keypress to paint with syntax highlighting, C yew and
+# the port from the same run (C, the port, then C again: the rig's drift,
+# reported, not used), each row's p99 ratio port/C gated at 2.0, p50 and
+# max recorded beside it. The harness is sagitta's own perf_latency_s56
+# (the oracle tree's build) over its shipped sessions:
+#
+#   typing  typing.keys (10,000 keys of Insert typing), fixture class
+#           `small`, over a 10,000-line C file: the oracle's
+#           tests/perf/fixtures/syn/c_kitchen.c (8,000 lines) followed by
+#           its first 2,000 lines
+#   edit    edit.keys (typing, newlines, undo and redo), class `syntax`,
+#           over the same 10,000-line file
+#   bomb    edit.keys, class `syntax`, over the oracle's
+#           tests/perf/fixtures/syn/c_comment_bomb.c, as C's own
+#           `make perf-latency-s56-syntax` runs it
+#
+# Both editors read the oracle's runtime/ (the harness refuses otherwise,
+# perf_runtime.h:37-62); the port's embedded copies of the seven stage-one
+# definitions are the same bytes (tools/check-runtime). HOME and
+# XDG_CONFIG_HOME are a scratch directory. Each row takes the first five
+# C-stable triples (tools/perf-editor-samples, drift at most 1.25), at most
+# twenty, never selecting by the port's speed.
+#
+#   tools/run-perf-syntax [--yew BIN] [--c-yew BIN] [--cpus LIST] [--rows LIST]
+#
+# The harness SIGKILLs a child that does not quit: run this inside a
+# container. Exit 0 when every p99 ratio is at most 2.0, 1 when one is
+# above, 2 on a harness fault.
+set -u
+YEW_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$YEW_ROOT" || exit 2
+yew=$YEW_ROOT/target/release/yew
+tree=$YEW_ROOT/target/oracle/sagitta
+c_yew=$tree/build/yew
+cpus=
+rows="typing edit bomb"
+while [ $# -gt 0 ]; do
+  case $1 in
+    --yew) yew=$2; shift 2 ;;
+    --c-yew) c_yew=$2; shift 2 ;;
+    --cpus) cpus=$2; shift 2 ;;
+    --rows) rows=$2; shift 2 ;;
+    *) echo "run-perf-syntax: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+case $yew in /*) ;; *) yew=$YEW_ROOT/$yew ;; esac
+h=$tree/build/perf_latency_s56
+kitchen=$tree/tests/perf/fixtures/syn/c_kitchen.c
+bomb=$tree/tests/perf/fixtures/syn/c_comment_bomb.c
+for f in "$h" "$yew" "$c_yew" "$kitchen" "$bomb"; do
+  [ -e "$f" ] || { echo "run-perf-syntax: missing $f" >&2; exit 2; }
+done
+out=$YEW_ROOT/target/perf-syntax
+rm -rf "$out"
+mkdir -p "$out/home/config"
+export HOME=$out/home XDG_CONFIG_HOME=$out/home/config
+big=$out/kitchen10k.c
+{ cat "$kitchen"; head -n 2000 "$kitchen"; } >"$big"
+lines=$(wc -l <"$big")
+[ "$lines" -eq 10000 ] || { echo "run-perf-syntax: the large file has $lines lines, not 10000" >&2; exit 2; }
+pin=
+[ -n "$cpus" ] && pin="taskset -c $cpus"
+metric() {
+  case $1 in typing) echo latency.typing.small ;; *) echo latency.edit.syntax ;; esac
+}
+run() {
+  local label=$1 bin=$2 row=$3 trial=$4 state=$out/state-$1-$3-$4 args
+  rm -rf "$state"; mkdir -p "$state" "$out/$row"
+  case $row in
+    typing) args="--session $tree/tests/perf/sessions/typing.keys --fixture small --path $big" ;;
+    edit) args="--session $tree/tests/perf/sessions/edit.keys --fixture syntax --path $big" ;;
+    bomb) args="--session $tree/tests/perf/sessions/edit.keys --fixture syntax --path $bomb" ;;
+  esac
+  # shellcheck disable=SC2086
+  (cd "$tree" && YEW_RUNTIME_DIR="$tree/runtime" YEW_PERF_ADVISORY=1 $pin "$h" --yew "$bin" \
+    $args --state "$state") >"$out/$row/latency-$label-$trial.txt" 2>&1
+  local rc=$?
+  echo "== $label $row trial=$trial ($(sha256sum "$bin" | cut -c1-12))"
+  [ "$rc" -le 1 ] || { cat "$out/$row/latency-$label-$trial.txt"; return 2; }
+  grep "^$(metric "$row")\." "$out/$row/latency-$label-$trial.txt" || {
+    cat "$out/$row/latency-$label-$trial.txt"; return 2; }
+}
+for row in $rows; do
+  case $row in typing|edit|bomb) ;; *) echo "run-perf-syntax: no row $row" >&2; exit 2 ;; esac
+  ready=0
+  for trial in $(seq 1 20); do
+    run c "$c_yew" "$row" "$trial" || exit 2
+    run wolf "$yew" "$row" "$trial" || exit 2
+    run c2 "$c_yew" "$row" "$trial" || exit 2
+    m=$(metric "$row")
+    python3 -I "$YEW_ROOT/tools/perf-editor-samples" "$out/$row" "$trial" "$m.p99" "$m.p50" "$m.max"
+    sampled=$?
+    if [ "$sampled" = 0 ]; then ready=1; break; fi
+    [ "$sampled" = 3 ] || exit 2
+  done
+  [ "$ready" = 1 ] || { echo "run-perf-syntax: $row lacks five stable trials after 20" >&2; exit 2; }
+done
+status=0
+for row in $rows; do
+  m=$(metric "$row")
+  for q in p99 p50 max; do
+    c1=$(cat "$out/$row/median-$m.$q-c.txt"); w=$(cat "$out/$row/median-$m.$q-wolf.txt")
+    c2=$(cat "$out/$row/median-$m.$q-c2.txt")
+    [ -n "$c1" ] && [ -n "$w" ] && [ -n "$c2" ] || { echo "run-perf-syntax: $row $q: no value" >&2; exit 2; }
+    r=$(awk -v w="$w" -v a="$c1" -v b="$c2" 'BEGIN { c = (a + b) / 2; printf "%.2f", w / c }')
+    d=$(awk -v a="$c1" -v b="$c2" 'BEGIN { m = (a < b) ? a : b; printf "%.2f", (a > b ? a : b) / m }')
+    verdict=INFO
+    if [ "$q" = p99 ]; then
+      verdict=PASS
+      if awk -v r="$r" 'BEGIN { exit !(r > 2.0) }'; then verdict=FAIL; status=1; fi
+    fi
+    echo "syntax-$row: $q C=$c1,$c2 port=$w ratio=$r drift=$d verdict=$verdict accepted=$(cat "$out/$row/accepted-$m.$q.txt")"
+  done
+done
+exit $status
