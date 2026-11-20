@@ -1,0 +1,658 @@
+//! member: false
+//!
+//! The editor's syntax highlighting (sagitta Sprints 39-41 at 9ace98c2,
+//! `src/edit/ed.c:177-232` and `:1250-1390`, `notify.c:48-73`,
+//! `loop.c:281-330` and `:721-726`, `ui/draw.c:757-977`,
+//! `ui/statusline.c:543-552`, `edit/cmd.c:76-148`): a buffer's language is
+//! attached as it is born and dropped as it goes; its edits, undo and redo
+//! splice the line state, and an incremental highlight equals a fresh one;
+//! a multicursor batch is one splice; on a 10,000-line file a typed key
+//! costs at most two interpreter calls once settled and an unchanged
+//! redraw none; the loop wakes and ticks while a visible buffer settles;
+//! a guest language with no definition leaves nothing pending; the rows
+//! are drawn through the theme's slots; the badge shows after 250 ms of
+//! settling and degraded wins; `ed.syn.set` and `ed.syn.status` work as
+//! C's. One case runs alone under `YEW_SYN_EDIT_CASE`; the 10,000-line
+//! case is past the checked machine's budget and its twin runs 256 lines.
+
+use edit
+use std.fs
+use syn
+use term
+use text
+
+const CASES: int = 10
+
+fn pb(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn put(mut out: List[byte], s: str) {
+    for b in s.bytes() {
+        (mut out).push(b)
+    }
+}
+
+fn has_bytes(hay: List[byte], needle: str) -> bool {
+    let n = needle.bytes()
+    if n.len == 0 then return true
+    var i = 0
+    while i + n.len <= hay.len {
+        var same = true
+        for k in 0..n.len {
+            if hay[i + k] != n[k] {
+                same = false
+                break
+            }
+        }
+        if same then return true
+        i += 1
+    }
+    false
+}
+
+// `$TMPDIR` when it is absolute, else the root's `target/tests`, and a
+// directory of this process's own under it.
+fn scratch_dir(tag: str) -> str {
+    let tmp = env_get("TMPDIR") else ""
+    var base = tmp
+    if tmp.len == 0 || !tmp.starts_with("/") {
+        let cwd = os_cwd() else "."
+        base = "{cwd}/target/tests"
+    }
+    let dir = "{base}/yew-syn-edit-{os_pid()}-{tag}"
+    fs.create_dir_all(dir) else |_| { assert(false, "create {dir}") }
+    dir
+}
+
+fn write(path: str, body: str) {
+    fs.write_text(path, body) else |_| { assert(false, "write {path}") }
+}
+
+fn write_bytes(path: str, body: List[byte]) {
+    fs_write_bytes(path, body) else |_| { assert(false, "write {path}") }
+}
+
+fn invoke_str(mut ed: edit.Ed, name: str, arg: str) -> int {
+    let id = edit.cmd_lookup(ed.reg, name)
+    assert(id != 0, "{name} is registered")
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = 1
+    cx.sarg = arg
+    cx.has_sarg = true
+    edit.ed_cmd_invoke(mut ed, id, mut cx)
+}
+
+fn invoke(mut ed: edit.Ed, name: str) -> int {
+    let id = edit.cmd_lookup(ed.reg, name)
+    assert(id != 0, "{name} is registered")
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = 1
+    edit.ed_cmd_invoke(mut ed, id, mut cx)
+}
+
+// A probe command for every cursor (`edit.probe`'s
+// `ed.edit.mc.insert`, an `X` at each).
+fn mc_probe(mut ed: edit.Ed) -> int {
+    let name = "ed.edit.mc.insert"
+    let existing = edit.cmd_lookup(ed.reg, name)
+    if existing != 0 then return existing
+    edit.cmd_register(mut ed.reg, edit.CmdDesc {
+        name: name,
+        handler: edit.HANDLER_PROBE,
+        impl_id: 0,
+        arity: edit.ARITY_NONE,
+        flags: edit.CMD_NEEDS_WIN | edit.CMD_CHANGES_BUFFER,
+        help: "a syntax test probe",
+        word: "",
+        has_word: false,
+    })
+}
+
+// A fresh headless editor whose window shows a buffer over `body`.
+fn memory_ed(body: List[byte]) -> edit.Ed {
+    var ed = edit.ed_new()
+    ed.clean = true
+    edit.ed_open_memory(mut ed, body, "mem")
+    ed
+}
+
+// The driver's frame without a terminal (the drawbufs test's): init.fl,
+// its theme, 24x80 in truecolor.
+fn frame_ed() -> edit.Ed {
+    var ed = edit.ed_new_test(fs_read_bytes("runtime/init.fl") else List[byte](), "")
+    ed.clean = true
+    let name = ed.opts.theme
+    edit.ed_theme_set(mut ed, name)
+    ed.regs.clipboard_sync = text.CLIP_SYNC_OFF
+    ed.grid = term.grid_new(24, 80)
+    ed.grid_ready = true
+    var caps = term.caps_new()
+    caps.truecolor = true
+    ed.render = term.render_new(caps, term.env_process())
+    ed.render_ready = true
+    ed
+}
+
+fn doc(ed: edit.Ed) -> int {
+    edit.ed_doc(ed)
+}
+
+fn lines(ed: edit.Ed, bi: int) -> int {
+    text.textbuf_line_count(ed.bufs[bi].ec.tb)
+}
+
+// Ticks with an hour's budget until no visible buffer settles.
+fn settle_all(mut ed: edit.Ed) {
+    var guard = 0
+    while edit.ed_syn_pending(ed) && guard < 64 {
+        edit.ed_syn_tick(mut ed, 3600000000, false)
+        guard += 1
+    }
+    assert(!edit.ed_syn_pending(ed), "settled within 64 ticks")
+}
+
+fn state_of(mut ed: edit.Ed, bi: int) -> int {
+    let k = edit.ed_syn_resolve(mut ed, bi)
+    assert(k >= 0, "buffer {bi} has a syntax state")
+    assert(ed.syntax[0].bufs[k].sb.len == 1, "buffer {bi} is bound to an engine")
+    k
+}
+
+fn calls(ed: edit.Ed, bi: int) -> int {
+    let e = edit.ed_syn_engine(ed, bi)
+    assert(e >= 0, "an engine")
+    syn.syn_engine_line_calls(ed.syntax[0].engines[e])
+}
+
+fn reset_calls(mut ed: edit.Ed, bi: int) {
+    let e = edit.ed_syn_engine(ed, bi)
+    assert(e >= 0, "an engine")
+    syn.syn_engine_reset_counters(mut ed.syntax[0].engines[e])
+}
+
+fn same_spans(a: syn.SynSpans, b: syn.SynSpans) -> bool {
+    if a.n != b.n then return false
+    for i in 0..a.n * 8 {
+        if a.data[i] != b.data[i] then return false
+    }
+    true
+}
+
+// Every line's spans from the editor's settled state equal a fresh
+// engine's over the same text, settled to its fixpoint.
+fn assert_fresh(mut ed: edit.Ed, bi: int, what: str) {
+    settle_all(mut ed)
+    let k = state_of(mut ed, bi)
+    let e = ed.syntax[0].bufs[k].engine
+    let n = lines(ed, bi)
+    assert(edit.ed_syn_entry_len(ed, bi) == n, "{what}: an entry a line")
+    var engine = syn.syn_engine_new(ed.syntax[0].pool, ed.syntax[0].engines[e].root)
+    var fresh = syn.syn_buffer_new_at(ed.bufs[bi].ec.tb, engine.generation, 0)
+    let report = syn.syn_settle(
+        mut fresh,
+        mut engine,
+        mut ed.syntax[0].pool,
+        ed.bufs[bi].ec.tb,
+        0,
+        n,
+        0,
+    )
+    assert(report.fixpoint, "{what}: the fresh highlight settles")
+    var a = syn.syn_spans_new(syn.SYN_MAX_SPANS)
+    var b = syn.syn_spans_new(syn.SYN_MAX_SPANS)
+    for line in 0..n {
+        syn.syn_buffer_spans(
+            mut ed.syntax[0].bufs[k].sb[0],
+            mut ed.syntax[0].engines[e],
+            mut ed.syntax[0].pool,
+            ed.bufs[bi].ec.tb,
+            line,
+            mut a,
+        )
+        syn.syn_buffer_spans(mut fresh, mut engine, mut ed.syntax[0].pool, ed.bufs[bi].ec.tb, line, mut b)
+        assert(same_spans(a, b), "{what}: line {line} spans equal a fresh highlight's")
+    }
+}
+
+// ---- 0: attach -----------------------------------------------------------
+
+fn syntax_attach_by_path_and_none_for_plain() {
+    let dir = scratch_dir("attach")
+    write("{dir}/main.c", "int main(void)\n{{\n    return 0;\n}}\n")
+    write("{dir}/notes.txt", "int main(void) is not code here\n")
+    write("{dir}/run", "#!/bin/sh\necho hi\n")
+    write("{dir}/blob.c", "int\u{0}x\n")
+    write("{dir}/README.md", "# Title\n\ntext\n")
+    var ed = edit.ed_new()
+    ed.clean = true
+    edit.ed_open_scratch(mut ed)
+    let scratch = doc(ed)
+    assert(edit.edsyn_find(ed.syntax[0], ed.bufs[scratch].id) >= 0, "the scratch has a state")
+    assert(edit.ed_syn_lang(ed, scratch) == 0, "the scratch has no language")
+    assert(edit.ed_syn_entry_len(ed, scratch) == lines(ed, scratch), "the scratch's entries")
+    // `ed.buf.open` (C's model finish): the path, then the first line.
+    assert(invoke_str(mut ed, "ed.buf.open", "{dir}/main.c") == edit.CMD_OK, "open main.c")
+    let c = doc(ed)
+    assert(edit.ed_syn_lang(ed, c) == 1, "main.c is c: {edit.ed_syn_lang(ed, c)}")
+    assert((ed.buf_languages[ed.bufs[c].id] else "") == "c", "Buffer.lang c")
+    assert(edit.ed_syn_entry_len(ed, c) == lines(ed, c), "main.c: an entry a line")
+    assert(invoke_str(mut ed, "ed.buf.open", "{dir}/notes.txt") == edit.CMD_OK, "open notes")
+    let plain = doc(ed)
+    assert(edit.edsyn_find(ed.syntax[0], ed.bufs[plain].id) >= 0, "notes.txt has a state")
+    assert(edit.ed_syn_lang(ed, plain) == 0, "notes.txt has no language")
+    assert((ed.buf_languages[ed.bufs[plain].id] else "") == "", "no Buffer.lang")
+    assert(edit.ed_syn_entry_len(ed, plain) == lines(ed, plain), "notes.txt's entries")
+    assert(invoke_str(mut ed, "ed.buf.open", "{dir}/run") == edit.CMD_OK, "open run")
+    let sh = doc(ed)
+    assert(edit.ed_syn_lang(ed, sh) == 16, "the shebang names sh: {edit.ed_syn_lang(ed, sh)}")
+    assert((ed.buf_languages[ed.bufs[sh].id] else "") == "sh", "Buffer.lang sh")
+    assert(invoke_str(mut ed, "ed.buf.open", "{dir}/blob.c") == edit.CMD_OK, "open blob.c")
+    let blob = doc(ed)
+    assert(ed.bufs[blob].ec.meta.binary, "blob.c reads as binary")
+    assert(edit.ed_syn_lang(ed, blob) == 0, "a binary file has no language")
+    assert((ed.buf_languages[ed.bufs[blob].id] else "") == "", "nor Buffer.lang")
+    // A deferred tab binds when it hydrates.
+    let tab = edit.tab_open(mut ed, "{dir}/README.md")
+    assert(tab >= 0, "a README tab")
+    let md = edit.tab_buffer(ed, tab)
+    assert(!ed.bufs[md].resident, "born deferred")
+    assert(edit.edsyn_find(ed.syntax[0], ed.bufs[md].id) < 0, "no state while deferred")
+    edit.tab_switch(mut ed, tab)
+    assert(ed.bufs[md].resident, "hydrated")
+    assert(edit.ed_syn_lang(ed, md) == 13, "README.md is markdown: {edit.ed_syn_lang(ed, md)}")
+    assert(edit.ed_syn_entry_len(ed, md) == lines(ed, md), "README.md's entries")
+    // The definition loads on first need: main.c binds to c's engine.
+    let k = state_of(mut ed, c)
+    assert(ed.syntax[0].bufs[k].sb[0].lines.settling, "main.c settles once bound")
+    // Untitled and scratch buffers have no language.
+    let untitled = edit.buffer_untitled(mut ed)
+    assert(edit.edsyn_find(ed.syntax[0], ed.bufs[untitled].id) >= 0, "the untitled has a state")
+    assert(edit.ed_syn_lang(ed, untitled) == 0, "the untitled has no language")
+    let named = edit.ws_scratch_new(mut ed, "*scratch*", 0)
+    assert(edit.edsyn_find(ed.syntax[0], ed.bufs[named].id) >= 0, "a named scratch has a state")
+    assert(edit.ed_syn_lang(ed, named) == 0, "a named scratch has no language")
+    // Deferring a tab drops its state; closing a buffer drops its.
+    let first = 0
+    edit.tab_switch(mut ed, first)
+    edit.tab_defer(mut ed, tab)
+    assert(!ed.bufs[md].resident, "deferred again")
+    assert(edit.edsyn_find(ed.syntax[0], ed.bufs[md].id) < 0, "the deferred state is dropped")
+    edit.ed_show_buffer(mut ed, plain)
+    let plain_id = ed.bufs[plain].id
+    assert(invoke(mut ed, "ed.buf.close") == edit.CMD_OK, "close notes.txt")
+    assert(edit.edsyn_find(ed.syntax[0], plain_id) < 0, "the closed state is dropped")
+    fs.remove_dir_all(dir) else |_| {}
+}
+
+// ---- 1: edits, undo and redo splice --------------------------------------
+
+fn sh_body(n: int) -> List[byte] {
+    let pool = [
+        "echo \"hello $USER\"",
+        "cat <<EOF",
+        "inside the heredoc $x",
+        "EOF",
+        "if [ -n \"$a\" ]; then",
+        "  x='a single",
+        "quoted value'",
+        "fi",
+        "# a comment line",
+        "f() {{ printf '%s\\n' \"$@\"; }}",
+    ]
+    var s = pb("#!/bin/sh\n")
+    for i in 0..n {
+        put(mut s, pool[i % pool.len])
+        (mut s).push(10 as byte)
+    }
+    s
+}
+
+fn next_rand(state: int) -> int {
+    (state * 1103515245 + 12345) % 2147483648
+}
+
+fn syntax_edits_undo_and_redo_splice_and_match_fresh() {
+    let inserts = ["\"", "'", "\n", "<<EOF\n", "EOF\n", "# ", "x", "$(", ")", "\\"]
+    for seed in [1, 7, 42] {
+        var ed = memory_ed(sh_body(24))
+        let bi = doc(ed)
+        let w = ed.win
+        assert(edit.ed_syn_lang(ed, bi) == 16, "seed {seed}: the shebang names sh")
+        assert_fresh(mut ed, bi, "seed {seed}, opened")
+        var r = seed
+        for step in 0..10 {
+            r = next_rand(r)
+            let len = text.textbuf_len(ed.bufs[bi].ec.tb)
+            let before = edit.ed_syn_splices(ed, bi)
+            edit.ed_undo_begin(mut ed, w, text.TXN_TYPE)
+            if r % 3 == 0 && len > 8 {
+                let lo = r / 7 % (len - 6)
+                let hi = lo + 1 + r / 13 % 6
+                assert(edit.ed_edit_delete(mut ed, w, lo, hi), "seed {seed}: delete")
+            } else {
+                let at = r / 7 % (len + 1)
+                let piece = pb(inserts[r / 11 % inserts.len])
+                assert(edit.ed_edit_insert(mut ed, w, at, piece, 0, piece.len), "seed {seed}: insert")
+            }
+            edit.ed_undo_end(mut ed, w)
+            edit.ed_finish_edit(mut ed, w)
+            assert(
+                edit.ed_syn_splices(ed, bi) == before + 1,
+                "seed {seed} step {step}: one splice for one edit",
+            )
+            assert_fresh(mut ed, bi, "seed {seed} step {step}")
+        }
+        for _ in 0..3 {
+            let before = edit.ed_syn_splices(ed, bi)
+            assert(invoke(mut ed, "ed.edit.undo") == edit.CMD_OK, "seed {seed}: undo")
+            assert(edit.ed_syn_splices(ed, bi) > before, "seed {seed}: the undo spliced")
+            assert_fresh(mut ed, bi, "seed {seed}, undone")
+        }
+        for _ in 0..2 {
+            let before = edit.ed_syn_splices(ed, bi)
+            assert(invoke(mut ed, "ed.edit.redo") == edit.CMD_OK, "seed {seed}: redo")
+            assert(edit.ed_syn_splices(ed, bi) > before, "seed {seed}: the redo spliced")
+            assert_fresh(mut ed, bi, "seed {seed}, redone")
+        }
+    }
+}
+
+// ---- 2: a multicursor batch is one splice ---------------------------------
+
+fn syntax_multicursor_batch_is_one_splice() {
+    var body = pb("#!/bin/sh\n")
+    for i in 1..40 {
+        put(mut body, "echo line_{i} \"value {i}\"\n")
+    }
+    var ed = memory_ed(body)
+    let bi = doc(ed)
+    let w = ed.win
+    let _ = state_of(mut ed, bi)
+    for line in 1..40 {
+        let sp = text.textbuf_line_span(ed.bufs[bi].ec.tb, line as text.LineNo)
+        assert(
+            text.cset_add(mut ed.wins[w].cs, text.Cursor { pos: sp.lo, goal_col: 0, anchor: sp.lo }),
+            "a cursor on line {line}",
+        )
+    }
+    ed.wins[w].rect.h = 24
+    let probe = mc_probe(mut ed)
+    var before = edit.ed_syn_splices(ed, bi)
+    var cx = edit.cmdctx_new(ed.win, edit.SRC_TEST)
+    cx.count = 1
+    assert(edit.ed_cmd_invoke(mut ed, probe, mut cx) == edit.CMD_OK, "one invoke over 40 cursors")
+    assert(edit.ed_syn_splices(ed, bi) == before + 1, "one splice for the batch")
+    assert_fresh(mut ed, bi, "the batch")
+    before = edit.ed_syn_splices(ed, bi)
+    assert(invoke(mut ed, "ed.edit.undo") == edit.CMD_OK, "undo")
+    assert(edit.ed_syn_splices(ed, bi) == before + 1, "one splice for the undo")
+    before = edit.ed_syn_splices(ed, bi)
+    assert(invoke(mut ed, "ed.edit.redo") == edit.CMD_OK, "redo")
+    assert(edit.ed_syn_splices(ed, bi) == before + 1, "one splice for the redo")
+    assert_fresh(mut ed, bi, "the redo")
+}
+
+// ---- 3 and 4: per key ------------------------------------------------------
+
+fn per_key(n: int) {
+    let dir = scratch_dir("key{n}")
+    var body = List[byte]()
+    for i in 0..n {
+        put(mut body, "int value_{i} = {i}; /* note */\n")
+    }
+    write_bytes("{dir}/fixture.c", body)
+    var ed = frame_ed()
+    assert(invoke_str(mut ed, "ed.buf.open", "{dir}/fixture.c") == edit.CMD_OK, "open fixture.c")
+    let bi = doc(ed)
+    assert(lines(ed, bi) == n + 1, "{n} lines and the last")
+    edit.ed_layout(mut ed)
+    settle_all(mut ed)
+    ed.full_damage = true
+    edit.ed_render(mut ed)
+    reset_calls(mut ed, bi)
+    let wi = ed.win
+    edit.draw_document_rows(mut ed, wi, 0, ed.wins[wi].rect.h)
+    assert(calls(ed, bi) == 0, "an unchanged redraw: {calls(ed, bi)} interpreter calls")
+    for key in 0..8 {
+        reset_calls(mut ed, bi)
+        assert(invoke_str(mut ed, "ed.edit.insert.text", "x") == edit.CMD_OK, "key {key}")
+        if edit.ed_syn_pending(ed) {
+            edit.ed_syn_tick(mut ed, edit.SYN_FRAME_BUDGET_US, true)
+        }
+        if ed.layout_dirty {
+            edit.ed_layout(mut ed)
+        }
+        edit.ed_render(mut ed)
+        assert(calls(ed, bi) <= 2, "key {key}: {calls(ed, bi)} interpreter calls")
+        reset_calls(mut ed, bi)
+        edit.ed_render(mut ed)
+        assert(calls(ed, bi) == 0, "key {key}: the frame after, {calls(ed, bi)} calls")
+    }
+    fs.remove_dir_all(dir) else |_| {}
+}
+
+fn syntax_per_key_ten_thousand_lines() {
+    per_key(10000)
+}
+
+fn syntax_per_key_twin() {
+    per_key(256)
+}
+
+// ---- 5: the loop wakes and ticks -------------------------------------------
+
+fn syntax_loop_wakes_and_each_tick_progresses() {
+    var ed = memory_ed(sh_body(300))
+    let bi = doc(ed)
+    assert(edit.ed_syn_pending(ed), "a buffer with a language is pending")
+    let d = edit.loop_deadline(ed, 0)
+    assert(d >= 0 && d <= edit.SYN_WAKE_MS, "the loop wakes within 16 ms: {d}")
+    let k = state_of(mut ed, bi)
+    // An injected clock observes every 256 lines (`engine.c:5233-5236`):
+    // each observation a second past a 1-ms budget.
+    syn.syn_buffer_fake_clock(mut ed.syntax[0].bufs[k].sb[0], 0, 1000000)
+    edit.ed_syn_tick(mut ed, edit.SYN_FRAME_BUDGET_US, true)
+    assert(ed.syntax[0].bufs[k].sb[0].lines.wave == 1, "the first slice stops at the first look")
+    edit.ed_syn_tick(mut ed, edit.SYN_FRAME_BUDGET_US, true)
+    assert(
+        ed.syntax[0].bufs[k].sb[0].lines.wave == 257,
+        "the second slice runs to line 256: {ed.syntax[0].bufs[k].sb[0].lines.wave}",
+    )
+    assert(edit.ed_syn_pending(ed), "still settling")
+    ed.footer_dirty = false
+    edit.ed_syn_tick(mut ed, edit.SYN_FRAME_BUDGET_US, true)
+    assert(!ed.syntax[0].bufs[k].sb[0].lines.settling, "the third reaches the end")
+    assert(!edit.ed_syn_pending(ed), "nothing pending")
+    assert(ed.footer_dirty, "the footer redraws at the fixpoint")
+}
+
+// ---- 6: guests --------------------------------------------------------------
+
+fn syntax_unloadable_guest_leaves_nothing_pending() {
+    let dir = scratch_dir("guest")
+    write(
+        "{dir}/notes.md",
+        "# Fences\n\n```javascript\nlet x = 1\n```\n\n```c\nint main(void) {{ return 0; }}\n```\n",
+    )
+    var ed = edit.ed_new()
+    ed.clean = true
+    edit.ed_open_scratch(mut ed)
+    assert(invoke_str(mut ed, "ed.buf.open", "{dir}/notes.md") == edit.CMD_OK, "open notes.md")
+    let bi = doc(ed)
+    assert(edit.ed_syn_lang(ed, bi) == 13, "markdown")
+    settle_all(mut ed)
+    let k = state_of(mut ed, bi)
+    assert(ed.syntax[0].bufs[k].sb[0].pending_langs.len == 0, "no guest pending")
+    assert(!ed.syntax[0].bufs[k].sb[0].degraded, "the refusal does not degrade the buffer")
+    let e = ed.syntax[0].bufs[k].engine
+    assert(ed.syntax[0].engines[e].residents.len == 2, "c's definition is resident")
+    // The c fence's `int` is styled by c's definition.
+    let _ = edit.ed_syn_draw_state(mut ed, bi)
+    edit.ed_syn_line_spans(mut ed, k, bi, 7)
+    let spans = copy ed.syntax[0].spans[0]
+    assert(spans.n > 0 && syn.syn_span_attr(spans, 0) != edit.ATTR_TEXT, "int is not plain text")
+    fs.remove_dir_all(dir) else |_| {}
+}
+
+// ---- 7: drawn through the theme -------------------------------------------
+
+fn syntax_rows_draw_through_the_theme_slots() {
+    let dir = scratch_dir("draw")
+    // The code on line 1, away from the cursor's row.
+    write("{dir}/main.c", "\nint main(void) {{ return 0; }} /* done */\n")
+    var ed = frame_ed()
+    assert(invoke_str(mut ed, "ed.buf.open", "{dir}/main.c") == edit.CMD_OK, "open main.c")
+    let bi = doc(ed)
+    edit.ed_layout(mut ed)
+    settle_all(mut ed)
+    ed.full_damage = true
+    edit.ed_render(mut ed)
+    let wi = ed.win
+    let k = edit.ed_syn_draw_state(mut ed, bi)
+    assert(k >= 0, "main.c is drawn highlighted")
+    edit.ed_syn_line_spans(mut ed, k, bi, 1)
+    let spans = copy ed.syntax[0].spans[0]
+    let rendition = edit.theme_rendition_of(ed.render)
+    let row = ed.wins[wi].rect.y + 1
+    var lit = 0
+    for i in 0..spans.n {
+        let attr = syn.syn_span_attr(spans, i)
+        let want = edit.theme_attr(ed.theme, rendition, attr)
+        var fg = copy want.fg
+        if fg.tag == term.COLOR_DEFAULT {
+            fg = copy ed.grid.blank.fg
+        }
+        var bg = copy want.bg
+        if bg.tag == term.COLOR_DEFAULT {
+            bg = copy ed.grid.blank.bg
+        }
+        let start = syn.syn_span_start(spans, i)
+        for at in start..start + syn.syn_span_len(spans, i) {
+            let cell = term.grid_back(ed.grid, row, ed.wins[wi].rect.x + at)
+            assert(term.color_equal(cell.fg, fg), "column {at}: the fg of attr {attr}")
+            assert(term.color_equal(cell.bg, bg), "column {at}: the bg of attr {attr}")
+            assert(cell.attrs == want.attrs, "column {at}: the attrs of attr {attr}")
+        }
+        if attr != edit.ATTR_TEXT {
+            lit += 1
+        }
+    }
+    assert(lit >= 3, "keyword, type and comment spans: {lit}")
+    fs.remove_dir_all(dir) else |_| {}
+}
+
+// ---- 8: the badge -----------------------------------------------------------
+
+fn badge(mut ed: edit.Ed) -> List[byte] {
+    let wi = ed.win
+    let out = edit.statusline_build(mut ed, wi, 120)
+    copy out.body
+}
+
+fn syntax_badge_after_250ms_and_degraded_wins() {
+    var ed = memory_ed(sh_body(40))
+    let bi = doc(ed)
+    let k = state_of(mut ed, bi)
+    syn.syn_buffer_fake_clock(mut ed.syntax[0].bufs[k].sb[0], 1000000, 0)
+    assert(!has_bytes(badge(mut ed), "syn"), "no badge at the attach")
+    ed.syntax[0].bufs[k].sb[0].clock_now = 1249999
+    assert(!has_bytes(badge(mut ed), "syn"), "no badge before 250 ms")
+    ed.syntax[0].bufs[k].sb[0].clock_now = 1250000
+    assert(has_bytes(badge(mut ed), "syn\u{2026}"), "syn\u{2026} at 250 ms of settling")
+    ed.footer_dirty = false
+    settle_all(mut ed)
+    assert(ed.footer_dirty, "the footer redraws as the badge goes")
+    assert(!has_bytes(badge(mut ed), "syn"), "no badge once settled")
+    // A line past the 64-KiB cap degrades the buffer: `syn!`, settled or not.
+    var long = pb("#!/bin/sh\necho ")
+    for _ in 0..1100 {
+        put(mut long, "0123456789012345678901234567890123456789012345678901234567890123")
+    }
+    put(mut long, "\necho done\n")
+    var ed2 = memory_ed(long)
+    let b2 = doc(ed2)
+    settle_all(mut ed2)
+    let k2 = state_of(mut ed2, b2)
+    assert(ed2.syntax[0].bufs[k2].sb[0].degraded, "the long line degrades")
+    assert(has_bytes(badge(mut ed2), "syn!"), "syn! when degraded")
+    assert(!has_bytes(badge(mut ed2), "syn\u{2026}"), "degraded wins over settling")
+}
+
+// ---- 9: the commands --------------------------------------------------------
+
+fn syntax_set_and_status_commands() {
+    var ed = memory_ed(sh_body(12))
+    let bi = doc(ed)
+    let id = ed.bufs[bi].id
+    assert(edit.ed_syn_lang(ed, bi) == 16, "sh by its shebang")
+    assert(invoke_str(mut ed, "ed.syn.set", "python") == edit.CMD_OK, "set python")
+    assert(edit.ed_syn_lang(ed, bi) == 14, "python: {edit.ed_syn_lang(ed, bi)}")
+    assert((ed.buf_languages[id] else "") == "python", "Buffer.lang python")
+    assert(edit.ed_syn_engine(ed, bi) >= 0, "bound to python's engine")
+    settle_all(mut ed)
+    assert(invoke(mut ed, "ed.syn.status") == edit.CMD_OK, "status")
+    let n = lines(ed, bi)
+    assert(ed.msg.text.starts_with("settled {n}/{n}, wave {n}, root=python "), "the report: {ed.msg.text}")
+    assert(ed.msg.text.ends_with(" degraded=no embed_pending=0 embed_refused=none"), "its tail: {ed.msg.text}")
+    assert(invoke_str(mut ed, "ed.syn.set", "none") == edit.CMD_OK, "set none")
+    assert(edit.ed_syn_lang(ed, bi) == 0, "no language")
+    assert((ed.buf_languages[id] else "") == "", "no Buffer.lang")
+    assert(edit.ed_syn_draw_state(mut ed, bi) < 0, "drawn plain")
+    assert(!edit.ed_syn_pending(ed), "nothing to settle")
+    assert(invoke_str(mut ed, "ed.syn.set", "nosuch") == edit.CMD_ERR_ARG, "an unknown name")
+    assert(ed.msg.text == "no definition for 'nosuch' \u{2014} Sprint 42", "the error: {ed.msg.text}")
+    assert(invoke_str(mut ed, "ed.syn.set", "javascript") == edit.CMD_ERR_IO, "no javascript.fl ships")
+    assert(edit.ed_syn_lang(ed, bi) == 0, "unchanged by the refusals")
+    assert(invoke_str(mut ed, "ed.syn.set", "sh") == edit.CMD_OK, "set sh")
+    assert(edit.ed_syn_lang(ed, bi) == 16, "sh again")
+    assert((ed.buf_languages[id] else "") == "sh", "Buffer.lang sh")
+    assert(edit.ed_syn_draw_state(mut ed, bi) >= 0, "drawn highlighted")
+}
+
+fn run_case(i: int) {
+    if i == 0 {
+        syntax_attach_by_path_and_none_for_plain()
+        print("syntax_attach_by_path_and_none_for_plain: PASS")
+    } else if i == 1 {
+        syntax_edits_undo_and_redo_splice_and_match_fresh()
+        print("syntax_edits_undo_and_redo_splice_and_match_fresh: PASS")
+    } else if i == 2 {
+        syntax_multicursor_batch_is_one_splice()
+        print("syntax_multicursor_batch_is_one_splice: PASS")
+    } else if i == 3 {
+        syntax_per_key_ten_thousand_lines()
+        print("syntax_per_key_ten_thousand_lines: PASS")
+    } else if i == 4 {
+        syntax_per_key_twin()
+        print("syntax_per_key_twin: PASS")
+    } else if i == 5 {
+        syntax_loop_wakes_and_each_tick_progresses()
+        print("syntax_loop_wakes_and_each_tick_progresses: PASS")
+    } else if i == 6 {
+        syntax_unloadable_guest_leaves_nothing_pending()
+        print("syntax_unloadable_guest_leaves_nothing_pending: PASS")
+    } else if i == 7 {
+        syntax_rows_draw_through_the_theme_slots()
+        print("syntax_rows_draw_through_the_theme_slots: PASS")
+    } else if i == 8 {
+        syntax_badge_after_250ms_and_degraded_wins()
+        print("syntax_badge_after_250ms_and_degraded_wins: PASS")
+    } else if i == 9 {
+        syntax_set_and_status_commands()
+        print("syntax_set_and_status_commands: PASS")
+    }
+}
+
+fn main() {
+    let selected = (env_get("YEW_SYN_EDIT_CASE") else "-1").to_int() else -1
+    for i in 0..CASES {
+        if selected == -1 || selected == i {
+            run_case(i)
+        }
+    }
+}
