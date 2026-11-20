@@ -19,9 +19,22 @@ The format follows Keep a Changelog; the port has no release yet.
   edit re-highlights from the edited line only until the retained states agree
   again; settling runs on a time budget, and a span cache serves an unchanged
   screen without re-highlighting.
-- `src/syncli/` ports `src/syncli.c`: `yew syn list`, `compile`, `check` and
-  `dump FILE --tables|--spans INPUT`. The on-disk cache (`yew syn cache`) and
-  the coverage and embed reports refuse by name until the full language pack.
+- The registry detects a file's language as C does (exact name, glob, the
+  longest extension without case, the shebang's interpreter through `env`,
+  then a first-line pattern; priority, then name, breaks ties) and discovers
+  user definitions under the configuration directory's `syntax/`, which
+  `--clean` bypasses. The matcher tries C's exact fast paths (identifiers,
+  word and finite literal sets, JSON keys) before the regex machine, each
+  held equal to it by a test.
+- `src/syncli/` ports `src/syncli.c`: `yew syn list`, `compile`, `check` (with
+  its report of embed selectors that name no definition and of embedding
+  chains past the 16-frame cap) and `dump FILE --tables|--spans INPUT`. Every
+  such command line prints and exits as C yew's does. The on-disk cache
+  (`yew syn cache`) and the `--coverage` and `--embed` reports refuse by name
+  until the full language pack.
+- sagitta's syn unit tests are ported one for one where they need only the
+  first-stage definitions; the cache, the structural provider, the
+  48-definition pack and the stage-two modes' tests are named for later.
 - `tools/check-syntax-cohort` runs the first cohort: 132 of the pin's 432
   syntax goldens (the seven modes' base fixtures, the eight shell embeddings
   and the nine Markdown fences whose guests are in the cohort), each dumped

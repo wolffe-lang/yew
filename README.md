@@ -77,8 +77,9 @@ definition's `yew syn dump FILE --tables` is byte for byte C's), and an
 incremental line-state engine interprets them: one interned state per line
 start, re-highlighting from an edited line only until the old states agree
 again, settling on a time budget, and embedded languages such as fenced code
-and command substitutions. `yew syn list`, `compile`, `check` and `dump`
-work; the syntax goldens of the seven first modes (wolf, Markdown, C,
+and command substitutions; languages are detected by name, extension,
+shebang and first line, and user definitions are discovered. `yew syn list`,
+`compile`, `check` and `dump` work as C's do; the syntax goldens of the seven first modes (wolf, Markdown, C,
 Python, shell, TOML and JSON: 132 of the 432) pass through `yew syn dump`,
 and the other 300 are listed by name for the full language pack. The editor
 does not draw syntax colours yet, and there is no on-disk definition cache:
