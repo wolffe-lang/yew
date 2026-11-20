@@ -1,0 +1,385 @@
+//! syn.detect — choosing a language for a path and its first line.
+//! Ports sagitta src/syn/registry.c's `yew_syn_detect_find` and the
+//! detection of src/syn/defs.c:3292–3657 (`ascii_equal_fold`, `path_base`,
+//! `one_star_glob`, `better`, `best_detect_run`, `path_language`,
+//! `parse_shebang`, `yew_syn_lang_for`) at 9ace98c2. Stages, first match
+//! wins: exact filename, glob, longest extension (case-folded), shebang
+//! interpreter, first-line pattern. Inside a stage the higher priority wins,
+//! then the bytewise-smaller name. Builtins answer from the generated
+//! indexes; registered user languages are compared in each stage.
+
+use search
+use text
+
+/// One detection index: keys in the generated table's order (sorted for
+/// the binary search), each with its language and, for a glob, the byte
+/// offset of its one star.
+pub struct SynDetectEntries {
+    keys: List[List[byte]],
+    langs: List[int],
+    splits: List[int],
+}
+
+/// An empty index.
+pub fn syn_detect_entries() -> SynDetectEntries {
+    SynDetectEntries { keys: List[List[byte]](), langs: List[int](), splits: List[int]() }
+}
+
+/// Append one entry; the caller keeps the keys in search order.
+pub fn syn_detect_add(mut entries: SynDetectEntries, key: List[byte], language: int, split: int) {
+    (mut entries.keys).push(key)
+    (mut entries.langs).push(language)
+    (mut entries.splits).push(split)
+}
+
+// A generated table: `KEY<TAB>ID` rows, or `KEY<TAB>SPLIT<TAB>ID` for globs.
+fn syn_detect_parse(rows: str, split: bool) -> SynDetectEntries {
+    var entries = syn_detect_entries()
+    let text = model_bytes(rows)
+    var at = 0
+    while at < text.len {
+        let end = registry_line_end(text, at)
+        var tab = at
+        while tab < end && text[tab] as int != 9 { tab += 1 }
+        if tab >= end then syn_bug("syntax: malformed detection row")
+        var cut = -1
+        var lang_at = tab + 1
+        if split {
+            var second = tab + 1
+            while second < end && text[second] as int != 9 { second += 1 }
+            if second >= end then syn_bug("syntax: malformed glob detection row")
+            cut = registry_int(text, tab + 1, second)
+            lang_at = second + 1
+        }
+        syn_detect_add(mut entries, registry_field(text, at, tab), registry_int(text, lang_at, end), cut)
+        at = end + 1
+    }
+    entries
+}
+
+fn detect_fold(b: int) -> int {
+    if b >= 65 && b <= 90 then b + 32 else b
+}
+
+// `detect_key_compare`: key[lo..hi] against one entry, bytewise, folding
+// ASCII case on both sides when asked.
+fn detect_compare(key: List[byte], lo: int, hi: int, candidate: List[byte], fold: bool) -> int {
+    let key_len = hi - lo
+    let common = if key_len < candidate.len then key_len else candidate.len
+    for i in 0..common {
+        var left = key[lo + i] as int
+        var right = candidate[i] as int
+        if fold {
+            left = detect_fold(left)
+            right = detect_fold(right)
+        }
+        if left < right then return -1
+        if left > right then return 1
+    }
+    if key_len < candidate.len then return -1
+    if key_len > candidate.len then return 1
+    0
+}
+
+/// `yew_syn_detect_find`: the lower bound of key[lo..hi] by binary search
+/// and the length of the run of equal keys from it, as (first, len);
+/// (-1, 0) when absent. A whole duplicate run is answered in table order.
+pub fn syn_detect_find(entries: SynDetectEntries, key: List[byte], lo: int, hi: int, fold: bool) -> (int, int) {
+    var low = 0
+    var high = entries.keys.len
+    while low < high {
+        let mid = low + (high - low) / 2
+        if detect_compare(key, lo, hi, entries.keys[mid], fold) > 0 {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+    if low == entries.keys.len || detect_compare(key, lo, hi, entries.keys[low], fold) != 0 {
+        return (-1, 0)
+    }
+    var at = low
+    while at < entries.keys.len && detect_compare(key, lo, hi, entries.keys[at], fold) == 0 { at += 1 }
+    (low, at - low)
+}
+
+// A candidate is a builtin ordinal (0..builtins) or builtins + a user
+// index; -1 is none.
+fn cand_priority(reg: SynRegistry, c: int) -> int {
+    if c < reg.ids.len then reg.priorities[c] else reg.users[c - reg.ids.len].priority
+}
+
+fn cand_id(reg: SynRegistry, c: int) -> int {
+    if c < reg.ids.len then reg.ids[c] else reg.users[c - reg.ids.len].id
+}
+
+fn name_less(a: List[byte], b: List[byte]) -> bool {
+    let n = if a.len < b.len then a.len else b.len
+    for i in 0..n {
+        if a[i] != b[i] then return a[i] as int < b[i] as int
+    }
+    a.len < b.len
+}
+
+fn cand_name_less(reg: SynRegistry, a: int, b: int) -> bool {
+    if a < reg.ids.len {
+        if b < reg.ids.len then return name_less(reg.names[a], reg.names[b])
+        return name_less(reg.names[a], reg.users[b - reg.ids.len].name)
+    }
+    if b < reg.ids.len then return name_less(reg.users[a - reg.ids.len].name, reg.names[b])
+    name_less(reg.users[a - reg.ids.len].name, reg.users[b - reg.ids.len].name)
+}
+
+// `better`: no incumbent, a higher priority, or an equal one with the
+// bytewise-smaller name.
+fn better(reg: SynRegistry, a: int, b: int) -> bool {
+    if b < 0 then return true
+    let pa = cand_priority(reg, a)
+    let pb = cand_priority(reg, b)
+    pa > pb || pa == pb && cand_name_less(reg, a, b)
+}
+
+// `best_detect_run` over builtin ids.
+fn best_run(reg: SynRegistry, entries: SynDetectEntries, first: int, len: int) -> int {
+    var best = -1
+    for i in first..first + len {
+        if first < 0 then break
+        let o = syn_registry_ordinal(reg, entries.langs[i])
+        if o >= 0 && better(reg, o, best) {
+            best = o
+        }
+    }
+    best
+}
+
+fn fold_equal(a: List[byte], alo: int, ahi: int, b: List[byte]) -> bool {
+    if ahi - alo != b.len then return false
+    for i in 0..b.len {
+        if detect_fold(a[alo + i] as int) != detect_fold(b[i] as int) then return false
+    }
+    true
+}
+
+fn exact_equal(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len then return false
+    for i in 0..a.len {
+        if a[i] != b[i] then return false
+    }
+    true
+}
+
+// `one_star_glob`: a pattern with exactly one star against a whole base.
+fn one_star_glob(pat: List[byte], base: List[byte]) -> bool {
+    var star = -1
+    for i in 0..pat.len {
+        if pat[i] as int == 42 {
+            if star >= 0 then return false
+            star = i
+        }
+    }
+    if star < 0 then return false
+    let prefix = star
+    let suffix = pat.len - prefix - 1
+    if base.len < prefix + suffix then return false
+    for i in 0..prefix {
+        if pat[i] != base[i] then return false
+    }
+    for i in 0..suffix {
+        if pat[star + 1 + i] != base[base.len - suffix + i] then return false
+    }
+    true
+}
+
+// `language_extension_len`: a user language's longest extension the base
+// ends with after a dot, case-folded; 0 when none.
+fn user_extension_len(lang: SynLanguage, base: List[byte]) -> int {
+    var longest = 0
+    for ext in lang.extensions {
+        let n = ext.len
+        if n <= longest || base.len <= n || base[base.len - n - 1] as int != 46 then continue
+        if fold_equal(base, base.len - n, base.len, ext) {
+            longest = n
+        }
+    }
+    longest
+}
+
+// `path_language`: exact filename, then glob, then the longest extension.
+fn path_language(reg: SynRegistry, base: List[byte]) -> int {
+    let (xf, xn) = syn_detect_find(reg.exact, base, 0, base.len, false)
+    var exact = best_run(reg, reg.exact, xf, xn)
+    var glob = -1
+    for i in 0..reg.globs.keys.len {
+        let prefix = reg.globs.splits[i]
+        let suffix = reg.globs.keys[i].len - prefix - 1
+        if base.len < prefix + suffix then continue
+        var hit = true
+        for j in 0..prefix {
+            if reg.globs.keys[i][j] != base[j] {
+                hit = false
+                break
+            }
+        }
+        if hit {
+            for j in 0..suffix {
+                if reg.globs.keys[i][prefix + 1 + j] != base[base.len - suffix + j] {
+                    hit = false
+                    break
+                }
+            }
+        }
+        if !hit then continue
+        let o = syn_registry_ordinal(reg, reg.globs.langs[i])
+        if o >= 0 && better(reg, o, glob) {
+            glob = o
+        }
+    }
+    var extension = -1
+    var extension_len = 0
+    for dot in 0..base.len {
+        if base[dot] as int != 46 then continue
+        let len = base.len - dot - 1
+        let (ef, en) = syn_detect_find(reg.extension_index, base, dot + 1, base.len, true)
+        let o = best_run(reg, reg.extension_index, ef, en)
+        if o >= 0 && (len > extension_len || len == extension_len && better(reg, o, extension)) {
+            extension_len = len
+            extension = o
+        }
+    }
+    for u in 0..reg.users.len {
+        if reg.user_retired[u] then continue
+        let c = reg.ids.len + u
+        for pattern in reg.users[u].filenames {
+            var star = false
+            for b in pattern {
+                if b as int == 42 {
+                    star = true
+                }
+            }
+            if !star && exact_equal(pattern, base) && better(reg, c, exact) {
+                exact = c
+            }
+            if star && one_star_glob(pattern, base) && better(reg, c, glob) {
+                glob = c
+            }
+        }
+        let n = user_extension_len(reg.users[u], base)
+        if n > extension_len || n != 0 && n == extension_len && better(reg, c, extension) {
+            extension_len = n
+            extension = c
+        }
+    }
+    if exact >= 0 then return exact
+    if glob >= 0 then return glob
+    extension
+}
+
+// `parse_shebang`: the interpreter's basename, past `env` and its flags,
+// as (found, lo, hi).
+fn parse_shebang(line: List[byte]) -> (bool, int, int) {
+    let len = line.len
+    if len < 3 || line[0] as int != 35 || line[1] as int != 33 then return (false, 0, 0)
+    var at = 2
+    while at < len && (line[at] as int == 32 || line[at] as int == 9) { at += 1 }
+    var start = at
+    while at < len && !shebang_stop(line[at] as int) { at += 1 }
+    var end = at
+    var slash = end
+    while slash > start && line[slash - 1] as int != 47 { slash -= 1 }
+    start = slash
+    if fold_equal(line, start, end, model_bytes("env")) {
+        loop {
+            while at < len && (line[at] as int == 32 || line[at] as int == 9) { at += 1 }
+            start = at
+            while at < len && !shebang_stop(line[at] as int) { at += 1 }
+            end = at
+            if !(start < end && line[start] as int == 45) then break
+        }
+        slash = end
+        while slash > start && line[slash - 1] as int != 47 { slash -= 1 }
+        start = slash
+    }
+    if start == end then return (false, 0, 0)
+    (true, start, end)
+}
+
+fn shebang_stop(b: int) -> bool {
+    b == 32 || b == 9 || b == 13 || b == 10
+}
+
+fn first_line_matches(reg: SynRegistry, re: int, line: List[byte]) -> bool {
+    var m = search.re_match_new()
+    search.re_match_at(
+        reg.first_compiled[re],
+        text.textbuf_new(),
+        line,
+        search.re_input_bytes(line.len),
+        0 as text.ByteOff,
+        mut m,
+    )
+}
+
+// A user language's first-line pattern, compiled on first use and kept.
+fn user_first_line(mut reg: SynRegistry, u: int) -> int {
+    if !reg.users[u].has_first_line then return -1
+    if reg.user_first_res[u] >= 0 then return reg.user_first_res[u]
+    var n = 0
+    while n < reg.users[u].first_line.len && reg.users[u].first_line[n] as int != 0 { n += 1 }
+    var err = search.re_err_new()
+    let re = search.re_compile(copy reg.users[u].first_line[0..n], 0, mut err) else {
+        return -1
+    }
+    if err.msg.len != 0 then return -1
+    reg.user_first_res[u] = reg.first_compiled.len
+    (mut reg.first_compiled).push(re)
+    reg.user_first_res[u]
+}
+
+/// `yew_syn_lang_for`: the language for a path (its basename is what
+/// matches) and, when `has_line`, its first line; 0 is YEW_LANG_NONE.
+/// Compiles a first-line pattern at most once each.
+pub fn syn_registry_lang_for(mut reg: SynRegistry, path: str, line: List[byte], has_line: bool) -> int {
+    let whole = model_bytes(path)
+    var cut = whole.len
+    while cut > 0 && whole[cut - 1] as int != 47 { cut -= 1 }
+    let base = whole[cut..whole.len]
+    let found = path_language(reg, base)
+    if found >= 0 then return cand_id(reg, found)
+    if !has_line then return 0
+    let (ok, lo, hi) = parse_shebang(line)
+    if ok {
+        let (sf, sn) = syn_detect_find(reg.shebang_index, line, lo, hi, true)
+        var best = best_run(reg, reg.shebang_index, sf, sn)
+        for u in 0..reg.users.len {
+            if reg.user_retired[u] then continue
+            var hit = false
+            for interp in reg.users[u].shebangs {
+                if fold_equal(line, lo, hi, interp) {
+                    hit = true
+                }
+            }
+            if hit && better(reg, reg.ids.len + u, best) {
+                best = reg.ids.len + u
+            }
+        }
+        if best >= 0 then return cand_id(reg, best)
+    }
+    var best = -1
+    for i in 0..reg.first_line_index.langs.len {
+        let o = syn_registry_ordinal(reg, reg.first_line_index.langs[i])
+        if o < 0 || reg.first_lines[o].len == 0 then continue
+        let re = syn_registry_first_line(mut reg, o)
+        if re >= 0 && first_line_matches(reg, re, line) && better(reg, o, best) {
+            best = o
+        }
+    }
+    for u in 0..reg.users.len {
+        if reg.user_retired[u] then continue
+        let re = user_first_line(mut reg, u)
+        if re >= 0 && first_line_matches(reg, re, line) && better(reg, reg.ids.len + u, best) {
+            best = reg.ids.len + u
+        }
+    }
+    if best >= 0 then return cand_id(reg, best)
+    0
+}
