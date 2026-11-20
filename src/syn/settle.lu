@@ -3,6 +3,7 @@
 //! an owner/registry operation; only already-loaded programs install here.
 
 use text
+use util
 
 /// Work, timing and damage of one propagation slice. lines counts actual
 /// syn_line calls, not byte spans or an estimate of work.
@@ -57,6 +58,81 @@ pub fn syn_buffer_install_guest(
     true
 }
 
+// syn_settle_embed_line's warning: an embed selected a language that is
+// not available, so the bridge's fallback styles it. Once per buffer.
+fn settle_unknown_warning(buffer: SynBuffer, engine: SynEngine, pool: SynPool) {
+    var message = List[byte]()
+    for b in "syntax embed language '".bytes() { (mut message).push(b) }
+    if engine.unknown_program >= 0 {
+        let name_len = pool.aux[engine.unknown_program].items[engine.unknown_literal].len
+        let shown = if name_len > 120 then 120 else name_len
+        for i in 0..shown { (mut message).push(pool.aux[engine.unknown_program].items[engine.unknown_literal][i]) }
+    } else {
+        let shown = if engine.unknown_len > 120 then 120 else engine.unknown_len
+        for i in 0..shown { (mut message).push(buffer.line_bytes[engine.unknown_start + i]) }
+    }
+    for b in "' is unavailable; using fallback".bytes() { (mut message).push(b) }
+    util.log_at_bytes(util.LOG_WARN, message)
+}
+
+/// `yew_syn_embed_pump`: with at least the 2,000-us guest load budget,
+/// install the head queued guest once its owner has pooled the program,
+/// then replay from its opener (syn_buffer_install_guest). Loading and
+/// compiling a definition is the owner's I/O, done before this call.
+pub fn syn_embed_pump(mut buffer: SynBuffer, mut engine: SynEngine, pool: SynPool, budget_us: int) -> bool {
+    if budget_us < 2000 || buffer.pending_langs.len == 0 || engine.residents.len >= SYN_RESIDENT_MAX {
+        return false
+    }
+    let program = pool_for_language(pool, buffer.pending_langs[0])
+    if program < 0 then return false
+    syn_buffer_install_guest(mut buffer, mut engine, pool, program)
+}
+
+/// The queued guest language an owner should load next, or 0 for none.
+pub fn syn_embed_wanted(buffer: SynBuffer) -> int {
+    if buffer.pending_langs.len == 0 then return 0
+    buffer.pending_langs[0]
+}
+
+fn status_name(name: List[byte]) -> str {
+    let s = str_from_utf8(copy name) else { return "?" }
+    s
+}
+
+/// `yew_syn_status`: the settling badge's report line, naming the root and
+/// active definitions, the qualified depth, the degraded mark and any
+/// queued or refused guest.
+pub fn syn_buffer_status(buffer: SynBuffer, engine: SynEngine, pool: SynPool, line_count: int) -> str {
+    let count = syn_ids_len(buffer.lines.entry)
+    var at = buffer.lines.wave
+    if at >= count { at = if count == 0 then 0 else count - 1 }
+    let root_name = status_name(pool.programs[engine.residents[0]].name)
+    var active_name = "none"
+    var ndefs = 0
+    var depth = 0
+    var active = syn_state_root(0, 0)
+    if count != 0 && syn_state_read(mut active, engine.states, syn_ids_get(buffer.lines.entry, at)) {
+        depth = syn_state_depth(active)
+        ndefs = syn_state_ndef(active)
+        let slot = syn_state_def(active, depth - 1)
+        if slot < engine.residents.len {
+            active_name = status_name(pool.programs[engine.residents[slot]].name)
+        }
+    }
+    var refused_name = "none"
+    if buffer.refused_lang != 0 {
+        for i in 0..engine.known_ids.len {
+            if engine.known_ids[i] == buffer.refused_lang {
+                refused_name = status_name(engine.known_names[i])
+                break
+            }
+        }
+    }
+    let degraded = if buffer.degraded then "yes" else "no"
+    let states = syn_state_count(engine.states)
+    "settled {buffer.lines.settled_to}/{line_count}, wave {buffer.lines.wave}, root={root_name} active={active_name} defs={ndefs}/{SYN_DEF_MAX} depth={depth}/{SYN_DEPTH_MAX} states={states} degraded={degraded} embed_pending={buffer.pending_langs.len} embed_refused={refused_name}"
+}
+
 /// Spend at most a line-granular budget, retaining a wave across calls.
 /// budget_us <= 0 runs to a verified fixpoint. Real clocks observe every
 /// four lines with 64-us headroom; injected clocks preserve C's 256-line
@@ -84,10 +160,7 @@ pub fn syn_settle(
     var deadline = budget_us
     if !buffer.fake_clock && deadline > 64 { deadline -= 64 }
     buffer_reconcile(mut buffer, engine, tb)
-    if budget_us >= 4000 && buffer.pending_langs.len != 0 {
-        let loaded = pool_for_language(pool, buffer.pending_langs[0])
-        if loaded >= 0 { let _ = syn_buffer_install_guest(mut buffer, mut engine, pool, loaded) }
-    }
+    if budget_us >= 4000 { let _ = syn_embed_pump(mut buffer, mut engine, pool, 2000) }
     let count = syn_ids_len(buffer.lines.entry)
     if !buffer.enabled || count == 0 {
         buffer.lines.settling = false
@@ -110,7 +183,14 @@ pub fn syn_settle(
         report.lines += 1
         buffer_note_stop(mut buffer, engine, buffer.scratch.stop)
         if engine.pending_lang != 0 { buffer_pending_add(mut buffer, engine.pending_lang, line) }
-        if engine.refused_lang != 0 { buffer.refused_lang = engine.refused_lang }
+        if engine.refused_lang != 0 {
+            buffer.refused_lang = engine.refused_lang
+            buffer.degraded = true
+        }
+        if !buffer.embed_unknown_logged && (engine.unknown_start >= 0 || engine.unknown_program >= 0) {
+            settle_unknown_warning(buffer, engine, pool)
+            buffer.embed_unknown_logged = true
+        }
         if report.damage_lo == 9223372036854775807 { report.damage_lo = line }
         report.damage_hi = line + 1
         if line >= view_lo && line < view_hi { report.hit_view = true }
