@@ -1,0 +1,286 @@
+//! member: false
+//! Ports sagitta tests/unit/test_syn_discovery.c at 9ace98c2, one case per
+//! C test in its order. C points XDG_CONFIG_HOME at a mkdtemp root and
+//! discovers lazily on the next registry lookup; here the config directory
+//! is an explicit argument (`syn_registry_discover`), the root is a scratch
+//! directory under TMPDIR (or target/), and a captured log is the
+//! registry's own warning list. C's `yew_syn_embed_pump` is the explicit
+//! guest install (`syn_buffer_install_guest`) of the pooled definition.
+
+use std.fs
+use syn
+use text
+
+struct Fix {
+    root: str,
+    config: str,
+    syntax: str,
+    reg: syn.SynRegistry,
+    pool: syn.SynPool,
+    builtin_count: int,
+}
+
+const ALPHA_DEF: str = "{{ syntax: 1, language: {{ name: \"user-alpha\", extensions: [\"ualpha\"], filenames: [\"Alpha.project\"], shebangs: [\"ualpha\"], priority: 4 }}, contexts: {{ main: {{ rules: [ {{ match: \"x\", attr: \"keyword\" }} ] }} }} }}"
+
+const ZETA_DEF: str = "{{ syntax: 1, language: {{ name: \"user-zeta\", extensions: [\"uzeta\"], filenames: [], shebangs: [], priority: 2 }}, contexts: {{ main: {{ rules: [] }} }} }}"
+
+fn bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() { (mut out).push(b) }
+    out
+}
+
+fn contains(haystack: str, needle: str) -> bool {
+    let _ = haystack.find(needle) else {
+        return false
+    }
+    true
+}
+
+fn same(a: List[byte], s: str) -> bool {
+    if a.len != s.len then return false
+    var i = 0
+    for b in s.bytes() {
+        if a[i] != b then return false
+        i += 1
+    }
+    true
+}
+
+// `discovery_open`: a scratch config root, the builtin count, and (when
+// asked) the `yew/syntax` directory.
+fn open(make_syntax: bool) -> Fix {
+    let base = env_get("TMPDIR") else "target"
+    var n = 0
+    var root = ""
+    loop {
+        root = "{base}/yew-syn-discovery-{os_pid()}-{n}"
+        if !fs.exists(root) then break
+        n += 1
+    }
+    fs.create_dir_all(root) else |_| { assert(false, "scratch root") }
+    let config = "{root}/yew"
+    let syntax = "{config}/syntax"
+    if make_syntax {
+        fs.create_dir_all(syntax) else |_| { assert(false, "syntax directory") }
+    }
+    let reg = syn.syn_registry_new()
+    var pool = syn.syn_pool_new()
+    syn.syn_registry_seed(reg, mut pool)
+    let count = syn.syn_registry_lang_count(reg)
+    Fix { root: root, config: config, syntax: syntax, reg: reg, pool: pool, builtin_count: count }
+}
+
+fn write(f: Fix, name: str, source: str) {
+    fs.write_text("{f.syntax}/{name}", source) else |_| { assert(false, "fixture write {name}") }
+}
+
+fn remove(f: Fix, name: str) {
+    fs.remove("{f.syntax}/{name}") else |_| { assert(false, "fixture remove {name}") }
+}
+
+// `yew_syn_discovery_reset` followed by the lookup that rescans.
+fn rescan(mut f: Fix) {
+    syn.syn_registry_discovery_reset(mut f.reg)
+    syn.syn_registry_discover(mut f.reg, mut f.pool, f.config)
+}
+
+// `discovery_close`: an empty rescan pins the builtin count, then the root goes.
+fn close(mut f: Fix) {
+    syn.syn_registry_discovery_reset(mut f.reg)
+    fs.remove_dir_all(f.root) else |_| { assert(false, "scratch root removal") }
+    syn.syn_registry_discover(mut f.reg, mut f.pool, f.config)
+    assert(syn.syn_registry_lang_count(f.reg) == f.builtin_count, "only builtins remain")
+}
+
+fn lang_for(mut f: Fix, path: str) -> int {
+    syn.syn_registry_lang_for(mut f.reg, path, List[byte](), false)
+}
+
+fn named(f: Fix, name: str) -> int {
+    syn.syn_registry_lang_named(f.reg, bytes(name))
+}
+
+// test_syn_discovery_absent_config_directory_is_silent
+fn absent_config_directory_is_silent() {
+    var f = open(false)
+    rescan(mut f)
+    assert(syn.syn_registry_lang_count(f.reg) == f.builtin_count, "nothing discovered")
+    assert(f.reg.warnings.len == 0, "an absent directory is silent")
+    close(mut f)
+}
+
+// test_syn_discovery_is_sorted_and_integrates_every_registry_surface
+fn is_sorted_and_integrates_every_registry_surface() {
+    var f = open(true)
+    // Creation order deliberately opposes the required bytewise scan order.
+    write(f, "z-last.fl", ZETA_DEF)
+    write(f, "README", "ignored")
+    write(f, "a-first.fl", ALPHA_DEF)
+    f.reg.compiles = 0
+    rescan(mut f)
+    assert(syn.syn_registry_lang_count(f.reg) == f.builtin_count + 2, "two discovered")
+    assert(f.reg.compiles == 2, "two definitions compiled")
+    let alpha = named(f, "user-alpha")
+    let zeta = named(f, "user-zeta")
+    assert(alpha != 0 && zeta != 0, "both resolve by name")
+    assert(alpha < zeta, "ids follow the bytewise scan order")
+    assert(lang_for(mut f, "example.ualpha") == alpha, "extension detection")
+    assert(lang_for(mut f, "Alpha.project") == alpha, "filename detection")
+    let desc = syn.syn_registry_desc(f.reg, alpha) else {
+        assert(false, "a discovered language has a descriptor")
+        return
+    }
+    assert(same(desc.name, "user-alpha"), "descriptor name")
+    assert(contains(desc.source, "/a-first.fl"), "descriptor source")
+    let compiled = f.reg.compiles
+    let program = syn.syn_registry_def_for(f.reg, alpha)
+    assert(program >= 0, "the discovered definition is loaded")
+    let engine = syn.syn_engine_new(f.pool, program)
+    assert(engine.residents.len == 1, "an engine for the discovered definition")
+    assert(f.reg.compiles == compiled, "no recompilation for an engine")
+    // Looking up built-in metadata must not compile a built-in definition.
+    assert(named(f, "ini") != 0, "ini resolves")
+    assert(f.reg.compiles == compiled, "metadata lookup compiles nothing")
+    close(mut f)
+}
+
+// test_syn_discovery_invalid_file_warns_once_and_reset_drops_user_state
+fn invalid_file_warns_once_and_reset_drops_user_state() {
+    var f = open(true)
+    write(f, "broken.fl", "{{ syntax: 1, language: [ }}")
+    rescan(mut f)
+    assert(syn.syn_registry_lang_count(f.reg) == f.builtin_count, "nothing discovered")
+    assert(f.reg.warnings.len == 1, "one warning")
+    assert(contains(f.reg.warnings[0], "ignoring invalid syntax definition"), "the invalid file is named")
+    let ini = named(f, "ini")
+    assert(ini != 0, "ini resolves")
+    assert(lang_for(mut f, "settings.ini") == ini, "builtin detection unaffected")
+    remove(f, "broken.fl")
+    write(f, "user.fl", ALPHA_DEF)
+    rescan(mut f)
+    assert(named(f, "user-alpha") != 0, "a later scan discovers the replacement")
+    remove(f, "user.fl")
+    rescan(mut f)
+    assert(named(f, "user-alpha") == 0, "a reset drops the user definition")
+    assert(syn.syn_registry_lang_count(f.reg) == f.builtin_count, "only builtins remain")
+    close(mut f)
+}
+
+// test_syn_discovery_duplicate_name_keeps_first_sorted_definition
+fn duplicate_name_keeps_first_sorted_definition() {
+    let duplicate = "{{ syntax: 1, language: {{ name: \"user-alpha\", extensions: [\"duplicate\"], filenames: [], shebangs: [] }}, contexts: {{ main: {{ rules: [] }} }} }}"
+    var f = open(true)
+    write(f, "01-first.fl", ALPHA_DEF)
+    write(f, "02-duplicate.fl", duplicate)
+    rescan(mut f)
+    assert(syn.syn_registry_lang_count(f.reg) == f.builtin_count + 1, "one discovered")
+    assert(f.reg.warnings.len == 1, "one warning")
+    assert(contains(f.reg.warnings[0], "duplicate syntax language 'user-alpha'"), "the duplicate is named")
+    let alpha = named(f, "user-alpha")
+    let desc = syn.syn_registry_desc(f.reg, alpha) else {
+        assert(false, "the first definition has a descriptor")
+        return
+    }
+    assert(contains(desc.source, "/01-first.fl"), "the first sorted file wins")
+    assert(lang_for(mut f, "x.ualpha") == alpha, "the first definition detects")
+    assert(lang_for(mut f, "x.duplicate") == 0, "the duplicate detects nothing")
+    close(mut f)
+}
+
+// test_syn_discovery_rejects_builtin_language_name_collision
+fn rejects_builtin_language_name_collision() {
+    let collision = "{{ syntax: 1, language: {{ name: \"ini\", extensions: [\"hijack\"] }}, contexts: {{ main: {{ rules: [] }} }} }}"
+    var f = open(true)
+    write(f, "hijack.fl", collision)
+    rescan(mut f)
+    assert(syn.syn_registry_lang_count(f.reg) == f.builtin_count, "nothing discovered")
+    assert(f.reg.warnings.len == 1, "one warning")
+    assert(contains(f.reg.warnings[0], "duplicate syntax language 'ini'"), "the collision is named")
+    let ini = named(f, "ini")
+    let desc = syn.syn_registry_desc(f.reg, ini) else {
+        assert(false, "ini has a descriptor")
+        return
+    }
+    assert(desc.source == "runtime/syntax/ini.fl", "the builtin descriptor stands")
+    assert(lang_for(mut f, "x.hijack") == 0, "the collision detects nothing")
+    close(mut f)
+}
+
+fn host(mut f: Fix, name: str) -> int {
+    let src = "{{syntax:1,language:{{name:\"{name}\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"user-alpha\",end:\"inline\"}}}}]}},bridge:{{rules:[{{match:\"END\",pop:1,end:true}}]}}}}}}"
+    var c = syn.syn_compile("{name}.fl", bytes(src))
+    assert(c.valid, "host compiles")
+    assert(c.diagnostics.nerrors == 0 && c.diagnostics.nwarnings == 0, "host is clean")
+    let id = syn.syn_registry_register(mut f.reg, mut f.pool, take c.definition, "{name}.fl")
+    syn.syn_registry_def_for(f.reg, id)
+}
+
+// test_syn_discovery_engine_snapshots_user_name_for_pure_embed_lookup
+fn engine_snapshots_user_name_for_pure_embed_lookup() {
+    var f = open(true)
+    write(f, "user.fl", ALPHA_DEF)
+    rescan(mut f)
+    assert(named(f, "user-alpha") != 0, "the guest is discovered")
+    let program = host(mut f, "snapshot-host")
+    var engine = syn.syn_engine_new(f.pool, program)
+    let compiled = f.reg.compiles
+    var out = syn.syn_spans_new(8)
+    syn.syn_line(mut engine, mut f.pool, syn.SYN_STATE_ROOT, bytes("OPENx"), 5, mut out, false)
+    assert(f.reg.compiles == compiled, "matching never compiles a guest")
+    let pending = syn.syn_state_get(engine.states, out.exit_state) else {
+        assert(false, "a pending exit state")
+        return
+    }
+    assert(syn.syn_state_flags(pending) & syn.SYN_F_EMBED_PEND != 0, "the known guest is pending, not unknown")
+    for slot in syn.syn_state_ndef(pending)..syn.SYN_DEF_MAX {
+        assert(syn.syn_state_aux(pending, slot) == 0, "unused aux slots stay canonical")
+    }
+    close(mut f)
+}
+
+// test_syn_discovery_reset_keeps_pumped_guest_runtime_alive
+fn reset_keeps_pumped_guest_runtime_alive() {
+    var f = open(true)
+    write(f, "user.fl", ALPHA_DEF)
+    rescan(mut f)
+    let alpha = named(f, "user-alpha")
+    assert(alpha != 0, "the guest is discovered")
+    let program = host(mut f, "reset-host")
+    var engine = syn.syn_engine_new(f.pool, program)
+    let tb = text.textbuf_from_str("OPENxEND\n")
+    var buffer = syn.syn_buffer_new_at(tb, engine.generation, 0)
+    let first = syn.syn_settle(mut buffer, mut engine, mut f.pool, tb, 0, 1, 9223372036854775807)
+    assert(first.lines > 0, "the opener line settles")
+    assert(buffer.pending_langs.len == 1 && buffer.pending_langs[0] == alpha, "the guest is requested")
+    let guest = syn.syn_registry_def_for(f.reg, alpha)
+    assert(guest >= 0, "the discovered guest is loaded")
+    assert(syn.syn_buffer_install_guest(mut buffer, mut engine, f.pool, guest), "the guest installs")
+    assert(syn.syn_registry_resident(engine, f.pool, alpha) >= 0, "the guest is resident")
+    syn.syn_registry_discovery_reset(mut f.reg)
+    syn.syn_buffer_edit(mut buffer, 0, 0, 0)
+    let report = syn.syn_settle(mut buffer, mut engine, mut f.pool, tb, 0, 1, 9223372036854775807)
+    assert(report.fixpoint, "settling reaches a fixpoint after the reset")
+    let resident = syn.syn_registry_resident(engine, f.pool, alpha)
+    assert(resident >= 0, "the resident guest survives the reset")
+    assert(same(f.pool.programs[resident].name, "user-alpha"), "the resident guest keeps its name")
+    close(mut f)
+}
+
+fn main() {
+    let selected = (env_get("YEW_SYN_DISCOVERY_CASE") else "-1").to_int() else -1
+    for i in 0..7 {
+        if selected == -1 || selected == i {
+            match i {
+                0 => absent_config_directory_is_silent(),
+                1 => is_sorted_and_integrates_every_registry_surface(),
+                2 => invalid_file_warns_once_and_reset_drops_user_state(),
+                3 => duplicate_name_keeps_first_sorted_definition(),
+                4 => rejects_builtin_language_name_collision(),
+                5 => engine_snapshots_user_name_for_pure_embed_lookup(),
+                _ => reset_keeps_pumped_guest_runtime_alive(),
+            }
+            print("syn_discovery_case_{i}: PASS")
+        }
+    }
+}
