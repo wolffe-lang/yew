@@ -1,0 +1,305 @@
+//! member: false
+//! Ports sagitta tests/unit/test_syn_diff.c at 9ace98c2, one case per C
+//! test in its order: incremental settling after random one-byte edits
+//! equals a from-scratch interpretation, line states and spans alike.
+//! The embedded-boundary differential runs its shell document (sh is a
+//! stage-one definition, tests/fixtures/syn/sh.fl, the pin's file byte for
+//! byte); its Markdown-with-JavaScript and HTML documents need stage-two
+//! definitions and join it with the full language pack. Cases past the
+//! checked machine's step budget have smaller checked twins after the C
+//! cases (see tools/check-test-cases.txt).
+
+use search
+use syn
+use text
+
+fn bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() { (mut out).push(b) }
+    out
+}
+
+fn rule(mut def: syn.SynDefinition, ctx: int, pattern: str, attr: int, op: int, target: int) {
+    var err = search.re_err_new()
+    let re = search.re_compile_str(pattern, 0, mut err) else {
+        assert(false, "toy regex: {err.msg}")
+        return
+    }
+    var r = syn.syn_rule_new(def.regexes.len, attr)
+    r.op = op
+    r.target = target
+    if op == syn.SYN_OP_POP { r.nop = 1 }
+    let first = search.re_first_bytes(re)
+    r.first = syn.syn_first_new(false)
+    for i in 0..256 {
+        if first[i] { syn.syn_first_add(mut r.first, i) }
+    }
+    syn.syn_first_union(mut def.contexts[ctx].first, r.first)
+    (mut def.regexes).push(re)
+    (mut def.rules).push(r)
+    (mut def.patterns).push(bytes(pattern))
+}
+
+// syn_toy.c's four contexts and ten rules.
+fn toy() -> syn.SynDefinition {
+    var def = syn.syn_definition_new("toy")
+    var main = syn.syn_context_new(0)
+    main.nrules = 7
+    var string = syn.syn_context_new(12)
+    string.first_rule = 7
+    string.nrules = 2
+    string.eol_op = syn.SYN_OP_POP
+    string.eol_nop = 1
+    var block = syn.syn_context_new(16)
+    block.first_rule = 9
+    block.nrules = 1
+    var comment = syn.syn_context_new(16)
+    comment.first_rule = 10
+    comment.eol_op = syn.SYN_OP_POP
+    comment.eol_nop = 1
+    (mut def.contexts).push(main)
+    (mut def.contexts).push(string)
+    (mut def.contexts).push(block)
+    (mut def.contexts).push(comment)
+    for name in "main string comment_block comment_line".words() {
+        (mut def.context_names).push(bytes(name))
+    }
+    rule(mut def, 0, "//", 16, syn.SYN_OP_PUSH, 3)
+    rule(mut def, 0, "/\\*", 16, syn.SYN_OP_PUSH, 2)
+    rule(mut def, 0, "\"", 12, syn.SYN_OP_PUSH, 1)
+    rule(mut def, 0, "\\b(if|else|while|return)\\b", 2, syn.SYN_OP_STAY, 0)
+    rule(mut def, 0, "[0-9]+", 9, syn.SYN_OP_STAY, 0)
+    rule(mut def, 0, "\\b(true|false)\\b", 10, syn.SYN_OP_STAY, 0)
+    rule(mut def, 0, "[+*/=-]+", 31, syn.SYN_OP_STAY, 0)
+    rule(mut def, 1, "\\\\.", 13, syn.SYN_OP_STAY, 0)
+    rule(mut def, 1, "\"", 12, syn.SYN_OP_POP, 0)
+    rule(mut def, 2, "\\*/", 16, syn.SYN_OP_POP, 0)
+    def
+}
+
+fn toy_engine() -> syn.SynEngine {
+    var pool = syn.syn_pool_new()
+    let root = syn.syn_pool_add(mut pool, take toy(), 1)
+    syn.syn_engine_new(pool, root)
+}
+
+const UNBOUNDED: int = 9223372036854775807
+
+// diff_rand: xorshift64*, the state and the output separate.
+fn diff_rand(s: wrapping[u64]) -> (wrapping[u64], wrapping[u64]) {
+    var x = s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    (x, x * 2685821657736338717)
+}
+
+fn below(x: wrapping[u64], n: int) -> int {
+    (x % n as wrapping[u64]) as int
+}
+
+fn settle_all(mut buffer: syn.SynBuffer, mut engine: syn.SynEngine, mut pool: syn.SynPool, tb: text.TextBuf) {
+    var calls = 0
+    while true {
+        let report = syn.syn_settle(mut buffer, mut engine, mut pool, tb, 0, text.textbuf_line_count(tb), UNBOUNDED)
+        calls += 1
+        assert(calls < 1000, "settling terminates")
+        if report.fixpoint { break }
+    }
+}
+
+fn assert_line_equal(a: syn.SynSpans, b: syn.SynSpans) {
+    assert(a.stop == b.stop, "same stop")
+    assert(a.exit_state == b.exit_state, "same exit state")
+    assert(a.n == b.n, "same span count")
+    for i in 0..a.n {
+        assert(syn.syn_span_start(a, i) == syn.syn_span_start(b, i), "same span start")
+        assert(syn.syn_span_len(a, i) == syn.syn_span_len(b, i), "same span length")
+        assert(syn.syn_span_attr(a, i) == syn.syn_span_attr(b, i), "same span attr")
+        assert(syn.syn_span_flags(a, i) == syn.syn_span_flags(b, i), "same span flags")
+    }
+}
+
+// assert_buf_matches_from_scratch: every retained entry and every cached
+// span list equals a fresh interpretation of the flat text.
+fn assert_matches_from_scratch(
+    mut buffer: syn.SynBuffer,
+    mut engine: syn.SynEngine,
+    mut pool: syn.SynPool,
+    tb: text.TextBuf,
+    flat: List[byte],
+) {
+    let count = text.textbuf_line_count(tb)
+    assert(syn.syn_ids_len(buffer.lines.entry) == count, "one entry per line")
+    var state = syn.SYN_STATE_ROOT
+    var lo = 0
+    var want = syn.syn_spans_new(128)
+    var got = syn.syn_spans_new(128)
+    for line in 0..count {
+        var hi = lo
+        while hi < flat.len && flat[hi] as int != 10 { hi += 1 }
+        assert(syn.syn_ids_get(buffer.lines.entry, line) == state, "retained entry equals the fresh chain")
+        syn.syn_line(mut engine, mut pool, state, flat[lo..hi], hi - lo, mut want, false)
+        syn.syn_buffer_spans(mut buffer, mut engine, mut pool, tb, line, mut got)
+        assert_line_equal(got, want)
+        state = want.exit_state
+        lo = if hi < flat.len then hi + 1 else hi
+    }
+}
+
+fn replace_byte(mut tb: text.TextBuf, mut flat: List[byte], at: int, value: byte) -> int {
+    let line = text.textbuf_line_of(tb, at as text.ByteOff) as int
+    text.textbuf_delete(mut tb, text.Span { lo: at, hi: at + 1 })
+    var one = List[byte]()
+    (mut one).push(value)
+    text.textbuf_insert(mut tb, at as text.ByteOff, one)
+    flat[at] = value
+    line
+}
+
+fn run_diff_seed(seed0: wrapping[u64], edits: int) {
+    let initial = "if value = 10\nplain text\n/* block\ncomment */ return\n\"str\\n\" + false\n// final comment\nwhile x = 99\ntail\n"
+    let replacements = "abcdefghijklmnopqrstuvwxyz0123456789/*\"\\=+- "
+    var flat = bytes(initial)
+    var tb = text.textbuf_from_bytes(flat, 0, flat.len)
+    var pool = syn.syn_pool_new()
+    let root = syn.syn_pool_add(mut pool, take toy(), 1)
+    var engine = syn.syn_engine_new(pool, root)
+    var buffer = syn.syn_buffer_new_at(tb, engine.generation, 0)
+    settle_all(mut buffer, mut engine, mut pool, tb)
+    var seed = seed0
+    for _ in 0..edits {
+        var at = 0
+        while true {
+            let (next, out) = diff_rand(seed)
+            seed = next
+            at = below(out, flat.len)
+            if flat[at] as int != 10 { break }
+        }
+        let (next, out) = diff_rand(seed)
+        seed = next
+        let value = replacements.bytes()[below(out, replacements.len)]
+        let line = replace_byte(mut tb, mut flat, at, value)
+        syn.syn_buffer_edit(mut buffer, line, 0, 0)
+        settle_all(mut buffer, mut engine, mut pool, tb)
+        assert(syn.syn_ids_len(buffer.lines.entry) == text.textbuf_line_count(tb), "entries follow the line count")
+        assert(syn.syn_ids_get(buffer.lines.entry, 0) == syn.SYN_STATE_ROOT, "ROOT enters line zero")
+    }
+    assert_matches_from_scratch(mut buffer, mut engine, mut pool, tb, flat)
+}
+
+fn has_pending_embed(buffer: syn.SynBuffer, engine: syn.SynEngine) -> bool {
+    var state = syn.syn_state_root(0, 0)
+    for i in 0..syn.syn_ids_len(buffer.lines.entry) {
+        if syn.syn_state_read(mut state, engine.states, syn.syn_ids_get(buffer.lines.entry, i)) &&
+            syn.syn_state_flags(state) & syn.SYN_F_EMBED_PEND != 0 {
+            return true
+        }
+    }
+    false
+}
+
+fn settle_embeds(mut buffer: syn.SynBuffer, mut engine: syn.SynEngine, mut pool: syn.SynPool, tb: text.TextBuf) {
+    var calls = 0
+    while true {
+        let report = syn.syn_settle(mut buffer, mut engine, mut pool, tb, 0, text.textbuf_line_count(tb), UNBOUNDED)
+        calls += 1
+        assert(calls <= syn.SYN_DEF_MAX + 2, "embedded settling converges")
+        if report.fixpoint && !has_pending_embed(buffer, engine) { break }
+    }
+}
+
+// The shell document of run_embed_diff_seed: boundary edits flip the
+// command and arithmetic substitutions' delimiters, body edits the text.
+fn run_embed_diff_seed(seed0: wrapping[u64], edits: int) {
+    let initial = "header plain\nbefore=$(printf '%s' value)\nmiddle plain\nafter=$((1 + 2))\ntail plain\n"
+    let boundary_markers = ["$(printf", "value)", "$((1", "2))"]
+    let boundary_within = [0, 5, 0, 2]
+    let boundary_replacement = "xxxx"
+    let body_markers = ["header", "middle", "tail"]
+    let body_replacement = "HMT"
+    let source = fs_read_bytes("tests/fixtures/syn/sh.fl") else {
+        assert(false, "the sh definition fixture is readable")
+        return
+    }
+    var reg = syn.syn_registry_new()
+    var pool = syn.syn_pool_new()
+    syn.syn_registry_seed(reg, mut pool)
+    let sh = syn.syn_registry_lang_named(reg, bytes("sh"))
+    let root = syn.syn_registry_load(mut reg, mut pool, sh, "tests/fixtures/syn/sh.fl", source)
+    assert(root >= 0, "the sh definition loads")
+    var engine = syn.syn_engine_new(pool, root)
+    var flat = bytes(initial)
+    var tb = text.textbuf_from_bytes(flat, 0, flat.len)
+    var boundary = List[int]()
+    var boundary_original = List[byte]()
+    for i in 0..boundary_markers.len {
+        let at = initial.find(boundary_markers[i]) else -1
+        assert(at >= 0, "boundary marker present")
+        (mut boundary).push(at + boundary_within[i])
+        (mut boundary_original).push(flat[at + boundary_within[i]])
+    }
+    var body = List[int]()
+    var body_original = List[byte]()
+    for i in 0..body_markers.len {
+        let at = initial.find(body_markers[i]) else -1
+        assert(at >= 0, "body marker present")
+        (mut body).push(at)
+        (mut body_original).push(flat[at])
+    }
+    var buffer = syn.syn_buffer_new_at(tb, engine.generation, 0)
+    settle_embeds(mut buffer, mut engine, mut pool, tb)
+    assert_matches_from_scratch(mut buffer, mut engine, mut pool, tb, flat)
+    var seed = seed0
+    var boundary_edits = 0
+    for i in 0..edits {
+        let on_boundary = i & 3 == 0
+        let (next, out) = diff_rand(seed)
+        seed = next
+        var at = 0
+        var value = 0 as byte
+        if on_boundary {
+            boundary_edits += 1
+            let point = below(out, boundary.len)
+            at = boundary[point]
+            value = if flat[at] == boundary_original[point] then boundary_replacement.bytes()[point] else boundary_original[point]
+        } else {
+            let point = below(out, body.len)
+            at = body[point]
+            value = if flat[at] == body_original[point] then body_replacement.bytes()[point] else body_original[point]
+        }
+        let line = replace_byte(mut tb, mut flat, at, value)
+        syn.syn_buffer_edit(mut buffer, line, 0, 0)
+        settle_embeds(mut buffer, mut engine, mut pool, tb)
+        assert_matches_from_scratch(mut buffer, mut engine, mut pool, tb, flat)
+    }
+    assert(boundary_edits * 4 >= edits, "a quarter of the edits move a boundary")
+}
+
+// test_syn_diff_incremental_matches_from_scratch_four_seeds
+fn incremental_matches_from_scratch_four_seeds() {
+    let seeds: List[wrapping[u64]] = [1311768467463790320, 998690804919562253, 11400714819323198485, 18369614221190020847]
+    for seed in seeds {
+        run_diff_seed(seed, 100000)
+        run_embed_diff_seed(seed, 100000)
+    }
+}
+
+// test_syn_diff_same_seed_is_deterministic
+fn same_seed_is_deterministic() {
+    run_diff_seed(6840227782638526189, 1000)
+    run_diff_seed(6840227782638526189, 1000)
+}
+
+fn main() {
+    let selected = (env_get("YEW_SYN_DIFF_CASE") else "-1").to_int() else -1
+    for i in 0..2 {
+        if selected == -1 || selected == i {
+            match i {
+                0 => incremental_matches_from_scratch_four_seeds(),
+                _ => same_seed_is_deterministic(),
+            }
+            print("syn_diff_case_{i}: PASS")
+        }
+    }
+}
