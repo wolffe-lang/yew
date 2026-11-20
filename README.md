@@ -81,12 +81,18 @@ and command substitutions; languages are detected by name, extension,
 shebang and first line, and user definitions are discovered. `yew syn list`,
 `compile`, `check` and `dump` work as C's do; the syntax goldens of the seven first modes (wolf, Markdown, C,
 Python, shell, TOML and JSON: 132 of the 432) pass through `yew syn dump`,
-and the other 300 are listed by name for the full language pack. The editor
-does not draw syntax colours yet, and there is no on-disk definition cache:
-`yew syn cache` refuses by name.
-Each campaign's reachable PTY goldens are gated by name against C yew's
-(the cases that draw source text in syntax colours, campaign 05's four
-and campaign 11's 24, are recorded until yw10 lands highlighting); every path
+and the other 300 are listed by name for the full language pack. The seven
+definitions ship in `runtime/syntax/` and inside the binary, and the editor
+draws buffers in their languages in the theme's syntax colours, as C does:
+edits re-highlight only from the edited line, settling runs on the event
+loop's frame budget, and the statusline shows `syn…` while a buffer settles
+past 250 ms and `syn!` when it degrades; `ed.syn.status` and `ed.syn.set`
+work. There is no on-disk definition cache (`yew syn cache` refuses by name)
+and no structural block provider yet.
+Each campaign's reachable PTY goldens are gated by name against C yew's,
+those drawn in syntax colours included; the few coloured cases that need an
+unported feature (the sign column, the structural block provider, the
+definition cache, the theme commands) are recorded by name. Every path
 not yet ported hard-errors naming its sagitta sprint and the port lane
 that lands it. The map of every sagitta
 directory and sprint to a port lane, and of every wolf gap the port has
