@@ -1,0 +1,828 @@
+//! edit.syntax — syntax highlighting in the editor: the registry and the
+//! engines, each buffer's line state, the splice notices, the budgeted
+//! tick, the badge and the two `ed.syn.*` commands.
+//!
+//! Ports the editor's half of sagitta's highlighting at 9ace98c2:
+//! `yew_ed_syn_bind` (`ed.c:177-232`), the line state's attach and detach
+//! at a buffer's birth and death (`ed.c:342-505`, `file_cmds.c:281-302`),
+//! `yew_ed_syn_pending` and `yew_ed_syn_tick` (`ed.c:1250-1390`),
+//! `yew_ed_syn_note_edit` and the damage batch's merged splice
+//! (`ed.c:1544-1617`), the syntax half of `yew_edit_notify_post`
+//! (`notify.c:57-73`), the badge's test (`yew_syn_status_visible`,
+//! `engine.c:5424-5432`) and `cmd_syn_status` and `cmd_syn_set`
+//! (`cmd.c:76-148`). C keeps one registry for the process, an engine per
+//! definition and a `SynBuf` in every `Buffer`; the port's editor holds
+//! them all (`Ed.syntax`, one `EdSyn`), each buffer's state keyed by the
+//! buffer's id. The text layer cannot see the editor, so it logs each
+//! edit's line and line counts (`text.EditCtx.syn_log`) and the editor
+//! applies the log when the edit is handed back (`edit_give`), in order.
+//!
+//! Two shapes differ from C, and neither changes what is drawn. A
+//! buffer's definition is compiled when the buffer is first drawn, ticked
+//! or asked about rather than when it is opened (C compiles at the bind):
+//! the state the bind would have left is made then, stamped with the
+//! bind's time, so a file opened and never shown costs no compile. And a
+//! guest language the registry refuses (seven definitions ship, so a
+//! `javascript` fence has none) leaves the pending queue
+//! (`edsyn_drop_refused_guest`), where C keeps it and wakes every 16 ms to
+//! retry; the buffer is not marked degraded, the fence keeps its fallback
+//! styling, and `ed.syn.status` counts it no longer pending.
+
+use std.map as std_map
+use syn
+use text
+use util
+
+/// The tick's budget on a turn that read input (`YEW_SYN_FRAME_BUDGET_US`).
+pub const SYN_FRAME_BUDGET_US: int = 1000
+
+/// The tick's budget on a turn with no input (`YEW_SYN_IDLE_BUDGET_US`); a
+/// guest's definition loads only on such a turn.
+pub const SYN_IDLE_BUDGET_US: int = 4000
+
+/// The loop's wake while a visible buffer settles (`loop.c:314-319`), in
+/// milliseconds.
+pub const SYN_WAKE_MS: int = 16
+
+// The badge's delay (`YEW_SYN_SETTLING_MS`, `engine.h:28`), microseconds.
+const SYN_SETTLING_US: int = 250000
+
+/// One buffer's syntax state (C's `Buffer.syn`), keyed by the buffer's id:
+/// its language, the engine it is bound to (-1 for none), whether that
+/// engine has been looked up, and the line state once bound. Until then
+/// `entry_len`, `splices` and `edit_us` stand for the line state's count,
+/// splice count and last edit (C's `entry.len`, `splice_count`,
+/// `edit_us`).
+pub struct EdSynBuf {
+    buf_id: int,
+    lang: int,
+    engine: int,
+    resolved: bool,
+    entry_len: int,
+    splices: int,
+    edit_us: int,
+    sb: List[syn.SynBuffer],
+}
+
+/// The editor's syntax state (`Ed.syntax`, one element): the registry,
+/// built on first need (`regs` is empty until then), the program pool, an
+/// engine per root language, each buffer's state, the tick's round robin
+/// (`ed->syn_rr_last_*`), the damage batch's merged splice
+/// (`ed->damage_batch_syn_*`) and the draw's span scratch (C's per-window
+/// `syn_spans`; one serves, as one window draws at a time).
+pub struct EdSyn {
+    regs: List[syn.SynRegistry],
+    pool: syn.SynPool,
+    engines: List[syn.SynEngine],
+    engine_langs: List[int],
+    bufs: List[EdSynBuf],
+    rr_last_buf_id: int,
+    rr_last_valid: bool,
+    batch_pending: bool,
+    batch_buf_id: int,
+    batch_lo: int,
+    spans: List[syn.SynSpans],
+}
+
+/// An empty state: no registry, no engine, no buffer.
+pub fn edsyn_new() -> EdSyn {
+    EdSyn {
+        regs: List[syn.SynRegistry](),
+        pool: syn.syn_pool_new(),
+        engines: List[syn.SynEngine](),
+        engine_langs: List[int](),
+        bufs: List[EdSynBuf](),
+        rr_last_buf_id: 0,
+        rr_last_valid: false,
+        batch_pending: false,
+        batch_buf_id: 0,
+        batch_lo: 0,
+        spans: List[syn.SynSpans](),
+    }
+}
+
+// The line state's clock (`syn_now`): monotonic microseconds, the clock a
+// `syn.SynBuffer` reads.
+fn syn_now_us() -> int {
+    os_clock_ns() / 1000
+}
+
+/// The index of buffer `id`'s state, or -1.
+pub fn edsyn_find(s: EdSyn, id: int) -> int {
+    for k in 0..s.bufs.len {
+        if s.bufs[k].buf_id == id then return k
+    }
+    -1
+}
+
+// Buffer `id`'s state, made (with no language) when it has none.
+fn edsyn_entry(mut s: EdSyn, id: int) -> int {
+    let found = edsyn_find(s, id)
+    if found >= 0 then return found
+    (mut s.bufs).push(EdSynBuf {
+        buf_id: id,
+        lang: 0,
+        engine: -1,
+        resolved: true,
+        entry_len: 0,
+        splices: 0,
+        edit_us: 0,
+        sb: List[syn.SynBuffer](),
+    })
+    s.bufs.len - 1
+}
+
+// C's lazy registry (`builtin_registry_init` and
+// `discover_user_definitions`), built once: the builtins, their names
+// seeded into the pool before any engine snapshots them, then the user's
+// definitions unless `--clean` bypasses them (`main.c:126-127`).
+fn edsyn_registry(mut s: EdSyn, clean: bool) {
+    if s.regs.len != 0 then return
+    var reg = syn.syn_registry_new()
+    syn.syn_registry_seed(reg, mut s.pool)
+    syn.syn_registry_set_discovery_bypass(mut reg, clean)
+    syn.syn_registry_discover(mut reg, mut s.pool, util.xdg_config_dir() else "")
+    for warning in reg.warnings { util.log_warn(warning) }
+    (mut s.regs).push(reg)
+}
+
+// The line state an attach leaves (`yew_syn_attach`, `engine.c:4859-4896`,
+// and `yew_syn_buf_bind`, `:4913-4932`): every entry unknown but the
+// first; settling over all of them with a language, settled without one.
+fn edsyn_state(tb: text.TextBuf, generation: int, enabled: bool, now: int) -> syn.SynBuffer {
+    var sb = syn.syn_buffer_new_at(tb, generation, now)
+    if !enabled {
+        let n = syn.syn_ids_len(sb.lines.entry)
+        sb.enabled = false
+        sb.lines.settling = false
+        sb.lines.wave = n
+        sb.lines.settled_to = n
+        sb.lines.must_reach = 0
+    }
+    sb
+}
+
+// `yew_syn_attach` on state `k`: `lang` over `tb`'s lines. The engine stays
+// bound, as C's attach keeps it, and its line state restarts.
+fn edsyn_attach(mut s: EdSyn, k: int, lang: int, tb: text.TextBuf) {
+    let now = syn_now_us()
+    s.bufs[k].lang = lang
+    s.bufs[k].entry_len = text.textbuf_line_count(tb)
+    s.bufs[k].splices = 0
+    s.bufs[k].edit_us = now
+    let e = s.bufs[k].engine
+    if e >= 0 && s.bufs[k].sb.len != 0 {
+        s.bufs[k].sb[0] = edsyn_state(tb, s.engines[e].generation, lang != 0, now)
+    }
+}
+
+/// A scratch or untitled buffer's attach (`ed.c:354`, `:410`): buffer `id`
+/// over `tb` with no language.
+pub fn edsyn_attach_none(mut s: EdSyn, id: int, tb: text.TextBuf) {
+    let k = edsyn_entry(mut s, id)
+    edsyn_attach(mut s, k, 0, tb)
+    s.bufs[k].resolved = true
+}
+
+// `ed_first_line` (`ed.c:107-138`): line 0's bytes up to the line byte
+// cap, its trailing LF and CR bytes dropped.
+fn edsyn_first_line(tb: text.TextBuf) -> List[byte] {
+    let span = text.textbuf_line_span(tb, 0 as text.LineNo)
+    var want = span.hi - span.lo
+    if want > syn.SYN_LINE_BYTE_CAP {
+        want = syn.SYN_LINE_BYTE_CAP
+    }
+    var line = text.textbuf_copy_range(tb, span.lo, span.lo + want)
+    while line.len != 0 && (line[line.len - 1] as int == 10 || line[line.len - 1] as int == 13) {
+        let _ = (mut line).pop() else 0 as byte
+    }
+    line
+}
+
+// `Buffer.lang`'s spelling of a language (`ed.c:228-231`): its name, with
+// `fortran-fixed` as `fortran(fixed)`; "" for none.
+fn edsyn_lang_name(s: EdSyn, lang: int) -> str {
+    if lang == 0 || s.regs.len == 0 then return ""
+    let desc = syn.syn_registry_desc(s.regs[0], lang) else { return "" }
+    let name = str_from_utf8(copy desc.name) else ""
+    if name == "fortran-fixed" then "fortran(fixed)" else name
+}
+
+/// `yew_ed_syn_bind` (`ed.c:177-232`) for buffer `id` over `tb`: a binary
+/// file has no language (`ed.c:195-200`); any other gets the language its
+/// path (`path`, "" for none) or its first line names (`yew_syn_lang_for`;
+/// the Fortran scorer is not ported), and its definition loads on first
+/// need (`edsyn_resolve`). Answers the language as `Buffer.lang` spells
+/// it, "" for none.
+pub fn edsyn_bind_text(
+    mut s: EdSyn,
+    id: int,
+    tb: text.TextBuf,
+    path: str,
+    binary: bool,
+    clean: bool,
+) -> str {
+    let k = edsyn_entry(mut s, id)
+    if binary {
+        s.bufs[k].engine = -1
+        s.bufs[k].sb = List[syn.SynBuffer]()
+        edsyn_attach(mut s, k, 0, tb)
+        s.bufs[k].resolved = true
+        return ""
+    }
+    let line = edsyn_first_line(tb)
+    var lang = 0
+    // No path and an empty first line name nothing (the one builtin
+    // first-line pattern needs a bracketed word), so the registry need not
+    // be built for a fresh scratch.
+    if path.len != 0 || line.len != 0 {
+        edsyn_registry(mut s, clean)
+        lang = syn.syn_registry_lang_for(mut s.regs[0], path, line, true)
+    }
+    edsyn_attach(mut s, k, lang, tb)
+    s.bufs[k].resolved = lang == 0
+    edsyn_lang_name(s, lang)
+}
+
+// `yew_syn_def_for` (`defs.c:3712-3727`): a live user language's program,
+// else the builtin's, read from the runtime (or this build's embedded
+// copy) and compiled once (`load_builtin_definition`, `:3698-3710`); -1
+// when its source cannot be read or does not compile, a slot not tried
+// again.
+fn edsyn_program(mut s: EdSyn, lang: int) -> int {
+    if s.regs.len == 0 then return -1
+    let found = syn.syn_registry_def_for(s.regs[0], lang)
+    if found >= 0 || syn.syn_registry_tried(s.regs[0], lang) then return found
+    let source = syn.syn_registry_source(s.regs[0], lang)
+    if source.len == 0 then return -1
+    let relative = if source.len > 8 && source[0..8] == "runtime/" then source[8..] else source
+    let (ok, bytes, path) = runtime_read(relative)
+    if !ok {
+        syn.syn_registry_refuse(mut s.regs[0], lang)
+        return -1
+    }
+    syn.syn_registry_load(mut s.regs[0], mut s.pool, lang, path, bytes)
+}
+
+// `yew_syn_engine_for` (`defs.c:3729-3742`): the one engine of a root
+// language, over its definition; -1 when there is none.
+fn edsyn_engine_for(mut s: EdSyn, lang: int) -> int {
+    for i in 0..s.engine_langs.len {
+        if s.engine_langs[i] == lang then return i
+    }
+    let program = edsyn_program(mut s, lang)
+    if program < 0 then return -1
+    (mut s.engines).push(syn.syn_engine_new(s.pool, program))
+    (mut s.engine_langs).push(lang)
+    s.engines.len - 1
+}
+
+// `yew_syn_buf_bind` (`engine.c:4913-4932`): state `k` bound to engine
+// `e`, its line state restarted over `tb` at the attach's time with the
+// splices counted since.
+fn edsyn_bind(mut s: EdSyn, k: int, e: int, tb: text.TextBuf) {
+    s.bufs[k].engine = e
+    var sb = edsyn_state(tb, s.engines[e].generation, s.bufs[k].lang != 0, s.bufs[k].edit_us)
+    sb.lines.splice_count = s.bufs[k].splices
+    if s.bufs[k].sb.len == 0 {
+        (mut s.bufs[k].sb).push(sb)
+    } else {
+        s.bufs[k].sb[0] = sb
+    }
+}
+
+// `yew_ed_syn_bind`'s engine half (`ed.c:222-227`), made on first need: the
+// language's engine, then its bind. A language whose definition will not
+// load stays unbound, its lines plain.
+fn edsyn_resolve(mut s: EdSyn, k: int, tb: text.TextBuf, clean: bool) {
+    if s.bufs[k].resolved then return
+    s.bufs[k].resolved = true
+    let lang = s.bufs[k].lang
+    if lang == 0 then return
+    edsyn_registry(mut s, clean)
+    let e = edsyn_engine_for(mut s, lang)
+    if e >= 0 {
+        edsyn_bind(mut s, k, e, tb)
+    }
+}
+
+/// `yew_syn_detach`: buffer `id`'s state is dropped.
+pub fn edsyn_detach(mut s: EdSyn, id: int) {
+    let k = edsyn_find(s, id)
+    if k < 0 then return
+    let last = (mut s.bufs).pop() else { return }
+    if k < s.bufs.len {
+        s.bufs[k] = last
+    }
+}
+
+// The line state's entry count (C's `entry.len`).
+fn edsyn_entry_len(s: EdSyn, k: int) -> int {
+    if s.bufs[k].sb.len != 0 then syn.syn_ids_len(s.bufs[k].sb[0].lines.entry) else s.bufs[k].entry_len
+}
+
+// `yew_syn_edit` (`engine.c:4942-4988`) on state `k`: unbound, the count
+// and the clock; bound without a language, the splice and nothing left to
+// settle, as C's last clause leaves it.
+fn edsyn_splice(mut s: EdSyn, k: int, lo: int, removed: int, inserted: int) {
+    if s.bufs[k].sb.len == 0 {
+        s.bufs[k].entry_len = s.bufs[k].entry_len - removed + inserted
+        s.bufs[k].splices += 1
+        s.bufs[k].edit_us = syn_now_us()
+        return
+    }
+    syn.syn_buffer_edit(mut s.bufs[k].sb[0], lo, removed, inserted)
+    if !s.bufs[k].sb[0].enabled {
+        let n = syn.syn_ids_len(s.bufs[k].sb[0].lines.entry)
+        s.bufs[k].sb[0].lines.settling = false
+        s.bufs[k].sb[0].lines.wave = n
+        s.bufs[k].sb[0].lines.settled_to = n
+    }
+}
+
+/// `ed_syn_batch_flush` (`ed.c:1544-1552`): the damage batch's merged
+/// splice, from its lowest line.
+pub fn edsyn_batch_flush(mut s: EdSyn) {
+    if !s.batch_pending then return
+    s.batch_pending = false
+    let k = edsyn_find(s, s.batch_buf_id)
+    let lo = s.batch_lo
+    if k >= 0 && lo < edsyn_entry_len(s, k) {
+        edsyn_splice(mut s, k, lo, 0, 0)
+    }
+}
+
+// The tick's test (`ed.c:1284-1285`): settling or waiting on a guest. A
+// language whose engine has not been looked up counts: the tick binds it.
+fn edsyn_busy(s: EdSyn, k: int) -> bool {
+    if !s.bufs[k].resolved then return true
+    s.bufs[k].sb.len != 0 &&
+        (s.bufs[k].sb[0].lines.settling || s.bufs[k].sb[0].pending_langs.len != 0)
+}
+
+// The load C's settle makes before its pump (`yew_syn_embed_pump`,
+// `engine.c:5143-5160`, through `yew_syn_engine_for`): the head of the
+// queue gets its definition pooled; one the registry refuses leaves the
+// queue (`edsyn_drop_refused_guest`).
+fn edsyn_load_guest(mut s: EdSyn, k: int) {
+    if s.bufs[k].sb[0].pending_langs.len == 0 then return
+    let e = s.bufs[k].engine
+    if s.engines[e].residents.len >= syn.SYN_RESIDENT_MAX then return
+    let lang = syn.syn_embed_wanted(s.bufs[k].sb[0])
+    if edsyn_program(mut s, lang) < 0 {
+        edsyn_drop_refused_guest(mut s.bufs[k].sb[0], lang)
+    }
+}
+
+/// The one place the port's guest queue differs from C's: a guest language
+/// whose definition the registry refuses leaves the pending queue, where C
+/// keeps it and wakes every 16 ms to retry (`yew_syn_embed_pump`,
+/// `engine.c:5143-5160`). The buffer is not marked degraded, so the
+/// embedded text keeps its fallback styling.
+pub fn edsyn_drop_refused_guest(mut sb: syn.SynBuffer, lang: int) {
+    var i = 0
+    while i < sb.pending_langs.len {
+        if sb.pending_langs[i] == lang {
+            var j = i + 1
+            while j < sb.pending_langs.len {
+                sb.pending_langs[j - 1] = sb.pending_langs[j]
+                sb.pending_lines[j - 1] = sb.pending_lines[j]
+                j += 1
+            }
+            let _ = (mut sb.pending_langs).pop() else 0
+            let _ = (mut sb.pending_lines).pop() else 0
+            return
+        }
+        i += 1
+    }
+}
+
+// ---- the editor's side ------------------------------------------------
+
+/// `yew_ed_syn_bind` for buffer index `bi` (`ed.c:455`, `:2145`): its
+/// language detected again over its text, `Buffer.lang`
+/// (`ed.buf_languages`) set or cleared, its edits logged for the line
+/// state.
+pub fn ed_syn_bind(mut ed: Ed, bi: int) {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident then return
+    let id = ed.bufs[bi].id
+    let _ = std_map.remove(mut ed.buf_languages, id) else ""
+    let path = if ed.bufs[bi].has_path then ed.bufs[bi].path else ""
+    let name = edsyn_bind_text(
+        mut ed.syntax[0],
+        id,
+        ed.bufs[bi].ec.tb,
+        path,
+        ed.bufs[bi].ec.meta.binary,
+        ed.clean,
+    )
+    if name.len != 0 {
+        ed.buf_languages[id] = name
+    }
+    ed_syn_log_start(mut ed, bi)
+}
+
+// The text layer's log turned on for buffer index `bi`, empty.
+fn ed_syn_log_start(mut ed: Ed, bi: int) {
+    ed.bufs[bi].ec.syn_logging = true
+    while ed.bufs[bi].ec.syn_log.len != 0 {
+        let _ = (mut ed.bufs[bi].ec.syn_log).pop() else 0
+    }
+}
+
+/// The macro scratch's attach (`macrobrowse.c:109-120`): buffer index `bi`
+/// over its text in language `name`, bound on first need. C refuses the
+/// macro edit when that definition will not load; fletch's does not ship
+/// here, so the scratch keeps its language and draws plain.
+pub fn ed_syn_attach_named(mut ed: Ed, bi: int, name: str) {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident then return
+    edsyn_registry(mut ed.syntax[0], ed.clean)
+    let lang = syn.syn_registry_lang_named(ed.syntax[0].regs[0], name.bytes())
+    let k = edsyn_entry(mut ed.syntax[0], ed.bufs[bi].id)
+    edsyn_attach(mut ed.syntax[0], k, lang, ed.bufs[bi].ec.tb)
+    ed.syntax[0].bufs[k].resolved = lang == 0
+    ed_syn_log_start(mut ed, bi)
+}
+
+/// `yew_syn_detach` for buffer index `bi` (`ed.c:505`, `file_cmds.c:294`):
+/// its state dropped and its log off.
+pub fn ed_syn_detach(mut ed: Ed, bi: int) {
+    if bi < 0 || bi >= ed.bufs.len then return
+    edsyn_detach(mut ed.syntax[0], ed.bufs[bi].id)
+    ed.bufs[bi].ec.syn_logging = false
+    while ed.bufs[bi].ec.syn_log.len != 0 {
+        let _ = (mut ed.bufs[bi].ec.syn_log).pop() else 0
+    }
+}
+
+/// The syntax half of `yew_edit_notify_post` (`notify.c:57-73`) for buffer
+/// index `bi`: each edit the text layer logged (its line, the line counts
+/// before and after), in order — a splice when the state counted the lines
+/// the edit started from, else the state attached again in its language.
+/// The log is emptied.
+pub fn ed_syn_drain(mut ed: Ed, bi: int) {
+    if ed.bufs[bi].ec.syn_log.len == 0 then return
+    let k = edsyn_find(ed.syntax[0], ed.bufs[bi].id)
+    var i = 0
+    while k >= 0 && i + 2 < ed.bufs[bi].ec.syn_log.len {
+        let line = ed.bufs[bi].ec.syn_log[i]
+        let old = ed.bufs[bi].ec.syn_log[i + 1]
+        let after = ed.bufs[bi].ec.syn_log[i + 2]
+        if old == edsyn_entry_len(ed.syntax[0], k) {
+            let removed = if old > after then old - after else 0
+            let inserted = if after > old then after - old else 0
+            ed_syn_note_edit(mut ed, bi, k, line, removed, inserted)
+        } else {
+            let lang = ed.syntax[0].bufs[k].lang
+            edsyn_attach(mut ed.syntax[0], k, lang, ed.bufs[bi].ec.tb)
+        }
+        i += 3
+    }
+    while ed.bufs[bi].ec.syn_log.len != 0 {
+        let _ = (mut ed.bufs[bi].ec.syn_log).pop() else 0
+    }
+}
+
+// `yew_ed_syn_note_edit` (`ed.c:1554-1578`): inside a damage batch on this
+// buffer's window, edits that keep the line count merge into one splice at
+// the batch's end, from the lowest line; any other edit flushes it and
+// splices at once. (C's row damage here is the seam's, `ed_note_edit`, and
+// the batched undo's log in `edit_cmds.undo_redo`.)
+fn ed_syn_note_edit(mut ed: Ed, bi: int, k: int, lo: int, removed: int, inserted: int) {
+    let w = ed.damage_batch_win
+    let owns = ed.damage_batching && w >= 0 && w < ed.wins.len && ed.wins[w].buf == bi
+    if !owns || removed != 0 || inserted != 0 {
+        edsyn_batch_flush(mut ed.syntax[0])
+        edsyn_splice(mut ed.syntax[0], k, lo, removed, inserted)
+        return
+    }
+    let id = ed.bufs[bi].id
+    if ed.syntax[0].batch_pending && ed.syntax[0].batch_buf_id != id {
+        edsyn_batch_flush(mut ed.syntax[0])
+    }
+    if !ed.syntax[0].batch_pending || lo < ed.syntax[0].batch_lo {
+        ed.syntax[0].batch_lo = lo
+    }
+    ed.syntax[0].batch_pending = true
+    ed.syntax[0].batch_buf_id = id
+}
+
+/// Buffer index `bi`'s state made ready: its logged edits applied and its
+/// definition looked up (`edsyn_resolve`). Answers the state's index, or
+/// -1 for a buffer with none.
+pub fn ed_syn_resolve(mut ed: Ed, bi: int) -> int {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident then return -1
+    ed_syn_drain(mut ed, bi)
+    let k = edsyn_find(ed.syntax[0], ed.bufs[bi].id)
+    if k >= 0 {
+        edsyn_resolve(mut ed.syntax[0], k, ed.bufs[bi].ec.tb, ed.clean)
+    }
+    k
+}
+
+/// `yew_ed_syn_pending` (`ed.c:1273-1289`): a visible buffer is settling
+/// or waiting on a guest, or has a language whose definition the tick has
+/// yet to look up.
+pub fn ed_syn_pending(ed: Ed) -> bool {
+    syn_tree_pending(ed, ed.pane_root)
+}
+
+// The pending test over the tree at `p` (no allocation: the loop asks it
+// every turn).
+fn syn_tree_pending(ed: Ed, p: int) -> bool {
+    if !pane_live(ed, p) then return false
+    if !ed.panes[p].is_leaf {
+        return syn_tree_pending(ed, ed.panes[p].a) || syn_tree_pending(ed, ed.panes[p].b)
+    }
+    let w = ed.panes[p].win
+    if w < 0 || w >= ed.wins.len then return false
+    let b = ed.wins[w].buf
+    if b < 0 || b >= ed.bufs.len || !ed.bufs[b].resident then return false
+    let k = edsyn_find(ed.syntax[0], ed.bufs[b].id)
+    k >= 0 && edsyn_busy(ed.syntax[0], k)
+}
+
+// `ed_syn_visible_leaves` (`ed.c:1250-1271`): the active tree's windows,
+// the focused leaf's first.
+fn ed_syn_visible_wins(ed: Ed) -> List[int] {
+    let leaves = pane_collect_leaves(ed, ed.pane_root, PANE_MAX_LEAVES)
+    var out = List[int]()
+    for l in leaves {
+        if l == ed.focus && ed.panes[l].win >= 0 && ed.panes[l].win < ed.wins.len {
+            (mut out).push(ed.panes[l].win)
+        }
+    }
+    for l in leaves {
+        if l != ed.focus && ed.panes[l].win >= 0 && ed.panes[l].win < ed.wins.len {
+            (mut out).push(ed.panes[l].win)
+        }
+    }
+    out
+}
+
+/// `yew_ed_syn_tick` (`ed.c:1291-1390`): one budgeted slice for one visible
+/// buffer that is settling or waiting on a guest — the focused window's
+/// when `prioritize_focus` (a turn that read input), else the one after the
+/// buffer served last — over the union of its windows' visible lines. The
+/// rows it settled are damaged as C damages them, and the footer when the
+/// badge may have changed.
+pub fn ed_syn_tick(mut ed: Ed, budget_us: int, prioritize_focus: bool) {
+    let wins = ed_syn_visible_wins(ed)
+    var cand_bufs = List[int]()
+    var cand_wins = List[int]()
+    for w in wins {
+        let b = ed.wins[w].buf
+        let k = ed_syn_resolve(mut ed, b)
+        if k < 0 || !edsyn_busy(ed.syntax[0], k) then continue
+        var seen = false
+        for c in cand_bufs {
+            if c == b {
+                seen = true
+            }
+        }
+        if seen then continue
+        (mut cand_bufs).push(b)
+        (mut cand_wins).push(w)
+    }
+    if cand_bufs.len == 0 then return
+    var selected = 0
+    if !prioritize_focus && ed.syntax[0].rr_last_valid {
+        for i in 0..cand_bufs.len {
+            if ed.bufs[cand_bufs[i]].id == ed.syntax[0].rr_last_buf_id {
+                selected = (i + 1) % cand_bufs.len
+                break
+            }
+        }
+    }
+    let b = cand_bufs[selected]
+    let view = cand_wins[selected]
+    ed.syntax[0].rr_last_buf_id = ed.bufs[b].id
+    ed.syntax[0].rr_last_valid = true
+    var view_lo = INT64_MAX
+    var view_hi = 0
+    var shown = 0
+    for w in wins {
+        if ed.wins[w].buf != b then continue
+        shown += 1
+        let lo = ed.wins[w].vp.top
+        let hi = vp_last_visible_line(mut ed.wins[w], ed.bufs[b].ec.tb) + 1
+        if lo < view_lo {
+            view_lo = lo
+        }
+        if hi > view_hi {
+            view_hi = hi
+        }
+    }
+    let k = edsyn_find(ed.syntax[0], ed.bufs[b].id)
+    let e = ed.syntax[0].bufs[k].engine
+    let focused = ed.win >= 0 && ed.wins[ed.win].buf == b
+    let status_before = focused && syn.syn_buffer_status_visible(mut ed.syntax[0].bufs[k].sb[0])
+    let spec_before = ed.syntax[0].bufs[k].sb[0].lines.spec_valid
+    if budget_us >= SYN_IDLE_BUDGET_US {
+        edsyn_load_guest(mut ed.syntax[0], k)
+    }
+    let report = syn.syn_settle(
+        mut ed.syntax[0].bufs[k].sb[0],
+        mut ed.syntax[0].engines[e],
+        mut ed.syntax[0].pool,
+        ed.bufs[b].ec.tb,
+        view_lo,
+        view_hi,
+        budget_us,
+    )
+    let provisional_changed = spec_before != ed.syntax[0].bufs[k].sb[0].lines.spec_valid
+    let status_after = focused && syn.syn_buffer_status_visible(mut ed.syntax[0].bufs[k].sb[0])
+    if (provisional_changed || report.hit_view) && (shown > 1 || view != ed.win) {
+        ed.full_damage = true
+    } else if provisional_changed {
+        ed_damage_document(mut ed)
+    } else if report.hit_view {
+        let lo = if report.damage_lo > view_lo then report.damage_lo else view_lo
+        let hi = if report.damage_hi < view_hi then report.damage_hi else view_hi
+        for line in lo..hi {
+            ed_damage_win_line(mut ed, view, line, false)
+        }
+    }
+    if focused &&
+        (status_before || status_after || report.fixpoint || ed.syntax[0].bufs[k].sb[0].degraded) {
+        ed.footer_dirty = true
+    }
+}
+
+/// The draw's guard (`draw.c:957-967`) for buffer index `bi`: its state
+/// made ready (`ed_syn_resolve`); answers the state's index when its lines
+/// are highlighted — bound, with a language and an entry for every line —
+/// else -1, and the row is one plain span.
+pub fn ed_syn_draw_state(mut ed: Ed, bi: int) -> int {
+    let k = ed_syn_resolve(mut ed, bi)
+    if k < 0 || ed.syntax[0].bufs[k].sb.len == 0 || !ed.syntax[0].bufs[k].sb[0].enabled {
+        return -1
+    }
+    let count = text.textbuf_line_count(ed.bufs[bi].ec.tb)
+    if syn.syn_ids_len(ed.syntax[0].bufs[k].sb[0].lines.entry) != count then return -1
+    if ed.syntax[0].spans.len == 0 {
+        (mut ed.syntax[0].spans).push(syn.syn_spans_new(syn.SYN_MAX_SPANS))
+    }
+    k
+}
+
+/// Line `line` of buffer index `bi` (state `k`, from `ed_syn_draw_state`)
+/// into the draw's span scratch (`yew_syn_spans`, `engine.c:5377-5422`).
+pub fn ed_syn_line_spans(mut ed: Ed, k: int, bi: int, line: int) {
+    let e = ed.syntax[0].bufs[k].engine
+    syn.syn_buffer_spans(
+        mut ed.syntax[0].bufs[k].sb[0],
+        mut ed.syntax[0].engines[e],
+        mut ed.syntax[0].pool,
+        ed.bufs[bi].ec.tb,
+        line,
+        mut ed.syntax[0].spans[0],
+    )
+}
+
+/// The statusline's syntax badge (`statusline.c:543-552`) for buffer index
+/// `bi`: `syn!` once highlighting has degraded, `syn…` after 250 ms of
+/// settling (`yew_syn_status_visible`), else "". A definition not looked up
+/// yet is looked up only once the badge could show.
+pub fn ed_syn_badge(mut ed: Ed, bi: int) -> str {
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident then return ""
+    let found = edsyn_find(ed.syntax[0], ed.bufs[bi].id)
+    if found < 0 then return ""
+    if !ed.syntax[0].bufs[found].resolved &&
+        syn_now_us() - ed.syntax[0].bufs[found].edit_us < SYN_SETTLING_US {
+        return ""
+    }
+    let k = ed_syn_resolve(mut ed, bi)
+    if k < 0 || ed.syntax[0].bufs[k].sb.len == 0 then return ""
+    if !syn.syn_buffer_status_visible(mut ed.syntax[0].bufs[k].sb[0]) then return ""
+    if ed.syntax[0].bufs[k].sb[0].degraded then "syn!" else "syn\u{2026}"
+}
+
+/// `yew_syn_status` (`engine.c:5434-5487`) for buffer index `bi`, cut to
+/// the 159 bytes C's 160-byte buffer holds (`cmd.c:79`).
+pub fn ed_syn_status_text(mut ed: Ed, bi: int) -> str {
+    let n = text.textbuf_line_count(ed.bufs[bi].ec.tb)
+    let k = ed_syn_resolve(mut ed, bi)
+    var line = ""
+    if k >= 0 && ed.syntax[0].bufs[k].sb.len != 0 {
+        let e = ed.syntax[0].bufs[k].engine
+        line = syn.syn_buffer_status(
+            ed.syntax[0].bufs[k].sb[0],
+            ed.syntax[0].engines[e],
+            ed.syntax[0].pool,
+            n,
+        )
+    } else {
+        // No engine: C's attach leaves the wave at the entry count, and
+        // every engine field reads as none (`engine.c:5446-5487`).
+        let at = if k >= 0 then edsyn_entry_len(ed.syntax[0], k) else 0
+        let defs = syn.SYN_DEF_MAX
+        let depth = syn.SYN_DEPTH_MAX
+        line = "settled {at}/{n}, wave {at}, root=none active=none defs=0/{defs} depth=0/{depth} states=0 degraded=no embed_pending=0 embed_refused=none"
+    }
+    let bytes = line.bytes()
+    if bytes.len <= 159 then return line
+    let cut = str_from_utf8(bytes[0..159]) else line
+    cut
+}
+
+/// `cmd_syn_status` (`cmd.c:76-89`): the window's buffer's settling report
+/// as an information message.
+pub fn cmd_syn_status(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len then return CMD_ERR_STATE
+    let bi = ed.wins[w].buf
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident then return CMD_ERR_STATE
+    let report = ed_syn_status_text(mut ed, bi)
+    ed_msg(mut ed, MSG_INFO, report)
+    CMD_OK
+}
+
+/// `cmd_syn_set` (`cmd.c:91-148`): `none` or `text` drops the window's
+/// buffer's language (closing its language-server document); a language's
+/// name attaches and binds that language's definition, and a change of
+/// language closes the document and opens it again under the new one. A
+/// name no language has is an error naming the sprint that ships it; a
+/// language whose definition will not load is an I/O error.
+pub fn cmd_syn_set(mut ed: Ed, cx: CmdCtx) -> int {
+    let w = cx.win
+    if w < 0 || w >= ed.wins.len || !cx.has_sarg then return CMD_ERR_STATE
+    let bi = ed.wins[w].buf
+    if bi < 0 || bi >= ed.bufs.len || !ed.bufs[bi].resident then return CMD_ERR_STATE
+    ed_syn_drain(mut ed, bi)
+    let id = ed.bufs[bi].id
+    let name = cx.sarg
+    let k = edsyn_entry(mut ed.syntax[0], id)
+    let had = ed.buf_languages[id] else ""
+    if name == "none" || name == "text" {
+        if had.len != 0 {
+            lsp_buffer_close(mut ed, bi)
+        }
+        edsyn_attach(mut ed.syntax[0], k, 0, ed.bufs[bi].ec.tb)
+        ed.syntax[0].bufs[k].resolved = true
+        let _ = std_map.remove(mut ed.buf_languages, id) else ""
+        ed_syn_log_start(mut ed, bi)
+        return CMD_OK
+    }
+    if name.len == 0 || name.len >= 96 then return CMD_ERR_ARG
+    edsyn_registry(mut ed.syntax[0], ed.clean)
+    let lang = syn.syn_registry_lang_named(ed.syntax[0].regs[0], name.bytes())
+    if lang == 0 {
+        let first = name == "c" || name == "fletch" || name == "sh" || name == "make" ||
+            name == "markdown"
+        let sprint = if first then 41 else 42
+        ed_msg(mut ed, MSG_ERROR, "no definition for '{name}' \u{2014} Sprint {sprint}")
+        return CMD_ERR_ARG
+    }
+    let e = edsyn_engine_for(mut ed.syntax[0], lang)
+    if e < 0 then return CMD_ERR_IO
+    edsyn_attach(mut ed.syntax[0], k, lang, ed.bufs[bi].ec.tb)
+    edsyn_bind(mut ed.syntax[0], k, e, ed.bufs[bi].ec.tb)
+    ed.syntax[0].bufs[k].resolved = true
+    ed_syn_log_start(mut ed, bi)
+    let next = edsyn_lang_name(ed.syntax[0], lang)
+    if had != next {
+        lsp_buffer_close(mut ed, bi)
+        ed.buf_languages[id] = next
+        lsp_buffer_open(ed, bi)
+    } else {
+        ed.buf_languages[id] = next
+    }
+    CMD_OK
+}
+
+// ---- readers -----------------------------------------------------------
+
+/// Buffer index `bi`'s language id (C's `syn.lang`), 0 for none.
+pub fn ed_syn_lang(ed: Ed, bi: int) -> int {
+    if bi < 0 || bi >= ed.bufs.len then return 0
+    let k = edsyn_find(ed.syntax[0], ed.bufs[bi].id)
+    if k < 0 then 0 else ed.syntax[0].bufs[k].lang
+}
+
+/// Buffer index `bi`'s line state's entry count (C's `syn.entry.len`), 0
+/// for a buffer with no state.
+pub fn ed_syn_entry_len(ed: Ed, bi: int) -> int {
+    if bi < 0 || bi >= ed.bufs.len then return 0
+    let k = edsyn_find(ed.syntax[0], ed.bufs[bi].id)
+    if k < 0 then 0 else edsyn_entry_len(ed.syntax[0], k)
+}
+
+/// Buffer index `bi`'s splice count (C's `syn.splice_count`).
+pub fn ed_syn_splices(ed: Ed, bi: int) -> int {
+    if bi < 0 || bi >= ed.bufs.len then return 0
+    let k = edsyn_find(ed.syntax[0], ed.bufs[bi].id)
+    if k < 0 then return 0
+    if ed.syntax[0].bufs[k].sb.len != 0 {
+        return ed.syntax[0].bufs[k].sb[0].lines.splice_count
+    }
+    ed.syntax[0].bufs[k].splices
+}
+
+/// The engine buffer index `bi` is bound to (an index into
+/// `ed.syntax[0].engines`), -1 for none.
+pub fn ed_syn_engine(ed: Ed, bi: int) -> int {
+    if bi < 0 || bi >= ed.bufs.len then return -1
+    let k = edsyn_find(ed.syntax[0], ed.bufs[bi].id)
+    if k < 0 then -1 else ed.syntax[0].bufs[k].engine
+}
