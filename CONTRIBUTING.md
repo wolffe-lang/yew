@@ -114,7 +114,7 @@ coverage, the clipboard rows).
 ## Pull requests
 
 Open a pull request from a branch against `trunk`. Its CI runs every job on
-every host but the macOS port, which runs nightly. The description says which
+every host, the macOS legs included. The description says which
 sagitta files and sprint the change ports, and carries the evidence: the checks
 above as you ran them, and the wolf/C ratios for any quality gate the change
 touches. Pull requests are merged by fast-forward after review.
