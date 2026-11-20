@@ -27,6 +27,14 @@ def completions(root):
                   if n.endswith(".fl") and not n.startswith("."))
 
 
+def syntax(root):
+    """The stage-one syntax definitions: every `*.fl` of runtime/syntax/, in
+    name order (C embeds every runtime file)."""
+    d = f"{root}/runtime/syntax"
+    return sorted("syntax/" + n for n in os.listdir(d)
+                  if n.endswith(".fl") and not n.startswith("."))
+
+
 def literal(text):
     out = []
     for ch in text:
@@ -56,7 +64,7 @@ def main():
         f.write("//! repository's verified `runtime/`; do not edit this copy.\n")
         f.write("//! `tools/check-runtime` regenerates it and diffs.\n\n")
         names = []
-        for i, rel in enumerate(FILES + completions(root)):
+        for i, rel in enumerate(FILES + completions(root) + syntax(root)):
             text = open(f"{root}/runtime/{rel}", encoding="utf-8").read()
             name = f"RUNTIME_FILE_{i}"
             names.append((rel, name))
