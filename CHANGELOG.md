@@ -5,6 +5,32 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Highlighting, stage one: syntax colours in the editor (2026-11-20)
+
+- The seven first-stage definitions (wolf, Markdown, C, Python, shell, TOML
+  and JSON) ship in `runtime/syntax/`, the reference's bytes
+  (`tools/check-runtime` compares them), and in the embedded runtime the
+  editor falls back to.
+- The editor attaches a syntax state to each buffer by its detected language
+  (open, reload, tab hydration, save-as; scratch buffers have none), tells it
+  which lines every edit, undo and redo changed (a multi-cursor batch is one
+  notice), settles it on the event loop's budget (1 ms on input, 4 ms idle,
+  waking every 16 ms while work remains) and draws each span through the
+  theme's slots, at every colour tier, as C does. The statusline shows
+  `syn…` after 250 ms of settling and `syn!` when highlighting degrades;
+  `ed.syn.status` and `ed.syn.set` work. A guest language that does not ship
+  (say a JavaScript fence) keeps its fallback style and is not waited for.
+- `src/edit_syntax_test.lu` holds the editor's rows, among them the per-key
+  row: after settling, a typed key in a 10,000-line file costs at most two
+  line evaluations, and an unchanged redraw none.
+- CI gates by name the PTY goldens drawn in syntax colours: campaign 08's
+  C, shell and Markdown kitchens in both themes at every tier, the
+  5,000-line deferred wave and its badge, a Markdown fence's guest, wide
+  text and colour turned off, and campaigns 05, 09 and 11's cases that draw
+  a coloured document; eight that need unported features are recorded.
+  `tools/run-perf-syntax` measures keypress to paint with highlighting on a
+  10,000-line C file against C (an advisory on the hosted runner).
+
 ### Highlighting, stage one: the syntax engine, its compiler and `yew syn` (2026-11-20)
 
 - `src/syn/` ports sagitta's `src/syn/` engine and definition compiler. A
