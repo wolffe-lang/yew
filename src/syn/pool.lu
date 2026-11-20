@@ -3,6 +3,7 @@
 //! and registry.c at 9ace98c2. Programs are never copied per line/token.
 
 use fl
+use search
 
 /// Process-owner storage. programs have their seed interner moved into aux;
 /// use the explicit-aux matcher for pooled programs. Indices remain stable
@@ -72,37 +73,239 @@ fn pool_for_language(pool: SynPool, language: int) -> int {
 }
 
 /// Structural indexes derived from compiled tables, not language tokens.
+/// firsts[first_slot[rule]] is each rule's effective first-byte set (C's
+/// rule_first) and ctx_first_nonbol each context's union of them over
+/// rules that need no line start; the candidate index and the run masks
+/// read these. The rest is the fast-path index (C's
+/// rule_identifier_suffix, rule_identifiers, word_sets, finite_sets,
+/// rule_json_key, rule_yaml_block_key). Rules sharing one compiled regex
+/// share its analysis, as C rules sharing one YewRe do.
 pub struct SynProgramFacts {
     context_has_aux: List[bool],
     candidates: bool,
+    first_slot: List[int],
+    firsts: List[List[byte]],
+    ctx_first_nonbol: List[List[byte]],
+    suffix: List[int],
+    ident: List[int],
+    specs: List[SynIdentSpec],
+    word: List[int],
+    words: List[SynWordSet],
+    finite: List[int],
+    finites: List[SynFiniteSet],
+    json: List[bool],
+    yaml: List[int],
+}
+
+fn first_count(first: List[byte]) -> int {
+    var n: int = 0
+    for i in 0..32 {
+        var b = first[i] as int
+        while b != 0 {
+            n += b & 1
+            b = b >> 1
+        }
+    }
+    n
+}
+
+// The regex-only part of the fast-path index, computed once per regex.
+struct RegexFacts {
+    slot: int,
+    count: int,
+    bol: bool,
+    suffix: int,
+    ident: int,
+    word: int,
+    finite: int,
+    json: bool,
+    yaml: bool,
 }
 
 fn program_facts(program: SynDefinition) -> SynProgramFacts {
-    var aux = List[bool]()
-    var total: int = 0
-    var ctx = 0
-    while ctx < program.contexts.len {
-        var has_aux = false
-        let first = program.contexts[ctx].first_rule
-        var i = 0
-        while i < program.contexts[ctx].nrules {
-            let rule = first + i
-            if rule >= program.rules.len { break }
-            if program.rules[rule].aux_match != SYN_AUXM_NONE { has_aux = true }
-            if total <= 2097152 {
-                var b = 0
-                while b < 256 {
-                    if program.rules[rule].aux_match != SYN_AUXM_NONE ||
-                        syn_first_has(program.rules[rule].first, b) {
-                        total += 1
-                    }
-                    b += 1
+    var facts = SynProgramFacts {
+        context_has_aux: List[bool](),
+        candidates: true,
+        first_slot: List[int](),
+        firsts: List[List[byte]](),
+        ctx_first_nonbol: List[List[byte]](),
+        suffix: List[int](),
+        ident: List[int](),
+        specs: List[SynIdentSpec](),
+        word: List[int](),
+        words: List[SynWordSet](),
+        finite: List[int](),
+        finites: List[SynFiniteSet](),
+        json: List[bool](),
+        yaml: List[int](),
+    }
+    // Slot 0 is C's regex_effective_first(NULL): every byte.
+    (mut facts.firsts).push(syn_first_new(true))
+    var seen = List[int]()
+    for _ in 0..program.regexes.len { (mut seen).push(-1) }
+    var regex = List[RegexFacts]()
+    for rule in 0..program.rules.len {
+        let index = program.rules[rule].regex
+        let plain = program.rules[rule].aux_match == SYN_AUXM_NONE
+        if index <= 0 || index >= program.regexes.len {
+            (mut facts.first_slot).push(0)
+            (mut facts.suffix).push(0)
+            (mut facts.ident).push(-1)
+            (mut facts.word).push(-1)
+            (mut facts.finite).push(-1)
+            (mut facts.json).push(false)
+            (mut facts.yaml).push(0)
+        } else {
+            if seen[index] < 0 {
+                seen[index] = regex.len
+                (mut regex).push(regex_facts(mut facts, program, index))
+            }
+            let at = seen[index]
+            // C builds a finite set only for a plain rule without a word set.
+            if plain && regex[at].word < 0 && regex[at].finite == -2 {
+                let set = finite_set_build(program.regexes[index])
+                regex[at].finite = -1
+                if set.lits.len != 0 {
+                    regex[at].finite = facts.finites.len
+                    (mut facts.finites).push(set)
                 }
             }
-            i += 1
+            (mut facts.first_slot).push(regex[at].slot)
+            (mut facts.suffix).push(regex[at].suffix)
+            (mut facts.ident).push(regex[at].ident)
+            (mut facts.word).push(regex[at].word)
+            (mut facts.finite).push(if plain && regex[at].word < 0 then regex[at].finite else -1)
+            (mut facts.json).push(plain && regex[at].json)
+            (mut facts.yaml).push(if plain && regex[at].yaml then 1 else 0)
         }
-        (mut aux).push(has_aux)
-        ctx += 1
     }
-    SynProgramFacts { context_has_aux: aux, candidates: total <= 2097152 }
+    var total: int = 0
+    for ctx in 0..program.contexts.len {
+        var has_aux = false
+        var nonbol = syn_first_new(false)
+        var unioned = -1
+        let first = program.contexts[ctx].first_rule
+        for i in 0..program.contexts[ctx].nrules {
+            let rule = first + i
+            if rule >= program.rules.len then break
+            let index = program.rules[rule].regex
+            let shared = index > 0 && index < program.regexes.len
+            if program.rules[rule].aux_match != SYN_AUXM_NONE {
+                has_aux = true
+                total += 256
+            } else if shared {
+                total += regex[seen[index]].count
+            } else {
+                total += 256
+            }
+            let bol = shared && regex[seen[index]].bol
+            // A union is idempotent: a run of rules on one regex adds once.
+            if !bol && (!shared || index != unioned) {
+                syn_first_union(mut nonbol, facts.firsts[facts.first_slot[rule]])
+                unioned = if shared then index else -1
+            }
+        }
+        (mut facts.context_has_aux).push(has_aux)
+        (mut facts.ctx_first_nonbol).push(nonbol)
+    }
+    facts.candidates = total <= 2097152
+    facts
+}
+
+// One regex's effective first set and fast-path shapes, as C's
+// engine_index_* passes compute them; the finite set waits for a plain
+// rule (-2 until then).
+fn regex_facts(mut facts: SynProgramFacts, program: SynDefinition, index: int) -> RegexFacts {
+    let first = syn_effective_first(program.regexes[index])
+    let count = first_count(first)
+    let slot = facts.firsts.len
+    (mut facts.firsts).push(first)
+    var ident = -1
+    let spec = ascii_identifier_spec(program.regexes[index])
+    if spec.start_kind != 0 {
+        ident = facts.specs.len
+        (mut facts.specs).push(spec)
+    }
+    var word = -1
+    if word_literal_shape(program.regexes[index]) {
+        let set = word_set_build(program.regexes[index])
+        if !set.overflow && set.words.len != 0 {
+            word = facts.words.len
+            (mut facts.words).push(set)
+        }
+    }
+    var bol = false
+    var pc = 0
+    var guard = 0
+    let n = program.regexes[index].prog.len
+    while pc < n && guard <= n {
+        guard += 1
+        let kind = program.regexes[index].prog[pc].op
+        if kind == search.RE_BOL {
+            bol = true
+            break
+        }
+        if kind == search.RE_JMP {
+            pc = program.regexes[index].prog[pc].x
+        } else if kind == search.RE_SAVE ||
+            kind == search.RE_BOT ||
+            kind == search.RE_EOT ||
+            kind == search.RE_WORDB ||
+            kind == search.RE_NWORDB {
+            pc += 1
+        } else {
+            break
+        }
+    }
+    RegexFacts {
+        slot: slot,
+        count: count,
+        bol: bol,
+        suffix: identifier_suffix_byte(program.regexes[index]),
+        ident: ident,
+        word: word,
+        finite: -2,
+        json: json_key_shape(program.regexes[index]),
+        yaml: yaml_block_key_shape(program.regexes[index]),
+    }
+}
+
+/// Try a rule's fast paths in C's order (YAML key, JSON key, identifier
+/// suffix, ASCII identifier, word literal, finite literal) under the
+/// engine's toggle bits: -1 lets the Pike VM decide, 0 is no match and 1
+/// a match with the groups written. A finite set is authoritative.
+pub fn syn_fast_match(
+    facts: SynProgramFacts,
+    rule: int,
+    ngroups: int,
+    enabled: int,
+    line: List[byte],
+    len: int,
+    at: int,
+    mut m: search.ReMatch,
+) -> int {
+    if enabled & SYN_FAST_YAML_BLOCK_KEY != 0 && facts.yaml[rule] != 0 {
+        let fast = yaml_block_key_match(ngroups, line, len, at, mut m)
+        if fast >= 0 then return fast
+    }
+    if enabled & SYN_FAST_JSON_KEY != 0 && facts.json[rule] {
+        let fast = json_key_match(line, len, at, mut m)
+        if fast >= 0 then return fast
+    }
+    if enabled & SYN_FAST_IDENTIFIER != 0 && facts.suffix[rule] != 0 {
+        let fast = identifier_suffix_match(facts.suffix[rule], ngroups, line, len, at, mut m)
+        if fast >= 0 then return fast
+    }
+    if enabled & SYN_FAST_IDENTIFIER != 0 && facts.ident[rule] >= 0 {
+        let fast = ascii_identifier_match(facts.specs[facts.ident[rule]], line, len, at, mut m)
+        if fast >= 0 then return fast
+    }
+    if enabled & SYN_FAST_WORD_LITERAL != 0 && facts.word[rule] >= 0 {
+        let fast = word_literal_match(facts.words[facts.word[rule]], ngroups, line, len, at, mut m)
+        if fast >= 0 then return fast
+    }
+    if enabled & SYN_FAST_FINITE_LITERAL != 0 && facts.finite[rule] >= 0 {
+        return finite_literal_match(facts.finites[facts.finite[rule]], line, len, at, mut m)
+    }
+    -1
 }
