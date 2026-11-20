@@ -4,7 +4,12 @@
 //! (`yew_syn_lang_desc`, `yew_syn_lang_named`, `yew_syn_lang_by_name`,
 //! `yew_syn_lang_count`) at 9ace98c2. The table is the generated
 //! `SYN_BUILTINS`; reading a definition file is the caller's I/O, so this
-//! owner holds no global state and never touches the filesystem.
+//! owner holds no global state. C's DefMeta list (every compiled
+//! definition registers itself) is `syn_registry_register` here: user
+//! languages get C's ids (a builtin's by name, else an earlier
+//! registration's, else one past the largest) and join detection
+//! (syn/detect.lu); discovery (syn/discovery.lu) is the one reader of the
+//! filesystem in this module.
 
 use search
 
@@ -17,12 +22,28 @@ pub struct SynRegistry {
     names: List[List[byte]],
     sources: List[str],
     priorities: List[int],
+    extensions: List[List[List[byte]]],
+    filenames: List[List[List[byte]]],
+    shebangs: List[List[List[byte]]],
     first_lines: List[List[byte]],
     first_res: List[int],
     first_compiled: List[search.Re],
     tried: List[bool],
     programs: List[int],
     compiles: int,
+    users: List[SynLanguage],
+    user_programs: List[int],
+    user_first_res: List[int],
+    user_retired: List[bool],
+    user_discovered: List[bool],
+    exact: SynDetectEntries,
+    extension_index: SynDetectEntries,
+    globs: SynDetectEntries,
+    shebang_index: SynDetectEntries,
+    first_line_index: SynDetectEntries,
+    discovery_done: bool,
+    discovery_bypass: bool,
+    warnings: List[str],
 }
 
 fn registry_field(text: List[byte], lo: int, hi: int) -> List[byte] {
@@ -65,12 +86,28 @@ pub fn syn_registry_build(rows: str, first_lines: str) -> SynRegistry {
         names: List[List[byte]](),
         sources: List[str](),
         priorities: List[int](),
+        extensions: List[List[List[byte]]](),
+        filenames: List[List[List[byte]]](),
+        shebangs: List[List[List[byte]]](),
         first_lines: List[List[byte]](),
         first_res: List[int](),
         first_compiled: List[search.Re](),
         tried: List[bool](),
         programs: List[int](),
         compiles: 0,
+        users: List[SynLanguage](),
+        user_programs: List[int](),
+        user_first_res: List[int](),
+        user_retired: List[bool](),
+        user_discovered: List[bool](),
+        exact: syn_detect_entries(),
+        extension_index: syn_detect_entries(),
+        globs: syn_detect_entries(),
+        shebang_index: syn_detect_entries(),
+        first_line_index: syn_detect_entries(),
+        discovery_done: false,
+        discovery_bypass: false,
+        warnings: List[str](),
     }
     let text = model_bytes(rows)
     var at = 0
@@ -85,6 +122,9 @@ pub fn syn_registry_build(rows: str, first_lines: str) -> SynRegistry {
         (mut reg.names).push(registry_field(text, cuts[0] + 1, cuts[1]))
         (mut reg.priorities).push(registry_int(text, cuts[1] + 1, cuts[2]))
         (mut reg.sources).push(buf_str(registry_field(text, cuts[2] + 1, end)))
+        (mut reg.extensions).push(List[List[byte]]())
+        (mut reg.filenames).push(List[List[byte]]())
+        (mut reg.shebangs).push(List[List[byte]]())
         (mut reg.first_lines).push(List[byte]())
         (mut reg.first_res).push(-1)
         (mut reg.tried).push(false)
@@ -106,9 +146,54 @@ pub fn syn_registry_build(rows: str, first_lines: str) -> SynRegistry {
     reg
 }
 
-/// The generated 48-language registry.
+/// The generated 48-language registry, with each builtin's descriptor
+/// lists and the generated detection indexes.
 pub fn syn_registry_new() -> SynRegistry {
-    syn_registry_build(SYN_BUILTINS, SYN_DETECT_FIRST_LINES)
+    var reg = syn_registry_build(SYN_BUILTINS, SYN_DETECT_FIRST_LINES)
+    registry_lists(mut reg, SYN_BUILTIN_EXTENSIONS, 0)
+    registry_lists(mut reg, SYN_BUILTIN_FILENAMES, 1)
+    registry_lists(mut reg, SYN_BUILTIN_SHEBANGS, 2)
+    reg.exact = syn_detect_parse(SYN_DETECT_EXACT, false)
+    reg.extension_index = syn_detect_parse(SYN_DETECT_EXTENSIONS, false)
+    reg.globs = syn_detect_parse(SYN_DETECT_GLOBS, true)
+    reg.shebang_index = syn_detect_parse(SYN_DETECT_SHEBANGS, false)
+    reg.first_line_index = syn_detect_parse(SYN_DETECT_FIRST_LINES, false)
+    reg
+}
+
+// One `ID<TAB>a,b,c` row per builtin: kind 0 extensions, 1 filenames,
+// 2 shebangs.
+fn registry_lists(mut reg: SynRegistry, rows: str, kind: int) {
+    let text = model_bytes(rows)
+    var at = 0
+    while at < text.len {
+        let end = registry_line_end(text, at)
+        var tab = at
+        while tab < end && text[tab] as int != 9 { tab += 1 }
+        if tab >= end then syn_bug("syntax: malformed builtin list row")
+        let ordinal = syn_registry_ordinal(reg, registry_int(text, at, tab))
+        if ordinal < 0 then syn_bug("syntax: builtin list row names no builtin")
+        var items = List[List[byte]]()
+        var lo = tab + 1
+        if lo < end {
+            var p = lo
+            while p <= end {
+                if p == end || text[p] as int == 44 {
+                    (mut items).push(registry_field(text, lo, p))
+                    lo = p + 1
+                }
+                p += 1
+            }
+        }
+        if kind == 0 {
+            reg.extensions[ordinal] = items
+        } else if kind == 1 {
+            reg.filenames[ordinal] = items
+        } else {
+            reg.shebangs[ordinal] = items
+        }
+        at = end + 1
+    }
 }
 
 fn buf_str(bytes: List[byte]) -> str {
@@ -119,9 +204,134 @@ fn buf_str(bytes: List[byte]) -> str {
     s
 }
 
-/// `yew_syn_lang_count` over the builtins.
+/// The builtin table's length (`BuiltinRegistry.len`).
 pub fn syn_registry_count(reg: SynRegistry) -> int {
     reg.ids.len
+}
+
+/// `yew_syn_lang_count`: the builtins plus every live user language.
+pub fn syn_registry_lang_count(reg: SynRegistry) -> int {
+    var n = reg.ids.len
+    for u in 0..reg.users.len {
+        if !reg.user_retired[u] && syn_registry_ordinal(reg, reg.users[u].id) < 0 {
+            n += 1
+        }
+    }
+    n
+}
+
+fn same_name(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len then return false
+    for i in 0..a.len {
+        if a[i] != b[i] then return false
+    }
+    true
+}
+
+fn registry_user(reg: SynRegistry, language: int) -> int {
+    for u in 0..reg.users.len {
+        if !reg.user_retired[u] && reg.users[u].id == language then return u
+    }
+    -1
+}
+
+// C's `language_id`: a builtin's id by name, else an earlier
+// registration's, else one past the largest id in use.
+fn registry_language_id(reg: SynRegistry, name: List[byte]) -> int {
+    var max: int = 0
+    for i in 0..reg.ids.len {
+        if same_name(reg.names[i], name) then return reg.ids[i]
+        if reg.ids[i] > max {
+            max = reg.ids[i]
+        }
+    }
+    for u in 0..reg.users.len {
+        if same_name(reg.users[u].name, name) then return reg.users[u].id
+        if reg.users[u].id > max {
+            max = reg.users[u].id
+        }
+    }
+    max + 1
+}
+
+/// Register a compiled definition (C's `register_meta`, which every
+/// compile performs): pool it under C's language id and answer the id. A
+/// builtin's name fills that builtin's load slot, as C's `yew_syn_def_for`
+/// then finds the registered definition first; any other name becomes a
+/// user language that joins name lookup, descriptors and detection.
+pub fn syn_registry_register(
+    mut reg: SynRegistry,
+    mut pool: SynPool,
+    take definition: SynDefinition,
+    source: str,
+) -> int {
+    let id = registry_language_id(reg, definition.name)
+    let ordinal = syn_registry_ordinal(reg, id)
+    let program = syn_pool_add(mut pool, take definition, id)
+    pool.programs[program].language.source = source
+    if ordinal >= 0 {
+        reg.tried[ordinal] = true
+        reg.programs[ordinal] = program
+        return id
+    }
+    (mut reg.users).push(copy pool.programs[program].language)
+    (mut reg.user_programs).push(program)
+    (mut reg.user_first_res).push(-1)
+    (mut reg.user_retired).push(false)
+    (mut reg.user_discovered).push(false)
+    id
+}
+
+/// Retire a user language (C's `yew_syn_def_dispose` unlinking its
+/// DefMeta): it leaves lookup and detection; its pooled program stays for
+/// any engine that installed it.
+pub fn syn_registry_retire(mut reg: SynRegistry, language: int) {
+    let u = registry_user(reg, language)
+    if u >= 0 {
+        reg.user_retired[u] = true
+    }
+}
+
+/// `yew_syn_def_for` without I/O: the pooled program of a live user
+/// language or of a loaded builtin, else -1 (the caller loads builtins).
+pub fn syn_registry_def_for(reg: SynRegistry, language: int) -> int {
+    let u = registry_user(reg, language)
+    if u >= 0 then return reg.user_programs[u]
+    syn_registry_program(reg, language)
+}
+
+/// `yew_syn_lang_desc`: builtins first (their generated metadata, never a
+/// loaded copy's), then live user languages; none for YEW_LANG_NONE.
+pub fn syn_registry_desc(reg: SynRegistry, language: int) -> SynLanguage ! {none} {
+    let o = syn_registry_ordinal(reg, language)
+    if o >= 0 {
+        return SynLanguage {
+            id: reg.ids[o],
+            name: copy reg.names[o],
+            source: reg.sources[o],
+            extensions: copy reg.extensions[o],
+            filenames: copy reg.filenames[o],
+            shebangs: copy reg.shebangs[o],
+            first_line: copy reg.first_lines[o],
+            has_first_line: reg.first_lines[o].len != 0,
+            first_line_regex: 0,
+            priority: reg.priorities[o],
+            comment_line: List[byte](),
+            comment_open: List[byte](),
+            comment_close: List[byte](),
+        }
+    }
+    let u = registry_user(reg, language)
+    if u < 0 then return none
+    copy reg.users[u]
+}
+
+/// `yew_syn_def_resident`: the pooled program an engine holds resident
+/// for a language, or -1.
+pub fn syn_registry_resident(engine: SynEngine, pool: SynPool, language: int) -> int {
+    let slot = engine_resident(engine, pool, language)
+    if slot < 0 then return -1
+    engine.residents[slot]
 }
 
 /// The ordinal of a builtin language id, or -1.
@@ -149,8 +359,12 @@ pub fn syn_registry_lang_by_name(reg: SynRegistry, name: List[byte], lo: int, hi
     0
 }
 
-/// `yew_syn_lang_named` for a whole name; 0 is YEW_LANG_NONE.
+/// `yew_syn_lang_named` for a whole name: live user languages first, as
+/// C's DefMeta walk, then the builtins; 0 is YEW_LANG_NONE.
 pub fn syn_registry_lang_named(reg: SynRegistry, name: List[byte]) -> int {
+    for u in 0..reg.users.len {
+        if !reg.user_retired[u] && same_name(reg.users[u].name, name) then return reg.users[u].id
+    }
     syn_registry_lang_by_name(reg, name, 0, name.len)
 }
 
