@@ -1,0 +1,624 @@
+//! syncli — `yew syn`: inspect and compile syntax definitions.
+//!
+//! Ports sagitta src/syncli.c at 9ace98c2: the dispatch (`yew_syn_main`,
+//! syncli.c:1490–1591), `list_defs` (:124–163), `load_def` (:165–199),
+//! `compile_one`/`compile_all` (:217–251), `check_one` (:253–304),
+//! `dump_tables` (:1159–1304) and `dump_spans` (:1306–1469). The CLI owns
+//! its registry and pool explicitly; it shares the compiler, engine and
+//! settling with the editor and has no tokenizer of its own.
+//!
+//! Stage one has no on-disk definition cache: `yew syn cache` and the
+//! coverage and embed reports are refused by name, and `list` reports a
+//! definition `cold` (it compiles in memory on every load) unless the
+//! cache is bypassed. Those routes arrive with the full language pack.
+
+use edit
+use fl
+use syn
+use text
+use util
+
+const SYN_USAGE: str = "Usage:\n  yew syn list\n  yew syn compile [--all | FILE]\n  yew syn check FILE [--strict]\n  yew syn check --coverage FILE INPUT... [--strict]\n  yew syn check --embed [--strict]\n  yew syn dump FILE --tables\n  yew syn dump FILE --spans INPUT\n  yew syn cache clear|path\n\nExit: 0 valid, 1 invalid definition or arguments, 3 I/O error,\n4 internal error.  --strict promotes warnings to errors.\n"
+
+/// The sprint and lane that own the routes stage one refuses by name.
+const SYN_DEFERRED: str = "sagitta Sprint 42.5 (the native language pack)"
+
+/// The CLI's explicit state: the builtin registry and the program pool
+/// every loaded definition lives in, with the cache-bypass decision.
+struct SynCli {
+    reg: syn.SynRegistry,
+    pool: syn.SynPool,
+    bypass: bool,
+}
+
+fn cli_new(bypass: bool) -> SynCli {
+    let reg = syn.syn_registry_new()
+    var pool = syn.syn_pool_new()
+    syn.syn_registry_seed(reg, mut pool)
+    SynCli { reg: reg, pool: pool, bypass: bypass }
+}
+
+fn stderr_bytes(bytes: List[byte]) {
+    if bytes.len == 0 then return
+    fs_write_chunk(2, bytes) else {}
+}
+
+fn stdout_bytes(bytes: List[byte]) -> bool {
+    if bytes.len == 0 then return true
+    fs_write_chunk(1, bytes) else { return false }
+    true
+}
+
+fn put(mut out: List[byte], s: str) {
+    for b in s.bytes() { (mut out).push(b) }
+}
+
+fn put_bytes(mut out: List[byte], bytes: List[byte]) {
+    for b in bytes { (mut out).push(b) }
+}
+
+fn usage_error(msg: str) -> int {
+    eprint("yew syn: error: {msg}")
+    stderr_bytes(text_bytes(SYN_USAGE))
+    util.EXIT_ERR
+}
+
+fn text_bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    put(mut out, s)
+    out
+}
+
+fn refuse(what: str) -> int {
+    eprint("yew: error: not yet ported: {what}: {SYN_DEFERRED}")
+    util.EXIT_ERR
+}
+
+// strerror's text for the numbers a read reports; glibc's spellings.
+fn errno_text(e: int) -> str {
+    if e == 2 then return "No such file or directory"
+    if e == 13 then return "Permission denied"
+    if e == 20 then return "Not a directory"
+    if e == 21 then return "Is a directory"
+    if e == 36 then return "File name too long"
+    "Input/output error"
+}
+
+fn read_error(path: str) -> int {
+    let e = os_error()
+    eprint("yew syn: cannot read {path}: {errno_text(if e == 0 then 5 else e)}")
+    util.EXIT_IO
+}
+
+fn render_diagnostics(result: syn.SynCompileResult) {
+    var rendered = List[byte]()
+    for i in 0..result.diagnostics.entries.len {
+        syn.syn_compile_diagnostic_render(mut rendered, result, i)
+    }
+    stderr_bytes(rendered)
+}
+
+// A runtime-relative definition key for the embedded copies.
+fn embedded_key(path: str) -> str {
+    if path.len > 8 && path[0..8] == "runtime/" then return path[8..]
+    path
+}
+
+// `load_def` and `yew_syn_def_load` without a cache: read the file (or,
+// with no YEW_RUNTIME_DIR, this build's embedded copy of a runtime path),
+// compile, render diagnostics, and pool the definition under its builtin
+// id (YEW_LANG_NONE pools as 1, as dump_spans attaches it). Answers
+// (status, program).
+fn load_def(mut cli: SynCli, path: str) -> (int, int) {
+    let source = fs_read_bytes(path) else {
+        let runtime = env_get("YEW_RUNTIME_DIR") else ""
+        let (has, text) = edit.runtime_embedded(embedded_key(path))
+        if runtime.len != 0 || !has then return (read_error(path), -1)
+        text_bytes(text)
+    }
+    var result = syn.syn_compile(path, source)
+    render_diagnostics(result)
+    if !result.valid then return (util.EXIT_ERR, -1)
+    let expected = syn.syn_registry_name_for_source(cli.reg, path)
+    if expected.len != 0 && !same_bytes(expected, result.definition.name) {
+        eprint("{path}:1:1: error: syntax language name '{lossy(result.definition.name)}' does not match expected '{lossy(expected)}'")
+        return (util.EXIT_ERR, -1)
+    }
+    let named = syn.syn_registry_lang_named(cli.reg, result.definition.name)
+    let language = if named == 0 then 1 else named
+    let program = syn.syn_pool_add(mut cli.pool, take result.definition, language)
+    (util.EXIT_OK, program)
+}
+
+fn same_bytes(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len then return false
+    for i in 0..a.len {
+        if a[i] != b[i] then return false
+    }
+    true
+}
+
+fn lossy(bytes: List[byte]) -> str {
+    let s = str_from_utf8(copy bytes) else { return "<bytes>" }
+    s
+}
+
+// Load a guest the settling queue asked for (`yew_syn_def_for` through the
+// builtin registry's `load_builtin_definition`): the runtime copy of its
+// builtin source, compiled once. A failure leaves the slot tried.
+fn load_guest(mut cli: SynCli, language: int) {
+    if syn.syn_registry_tried(cli.reg, language) then return
+    let source = syn.syn_registry_source(cli.reg, language)
+    if source.len == 0 then return
+    let (found, bytes, path) = edit.runtime_read(embedded_key(source))
+    if !found {
+        syn.syn_registry_refuse(mut cli.reg, language)
+        return
+    }
+    let _ = syn.syn_registry_load(mut cli.reg, mut cli.pool, language, path, bytes)
+}
+
+fn list_defs(cli: SynCli) -> int {
+    let no_cache = env_get("YEW_NO_SYN_CACHE") else ""
+    let state = if cli.bypass || no_cache == "1" then "bypassed" else "cold"
+    var out = List[byte]()
+    let extensions = text_bytes(syn.SYN_BUILTIN_EXTENSIONS)
+    var at = 0
+    for i in 0..syn.syn_registry_count(cli.reg) {
+        put_bytes(mut out, cli.reg.names[i])
+        (mut out).push(9 as byte)
+        // Each SYN_BUILTIN_EXTENSIONS row is `ID<TAB>a,b,c`, in id order.
+        while at < extensions.len && extensions[at] as int != 9 { at += 1 }
+        at += 1
+        while at < extensions.len && extensions[at] as int != 10 {
+            (mut out).push(extensions[at])
+            at += 1
+        }
+        at += 1
+        (mut out).push(9 as byte)
+        put(mut out, cli.reg.sources[i])
+        put(mut out, "\t{state}\n")
+    }
+    if !stdout_bytes(out) then return util.EXIT_IO
+    util.EXIT_OK
+}
+
+fn compile_one(mut cli: SynCli, path: str) -> int {
+    let (status, _) = load_def(mut cli, path)
+    status
+}
+
+// `runtime_source`: a builtin's source under the runtime root.
+fn runtime_source(source: str) -> str {
+    let (kind, dir) = edit.runtime_root_at("")
+    let relative = embedded_key(source)
+    if kind == edit.RUNTIME_ROOT_ENV || kind == edit.RUNTIME_ROOT_PREFIX || kind == edit.RUNTIME_ROOT_SOURCE {
+        return "{dir}/{relative}"
+    }
+    source
+}
+
+fn compile_all(mut cli: SynCli) -> int {
+    for i in 0..syn.syn_registry_count(cli.reg) {
+        let path = runtime_source(cli.reg.sources[i])
+        let status = compile_one(mut cli, path)
+        if status != util.EXIT_OK then return status
+    }
+    util.EXIT_OK
+}
+
+fn check_one(path: str, strict: bool) -> int {
+    let source = fs_read_bytes(path) else { return read_error(path) }
+    let result = syn.syn_compile(path, source)
+    render_diagnostics(result)
+    if result.diagnostics.nerrors != 0 || !result.valid then return util.EXIT_ERR
+    if strict && result.diagnostics.nwarnings != 0 then return util.EXIT_ERR
+    util.EXIT_OK
+}
+
+// C's quote(): C-string bytes up to a NUL, escaped.
+fn quote(mut out: List[byte], s: List[byte]) {
+    (mut out).push(34 as byte)
+    for b in s {
+        let c = b as int
+        if c == 0 then break
+        if c == 92 {
+            put(mut out, "\\\\")
+        } else if c == 34 {
+            put(mut out, "\\\"")
+        } else if c == 10 {
+            put(mut out, "\\n")
+        } else if c == 13 {
+            put(mut out, "\\r")
+        } else if c == 9 {
+            put(mut out, "\\t")
+        } else if c < 32 || c == 127 {
+            put(mut out, "\\x")
+            put_hex2(mut out, c)
+        } else {
+            (mut out).push(b)
+        }
+    }
+    (mut out).push(34 as byte)
+}
+
+fn put_hex2(mut out: List[byte], n: int) {
+    (mut out).push("0123456789abcdef".bytes()[(n >> 4) & 15])
+    (mut out).push("0123456789abcdef".bytes()[n & 15])
+}
+
+fn dump_first(mut out: List[byte], first: List[byte]) {
+    put(mut out, " first=")
+    for i in 0..32 { put_hex2(mut out, first[i] as int) }
+}
+
+fn attr_name(attr: int) -> str {
+    syn.syn_attr_name(attr) else "<invalid>"
+}
+
+fn op_name(op: int) -> str {
+    if op == syn.SYN_OP_PUSH then return "push"
+    if op == syn.SYN_OP_POP then return "pop"
+    if op == syn.SYN_OP_SET then return "set"
+    if op == syn.SYN_OP_EMBED then return "embed"
+    "stay"
+}
+
+fn embed_end_name(end: int) -> str {
+    if end == syn.SYN_EMBED_END_LINE then return "line"
+    if end == syn.SYN_EMBED_END_INLINE then return "inline"
+    if end == syn.SYN_EMBED_END_INLINE_ROOT then return "inline-root"
+    if end == syn.SYN_EMBED_END_LINE_CONTINUATION then return "line-continuation"
+    "none"
+}
+
+fn aux_match_name(kind: int) -> str {
+    if kind == syn.SYN_AUXM_LINE_EQ then return "line_eq"
+    if kind == syn.SYN_AUXM_LITERAL then return "literal"
+    if kind == syn.SYN_AUXM_FENCE_CLOSE then return "fence_close"
+    if kind == syn.SYN_AUXM_INDENT_LT then return "indent_lt"
+    "none"
+}
+
+fn unit_name(flags: int) -> str {
+    if flags & syn.SYN_CTX_UNIT_ATOM != 0 then return "atom"
+    if flags & syn.SYN_CTX_UNIT_SPAN != 0 then return "span"
+    "none"
+}
+
+fn ctx_name(def: syn.SynDefinition, id: int) -> List[byte] {
+    if id < 0 || id >= def.context_names.len then return text_bytes("<unknown>")
+    copy def.context_names[id]
+}
+
+fn aux_string(aux: fl.FlStrings, id: int) -> List[byte] {
+    if id <= 0 || id >= aux.items.len then return List[byte]()
+    copy aux.items[id]
+}
+
+fn put_cstr(mut out: List[byte], bytes: List[byte]) {
+    for b in bytes {
+        if b as int == 0 then break
+        (mut out).push(b)
+    }
+}
+
+fn dump_rule(
+    mut out: List[byte],
+    def: syn.SynDefinition,
+    aux: fl.FlStrings,
+    rule: syn.SynRule,
+    index: int,
+) {
+    put(mut out, "  rule {index} match=")
+    quote(mut out, if index < def.patterns.len then copy def.patterns[index] else List[byte]())
+    put(mut out, " attr={attr_name(rule.attr)} op={op_name(rule.op)}")
+    if rule.op == syn.SYN_OP_PUSH || rule.op == syn.SYN_OP_EMBED {
+        put(mut out, " target=")
+        if rule.pushes.len != 0 {
+            for i in 0..rule.pushes.len {
+                if i != 0 then (mut out).push(44 as byte)
+                put_cstr(mut out, ctx_name(def, rule.pushes[i]))
+            }
+        } else {
+            put_cstr(mut out, ctx_name(def, rule.target))
+        }
+    } else if rule.op == syn.SYN_OP_SET {
+        put(mut out, " target=")
+        put_cstr(mut out, ctx_name(def, rule.target))
+    } else if rule.op == syn.SYN_OP_POP {
+        put(mut out, " count={rule.nop}")
+    }
+    if rule.op == syn.SYN_OP_EMBED {
+        put(mut out, " embed.lang=")
+        if rule.embed.lang_kind == syn.SYN_EMBED_LANG_LITERAL {
+            quote(mut out, aux_string(aux, rule.embed.lang))
+        } else if rule.embed.lang_kind == syn.SYN_EMBED_LANG_CAPTURE {
+            put(mut out, "@{rule.embed.lang_group}")
+        } else if rule.embed.lang_kind == syn.SYN_EMBED_LANG_SELF {
+            put(mut out, "@self")
+        } else {
+            put(mut out, "<invalid>")
+        }
+        put(mut out, " embed.ctx=")
+        if rule.embed.ctx == 0 {
+            put(mut out, "<root>")
+        } else {
+            quote(mut out, aux_string(aux, rule.embed.ctx))
+        }
+        let defer = if rule.embed.flags & syn.SYN_EMBED_DEFER != 0 then "true" else "false"
+        put(mut out, " embed.end={embed_end_name(rule.embed.end_kind)} embed.defer={defer}")
+        put(mut out, " embed.fallback={attr_name(rule.embed.fallback)}")
+    }
+    if rule.end_boundary then put(mut out, " end=true")
+    put(mut out, " consume={rule.consume} aux={aux_match_name(rule.aux_match)}")
+    if rule.flags != 0 {
+        put(mut out, " flags=0x")
+        put_hex2(mut out, rule.flags)
+    }
+    for i in 0..rule.caps.len {
+        if rule.caps[i] as int != 255 then put(mut out, " capture.{i}={attr_name(rule.caps[i] as int)}")
+    }
+    if rule.aux_pre != 0 {
+        put(mut out, " aux_pre=")
+        quote(mut out, aux_string(aux, rule.aux_pre))
+    }
+    if rule.aux_post != 0 {
+        put(mut out, " aux_post=")
+        quote(mut out, aux_string(aux, rule.aux_post))
+    }
+    dump_first(mut out, rule.first)
+    (mut out).push(10 as byte)
+}
+
+fn dump_tables(cli: SynCli, program: int) -> int {
+    var out = List[byte]()
+    tables_text(mut out, cli.pool.programs[program], cli.pool.aux[program])
+    if !stdout_bytes(out) then return util.EXIT_IO
+    util.EXIT_OK
+}
+
+fn tables_text(mut out: List[byte], def: syn.SynDefinition, aux: fl.FlStrings) {
+    put(mut out, "language ")
+    put_cstr(mut out, def.name)
+    put(mut out, "\nroot ")
+    put_cstr(mut out, ctx_name(def, def.root))
+    (mut out).push(10 as byte)
+    for i in 0..def.contexts.len {
+        context_text(mut out, def, aux, def.contexts[i], i)
+    }
+}
+
+fn context_text(
+    mut out: List[byte],
+    def: syn.SynDefinition,
+    aux: fl.FlStrings,
+    ctx: syn.SynContext,
+    i: int,
+) {
+    put(mut out, "context ")
+        put_cstr(mut out, ctx_name(def, i))
+        put(mut out, " default={attr_name(ctx.default_attr)} at_eol={op_name(ctx.eol_op)} unit={unit_name(ctx.flags)}")
+        if ctx.eol_op == syn.SYN_OP_SET {
+            put(mut out, " target=")
+            put_cstr(mut out, ctx_name(def, ctx.eol_target))
+        } else if ctx.eol_op == syn.SYN_OP_POP {
+            put(mut out, " count={ctx.eol_nop}")
+        }
+        if ctx.flags & syn.SYN_CTX_EMBED_BRIDGE != 0 {
+            put(mut out, " embed.end={embed_end_name(ctx.embed.end_kind)} embed.ctx=")
+            if ctx.embed.ctx == 0 {
+                put(mut out, "<root>")
+            } else {
+                quote(mut out, aux_string(aux, ctx.embed.ctx))
+            }
+            put(mut out, " embed.fallback={attr_name(ctx.embed.fallback)}")
+        }
+        dump_first(mut out, ctx.first)
+        (mut out).push(10 as byte)
+        for j in 0..ctx.nrules {
+            let r = ctx.first_rule + j
+            dump_rule(mut out, def, aux, def.rules[r], r)
+        }
+}
+
+// `qualified_frame`: "LANGUAGE:CONTEXT" for one frame of a state.
+fn put_frame(mut out: List[byte], cli: SynCli, engine: syn.SynEngine, state: syn.SynState, depth: int) {
+    let slot = syn.syn_state_def(state, depth)
+    if slot < 0 || slot >= engine.residents.len {
+        put(mut out, "<unknown>")
+        return
+    }
+    frame_text(mut out, cli.pool.programs[engine.residents[slot]], syn.syn_state_ctx(state, depth))
+}
+
+fn frame_text(mut out: List[byte], def: syn.SynDefinition, ctx: int) {
+    put_cstr(mut out, def.name)
+    (mut out).push(58 as byte)
+    put_cstr(mut out, ctx_name(def, ctx))
+}
+
+// `qualified_context`: the top frame, or <unknown> for an empty stack.
+fn put_context(mut out: List[byte], cli: SynCli, engine: syn.SynEngine, state: syn.SynState) {
+    let depth = syn.syn_state_depth(state)
+    if depth == 0 {
+        put(mut out, "<unknown>")
+        return
+    }
+    put_frame(mut out, cli, engine, state, depth - 1)
+}
+
+fn put_state_context(mut out: List[byte], cli: SynCli, engine: syn.SynEngine, id: int) {
+    var state = syn.syn_state_root(0, 0)
+    if !syn.syn_state_read(mut state, engine.states, id) {
+        put(mut out, "<unknown>")
+        return
+    }
+    put_context(mut out, cli, engine, state)
+}
+
+fn dump_spans(mut cli: SynCli, root: int, path: str) -> int {
+    let input = fs_read_bytes(path) else { return read_error(path) }
+    var engine = syn.syn_engine_new(cli.pool, root)
+    let tb = text.textbuf_from_bytes(input, 0, input.len)
+    var buffer = syn.syn_buffer_new_at(tb, engine.generation, 0)
+    let count = text.textbuf_line_count(tb)
+    var status = util.EXIT_OK
+    var passes = 0
+    while true {
+        if buffer.pending_langs.len != 0 then load_guest(mut cli, buffer.pending_langs[0])
+        let report = syn.syn_settle(mut buffer, mut engine, mut cli.pool, tb, 0, count, 9223372036854775807)
+        passes += 1
+        if report.fixpoint && buffer.pending_langs.len == 0 then break
+        if passes == 64 {
+            eprint("yew syn: embed settling did not converge")
+            status = util.EXIT_BUG
+            break
+        }
+    }
+    var out = List[byte]()
+    var spans = syn.syn_spans_new(syn.SYN_MAX_SPANS)
+    var at = syn.syn_state_root(0, 0)
+    var after = syn.syn_state_root(0, 0)
+    var entry = syn.SYN_STATE_ROOT
+    var lo = 0
+    var line_no = 1
+    while status == util.EXIT_OK && lo <= input.len {
+        var hi = lo
+        while hi < input.len && input[hi] as int != 10 { hi += 1 }
+        var len = hi - lo
+        if len != 0 && input[lo + len - 1] as int == 13 then len -= 1
+        if line_no - 1 < syn.syn_ids_len(buffer.lines.entry) {
+            entry = syn.syn_ids_get(buffer.lines.entry, line_no - 1)
+        }
+        let line = if len <= syn.SYN_LINE_BYTE_CAP then input[lo..lo + len] else List[byte]()
+        syn.syn_line(mut engine, mut cli.pool, entry, line, len, mut spans, true)
+        put(mut out, "line {line_no} entry=")
+        put_state_context(mut out, cli, engine, entry)
+        put(mut out, " exit=")
+        put_state_context(mut out, cli, engine, spans.exit_state)
+        (mut out).push(10 as byte)
+        for i in 0..spans.n {
+            let start = syn.syn_span_start(spans, i)
+            let end = start + syn.syn_span_len(spans, i)
+            put(mut out, "  {line_no}:{start}-{end} attr={attr_name(syn.syn_span_attr(spans, i))} context=")
+            var named = false
+            if syn.syn_engine_trace_at(mut at, engine, start) && syn.syn_state_depth(at) != 0 {
+                var bridge = -1
+                if syn.syn_state_ndef(at) > 1 &&
+                    syn.syn_engine_trace_at(mut after, engine, end) &&
+                    syn.syn_state_ndef(after) < syn.syn_state_ndef(at) {
+                    var depth = syn.syn_state_depth(at)
+                    while depth != 0 {
+                        depth -= 1
+                        if syn.syn_state_frame_flags(at, depth) & syn.SYN_FR_BRIDGE != 0 {
+                            bridge = depth
+                            break
+                        }
+                    }
+                }
+                if bridge >= 0 {
+                    put_frame(mut out, cli, engine, at, bridge)
+                } else {
+                    put_context(mut out, cli, engine, at)
+                }
+                named = true
+            }
+            if !named then put_state_context(mut out, cli, engine, entry)
+            if syn.syn_span_flags(spans, i) & syn.SYN_SPAN_TRUNCATED != 0 then put(mut out, " truncated")
+            (mut out).push(10 as byte)
+        }
+        entry = spans.exit_state
+        if hi == input.len then break
+        lo = hi + 1
+        line_no += 1
+    }
+    if status == util.EXIT_OK && !stdout_bytes(out) then status = util.EXIT_IO
+    status
+}
+
+fn dump_def(mut cli: SynCli, path: str, tables: bool, input: str) -> int {
+    let (status, program) = load_def(mut cli, path)
+    if status != util.EXIT_OK then return status
+    if tables then return dump_tables(cli, program)
+    dump_spans(mut cli, program, input)
+}
+
+/// `yew syn ...` (`yew_syn_main`): `argv[0]` is "syn"; `clean` is set by
+/// `yew --clean syn`. Answers the process exit status.
+pub fn yew_syn_main(argv: List[str], clean0: bool) -> int {
+    var at = 1
+    var clean = clean0
+    if at < argv.len && argv[at] == "--clean" {
+        clean = true
+        at += 1
+    }
+    if at >= argv.len {
+        stderr_bytes(text_bytes(SYN_USAGE))
+        return util.EXIT_ERR
+    }
+    if argv[at] == "--help" {
+        if !stdout_bytes(text_bytes(SYN_USAGE)) then return util.EXIT_IO
+        return util.EXIT_OK
+    }
+    var cli = cli_new(clean)
+    let command = argv[at]
+    if command == "list" {
+        if at + 1 != argv.len then return usage_error("list takes no arguments")
+        return list_defs(cli)
+    }
+    if command == "compile" {
+        if at + 2 != argv.len then return usage_error("compile requires --all or FILE")
+        if argv[at + 1] == "--all" then return compile_all(mut cli)
+        return compile_one(mut cli, argv[at + 1])
+    }
+    if command == "check" {
+        var strict = false
+        var coverage = false
+        var embed = false
+        var path = ""
+        var has_path = false
+        var inputs = 0
+        for i in at + 1..argv.len {
+            if argv[i] == "--strict" && !strict {
+                strict = true
+            } else if argv[i] == "--coverage" && !coverage {
+                coverage = true
+            } else if argv[i] == "--embed" && !embed {
+                embed = true
+            } else if !has_path {
+                path = argv[i]
+                has_path = true
+            } else if coverage {
+                inputs += 1
+            } else {
+                return usage_error("check requires one FILE")
+            }
+        }
+        if embed {
+            if coverage || has_path then return usage_error("--embed takes no FILE or coverage inputs")
+            return refuse("yew syn check --embed")
+        }
+        if !has_path then return usage_error("check requires FILE")
+        if coverage && inputs == 0 then return usage_error("--coverage requires at least one INPUT")
+        if coverage then return refuse("yew syn check --coverage")
+        return check_one(path, strict)
+    }
+    if command == "dump" {
+        if at + 3 == argv.len && argv[at + 2] == "--tables" {
+            return dump_def(mut cli, argv[at + 1], true, "")
+        }
+        if at + 4 == argv.len && argv[at + 2] == "--spans" {
+            return dump_def(mut cli, argv[at + 1], false, argv[at + 3])
+        }
+        return usage_error("dump requires FILE --tables or FILE --spans INPUT")
+    }
+    if command == "cache" {
+        if at + 2 != argv.len then return usage_error("cache requires clear or path")
+        if argv[at + 1] != "clear" && argv[at + 1] != "path" {
+            return usage_error("cache requires clear or path")
+        }
+        return refuse("yew syn cache {argv[at + 1]}")
+    }
+    usage_error("unknown command")
+}
