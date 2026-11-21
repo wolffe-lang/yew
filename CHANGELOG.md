@@ -122,6 +122,18 @@ The format follows Keep a Changelog; the port has no release yet.
   across later saves, the three generations, and the reader and first-session
   cases.
 
+### The first Esc under the file-tree drawer keeps the restore prompt (2026-11-21)
+
+- Opening a directory whose active file has a crash journal raises the
+  restore prompt while F mode's drawer is open, and the drawer narrows the
+  footer the prompt is written in. The first Esc now goes to F mode, which
+  closes the drawer, and leaves the prompt open; the next Esc answers it as
+  before ("open as-is"), and `r` and `d` work as before. Without the drawer
+  nothing changes.
+- `src/edit_recover_prompt_drawer_test.lu` stages a real crash journal
+  through the text layer, opens the editor as a directory launch does, and
+  feeds Esc as raw terminal bytes in the legacy and kitty encodings.
+
 ### goldens: a script case the runner never started is run once more (2026-11-19)
 
 - The oracle's script suite went red on macOS with `FAIL 07_functions (exit
