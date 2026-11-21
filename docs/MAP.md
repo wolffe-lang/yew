@@ -1318,3 +1318,17 @@ own. Any changed C golden is separately listed and pinned in
     skipped at restore without being logged as dropped (C logs it), and
     `active_tab` names a written record past the record cap too. The
     state file stays C's byte for byte below that cap.
+
+- **An Insert run's undo group stays on its buffer** (yew#128,
+  `src/edit/ed.lu`, `invoke.lu`). A plain click on another tab or pane
+  moves focus without leaving Insert (`mouse.lu`'s `click_tab` and
+  `pane_click`). C keeps one editor-wide `insert_txn` flag and closes the
+  group through the focused window (`ed.c:1666-1676`), so after such a
+  click the next keys land outside any group and Esc ends a group the
+  clicked buffer never opened: `undo: unbalanced end`, an internal error.
+  The port records the buffer the run began on (`insert_txn_buf`), closes
+  the run there before a command edits another buffer, and ends it on
+  that buffer at every barrier; each buffer's typing is one undo step on
+  that buffer. Rows: `src/edit_insert_txn_focus_test.lu` (tab and pane
+  clicks in the legacy and kitty encodings, keyed tab moves as controls)
+  and `tools/editing-row`'s `insert-tab-click-*` and `insert-pane-click-*`.
