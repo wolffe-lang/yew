@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+# lsp-typing-row — yew typing with its language server on (yw25, yew#137).
+#
+#   tools/lsp-typing-row YEW_BIN [--keys N] [--rate HZ] [--pattern text|mix]
+#       [--max-rss-kb-per-key X] [--max-didchange-per-s Y]
+#       [--max-didchange-bytes-per-key Z] [--json OUT]
+#
+# yew runs in a 160x50 pty on a copy of this tree's `src/` (so `wolf.pkg`
+# roots the server there), opens src/edit/lsp_client.lu (about 40 KB), pages
+# down, enters Insert and types N keys at HZ keys a second. `wolf lsp`
+# (the pinned toolchain's, .wolf-bin/wolf, or $YW_REAL_WOLF) sits behind
+# tools/lsp-typing/wolf, a proxy that logs every frame. Measured over the
+# typing: yew's resident memory per key, didChange frames per second (the
+# server runs one analysis for each), didChange bytes per key. A bound that
+# is exceeded fails the row (exit 1); no bound, no verdict. Linux only
+# (/proc); exit 2 on a harness fault.
+import argparse, fcntl, json, os, pty, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time
+
+here = os.path.dirname(os.path.abspath(__file__))
+root = os.path.dirname(here)
+ap = argparse.ArgumentParser()
+ap.add_argument("yew")
+ap.add_argument("--keys", type=int, default=300)
+ap.add_argument("--rate", type=float, default=5.0)
+ap.add_argument("--pattern", default="text", choices=["text", "mix"])
+ap.add_argument("--max-rss-kb-per-key", type=float)
+ap.add_argument("--max-didchange-per-s", type=float)
+ap.add_argument("--max-didchange-bytes-per-key", type=float)
+ap.add_argument("--json")
+a = ap.parse_args()
+
+real = os.environ.get("YW_REAL_WOLF") or os.path.join(root, ".wolf-bin", "wolf")
+if not os.access(real, os.X_OK):
+    print("lsp-typing-row: no wolf at %s; run tools/fetch-toolchain" % real, file=sys.stderr)
+    sys.exit(2)
+work = tempfile.mkdtemp(prefix="lsp-typing-")
+shutil.copytree(os.path.join(root, "src"), os.path.join(work, "ws", "src"))
+shutil.copy(os.path.join(root, "wolf.pkg"), os.path.join(work, "ws", "wolf.pkg"))
+for sub in ("home",):
+    os.makedirs(os.path.join(work, sub))
+log = os.path.join(work, "lsp.jsonl")
+open(log, "w").close()
+env = dict(os.environ, TERM="xterm-256color", HOME=work + "/home", XDG_CONFIG_HOME=work + "/home/.config",
+           XDG_STATE_HOME=work + "/home/.state", XDG_DATA_HOME=work + "/home/.data", SHELL="/bin/sh",
+           LANG="C.UTF-8", YW25_LSPLOG=log, YW25_REAL_WOLF=real, PATH=os.path.join(here, "lsp-typing") + ":" + os.environ["PATH"])
+yew_bin = os.path.abspath(a.yew)
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(os.path.join(work, "ws"))
+    os.execve(yew_bin, [yew_bin, "src/edit/lsp_client.lu"], env)
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))
+os.kill(pid, signal.SIGWINCH)
+
+def pump(dur):
+    end = time.monotonic() + dur
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        r, _, _ = select.select([fd], [], [], min(left, 0.02))
+        if r:
+            try:
+                if not os.read(fd, 65536):
+                    return
+            except OSError:
+                return
+
+def rss():
+    for l in open("/proc/%d/status" % pid):
+        if l.startswith("VmRSS"):
+            return int(l.split()[1])
+
+pump(6.0)                                   # the server is up, first diagnostics in
+for _ in range(12):
+    os.write(fd, b"\x1b[6~"); pump(0.15)    # PageDown
+os.write(fd, b"i"); pump(0.5)
+base_rss, t0 = rss(), time.monotonic()
+gap = 1.0 / a.rate
+for k in range(a.keys):
+    if a.pattern == "text":
+        key = bytes([97 + k % 26])
+    else:
+        key = b"\r" if k % 12 == 11 else (b"\x7f" if k % 7 == 6 else bytes([97 + k % 26]))
+    t = time.monotonic()
+    os.write(fd, key)
+    pump(max(gap - (time.monotonic() - t), 0))
+pump(3.0)
+end_rss, dur = rss(), time.monotonic() - t0 - 3.0
+os.write(fd, b"\x1b"); pump(0.5)
+os.write(fd, b":q!\r"); pump(2.0)
+try:
+    os.kill(pid, signal.SIGTERM)
+except OSError:
+    pass
+frames = [json.loads(l) for l in open(log) if l.strip()]
+if not any(f.get("method") == "initialize" for f in frames):
+    print("lsp-typing-row: the server never started behind the proxy (no initialize frame)", file=sys.stderr)
+    sys.exit(2)
+dc = [f for f in frames if f.get("method") == "textDocument/didChange"]
+res = {
+    "keys": a.keys, "rate_hz": a.rate, "pattern": a.pattern,
+    "rss_kb_per_key": round((end_rss - base_rss) / a.keys, 2),
+    "didchange_count": len(dc),
+    "didchange_per_s": round(len(dc) / dur, 2),
+    "didchange_bytes_per_key": round(sum(f["bytes"] for f in dc) / a.keys, 1),
+    "publish_diagnostics": sum(1 for f in frames if f.get("method") == "textDocument/publishDiagnostics"),
+}
+print(json.dumps(res))
+if a.json:
+    json.dump(res, open(a.json, "w"), indent=1)
+shutil.rmtree(work, ignore_errors=True)
+bad = []
+for key, bound in (("rss_kb_per_key", a.max_rss_kb_per_key), ("didchange_per_s", a.max_didchange_per_s),
+                   ("didchange_bytes_per_key", a.max_didchange_bytes_per_key)):
+    if bound is not None and res[key] > bound:
+        bad.append("FAIL lsp-typing %s %s > %s" % (key, res[key], bound))
+for b in bad:
+    print(b)
+print("lsp-typing-row: %s" % ("RED" if bad else "GREEN"))
+sys.exit(1 if bad else 0)
