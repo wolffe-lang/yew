@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Drive the actual census process on a PTY, including macOS script(1)."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import select
+import subprocess
+import sys
+import termios
+import time
+
+HERE = Path(__file__).resolve().parent
+
+
+def run_case(root, via_script=False, control_c=False, shift_escape=False):
+    root.mkdir(parents=True, exist_ok=False)
+    master, slave = pty.openpty()
+    before = termios.tcgetattr(slave)
+    cmd = [sys.executable, '-I', str(HERE/'mouse-census.py'), '--terminal', 'automated-pty']
+    if shift_escape:
+        cmd.append('--shift-escape')
+    if via_script:
+        cmd = ['/usr/bin/script', '-q', str(root/'script.typescript')] + cmd
+    def controlling_tty():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    done_read, done_write = os.pipe()
+    release_read, release_write = os.pipe()
+    # Keep the controlling session leader alive while checking restored attrs.
+    # Darwin invalidates the slave ioctl after its session leader has exited.
+    wrapper = ('import os,subprocess,sys; '
+               'rc=subprocess.run(sys.argv[3:]).returncode; '
+               'os.write(int(sys.argv[1]),b"done"); '
+               'os.read(int(sys.argv[2]),1); sys.exit(rc)')
+    proc = subprocess.Popen([sys.executable, '-I', '-c', wrapper,
+                             str(done_write), str(release_read)] + cmd,
+                            stdin=slave, stdout=slave, stderr=slave,
+                            pass_fds=(slave, done_write, release_read), preexec_fn=controlling_tty,
+                            cwd=root, env={'PATH':'/usr/bin:/bin','HOME':str(root),
+                                           'SHELL':'/bin/sh','TERM':'xterm-256color'})
+    os.close(done_write)
+    os.close(release_read)
+    raw = bytearray()
+    def wait_for(needle, seconds=8):
+        deadline = time.monotonic()+seconds
+        while needle not in raw:
+            if time.monotonic()>deadline:
+                raise AssertionError(f'timed out awaiting {needle!r}; {bytes(raw)!r}')
+            ready,_,_=select.select([master],[],[],.1)
+            if ready:
+                data=os.read(master,65536)
+                if not data:raise AssertionError('unexpected EOF')
+                raw.extend(data)
+    try:
+        wait_for(b'press q when done')
+        assert b'\x1b[?1000h\x1b[?1002h\x1b[?1006h' in raw
+        assert (b'\x1b[?1006h\x1b[>1s' in raw)==shift_escape
+        current=termios.tcgetattr(slave)
+        assert not (current[3] & termios.ICANON), 'not raw: ICANON'
+        assert not (current[3] & termios.ECHO), 'not raw: ECHO'
+        for cb in (0,16,20,8,4,2):
+            for suffix in ('M','m'):
+                event=f'\x1b[<{cb};10;5{suffix}'.encode()
+                # Split the CSI across writes; no Space or timer handshake.
+                os.write(master,event[:4]);os.write(master,event[4:])
+                wait_for(('raw='+event.hex()).encode())
+        os.write(master,b'\x03' if control_c else b'q')
+        wait_for(b'MOUSE-CENSUS-JSON ')
+        # The JSON is line framed; wait for its completed line, not just prefix.
+        while b'\n' not in raw.split(b'MOUSE-CENSUS-JSON ',1)[1]:
+            ready,_,_=select.select([master],[],[],2)
+            if not ready:raise AssertionError('incomplete JSON line')
+            raw.extend(os.read(master,65536))
+        ready,_,_=select.select([done_read],[],[],8)
+        assert ready and os.read(done_read,4)==b'done', 'census did not finish'
+        payload=json.loads(raw.split(b'MOUSE-CENSUS-JSON ',1)[1].splitlines()[0])
+        mouse=[x for x in payload['events'] if x['kind'] in ('press','release')]
+        assert len(mouse)==12, payload
+        assert [x['mods'] for x in mouse[::2]]==[0,16,20,8,4,0], payload
+        assert [x['button'] for x in mouse[::2]]==[0,0,0,0,0,2], payload
+        assert all(x['x']==10 and x['y']==5 for x in mouse)
+        assert [x['release'] for x in mouse]==[False,True]*6
+        assert payload['exit_reason']==('ctrl-c' if control_c else 'q'), payload
+        assert b'\x1b[?1000l\x1b[?1002l\x1b[?1006l' in raw
+        assert (b'\x1b[>0s\x1b[?1000l' in raw)==shift_escape
+        assert payload['shift_escape_requested']==shift_escape
+        restored=termios.tcgetattr(slave)
+        # Darwin sets PENDIN while returning to canonical input. It is a
+        # kernel retype-pending flag, not a changed terminal policy setting.
+        stable_before=list(before)
+        stable_after=list(restored)
+        stable_before[3] &= ~getattr(termios,'PENDIN',0)
+        stable_after[3] &= ~getattr(termios,'PENDIN',0)
+        assert stable_after==stable_before, f'terminal settings not restored: before={before!r}, after={restored!r}'
+        os.write(release_write,b'x')
+        proc.wait(timeout=8)
+        assert proc.returncode==0, proc.returncode
+        (root/'result.json').write_text(json.dumps(payload,indent=2))
+    finally:
+        (root/'raw.bin').write_bytes(raw)
+        os.close(release_write)
+        os.close(done_read)
+        os.close(master)
+        os.close(slave)
+        if proc.poll() is None:
+            proc.wait(timeout=8)  # controlling-tty EOF; no process scan or group signal
+    print('PASS '+root.name+' live events, raw mode, decoded JSON and exact tty restore',flush=True)
+
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--output',type=Path,required=True)
+    a=p.parse_args()
+    a.output=a.output.resolve()
+    a.output.mkdir(parents=True,exist_ok=True)
+    run_case(a.output/'direct-q')
+    run_case(a.output/'direct-ctrl-c',control_c=True)
+    run_case(a.output/'shift-q',shift_escape=True)
+    run_case(a.output/'shift-ctrl-c',control_c=True,shift_escape=True)
+    if sys.platform=='darwin':
+        run_case(a.output/'mac-script-q',via_script=True)
+        run_case(a.output/'mac-script-shift-q',via_script=True,shift_escape=True)
+    else:
+        print('SKIP mac-script-q reason=macos-specific-script-cli')

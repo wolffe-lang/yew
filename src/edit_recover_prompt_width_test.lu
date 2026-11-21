@@ -1,0 +1,282 @@
+//! member: false
+//! A prompt under the file-tree drawer is written across the whole width.
+//! F mode's drawer takes the left of the screen and, in sagitta, the left
+//! of the footer too, so a prompt raised while it is open (the restore
+//! prompt when a directory opens on a file with a crash journal, the quit
+//! and overwrite prompts) was cut at the drawer's edge. While a prompt is
+//! open the footer spans the grid and the drawer ends above it; once the
+//! prompt is answered the footer starts at the drawer's edge again.
+//! Port-only rows: sagitta's footer always starts at the drawer's edge
+//! (`src/edit/layout.c:681-700`).
+//!
+//! The journal is written through the text layer's own calls, as sagitta's
+//! pty harness writes one (`tests/pty/registry.c:969-1005`), never by ending
+//! an editor. The editor is built as a directory launch builds it: the
+//! journaled tab restored first, then F mode, its git spawns hooked so no
+//! child runs. Each case runs alone with `YEW_RECOVER_WIDTH_CASE=N`; all run
+//! in order without it.
+
+use edit
+use std.fs
+use term
+use text
+
+const RESTORE_TAIL: str = "[r]ecover [d]iscard [esc] open as-is"
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+// Keys through the editor's own decoder, then a frame as the loop draws it.
+fn drain(mut ed: edit.Ed) {
+    var now = ed.now_ms + 40
+    var waits = 0
+    loop {
+        var key = term.key_new()
+        if term.input_next(mut ed.input, now, mut key) {
+            edit.loop_dispatch_event(mut ed, key, now)
+            continue
+        }
+        let d = term.input_deadline(ed.input, now)
+        if d < 0 || waits == 8 {
+            break
+        }
+        waits += 1
+        now += d + 1
+    }
+    ed.now_ms = now
+    if ed.layout_dirty {
+        edit.ed_layout(mut ed)
+    }
+    edit.ed_render(mut ed)
+}
+
+fn feed(mut ed: edit.Ed, s: str) {
+    let b = bytes_of(s)
+    term.input_feed(mut ed.input, b, 0, b.len)
+    drain(mut ed)
+}
+
+// Grid row `y` as text, single-byte cells only (others read as spaces).
+fn row_text(ed: edit.Ed, y: int) -> str {
+    var out = List[byte]()
+    var x = 0
+    while x < ed.grid.cols {
+        let c = term.grid_back(ed.grid, y, x)
+        let b = if term.cell_interned(c) then 32 else term.cell_byte(c, 0)
+        (mut out).push(if b >= 32 && b < 127 then b as byte else 32 as byte)
+        x += 1
+    }
+    str_from_utf8(out) else ""
+}
+
+fn has_at(hay: str, at: int, needle: str) -> bool {
+    let h = hay.bytes()
+    let n = needle.bytes()
+    if at < 0 || at + n.len > h.len {
+        return false
+    }
+    for i in 0..n.len {
+        if h[at + i] != n[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn contains(hay: str, needle: str) -> bool {
+    let h = hay.bytes()
+    let n = needle.bytes()
+    var at = 0
+    while at + n.len <= h.len {
+        if has_at(hay, at, needle) {
+            return true
+        }
+        at += 1
+    }
+    false
+}
+
+// A scratch directory under target/ holding one.txt, and a crash journal
+// for it that inserts "RECOVERED " at its start.
+fn journaled_file() -> (str, str) {
+    var suffix = ""
+    for r in os_random(8) {
+        suffix = suffix + "{r % 10}"
+    }
+    let dir = "target/recover-width-{suffix}"
+    fs.create_dir_all(dir) else |_| { assert(false, "mkdir {dir}") }
+    let root = text.file_realpath(dir) else {
+        assert(false, "realpath {dir}")
+        dir
+    }
+    let path = "{root}/one.txt"
+    fs.write_text(path, "one\n") else |_| { assert(false, "create {path}") }
+    let (st, _, loaded) = text.file_load(path)
+    assert(st == text.LOAD_OK, "one.txt loads")
+    var meta = loaded
+    let rp = meta.realpath
+    var reg = text.journalset_new()
+    let (opened, err) = text.journal_open(mut reg, rp, mut meta)
+    var j = opened
+    assert(j.open, "the journal opens (err {err})")
+    let ins = bytes_of("RECOVERED ")
+    assert(text.journal_record(mut j, text.JOURNAL_INS, 0, ins, 0, ins.len), "the record")
+    assert(text.journal_sync(mut j), "the journal syncs")
+    text.journal_close(mut reg, mut j)
+    (root, path)
+}
+
+fn drop_dir(root: str) {
+    fs.remove_dir_all(root) else |_| {}
+}
+
+// The configured editor over the directory on a 24x80 grid. With
+// `journaled` the file's tab is restored first (raising the restore
+// prompt); with `drawer` F mode opens after it.
+fn launched(root: str, path: str, journaled: bool, drawer: bool) -> edit.Ed {
+    let runtime = fs_read_bytes("runtime/init.fl") else List[byte]()
+    assert(runtime.len != 0, "runtime readable")
+    var ed = edit.ed_new_test(runtime, "")
+    edit.git_test_spawn_set(mut ed, true)
+    ed.ws_dir = root
+    ed.grid = term.grid_new(24, 80)
+    ed.grid_ready = true
+    ed.render = term.render_new(term.caps_new(), term.env_process())
+    ed.render_ready = true
+    ed.now_ms = 1000
+    if journaled {
+        let idx = edit.tab_open(mut ed, path)
+        assert(idx >= 0, "the tab opens")
+        edit.tab_switch(mut ed, idx)
+        assert(ed.prompt == edit.PROMPT_RECOVER, "the restore prompt is up")
+    }
+    if drawer {
+        assert(edit.mode_enter(mut ed, edit.MODE_F) == edit.CMD_OK, "F mode")
+        assert(edit.fuss_active(ed), "the drawer is open")
+    }
+    edit.ed_layout(mut ed)
+    edit.ed_render(mut ed)
+    ed
+}
+
+// The drawer's width as the layout gives it.
+fn drawer_cols(ed: edit.Ed) -> int {
+    let w = edit.fuss_drawer_rect(ed).w
+    if w > ed.grid.cols then ed.grid.cols else w
+}
+
+// The footer spans the grid and its first row holds the whole restore
+// prompt: from column 0 under the drawer (F mode's footer has no chip),
+// after the mode chip without it.
+fn prompt_across(ed: edit.Ed, what: str, at_start: bool) {
+    let fr = copy ed.footer_rect
+    assert(fr.h != 0, "{what}: a footer")
+    assert(fr.x == 0 && fr.w == ed.grid.cols, "{what}: the footer spans the grid, at {fr.x}+{fr.w}")
+    let row = row_text(ed, fr.y)
+    let head = "recover unsaved changes to "
+    if at_start {
+        assert(has_at(row, 0, head), "{what}: the prompt starts the row: [{row}]")
+    } else {
+        assert(contains(row, head), "{what}: the prompt is on the row: [{row}]")
+    }
+    assert(contains(row, RESTORE_TAIL), "{what}: the prompt is whole: [{row}]")
+}
+
+// The restore prompt raised before the drawer opens: written whole.
+fn restore_prompt_spans_the_width() {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, true, true)
+    assert(drawer_cols(ed) > 0 && drawer_cols(ed) < ed.grid.cols, "a side drawer, not fullscreen")
+    prompt_across(ed, "under the drawer", true)
+    drop_dir(root)
+}
+
+// A drawer repaint alone (no footer repaint) leaves the prompt whole: the
+// drawer ends above the footer.
+fn drawer_repaint_keeps_the_prompt() {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, true, true)
+    ed.full_damage = false
+    ed.footer_dirty = false
+    ed.fuss[0].draw_dirty = true
+    edit.ed_render(mut ed)
+    prompt_across(ed, "after a drawer repaint", true)
+    let d = edit.fuss_drawer_rect(ed)
+    assert(d.y + d.h <= ed.footer_rect.y, "the drawer ends above the footer, at {d.y}+{d.h}")
+    drop_dir(root)
+}
+
+// A prompt raised while the drawer is already open: the next frame lays
+// the footer across, with no layout requested by whoever raised it.
+fn prompt_raised_under_the_open_drawer() {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, false, true)
+    let left = drawer_cols(ed)
+    assert(ed.footer_rect.x == left, "no prompt: the footer starts at the drawer's edge")
+    edit.ed_prompt(mut ed, edit.PROMPT_OVERWRITE)
+    assert(!ed.layout_dirty, "raising a prompt asks for no layout")
+    edit.ed_render(mut ed)
+    let fr = copy ed.footer_rect
+    assert(fr.x == 0 && fr.w == ed.grid.cols, "the footer spans the grid, at {fr.x}+{fr.w}")
+    let row = row_text(ed, fr.y)
+    assert(
+        has_at(row, 0, "file changed on disk - [o]verwrite [esc] cancel"),
+        "the prompt starts the row: [{row}]",
+    )
+    drop_dir(root)
+}
+
+// Once the prompt is answered the footer starts at the drawer's edge
+// again, as sagitta's does.
+fn answered_prompt_returns_the_footer() {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, true, true)
+    feed(mut ed, "d")
+    assert(ed.prompt == edit.PROMPT_NONE, "d answered the prompt")
+    assert(edit.fuss_active(ed), "the drawer stays open")
+    let left = drawer_cols(ed)
+    assert(
+        ed.footer_rect.x == left,
+        "the footer starts at the drawer's edge, at {ed.footer_rect.x}",
+    )
+    let d = edit.fuss_drawer_rect(ed)
+    assert(d.h == ed.grid.rows, "the drawer runs the grid's height again, at {d.h}")
+    drop_dir(root)
+}
+
+// No drawer: the footer spans the grid already, the prompt after the mode
+// chip (unchanged from sagitta).
+fn no_drawer_control() {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, true, false)
+    prompt_across(ed, "no drawer", false)
+    drop_dir(root)
+}
+
+fn run(i: int) {
+    match i {
+        0 => restore_prompt_spans_the_width(),
+        1 => drawer_repaint_keeps_the_prompt(),
+        2 => prompt_raised_under_the_open_drawer(),
+        3 => answered_prompt_returns_the_footer(),
+        4 => no_drawer_control(),
+        _ => return,
+    }
+    print("recover_width: case {i}: PASS")
+}
+
+fn main() {
+    let pick = env_get("YEW_RECOVER_WIDTH_CASE") else ""
+    if pick.len != 0 {
+        run(pick.to_int() else -1)
+    } else {
+        for i in 0..5 {
+            run(i)
+        }
+    }
+}
