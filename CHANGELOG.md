@@ -5,6 +5,57 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### yw25 — a diagnostics publication repaints its rows (2026-11-17)
+
+- Every publication set a full repaint. It now damages the rows the old
+  and the new diagnostics touch (gutter sign and underline) and the
+  footer. A wrapped view, a split, a panel, or another buffer in the
+  window keeps the full repaint.
+- Rows: `src/edit_lsp_diag_damage_test.lu`.
+
+### yw25 — a whole-text server's didChange waits for a pause (2026-11-17)
+
+- `wolf lsp` takes the whole text on every change, so each key sent 42 KB
+  of a 40 KB file and started one analysis, about five a second while
+  typing. A server that syncs the whole text is now sent the document at
+  once for the first edit after a pause (500 ms), then when the typing
+  has been quiet for 500 ms, and at the latest a second after the first
+  held edit. Requests, saves and closes still send first; a server that
+  takes incremental changes keeps its per-turn flush. The loop's wait ends
+  by the held edit's deadline.
+- Rows: `src/lsp_sync_debounce_test.lu` (the clocks, simulated) and
+  `tools/lsp-typing-row` (didChange per second and bytes per key).
+
+### yw25 — whole-text didChange keeps nothing (2026-11-17)
+
+- yew#137: with a language server on, yew's resident memory grew about
+  730 KB a key on a 40 KB file. The whole text of a full-sync server is
+  built, escaped into JSON, framed and copied out for the write on every
+  edit, and each of those buffers was kept to the session's end. The
+  didChange now builds its text and frame in a region freed when the call
+  ends, and the framed write stages its chunk in one buffer the job table
+  owns. A per-turn region around the loop is still refused at wolf 0.2.36
+  (E1010: `loop_turn` stores non-scalar values into the editor); what a
+  diagnostics publication's parse and store keep is the remaining growth.
+- Rows: `src/lsp_sync_alloc_test.lu` (the ledger of twenty whole-text
+  flushes, native lane) and `tools/lsp-typing-row` (yew in a pty typing
+  with `wolf lsp` behind a logging proxy: resident memory per key,
+  didChange per second and bytes per key).
+
+### Selection visibility and Shift mouse reports (2026-11-15)
+
+- Preserve visible selection on 16-color and monochrome terminals, including
+  themes whose text and selection colors coincide. Paint selection after
+  search and diagnostic backgrounds, without splitting wide glyphs.
+- Mark an armed empty selection's insertion boundary without changing its
+  byte range or copy/cut semantics.
+- Request Shift mouse reports with XTSHIFTESCAPE when enabling the mouse,
+  and reset that request in normal, suspended and fatal terminal restoration.
+  Terminal settings may still reserve Shift for local selection.
+- Add literal held selection contracts and a free, live mouse census with
+  raw event output, optional Shift-capture negotiation and tty restoration
+  tests. Other selection redesign behaviors remain held, not implemented.
+
 ### Highlighting, stage one: the syntax engine, its compiler and `yew syn` (2026-11-20)
 
 - `src/syn/` ports sagitta's `src/syn/` engine and definition compiler. A
