@@ -18,6 +18,18 @@ use util
 /// resync.
 pub const LSP_PENDING_MAX: int = 512
 
+/// yw25: the quiet a full-sync document waits after its last edit before
+/// its text is sent, in milliseconds. 500 ms is past the gap of a slow
+/// typist's keys too (2.5 keys a second are 400 ms apart), so such typing
+/// is held to the cap like a fast typist's, and a pause of half a second
+/// sends at once and the diagnostics follow the stop.
+pub const LSP_CHANGE_QUIET_MS: int = 500
+
+/// yw25: the longest a full-sync document's edits are held while keys keep
+/// coming, in milliseconds: one text a second at most however fast the
+/// typing, so a long burst is still analysed about once a second.
+pub const LSP_CHANGE_MAX_WAIT_MS: int = 1000
+
 /// One incremental change (`LspChange`, `sync.h:22-26`): the range in the
 /// pre-edit document, and the inserted text.
 pub struct LspChange {
@@ -40,6 +52,10 @@ pub struct LspDoc {
     full_sync: bool,
     insert_waiting: bool,
     pending: List[LspChange],
+    // yw25's debounce clocks (ms; `dirty_since` 0 while nothing waits).
+    edit_gen: int,
+    last_edit_ms: int,
+    dirty_since: int,
 }
 
 /// `yew_lsp_doc_init` (`sync.c:24-36`).
@@ -54,6 +70,9 @@ pub fn lsp_doc_new(buf_id: int, uri: str) -> LspDoc {
         full_sync: false,
         insert_waiting: false,
         pending: List[LspChange](),
+        edit_gen: -1,
+        last_edit_ms: -1000000,
+        dirty_since: 0,
     }
 }
 
@@ -62,6 +81,7 @@ fn clear_changes(mut doc: LspDoc) {
     (mut doc.pending).reset()
     doc.full_sync = false
     doc.insert_waiting = false
+    doc.dirty_since = 0
 }
 
 // `jsonw_textbuf` (`sync.c:76-90`): the whole document as one string.
@@ -280,6 +300,42 @@ fn w_change(mut w: JsonW, c: LspChange) {
     jsonw_obj_end(mut w)
 }
 
+/// yw25: whether a full-sync document's waiting edits are to go out at
+/// `now`: the first edit after a pause at once (diagnostics follow a
+/// keystroke that ends a pause), then only when the typing has been quiet
+/// for `LSP_CHANGE_QUIET_MS` or the edits have waited `LSP_CHANGE_MAX_WAIT_MS`.
+/// Called once a turn after the edit log is drained; false and the clocks
+/// reset when nothing waits.
+pub fn lsp_doc_change_due(mut doc: LspDoc, gen: int, now: int) -> bool {
+    if !doc.open || !doc.full_sync && doc.pending.len == 0 {
+        doc.dirty_since = 0
+        return false
+    }
+    if doc.dirty_since == 0 {
+        doc.dirty_since = if now == 0 then 1 else now
+        let paused = now - doc.last_edit_ms >= LSP_CHANGE_QUIET_MS
+        doc.last_edit_ms = now
+        doc.edit_gen = gen
+        return paused
+    }
+    if gen != doc.edit_gen {
+        doc.edit_gen = gen
+        doc.last_edit_ms = now
+    }
+    now - doc.last_edit_ms >= LSP_CHANGE_QUIET_MS || now - doc.dirty_since >= LSP_CHANGE_MAX_WAIT_MS
+}
+
+/// yw25: when the waiting edits fall due, an absolute millisecond, or -1
+/// when none wait (the loop's wait must not sleep past it).
+pub fn lsp_doc_change_deadline(doc: LspDoc) -> int {
+    if doc.dirty_since == 0 {
+        return -1
+    }
+    let quiet = doc.last_edit_ms + LSP_CHANGE_QUIET_MS
+    let cap = doc.dirty_since + LSP_CHANGE_MAX_WAIT_MS
+    if quiet < cap then quiet else cap
+}
+
 /// `yew_lsp_doc_flush` (`sync.c:288-331`): the queued changes as one
 /// didChange (the whole text when the server syncs fully or the queue
 /// fell back), the version bumped. False when nothing is queued.
@@ -290,30 +346,34 @@ pub fn lsp_doc_flush(mut rpc: RpcConn, mut doc: LspDoc, sync_kind: int, tb: text
     if doc.insert_waiting {
         util.bug("lsp.sync", "lsp didChange: insert post notification missing")
     }
-    var w = jsonw_new()
-    jsonw_obj(mut w)
-    jsonw_key(mut w, "textDocument")
-    jsonw_obj(mut w)
-    jsonw_key(mut w, "uri")
-    jsonw_cstr(mut w, doc.uri)
-    jsonw_key(mut w, "version")
-    jsonw_int(mut w, doc.version + 1)
-    jsonw_obj_end(mut w)
-    jsonw_key(mut w, "contentChanges")
-    jsonw_arr(mut w)
-    if sync_kind == 1 || doc.full_sync {
+    // yw25: the whole text, its JSON and the frame are this call's
+    // temporaries: a region frees them when it ends, not at the session's.
+    region flush {
+        var w = jsonw_new()
         jsonw_obj(mut w)
-        jsonw_key(mut w, "text")
-        w_text(mut w, tb)
+        jsonw_key(mut w, "textDocument")
+        jsonw_obj(mut w)
+        jsonw_key(mut w, "uri")
+        jsonw_cstr(mut w, doc.uri)
+        jsonw_key(mut w, "version")
+        jsonw_int(mut w, doc.version + 1)
         jsonw_obj_end(mut w)
-    } else {
-        for c in doc.pending {
-            w_change(mut w, c)
+        jsonw_key(mut w, "contentChanges")
+        jsonw_arr(mut w)
+        if sync_kind == 1 || doc.full_sync {
+            jsonw_obj(mut w)
+            jsonw_key(mut w, "text")
+            w_text(mut w, tb)
+            jsonw_obj_end(mut w)
+        } else {
+            for c in doc.pending {
+                w_change(mut w, c)
+            }
         }
+        jsonw_arr_end(mut w)
+        jsonw_obj_end(mut w)
+        rpc_notify(mut rpc, "textDocument/didChange", w.out)
     }
-    jsonw_arr_end(mut w)
-    jsonw_obj_end(mut w)
-    rpc_notify(mut rpc, "textDocument/didChange", w.out)
     doc.version += 1
     doc.sent_gen = tb.gen
     clear_changes(mut doc)

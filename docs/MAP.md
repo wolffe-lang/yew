@@ -12,7 +12,7 @@ yw02–yw16.
 
 ## 1. The idiom: how wolf stands in for C
 
-Settled by yw00 and binding on later lanes (CLAUDE.md), each measured
+Settled by yw00 and binding on later work (CONTRIBUTING.md), each measured
 on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 
 | C yew | the port | why |
@@ -1253,6 +1253,19 @@ own. Any changed C golden is separately listed and pinned in
   split and one-byte feeds, including modified arrows and malformed
   Linux sequences. This is an input alias, not a new binding.
 
+- **Selection visibility and Shift mouse capture** (`src/edit/draw.lu`,
+  `src/term/input.lu`, `src/term/tty.lu`): 16-color and monochrome selection
+  have a reverse-video floor; equal styles receive visible emphasis; empty
+  ranges mark their boundary without selecting bytes. Selection follows
+  search/diagnostic backgrounds and precedes secondary cursors. The input
+  setup requests XTSHIFTESCAPE and all shared restore blobs reset it.
+  Rows: `src/edit_selection_visibility_test.lu` and the rendering cases in
+  `tests/selection/run.py`. The other selection contracts remain literal
+  reds until their implementation stages; the observer and physical-census
+  driver have independent tests. The protocol is documented in
+  [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html);
+  application overrides can be forbidden by terminal configuration.
+
 - **`ed.keys`, the keys help** (yw15, `src/edit/keyshelp.lu`): every
   mode's bindings in the list picker (`PICK_HOST_KEYS`), each row its
   mode, keys, command, help and, for a binding the port refuses, the
@@ -1305,3 +1318,17 @@ own. Any changed C golden is separately listed and pinned in
     skipped at restore without being logged as dropped (C logs it), and
     `active_tab` names a written record past the record cap too. The
     state file stays C's byte for byte below that cap.
+
+- **An Insert run's undo group stays on its buffer** (yew#128,
+  `src/edit/ed.lu`, `invoke.lu`). A plain click on another tab or pane
+  moves focus without leaving Insert (`mouse.lu`'s `click_tab` and
+  `pane_click`). C keeps one editor-wide `insert_txn` flag and closes the
+  group through the focused window (`ed.c:1666-1676`), so after such a
+  click the next keys land outside any group and Esc ends a group the
+  clicked buffer never opened: `undo: unbalanced end`, an internal error.
+  The port records the buffer the run began on (`insert_txn_buf`), closes
+  the run there before a command edits another buffer, and ends it on
+  that buffer at every barrier; each buffer's typing is one undo step on
+  that buffer. Rows: `src/edit_insert_txn_focus_test.lu` (tab and pane
+  clicks in the legacy and kitty encodings, keyed tab moves as controls)
+  and `tools/editing-row`'s `insert-tab-click-*` and `insert-pane-click-*`.
