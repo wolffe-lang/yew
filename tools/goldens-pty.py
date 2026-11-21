@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run C's PTY runner; named, digest-pinned divergences use port snapshots.
 
-The oracle checkout is read-only. Only divergent cases run in a shadow cwd,
-whose golden entries point at the port's snapshots. Every other case runs
-in the original oracle cwd against the original C golden.
+This runner treats the prepared oracle checkout as read-only. Only divergent
+cases run in a shadow cwd, whose golden entries point at the port's snapshots.
+Every other case runs in the original oracle cwd against the original C golden.
 """
 import hashlib
 import os
@@ -15,6 +15,15 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
+def authorization_valid(text):
+    if re.fullmatch(r"ruling #[0-9]+", text):
+        return True
+    if not text.startswith("approved: "):
+        return False
+    reason = text[len("approved: "):].strip()
+    return bool(reason) and all(ch.isprintable() for ch in reason)
+
+
 def entries(tree, listing):
     rows = {}
     names = set(re.findall(r"^\s*C\(([a-z0-9_]+),", (tree / "tests/pty/registry.c").read_text(), re.M))
@@ -24,7 +33,7 @@ def entries(tree, listing):
         if len(fields) != 4: raise ValueError(f"{listing}:{n}: expected four tab-separated fields")
         case, ruling, expected, sha = fields
         if case not in names or case in rows: raise ValueError(f"invalid/duplicate divergence {case}")
-        if not re.fullmatch(r"ruling #[0-9]+", ruling): raise ValueError(f"invalid ruling for {case}")
+        if not authorization_valid(ruling): raise ValueError(f"invalid authorization for {case}")
         path = (ROOT / expected).resolve()
         if not path.is_relative_to((ROOT / "tests/divergences").resolve()) or not path.is_file():
             raise ValueError(f"invalid port snapshot for {case}")

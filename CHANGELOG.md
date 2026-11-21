@@ -5,6 +5,20 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Selection visibility and Shift mouse reports (2026-11-15)
+
+- Preserve visible selection on 16-color and monochrome terminals, including
+  themes whose text and selection colors coincide. Paint selection after
+  search and diagnostic backgrounds, without splitting wide glyphs.
+- Mark an armed empty selection's insertion boundary without changing its
+  byte range or copy/cut semantics.
+- Request Shift mouse reports with XTSHIFTESCAPE when enabling the mouse,
+  and reset that request in normal, suspended and fatal terminal restoration.
+  Terminal settings may still reserve Shift for local selection.
+- Add literal held selection contracts and a free, live mouse census with
+  raw event output, optional Shift-capture negotiation and tty restoration
+  tests. Other selection redesign behaviors remain held, not implemented.
+
 ### Highlighting, stage one: the syntax engine, its compiler and `yew syn` (2026-11-20)
 
 - `src/syn/` ports sagitta's `src/syn/` engine and definition compiler. A
