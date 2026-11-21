@@ -12,7 +12,7 @@ yw02–yw16.
 
 ## 1. The idiom: how wolf stands in for C
 
-Settled by yw00 and binding on later lanes (CLAUDE.md), each measured
+Settled by yw00 and binding on later work (CONTRIBUTING.md), each measured
 on wolf 0.2.32 (`notes/yw00-the-map.md` §4 has the probes):
 
 | C yew | the port | why |
@@ -1253,6 +1253,19 @@ own. Any changed C golden is separately listed and pinned in
   split and one-byte feeds, including modified arrows and malformed
   Linux sequences. This is an input alias, not a new binding.
 
+- **Selection visibility and Shift mouse capture** (`src/edit/draw.lu`,
+  `src/term/input.lu`, `src/term/tty.lu`): 16-color and monochrome selection
+  have a reverse-video floor; equal styles receive visible emphasis; empty
+  ranges mark their boundary without selecting bytes. Selection follows
+  search/diagnostic backgrounds and precedes secondary cursors. The input
+  setup requests XTSHIFTESCAPE and all shared restore blobs reset it.
+  Rows: `src/edit_selection_visibility_test.lu` and the rendering cases in
+  `tests/selection/run.py`. The other selection contracts remain literal
+  reds until their implementation stages; the observer and physical-census
+  driver have independent tests. The protocol is documented in
+  [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html);
+  application overrides can be forbidden by terminal configuration.
+
 - **`ed.keys`, the keys help** (yw15, `src/edit/keyshelp.lu`): every
   mode's bindings in the list picker (`PICK_HOST_KEYS`), each row its
   mode, keys, command, help and, for a binding the port refuses, the
@@ -1305,3 +1318,49 @@ own. Any changed C golden is separately listed and pinned in
     skipped at restore without being logged as dropped (C logs it), and
     `active_tab` names a written record past the record cap too. The
     state file stays C's byte for byte below that cap.
+
+- **An Insert run's undo group stays on its buffer** (yew#128,
+  `src/edit/ed.lu`, `invoke.lu`). A plain click on another tab or pane
+  moves focus without leaving Insert (`mouse.lu`'s `click_tab` and
+  `pane_click`). C keeps one editor-wide `insert_txn` flag and closes the
+  group through the focused window (`ed.c:1666-1676`), so after such a
+  click the next keys land outside any group and Esc ends a group the
+  clicked buffer never opened: `undo: unbalanced end`, an internal error.
+  The port records the buffer the run began on (`insert_txn_buf`), closes
+  the run there before a command edits another buffer, and ends it on
+  that buffer at every barrier; each buffer's typing is one undo step on
+  that buffer. Rows: `src/edit_insert_txn_focus_test.lu` (tab and pane
+  clicks in the legacy and kitty encodings, keyed tab moves as controls)
+  and `tools/editing-row`'s `insert-tab-click-*` and `insert-pane-click-*`.
+
+- **Previous generations of the workspace state** (yew#129,
+  `src/edit/state_save.lu`). A writing session copies the state file it
+  finds when it opens to `state.fl.prev`, after moving the older copies
+  down to `.prev.2` and `.prev.3` (`STATE_PREV_KEEP`). C keeps no copy
+  (`state_save.c:56-325`). Every copy goes through `text.file_write_atomic`
+  and the state file is never moved, so no step leaves the workspace
+  without its state; a reader, a clean session and a workspace with no
+  state keep nothing. The copies are taken outside the save, so the save's
+  own write order and its kill points are C's. Rows:
+  `src/edit_ws_state_prev_test.lu`.
+
+- **The first Esc under the file-tree drawer keeps the restore prompt**
+  (`src/edit/input.lu`). A directory launch restores its tabs, which can
+  raise the restore prompt for a journaled file, and then opens F mode's
+  drawer (`driver.lu`), which narrows the footer the prompt is written in.
+  C's prompt takes every key first (`ed.c:2211-2298`), so the first Esc
+  answered it unread ("open as-is"). In the port, an Esc while the restore
+  prompt is open and F mode's drawer is active goes to F mode
+  (`ed.git.mode.leave`), which closes the drawer, and the prompt stays open;
+  the next Esc, `r` and `d` answer it as C's do. Without the drawer nothing
+  changes (C's `notepad_recover_*` goldens). Rows:
+  `src/edit_recover_prompt_drawer_test.lu`.
+
+- **A prompt beside the file-tree drawer is written across the whole width**
+  (`src/edit/layout.lu`, `src/edit/fussdraw.lu`, `src/edit/draw.lu`).
+  sagitta's footer starts at the drawer's edge whenever the drawer is open
+  (`layout.c:681-700`), so a prompt raised beside it is cut. Here `ed_layout`
+  lays the footer across the grid while a prompt is open, `fuss_drawer_rect`
+  ends the drawer above it, and `ed_render` lays out again when the footer's
+  span no longer matches the prompt state (`layout_footer_stale`), since a
+  prompt opens and closes in many places and none of them asks for a layout.

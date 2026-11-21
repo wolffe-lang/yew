@@ -1,0 +1,197 @@
+//! member: false
+//! The restore prompt under the file-tree drawer. Opening a directory with
+//! a crash journal for its active file raises the restore prompt while F
+//! mode's drawer is open, and the drawer narrows the footer the prompt is
+//! written in. The first Esc goes to F mode, which closes the drawer, and
+//! leaves the prompt open; the next Esc answers it as before ("open as-is").
+//! Port-only rows: sagitta's prompt takes every key first
+//! (`src/edit/ed.c:2211-2298`).
+//!
+//! The journal is written through the text layer's own calls, as sagitta's
+//! pty harness writes one (`tests/pty/registry.c:969-1005`), never by ending
+//! an editor. The editor is built as a directory launch builds it: the
+//! journaled tab restored first, then F mode (`driver.lu`'s start), its git
+//! spawns hooked so no child runs. Keys are raw terminal bytes fed through
+//! the editor's own decoder, in the legacy encoding and the kitty keyboard
+//! protocol's. Each case runs alone with `YEW_RECOVER_DRAWER_CASE=N`; all run
+//! in order without it.
+
+use edit
+use std.fs
+use term
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+fn drain(mut ed: edit.Ed) {
+    var now = ed.now_ms + 40
+    var waits = 0
+    loop {
+        var key = term.key_new()
+        if term.input_next(mut ed.input, now, mut key) {
+            edit.loop_dispatch_event(mut ed, key, now)
+            continue
+        }
+        let d = term.input_deadline(ed.input, now)
+        if d < 0 || waits == 8 {
+            break
+        }
+        waits += 1
+        now += d + 1
+    }
+    ed.now_ms = now
+    if ed.layout_dirty {
+        edit.ed_layout(mut ed)
+    }
+    edit.ed_render(mut ed)
+}
+
+fn feed(mut ed: edit.Ed, s: str) {
+    let b = bytes_of(s)
+    term.input_feed(mut ed.input, b, 0, b.len)
+    drain(mut ed)
+}
+
+fn esc(mut ed: edit.Ed, kitty: bool) {
+    feed(mut ed, if kitty then "\x1b[27u" else "\x1b")
+}
+
+// A scratch directory under target/ holding one.txt, and a crash journal
+// for it that inserts "RECOVERED " at its start.
+fn journaled_file() -> (str, str) {
+    var suffix = ""
+    for r in os_random(8) {
+        suffix = suffix + "{r % 10}"
+    }
+    let dir = "target/recover-drawer-{suffix}"
+    fs.create_dir_all(dir) else |_| { assert(false, "mkdir {dir}") }
+    let root = text.file_realpath(dir) else {
+        assert(false, "realpath {dir}")
+        dir
+    }
+    let path = "{root}/one.txt"
+    fs.write_text(path, "one\n") else |_| { assert(false, "create {path}") }
+    let (st, _, loaded) = text.file_load(path)
+    assert(st == text.LOAD_OK, "one.txt loads")
+    var meta = loaded
+    let rp = meta.realpath
+    var reg = text.journalset_new()
+    let (opened, err) = text.journal_open(mut reg, rp, mut meta)
+    var j = opened
+    assert(j.open, "the journal opens (err {err})")
+    let ins = bytes_of("RECOVERED ")
+    assert(text.journal_record(mut j, text.JOURNAL_INS, 0, ins, 0, ins.len), "the record")
+    assert(text.journal_sync(mut j), "the journal syncs")
+    text.journal_close(mut reg, mut j)
+    (root, path)
+}
+
+fn drop_dir(root: str) {
+    fs.remove_dir_all(root) else |_| {}
+}
+
+// The configured editor over the directory, the journaled file's tab
+// restored (raising the prompt), then F mode, on a 24x80 grid.
+fn launched(root: str, path: str, drawer: bool) -> edit.Ed {
+    let runtime = fs_read_bytes("runtime/init.fl") else List[byte]()
+    assert(runtime.len != 0, "runtime readable")
+    var ed = edit.ed_new_test(runtime, "")
+    edit.git_test_spawn_set(mut ed, true)
+    ed.ws_dir = root
+    ed.grid = term.grid_new(24, 80)
+    ed.grid_ready = true
+    ed.render = term.render_new(term.caps_new(), term.env_process())
+    ed.render_ready = true
+    ed.now_ms = 1000
+    let idx = edit.tab_open(mut ed, path)
+    assert(idx >= 0, "the tab opens")
+    edit.tab_switch(mut ed, idx)
+    assert(ed.prompt == edit.PROMPT_RECOVER, "the restore prompt is up")
+    if drawer {
+        assert(edit.mode_enter(mut ed, edit.MODE_F) == edit.CMD_OK, "F mode")
+        assert(edit.fuss_active(ed), "the drawer is open")
+    }
+    edit.ed_layout(mut ed)
+    edit.ed_render(mut ed)
+    ed
+}
+
+fn contents(ed: edit.Ed, want: str, what: str) {
+    let bi = ed.wins[ed.win].buf
+    let got = text.textbuf_bytes(ed.bufs[bi].ec.tb)
+    let w = want.bytes()
+    let shown = str_from_utf8(got) else "<invalid>"
+    assert(got.len == w.len, "{what}: expected {want}, got {shown}")
+    for i in 0..got.len {
+        assert(got[i] == w[i], "{what}: expected {want}, got {shown}")
+    }
+}
+
+// The first Esc closes the drawer and keeps the prompt; `r` then recovers.
+fn first_esc_goes_to_the_drawer(kitty: bool) {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, true)
+    esc(mut ed, kitty)
+    assert(!edit.fuss_active(ed), "the first Esc closed the drawer")
+    assert(ed.mode != edit.MODE_F, "F mode is left")
+    assert(ed.prompt == edit.PROMPT_RECOVER, "the prompt is still open")
+    assert(ed.bufs[ed.wins[ed.win].buf].recovery_pending, "the recovery is still pending")
+    feed(mut ed, "r")
+    assert(ed.prompt == edit.PROMPT_NONE, "r answered it")
+    contents(ed, "RECOVERED one\n", "the recovered text")
+    drop_dir(root)
+}
+
+// With the drawer closed, the next Esc answers the prompt as sagitta's
+// does: the file opens as it is on disk.
+fn second_esc_opens_as_is(kitty: bool) {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, true)
+    esc(mut ed, kitty)
+    assert(ed.prompt == edit.PROMPT_RECOVER, "the first Esc kept the prompt")
+    esc(mut ed, kitty)
+    assert(ed.prompt == edit.PROMPT_NONE, "the second Esc answered it")
+    assert(!ed.bufs[ed.wins[ed.win].buf].recovery_pending, "opened as-is")
+    contents(ed, "one\n", "the file as it is on disk")
+    drop_dir(root)
+}
+
+// No drawer: the first Esc answers the prompt, unchanged from sagitta.
+fn no_drawer_esc_opens_as_is() {
+    let (root, path) = journaled_file()
+    var ed = launched(root, path, false)
+    esc(mut ed, false)
+    assert(ed.prompt == edit.PROMPT_NONE, "Esc answered the prompt")
+    assert(!ed.bufs[ed.wins[ed.win].buf].recovery_pending, "opened as-is")
+    contents(ed, "one\n", "the file as it is on disk")
+    drop_dir(root)
+}
+
+fn run(i: int) {
+    match i {
+        0 => first_esc_goes_to_the_drawer(false),
+        1 => first_esc_goes_to_the_drawer(true),
+        2 => second_esc_opens_as_is(false),
+        3 => second_esc_opens_as_is(true),
+        4 => no_drawer_esc_opens_as_is(),
+        _ => return,
+    }
+    print("recover_drawer: case {i}: PASS")
+}
+
+fn main() {
+    let pick = env_get("YEW_RECOVER_DRAWER_CASE") else ""
+    if pick.len != 0 {
+        run(pick.to_int() else -1)
+    } else {
+        for i in 0..5 {
+            run(i)
+        }
+    }
+}
