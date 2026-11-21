@@ -5,6 +5,19 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### The workspace state keeps three previous generations (2026-11-21)
+
+- A writing session copies the state file it finds when it opens to
+  `state.fl.prev`, after moving the older copies down to `state.fl.prev.2`
+  and `state.fl.prev.3`. A save that lost tabs (#129) can then be undone by
+  hand from a copy, for three sessions after it. Each copy is written with the
+  same atomic save as the state; the state file itself is never moved. A
+  reader session, a clean session and a workspace with no state yet keep
+  nothing.
+- `src/edit_ws_state_prev_test.lu` holds the copy taken at open and kept
+  across later saves, the three generations, and the reader and first-session
+  cases.
+
 ### Insert's undo group stays on its buffer across a click (2026-11-21)
 
 - A plain click on another tab or pane moves focus without leaving Insert.
