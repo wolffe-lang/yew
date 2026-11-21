@@ -5,6 +5,15 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### CI runs the editing row on Linux and macOS (2026-11-21)
+
+- `tools/editing-row` types real key and mouse bytes into the editor through
+  a pty, each key-sensitive case in the legacy encoding and the kitty
+  keyboard protocol's. It ran only in local records, on Linux. The oracle
+  job's port legs now run its selftest and every case against the release
+  editor, on Linux and macOS, so a red case fails the pull request's run by
+  name.
+
 ### A prompt beside the file-tree drawer is written across the whole width (2026-11-21)
 
 - While F mode's drawer is open the footer starts at the drawer's edge, so a
