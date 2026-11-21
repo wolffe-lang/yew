@@ -1305,3 +1305,15 @@ own. Any changed C golden is separately listed and pinned in
     skipped at restore without being logged as dropped (C logs it), and
     `active_tab` names a written record past the record cap too. The
     state file stays C's byte for byte below that cap.
+
+- **The first Esc under the file-tree drawer keeps the restore prompt**
+  (`src/edit/input.lu`). A directory launch restores its tabs, which can
+  raise the restore prompt for a journaled file, and then opens F mode's
+  drawer (`driver.lu`), which narrows the footer the prompt is written in.
+  C's prompt takes every key first (`ed.c:2211-2298`), so the first Esc
+  answered it unread ("open as-is"). In the port, an Esc while the restore
+  prompt is open and F mode's drawer is active goes to F mode
+  (`ed.git.mode.leave`), which closes the drawer, and the prompt stays open;
+  the next Esc, `r` and `d` answer it as C's do. Without the drawer nothing
+  changes (C's `notepad_recover_*` goldens). Rows:
+  `src/edit_recover_prompt_drawer_test.lu`.
