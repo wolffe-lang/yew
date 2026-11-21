@@ -56,6 +56,44 @@ The format follows Keep a Changelog; the port has no release yet.
   raw event output, optional Shift-capture negotiation and tty restoration
   tests. Other selection redesign behaviors remain held, not implemented.
 
+### Highlighting, stage one: the syntax engine, its compiler and `yew syn` (2026-11-20)
+
+- `src/syn/` ports sagitta's `src/syn/` engine and definition compiler. A
+  syntax definition is literal Fletch data, parsed without running Fletch and
+  compiled to ordered context and rule tables with first-byte masks, capture
+  overlays, aux matchers (heredoc delimiters, fence runs, indentation) and
+  embedding bridges. For the seven first-stage definitions the compiled tables
+  are byte for byte C's (`yew syn dump FILE --tables`, compared in CI).
+- The line interpreter keeps one interned 84-byte state per line start (ids in
+  four bytes each), caps a line at 64 KiB, 4,096 spans and a bounded number of
+  rule attempts, and degrades to plain text by name when a cap is reached. An
+  edit re-highlights from the edited line only until the retained states agree
+  again; settling runs on a time budget, and a span cache serves an unchanged
+  screen without re-highlighting.
+- The registry detects a file's language as C does (exact name, glob, the
+  longest extension without case, the shebang's interpreter through `env`,
+  then a first-line pattern; priority, then name, breaks ties) and discovers
+  user definitions under the configuration directory's `syntax/`, which
+  `--clean` bypasses. The matcher tries C's exact fast paths (identifiers,
+  word and finite literal sets, JSON keys) before the regex machine, each
+  held equal to it by a test.
+- `src/syncli/` ports `src/syncli.c`: `yew syn list`, `compile`, `check` (with
+  its report of embed selectors that name no definition and of embedding
+  chains past the 16-frame cap) and `dump FILE --tables|--spans INPUT`. Every
+  such command line prints and exits as C yew's does. The on-disk cache
+  (`yew syn cache`) and the `--coverage` and `--embed` reports refuse by name
+  until the full language pack.
+- sagitta's syn unit tests are ported one for one where they need only the
+  first-stage definitions; the cache, the structural provider, the
+  48-definition pack and the stage-two modes' tests are named for later.
+- `tools/check-syntax-cohort` runs the first cohort: 132 of the pin's 432
+  syntax goldens (the seven modes' base fixtures, the eight shell embeddings
+  and the nine Markdown fences whose guests are in the cohort), each dumped
+  twice and compared byte for byte; the other 300 are named in
+  `tools/syntax-cohorts.tsv`. The oracle job runs it and the tables check.
+- `tools/gen-syn-registry` generates the 48-language registry and detection
+  indexes from the pinned `langs_gen.c`.
+
 ### goldens: a script case the runner never started is run once more (2026-11-19)
 
 - The oracle's script suite went red on macOS with `FAIL 07_functions (exit

@@ -1,0 +1,316 @@
+//! member: false
+//! Ports sagitta tests/unit/test_syn_embed_runtime.c at 9ace98c2, one case
+//! per portable C test in its order: qualified guest entry and exit at run
+//! time, fallback for an unknown guest, lost-frame debt at the depth cap,
+//! inline-root and line-continuation ends. Not ported here:
+//! merged_first_mask_covers_all_bytes and its mutation twin
+//! merged_mask_mutation_fails walk all 48 shipped definitions (the full
+//! language pack); coverage_uses_resident_definition_and_site needs the
+//! css definition and the coverage hook. A C stack trace is the engine's
+//! explicit per-byte trace of one interpreted line.
+
+use syn
+use text
+
+const ROOT_LANGUAGE: int = 49
+
+struct Runtime {
+    pool: syn.SynPool,
+    engine: syn.SynEngine,
+}
+
+fn bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() { (mut out).push(b) }
+    out
+}
+
+// runtime_open: a strict compile, pooled under a fresh language id after
+// the builtins (C's language_id for a new name), with the builtin name
+// snapshot in place.
+fn runtime_open(source: str) -> Runtime {
+    var c = syn.syn_compile("embed-runtime.fl", source.bytes())
+    assert(c.valid && c.diagnostics.nerrors == 0, "the runtime definition compiles")
+    assert(c.diagnostics.nwarnings == 0, "without warnings")
+    let reg = syn.syn_registry_new()
+    var pool = syn.syn_pool_new()
+    syn.syn_registry_seed(reg, mut pool)
+    let root = syn.syn_pool_add(mut pool, take c.definition, ROOT_LANGUAGE)
+    let engine = syn.syn_engine_new(pool, root)
+    Runtime { pool: pool, engine: engine }
+}
+
+fn attr_at(out: syn.SynSpans, at: int) -> int {
+    for i in 0..out.n {
+        let lo = syn.syn_span_start(out, i)
+        if lo <= at && at < lo + syn.syn_span_len(out, i) then return syn.syn_span_attr(out, i)
+    }
+    255
+}
+
+fn attr(name: str) -> int {
+    syn.syn_attr_id(name) else -1
+}
+
+fn state(r: Runtime, id: int) -> syn.SynState {
+    let s = syn.syn_state_get(r.engine.states, id) else {
+        assert(false, "the state exists")
+        return syn.syn_state_root(0, 0)
+    }
+    s
+}
+
+fn line(mut r: Runtime, entry: int, input: str, mut out: syn.SynSpans) {
+    syn.syn_line(mut r.engine, mut r.pool, entry, input.bytes(), input.len, mut out, false)
+}
+
+// The pre-EOL state at byte `at` of one traced interpretation.
+fn trace_at(mut r: Runtime, entry: int, input: str, at: int) -> syn.SynState {
+    var out = syn.syn_spans_new(syn.SYN_MAX_SPANS)
+    syn.syn_line(mut r.engine, mut r.pool, entry, input.bytes(), input.len, mut out, true)
+    var s = syn.syn_state_root(0, 0)
+    assert(syn.syn_engine_trace_at(mut s, r.engine, at), "the trace covers the position")
+    s
+}
+
+fn log_path() -> str {
+    let dir = env_get("TMPDIR") else "/tmp"
+    "{dir}/yew-syn-embed-runtime-{os_pid()}.log"
+}
+
+fn warn_lines(path: str) -> (int, bool) {
+    let log = fs_read_bytes(path) else { return (0, false) }
+    let tag = bytes(" warn: ")
+    let want = bytes("not-installed' is unavailable")
+    var count = 0
+    var found = false
+    var start = 0
+    while start < log.len {
+        var end = start
+        while end < log.len && log[end] as int != 10 { end += 1 }
+        if find(log, start, end, tag) >= 0 {
+            count += 1
+            if find(log, start, end, want) >= 0 {
+                found = true
+            }
+        }
+        start = end + 1
+    }
+    (count, found)
+}
+
+fn find(hay: List[byte], lo: int, hi: int, needle: List[byte]) -> int {
+    var i = lo
+    while i + needle.len <= hi {
+        var k = 0
+        while k < needle.len && hay[i + k] == needle[k] { k += 1 }
+        if k == needle.len then return i
+        i += 1
+    }
+    -1
+}
+
+// test_syn_embed_runtime_self_inline_exit_precedes_guest
+fn self_inline_exit_precedes_guest() {
+    var r = runtime_open(
+        "{{syntax:1,language:{{name:\"runtime-self\"}},contexts:{{main:{{rules:[{{match:\"BEGIN\",push:\"bridge\",embed:{{lang:\"@self\",end:\"inline\",fallback:\"code\"}}}},{{match:\"x\",attr:\"keyword\"}}]}},bridge:{{default:\"comment\",rules:[{{match:\"END\",attr:\"punct\",pop:1,end:true}}]}}}}}}",
+    )
+    var out = syn.syn_spans_new(32)
+    line(mut r, syn.SYN_STATE_ROOT, "BEGINxENDz", mut out)
+    let exit = state(r, out.exit_state)
+    assert(out.exit_state == syn.SYN_STATE_ROOT, "the inline end returns to ROOT")
+    assert(syn.syn_state_depth(exit) == 1 && syn.syn_state_ndef(exit) == 1, "balanced")
+    assert(attr_at(out, 5) == attr("keyword"), "the guest styles its own keyword")
+    assert(attr_at(out, 6) == attr("punct"), "the host's end precedes the guest")
+}
+
+// test_syn_embed_runtime_deferred_self_enters_at_eol
+fn deferred_self_enters_at_eol() {
+    var r = runtime_open(
+        "{{syntax:1,language:{{name:\"runtime-defer\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"@self\",end:\"line\",defer:true,fallback:\"code\"}}}},{{match:\"x\",attr:\"keyword\"}}]}},bridge:{{default:\"comment\",rules:[{{match:\"END\",attr:\"punct\",pop:1,end:true}}]}}}}}}",
+    )
+    var out = syn.syn_spans_new(16)
+    line(mut r, syn.SYN_STATE_ROOT, "OPEN", mut out)
+    let open = state(r, out.exit_state)
+    assert(
+        syn.syn_state_depth(open) == 3 && syn.syn_state_ndef(open) == 2,
+        "the deferred guest is entered at EOL",
+    )
+    assert(
+        syn.syn_state_frame_flags(open, 1) == syn.SYN_FR_BRIDGE,
+        "the host frame is a plain bridge",
+    )
+    let entered = out.exit_state
+    line(mut r, entered, "END", mut out)
+    let closed = state(r, out.exit_state)
+    assert(out.exit_state == syn.SYN_STATE_ROOT, "the end returns to ROOT")
+    assert(syn.syn_state_depth(closed) == 1 && syn.syn_state_ndef(closed) == 1, "balanced")
+    assert(syn.syn_state_aux(closed, 1) == 0, "the guest's aux level is cleared")
+}
+
+// test_syn_embed_runtime_unknown_uses_fallback_and_balances
+fn unknown_uses_fallback_and_balances() {
+    let path = log_path()
+    fs_write_bytes(path, List[byte]()) else {
+        assert(false, "the log capture file is writable")
+        return
+    }
+    env_set("YEW_LOG", path) else |_| {}
+    var r = runtime_open(
+        "{{syntax:1,language:{{name:\"runtime-unknown\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"not-installed\",end:\"inline\",fallback:\"code\"}}}}]}},bridge:{{default:\"comment\",rules:[{{match:\"END\",attr:\"punct\",pop:1,end:true}}]}}}}}}",
+    )
+    var out = syn.syn_spans_new(16)
+    line(mut r, syn.SYN_STATE_ROOT, "OPENbodyEND", mut out)
+    let (quiet, _) = warn_lines(path)
+    assert(quiet == 0, "interpreting a line logs nothing")
+    let exit = state(r, out.exit_state)
+    assert(out.exit_state == syn.SYN_STATE_ROOT, "balanced to ROOT")
+    assert(attr_at(out, 4) == attr("code"), "the body takes the fallback")
+    assert(syn.syn_state_depth(exit) == 1 && syn.syn_state_ndef(exit) == 1, "no guest frame")
+    assert(syn.syn_state_flags(exit) & syn.SYN_F_EMBED_PEND == 0, "an unknown guest is not queued")
+    let tb = text.textbuf_from_str("OPENbodyEND\nOPENbodyEND\n")
+    var buffer = syn.syn_buffer_new_at(tb, r.engine.generation, 0)
+    let report = syn.syn_settle(mut buffer, mut r.engine, mut r.pool, tb, 0, 2, 9223372036854775807)
+    assert(report.fixpoint, "settled")
+    let (count, named) = warn_lines(path)
+    assert(count == 1, "the buffer warns once")
+    assert(named, "naming the unavailable language")
+    env_set("YEW_LOG", "/dev/null") else |_| {}
+    fs_remove(path) else |_| {}
+}
+
+// test_syn_embed_runtime_line_host_eol_returns_after_guest
+fn line_host_eol_returns_after_guest() {
+    var r = runtime_open(
+        "{{syntax:1,language:{{name:\"runtime-line\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"@self\",end:\"line\",fallback:\"code\"}}}}]}},bridge:{{at_eol:\"pop\",rules:[]}}}}}}",
+    )
+    var out = syn.syn_spans_new(16)
+    line(mut r, syn.SYN_STATE_ROOT, "OPENrecipe", mut out)
+    let exit = state(r, out.exit_state)
+    assert(out.exit_state == syn.SYN_STATE_ROOT, "the line host returns at EOL")
+    assert(syn.syn_state_depth(exit) == 1 && syn.syn_state_ndef(exit) == 1, "balanced")
+}
+
+// test_syn_embed_runtime_zero_headroom_records_protected_lost_debt
+fn zero_headroom_records_protected_lost_debt() {
+    var r = runtime_open(
+        "{{syntax:1,language:{{name:\"runtime-full\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"@self\",end:\"inline\",fallback:\"code\"}}}},{{match:\"POP\",pop:1}}]}},bridge:{{rules:[{{match:\"END\",pop:1,end:true}}]}}}}}}",
+    )
+    var full = syn.syn_state_root(0, 0)
+    syn.syn_state_set_depths(mut full, syn.SYN_DEPTH_MAX, 1)
+    for i in 0..syn.SYN_DEPTH_MAX { syn.syn_state_set_frame(mut full, i, 0, 0, 0) }
+    let entry = syn.syn_state_intern(mut r.engine.states, full)
+    let opened = trace_at(mut r, entry, "OPENPOP", 4)
+    assert(
+        syn.syn_state_depth(opened) == syn.SYN_DEPTH_MAX,
+        "no headroom: the depth stays at the cap",
+    )
+    assert(syn.syn_state_lost(opened) == 2, "both refused frames are recorded as debt")
+    assert(syn.syn_state_flags(opened) & syn.SYN_F_EMBED_ORPHAN != 0, "the guest is an orphan")
+    let popped = trace_at(mut r, entry, "OPENPOP", 7)
+    assert(
+        syn.syn_state_depth(popped) == syn.SYN_DEPTH_MAX - 1,
+        "the pop beneath the debt removes a real frame",
+    )
+    assert(syn.syn_state_lost(popped) == 2, "the debt is protected")
+    var out = syn.syn_spans_new(8)
+    line(mut r, entry, "OPENPOP", mut out)
+    let exit = state(r, out.exit_state)
+    assert(syn.syn_state_depth(exit) == syn.SYN_DEPTH_MAX - 1, "the exit keeps the real pop")
+    assert(syn.syn_state_lost(exit) == 0, "EOL discards the guest's debt")
+    assert(
+        syn.syn_state_flags(exit) & (syn.SYN_F_EMBED_LOST | syn.SYN_F_EMBED_ORPHAN) == 0,
+        "and its embed flags",
+    )
+    let tb = text.textbuf_from_str("OPEN\n")
+    var buffer = syn.syn_buffer_new_at(tb, r.engine.generation, 0)
+    syn.syn_ids_set(mut buffer.lines.entry, 0, entry)
+    buffer.lines.settled_to = 0
+    buffer.lines.wave = 0
+    let report = syn.syn_settle(mut buffer, mut r.engine, mut r.pool, tb, 0, 1, 9223372036854775807)
+    assert(report.fixpoint, "settled")
+    assert(buffer.degraded, "a refused guest degrades the buffer")
+    assert(buffer.refused_lang != 0, "and is recorded")
+    let status = syn.syn_buffer_status(buffer, r.engine, r.pool, 1)
+    assert(status.contains("degraded=yes"), "the status says degraded")
+    assert(status.contains("embed_refused=runtime-full"), "and names the refused guest")
+}
+
+// test_syn_embed_runtime_inline_root_defers_outer_exit_until_guest_root
+fn inline_root_defers_outer_exit_until_guest_root() {
+    var r = runtime_open(
+        "{{syntax:1,language:{{name:\"runtime-inline-root\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"@self\",end:\"inline-root\"}}}},{{match:\"[{{]\",push:\"nested\"}}]}},nested:{{rules:[{{match:\"[}}]\",pop:1}}]}},bridge:{{rules:[{{match:\"[}}]\",pop:1,end:true}}]}}}}}}",
+    )
+    assert(
+        r.pool.programs[r.engine.root].contexts[2].embed.end_kind == syn.SYN_EMBED_END_INLINE_ROOT,
+        "the bridge ends inline at the guest root",
+    )
+    let nested = trace_at(mut r, syn.SYN_STATE_ROOT, "OPEN{{x}}}}", 7)
+    assert(
+        syn.syn_state_depth(nested) == 3 && syn.syn_state_ndef(nested) == 2,
+        "a nested brace stays in the guest",
+    )
+    let returned = trace_at(mut r, syn.SYN_STATE_ROOT, "OPEN{{x}}}}", 8)
+    assert(
+        syn.syn_state_depth(returned) == 1 && syn.syn_state_ndef(returned) == 1,
+        "the brace at the guest root ends it",
+    )
+    var out = syn.syn_spans_new(16)
+    line(mut r, syn.SYN_STATE_ROOT, "OPEN{{x}}}}", mut out)
+    assert(out.exit_state == syn.SYN_STATE_ROOT, "balanced to ROOT")
+}
+
+// test_syn_embed_runtime_line_continuation_keeps_unprefixed_guest
+fn line_continuation_keeps_unprefixed_guest() {
+    var r = runtime_open(
+        "{{syntax:1,language:{{name:\"runtime-line-cont\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"@self\",end:\"line-continuation\"}}}}]}},bridge:{{at_eol:\"pop\",rules:[]}}}}}}",
+    )
+    assert(
+        r.pool.programs[r.engine.root].contexts[1].embed.end_kind ==
+            syn.SYN_EMBED_END_LINE_CONTINUATION,
+        "a line-continuation bridge",
+    )
+    var out = syn.syn_spans_new(16)
+    line(mut r, syn.SYN_STATE_ROOT, "OPENecho \\", mut out)
+    var s = state(r, out.exit_state)
+    assert(
+        syn.syn_state_depth(s) == 3 && syn.syn_state_ndef(s) == 2,
+        "a trailing backslash continues the guest",
+    )
+    let first = out.exit_state
+    line(mut r, first, "unprefixed \\", mut out)
+    s = state(r, out.exit_state)
+    assert(
+        syn.syn_state_depth(s) == 3 && syn.syn_state_ndef(s) == 2,
+        "an unprefixed line continues too",
+    )
+    let second = out.exit_state
+    line(mut r, second, "done", mut out)
+    s = state(r, out.exit_state)
+    assert(out.exit_state == syn.SYN_STATE_ROOT, "a line without the backslash ends it")
+    assert(syn.syn_state_depth(s) == 1 && syn.syn_state_ndef(s) == 1, "balanced")
+    line(mut r, syn.SYN_STATE_ROOT, "OPENecho \\\\", mut out)
+    s = state(r, out.exit_state)
+    assert(
+        syn.syn_state_depth(s) == 1 && syn.syn_state_ndef(s) == 1,
+        "an escaped backslash does not continue",
+    )
+}
+
+fn main() {
+    let selected = (env_get("YEW_SYN_EMBED_RUNTIME_CASE") else "-1").to_int() else -1
+    for i in 0..7 {
+        if selected == -1 || selected == i {
+            match i {
+                0 => self_inline_exit_precedes_guest(),
+                1 => deferred_self_enters_at_eol(),
+                2 => unknown_uses_fallback_and_balances(),
+                3 => line_host_eol_returns_after_guest(),
+                4 => zero_headroom_records_protected_lost_debt(),
+                5 => inline_root_defers_outer_exit_until_guest_root(),
+                _ => line_continuation_keeps_unprefixed_guest(),
+            }
+            print("syn_embed_runtime_case_{i}: PASS")
+        }
+    }
+}

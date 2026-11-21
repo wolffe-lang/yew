@@ -1,0 +1,278 @@
+//! member: false
+//! Ports sagitta tests/unit/test_syn_embed_pump.c at 9ace98c2, one case per
+//! C test in its order. The engine never loads a definition while it
+//! matches or settles; the owner loads a queued guest through the builtin
+//! registry (here from an explicit minimal source naming the builtin
+//! language) and the pump installs it only with the idle load budget.
+
+use syn
+use text
+
+const HOST_LANGUAGE: int = 49
+
+const UNBOUNDED: int = 9223372036854775807
+
+struct Pump {
+    reg: syn.SynRegistry,
+    pool: syn.SynPool,
+    engine: syn.SynEngine,
+}
+
+fn bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() { (mut out).push(b) }
+    out
+}
+
+fn pump_open(source: str) -> Pump {
+    var c = syn.syn_compile("pump.fl", source.bytes())
+    assert(c.valid && c.diagnostics.nerrors == 0, "the host compiles")
+    assert(c.diagnostics.nwarnings == 0, "without warnings")
+    let reg = syn.syn_registry_new()
+    var pool = syn.syn_pool_new()
+    syn.syn_registry_seed(reg, mut pool)
+    let root = syn.syn_pool_add(mut pool, take c.definition, HOST_LANGUAGE)
+    let engine = syn.syn_engine_new(pool, root)
+    Pump { reg: reg, pool: pool, engine: engine }
+}
+
+fn lang(p: Pump, name: str) -> int {
+    let id = syn.syn_registry_lang_named(p.reg, bytes(name))
+    assert(id != 0, "a builtin language")
+    id
+}
+
+// The owner's load of a queued builtin guest, from a minimal source.
+fn load_guest(mut p: Pump, name: str) {
+    let source = "{{syntax:1,language:{{name:\"{name}\"}},contexts:{{main:{{rules:[]}}}}}}"
+    let id = lang(p, name)
+    let program = syn.syn_registry_load(mut p.reg, mut p.pool, id, "{name}.fl", bytes(source))
+    assert(program >= 0, "the guest loads")
+}
+
+fn state(p: Pump, id: int) -> syn.SynState {
+    let s = syn.syn_state_get(p.engine.states, id) else {
+        assert(false, "the state exists")
+        return syn.syn_state_root(0, 0)
+    }
+    s
+}
+
+fn line(mut p: Pump, entry: int, input: str, mut out: syn.SynSpans) {
+    syn.syn_line(mut p.engine, mut p.pool, entry, input.bytes(), input.len, mut out, false)
+}
+
+fn assert_spare_aux_zero(s: syn.SynState) {
+    for slot in syn.syn_state_ndef(s)..syn.SYN_DEF_MAX {
+        assert(syn.syn_state_aux(s, slot) == 0, "no aux above the active definitions")
+    }
+}
+
+// test_syn_embed_pump_is_idle_only_and_loads_one
+fn idle_only_and_loads_one() {
+    var p = pump_open(
+        "{{syntax:1,language:{{name:\"pump-host\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"javascript\",end:\"inline\",fallback:\"code\"}}}}]}},bridge:{{rules:[{{match:\"END\",pop:1,end:true}}]}}}}}}",
+    )
+    let js = lang(p, "javascript")
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, js) == -1, "the guest starts absent")
+    p.reg.compiles = 0
+    var out = syn.syn_spans_new(8)
+    line(mut p, syn.SYN_STATE_ROOT, "OPENbody", mut out)
+    assert(p.reg.compiles == 0, "matching loads nothing")
+    let pending = state(p, out.exit_state)
+    assert(
+        syn.syn_state_depth(pending) == 2 && syn.syn_state_ndef(pending) == 1,
+        "the bridge waits for its guest",
+    )
+    assert(syn.syn_state_flags(pending) & syn.SYN_F_EMBED_PEND != 0, "pending")
+    assert_spare_aux_zero(pending)
+    let tb = text.textbuf_from_str("OPENbody\nnext\n")
+    var buffer = syn.syn_buffer_new_at(tb, p.engine.generation, 0)
+    let report = syn.syn_settle(mut buffer, mut p.engine, mut p.pool, tb, 0, 2, UNBOUNDED)
+    assert(report.fixpoint, "settled")
+    assert(p.reg.compiles == 0, "settling loads nothing")
+    assert(buffer.pending_langs.len == 1, "one queued guest")
+    assert(buffer.pending_langs[0] == js, "the queued guest")
+    assert(buffer.pending_lines[0] == 0, "queued against its opener line")
+    assert(syn.syn_embed_wanted(buffer) == js, "the owner is asked for it")
+    let carried = state(p, syn.syn_ids_get(buffer.lines.entry, 1))
+    assert(syn.syn_state_flags(carried) & syn.SYN_F_EMBED_PEND != 0, "the pending state is carried")
+    assert_spare_aux_zero(carried)
+    load_guest(mut p, "javascript")
+    assert(
+        !syn.syn_embed_pump(mut buffer, mut p.engine, p.pool, 1000),
+        "a frame budget never pumps",
+    )
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, js) == -1, "still absent")
+    assert(syn.syn_embed_pump(mut buffer, mut p.engine, p.pool, 2000), "the idle load budget pumps")
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, js) >= 0, "resident")
+    assert(buffer.lines.wave == 0, "the opener is replayed")
+    assert(syn.syn_ids_get(buffer.lines.entry, 0) == syn.SYN_STATE_ROOT, "ROOT enters it")
+    assert(
+        syn.syn_ids_get(buffer.lines.entry, 1) == syn.SYN_STATE_UNKNOWN,
+        "the old tail is discarded",
+    )
+    assert(!syn.syn_embed_pump(mut buffer, mut p.engine, p.pool, 2000), "one guest per pump")
+    line(mut p, syn.SYN_STATE_ROOT, "OPENbody", mut out)
+    let resident = state(p, out.exit_state)
+    assert(
+        syn.syn_state_ndef(resident) == 2 && syn.syn_state_depth(resident) == 3,
+        "the guest is entered",
+    )
+    assert(syn.syn_state_def(resident, 2) == 1, "in resident slot one")
+    assert(syn.syn_engine_def_at(p.engine, 1) >= 0, "slot one holds the guest")
+    assert(syn.syn_engine_def_at(p.engine, syn.SYN_DEF_MAX) == -1, "no slot past the residents")
+    syn.syn_ids_set(mut buffer.lines.entry, 1, out.exit_state)
+    buffer.lines.wave = 1
+    let status = syn.syn_buffer_status(buffer, p.engine, p.pool, 2)
+    assert(status.contains("root=pump-host active=javascript"), "the status names both definitions")
+    assert(status.contains("defs=2/4 depth=3/16"), "and the qualified depth")
+    assert(status.contains("embed_pending=0"), "nothing remains queued")
+}
+
+// test_syn_lang_by_name_is_length_checked_and_io_free
+fn lang_by_name_is_length_checked_and_io_free() {
+    var reg = syn.syn_registry_new()
+    let name = bytes("javascriptx")
+    let js = syn.syn_registry_lang_by_name(reg, name, 0, 10)
+    assert(js != 0, "javascript is a builtin")
+    assert(syn.syn_registry_lang_by_name(reg, name, 0, 9) == 0, "a prefix is not a name")
+    assert(syn.syn_registry_lang_by_name(reg, name, 0, 11) == 0, "a longer name is not a name")
+    assert(syn.syn_registry_lang_by_name(reg, List[byte](), 0, 0) == 0, "nothing is no language")
+    reg.compiles = 0
+    for _ in 0..64 {
+        assert(syn.syn_registry_lang_by_name(reg, name, 0, 10) == js, "stable")
+    }
+    assert(reg.compiles == 0, "a lookup compiles nothing")
+}
+
+// test_syn_embed_pump_keeps_one_line_request_after_balanced_exit
+fn keeps_one_line_request_after_balanced_exit() {
+    var p = pump_open(
+        "{{syntax:1,language:{{name:\"pump-inline\"}},contexts:{{main:{{rules:[{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"css\",end:\"inline\",fallback:\"code\"}}}}]}},bridge:{{rules:[{{match:\"END\",pop:1,end:true}}]}}}}}}",
+    )
+    let css = lang(p, "css")
+    var out = syn.syn_spans_new(8)
+    line(mut p, syn.SYN_STATE_ROOT, "OPENbodyEND", mut out)
+    let exit = state(p, out.exit_state)
+    assert(out.exit_state == syn.SYN_STATE_ROOT, "a balanced inline embed returns to ROOT")
+    assert(syn.syn_state_depth(exit) == 1 && syn.syn_state_ndef(exit) == 1, "balanced")
+    assert(
+        syn.syn_state_flags(exit) & syn.SYN_F_EMBED_PEND == 0,
+        "no pending flag survives the line",
+    )
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, css) == -1, "the guest is absent")
+    let first_exit = out.exit_state
+    let first_n = out.n
+    line(mut p, syn.SYN_STATE_ROOT, "OPENbodyEND", mut out)
+    assert(out.exit_state == first_exit && out.n == first_n, "the line repeats exactly")
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, css) == -1, "still absent")
+    let tb = text.textbuf_from_str("OPENbodyEND\nOPENbodyEND\n")
+    var buffer = syn.syn_buffer_new_at(tb, p.engine.generation, 0)
+    let report = syn.syn_settle(mut buffer, mut p.engine, mut p.pool, tb, 0, 2, UNBOUNDED)
+    assert(report.fixpoint, "settled")
+    assert(buffer.pending_langs.len == 1 && buffer.pending_langs[0] == css, "the request is kept")
+    assert(buffer.pending_lines[0] == 0, "against the first opener")
+    syn.syn_buffer_edit(mut buffer, 0, 0, 0)
+    assert(
+        buffer.pending_langs.len == 1 && buffer.pending_langs[0] == css,
+        "an edit keeps the request",
+    )
+    assert(buffer.pending_lines[0] == 0, "and its line")
+    load_guest(mut p, "css")
+    assert(syn.syn_embed_pump(mut buffer, mut p.engine, p.pool, 2000), "pumped")
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, css) >= 0, "resident")
+    assert(buffer.lines.wave == 0, "replayed from its opener")
+    assert(buffer.pending_langs.len == 0, "the queue is empty")
+    assert(syn.syn_embed_wanted(buffer) == 0, "nothing is wanted")
+}
+
+// test_syn_embed_pump_keeps_more_than_three_guests_resident
+fn keeps_more_than_three_guests_resident() {
+    var p = pump_open(
+        "{{syntax:1,language:{{name:\"pump-many\"}},contexts:{{main:{{rules:[{{match:\"J\",push:\"bridge\",embed:{{lang:\"javascript\",end:\"inline\"}}}},{{match:\"C\",push:\"bridge\",embed:{{lang:\"css\",end:\"inline\"}}}},{{match:\"S\",push:\"bridge\",embed:{{lang:\"sh\",end:\"inline\"}}}},{{match:\"P\",push:\"bridge\",embed:{{lang:\"python\",end:\"inline\"}}}}]}},bridge:{{rules:[{{match:\"END\",pop:1,end:true}}]}}}}}}",
+    )
+    let lines = ["JxEND\n", "CxEND\n", "SxEND\n", "PxEND\n"]
+    let guests = ["javascript", "css", "sh", "python"]
+    var last = syn.syn_buffer_new_at(text.textbuf_from_str("\n"), p.engine.generation, 0)
+    for i in 0..lines.len {
+        let tb = text.textbuf_from_str(lines[i])
+        var buffer = syn.syn_buffer_new_at(tb, p.engine.generation, 0)
+        let report = syn.syn_settle(mut buffer, mut p.engine, mut p.pool, tb, 0, 1, UNBOUNDED)
+        assert(report.fixpoint, "settled")
+        load_guest(mut p, guests[i])
+        assert(syn.syn_embed_pump(mut buffer, mut p.engine, p.pool, 2000), "pumped")
+        assert(
+            syn.syn_engine_def_at(p.engine, i + 1) >= 0,
+            "every guest keeps its own resident slot",
+        )
+        last = buffer
+    }
+    syn.syn_ids_set(mut last.lines.entry, 0, syn.SYN_STATE_ROOT)
+    last.lines.wave = 0
+    let status = syn.syn_buffer_status(last, p.engine, p.pool, 1)
+    assert(status.contains("defs=1/4 depth=1/16"), "the active state is the host's root")
+}
+
+// test_syn_embed_pump_never_skips_a_line_edited_above_the_opener
+fn never_skips_a_line_edited_above_the_opener() {
+    var p = pump_open(
+        "{{syntax:1,language:{{name:\"pump-wave\"}},contexts:{{main:{{rules:[{{match:\"B\",push:\"blk\"}},{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"css\",end:\"inline\",fallback:\"code\"}}}}]}},blk:{{rules:[{{match:\"E\",pop:1}},{{match:\"OPEN\",push:\"bridge\",embed:{{lang:\"css\",end:\"inline\",fallback:\"code\"}}}}]}},bridge:{{rules:[{{match:\"END\",pop:1,end:true}}]}}}}}}",
+    )
+    let css = lang(p, "css")
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, css) == -1, "the guest starts absent")
+    var tb = text.textbuf_from_str("B\nOPENbody\nx\n")
+    var buffer = syn.syn_buffer_new_at(tb, p.engine.generation, 0)
+    // A still clock: the checked machine's slow real clock must not turn
+    // the frame budget into a partial settle; the pump is gated by budget.
+    syn.syn_buffer_fake_clock(mut buffer, 0, 0)
+    var report = syn.syn_settle(mut buffer, mut p.engine, mut p.pool, tb, 0, 4, 1000)
+    assert(report.fixpoint, "a frame budget settles")
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, css) == -1, "without pumping")
+    assert(buffer.pending_langs.len == 1, "the guest stays queued")
+    assert(buffer.pending_lines[0] == 1, "against the opener on line one")
+    assert(
+        syn.syn_ids_get(buffer.lines.entry, 1) != syn.SYN_STATE_ROOT,
+        "line one starts inside the block",
+    )
+    text.textbuf_delete(mut tb, text.Span { lo: 0, hi: 1 })
+    syn.syn_buffer_edit(mut buffer, 0, 0, 0)
+    assert(buffer.lines.wave == 0, "the edit above pulls the wave to line zero")
+    load_guest(mut p, "css")
+    report = syn.syn_settle(mut buffer, mut p.engine, mut p.pool, tb, 0, 4, UNBOUNDED)
+    assert(report.fixpoint, "the idle settle pumps and settles")
+    assert(syn.syn_engine_def_resident(p.engine, p.pool, css) >= 0, "resident")
+    assert(
+        syn.syn_ids_get(buffer.lines.entry, 1) == syn.SYN_STATE_ROOT,
+        "the edited line's new exit reached line one",
+    )
+    var fresh = syn.syn_buffer_new_at(tb, p.engine.generation, 0)
+    report = syn.syn_settle(mut fresh, mut p.engine, mut p.pool, tb, 0, 4, UNBOUNDED)
+    assert(report.fixpoint, "a fresh highlight settles")
+    assert(
+        syn.syn_ids_len(fresh.lines.entry) == syn.syn_ids_len(buffer.lines.entry),
+        "same line count",
+    )
+    for i in 0..syn.syn_ids_len(buffer.lines.entry) {
+        assert(
+            syn.syn_ids_get(buffer.lines.entry, i) == syn.syn_ids_get(fresh.lines.entry, i),
+            "the pumped buffer agrees with a fresh highlight",
+        )
+    }
+}
+
+fn main() {
+    let selected = (env_get("YEW_SYN_EMBED_PUMP_CASE") else "-1").to_int() else -1
+    for i in 0..5 {
+        if selected == -1 || selected == i {
+            match i {
+                0 => idle_only_and_loads_one(),
+                1 => lang_by_name_is_length_checked_and_io_free(),
+                2 => keeps_one_line_request_after_balanced_exit(),
+                3 => keeps_more_than_three_guests_resident(),
+                _ => never_skips_a_line_edited_above_the_opener(),
+            }
+            print("syn_embed_pump_case_{i}: PASS")
+        }
+    }
+}

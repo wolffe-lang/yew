@@ -1,0 +1,393 @@
+//! member: false
+//! Ports sagitta tests/unit/test_syn_settle.c at 9ace98c2, one case per C
+//! test in its order, over syn_toy.c's definition as table data. The C
+//! fake clock is the buffer's deterministic observation clock. Cases past
+//! the checked machine's step budget have smaller checked twins after the
+//! C cases (see tools/check-test-cases.txt): the same laws at a size the
+//! checked machine finishes, so a regrowth of per-key work fails there.
+
+use search
+use syn
+use text
+
+fn bytes(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() { (mut out).push(b) }
+    out
+}
+
+fn rule(mut def: syn.SynDefinition, ctx: int, pattern: str, attr: int, op: int, target: int) {
+    var err = search.re_err_new()
+    let re = search.re_compile_str(pattern, 0, mut err) else {
+        assert(false, "toy regex: {err.msg}")
+        return
+    }
+    var r = syn.syn_rule_new(def.regexes.len, attr)
+    r.op = op
+    r.target = target
+    if op == syn.SYN_OP_POP { r.nop = 1 }
+    let first = search.re_first_bytes(re)
+    r.first = syn.syn_first_new(false)
+    for i in 0..256 {
+        if first[i] { syn.syn_first_add(mut r.first, i) }
+    }
+    syn.syn_first_union(mut def.contexts[ctx].first, r.first)
+    (mut def.regexes).push(re)
+    (mut def.rules).push(r)
+    (mut def.patterns).push(bytes(pattern))
+}
+
+// syn_toy.c's four contexts and ten rules.
+fn toy() -> syn.SynDefinition {
+    var def = syn.syn_definition_new("toy")
+    var main = syn.syn_context_new(0)
+    main.nrules = 7
+    var string = syn.syn_context_new(12)
+    string.first_rule = 7
+    string.nrules = 2
+    string.eol_op = syn.SYN_OP_POP
+    string.eol_nop = 1
+    var block = syn.syn_context_new(16)
+    block.first_rule = 9
+    block.nrules = 1
+    var comment = syn.syn_context_new(16)
+    comment.first_rule = 10
+    comment.eol_op = syn.SYN_OP_POP
+    comment.eol_nop = 1
+    (mut def.contexts).push(main)
+    (mut def.contexts).push(string)
+    (mut def.contexts).push(block)
+    (mut def.contexts).push(comment)
+    for name in "main string comment_block comment_line".words() {
+        (mut def.context_names).push(bytes(name))
+    }
+    rule(mut def, 0, "//", 16, syn.SYN_OP_PUSH, 3)
+    rule(mut def, 0, "/\\*", 16, syn.SYN_OP_PUSH, 2)
+    rule(mut def, 0, "\"", 12, syn.SYN_OP_PUSH, 1)
+    rule(mut def, 0, "\\b(if|else|while|return)\\b", 2, syn.SYN_OP_STAY, 0)
+    rule(mut def, 0, "[0-9]+", 9, syn.SYN_OP_STAY, 0)
+    rule(mut def, 0, "\\b(true|false)\\b", 10, syn.SYN_OP_STAY, 0)
+    rule(mut def, 0, "[+*/=-]+", 31, syn.SYN_OP_STAY, 0)
+    rule(mut def, 1, "\\\\.", 13, syn.SYN_OP_STAY, 0)
+    rule(mut def, 1, "\"", 12, syn.SYN_OP_POP, 0)
+    rule(mut def, 2, "\\*/", 16, syn.SYN_OP_POP, 0)
+    def
+}
+
+fn toy_engine() -> syn.SynEngine {
+    var pool = syn.syn_pool_new()
+    let root = syn.syn_pool_add(mut pool, take toy(), 1)
+    syn.syn_engine_new(pool, root)
+}
+
+struct Fixture {
+    pool: syn.SynPool,
+    engine: syn.SynEngine,
+    tb: text.TextBuf,
+    buffer: syn.SynBuffer,
+}
+
+// repeat_lines: `count` copies of `line`.
+fn repeat_lines(line: str, count: int) -> text.TextBuf {
+    var all = List[byte]()
+    for _ in 0..count {
+        for b in line.bytes() { (mut all).push(b) }
+    }
+    text.textbuf_from_bytes(all, 0, all.len)
+}
+
+fn fixture(take tb: text.TextBuf, clock_step: int) -> Fixture {
+    var pool = syn.syn_pool_new()
+    let root = syn.syn_pool_add(mut pool, take toy(), 1)
+    let engine = syn.syn_engine_new(pool, root)
+    var buffer = syn.syn_buffer_new_at(tb, engine.generation, 0)
+    if clock_step >= 0 { syn.syn_buffer_fake_clock(mut buffer, 0, clock_step) }
+    Fixture { pool: pool, engine: engine, tb: tb, buffer: buffer }
+}
+
+const UNBOUNDED: int = 9223372036854775807
+
+fn settle_all(mut f: Fixture, budget: int) {
+    var calls = 0
+    while true {
+        let report = syn.syn_settle(mut f.buffer, mut f.engine, mut f.pool, f.tb, 0, 1, budget)
+        calls += 1
+        assert(calls < 100000, "settling terminates")
+        if report.fixpoint { break }
+    }
+}
+
+fn plain_edit(lines: int) {
+    var f = fixture(take repeat_lines("plain text\n", lines), -1)
+    settle_all(mut f, UNBOUNDED)
+    text.textbuf_insert_str(mut f.tb, 3 as text.ByteOff, "x")
+    syn.syn_buffer_edit(mut f.buffer, 0, 0, 0)
+    syn.syn_engine_reset_counters(mut f.engine)
+    let report = syn.syn_settle(mut f.buffer, mut f.engine, mut f.pool, f.tb, 0, 24, 1000)
+    assert(report.fixpoint, "a plain edit reaches a fixpoint in one frame")
+    assert(report.lines <= 2, "at most two lines evaluated")
+    assert(syn.syn_engine_line_calls(f.engine) <= 2, "at most two interpreter calls")
+    assert(f.buffer.lines.settled_to == text.textbuf_line_count(f.tb), "settled to the end")
+    assert(!f.buffer.lines.settling, "settling finished")
+}
+
+// test_syn_settle_plain_edit_reaches_one_line_fixpoint
+fn plain_edit_reaches_one_line_fixpoint() {
+    plain_edit(100000)
+}
+
+fn comment_wave(lines: int, view: int) {
+    var f = fixture(take repeat_lines("plain\n", lines), 1)
+    settle_all(mut f, UNBOUNDED)
+    text.textbuf_insert_str(mut f.tb, 0 as text.ByteOff, "/*")
+    syn.syn_buffer_edit(mut f.buffer, 0, 0, 0)
+    var calls = 0
+    var out = syn.syn_spans_new(8)
+    while true {
+        let report = syn.syn_settle(
+            mut f.buffer,
+            mut f.engine,
+            mut f.pool,
+            f.tb,
+            view,
+            view + 24,
+            8,
+        )
+        assert(report.us <= 8, "each slice obeys its budget")
+        calls += 1
+        assert(calls < 10000, "the wave completes")
+        if calls == 1 {
+            syn.syn_buffer_spans(mut f.buffer, mut f.engine, mut f.pool, f.tb, view, mut out)
+            assert(out.n > 0, "the viewed line has spans")
+            assert(syn.syn_span_attr(out, 0) == 16, "the wave already styles the view as comment")
+        }
+        if report.fixpoint { break }
+    }
+    assert(f.buffer.lines.settled_to == text.textbuf_line_count(f.tb), "settled to the end")
+    assert(!f.buffer.lines.settling, "settling finished")
+}
+
+// test_syn_settle_comment_wave_obeys_each_budget
+fn comment_wave_obeys_each_budget() {
+    comment_wave(1000000, 100)
+}
+
+fn speculative_view(lines: int, view: int) {
+    var f = fixture(take repeat_lines("plain\n", lines), 2)
+    settle_all(mut f, UNBOUNDED)
+    text.textbuf_insert_str(mut f.tb, 0 as text.ByteOff, "/*")
+    syn.syn_buffer_edit(mut f.buffer, 0, 0, 0)
+    let before = f.buffer.lines.provisional_corrections
+    var calls = 0
+    while true {
+        let report = syn.syn_settle(
+            mut f.buffer,
+            mut f.engine,
+            mut f.pool,
+            f.tb,
+            view,
+            view + 24,
+            1,
+        )
+        calls += 1
+        assert(calls < 10000, "the wave completes")
+        if report.fixpoint { break }
+    }
+    assert(
+        f.buffer.lines.provisional_corrections == before + 1,
+        "the speculative view is corrected once",
+    )
+    assert(!f.buffer.lines.spec_valid, "no speculation remains")
+}
+
+// test_syn_settle_speculative_view_is_corrected_once
+fn speculative_view_is_corrected_once() {
+    speculative_view(20000, 10000)
+}
+
+// test_syn_settle_indicator_waits_250ms_and_degraded_wins
+fn indicator_waits_250ms_and_degraded_wins() {
+    var f = fixture(take text.textbuf_new(), 0)
+    syn.syn_buffer_fake_clock(mut f.buffer, 1000000, 0)
+    f.buffer.lines.settling = true
+    f.buffer.edit_us = f.buffer.clock_now
+    assert(!syn.syn_buffer_status_visible(mut f.buffer), "no badge at the edit")
+    f.buffer.clock_now += 250 * 1000 - 1
+    assert(!syn.syn_buffer_status_visible(mut f.buffer), "no badge one microsecond early")
+    f.buffer.clock_now += 1
+    assert(syn.syn_buffer_status_visible(mut f.buffer), "the badge after 250 ms")
+    let settled = syn.syn_buffer_status(f.buffer, f.engine, f.pool, 999)
+    assert(settled.contains("settled"), "the status names the settled frontier")
+    assert(settled.contains("degraded=no"), "not degraded")
+    f.buffer.degraded = true
+    f.buffer.lines.settling = false
+    assert(syn.syn_buffer_status_visible(mut f.buffer), "degraded wins without settling")
+    let degraded = syn.syn_buffer_status(f.buffer, f.engine, f.pool, 999)
+    assert(degraded.contains("degraded=yes"), "degraded reported")
+}
+
+// last_calls: the row past the view costs one call once the 256-row cache
+// has evicted it, and none while the whole file still fits.
+fn cache_rows(lines: int, viewed: int, last_calls: int, reps: int, dense: int) {
+    var row = ""
+    for _ in 0..reps { row = row + "if+" }
+    var f = fixture(take repeat_lines(row + "\n", lines), -1)
+    settle_all(mut f, UNBOUNDED)
+    var out = syn.syn_spans_new(128)
+    syn.syn_engine_reset_counters(mut f.engine)
+    syn.syn_buffer_spans(mut f.buffer, mut f.engine, mut f.pool, f.tb, viewed / 2, mut out)
+    assert(out.n > dense, "a dense row")
+    assert(syn.syn_engine_line_calls(f.engine) == 0, "a settled row is a cache hit")
+    for line in 0..viewed {
+        syn.syn_buffer_spans(mut f.buffer, mut f.engine, mut f.pool, f.tb, line, mut out)
+        assert(out.n > dense, "every viewed row is dense")
+    }
+    syn.syn_engine_reset_counters(mut f.engine)
+    for line in 0..viewed {
+        syn.syn_buffer_spans(mut f.buffer, mut f.engine, mut f.pool, f.tb, line, mut out)
+    }
+    assert(
+        syn.syn_engine_line_calls(f.engine) == 0,
+        "an unchanged redraw calls the interpreter zero times",
+    )
+    syn.syn_buffer_spans(mut f.buffer, mut f.engine, mut f.pool, f.tb, viewed, mut out)
+    assert(syn.syn_engine_line_calls(f.engine) == last_calls, "one new row is one call")
+}
+
+// test_syn_spans_cache_avoids_unchanged_rehighlight
+fn spans_cache_avoids_unchanged_rehighlight() {
+    cache_rows(300, 200, 1, 48, 40)
+}
+
+fn line_bytes(tb: text.TextBuf, line: int) -> List[byte] {
+    let span = text.textbuf_line_span(tb, line as text.LineNo)
+    var out = List[byte]()
+    for at in span.lo..span.hi { (mut out).push(text.textbuf_byte_at(tb, at) as byte) }
+    if out.len != 0 && out[out.len - 1] as int == 10 {
+        let _ = (mut out).pop() else 0 as byte
+    }
+    out
+}
+
+fn repeated_edit(lines: int, edited: int) {
+    var f = fixture(take repeat_lines("plain\n", lines), 2)
+    settle_all(mut f, UNBOUNDED)
+    text.textbuf_insert_str(mut f.tb, 0 as text.ByteOff, "/*\n\n\n\n\n\n\n\n\n\n")
+    syn.syn_buffer_edit(mut f.buffer, 0, 0, 10)
+    let report = syn.syn_settle(
+        mut f.buffer,
+        mut f.engine,
+        mut f.pool,
+        f.tb,
+        edited * 2,
+        edited * 2 + 24,
+        1,
+    )
+    assert(!report.fixpoint, "a one-microsecond slice stops early")
+    assert(
+        f.buffer.lines.wave > 0 && f.buffer.lines.wave < 11,
+        "the wave is inside the opened comment",
+    )
+    assert(
+        syn.syn_ids_get(f.buffer.lines.entry, f.buffer.lines.wave + 1) == syn.SYN_STATE_UNKNOWN,
+        "the inserted lines past the wave are still UNKNOWN",
+    )
+    let at = text.textbuf_line_start(f.tb, edited as text.LineNo)
+    text.textbuf_insert_str(mut f.tb, at, "x")
+    syn.syn_buffer_edit(mut f.buffer, edited, 0, 0)
+    assert(f.buffer.lines.wave < 11, "a later edit below never advances the wave")
+    settle_all(mut f, UNBOUNDED)
+    var state = syn.SYN_STATE_ROOT
+    var out = syn.syn_spans_new(32)
+    for line in 0..text.textbuf_line_count(f.tb) {
+        let bytes = line_bytes(f.tb, line)
+        assert(
+            syn.syn_ids_get(f.buffer.lines.entry, line) == state,
+            "every entry equals the fresh chain",
+        )
+        syn.syn_line(mut f.engine, mut f.pool, state, bytes, bytes.len, mut out, false)
+        state = out.exit_state
+    }
+    assert(f.buffer.lines.settled_to == text.textbuf_line_count(f.tb), "settled to the end")
+}
+
+// test_syn_settle_repeated_edit_preserves_unfinished_unknown_wave
+fn repeated_edit_preserves_unfinished_unknown_wave() {
+    repeated_edit(2000, 500)
+}
+
+fn exact_byte_cap(cap: int, suffixes: List[str]) {
+    for suffix in suffixes {
+        var all = List[byte]()
+        for _ in 0..cap { (mut all).push(120 as byte) }
+        for b in suffix.bytes() { (mut all).push(b) }
+        let tb = text.textbuf_from_bytes(all, 0, all.len)
+        var f = fixture(take tb, -1)
+        settle_all(mut f, UNBOUNDED)
+        var out = syn.syn_spans_new(16)
+        syn.syn_buffer_spans(mut f.buffer, mut f.engine, mut f.pool, f.tb, 0, mut out)
+        assert(
+            out.stop == syn.SYN_STOP_OK,
+            "a line of exactly the cap is matched, terminator aside",
+        )
+        assert(out.exit_state == syn.SYN_STATE_ROOT, "and keeps ROOT")
+    }
+}
+
+// test_syn_spans_exact_byte_cap_ignores_line_terminator
+fn spans_exact_byte_cap_ignores_line_terminator() {
+    exact_byte_cap(syn.SYN_LINE_BYTE_CAP, ["\n", "\r\n"])
+}
+
+// Checked twins: the cases above at sizes the checked machine finishes.
+// Each keeps its case's per-key law, so regrown work fails here too.
+fn plain_edit_checked_twin() {
+    plain_edit(200)
+}
+
+fn comment_wave_checked_twin() {
+    comment_wave(300, 100)
+}
+
+fn speculative_view_checked_twin() {
+    speculative_view(400, 300)
+}
+
+fn spans_cache_checked_twin() {
+    cache_rows(300, 200, 1, 1, 1)
+}
+
+fn repeated_edit_checked_twin() {
+    repeated_edit(200, 50)
+}
+
+// The cap is a constant and a line a quarter of it is already past the
+// checked budget: this twin keeps the per-byte path and both terminators
+// at 1,024 bytes; the cap itself is the native lane's.
+fn exact_byte_cap_checked_twin() {
+    exact_byte_cap(1024, ["\n", "\r\n"])
+}
+
+fn main() {
+    let selected = (env_get("YEW_SYN_SETTLE_CASE") else "-1").to_int() else -1
+    for i in 0..13 {
+        if selected == -1 || selected == i {
+            match i {
+                0 => plain_edit_reaches_one_line_fixpoint(),
+                1 => comment_wave_obeys_each_budget(),
+                2 => speculative_view_is_corrected_once(),
+                3 => indicator_waits_250ms_and_degraded_wins(),
+                4 => spans_cache_avoids_unchanged_rehighlight(),
+                5 => repeated_edit_preserves_unfinished_unknown_wave(),
+                6 => spans_exact_byte_cap_ignores_line_terminator(),
+                7 => plain_edit_checked_twin(),
+                8 => comment_wave_checked_twin(),
+                9 => speculative_view_checked_twin(),
+                10 => spans_cache_checked_twin(),
+                11 => repeated_edit_checked_twin(),
+                _ => exact_byte_cap_checked_twin(),
+            }
+            print("syn_settle_case_{i}: PASS")
+        }
+    }
+}

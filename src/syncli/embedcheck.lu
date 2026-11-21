@@ -1,0 +1,487 @@
+//! syncli.embedcheck — `yew syn check`'s embed-source report.
+//!
+//! Ports sagitta src/syncli.c:306–505 and :652–870 at 9ace98c2:
+//! `embed_def_index`, `embed_closed_fallback`, `embed_ctx_index`,
+//! `embed_path_has`, `embed_depth_better`, `embed_chain_prefix`,
+//! `embed_combined_depth_limit`, `ast_embed_sites`, `embed_selector_span`
+//! and `check_embed_source`. A literal selector that names no installed
+//! definition is an error; a chain of embeddings that can pass the 16-frame
+//! stack cap is an error for static selectors and a warning for dynamic
+//! ones. The installed definitions are every builtin the runtime holds and
+//! every live user definition, in language-id order.
+
+use fl
+use syn
+
+const EMBED_PATH_MAX: int = 64
+
+const EMBED_CHAIN_CAP: int = 512
+
+/// One reachable chain: frames used, definitions crossed, and the chain's
+/// names separated by 0x1f (C's 512-byte `chain`, NUL included).
+struct EmbedDepth {
+    frames: int,
+    defs: int,
+    dynamic: bool,
+    chain: List[byte],
+}
+
+fn depth_empty() -> EmbedDepth {
+    EmbedDepth { frames: 0, defs: 0, dynamic: false, chain: List[byte]() }
+}
+
+fn cstr(bytes: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    for b in bytes {
+        if b as int == 0 then break
+        (mut out).push(b)
+    }
+    out
+}
+
+fn bytes_same(a: List[byte], b: List[byte]) -> bool {
+    if a.len != b.len then return false
+    for i in 0..a.len {
+        if a[i] != b[i] then return false
+    }
+    true
+}
+
+fn text_is(bytes: List[byte], s: str) -> bool {
+    if bytes.len != s.len then return false
+    var i = 0
+    for b in s.bytes() {
+        if bytes[i] != b then return false
+        i += 1
+    }
+    true
+}
+
+fn def_name(pool: syn.SynPool, program: int) -> List[byte] {
+    let name = cstr(pool.programs[program].name)
+    if name.len == 0 then return model("<unnamed>")
+    name
+}
+
+fn model(s: str) -> List[byte] {
+    var out = List[byte]()
+    for b in s.bytes() { (mut out).push(b) }
+    out
+}
+
+fn aux_cstr(pool: syn.SynPool, program: int, id: int) -> List[byte] {
+    if id <= 0 || id >= pool.aux[program].items.len then return List[byte]()
+    cstr(pool.aux[program].items[id])
+}
+
+// embed_def_index: the first installed definition with this name, or -1.
+fn def_index(pool: syn.SynPool, defs: List[int], name: List[byte]) -> int {
+    for i in 0..defs.len {
+        if bytes_same(cstr(pool.programs[defs[i]].name), name) then return i
+    }
+    -1
+}
+
+// embed_closed_fallback: the tagged-template table reserves `gql` for
+// fallback styling without a GraphQL definition.
+fn closed_fallback(name: List[byte]) -> bool {
+    text_is(name, "gql")
+}
+
+// embed_ctx_index: a context of the guest by name, or -1.
+fn ctx_index(def: syn.SynDefinition, name: List[byte]) -> int {
+    for i in 0..def.context_names.len {
+        if bytes_same(cstr(def.context_names[i]), name) then return i
+    }
+    -1
+}
+
+fn path_has(path: List[int], npath: int, def: int, ctx: int, level: int) -> bool {
+    for i in 0..npath {
+        if path[i * 3] == def && path[i * 3 + 1] == ctx && path[i * 3 + 2] == level then return true
+    }
+    false
+}
+
+fn depth_better(candidate: EmbedDepth, held: EmbedDepth) -> bool {
+    candidate.frames > held.frames || candidate.frames == held.frames && candidate.defs > held.defs
+}
+
+// embed_chain_prefix: HOST, 0x1f, then as much of the held chain as fits
+// in 511 bytes.
+fn chain_prefix(mut depth: EmbedDepth, host: List[byte]) {
+    let prefix = if host.len > EMBED_CHAIN_CAP - 2 then EMBED_CHAIN_CAP - 2 else host.len
+    var held = depth.chain.len
+    if held > EMBED_CHAIN_CAP - prefix - 2 {
+        held = EMBED_CHAIN_CAP - prefix - 2
+    }
+    var out = List[byte]()
+    for i in 0..prefix { (mut out).push(host[i]) }
+    (mut out).push(31 as byte)
+    for i in 0..held { (mut out).push(depth.chain[i]) }
+    depth.chain = out
+}
+
+fn chain_of(name: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    for i in 0..name.len {
+        if i >= EMBED_CHAIN_CAP - 1 then break
+        (mut out).push(name[i])
+    }
+    out
+}
+
+fn path_set(mut path: List[int], npath: int, def: int, ctx: int, level: int) {
+    while path.len < (npath + 1) * 3 { (mut path).push(0) }
+    path[npath * 3] = def
+    path[npath * 3 + 1] = ctx
+    path[npath * 3 + 2] = level
+}
+
+// embed_combined_depth_limit, recursive as C's: the path is capped at 64
+// entries, so the recursion is too.
+fn depth_limit(
+    pool: syn.SynPool,
+    defs: List[int],
+    index: int,
+    ctx: int,
+    mut path: List[int],
+    npath0: int,
+    def_cap: int,
+    level: int,
+    require_dynamic: bool,
+    allow_dynamic: bool,
+) -> EmbedDepth {
+    var best = depth_empty()
+    if index < 0 || index >= defs.len || def_cap == 0 then return best
+    let program = defs[index]
+    best.frames = if require_dynamic then 0 else 1
+    best.defs = if require_dynamic then 0 else 1
+    best.chain = chain_of(def_name(pool, program))
+    if ctx < 0 ||
+        ctx >= pool.programs[program].contexts.len ||
+        npath0 >= EMBED_PATH_MAX ||
+        path_has(path, npath0, index, ctx, level) {
+        return best
+    }
+    path_set(mut path, npath0, index, ctx, level)
+    let npath = npath0 + 1
+    let first = pool.programs[program].contexts[ctx].first_rule
+    for i in 0..pool.programs[program].contexts[ctx].nrules {
+        let r = first + i
+        let op = pool.programs[program].rules[r].op
+        if op == syn.SYN_OP_PUSH {
+            let pushes = pool.programs[program].rules[r].pushes.len
+            if pushes == 0 {
+                var candidate = depth_limit(
+                    pool,
+                    defs,
+                    index,
+                    pool.programs[program].rules[r].target,
+                    mut path,
+                    npath,
+                    def_cap,
+                    level,
+                    require_dynamic,
+                    allow_dynamic,
+                )
+                if candidate.frames != 0 {
+                    candidate.frames += 1
+                }
+                if depth_better(candidate, best) {
+                    best = candidate
+                }
+            } else {
+                for j in 0..pushes {
+                    var candidate = depth_limit(
+                        pool,
+                        defs,
+                        index,
+                        pool.programs[program].rules[r].pushes[j],
+                        mut path,
+                        npath,
+                        def_cap,
+                        level,
+                        require_dynamic,
+                        allow_dynamic,
+                    )
+                    if candidate.frames != 0 {
+                        candidate.frames += j + 1
+                    }
+                    if depth_better(candidate, best) {
+                        best = candidate
+                    }
+                }
+            }
+        } else if op == syn.SYN_OP_EMBED {
+            let kind = pool.programs[program].rules[r].embed.lang_kind
+            var guest = -1
+            var guest_level = level
+            if kind == syn.SYN_EMBED_LANG_SELF {
+                guest = index
+                guest_level = level + 1
+            } else if kind == syn.SYN_EMBED_LANG_LITERAL {
+                guest = def_index(
+                    pool,
+                    defs,
+                    aux_cstr(pool, program, pool.programs[program].rules[r].embed.lang),
+                )
+            }
+            if kind == syn.SYN_EMBED_LANG_CAPTURE {
+                if allow_dynamic && def_cap > 1 {
+                    for g in 0..defs.len {
+                        if g != index {
+                            var dynamic = depth_limit(
+                                pool,
+                                defs,
+                                g,
+                                pool.programs[defs[g]].root,
+                                mut path,
+                                npath,
+                                def_cap - 1,
+                                level,
+                                false,
+                                true,
+                            )
+                            if dynamic.frames != 0 {
+                                dynamic.frames += 2
+                                dynamic.defs += 1
+                                dynamic.dynamic = true
+                                chain_prefix(mut dynamic, def_name(pool, program))
+                                if dynamic.defs <= def_cap && depth_better(dynamic, best) {
+                                    best = dynamic
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if guest >= 0 {
+                var guest_ctx = pool.programs[defs[guest]].root
+                var reachable = true
+                let ctx_id = pool.programs[program].rules[r].embed.ctx
+                if ctx_id != 0 {
+                    let found = ctx_index(
+                        pool.programs[defs[guest]],
+                        aux_cstr(pool, program, ctx_id),
+                    )
+                    if found < 0 {
+                        reachable = false
+                    } else {
+                        guest_ctx = found
+                    }
+                }
+                if reachable && def_cap > 1 {
+                    var candidate = depth_limit(
+                        pool,
+                        defs,
+                        guest,
+                        guest_ctx,
+                        mut path,
+                        npath,
+                        def_cap - 1,
+                        guest_level,
+                        require_dynamic,
+                        allow_dynamic,
+                    )
+                    if candidate.frames != 0 {
+                        candidate.frames += 2
+                        candidate.defs += 1
+                        chain_prefix(mut candidate, def_name(pool, program))
+                        if candidate.defs <= def_cap && depth_better(candidate, best) {
+                            best = candidate
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+// ast_embed_sites: every map's `embed.lang` value node, in C's pre-order
+// (a map's own site before its values'), walked with an explicit stack.
+fn embed_sites(data: syn.SynData) -> List[int] {
+    var sites = List[int]()
+    let root = data.program.root
+    if root < 0 then return sites
+    var stack = List[int]()
+    (mut stack).push(root)
+    while stack.len != 0 {
+        let node = (mut stack).pop() else -1
+        if syn.syn_data_is(data, node, fl.FL_A_MAP) {
+            let embed = syn.syn_data_map_get(data, node, "embed") else -1
+            let lang = syn.syn_data_map_get(data, embed, "lang") else -1
+            if lang >= 0 then (mut sites).push(lang)
+            let count = data.program.nodes[node].c
+            var k = count
+            while k > 0 {
+                k -= 1
+                (mut stack).push(data.program.edges[data.program.nodes[node].b + k])
+            }
+        } else if syn.syn_data_is(data, node, fl.FL_A_LIST) {
+            var k = data.program.nodes[node].b
+            while k > 0 {
+                k -= 1
+                (mut stack).push(data.program.edges[data.program.nodes[node].a + k])
+            }
+        }
+    }
+    sites
+}
+
+// embed_selector_span: a static selector's span covers its text inside the
+// quotes; a dynamic one points at its closing quote.
+fn selector_span(data: syn.SynData, node: int, dynamic: bool) -> fl.FlSpan {
+    var span = copy data.program.nodes[node].sp
+    let id = syn.syn_data_string_id(data, node) else 0
+    let n = if id > 0 then data.strings.items[id].len else 0
+    if dynamic {
+        if span.len != 0 {
+            span.col += span.len - 1
+        }
+        span.len = 1
+    } else {
+        span.col += 1
+        span.len = if n > 4294967295 then 4294967295 else n
+    }
+    span
+}
+
+// The chain with each 0x1f rendered as U+2192, as C renders it into 512 bytes.
+fn rendered_chain(chain: List[byte]) -> List[byte] {
+    var out = List[byte]()
+    for b in chain {
+        if out.len + 4 >= EMBED_CHAIN_CAP then break
+        if b as int == 31 {
+            (mut out).push(226 as byte)
+            (mut out).push(134 as byte)
+            (mut out).push(146 as byte)
+        } else {
+            (mut out).push(b)
+        }
+    }
+    out
+}
+
+fn message(before: List[byte], s: str) -> List[byte] {
+    var out = copy before
+    for b in s.bytes() { (mut out).push(b) }
+    out
+}
+
+/// `check_embed_source`: add the embed report's diagnostics to a compiled
+/// definition's result. `pool` holds every installed definition, `installed`
+/// their programs in language-id order, `subject` the checked definition's
+/// own program (pooled for the walk). `source` is the checked file's bytes.
+pub fn embed_check(
+    mut result: syn.SynCompileResult,
+    pool: syn.SynPool,
+    installed: List[int],
+    subject: int,
+    path: str,
+    source: List[byte],
+) {
+    let data = syn.syn_data_parse(path, source)
+    let sites = embed_sites(data)
+    if sites.len == 0 then return
+    let subject_name = cstr(pool.programs[subject].name)
+    var defs = List[int]()
+    for program in installed {
+        if !bytes_same(cstr(pool.programs[program].name), subject_name) {
+            (mut defs).push(program)
+        }
+    }
+    let subject_index = defs.len
+    (mut defs).push(subject)
+    var has_dynamic = false
+    var static_site = -1
+    for node in sites {
+        let id = syn.syn_data_string_id(data, node) else -1
+        if id >= 0 {
+            let selector = cstr(data.strings.items[id])
+            let is_self = text_is(selector, "@self")
+            if selector.len != 0 && selector[0] as int == 64 && !is_self {
+                has_dynamic = true
+            } else if is_self {
+                if static_site < 0 {
+                    static_site = node
+                }
+            } else if def_index(pool, defs, selector) < 0 && !closed_fallback(selector) {
+                var text = model("embed: no definition named '")
+                for b in selector { (mut text).push(b) }
+                (mut text).push(39 as byte)
+                syn.syn_compile_emit(
+                    mut result,
+                    fl.FL_DIAG_ERROR,
+                    selector_span(data, node, false),
+                    text,
+                )
+            } else if static_site < 0 {
+                static_site = node
+            }
+        }
+    }
+    var walk = List[int]()
+    let depth = depth_limit(
+        pool,
+        defs,
+        subject_index,
+        pool.programs[subject].root,
+        mut walk,
+        0,
+        syn.SYN_DEF_MAX,
+        0,
+        false,
+        false,
+    )
+    if static_site >= 0 && depth.frames > syn.SYN_DEPTH_MAX {
+        let text = message(
+            rendered_chain(depth.chain),
+            " can reach depth {depth.frames}; the cap is {syn.SYN_DEPTH_MAX}",
+        )
+        syn.syn_compile_emit(
+            mut result,
+            fl.FL_DIAG_ERROR,
+            selector_span(data, static_site, false),
+            text,
+        )
+    }
+    if has_dynamic {
+        var walk2 = List[int]()
+        let dynamic = depth_limit(
+            pool,
+            defs,
+            subject_index,
+            pool.programs[subject].root,
+            mut walk2,
+            0,
+            syn.SYN_DEF_MAX,
+            0,
+            true,
+            true,
+        )
+        if dynamic.frames > syn.SYN_DEPTH_MAX {
+            for node in sites {
+                let id = syn.syn_data_string_id(data, node) else -1
+                if id >= 0 {
+                    let selector = cstr(data.strings.items[id])
+                    if selector.len != 0 &&
+                        selector[0] as int == 64 &&
+                        !text_is(selector, "@self") {
+                        var text = model("dynamic embed has worst installed chain ")
+                        for b in rendered_chain(dynamic.chain) { (mut text).push(b) }
+                        let over = dynamic.frames - syn.SYN_DEPTH_MAX
+                        for b in "; cap exceeded by {over} frame(s)".bytes() { (mut text).push(b) }
+                        syn.syn_compile_emit(
+                            mut result,
+                            fl.FL_DIAG_WARNING,
+                            selector_span(data, node, true),
+                            text,
+                        )
+                        break
+                    }
+                }
+            }
+        }
+    }
+}

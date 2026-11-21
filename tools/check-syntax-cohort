@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Check a named, exhaustive partition of the pinned syntax goldens.
+
+    tools/check-syntax-cohort --yew BIN --oracle TREE --work NEW_DIR
+                              [--cohort first|deferred|all]
+    tools/check-syntax-cohort --yew BIN --oracle TREE --work NEW_DIR
+                              --tables C_YEW
+    tools/check-syntax-cohort --yew BIN --oracle TREE --work NEW_DIR
+                              --cli C_YEW
+    tools/check-syntax-cohort --self-test
+
+The first cohort is 132 unchanged pairs. The remaining 300 are explicitly
+recorded, not silently skipped. Both ledgers together must equal the pinned
+oracle's complete manifest expansion, and input/golden bytes are pinned too.
+Each selected fixture is dumped twice and compared byte for byte. No golden
+update mode exists. Work directories must be new and remain available after
+failure. Run the editor under the enclosing gate's memory/CPU limits.
+
+--tables C_YEW compares `syn dump DEF --tables` of every first-cohort
+definition with the same dump from C yew built at the pin: the compiled
+contexts, rules, first-byte masks, flags and captures, byte for byte.
+
+--cli C_YEW runs the same `yew syn` command lines through both binaries
+and compares exit status, stdout and stderr: usage errors, `list`,
+`compile` of every shipped definition and `--all`, `check --strict` of
+every shipped definition and of tests/fixtures/syn/embed/'s definitions
+(the embed report's selector and depth diagnostics). The routes stage one refuses by name (the cache
+and the coverage and embed reports) are listed in CLI_DEFERRED and must
+refuse; they are not compared with C.
+"""
+import argparse
+import csv
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+PIN = '9ace98c2adfeb9d63e7da4bdb4fd6e29ae5c3e4a'
+COUNTS = {'first': 132, 'deferred': 300}
+BASE = {'wolf', 'markdown', 'c', 'python', 'sh', 'toml', 'json'}
+MD = {'01-fence-c', '10-fence-json', '13-fence-markdown', '14-fence-python',
+      '16-fence-sh', '17-fence-toml', '20-fence-unknown',
+      '23-longer-closing-run', '24-empty-info-fallback'}
+HEADER = ['cohort', 'definition', 'language', 'input', 'input_sha256', 'golden', 'golden_sha256']
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def pinned_revision(tree):
+    rev = subprocess.run(['git', '-C', str(tree), 'rev-parse', 'HEAD'],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    if rev != PIN:
+        raise ValueError(f'oracle HEAD is {rev}, need {PIN}')
+
+
+def manifest_pairs(tree):
+    """Same source globs and replace/append rule as check-syn-assets.sh."""
+    pairs = {}
+    manifest = tree / 'tests/syn/manifest.tsv'
+    for fields in csv.reader(manifest.read_text().splitlines(), delimiter='\t'):
+        if not fields or fields[0].startswith('#'):
+            continue
+        if len(fields) != 7:
+            raise ValueError('oracle manifest schema changed')
+        definition, language, patterns, rule, scope, _, minimum = fields
+        sources = []
+        for pattern in patterns.split(','):
+            if not pattern.startswith('tests/syn/') or '..' in Path(pattern).parts:
+                raise ValueError(f'unsafe manifest pattern {pattern}')
+            matches = sorted(p for p in tree.glob(pattern) if p.is_file())
+            if not matches:
+                raise ValueError(f'empty source pattern {pattern}')
+            sources.extend(matches)
+        if len(sources) < int(minimum):
+            raise ValueError(f'manifest minimum not met: {definition}/{scope}')
+        for source in sources:
+            relative = source.relative_to(tree).as_posix()
+            if relative in pairs:
+                raise ValueError(f'duplicate input {relative}')
+            if rule == 'replace-extension':
+                golden = source.with_suffix('.spans')
+            elif rule == 'append-spans':
+                golden = Path(str(source) + '.spans')
+            else:
+                raise ValueError(f'unknown golden rule {rule}')
+            cohort = 'deferred'
+            if language in BASE and (scope == 'base' or language == 'sh' or
+                                      language == 'markdown' and source.stem in MD):
+                cohort = 'first'
+            pairs[relative] = [cohort, definition, language, relative,
+                               digest(source.read_bytes()),
+                               golden.relative_to(tree).as_posix(), digest(golden.read_bytes())]
+    if len(pairs) != 432:
+        raise ValueError(f'oracle has {len(pairs)} pairs, need 432')
+    goldens = {p.relative_to(tree).as_posix() for p in (tree / 'tests/syn').rglob('*.spans')}
+    if goldens != {v[5] for v in pairs.values()}:
+        raise ValueError('oracle has an orphan or unlisted golden')
+    return pairs
+
+
+def load_ledger(tree):
+    pinned_revision(tree)
+    expected = manifest_pairs(tree)
+    ledger = ROOT / 'tools/syntax-cohorts.tsv'
+    lines = [s for s in ledger.read_text().splitlines() if s and not s.startswith('#')]
+    rows = list(csv.reader(lines, delimiter='\t'))
+    if not rows or rows.pop(0) != HEADER:
+        raise ValueError('cohort ledger schema changed')
+    seen, counts = set(), dict.fromkeys(COUNTS, 0)
+    for row in rows:
+        if len(row) != len(HEADER):
+            raise ValueError('malformed cohort row')
+        cohort, _, _, source, _, _, _ = row
+        if source in seen:
+            raise ValueError(f'duplicate cohort input {source}')
+        seen.add(source)
+        if expected.get(source) != row:
+            raise ValueError(f'cohort or pinned fixture bytes changed: {source}')
+        counts[cohort] += 1
+    if seen != expected.keys() or counts != COUNTS:
+        raise ValueError(f'cohort shrank or changed: {counts}; total {len(seen)}')
+    if rows != sorted(rows, key=lambda r: r[3]):
+        raise ValueError('cohort ledger is not in input-path order')
+    print(f'cohort inventory: first=132 deferred=300 total=432 pin={PIN}'
+          f' ledger_sha256={digest(ledger.read_bytes())}', flush=True)
+    return rows
+
+
+def difference(expected, first_status, first, second_status, second):
+    if first_status or second_status:
+        return 'dump-exit'
+    if first != second:
+        return 'nondeterministic'
+    if first != expected:
+        return 'span-mismatch'
+    return ''
+
+
+def selftest():
+    golden = b'line 1 entry=wolf:main exit=wolf:main\n  0..3 keyword\n'
+    assert difference(golden, 0, golden, 0, golden) == ''
+    assert difference(golden, 1, golden, 0, golden) == 'dump-exit'
+    assert difference(golden, 0, golden, 1, golden) == 'dump-exit'
+    assert difference(golden, 0, golden, 0, b'') == 'nondeterministic'
+    assert difference(golden, 0, b'', 0, b'') == 'span-mismatch'
+    print('PASS syntax_cohort_runner_controls (good, exit, second-exit, unstable, wrong-span)')
+    return 0
+
+
+CLI_DEFERRED = [['syn', 'cache', 'path'], ['syn', 'cache', 'clear'],
+                ['syn', 'check', '--embed'],
+                ['syn', 'check', '--coverage', 'runtime/syntax/c.fl', 'tests/syn/c/01-kitchen.c']]
+
+
+def cli_commands(tree):
+    defs = sorted(p.name for p in (tree / 'runtime/syntax').glob('*.fl'))
+    commands = [['syn'], ['syn', '--help'], ['syn', 'bogus'], ['syn', 'list'],
+                ['syn', 'list', 'extra'], ['--clean', 'syn', 'list'], ['syn', '--clean', 'list'],
+                ['syn', 'compile'], ['syn', 'compile', 'missing.fl'], ['syn', 'compile', '--all'],
+                ['syn', 'check'], ['syn', 'check', 'missing.fl'],
+                ['syn', 'dump', 'runtime/syntax/c.fl'],
+                ['syn', 'dump', 'runtime/syntax/c.fl', '--spans'],
+                ['syn', 'dump', 'missing.fl', '--tables'],
+                ['syn', 'dump', 'runtime/syntax/c.fl', '--spans', 'missing.c'],
+                ['syn', 'cache'], ['syn', 'cache', 'bogus']]
+    for name in defs:
+        commands.append(['syn', 'compile', 'runtime/syntax/' + name])
+        commands.append(['syn', 'check', 'runtime/syntax/' + name, '--strict'])
+    # The port's own embed fixtures: unknown, fallback, too-deep static and
+    # dynamic selectors, checked against every installed definition.
+    for fixture in sorted((ROOT / 'tests/fixtures/syn/embed').glob('*.fl')):
+        commands.append(['syn', 'check', str(fixture)])
+        commands.append(['syn', 'check', str(fixture), '--strict'])
+    return commands
+
+
+def cli(args):
+    tree, binary, work = args.oracle.resolve(), args.yew.resolve(), args.work.resolve()
+    reference = args.cli.resolve()
+    pinned_revision(tree)
+    work.mkdir(parents=True, exist_ok=False)
+    bad = 0
+    commands = cli_commands(tree)
+    for n, command in enumerate(commands):
+        runs = []
+        for label, exe in (('c', reference), ('wolf', binary)):
+            # A fresh home per run: a cache or discovery side effect of one
+            # binary must not reach the other.
+            env = isolated_env(work / f'{n}-{label}', tree)
+            result = subprocess.run([str(exe)] + command, cwd=tree, env=env, capture_output=True)
+            runs.append(result)
+        c, w = runs
+        name = 'syntax_cli_' + '_'.join(part.replace('/', '-') for part in command)
+        if (c.returncode, c.stdout, c.stderr) != (w.returncode, w.stdout, w.stderr):
+            bad += 1
+            (work / f'{n}.c.out').write_bytes(c.stdout + b'--stderr--\n' + c.stderr)
+            (work / f'{n}.wolf.out').write_bytes(w.stdout + b'--stderr--\n' + w.stderr)
+            print(f'FAIL {name} exits={c.returncode},{w.returncode}'
+                  f' stdout_same={c.stdout == w.stdout} stderr_same={c.stderr == w.stderr}'
+                  f' diff={work}/{n}.*.out', flush=True)
+        else:
+            print(f'PASS {name} exit={w.returncode}', flush=True)
+    for n, command in enumerate(CLI_DEFERRED):
+        env = isolated_env(work / f'deferred-{n}', tree)
+        w = subprocess.run([str(binary)] + command, cwd=tree, env=env, capture_output=True)
+        name = 'syntax_cli_deferred_' + '_'.join(part.replace('/', '-') for part in command[1:])
+        if w.returncode == 1 and b'not yet ported' in w.stderr:
+            print(f'PASS {name} refused by name', flush=True)
+        else:
+            bad += 1
+            print(f'FAIL {name} exit={w.returncode} (expected a refusal by name)', flush=True)
+    total = len(commands) + len(CLI_DEFERRED)
+    print(f'syntax cli: pass={total - bad} fail={bad} compared={len(commands)}'
+          f' deferred={len(CLI_DEFERRED)}', flush=True)
+    return 1 if bad else 0
+
+
+def isolated_env(work, tree):
+    home = work / 'home'
+    home.mkdir(parents=True)
+    tmp = work / 'tmp'
+    tmp.mkdir()
+    env = dict(os.environ, HOME=str(home), SHELL='/bin/sh', LC_ALL='C',
+               TMPDIR=str(tmp), XDG_CONFIG_HOME=str(home / 'config'),
+               XDG_CACHE_HOME=str(home / 'cache'), XDG_DATA_HOME=str(home / 'data'),
+               XDG_STATE_HOME=str(home / 'state'), YEW_RUNTIME_DIR=str(tree / 'runtime'),
+               YEW_NO_SYN_CACHE='1')
+    env.pop('YEW_PTY_UPDATE', None)
+    return env
+
+
+def check(args):
+    tree, binary, work = args.oracle.resolve(), args.yew.resolve(), args.work.resolve()
+    rows = load_ledger(tree)
+    work.mkdir(parents=True, exist_ok=False)
+    env = isolated_env(work, tree)
+    good, bad, selected = 0, 0, 0
+    for row in rows:
+        cohort, definition, language, source, _, golden, _ = row
+        if args.cohort != 'all' and cohort != args.cohort:
+            continue
+        selected += 1
+        name = 'syntax_' + source.removeprefix('tests/syn/').replace('/', '_').replace('.', '_')
+        command = [str(binary), 'syn', 'dump', 'runtime/syntax/' + definition + '.fl', '--spans', source]
+        observations = []
+        for take in (1, 2):
+            result = subprocess.run(command, cwd=tree, env=env, capture_output=True)
+            (work / f'{name}.{take}.stdout').write_bytes(result.stdout)
+            (work / f'{name}.{take}.stderr').write_bytes(result.stderr)
+            observations.append(result)
+        a, b = observations
+        reason = difference((tree / golden).read_bytes(), a.returncode, a.stdout, b.returncode, b.stdout)
+        if reason:
+            bad += 1
+            print(f'FAIL {name} reason={reason} exits={a.returncode},{b.returncode}'
+                  f' expected_sha256={row[6]} actual_sha256={digest(a.stdout)}', flush=True)
+        else:
+            good += 1
+            print(f'PASS {name} language={language} cohort={cohort}', flush=True)
+    expected_count = 432 if args.cohort == 'all' else COUNTS[args.cohort]
+    if selected != expected_count:
+        raise ValueError(f'selected {selected}, need {expected_count}')
+    print(f'syntax cohort {args.cohort}: pass={good} fail={bad} deferred='
+          f'{432 - selected} selected={selected} total=432', flush=True)
+    return 1 if bad else 0
+
+
+def tables(args):
+    tree, binary, work = args.oracle.resolve(), args.yew.resolve(), args.work.resolve()
+    reference = args.tables.resolve()
+    load_ledger(tree)
+    work.mkdir(parents=True, exist_ok=False)
+    env = isolated_env(work, tree)
+    bad = 0
+    for definition in sorted(BASE):
+        command = ['syn', 'dump', 'runtime/syntax/' + definition + '.fl', '--tables']
+        c = subprocess.run([str(reference)] + command, cwd=tree, env=env, capture_output=True)
+        w = subprocess.run([str(binary)] + command, cwd=tree, env=env, capture_output=True)
+        (work / f'{definition}.c').write_bytes(c.stdout)
+        (work / f'{definition}.wolf').write_bytes(w.stdout)
+        if c.returncode != 0 or w.returncode != 0 or c.stdout != w.stdout:
+            bad += 1
+            print(f'FAIL syntax_tables_{definition} exits={c.returncode},{w.returncode}'
+                  f' c_sha256={digest(c.stdout)} wolf_sha256={digest(w.stdout)}', flush=True)
+        else:
+            print(f'PASS syntax_tables_{definition} sha256={digest(w.stdout)}', flush=True)
+    print(f'syntax tables first: pass={len(BASE) - bad} fail={bad}', flush=True)
+    return 1 if bad else 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--self-test', action='store_true')
+    p.add_argument('--inventory', action='store_true')
+    p.add_argument('--yew', type=Path)
+    p.add_argument('--oracle', type=Path)
+    p.add_argument('--work', type=Path)
+    p.add_argument('--cohort', choices=('first', 'deferred', 'all'), default='first')
+    p.add_argument('--tables', type=Path, metavar='C_YEW')
+    p.add_argument('--cli', type=Path, metavar='C_YEW')
+    args = p.parse_args()
+    if args.self_test:
+        return selftest()
+    if args.oracle is None:
+        p.error('--oracle is required')
+    if args.inventory:
+        load_ledger(args.oracle.resolve())
+        return 0
+    if args.yew is None or args.work is None:
+        p.error('--yew and --work are required')
+    try:
+        if args.tables is not None:
+            return tables(args)
+        if args.cli is not None:
+            return cli(args)
+        return check(args)
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        print(f'FAIL syntax_cohort_inventory {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

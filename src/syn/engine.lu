@@ -1,0 +1,438 @@
+//! syn.engine — bounded, ordered line interpretation over compiled data.
+//! Ports sagitta engine.c:4001–4608 at 9ace98c2. The existing search VM
+//! chooses matches. Caps expose honest plain-text degradation; no grammar
+//! transition or guest loading is hidden in a terminal/renderer callback.
+
+use unicode
+
+fn engine_store_state(mut engine: SynEngine, entry: int) -> int {
+    if syn_state_matches(engine.states, entry, engine.state) { return entry }
+    syn_state_intern(mut engine.states, engine.state)
+}
+
+fn engine_truncated(mut engine: SynEngine, entry: int) -> int {
+    let _ = syn_state_read(mut engine.state, engine.states, entry)
+    var flags = syn_state_flags(engine.state) & !SYN_F_VALUE
+    if engine.has_first_line { flags = flags | SYN_F_PAST_FIRST }
+    syn_state_set_flags(mut engine.state, flags)
+    engine_store_state(mut engine, entry)
+}
+
+fn next_utf8(line: List[byte], at: int, limit: int) -> int {
+    let (_cp, n) = unicode.utf8_decode(line, at, limit)
+    if n > 0 then at + n else at + 1
+}
+
+fn engine_aux(
+    mut engine: SynEngine,
+    mut pool: SynPool,
+    program: int,
+    rule: int,
+    level: int,
+    line: List[byte],
+) -> bool {
+    syn_rule_set_aux(
+        mut pool.aux[program],
+        mut engine.state,
+        level,
+        pool.programs[program].rules[rule],
+        line,
+        engine.matcher.matched,
+    )
+}
+
+fn engine_normal_apply(
+    mut engine: SynEngine,
+    mut pool: SynPool,
+    program: int,
+    rule: int,
+    line: List[byte],
+) {
+    let aux_set = engine_aux(
+        mut engine,
+        mut pool,
+        program,
+        rule,
+        syn_state_ndef(engine.state) - 1,
+        line,
+    )
+    let flags = pool.programs[program].rules[rule].flags
+    var state_flags = syn_state_flags(engine.state)
+    if flags & SYN_RULE_STRIP != 0 && aux_set { state_flags = state_flags | SYN_F_STRIP }
+    if flags & SYN_RULE_SET_VALUE != 0 { state_flags = state_flags | SYN_F_VALUE }
+    if flags & SYN_RULE_CLR_VALUE != 0 { state_flags = state_flags & !SYN_F_VALUE }
+    syn_state_set_flags(mut engine.state, state_flags)
+    engine_local_op(mut engine, pool, program, rule, line)
+}
+
+fn engine_boundary_apply(
+    mut engine: SynEngine,
+    mut pool: SynPool,
+    host: int,
+    rule: int,
+    bridge: int,
+    level: int,
+    line: List[byte],
+) {
+    if engine.instrument then syn_state_assign(mut engine.before, engine.state)
+    let _ = engine_aux(mut engine, mut pool, host, rule, level, line)
+    engine_leave(mut engine.state, bridge)
+    engine_local_op(mut engine, pool, host, rule, line)
+    if engine.instrument {
+        cov_rule(mut engine, host, rule)
+        cov_transition(mut engine)
+    }
+}
+
+// rule_match (engine.c:2963–3052) for a scanned rule: an aux matcher,
+// the min_len rejection, then an enabled fast path, then the Pike VM.
+fn engine_rule_match(
+    mut engine: SynEngine,
+    pool: SynPool,
+    program: int,
+    index: int,
+    level: int,
+    line: List[byte],
+    len: int,
+    p: int,
+) -> bool {
+    let regex = pool.programs[program].rules[index].regex
+    if engine.fast != 0 &&
+        pool.programs[program].rules[index].aux_match == SYN_AUXM_NONE &&
+        regex > 0 &&
+        regex < pool.programs[program].regexes.len &&
+        pool.programs[program].regexes[regex].min_len <= len - p {
+        let fast = syn_fast_match(
+            pool.facts[program],
+            index,
+            pool.programs[program].regexes[regex].ngroups,
+            engine.fast,
+            line,
+            len,
+            p,
+            mut engine.matcher.matched,
+        )
+        if fast >= 0 { return fast == 1 }
+    }
+    rule_match_raw(
+        mut engine.matcher,
+        pool.programs[program],
+        pool.aux[program],
+        engine.state,
+        level,
+        pool.programs[program].rules[index],
+        line,
+        len,
+        p,
+    )
+}
+
+fn engine_empty(mut engine: SynEngine, mut pool: SynPool, line: List[byte]) {
+    let (host, rule, bridge, level) = engine_boundary(mut engine, pool, line, 0, 0) else (
+        -1,
+        -1,
+        -1,
+        0,
+    )
+    if host >= 0 {
+        engine_boundary_apply(mut engine, mut pool, host, rule, bridge, level, line)
+        return
+    }
+    var guard = 0
+    while guard <= SYN_DEPTH_MAX {
+        guard += 1
+        let top = syn_state_depth(engine.state) - 1
+        let program = engine_program(engine, syn_state_def(engine.state, top))
+        let ctx = engine_ctx(engine, pool, top)
+        if !pool.facts[program].context_has_aux[ctx] { return }
+        let first = pool.programs[program].contexts[ctx].first_rule
+        var selected = -1
+        var i = 0
+        while i < pool.programs[program].contexts[ctx].nrules {
+            let index = first + i
+            if index >= pool.programs[program].rules.len { return }
+            if syn_rule_enabled(pool.programs[program].rules[index], engine.state) &&
+                engine_rule_match(
+                    mut engine,
+                    pool,
+                    program,
+                    index,
+                    syn_state_ndef(engine.state) - 1,
+                    line,
+                    0,
+                    0,
+                ) &&
+                engine.matcher.matched.hi[0] == 0 {
+                selected = index
+                break
+            }
+            i += 1
+        }
+        if selected < 0 { return }
+        if engine.instrument {
+            syn_state_assign(mut engine.before, engine.state)
+            cov_rule(mut engine, program, selected)
+            if pool.programs[program].rules[selected].op == SYN_OP_EMBED {
+                cov_embed(mut engine, program, pool.programs[program].rules[selected].target)
+            }
+        }
+        let _ = engine_aux(
+            mut engine,
+            mut pool,
+            program,
+            selected,
+            syn_state_ndef(engine.state) - 1,
+            line,
+        )
+        engine_local_op(mut engine, pool, program, selected, line)
+        if engine.instrument then cov_transition(mut engine)
+        if pool.programs[program].rules[selected].flags & SYN_RULE_ZERO_TRANSITION == 0 ||
+            pool.programs[program].rules[selected].op == SYN_OP_STAY {
+            return
+        }
+    }
+}
+
+/// Interpret a physical line without its CR/LF terminator. For a declared
+/// length above 64 KiB no content bytes are accessed, allowing a bounded
+/// buffer reader to represent a huge inert line without copying it. The
+/// caller may retain backing bytes beyond the logical length and owns reusable output. traced explicitly requests pre-EOL states;
+/// normal editing passes false and allocates no per-byte state array.
+pub fn syn_line(
+    mut engine: SynEngine,
+    mut pool: SynPool,
+    entry_in: int,
+    line: List[byte],
+    declared_len: int,
+    mut out: SynSpans,
+    traced: bool,
+) {
+    if declared_len < 0 ||
+        declared_len > 4294967295 ||
+        declared_len <= SYN_LINE_BYTE_CAP && declared_len > line.len {
+        syn_bug("syntax: invalid line length")
+    }
+    let entry = if syn_state_has(engine.states, entry_in) then entry_in else SYN_STATE_ROOT
+    let _ = syn_state_read(mut engine.state, engine.states, entry)
+    syn_spans_clear(mut out, entry)
+    engine.line_calls += 1
+    engine.last_attempts = 0
+    engine.pending_lang = 0
+    engine.refused_lang = 0
+    engine.unknown_start = -1
+    engine.unknown_len = 0
+    engine.unknown_program = -1
+    engine.unknown_literal = 0
+    engine.deferred_slot = -1
+    engine.instrument = engine.coverage.len != 0 && !traced
+    if engine.instrument {
+        let depth = syn_state_depth(engine.state)
+        if depth != 0 then cov_frame(mut engine, depth - 1)
+    }
+    engine_trace_begin(mut engine, declared_len, traced)
+    if declared_len > SYN_LINE_BYTE_CAP {
+        syn_spans_emit_truncated(mut out, declared_len)
+        out.exit_state = engine_truncated(mut engine, entry)
+        out.stop = SYN_STOP_BYTES
+        return
+    }
+    let len = declared_len
+    if len == 0 {
+        engine_empty(mut engine, mut pool, line)
+        if engine.trace_valid { trace_write(mut engine.trace_data, engine.state, 0, 0) }
+    }
+    var p = 0
+    var zero = 0
+    let step_cap = 4096 + 8 * len
+    while p < len {
+        let top = syn_state_depth(engine.state) - 1
+        let program = engine_program(engine, syn_state_def(engine.state, top))
+        let ctx = engine_ctx(engine, pool, top)
+        let default_attr = if syn_state_frame_flags(engine.state, top) & SYN_FR_BRIDGE != 0 {
+            pool.programs[program].contexts[ctx].embed.fallback
+        } else {
+            pool.programs[program].contexts[ctx].default_attr
+        }
+        engine_masks(mut engine, pool, program, ctx)
+        let possible = if p == 0 {
+            syn_first_has(engine.mask_bol, line[p] as int)
+        } else {
+            syn_first_has(engine.mask_other, line[p] as int)
+        }
+        if !possible {
+            var q = p + 1
+            while q < len && !syn_first_has(engine.mask_other, line[q] as int) { q += 1 }
+            syn_spans_emit(mut out, p, q - p, default_attr, 0)
+            if engine.trace_valid { trace_write(mut engine.trace_data, engine.state, p + 1, q) }
+            p = q
+            continue
+        }
+        let (host, end_rule, bridge, level) = engine_boundary(mut engine, pool, line, len, p) else (
+            -1,
+            -1,
+            -1,
+            0,
+        )
+        if host >= 0 {
+            if engine.trace_valid { syn_state_assign(mut engine.before, engine.state) }
+            let end = engine.matcher.matched.hi[0]
+            syn_emit_match(
+                mut out,
+                pool.programs[host].rules[end_rule],
+                engine.matcher.matched,
+                end,
+            )
+            engine_boundary_apply(mut engine, mut pool, host, end_rule, bridge, level, line)
+            if end > p {
+                if engine.trace_valid {
+                    trace_write(mut engine.trace_data, engine.before, p + 1, end - 1)
+                    trace_write(mut engine.trace_data, engine.state, end, end)
+                }
+                p = end
+            } else {
+                if engine.trace_valid { trace_write(mut engine.trace_data, engine.state, p, p) }
+                if zero < SYN_DEPTH_MAX { zero += 1; continue }
+                p = next_utf8(line, p, len)
+            }
+            continue
+        }
+        let first = pool.programs[program].contexts[ctx].first_rule
+        var selected = -1
+        var i = 0
+        let indexed = pool.facts[program].candidates
+        while i < pool.programs[program].contexts[ctx].nrules {
+            let index = first + i
+            // C walks the byte's candidate list when the index exists, and
+            // otherwise every rule, spending a step before the mask test.
+            let skip = index < pool.programs[program].rules.len &&
+                pool.programs[program].rules[index].aux_match == SYN_AUXM_NONE &&
+                !syn_first_has(
+                    pool.facts[program].firsts[pool.facts[program].first_slot[index]],
+                    line[p] as int,
+                )
+            if indexed && skip {
+                i += 1
+                continue
+            }
+            engine.last_attempts += 1
+            if engine.last_attempts > step_cap || index >= pool.programs[program].rules.len {
+                syn_spans_emit(mut out, p, len - p, SYN_ATTR_TEXT, SYN_SPAN_TRUNCATED)
+                out.exit_state = engine_truncated(mut engine, entry)
+                out.stop = SYN_STOP_STEPS
+                engine.trace_valid = false
+                return
+            }
+            if skip {
+                i += 1
+                continue
+            }
+            if syn_rule_enabled(pool.programs[program].rules[index], engine.state) &&
+                engine_rule_match(
+                    mut engine,
+                    pool,
+                    program,
+                    index,
+                    syn_state_ndef(engine.state) - 1,
+                    line,
+                    len,
+                    p,
+                ) {
+                selected = index
+                break
+            }
+            i += 1
+        }
+        if selected < 0 {
+            let q = next_utf8(line, p, len)
+            syn_spans_emit(mut out, p, q - p, default_attr, 0)
+            if engine.trace_valid { trace_write(mut engine.trace_data, engine.state, p + 1, q) }
+            p = q
+            continue
+        }
+        if engine.trace_valid || engine.instrument {
+            syn_state_assign(mut engine.before, engine.state)
+        }
+        if engine.instrument {
+            cov_rule(mut engine, program, selected)
+            if pool.programs[program].rules[selected].op == SYN_OP_EMBED {
+                cov_embed(mut engine, program, pool.programs[program].rules[selected].target)
+            }
+        }
+        var end = engine.matcher.matched.hi[0]
+        let consume = pool.programs[program].rules[selected].consume
+        if consume != 0 &&
+            consume < engine.matcher.matched.ngroups &&
+            engine.matcher.matched.hi[consume] >= 0 {
+            end = engine.matcher.matched.hi[consume]
+        }
+        if end < p || end > engine.matcher.matched.hi[0] {
+            syn_bug("syntax: consume group ends outside whole match")
+        }
+        if consume == 3 &&
+            engine.matcher.matched.ngroups == 5 &&
+            engine.fast & SYN_FAST_YAML_BLOCK_KEY != 0 &&
+            pool.facts[program].yaml[selected] != 0 {
+            syn_emit_yaml_block_key(
+                mut out,
+                pool.programs[program].rules[selected],
+                engine.matcher.matched,
+            )
+        } else {
+            syn_emit_match(
+                mut out,
+                pool.programs[program].rules[selected],
+                engine.matcher.matched,
+                end,
+            )
+        }
+        engine_normal_apply(mut engine, mut pool, program, selected, line)
+        if engine.instrument then cov_transition(mut engine)
+        if end > p {
+            if engine.trace_valid {
+                trace_write(mut engine.trace_data, engine.before, p + 1, end - 1)
+                trace_write(mut engine.trace_data, engine.state, end, end)
+            }
+            p = end
+        } else if pool.programs[program].rules[selected].flags & SYN_RULE_ZERO_TRANSITION != 0 &&
+            pool.programs[program].rules[selected].op != SYN_OP_STAY &&
+            p == 0 &&
+            zero < SYN_DEPTH_MAX {
+            zero += 1
+            if engine.trace_valid { trace_write(mut engine.trace_data, engine.state, p, p) }
+        } else {
+            let after_top = syn_state_depth(engine.state) - 1
+            let after_program = engine_program(engine, syn_state_def(engine.state, after_top))
+            let after_ctx = engine_ctx(engine, pool, after_top)
+            let q = next_utf8(line, p, len)
+            syn_spans_emit(
+                mut out,
+                p,
+                q - p,
+                pool.programs[after_program].contexts[after_ctx].default_attr,
+                0,
+            )
+            if engine.trace_valid { trace_write(mut engine.trace_data, engine.state, p + 1, q) }
+            p = q
+        }
+    }
+    engine_eol(mut engine, pool, line, len)
+    out.exit_state = engine_store_state(mut engine, entry)
+}
+
+/// yew_syn_stack_at: the state before byte `p` (clamped to the line end)
+/// from an explicit traced run, which never counts coverage. False past the
+/// byte cap or when the run degraded before writing its trace.
+pub fn syn_stack_at(
+    mut out: SynState,
+    mut engine: SynEngine,
+    mut pool: SynPool,
+    entry: int,
+    line: List[byte],
+    len: int,
+    p: int,
+) -> bool {
+    if len < 0 || len > SYN_LINE_BYTE_CAP || len > line.len { return false }
+    var spans = syn_spans_new(SYN_MAX_SPANS)
+    syn_line(mut engine, mut pool, entry, line, len, mut spans, true)
+    syn_engine_trace_at(mut out, engine, if p > len then len else p)
+}

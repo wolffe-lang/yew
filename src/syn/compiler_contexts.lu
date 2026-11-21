@@ -1,0 +1,242 @@
+//! syn.compiler_contexts — ordered context inclusion without call-stack
+//! recursion. Ports sagitta src/syn/defs.c:737–893 and :1343–1509 at
+//! 9ace98c2. Include cycles are errors; recursive runtime pushes are not.
+
+use fl
+
+struct SynExpandFrame { ctx: int, phase: int, index: int }
+
+fn c_ctx_from(c: SynCompiler, name_id: int, offset: int) -> int {
+    var i = 0
+    while i < c.specs.len {
+        let other = c.specs[i].name
+        if c.data.strings.items[other].len == c.data.strings.items[name_id].len - offset {
+            var j = 0
+            var equal = true
+            while j < c.data.strings.items[other].len {
+                if c.data.strings.items[other][j] != c.data.strings.items[name_id][offset + j] {
+                    equal = false
+                    break
+                }
+                j += 1
+            }
+            if equal { return i }
+        }
+        i += 1
+    }
+    -1
+}
+
+fn c_named_slice(mut c: SynCompiler, node: int, before: str, id: int, offset: int, after: str) {
+    var message = model_bytes(before)
+    var i = offset
+    while i < c.data.strings.items[id].len && c.data.strings.items[id][i] as int != 0 {
+        (mut message).push(c.data.strings.items[id][i])
+        i += 1
+    }
+    for b in after.bytes() { (mut message).push(b) }
+    c_emit_bytes(mut c, fl.FL_DIAG_ERROR, node, message)
+}
+
+fn c_include_push(
+    mut c: SynCompiler,
+    mut stack: List[SynExpandFrame],
+    mut active: List[bool],
+    id: int,
+    offset: int,
+    via: int,
+) {
+    let target = c_ctx_from(c, id, offset)
+    if target < 0 { c_named_slice(mut c, via, "no context named '", id, offset, "'"); return }
+    c.specs[target].include_used = true
+    if active[target] {
+        let name = c.specs[target].name
+        c_named(mut c, fl.FL_DIAG_ERROR, via, "include cycle reaches '", name, "'")
+        return
+    }
+    active[target] = true
+    (mut stack).push(SynExpandFrame { ctx: target, phase: 0, index: 0 })
+}
+
+fn c_expand(mut c: SynCompiler, root: int) -> List[SynRuleRef] {
+    var out = List[SynRuleRef]()
+    var active = List[bool]()
+    var i = 0
+    while i < c.specs.len { (mut active).push(false); i += 1 }
+    var stack = List[SynExpandFrame]()
+    active[root] = true
+    (mut stack).push(SynExpandFrame { ctx: root, phase: 0, index: 0 })
+    while stack.len != 0 {
+        let top = stack.len - 1
+        let ctx = stack[top].ctx
+        if stack[top].phase == 0 {
+            let include = c.specs[ctx].includes
+            if include < 0 {
+                stack[top].phase = 1
+                stack[top].index = 0
+                continue
+            }
+            let single = syn_data_string_id(c.data, include) else 0
+            if single != 0 {
+                if stack[top].index == 0 {
+                    stack[top].index = 1
+                    c_include_push(mut c, mut stack, mut active, single, 0, include)
+                } else {
+                    stack[top].phase = 1
+                    stack[top].index = 0
+                }
+                continue
+            }
+            if !syn_data_is(c.data, include, fl.FL_A_LIST) {
+                c_error(mut c, include, "context include must be a string or list")
+                stack[top].phase = 1
+                stack[top].index = 0
+                continue
+            }
+            if stack[top].index >= c.data.program.nodes[include].b {
+                stack[top].phase = 1
+                stack[top].index = 0
+                continue
+            }
+            let item = c_item(c, include, stack[top].index)
+            stack[top].index += 1
+            let id = syn_data_string_id(c.data, item) else 0
+            if id == 0 {
+                c_error(mut c, item, "context include entries must be strings")
+            } else {
+                c_include_push(mut c, mut stack, mut active, id, 0, item)
+            }
+            continue
+        }
+        let rules = c.specs[ctx].rules
+        if !syn_data_is(c.data, rules, fl.FL_A_LIST) ||
+            stack[top].index >= c.data.program.nodes[rules].b {
+            active[ctx] = false
+            let _ = (mut stack).pop() else SynExpandFrame { ctx: 0, phase: 0, index: 0 }
+            continue
+        }
+        let node = c_item(c, rules, stack[top].index)
+        stack[top].index += 1
+        if syn_data_is(c.data, node, fl.FL_A_MAP) {
+            if out.len == 65536 {
+                c_error(mut c, node, "too many expanded rules (max 65536)")
+                return out
+            }
+            (mut out).push(SynRuleRef { node: node, owner: ctx })
+        } else {
+            let id = syn_data_string_id(c.data, node) else 0
+            if id == 0 {
+                c_error(mut c, node, "rule must be a map or 'include:NAME'")
+            } else {
+                let n = c.data.strings.items[id].len
+                var prefix = n > 8
+                i = 0
+                while prefix && i < 8 {
+                    if c.data.strings.items[id][i] != "include:".bytes()[i] { prefix = false }
+                    i += 1
+                }
+                if !prefix {
+                    c_error(mut c, node, "rule-list string must be 'include:NAME'")
+                } else {
+                    c_include_push(mut c, mut stack, mut active, id, 8, node)
+                }
+            }
+        }
+    }
+    out
+}
+
+fn c_target(mut c: SynCompiler, node: int, what: str) -> int {
+    let id = c_string(mut c, node, what)
+    if id == 0 { return -1 }
+    let target = c_ctx_from(c, id, 0)
+    if target < 0 {
+        c_named(mut c, fl.FL_DIAG_ERROR, node, "no context named '", id, "'")
+        return -1
+    }
+    target
+}
+
+fn c_pop(mut c: SynCompiler, node: int) -> int {
+    let b = syn_data_boolean(c.data, node) else {
+        let value = syn_data_integer(c.data, node) else {
+            c_error(mut c, node, "pop must be an integer")
+            return 0
+        }
+        if value < 1 || value > 4 {
+            c_error(mut c, node, "pop count {value} is out of range (1-4)")
+            return 0
+        }
+        return value
+    }
+    if !b { c_error(mut c, node, "pop: false is not an operation; omit pop instead"); return 0 }
+    1
+}
+
+fn c_eol(mut c: SynCompiler, id: int, mut ctx: SynContext) {
+    let node = c.specs[id].eol_node
+    if node < 0 { return }
+    let text = c_string(mut c, node, "at_eol")
+    if text == 0 { return }
+    if c_bytes_is(c.data.strings.items[text], "stay") { return }
+    if c_bytes_is(c.data.strings.items[text], "pop") {
+        ctx.eol_op = SYN_OP_POP
+        ctx.eol_nop = 1
+        return
+    }
+    let n = c.data.strings.items[text].len
+    if n > 4 {
+        var pop = true
+        var set = true
+        var i = 0
+        while i < 4 {
+            if c.data.strings.items[text][i] != "pop:".bytes()[i] { pop = false }
+            if c.data.strings.items[text][i] != "set:".bytes()[i] { set = false }
+            i += 1
+        }
+        if pop {
+            var value: int = 0
+            var valid = n - 4 < 16
+            i = 4
+            while i < n {
+                let b = c.data.strings.items[text][i] as int
+                if b < 48 || b > 57 || value > 4 { valid = false; break }
+                value = value * 10 + b - 48
+                i += 1
+            }
+            if !valid || value < 1 || value > 4 {
+                c_error(mut c, node, "at_eol pop count is out of range (1-4)")
+            } else {
+                ctx.eol_op = SYN_OP_POP
+                ctx.eol_nop = value
+            }
+            return
+        }
+        if set {
+            let target = c_ctx_from(c, text, 4)
+            if target < 0 {
+                c_named_slice(mut c, node, "no context named '", text, 4, "'")
+            } else {
+                ctx.eol_op = SYN_OP_SET
+                ctx.eol_target = target
+                c.specs[target].pushed = true
+            }
+            return
+        }
+    }
+    c_named(mut c, fl.FL_DIAG_ERROR, node, "invalid at_eol '", text, "'")
+}
+
+fn c_unit(mut c: SynCompiler, id: int, mut ctx: SynContext) {
+    let node = c.specs[id].unit_node
+    if node < 0 { return }
+    let text = c_string(mut c, node, "unit")
+    if text == 0 { return }
+    if c_bytes_is(c.data.strings.items[text], "span") {
+        ctx.flags = ctx.flags | SYN_CTX_UNIT_SPAN
+    } else if c_bytes_is(c.data.strings.items[text], "atom") {
+        ctx.flags = ctx.flags | SYN_CTX_UNIT_ATOM
+    } else {
+        c_error(mut c, node, "unit must be 'span' or 'atom'")
+    }
+}

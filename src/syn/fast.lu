@@ -1,0 +1,1043 @@
+//! syn.fast — exact fast paths over compiled regex programs.
+//! Ports sagitta src/syn/engine.c at 9ace98c2: the ASCII predicates and
+//! program-shape detectors (:285–597), the effective first bytes
+//! (:1193–1283), word-literal sets (:694–1023), finite-literal sets
+//! (:1036–1186) and their matchers (:2566–2961). A fast path reads only
+//! the compiled program, never a language token, and answers -1 (the
+//! Pike VM decides), 0 (no match) or 1 (a match, groups written as the VM
+//! would write them). The word and finite enumerations walk the program
+//! with explicit stacks, in the C recursion's order.
+
+use search
+use unicode
+
+const WORD_PROG_MAX: int = 4096
+
+const WORD_COUNT_MAX: int = 4096
+
+const WORD_BYTES_MAX: int = 262144
+
+const WORD_STEPS_MAX: int = 65536
+
+const FINITE_LITERAL_MAX: int = 512
+
+const FINITE_BYTES_MAX: int = 32768
+
+const FINITE_LENGTH_MAX: int = 256
+
+// The ASCII predicates (C's AsciiPred functions) by number; the identifier
+// class kinds are the first five (SYN_IDENT_CLASS_START..CAMEL_CONTINUE).
+const P_START: int = 1
+
+const P_CONTINUE: int = 2
+
+const P_UPPER: int = 3
+
+const P_UPPER_CONTINUE: int = 4
+
+const P_CAMEL_CONTINUE: int = 5
+
+const P_SPACE: int = 6
+
+const P_YAML_START: int = 7
+
+const P_YAML_CONTINUE: int = 8
+
+const P_HEX: int = 9
+
+const P_JSON_ESCAPE: int = 10
+
+const P_JSON_KEY: int = 11
+
+/// The identifier fast path toggle bit of SynEngine.fast.
+pub const SYN_FAST_IDENTIFIER: int = 1
+
+/// The word-literal fast path toggle bit.
+pub const SYN_FAST_WORD_LITERAL: int = 2
+
+/// The finite-literal fast path toggle bit.
+pub const SYN_FAST_FINITE_LITERAL: int = 4
+
+/// The JSON-key fast path toggle bit.
+pub const SYN_FAST_JSON_KEY: int = 8
+
+/// The YAML block-key fast path toggle bit.
+pub const SYN_FAST_YAML_BLOCK_KEY: int = 16
+
+/// Every fast path enabled, as yew_syn_engine_new leaves an engine.
+pub const SYN_FAST_ALL: int = 31
+
+/// An ASCII identifier shape (C's SynIdentifierSpec): up to two literal
+/// prefix bytes, a start class, a repeated continue class, up to four
+/// literal suffix bytes and optional word boundaries.
+pub struct SynIdentSpec {
+    prefix: List[byte],
+    suffix: List[byte],
+    start_kind: int,
+    continue_kind: int,
+    boundary_before: bool,
+    boundary_after: bool,
+}
+
+/// The whole-word alternatives of a `\b(...)\b` rule (C's SynWordSet),
+/// folded when the regex is case-insensitive, with a probe table.
+pub struct SynWordSet {
+    fold: bool,
+    words: List[List[byte]],
+    slots: List[int],
+    bytes: int,
+    steps: int,
+    overflow: bool,
+}
+
+/// The finite set of literals a rule can match, in the program's
+/// priority order, with group 1's offsets (-1 when it does not take part).
+pub struct SynFiniteSet {
+    lits: List[List[byte]],
+    cap_lo: List[int],
+    cap_hi: List[int],
+    ngroups: int,
+    bytes: int,
+}
+
+fn ascii_pred(kind: int, b: int) -> bool {
+    let start = b == 95 || b >= 65 && b <= 90 || b >= 97 && b <= 122
+    let digit = b >= 48 && b <= 57
+    let space = b == 32 || b >= 9 && b <= 13
+    if kind == P_START then return start
+    if kind == P_CONTINUE then return start || digit
+    if kind == P_UPPER then return b >= 65 && b <= 90
+    if kind == P_UPPER_CONTINUE then return b >= 65 && b <= 90 || b == 95 || digit
+    if kind == P_CAMEL_CONTINUE then return b >= 65 && b <= 90 || b >= 97 && b <= 122 || digit
+    if kind == P_SPACE then return space
+    if kind == P_YAML_START then return !space && b != 35
+    if kind == P_YAML_CONTINUE then return b != 58 && b != 35
+    if kind == P_HEX then return digit || b >= 65 && b <= 70 || b >= 97 && b <= 102
+    if kind == P_JSON_ESCAPE {
+        return b == 34 ||
+            b == 92 ||
+            b == 47 ||
+            b == 98 ||
+            b == 102 ||
+            b == 110 ||
+            b == 114 ||
+            b == 116
+    }
+    if kind == P_JSON_KEY then return b >= 32 && b != 34 && b != 92
+    false
+}
+
+fn ascii_word(b: int) -> bool {
+    ascii_pred(P_CONTINUE, b)
+}
+
+fn ascii_fold(b: int) -> int {
+    if b >= 65 && b <= 90 then b + 32 else b
+}
+
+// yew_re_class_has: one binary search over the class's sorted ranges.
+fn class_has(re: search.Re, c: int, cp: int) -> bool {
+    var lo = re.cls_start[c]
+    var hi = lo + re.cls_n[c]
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if cp < re.cls_lo[mid] {
+            hi = mid
+        } else if cp > re.cls_hi[mid] {
+            lo = mid + 1
+        } else {
+            return true
+        }
+    }
+    false
+}
+
+fn class_ascii_equals(re: search.Re, c: int, kind: int) -> bool {
+    if c < 0 || c >= re.cls_start.len then return false
+    for b in 0..128 {
+        if class_has(re, c, b) != ascii_pred(kind, b) then return false
+    }
+    true
+}
+
+fn identifier_class_kind(re: search.Re, c: int) -> int {
+    if c < 0 || c >= re.cls_start.len then return 0
+    for r in 0..re.cls_n[c] {
+        if re.cls_hi[re.cls_start[c] + r] >= 128 then return 0
+    }
+    for kind in P_START..P_CAMEL_CONTINUE + 1 {
+        if class_ascii_equals(re, c, kind) then return kind
+    }
+    0
+}
+
+fn op(re: search.Re, pc: int) -> int {
+    re.prog[pc].op
+}
+
+fn arg(re: search.Re, pc: int) -> int {
+    re.prog[pc].arg
+}
+
+fn no_spec() -> SynIdentSpec {
+    SynIdentSpec {
+        prefix: List[byte](),
+        suffix: List[byte](),
+        start_kind: 0,
+        continue_kind: 0,
+        boundary_before: false,
+        boundary_after: false,
+    }
+}
+
+// regex_ascii_identifier: start_kind 0 when the program is not the shape.
+fn ascii_identifier_spec(re: search.Re) -> SynIdentSpec {
+    let n = re.prog.len
+    var spec = no_spec()
+    if re.ngroups != 1 || n < 7 || re.flags & search.RE_ICASE != 0 then return no_spec()
+    if op(re, 0) != search.RE_SAVE || arg(re, 0) != 0 then return no_spec()
+    var pc = 1
+    if op(re, pc) == search.RE_WORDB {
+        spec.boundary_before = true
+        pc += 1
+    }
+    while pc < n && op(re, pc) == search.RE_CHAR && spec.prefix.len < 2 {
+        if arg(re, pc) >= 128 then return no_spec()
+        (mut spec.prefix).push(arg(re, pc) as byte)
+        pc += 1
+    }
+    if pc >= n || op(re, pc) != search.RE_CLASS then return no_spec()
+    let start_kind = identifier_class_kind(re, arg(re, pc))
+    if start_kind == 0 then return no_spec()
+    pc += 1
+    let split = pc
+    if pc + 2 >= n ||
+        op(re, pc) != search.RE_SPLIT ||
+        re.prog[pc].x != pc + 1 ||
+        re.prog[pc].y != pc + 3 ||
+        op(re, pc + 1) != search.RE_CLASS ||
+        op(re, pc + 2) != search.RE_JMP ||
+        re.prog[pc + 2].x != split {
+        return no_spec()
+    }
+    let continue_kind = identifier_class_kind(re, arg(re, pc + 1))
+    if continue_kind == 0 then return no_spec()
+    pc += 3
+    while pc < n && op(re, pc) == search.RE_CHAR && spec.suffix.len < 4 {
+        if arg(re, pc) >= 128 || !ascii_pred(continue_kind, arg(re, pc)) then return no_spec()
+        (mut spec.suffix).push(arg(re, pc) as byte)
+        pc += 1
+    }
+    if pc < n && op(re, pc) == search.RE_CHAR then return no_spec()
+    if pc >= n then return no_spec()
+    if op(re, pc) == search.RE_WORDB {
+        spec.boundary_after = true
+        pc += 1
+    }
+    if spec.suffix.len != 0 && !spec.boundary_after then return no_spec()
+    if pc + 1 >= n ||
+        op(re, pc) != search.RE_SAVE ||
+        arg(re, pc) != 1 ||
+        op(re, pc + 1) != search.RE_MATCH ||
+        pc + 2 != n {
+        return no_spec()
+    }
+    spec.start_kind = start_kind
+    spec.continue_kind = continue_kind
+    spec
+}
+
+fn shape(re: search.Re, pc: int, kind: int, value: int) -> bool {
+    op(re, pc) == kind && arg(re, pc) == value
+}
+
+fn split_to(re: search.Re, pc: int, x: int, y: int) -> bool {
+    op(re, pc) == search.RE_SPLIT && re.prog[pc].x == x && re.prog[pc].y == y
+}
+
+fn jmp_to(re: search.Re, pc: int, x: int) -> bool {
+    op(re, pc) == search.RE_JMP && re.prog[pc].x == x
+}
+
+fn is_class(re: search.Re, pc: int) -> bool {
+    op(re, pc) == search.RE_CLASS
+}
+
+// regex_identifier_suffix: `(IDENT)\s*(` or `(IDENT)\s*:`, else 0.
+fn identifier_suffix_byte(re: search.Re) -> int {
+    if re.prog.len != 13 || re.ngroups != 2 || re.flags & search.RE_ICASE != 0 then return 0
+    let s = search.RE_SAVE
+    let suffix = arg(re, 10)
+    if !shape(re, 0, s, 0) ||
+        !shape(re, 1, s, 2) ||
+        !is_class(re, 2) ||
+        !split_to(re, 3, 4, 6) ||
+        !is_class(re, 4) ||
+        !jmp_to(re, 5, 3) ||
+        !shape(re, 6, s, 3) ||
+        !split_to(re, 7, 8, 10) ||
+        !is_class(re, 8) ||
+        !jmp_to(re, 9, 7) ||
+        op(re, 10) != search.RE_CHAR ||
+        suffix != 40 && suffix != 58 ||
+        !shape(re, 11, s, 1) ||
+        op(re, 12) != search.RE_MATCH ||
+        !class_ascii_equals(re, arg(re, 2), P_START) ||
+        !class_ascii_equals(re, arg(re, 4), P_CONTINUE) ||
+        !class_ascii_equals(re, arg(re, 8), P_SPACE) {
+        return 0
+    }
+    suffix
+}
+
+// regex_json_key: the JSON object-key shape, groups 1 (the quoted key) and
+// 2 (the last character of the key's body).
+fn json_key_shape(re: search.Re) -> bool {
+    if re.prog.len != 28 || re.ngroups != 3 || re.flags != 0 then return false
+    let s = search.RE_SAVE
+    let c = search.RE_CHAR
+    shape(re, 0, s, 0) &&
+        shape(re, 1, s, 2) &&
+        shape(re, 2, c, 34) &&
+        split_to(re, 3, 4, 20) &&
+        shape(re, 4, s, 4) &&
+        split_to(re, 5, 6, 17) &&
+        split_to(re, 6, 7, 10) &&
+        shape(re, 7, c, 92) &&
+        is_class(re, 8) &&
+        jmp_to(re, 9, 16) &&
+        shape(re, 10, c, 92) &&
+        shape(re, 11, c, 117) &&
+        is_class(re, 12) &&
+        is_class(re, 13) &&
+        is_class(re, 14) &&
+        is_class(re, 15) &&
+        jmp_to(re, 16, 18) &&
+        is_class(re, 17) &&
+        shape(re, 18, s, 5) &&
+        jmp_to(re, 19, 3) &&
+        shape(re, 20, c, 34) &&
+        shape(re, 21, s, 3) &&
+        split_to(re, 22, 23, 25) &&
+        is_class(re, 23) &&
+        jmp_to(re, 24, 22) &&
+        shape(re, 25, c, 58) &&
+        shape(re, 26, s, 1) &&
+        op(re, 27) == search.RE_MATCH &&
+        class_ascii_equals(re, arg(re, 8), P_JSON_ESCAPE) &&
+        class_ascii_equals(re, arg(re, 12), P_HEX) &&
+        arg(re, 13) == arg(re, 12) &&
+        arg(re, 14) == arg(re, 12) &&
+        arg(re, 15) == arg(re, 12) &&
+        class_ascii_equals(re, arg(re, 17), P_JSON_KEY) &&
+        class_ascii_equals(re, arg(re, 23), P_SPACE)
+}
+
+// regex_yaml_block_key: `^(\s*)([^\s#][^:#]*)(:)(\s|$)`.
+fn yaml_block_key_shape(re: search.Re) -> bool {
+    if re.prog.len != 24 || re.ngroups != 5 || re.flags != 0 then return false
+    let s = search.RE_SAVE
+    shape(re, 0, s, 0) &&
+        op(re, 1) == search.RE_BOL &&
+        shape(re, 2, s, 2) &&
+        split_to(re, 3, 4, 6) &&
+        is_class(re, 4) &&
+        jmp_to(re, 5, 3) &&
+        shape(re, 6, s, 3) &&
+        shape(re, 7, s, 4) &&
+        is_class(re, 8) &&
+        split_to(re, 9, 10, 12) &&
+        is_class(re, 10) &&
+        jmp_to(re, 11, 9) &&
+        shape(re, 12, s, 5) &&
+        shape(re, 13, s, 6) &&
+        shape(re, 14, search.RE_CHAR, 58) &&
+        shape(re, 15, s, 7) &&
+        shape(re, 16, s, 8) &&
+        split_to(re, 17, 18, 20) &&
+        is_class(re, 18) &&
+        jmp_to(re, 19, 21) &&
+        op(re, 20) == search.RE_EOL &&
+        shape(re, 21, s, 9) &&
+        shape(re, 22, s, 1) &&
+        op(re, 23) == search.RE_MATCH &&
+        class_ascii_equals(re, arg(re, 4), P_SPACE) &&
+        class_ascii_equals(re, arg(re, 8), P_YAML_START) &&
+        class_ascii_equals(re, arg(re, 10), P_YAML_CONTINUE) &&
+        class_ascii_equals(re, arg(re, 18), P_SPACE)
+}
+
+// regex_is_word_literal: `\b` + a forward graph of ASCII characters and
+// classes + `\b`, at most one capture around the alternatives.
+fn word_literal_shape(re: search.Re) -> bool {
+    let n = re.prog.len
+    if n < 5 || n > WORD_PROG_MAX || re.ngroups > 2 then return false
+    if op(re, 0) != search.RE_SAVE || arg(re, 0) != 0 || op(re, 1) != search.RE_WORDB {
+        return false
+    }
+    var suffix = n - 3
+    if re.ngroups == 2 {
+        if n < 7 || !shape(re, 2, search.RE_SAVE, 2) || !shape(re, n - 4, search.RE_SAVE, 3) {
+            return false
+        }
+        suffix -= 1
+    }
+    if op(re, n - 3) != search.RE_WORDB ||
+        !shape(re, n - 2, search.RE_SAVE, 1) ||
+        op(re, n - 1) != search.RE_MATCH {
+        return false
+    }
+    var seen = List[bool]()
+    for _ in 0..n { (mut seen).push(false) }
+    var stack = List[int]()
+    (mut stack).push(if re.ngroups == 2 then 3 else 2)
+    while stack.len != 0 {
+        let pc = (mut stack).pop() else 0
+        if pc == suffix then continue
+        if pc >= suffix then return false
+        if seen[pc] then continue
+        seen[pc] = true
+        let kind = op(re, pc)
+        if kind == search.RE_CHAR {
+            if arg(re, pc) >= 128 || stack.len == WORD_PROG_MAX then return false
+            (mut stack).push(pc + 1)
+        } else if kind == search.RE_CLASS {
+            if arg(re, pc) >= re.cls_start.len || stack.len == WORD_PROG_MAX then return false
+            (mut stack).push(pc + 1)
+        } else if kind == search.RE_JMP {
+            if re.prog[pc].x <= pc || stack.len == WORD_PROG_MAX then return false
+            (mut stack).push(re.prog[pc].x)
+        } else if kind == search.RE_SPLIT {
+            if re.prog[pc].x <= pc || re.prog[pc].y <= pc || stack.len + 2 > WORD_PROG_MAX {
+                return false
+            }
+            (mut stack).push(re.prog[pc].x)
+            (mut stack).push(re.prog[pc].y)
+        } else {
+            return false
+        }
+    }
+    true
+}
+
+// class_word_byte: a class holding one identifier byte, or one ASCII case
+// pair; -1 otherwise.
+fn class_word_byte(re: search.Re, c: int) -> int {
+    if c < 0 || c >= re.cls_start.len then return -1
+    var first = -1
+    var second = -1
+    for b in 0..128 {
+        if class_has(re, c, b) {
+            if second >= 0 then return -1
+            if first < 0 {
+                first = b
+            } else {
+                second = b
+            }
+        }
+    }
+    if first >= 0 && second < 0 && ascii_word(first) then return first
+    if second >= 0 &&
+        ascii_word(first) &&
+        ascii_word(second) &&
+        ascii_fold(first) == ascii_fold(second) {
+        return ascii_fold(first)
+    }
+    -1
+}
+
+fn word_hash(word: List[byte], lo: int, hi: int, fold: bool) -> int {
+    var hash: wrapping[u64] = 14695981039346656037
+    for i in lo..hi {
+        let b = if fold then ascii_fold(word[i] as int) else word[i] as int
+        hash = (hash ^ b as wrapping[u64]) * 1099511628211
+    }
+    (hash & 2147483647) as int
+}
+
+fn word_set_new(fold: bool) -> SynWordSet {
+    SynWordSet {
+        fold: fold,
+        words: List[List[byte]](),
+        slots: List[int](),
+        bytes: 0,
+        steps: 0,
+        overflow: false,
+    }
+}
+
+fn word_set_rehash(mut set: SynWordSet, cap: int) {
+    var slots = List[int]()
+    for _ in 0..cap { (mut slots).push(-1) }
+    for w in 0..set.words.len {
+        var at = word_hash(set.words[w], 0, set.words[w].len, false) & cap - 1
+        while slots[at] >= 0 { at = at + 1 & cap - 1 }
+        slots[at] = w
+    }
+    set.slots = slots
+}
+
+// word_set_insert: words are stored already folded; duplicates count once.
+fn word_set_insert(mut set: SynWordSet, word: List[byte], len: int) {
+    if set.words.len >= WORD_COUNT_MAX || len > WORD_BYTES_MAX - set.bytes {
+        set.overflow = true
+        return
+    }
+    if set.slots.len == 0 || (set.words.len + 1) * 4 >= set.slots.len * 3 {
+        word_set_rehash(mut set, if set.slots.len == 0 then 16 else set.slots.len * 2)
+    }
+    let cap = set.slots.len
+    var at = word_hash(word, 0, len, false) & cap - 1
+    while set.slots[at] >= 0 {
+        let w = set.slots[at]
+        if set.words[w].len == len {
+            var same = true
+            for i in 0..len {
+                if set.words[w][i] != word[i] {
+                    same = false
+                    break
+                }
+            }
+            if same then return
+        }
+        at = at + 1 & cap - 1
+    }
+    set.slots[at] = set.words.len
+    (mut set.words).push(copy word[0..len])
+    set.bytes += len
+}
+
+// word_set_build: every path from the alternatives' start to the closing
+// boundary is one word. The walk counts each visited instruction as C's
+// recursion counts calls; any unsupported instruction, cap or depth
+// refuses the whole set.
+fn word_set_build(re: search.Re) -> SynWordSet {
+    let n = re.prog.len
+    let start = if re.ngroups == 2 then 3 else 2
+    let suffix = n - (if re.ngroups == 2 then 4 else 3)
+    var set = word_set_new(re.flags & search.RE_ICASE != 0)
+    var word = List[byte]()
+    for _ in 0..WORD_PROG_MAX { (mut word).push(0 as byte) }
+    var pcs = List[int]()
+    var lens = List[int]()
+    var depths = List[int]()
+    (mut pcs).push(start)
+    (mut lens).push(0)
+    (mut depths).push(0)
+    while pcs.len != 0 {
+        var pc = (mut pcs).pop() else 0
+        var len = (mut lens).pop() else 0
+        var depth = (mut depths).pop() else 0
+        var walking = true
+        while walking {
+            if set.overflow || set.steps >= WORD_STEPS_MAX {
+                set.overflow = true
+                return set
+            }
+            set.steps += 1
+            if pc == suffix {
+                word_set_insert(mut set, word, len)
+                if set.overflow then return set
+                walking = false
+            } else {
+                if pc >= suffix || depth >= n || len >= WORD_PROG_MAX {
+                    set.overflow = true
+                    return set
+                }
+                let kind = op(re, pc)
+                if kind == search.RE_CHAR {
+                    let b = arg(re, pc)
+                    if b >= 128 || !ascii_word(b) {
+                        set.overflow = true
+                        return set
+                    }
+                    word[len] = (if set.fold then ascii_fold(b) else b) as byte
+                    len += 1
+                    pc += 1
+                } else if kind == search.RE_CLASS {
+                    let b = class_word_byte(re, arg(re, pc))
+                    if b < 0 {
+                        set.overflow = true
+                        return set
+                    }
+                    word[len] = (if set.fold then ascii_fold(b) else b) as byte
+                    len += 1
+                    pc += 1
+                } else if kind == search.RE_JMP {
+                    pc = re.prog[pc].x
+                } else if kind == search.RE_SPLIT {
+                    (mut pcs).push(re.prog[pc].y)
+                    (mut lens).push(len)
+                    (mut depths).push(depth + 1)
+                    pc = re.prog[pc].x
+                } else {
+                    set.overflow = true
+                    return set
+                }
+                depth += 1
+            }
+        }
+    }
+    set
+}
+
+fn finite_class_ascii(re: search.Re, c: int) -> bool {
+    if c < 0 || c >= re.cls_start.len || re.cls_n[c] == 0 then return false
+    for r in 0..re.cls_n[c] {
+        let k = re.cls_start[c] + r
+        if re.cls_lo[k] > re.cls_hi[k] || re.cls_hi[k] >= 128 then return false
+    }
+    true
+}
+
+fn finite_set_new(ngroups: int) -> SynFiniteSet {
+    SynFiniteSet {
+        lits: List[List[byte]](),
+        cap_lo: List[int](),
+        cap_hi: List[int](),
+        ngroups: ngroups,
+        bytes: 0,
+    }
+}
+
+// A program walked by finite_set_collect has no cycle (the C walk refuses
+// one by its on-path marks): any reachable backward edge refuses the set.
+fn forward_only(re: search.Re) -> bool {
+    let n = re.prog.len
+    var seen = List[bool]()
+    for _ in 0..n { (mut seen).push(false) }
+    var stack = List[int]()
+    (mut stack).push(0)
+    while stack.len != 0 {
+        let pc = (mut stack).pop() else 0
+        if pc >= n then return false
+        if !seen[pc] {
+            seen[pc] = true
+            let kind = op(re, pc)
+            if kind == search.RE_JMP {
+                if re.prog[pc].x <= pc then return false
+                (mut stack).push(re.prog[pc].x)
+            } else if kind == search.RE_SPLIT {
+                if re.prog[pc].x <= pc || re.prog[pc].y <= pc then return false
+                (mut stack).push(re.prog[pc].x)
+                (mut stack).push(re.prog[pc].y)
+            } else if kind != search.RE_MATCH {
+                (mut stack).push(pc + 1)
+            }
+        }
+    }
+    true
+}
+
+// finite_set_build: every path's literal, in the recursion's order (a split
+// tries x before y, a class its bytes in ascending order). Any refusal
+// empties the set.
+fn finite_set_build(re: search.Re) -> SynFiniteSet {
+    let none = finite_set_new(0)
+    let n = re.prog.len
+    if n > WORD_PROG_MAX || re.ngroups == 0 || re.ngroups > 2 || !forward_only(re) then return none
+    var set = finite_set_new(re.ngroups)
+    var bytes = List[byte]()
+    for _ in 0..FINITE_LENGTH_MAX { (mut bytes).push(0 as byte) }
+    var pcs = List[int]()
+    var lens = List[int]()
+    var los = List[int]()
+    var his = List[int]()
+    var pending = List[int]()
+    (mut pcs).push(0)
+    (mut lens).push(0)
+    (mut los).push(-1)
+    (mut his).push(-1)
+    (mut pending).push(-1)
+    while pcs.len != 0 {
+        var pc = (mut pcs).pop() else 0
+        var len = (mut lens).pop() else 0
+        var cap_lo = (mut los).pop() else -1
+        var cap_hi = (mut his).pop() else -1
+        let write = (mut pending).pop() else -1
+        if write >= 0 {
+            bytes[len - 1] = write as byte
+        }
+        var walking = true
+        while walking {
+            let kind = op(re, pc)
+            if kind == search.RE_CHAR {
+                if arg(re, pc) >= 128 || len >= FINITE_LENGTH_MAX then return none
+                bytes[len] = arg(re, pc) as byte
+                len += 1
+                pc += 1
+            } else if kind == search.RE_CLASS {
+                let c = arg(re, pc)
+                if !finite_class_ascii(re, c) || len >= FINITE_LENGTH_MAX then return none
+                // Later bytes wait on the stack; the first continues here.
+                var r = re.cls_n[c]
+                var first = -1
+                while r > 0 {
+                    r -= 1
+                    let k = re.cls_start[c] + r
+                    var b = re.cls_hi[k]
+                    while b >= re.cls_lo[k] {
+                        if first >= 0 {
+                            (mut pcs).push(pc + 1)
+                            (mut lens).push(len + 1)
+                            (mut los).push(cap_lo)
+                            (mut his).push(cap_hi)
+                            (mut pending).push(first)
+                        }
+                        first = b
+                        b -= 1
+                    }
+                }
+                bytes[len] = first as byte
+                len += 1
+                pc += 1
+            } else if kind == search.RE_JMP {
+                pc = re.prog[pc].x
+            } else if kind == search.RE_SPLIT {
+                (mut pcs).push(re.prog[pc].y)
+                (mut lens).push(len)
+                (mut los).push(cap_lo)
+                (mut his).push(cap_hi)
+                (mut pending).push(-1)
+                pc = re.prog[pc].x
+            } else if kind == search.RE_SAVE {
+                let slot = arg(re, pc)
+                if slot > 3 then return none
+                if slot == 2 {
+                    cap_lo = len
+                }
+                if slot == 3 {
+                    cap_hi = len
+                }
+                pc += 1
+            } else if kind == search.RE_MATCH {
+                if (cap_lo < 0) != (cap_hi < 0) || cap_lo >= 0 && cap_lo > cap_hi then return none
+                if len == 0 ||
+                    len > FINITE_LENGTH_MAX ||
+                    set.lits.len == FINITE_LITERAL_MAX ||
+                    len > FINITE_BYTES_MAX - set.bytes {
+                    return none
+                }
+                (mut set.lits).push(copy bytes[0..len])
+                (mut set.cap_lo).push(cap_lo)
+                (mut set.cap_hi).push(cap_hi)
+                set.bytes += len
+                walking = false
+            } else {
+                return none
+            }
+        }
+    }
+    set
+}
+
+// first_add over a 32-byte bitset.
+fn first_bit(mut first: List[byte], b: int) {
+    first[b >> 3] = (first[b >> 3] as int | 1 << (b & 7)) as byte
+}
+
+fn first_fill(mut first: List[byte]) {
+    for i in 0..32 { first[i] = 255 as byte }
+}
+
+/// regex_effective_first: the bytes a regex's first consumed character can
+/// start with, skipping zero-width assertions; every byte when an empty
+/// match is possible. The candidate index and run masks use this, not the
+/// conservative compiled mask.
+pub fn syn_effective_first(re: search.Re) -> List[byte] {
+    var first = syn_first_new(false)
+    let n = re.prog.len
+    if n == 0 {
+        first_fill(mut first)
+        return first
+    }
+    var seen = List[bool]()
+    for _ in 0..n { (mut seen).push(false) }
+    var stack = List[int]()
+    (mut stack).push(0)
+    while stack.len != 0 {
+        let pc = (mut stack).pop() else 0
+        if pc < n && !seen[pc] {
+            seen[pc] = true
+            let kind = op(re, pc)
+            if kind == search.RE_CHAR {
+                let cp = arg(re, pc)
+                if unicode.utf8_len(cp) == 0 {
+                    first_fill(mut first)
+                } else {
+                    let enc = unicode.utf8_encode(cp)
+                    first_bit(mut first, enc[0] as int)
+                }
+            } else if kind == search.RE_CLASS {
+                let c = arg(re, pc)
+                if c >= re.cls_start.len {
+                    first_fill(mut first)
+                } else {
+                    for b in 0..128 {
+                        if class_has(re, c, b) then first_bit(mut first, b)
+                    }
+                    for b in 128..256 {
+                        if class_has(re, c, unicode.utf8_escape_of(b)) then first_bit(mut first, b)
+                    }
+                    var wide = false
+                    for r in 0..re.cls_n[c] {
+                        if re.cls_hi[re.cls_start[c] + r] >= 128 {
+                            wide = true
+                        }
+                    }
+                    if wide {
+                        for lead in 194..245 { first_bit(mut first, lead) }
+                    }
+                }
+            } else if kind == search.RE_ANY {
+                first_fill(mut first)
+                if arg(re, pc) == 0 {
+                    first[1] = (first[1] as int & !(1 << 2)) as byte
+                }
+            } else if kind == search.RE_SPLIT {
+                (mut stack).push(re.prog[pc].x)
+                (mut stack).push(re.prog[pc].y)
+            } else if kind == search.RE_JMP {
+                (mut stack).push(re.prog[pc].x)
+            } else if kind == search.RE_MATCH {
+                first_fill(mut first)
+            } else {
+                (mut stack).push(pc + 1)
+            }
+        }
+    }
+    first
+}
+
+fn set_group(mut m: search.ReMatch, g: int, lo: int, hi: int) {
+    m.lo[g] = lo
+    m.hi[g] = hi
+}
+
+// identifier_suffix_match: an ASCII identifier, spaces, then the suffix.
+fn identifier_suffix_match(
+    suffix: int,
+    ngroups: int,
+    line: List[byte],
+    len: int,
+    at: int,
+    mut m: search.ReMatch,
+) -> int {
+    if at >= len then return 0
+    if line[at] as int >= 128 then return -1
+    if !ascii_pred(P_START, line[at] as int) then return 0
+    var p = at + 1
+    while p < len && line[p] as int < 128 && ascii_word(line[p] as int) { p += 1 }
+    let identifier_hi = p
+    if p < len && line[p] as int >= 128 then return -1
+    while p < len && ascii_pred(P_SPACE, line[p] as int) { p += 1 }
+    if p < len && line[p] as int >= 128 then return -1
+    if p >= len || line[p] as int != suffix then return 0
+    m.ngroups = ngroups
+    set_group(mut m, 0, at, p + 1)
+    set_group(mut m, 1, at, identifier_hi)
+    1
+}
+
+fn ascii_identifier_match(
+    spec: SynIdentSpec,
+    line: List[byte],
+    len: int,
+    at: int,
+    mut m: search.ReMatch,
+) -> int {
+    var p = at
+    if spec.boundary_before {
+        if at != 0 && line[at - 1] as int >= 128 || at < len && line[at] as int >= 128 {
+            return -1
+        }
+        let before_word = at != 0 && ascii_word(line[at - 1] as int)
+        let after_word = at < len && ascii_word(line[at] as int)
+        if before_word == after_word then return 0
+    }
+    if spec.prefix.len > len - p then return 0
+    for i in 0..spec.prefix.len {
+        if line[p + i] != spec.prefix[i] then return 0
+    }
+    p += spec.prefix.len
+    if p >= len || line[p] as int >= 128 || !ascii_pred(spec.start_kind, line[p] as int) {
+        return 0
+    }
+    p += 1
+    while p < len && line[p] as int < 128 && ascii_pred(spec.continue_kind, line[p] as int) {
+        p += 1
+    }
+    if spec.suffix.len != 0 {
+        if p - at < spec.prefix.len + 1 + spec.suffix.len then return 0
+        for i in 0..spec.suffix.len {
+            if line[p - spec.suffix.len + i] != spec.suffix[i] then return 0
+        }
+    }
+    if spec.boundary_after {
+        if p < len && line[p] as int >= 128 then return -1
+        if p < len && ascii_word(line[p] as int) then return 0
+    }
+    m.ngroups = 1
+    set_group(mut m, 0, at, p)
+    1
+}
+
+// word_probe_init + word_literal_match: the whole ASCII word at `at`,
+// looked up in the set; non-ASCII on either side delegates to the VM.
+fn word_literal_match(
+    set: SynWordSet,
+    ngroups: int,
+    line: List[byte],
+    len: int,
+    at: int,
+    mut m: search.ReMatch,
+) -> int {
+    if set.slots.len == 0 then return -1
+    if at >= len then return 0
+    if at != 0 && line[at - 1] as int >= 128 || line[at] as int >= 128 then return -1
+    if at != 0 && ascii_word(line[at - 1] as int) || !ascii_word(line[at] as int) then return 0
+    var p = at
+    while p < len && line[p] as int < 128 && ascii_word(line[p] as int) { p += 1 }
+    if p < len && line[p] as int >= 128 then return -1
+    let cap = set.slots.len
+    var slot = word_hash(line, at, p, set.fold) & cap - 1
+    while set.slots[slot] >= 0 {
+        let w = set.slots[slot]
+        if set.words[w].len == p - at {
+            var same = true
+            for i in 0..p - at {
+                let b = if set.fold then ascii_fold(line[at + i] as int) else line[at + i] as int
+                if set.words[w][i] as int != b {
+                    same = false
+                    break
+                }
+            }
+            if same {
+                m.ngroups = ngroups
+                for g in 0..ngroups { set_group(mut m, g, at, p) }
+                return 1
+            }
+        }
+        slot = slot + 1 & cap - 1
+    }
+    0
+}
+
+fn finite_literal_match(
+    set: SynFiniteSet,
+    line: List[byte],
+    len: int,
+    at: int,
+    mut m: search.ReMatch,
+) -> int {
+    for i in 0..set.lits.len {
+        let n = set.lits[i].len
+        if n <= len - at {
+            var same = true
+            for k in 0..n {
+                if line[at + k] != set.lits[i][k] {
+                    same = false
+                    break
+                }
+            }
+            if same {
+                m.ngroups = set.ngroups
+                set_group(mut m, 0, at, at + n)
+                if set.ngroups == 2 {
+                    if set.cap_lo[i] < 0 {
+                        set_group(mut m, 1, -1, -1)
+                    } else {
+                        set_group(mut m, 1, at + set.cap_lo[i], at + set.cap_hi[i])
+                    }
+                }
+                return 1
+            }
+        }
+    }
+    0
+}
+
+fn yaml_block_key_match(
+    ngroups: int,
+    line: List[byte],
+    len: int,
+    at: int,
+    mut m: search.ReMatch,
+) -> int {
+    if at != 0 then return 0
+    var key_lo = 0
+    while key_lo < len && line[key_lo] as int < 128 && ascii_pred(P_SPACE, line[key_lo] as int) {
+        key_lo += 1
+    }
+    if key_lo < len && line[key_lo] as int >= 128 then return -1
+    if key_lo == len || !ascii_pred(P_YAML_START, line[key_lo] as int) then return 0
+    var colon = key_lo + 1
+    while colon < len &&
+        line[colon] as int < 128 &&
+        ascii_pred(P_YAML_CONTINUE, line[colon] as int) { colon += 1 }
+    if colon < len && line[colon] as int >= 128 then return -1
+    if colon == len || line[colon] as int != 58 then return 0
+    var hi = colon + 1
+    if hi < len {
+        if line[hi] as int >= 128 then return -1
+        if !ascii_pred(P_SPACE, line[hi] as int) then return 0
+        hi += 1
+    }
+    m.ngroups = ngroups
+    set_group(mut m, 0, 0, hi)
+    set_group(mut m, 1, 0, key_lo)
+    set_group(mut m, 2, key_lo, colon)
+    set_group(mut m, 3, colon, colon + 1)
+    set_group(mut m, 4, colon + 1, hi)
+    1
+}
+
+fn json_key_match(line: List[byte], len: int, at: int, mut m: search.ReMatch) -> int {
+    if at >= len || line[at] as int != 34 then return 0
+    var last_lo = -1
+    var last_hi = -1
+    var p = at + 1
+    var close = -1
+    while close < 0 {
+        if p >= len then return 0
+        let b = line[p] as int
+        if b >= 128 then return -1
+        if b < 32 then return 0
+        if b == 34 {
+            close = p + 1
+        } else if b != 92 {
+            last_lo = p
+            p += 1
+            last_hi = p
+        } else {
+            if p + 1 >= len then return 0
+            let e = line[p + 1] as int
+            if e >= 128 then return -1
+            if ascii_pred(P_JSON_ESCAPE, e) {
+                last_lo = p
+                p += 2
+                last_hi = p
+            } else {
+                if e != 117 || p + 6 > len then return 0
+                for k in 2..6 {
+                    if line[p + k] as int >= 128 then return -1
+                }
+                for k in 2..6 {
+                    if !ascii_pred(P_HEX, line[p + k] as int) then return 0
+                }
+                last_lo = p
+                p += 6
+                last_hi = p
+            }
+        }
+    }
+    p = close
+    while p < len && line[p] as int < 128 && ascii_pred(P_SPACE, line[p] as int) { p += 1 }
+    if p < len && line[p] as int >= 128 then return -1
+    if p >= len || line[p] as int != 58 then return 0
+    m.ngroups = 3
+    set_group(mut m, 0, at, p + 1)
+    set_group(mut m, 1, at, close)
+    set_group(mut m, 2, last_lo, last_hi)
+    1
+}

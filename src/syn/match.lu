@@ -1,0 +1,369 @@
+//! syn.match — anchored regex/aux matching and capture-to-semantic spans.
+//! Ports sagitta src/syn/engine.c:2450–2565, :2963–3173 and
+//! :3389–3441 at 9ace98c2. The existing Pike VM is authoritative;
+//! these helpers neither search ahead nor guess language tokens.
+
+use fl
+use search
+use text
+
+/// One reusable regex workspace, match record and inert piece-tree backing.
+/// The byte-backed search API takes a TextBuf too; allocate it once, not
+/// for every rule attempt. It is never accessed for a byte-backed input.
+pub struct SynMatchScratch {
+    workspace: search.ReWorkspace,
+    matched: search.ReMatch,
+    backing: text.TextBuf,
+}
+
+/// Allocate reusable matching storage once, outside the scan/render loop.
+pub fn syn_match_scratch_new() -> SynMatchScratch {
+    SynMatchScratch {
+        workspace: search.re_workspace_new(),
+        matched: search.re_match_new(),
+        backing: text.textbuf_new(),
+    }
+}
+
+/// Entry predicates precede matching, exactly as syn_line_run's rule scan.
+pub fn syn_rule_enabled(rule: SynRule, state: SynState) -> bool {
+    let flags = syn_state_flags(state)
+    if flags & SYN_F_PAST_FIRST != 0 && rule.flags & SYN_RULE_FIRST_LINE != 0 {
+        return false
+    }
+    if rule.value_pred == SYN_VALUE_SET && flags & SYN_F_VALUE == 0 {
+        return false
+    }
+    if rule.value_pred == SYN_VALUE_CLEAR && flags & SYN_F_VALUE != 0 {
+        return false
+    }
+    true
+}
+
+fn equal_slice(line: List[byte], at: int, end: int, bytes: List[byte]) -> bool {
+    if end - at != bytes.len {
+        return false
+    }
+    var i = 0
+    while i < bytes.len {
+        if line[at + i] != bytes[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn aux_result(mut matched: search.ReMatch, lo: int, hi: int) {
+    matched.ngroups = 1
+    matched.lo[0] = lo
+    matched.hi[0] = hi
+}
+
+fn aux_match(
+    mut matched: search.ReMatch,
+    strings: fl.FlStrings,
+    state: SynState,
+    level: int,
+    rule: SynRule,
+    line: List[byte],
+    line_len: int,
+    at: int,
+) -> bool {
+    let len = line_len
+    if rule.aux_match == SYN_AUXM_INDENT_LT {
+        if at != 0 { return false }
+        var p = 0
+        var indent: int = 0
+        while p < len {
+            if line[p] as int == 32 {
+                indent += 1
+            } else if line[p] as int == 9 {
+                indent = indent + 8 & !7
+            } else {
+                break
+            }
+            p += 1
+        }
+        if p == len { return false }
+        aux_result(mut matched, 0, 0)
+        return indent < syn_state_aux(state, level)
+    }
+    if rule.aux_match == SYN_AUXM_LINE_EMPTY {
+        if at != 0 || len != 0 { return false }
+        aux_result(mut matched, 0, 0)
+        return true
+    }
+    if rule.aux_match == SYN_AUXM_LINE_START {
+        if at != 0 { return false }
+        aux_result(mut matched, 0, 0)
+        return true
+    }
+    let id = syn_state_aux(state, level)
+    if id == 0 || id >= strings.items.len { return false }
+    let delimiter_len = strings.items[id].len
+    if rule.aux_match == SYN_AUXM_LINE_EQ || rule.aux_match == SYN_AUXM_LINE_EQ_WS {
+        if at != 0 { return false }
+        var lo = 0
+        if rule.aux_match == SYN_AUXM_LINE_EQ_WS {
+            while lo < len && (line[lo] as int == 32 || line[lo] as int == 9) { lo += 1 }
+        } else if syn_state_flags(state) & SYN_F_STRIP != 0 {
+            while lo < len && line[lo] as int == 9 { lo += 1 }
+        }
+        if !equal_slice(line, lo, len, strings.items[id]) { return false }
+        aux_result(mut matched, 0, len)
+        return true
+    }
+    if rule.aux_match == SYN_AUXM_LITERAL {
+        let pre = rule.aux_pre
+        let post = rule.aux_post
+        if pre < 0 || pre >= strings.items.len || post < 0 || post >= strings.items.len {
+            syn_bug("syntax: aux affix id outside definition")
+        }
+        let pre_len = strings.items[pre].len
+        let post_len = strings.items[post].len
+        let total = pre_len + delimiter_len + post_len
+        if total > len - at { return false }
+        if !equal_slice(line, at, at + pre_len, strings.items[pre]) ||
+            !equal_slice(line, at + pre_len, at + pre_len + delimiter_len, strings.items[id]) ||
+            !equal_slice(line, at + pre_len + delimiter_len, at + total, strings.items[post]) {
+            return false
+        }
+        aux_result(mut matched, at, at + total)
+        return true
+    }
+    if rule.aux_match == SYN_AUXM_FENCE_CLOSE {
+        var p = 0
+        while p < len && p < 4 && line[p] as int == 32 { p += 1 }
+        if p > 3 || at != 0 || delimiter_len == 0 { return false }
+        var markers = 0
+        while p + markers < len && line[p + markers] == strings.items[id][0] {
+            markers += 1
+        }
+        if markers < delimiter_len { return false }
+        while p + markers < len &&
+            (line[p + markers] as int == 32 || line[p + markers] as int == 9) { markers += 1 }
+        if p + markers != len { return false }
+        aux_result(mut matched, 0, len)
+        return true
+    }
+    false
+}
+
+/// One anchored rule attempt, preserving source-order semantics in the
+/// caller. Aux matchers own their exact line-boundary checks. A conservative
+/// first-byte mask is only a rejection accelerator, never an alternate VM.
+pub fn syn_rule_match(
+    mut scratch: SynMatchScratch,
+    definition: SynDefinition,
+    state: SynState,
+    aux_level: int,
+    rule: SynRule,
+    line: List[byte],
+    at: int,
+) -> bool {
+    if !syn_rule_enabled(rule, state) { return false }
+    rule_match_raw(
+        mut scratch,
+        definition,
+        definition.strings,
+        state,
+        aux_level,
+        rule,
+        line,
+        line.len,
+        at,
+    )
+}
+
+/// Match against separately owned aux storage. Pooled programs keep no
+/// mutable interner themselves; predicates retain ordinary rule semantics.
+pub fn syn_rule_match_aux(
+    mut scratch: SynMatchScratch,
+    definition: SynDefinition,
+    strings: fl.FlStrings,
+    state: SynState,
+    aux_level: int,
+    rule: SynRule,
+    line: List[byte],
+    at: int,
+) -> bool {
+    if !syn_rule_enabled(rule, state) { return false }
+    rule_match_raw(mut scratch, definition, strings, state, aux_level, rule, line, line.len, at)
+}
+
+fn rule_match_raw(
+    mut scratch: SynMatchScratch,
+    definition: SynDefinition,
+    strings: fl.FlStrings,
+    state: SynState,
+    aux_level: int,
+    rule: SynRule,
+    line: List[byte],
+    line_len: int,
+    at: int,
+) -> bool {
+    if at < 0 ||
+        at > line_len ||
+        line_len < 0 ||
+        line_len > line.len ||
+        aux_level < 0 ||
+        aux_level >= SYN_DEF_MAX {
+        syn_bug("syntax: matcher position outside input/state")
+    }
+    if rule.aux_match != SYN_AUXM_NONE {
+        return aux_match(mut scratch.matched, strings, state, aux_level, rule, line, line_len, at)
+    }
+    if rule.regex <= 0 { return false }
+    if rule.regex >= definition.regexes.len { syn_bug("syntax: regex index outside definition") }
+    if definition.regexes[rule.regex].min_len > line_len - at { return false }
+    search.re_match_at_ws(
+        mut scratch.workspace,
+        definition.regexes[rule.regex],
+        scratch.backing,
+        line,
+        search.re_input_bytes(line_len),
+        at as text.ByteOff,
+        mut scratch.matched,
+    )
+}
+
+/// Capture overlays in ascending group order, with later groups winning
+/// inside earlier ones. The consumed group may shorten, never lengthen,
+/// the whole match. Missing optional groups carry -1, not byte offset zero.
+pub fn syn_emit_match(mut out: SynSpans, rule: SynRule, matched: search.ReMatch, consume_hi: int) {
+    var pos = matched.lo[0]
+    if pos < 0 || consume_hi < pos || consume_hi > matched.hi[0] {
+        syn_bug("syntax: consume group ends outside whole match")
+    }
+    while pos < consume_hi {
+        var attr = if rule.caps[0] as int == 255 then rule.attr else rule.caps[0] as int
+        var end = consume_hi
+        var group = 1
+        while group < 8 && group < matched.ngroups {
+            let lo = matched.lo[group]
+            let hi = matched.hi[group]
+            if rule.caps[group] as int != 255 && lo >= 0 && hi >= lo {
+                if lo <= pos && pos < hi {
+                    attr = rule.caps[group] as int
+                    if hi < end { end = hi }
+                } else if pos < lo && lo < end {
+                    end = lo
+                }
+            }
+            group += 1
+        }
+        if end <= pos { end = pos + 1 }
+        syn_spans_emit(mut out, pos, end - pos, attr, 0)
+        pos = end
+    }
+}
+
+// emit_yaml_block_key (engine.c:3085): a YAML block key's indent, key and
+// colon groups as three spans, each falling back to the whole-match
+// attribute. Output equals syn_emit_match for the indexed shape.
+fn syn_emit_yaml_block_key(mut out: SynSpans, rule: SynRule, matched: search.ReMatch) {
+    let base = if rule.caps[0] as int == 255 then rule.attr else rule.caps[0] as int
+    for group in 1..4 {
+        let attr = if rule.caps[group] as int == 255 then base else rule.caps[group] as int
+        syn_spans_emit(mut out, matched.lo[group], matched.hi[group] - matched.lo[group], attr, 0)
+    }
+}
+
+/// Store an exact byte capture or the pinned integer/indent interpretation.
+/// False means an optional capture was absent; its old aux/strip survives.
+pub fn syn_rule_set_aux(
+    mut strings: fl.FlStrings,
+    mut state: SynState,
+    aux_level: int,
+    rule: SynRule,
+    line: List[byte],
+    matched: search.ReMatch,
+) -> bool {
+    if rule.flags & SYN_RULE_SET_AUX == 0 { return true }
+    if rule.aux_group < 0 || rule.aux_group >= matched.ngroups {
+        syn_bug("syntax: SET_AUX has no usable capture")
+    }
+    var lo = matched.lo[rule.aux_group]
+    var hi = matched.hi[rule.aux_group]
+    if lo < 0 || hi < 0 { return false }
+    if hi < lo || hi > line.len { syn_bug("syntax: invalid aux capture") }
+    if rule.flags & SYN_RULE_STRIP != 0 {
+        while lo < hi && (line[lo] as int == 32 || line[lo] as int == 9) { lo += 1 }
+        while hi > lo && (line[hi - 1] as int == 32 || line[hi - 1] as int == 9) { hi -= 1 }
+    }
+    var value: int = 0
+    if rule.flags & SYN_RULE_AUX_INT != 0 {
+        var decimal = lo < hi
+        var p = lo
+        while p < hi {
+            let b = line[p] as int
+            if b < 48 || b > 57 { decimal = false; break }
+            if value <= 429496728 { value = value * 10 + b - 48 }
+            p += 1
+        }
+        if !decimal {
+            value = 0
+            p = lo
+            while p < hi {
+                if line[p] as int == 32 {
+                    value += 1
+                } else if line[p] as int == 9 {
+                    value = value + 8 & !7
+                }
+                p += 1
+            }
+        }
+        var add = rule.aux_add
+        let group = rule.aux_add_group
+        if group > 0 && group < matched.ngroups {
+            let a = matched.lo[group]
+            let b = matched.hi[group]
+            if a >= 0 &&
+                b == a + 1 &&
+                b <= line.len &&
+                line[a] as int >= 48 &&
+                line[a] as int <= 57 {
+                add = line[a] as int - 48
+            }
+        }
+        value = if value > 4294967295 - add then 4294967295 else value + add
+    } else {
+        value = fl.fl_intern(mut strings, line, lo, hi)
+    }
+    syn_state_set_aux(mut state, aux_level, value)
+    true
+}
+
+/// Local (non-embedding) transition seam. As C's apply_op, an EMBED needs
+/// the outer qualified-engine dispatcher and is invalid at this seam.
+pub fn syn_apply_op(mut state: SynState, op: int, nop: int, target: int) {
+    if op == SYN_OP_STAY {
+        return
+    }
+    if op == SYN_OP_PUSH {
+        syn_state_push(mut state, target)
+    } else if op == SYN_OP_POP {
+        syn_state_pop(mut state, if nop == 0 then 1 else nop)
+    } else if op == SYN_OP_SET {
+        syn_state_set(mut state, target)
+    } else {
+        syn_bug("syntax: operation requires qualified embed dispatcher")
+    }
+}
+
+/// Ordered multi-push and clear-aux-on-actual-pop law. Debt repayment is
+/// not an actual pop, so cannot clear a live outer delimiter.
+pub fn syn_apply_local_op(mut state: SynState, rule: SynRule) {
+    let depth = syn_state_depth(state)
+    if rule.op == SYN_OP_PUSH && rule.pushes.len != 0 {
+        if rule.pushes.len > 4 { syn_bug("syntax: rule push list exceeds four contexts") }
+        for ctx in rule.pushes { syn_state_push(mut state, ctx) }
+    } else {
+        syn_apply_op(mut state, rule.op, rule.nop, rule.target)
+    }
+    if rule.flags & SYN_RULE_CLR_AUX != 0 && syn_state_depth(state) < depth {
+        syn_state_set_aux(mut state, syn_state_ndef(state) - 1, 0)
+        syn_state_set_flags(mut state, syn_state_flags(state) & !SYN_F_STRIP)
+    }
+}

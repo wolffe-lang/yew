@@ -1,0 +1,334 @@
+//! syn.buffer_cache — bounded byte storage, retained lines and span cache.
+//! Ports sagitta engine.c:4771–5100 and :5377–5423 at 9ace98c2. A cache
+//! holds at most 32,768 packed spans, never 256 independent maximum lines.
+
+use text
+use util
+
+/// One cached line's identity and packed slab range.
+pub struct SynCacheSlot {
+    line: int,
+    gen: int,
+    entry: int,
+    exit_state: int,
+    offset: int,
+    n: int,
+    stop: int,
+    valid: bool,
+}
+
+/// Fixed-count ring metadata and a bounded, lazily committed 256-KiB slab.
+pub struct SynSpanCache {
+    slots: List[SynCacheSlot],
+    slab: List[byte],
+    hand: int,
+    slab_hand: int,
+}
+
+/// Per-buffer state, scratch and pending guest requests. Cache storage and
+/// interpreter scratch are separate fields so their read/mut loans do not
+/// overlap. Clocks are real monotonic microseconds or explicit test data.
+pub struct SynBuffer {
+    lines: SynLines,
+    gen: int,
+    engine_gen: int,
+    edit_spliced: bool,
+    enabled: bool,
+    degraded: bool,
+    edit_us: int,
+    fake_clock: bool,
+    clock_now: int,
+    clock_step: int,
+    cache: SynSpanCache,
+    scratch: SynSpans,
+    reader: text.TextIter,
+    line_bytes: List[byte],
+    line_used: int,
+    pending_langs: List[int],
+    pending_lines: List[int],
+    refused_lang: int,
+    embed_unknown_logged: bool,
+}
+
+fn buffer_cache_new() -> SynSpanCache {
+    var slots = List[SynCacheSlot]()
+    var i = 0
+    while i < 256 {
+        (mut slots).push(SynCacheSlot {
+            line: 0,
+            gen: 0,
+            entry: 0,
+            exit_state: 0,
+            offset: 0,
+            n: 0,
+            stop: 0,
+            valid: false,
+        })
+        i += 1
+    }
+    SynSpanCache { slots: slots, slab: List[byte](), hand: 0, slab_hand: 0 }
+}
+
+/// Attach to a real TextBuf with an explicit monotonic microsecond stamp.
+/// This constructor reads no clock, making deterministic budget tests total.
+pub fn syn_buffer_new_at(tb: text.TextBuf, engine_generation: int, now_us: int) -> SynBuffer {
+    let count = text.textbuf_line_count(tb)
+    var lines = syn_lines_new(count)
+    lines.must_reach = count
+    SynBuffer {
+        lines: lines,
+        gen: tb.gen,
+        engine_gen: engine_generation,
+        edit_spliced: false,
+        enabled: true,
+        degraded: false,
+        edit_us: now_us,
+        fake_clock: false,
+        clock_now: 0,
+        clock_step: 0,
+        cache: buffer_cache_new(),
+        scratch: syn_spans_new(SYN_MAX_SPANS),
+        reader: text.textiter_new(),
+        line_bytes: List[byte](),
+        line_used: 0,
+        pending_langs: List[int](),
+        pending_lines: List[int](),
+        refused_lang: 0,
+        embed_unknown_logged: false,
+    }
+}
+
+/// Install a deterministic observation clock. Each observation adds step
+/// microseconds; this is a test seam, never a mutable function callback.
+pub fn syn_buffer_fake_clock(mut buffer: SynBuffer, start_us: int, step_us: int) {
+    if step_us < 0 { syn_bug("syntax: negative fake-clock step") }
+    buffer.fake_clock = true
+    buffer.clock_now = start_us
+    buffer.clock_step = step_us
+    buffer.edit_us = start_us
+}
+
+fn buffer_now(mut buffer: SynBuffer) -> int {
+    if buffer.fake_clock { buffer.clock_now += buffer.clock_step; return buffer.clock_now }
+    os_clock_ns() / 1000
+}
+
+fn buffer_cache_invalidate(mut cache: SynSpanCache) {
+    cache.hand = 0
+    cache.slab_hand = 0
+    var i = 0
+    while i < cache.slots.len { cache.slots[i].valid = false; i += 1 }
+}
+
+fn buffer_cache_find(cache: SynSpanCache, line: int, gen: int, entry: int) -> int {
+    var i = 0
+    while i < cache.slots.len {
+        if cache.slots[i].valid &&
+            cache.slots[i].line == line &&
+            cache.slots[i].gen == gen &&
+            cache.slots[i].entry == entry {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn buffer_cache_store(
+    mut cache: SynSpanCache,
+    line: int,
+    gen: int,
+    entry: int,
+    out: SynSpans,
+) -> int {
+    let slot = cache.hand
+    cache.hand = (cache.hand + 1) % 256
+    cache.slots[slot].valid = false
+    let count = out.n
+    if count < 0 || count > 32768 { syn_bug("syntax: span slab request exceeds cap") }
+    var off = cache.slab_hand
+    if off + count > 32768 { off = 0 }
+    var i = 0
+    while i < 256 {
+        if cache.slots[i].valid &&
+            cache.slots[i].n != 0 &&
+            count != 0 &&
+            off < cache.slots[i].offset + cache.slots[i].n &&
+            cache.slots[i].offset < off + count {
+            cache.slots[i].valid = false
+        }
+        i += 1
+    }
+    cache.slab_hand = off + count
+    if cache.slab_hand == 32768 { cache.slab_hand = 0 }
+    while cache.slab.len < (off + count) * 8 { (mut cache.slab).push(0 as byte) }
+    i = 0
+    while i < count * 8 { cache.slab[off * 8 + i] = out.data[i]; i += 1 }
+    cache.slots[slot] = SynCacheSlot {
+        line: line,
+        gen: gen,
+        entry: entry,
+        exit_state: out.exit_state,
+        offset: off,
+        n: count,
+        stop: out.stop,
+        valid: true,
+    }
+    slot
+}
+
+fn buffer_cache_copy(mut out: SynSpans, cache: SynSpanCache, slot: int) {
+    let count = if cache.slots[slot].n > out.cap then out.cap else cache.slots[slot].n
+    let offset = cache.slots[slot].offset * 8
+    var i = 0
+    while i < count * 8 { out.data[i] = cache.slab[offset + i]; i += 1 }
+    out.n = count
+    out.exit_state = cache.slots[slot].exit_state
+    out.stop = if count == cache.slots[slot].n then cache.slots[slot].stop else SYN_STOP_SPANS
+    if count < cache.slots[slot].n && count > 0 {
+        out.data[(count - 1) * 8 + 7] = (
+            out.data[(count - 1) * 8 + 7] as int | SYN_SPAN_TRUNCATED
+        ) as byte
+    }
+}
+
+fn buffer_content_len(tb: text.TextBuf, line: int) -> int {
+    let span = text.textbuf_line_span(tb, line as text.LineNo)
+    var len = span.hi - span.lo
+    if len > 0 && text.textbuf_byte_at(tb, span.lo + len - 1) == 10 { len -= 1 }
+    if len > 0 && text.textbuf_byte_at(tb, span.lo + len - 1) == 13 { len -= 1 }
+    len
+}
+
+fn buffer_line(mut buffer: SynBuffer, tb: text.TextBuf, line: int) -> int {
+    let span = text.textbuf_line_span(tb, line as text.LineNo)
+    let full = buffer_content_len(tb, line)
+    let need = if full > SYN_LINE_BYTE_CAP + 1 then SYN_LINE_BYTE_CAP + 1 else full
+    while buffer.line_bytes.len < need { (mut buffer.line_bytes).push(0 as byte) }
+    buffer.line_used = need
+    if need == 0 { return 0 }
+    if !text.textiter_begin(mut buffer.reader, tb, span.lo as text.ByteOff) {
+        syn_bug("syntax: cannot begin line iterator")
+    }
+    var copied = 0
+    while copied < need {
+        let chunk = text.textiter_chunk(buffer.reader, tb)
+        if !chunk.ok { syn_bug("syntax: incomplete line iterator") }
+        let count = if chunk.len < need - copied then chunk.len else need - copied
+        text.textiter_copy_chunk(mut buffer.line_bytes, copied, tb, chunk, count)
+        copied += count
+        if copied < need && !text.textiter_advance(mut buffer.reader, tb) {
+            syn_bug("syntax: truncated line iterator")
+        }
+    }
+    need
+}
+
+fn buffer_reset_wave(mut buffer: SynBuffer, count: int) {
+    let old = syn_ids_len(buffer.lines.entry)
+    if old != count {
+        syn_ids_splice(mut buffer.lines.entry, 0, old, count)
+    } else {
+        var i = 0
+        while i < buffer.lines.entry.bytes.len { buffer.lines.entry.bytes[i] = 0 as byte; i += 1 }
+    }
+    if count != 0 { syn_ids_set(mut buffer.lines.entry, 0, SYN_STATE_ROOT) }
+    buffer.lines.wave = 0
+    buffer.lines.settled_to = if count == 0 then 0 else 1
+    buffer.lines.must_reach = count
+    buffer.lines.settling = buffer.enabled && count != 0
+    buffer.lines.spec_valid = false
+    buffer_cache_invalidate(mut buffer.cache)
+}
+
+fn buffer_reconcile(mut buffer: SynBuffer, engine: SynEngine, tb: text.TextBuf) {
+    let count = text.textbuf_line_count(tb)
+    if buffer.engine_gen != engine.generation {
+        buffer_reset_wave(mut buffer, count)
+        buffer.engine_gen = engine.generation
+    }
+    if buffer.gen == tb.gen && syn_ids_len(buffer.lines.entry) == count { return }
+    if buffer.edit_spliced && syn_ids_len(buffer.lines.entry) == count {
+        buffer.gen = tb.gen
+        buffer.edit_spliced = false
+        return
+    }
+    buffer_reset_wave(mut buffer, count)
+    buffer.gen = tb.gen
+    buffer.edit_spliced = false
+}
+
+fn buffer_pending_add(mut buffer: SynBuffer, language: int, line: int) {
+    var i = 0
+    while i < buffer.pending_langs.len {
+        if buffer.pending_langs[i] == language {
+            if line < buffer.pending_lines[i] { buffer.pending_lines[i] = line }
+            return
+        }
+        i += 1
+    }
+    if buffer.pending_langs.len >= SYN_RESIDENT_MAX { return }
+    (mut buffer.pending_langs).push(language)
+    (mut buffer.pending_lines).push(line)
+}
+
+/// Notify exact newline removal/insertion counts after an edit. No cache
+/// rebuild or full-file scan occurs; retained tail ids remain fixpoint data.
+pub fn syn_buffer_edit(mut buffer: SynBuffer, lo: int, removed: int, inserted: int) {
+    syn_lines_edit(mut buffer.lines, lo, removed, inserted)
+    buffer.edit_spliced = true
+    buffer.edit_us = buffer_now(mut buffer)
+    let at = lo + 1
+    var i = 0
+    while i < buffer.pending_lines.len {
+        var line = buffer.pending_lines[i]
+        if line >= at {
+            line = if line < at + removed then lo else line - removed + inserted
+            let count = syn_ids_len(buffer.lines.entry)
+            if count > 0 && line >= count { line = count - 1 }
+            buffer.pending_lines[i] = line
+        }
+        i += 1
+    }
+}
+
+// note_span_stop and settle's degraded test: warned once per buffer.
+fn buffer_note_stop(mut buffer: SynBuffer, engine: SynEngine, stop: int) {
+    if stop != SYN_STOP_OK ||
+        engine.states.exhausted ||
+        syn_state_flags(engine.state) & SYN_F_DEGRADED != 0 {
+        if !buffer.degraded { util.log_warn("syntax highlighting degraded for buffer") }
+        buffer.degraded = true
+    }
+}
+
+/// Fetch one line's reusable semantic spans. A hit never calls syn_line;
+/// stale/UNKNOWN entries are provisional ROOT styling until the wave arrives.
+pub fn syn_buffer_spans(
+    mut buffer: SynBuffer,
+    mut engine: SynEngine,
+    mut pool: SynPool,
+    tb: text.TextBuf,
+    line: int,
+    mut out: SynSpans,
+) {
+    buffer_reconcile(mut buffer, engine, tb)
+    if line < 0 || line >= syn_ids_len(buffer.lines.entry) {
+        syn_bug("syntax: span request outside buffer")
+    }
+    let held = syn_ids_get(buffer.lines.entry, line)
+    let entry = if held == SYN_STATE_UNKNOWN then SYN_STATE_ROOT else held
+    syn_spans_clear(mut out, entry)
+    if !buffer.enabled {
+        syn_spans_emit(mut out, 0, buffer_content_len(tb, line), SYN_ATTR_TEXT, 0)
+        return
+    }
+    var slot = buffer_cache_find(buffer.cache, line, tb.gen, entry)
+    if slot < 0 {
+        let len = buffer_line(mut buffer, tb, line)
+        syn_line(mut engine, mut pool, entry, buffer.line_bytes, len, mut buffer.scratch, false)
+        slot = buffer_cache_store(mut buffer.cache, line, tb.gen, entry, buffer.scratch)
+    }
+    buffer_cache_copy(mut out, buffer.cache, slot)
+    buffer_note_stop(mut buffer, engine, out.stop)
+}
