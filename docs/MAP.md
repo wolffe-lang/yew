@@ -1332,3 +1332,14 @@ own. Any changed C golden is separately listed and pinned in
   that buffer. Rows: `src/edit_insert_txn_focus_test.lu` (tab and pane
   clicks in the legacy and kitty encodings, keyed tab moves as controls)
   and `tools/editing-row`'s `insert-tab-click-*` and `insert-pane-click-*`.
+
+- **Previous generations of the workspace state** (yew#129,
+  `src/edit/state_save.lu`). A writing session copies the state file it
+  finds when it opens to `state.fl.prev`, after moving the older copies
+  down to `.prev.2` and `.prev.3` (`STATE_PREV_KEEP`). C keeps no copy
+  (`state_save.c:56-325`). Every copy goes through `text.file_write_atomic`
+  and the state file is never moved, so no step leaves the workspace
+  without its state; a reader, a clean session and a workspace with no
+  state keep nothing. The copies are taken outside the save, so the save's
+  own write order and its kill points are C's. Rows:
+  `src/edit_ws_state_prev_test.lu`.
