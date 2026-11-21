@@ -1305,3 +1305,14 @@ own. Any changed C golden is separately listed and pinned in
     skipped at restore without being logged as dropped (C logs it), and
     `active_tab` names a written record past the record cap too. The
     state file stays C's byte for byte below that cap.
+
+- **Previous generations of the workspace state** (yew#129,
+  `src/edit/state_save.lu`). A writing session copies the state file it
+  finds when it opens to `state.fl.prev`, after moving the older copies
+  down to `.prev.2` and `.prev.3` (`STATE_PREV_KEEP`). C keeps no copy
+  (`state_save.c:56-325`). Every copy goes through `text.file_write_atomic`
+  and the state file is never moved, so no step leaves the workspace
+  without its state; a reader, a clean session and a workspace with no
+  state keep nothing. The copies are taken outside the save, so the save's
+  own write order and its kill points are C's. Rows:
+  `src/edit_ws_state_prev_test.lu`.
