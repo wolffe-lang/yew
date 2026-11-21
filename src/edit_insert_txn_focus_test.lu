@@ -1,0 +1,244 @@
+//! member: false
+//! yew#128: an Insert edit group belongs to the buffer it opened on. A
+//! plain click on another tab or pane moves focus without leaving Insert
+//! (`mouse.lu`'s `click_tab` and `pane_click`), so the group must not
+//! follow the focus: the next key would land outside any group and Esc
+//! would end a group the new buffer never opened ("undo: unbalanced
+//! end"). Port-only rows: sagitta's insert barrier
+//! (`src/edit/ed.c:1666-1676`) has no caller on these paths either.
+//!
+//! Every key and click is raw terminal bytes fed through the editor's own
+//! decoder and event dispatch (`term.input_feed`, `term.input_next`,
+//! `edit.loop_dispatch_event`), in the legacy encoding (Esc is 0x1b) and
+//! in the kitty keyboard protocol's (Esc is CSI 27 u); clicks are SGR
+//! 1006 press and release. Each case runs alone with
+//! `YEW_INSERT_FOCUS_CASE=N`; all run in order without it.
+
+use edit
+use std.fs
+use term
+use text
+
+fn bytes_of(s: str) -> List[byte] {
+    var v = List[byte]()
+    for b in s.bytes() {
+        (mut v).push(b)
+    }
+    v
+}
+
+// The configured editor on a 24x80 grid with a renderer of no
+// capabilities: a frame is drawn and flipped, never written.
+fn fixture() -> edit.Ed {
+    let runtime = fs_read_bytes("runtime/init.fl") else List[byte]()
+    assert(runtime.len != 0, "runtime readable")
+    var ed = edit.ed_new_test(runtime, "")
+    ed.grid = term.grid_new(24, 80)
+    ed.grid_ready = true
+    ed.render = term.render_new(term.caps_new(), term.env_process())
+    ed.render_ready = true
+    ed.now_ms = 1000
+    edit.ed_layout(mut ed)
+    edit.ed_render(mut ed)
+    ed
+}
+
+// One loop turn's worth: every event the bytes decode to, a lone Esc
+// once its deadline passes, then the layout and the frame.
+fn drain(mut ed: edit.Ed) {
+    var now = ed.now_ms + 40
+    var waits = 0
+    loop {
+        var key = term.key_new()
+        if term.input_next(mut ed.input, now, mut key) {
+            edit.loop_dispatch_event(mut ed, key, now)
+            continue
+        }
+        let d = term.input_deadline(ed.input, now)
+        if d < 0 || waits == 8 {
+            break
+        }
+        waits += 1
+        now += d + 1
+    }
+    ed.now_ms = now
+    if ed.layout_dirty {
+        edit.ed_layout(mut ed)
+    }
+    edit.ed_render(mut ed)
+}
+
+fn feed(mut ed: edit.Ed, s: str) {
+    let b = bytes_of(s)
+    term.input_feed(mut ed.input, b, 0, b.len)
+    drain(mut ed)
+}
+
+fn esc(mut ed: edit.Ed, kitty: bool) {
+    feed(mut ed, if kitty then "\x1b[27u" else "\x1b")
+}
+
+// An SGR 1006 left press and release at screen cell (x, y), 0-based.
+fn click(mut ed: edit.Ed, x: int, y: int) {
+    let col = x + 1
+    let row = y + 1
+    feed(mut ed, "\x1b[<0;{col};{row}M")
+    feed(mut ed, "\x1b[<0;{col};{row}m")
+}
+
+// Two files with known bytes under target/, which the test lanes create.
+fn scratch_pair() -> (str, str) {
+    var suffix = ""
+    for r in os_random(8) {
+        suffix = suffix + "{r % 10}"
+    }
+    let a = "target/insert-focus-{suffix}-a.txt"
+    let b = "target/insert-focus-{suffix}-b.txt"
+    fs.write_text(a, "one\n") else |_| { assert(false, "create {a}") }
+    fs.write_text(b, "two\n") else |_| { assert(false, "create {b}") }
+    (a, b)
+}
+
+fn drop_pair(a: str, b: str) {
+    fs.remove(a) else |_| {}
+    fs.remove(b) else |_| {}
+}
+
+fn contents(ed: edit.Ed, bi: int, want: str, what: str) {
+    let got = text.textbuf_bytes(ed.bufs[bi].ec.tb)
+    let w = want.bytes()
+    let shown = str_from_utf8(got) else "<invalid>"
+    assert(got.len == w.len, "{what}: expected {want}, got {shown}")
+    for i in 0..got.len {
+        assert(got[i] == w[i], "{what}: expected {want}, got {shown}")
+    }
+}
+
+fn undo_on(mut ed: edit.Ed, w: int) {
+    let id = edit.cmd_lookup(ed.reg, "ed.edit.undo")
+    assert(id != 0, "ed.edit.undo is registered")
+    var cx = edit.cmdctx_new(w, edit.SRC_TEST)
+    assert(edit.ed_cmd_invoke(mut ed, id, mut cx) == edit.CMD_OK, "undo on window {w}")
+}
+
+// The first screen cell of tab `idx`'s label on the strip.
+fn tab_cell(mut ed: edit.Ed, idx: int) -> (int, int) {
+    let y = ed.tab_strip_rect.y
+    var x = ed.tab_strip_rect.x
+    while x < ed.tab_strip_rect.x + ed.tab_strip_rect.w {
+        let hit = edit.region_hit(mut ed.regions, x, y)
+        if hit.kind == edit.REGION_TAB && hit.payload == idx {
+            return (x, y)
+        }
+        x += 1
+    }
+    assert(false, "tab {idx} has a label on the strip")
+    (0, 0)
+}
+
+// Two file tabs, the first active and both read; answers the two tab
+// indices.
+fn two_tabs(mut ed: edit.Ed, a: str, b: str) -> (int, int) {
+    let ta = edit.tab_open(mut ed, a)
+    let tb = edit.tab_open(mut ed, b)
+    assert(ta >= 0 && tb >= 0, "both tabs open")
+    edit.tab_switch(mut ed, ta)
+    assert(edit.tab_hydrate(mut ed, ta) == 0, "the first tab reads")
+    assert(edit.tab_hydrate(mut ed, tb) == 0, "the second tab reads")
+    drain(mut ed)
+    assert(ed.tab_active == ta, "the first tab is active")
+    (ta, tb)
+}
+
+// Type in tab a, move to tab b by `move` (a click on its label, or the
+// keyed `A-N`), type, Esc; then each buffer holds its own typing and one
+// undo on each restores it.
+fn tab_case(kitty: bool, keyed: bool) {
+    var ed = fixture()
+    let (a, b) = scratch_pair()
+    let (ta, tb) = two_tabs(mut ed, a, b)
+    let ba = edit.tab_buffer(ed, ta)
+    let bb = edit.tab_buffer(ed, tb)
+    feed(mut ed, "i")
+    assert(ed.mode == edit.MODE_I, "i enters Insert")
+    feed(mut ed, "abc")
+    if keyed {
+        let n = tb + 1
+        let digit = 48 + n
+        feed(mut ed, if kitty then "\x1b[{digit};3u" else "\x1b{n}")
+    } else {
+        let (x, y) = tab_cell(mut ed, tb)
+        click(mut ed, x, y)
+    }
+    assert(ed.tab_active == tb, "the second tab is active")
+    assert(ed.mode == edit.MODE_I, "still Insert after the move")
+    feed(mut ed, "def")
+    esc(mut ed, kitty)
+    assert(ed.mode != edit.MODE_I, "Esc leaves Insert")
+    contents(ed, ba, "abcone\n", "the first buffer")
+    contents(ed, bb, "deftwo\n", "the second buffer")
+    undo_on(mut ed, edit.tab_focus_win(ed, tb))
+    contents(ed, bb, "two\n", "one undo on the second buffer")
+    contents(ed, ba, "abcone\n", "the first buffer untouched by it")
+    undo_on(mut ed, edit.tab_focus_win(ed, ta))
+    contents(ed, ba, "one\n", "one undo on the first buffer")
+    drop_pair(a, b)
+}
+
+// One tab split in two panes showing the two files: type in the new
+// pane, click into the other pane's text, type, Esc.
+fn pane_case(kitty: bool) {
+    var ed = fixture()
+    let (a, b) = scratch_pair()
+    let (ta, tb) = two_tabs(mut ed, a, b)
+    let ba = edit.tab_buffer(ed, ta)
+    let bb = edit.tab_buffer(ed, tb)
+    let w0 = ed.win
+    feed(mut ed, "\x17v")
+    let w1 = ed.win
+    assert(w1 != w0, "the split's new pane takes focus")
+    edit.ed_show_buffer(mut ed, bb)
+    drain(mut ed)
+    assert(ed.wins[w1].buf == bb && ed.wins[w0].buf == ba, "the panes show the two files")
+    feed(mut ed, "i")
+    assert(ed.mode == edit.MODE_I, "i enters Insert")
+    feed(mut ed, "abc")
+    click(mut ed, ed.wins[w0].rect.x, ed.wins[w0].rect.y)
+    assert(ed.win == w0, "the click focused the other pane")
+    assert(ed.mode == edit.MODE_I, "still Insert after the click")
+    feed(mut ed, "def")
+    esc(mut ed, kitty)
+    assert(ed.mode != edit.MODE_I, "Esc leaves Insert")
+    contents(ed, bb, "abctwo\n", "the first-typed buffer")
+    contents(ed, ba, "defone\n", "the clicked buffer")
+    undo_on(mut ed, w0)
+    contents(ed, ba, "one\n", "one undo on the clicked buffer")
+    contents(ed, bb, "abctwo\n", "the first-typed buffer untouched by it")
+    undo_on(mut ed, w1)
+    contents(ed, bb, "two\n", "one undo on the first-typed buffer")
+    drop_pair(a, b)
+}
+
+fn run(i: int) {
+    match i {
+        0 => tab_case(false, false),
+        1 => tab_case(true, false),
+        2 => pane_case(false),
+        3 => pane_case(true),
+        4 => tab_case(false, true),
+        5 => tab_case(true, true),
+        _ => return,
+    }
+    print("insert_txn_focus: case {i}: PASS")
+}
+
+fn main() {
+    let pick = env_get("YEW_INSERT_FOCUS_CASE") else ""
+    if pick.len != 0 {
+        run(pick.to_int() else -1)
+    } else {
+        for i in 0..6 {
+            run(i)
+        }
+    }
+}

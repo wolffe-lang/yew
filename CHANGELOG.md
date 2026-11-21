@@ -5,6 +5,97 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### The first Esc under the file-tree drawer keeps the restore prompt (2026-11-21)
+
+- Opening a directory whose active file has a crash journal raises the
+  restore prompt while F mode's drawer is open, and the drawer narrows the
+  footer the prompt is written in. The first Esc now goes to F mode, which
+  closes the drawer, and leaves the prompt open; the next Esc answers it as
+  before ("open as-is"), and `r` and `d` work as before. Without the drawer
+  nothing changes.
+- `src/edit_recover_prompt_drawer_test.lu` stages a real crash journal
+  through the text layer, opens the editor as a directory launch does, and
+  feeds Esc as raw terminal bytes in the legacy and kitty encodings.
+
+### The workspace state keeps three previous generations (2026-11-21)
+
+- A writing session copies the state file it finds when it opens to
+  `state.fl.prev`, after moving the older copies down to `state.fl.prev.2`
+  and `state.fl.prev.3`. A save that lost tabs (#129) can then be undone by
+  hand from a copy, for three sessions after it. Each copy is written with the
+  same atomic save as the state; the state file itself is never moved. A
+  reader session, a clean session and a workspace with no state yet keep
+  nothing.
+- `src/edit_ws_state_prev_test.lu` holds the copy taken at open and kept
+  across later saves, the three generations, and the reader and first-session
+  cases.
+
+### Insert's undo group stays on its buffer across a click (2026-11-21)
+
+- A plain click on another tab or pane moves focus without leaving Insert.
+  The typing run's undo group stayed open on the first buffer, the next keys
+  landed outside any group, and Esc ended a group the clicked buffer never
+  opened: `internal error at text.undo: undo: unbalanced end`, exit 4 (#128).
+  The run now records the buffer it began on, is closed there before a
+  command edits another buffer, and is ended on that buffer at every barrier,
+  so each buffer's typing is one undo step on that buffer.
+- `src/edit_insert_txn_focus_test.lu` feeds raw terminal bytes, legacy and
+  kitty, through the editor's own decoder for a click on a tab label and on
+  another pane, with keyed tab moves as controls. `tools/editing-row` types
+  the same moves into a pty, and a case there can now stage extra files and
+  run command lines.
+
+### yw25 — a diagnostics publication repaints its rows (2026-11-17)
+
+- Every publication set a full repaint. It now damages the rows the old
+  and the new diagnostics touch (gutter sign and underline) and the
+  footer. A wrapped view, a split, a panel, or another buffer in the
+  window keeps the full repaint.
+- Rows: `src/edit_lsp_diag_damage_test.lu`.
+
+### yw25 — a whole-text server's didChange waits for a pause (2026-11-17)
+
+- `wolf lsp` takes the whole text on every change, so each key sent 42 KB
+  of a 40 KB file and started one analysis, about five a second while
+  typing. A server that syncs the whole text is now sent the document at
+  once for the first edit after a pause (500 ms), then when the typing
+  has been quiet for 500 ms, and at the latest a second after the first
+  held edit. Requests, saves and closes still send first; a server that
+  takes incremental changes keeps its per-turn flush. The loop's wait ends
+  by the held edit's deadline.
+- Rows: `src/lsp_sync_debounce_test.lu` (the clocks, simulated) and
+  `tools/lsp-typing-row` (didChange per second and bytes per key).
+
+### yw25 — whole-text didChange keeps nothing (2026-11-17)
+
+- yew#137: with a language server on, yew's resident memory grew about
+  730 KB a key on a 40 KB file. The whole text of a full-sync server is
+  built, escaped into JSON, framed and copied out for the write on every
+  edit, and each of those buffers was kept to the session's end. The
+  didChange now builds its text and frame in a region freed when the call
+  ends, and the framed write stages its chunk in one buffer the job table
+  owns. A per-turn region around the loop is still refused at wolf 0.2.36
+  (E1010: `loop_turn` stores non-scalar values into the editor); what a
+  diagnostics publication's parse and store keep is the remaining growth.
+- Rows: `src/lsp_sync_alloc_test.lu` (the ledger of twenty whole-text
+  flushes, native lane) and `tools/lsp-typing-row` (yew in a pty typing
+  with `wolf lsp` behind a logging proxy: resident memory per key,
+  didChange per second and bytes per key).
+
+### Selection visibility and Shift mouse reports (2026-11-15)
+
+- Preserve visible selection on 16-color and monochrome terminals, including
+  themes whose text and selection colors coincide. Paint selection after
+  search and diagnostic backgrounds, without splitting wide glyphs.
+- Mark an armed empty selection's insertion boundary without changing its
+  byte range or copy/cut semantics.
+- Request Shift mouse reports with XTSHIFTESCAPE when enabling the mouse,
+  and reset that request in normal, suspended and fatal terminal restoration.
+  Terminal settings may still reserve Shift for local selection.
+- Add literal held selection contracts and a free, live mouse census with
+  raw event output, optional Shift-capture negotiation and tty restoration
+  tests. Other selection redesign behaviors remain held, not implemented.
+
 ### Highlighting, stage one: the syntax engine, its compiler and `yew syn` (2026-11-20)
 
 - `src/syn/` ports sagitta's `src/syn/` engine and definition compiler. A
