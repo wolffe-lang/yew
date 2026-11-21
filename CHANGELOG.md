@@ -5,6 +5,17 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### The prompt-keys test makes its clipboard fixtures' directory (2026-11-21)
+
+- `src/edit_prompt_keys_test.lu` wrote its fake clipboard's fixture files
+  under `target/tests` without creating it, so it passed only when an
+  earlier test in the same run had made the directory; a test file added on
+  2026-11-18 moved it into a macOS unit shard where none does, and the
+  scheduled run's shard 4 trapped on "clipboard fixture". Both fixture
+  helpers now create the directory, and a new case runs them from a scratch
+  directory with no `target/tests`, as the file run alone from a clean
+  checkout finds it (yew#156).
+
 ### CI runs the editing row on Linux and macOS (2026-11-21)
 
 - `tools/editing-row` types real key and mouse bytes into the editor through
