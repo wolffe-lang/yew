@@ -1343,3 +1343,15 @@ own. Any changed C golden is separately listed and pinned in
   state keep nothing. The copies are taken outside the save, so the save's
   own write order and its kill points are C's. Rows:
   `src/edit_ws_state_prev_test.lu`.
+
+- **The first Esc under the file-tree drawer keeps the restore prompt**
+  (`src/edit/input.lu`). A directory launch restores its tabs, which can
+  raise the restore prompt for a journaled file, and then opens F mode's
+  drawer (`driver.lu`), which narrows the footer the prompt is written in.
+  C's prompt takes every key first (`ed.c:2211-2298`), so the first Esc
+  answered it unread ("open as-is"). In the port, an Esc while the restore
+  prompt is open and F mode's drawer is active goes to F mode
+  (`ed.git.mode.leave`), which closes the drawer, and the prompt stays open;
+  the next Esc, `r` and `d` answer it as C's do. Without the drawer nothing
+  changes (C's `notepad_recover_*` goldens). Rows:
+  `src/edit_recover_prompt_drawer_test.lu`.
