@@ -1355,3 +1355,12 @@ own. Any changed C golden is separately listed and pinned in
   the next Esc, `r` and `d` answer it as C's do. Without the drawer nothing
   changes (C's `notepad_recover_*` goldens). Rows:
   `src/edit_recover_prompt_drawer_test.lu`.
+
+- **A prompt beside the file-tree drawer is written across the whole width**
+  (`src/edit/layout.lu`, `src/edit/fussdraw.lu`, `src/edit/draw.lu`).
+  sagitta's footer starts at the drawer's edge whenever the drawer is open
+  (`layout.c:681-700`), so a prompt raised beside it is cut. Here `ed_layout`
+  lays the footer across the grid while a prompt is open, `fuss_drawer_rect`
+  ends the drawer above it, and `ed_render` lays out again when the footer's
+  span no longer matches the prompt state (`layout_footer_stale`), since a
+  prompt opens and closes in many places and none of them asks for a layout.
