@@ -5,6 +5,19 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### A prompt beside the file-tree drawer is written across the whole width (2026-11-21)
+
+- While F mode's drawer is open the footer starts at the drawer's edge, so a
+  prompt raised then (the restore prompt a directory launch can raise for a
+  journaled file, the quit and overwrite prompts) was cut. While a prompt is
+  open the footer now spans the whole width and the drawer ends above it;
+  once the prompt is answered the footer starts at the drawer's edge again.
+  Without the drawer, and with a drawer that fills the screen, nothing
+  changes.
+- `src/edit_recover_prompt_width_test.lu` raises the restore prompt under
+  the drawer, raises a prompt while the drawer is already open, repaints the
+  drawer alone, and answers the prompt, reading the footer row from the grid.
+
 ### The first Esc under the file-tree drawer keeps the restore prompt (2026-11-21)
 
 - Opening a directory whose active file has a crash journal raises the
