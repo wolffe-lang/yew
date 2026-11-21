@@ -5,6 +5,18 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### The first Esc under the file-tree drawer keeps the restore prompt (2026-11-21)
+
+- Opening a directory whose active file has a crash journal raises the
+  restore prompt while F mode's drawer is open, and the drawer narrows the
+  footer the prompt is written in. The first Esc now goes to F mode, which
+  closes the drawer, and leaves the prompt open; the next Esc answers it as
+  before ("open as-is"), and `r` and `d` work as before. Without the drawer
+  nothing changes.
+- `src/edit_recover_prompt_drawer_test.lu` stages a real crash journal
+  through the text layer, opens the editor as a directory launch does, and
+  feeds Esc as raw terminal bytes in the legacy and kitty encodings.
+
 ### The workspace state keeps three previous generations (2026-11-21)
 
 - A writing session copies the state file it finds when it opens to
