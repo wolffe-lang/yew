@@ -5,6 +5,21 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Insert's undo group stays on its buffer across a click (2026-11-21)
+
+- A plain click on another tab or pane moves focus without leaving Insert.
+  The typing run's undo group stayed open on the first buffer, the next keys
+  landed outside any group, and Esc ended a group the clicked buffer never
+  opened: `internal error at text.undo: undo: unbalanced end`, exit 4 (#128).
+  The run now records the buffer it began on, is closed there before a
+  command edits another buffer, and is ended on that buffer at every barrier,
+  so each buffer's typing is one undo step on that buffer.
+- `src/edit_insert_txn_focus_test.lu` feeds raw terminal bytes, legacy and
+  kitty, through the editor's own decoder for a click on a tab label and on
+  another pane, with keyed tab moves as controls. `tools/editing-row` types
+  the same moves into a pty, and a case there can now stage extra files and
+  run command lines.
+
 ### goldens: a script case the runner never started is run once more (2026-11-19)
 
 - The oracle's script suite went red on macOS with `FAIL 07_functions (exit
