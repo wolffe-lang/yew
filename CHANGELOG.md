@@ -14,9 +14,10 @@ The format follows Keep a Changelog; the port has no release yet.
   appears in the sources, the rows or the workflows. The goldens' `version`
   suite names this one difference from C, pins C's output by digest
   (`tests/divergences/version.c-sha256`), and still holds the modules line
-  byte for byte. Macro files recorded by an earlier build say
-  `recorded-with: yew 1.0.0-dev`; they load as before, with the existing
-  different-major-version warning once.
+  byte for byte. The macro loader warned about a recorded-with major other
+  than 1, so a macro this build recorded would have warned on every load;
+  it now accepts C yew's major (1) and this build's own, and still warns on
+  any other.
 
 ### The prompt-keys test makes its clipboard fixtures' directory (2026-11-21)
 
