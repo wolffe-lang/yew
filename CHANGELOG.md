@@ -17,7 +17,13 @@ The format follows Keep a Changelog; the port has no release yet.
   byte for byte. The macro loader warned about a recorded-with major other
   than 1, so a macro this build recorded would have warned on every load;
   it now accepts C yew's major (1) and this build's own, and still warns on
-  any other.
+  any other. A macro file crosses between the port and C yew both ways: C yew
+  loads a macro the port records and warns that it was recorded with a
+  different major version; the port loads macros recorded by C yew or by
+  itself silently. A row (`tools/check-macro-crossing`) holds both. The size
+  `s35_macro_record_stop_message` shows after recording (96 bytes, C yew's
+  100) is a named difference, because the recorded text names the port's own
+  version.
 
 ### The prompt-keys test makes its clipboard fixtures' directory (2026-11-21)
 
