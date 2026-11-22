@@ -5,6 +5,19 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### The version is 0.1.0, from one source (2026-11-22)
+
+- `yew --version` prints `yew 0.1.0`, no longer C yew's `yew 1.0.0-dev`.
+  `wolf.pkg` names the number, `src/util/base.lu` holds it once for the
+  program, and `tools/check-version` (a CI step) fails if they differ, if the
+  built editor prints another number, or if a second copy of the number
+  appears in the sources, the rows or the workflows. The goldens' `version`
+  suite names this one difference from C, pins C's output by digest
+  (`tests/divergences/version.c-sha256`), and still holds the modules line
+  byte for byte. Macro files recorded by an earlier build say
+  `recorded-with: yew 1.0.0-dev`; they load as before, with the existing
+  different-major-version warning once.
+
 ### Highlighting, stage one: syntax colours in the editor (2026-11-20)
 
 - The seven first-stage definitions (wolf, Markdown, C, Python, shell, TOML
