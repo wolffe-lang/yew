@@ -30,6 +30,12 @@ The format follows Keep a Changelog; the port has no release yet.
   a coloured document; eight that need unported features are recorded.
   `tools/run-perf-syntax` measures keypress to paint with highlighting on a
   10,000-line C file against C (an advisory on the hosted runner).
+- With highlighting the port compiles the file's definition at every start,
+  and the four startup rows of `tools/run-perf-editor` (first paint default,
+  `--clean` and `TERM=dumb`, and cold open) exceed the 2x gate: they are MISS
+  rows on Linux x86-64 under yew#158 until they pass, and every keystroke row
+  stays gated. A listed row that passes now prints `PASS stale-miss`, and the
+  ledger refuses a keystroke row under a startup-only issue.
 
 ### The prompt-keys test makes its clipboard fixtures' directory (2026-11-21)
 
