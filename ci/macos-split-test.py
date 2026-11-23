@@ -108,8 +108,10 @@ def validate(text):
         assert len(re.findall(r"^        family:", block, re.M)) == 1
         assert "include:" not in block and "exclude:" not in block
     # yw13s: 310. The linux leg took 231 minutes in the nightly 42862922049
-    # (270 left 17 %); macOS 198.
-    assert "    timeout-minutes: 310\n" in oracle
+    # (270 left 17 %); macOS 198. Since the syntax engine the legs took 244.1
+    # (45075029709) and 255.6 (45129915974): 318 and 333, under GitHub's
+    # 360-minute ceiling for a hosted job.
+    assert "    timeout-minutes: ${{ matrix.os == 'macos-latest' && 333 || 318 }}\n" in oracle
     # yw11b: the port job's Linux legs are its `tools/build --all` and a
     # minute of checks. At 8967813 (run 42362461870) the ubuntu leg was cut
     # at its 60-minute cap mid-build on the first attempt and took 49
