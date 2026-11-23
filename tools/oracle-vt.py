@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Apply the pinned non-visual protocol extension to the copied oracle test VT.
+"""Apply the pinned adaptations to the copied oracle's test harness.
 
-Only target/oracle/sagitta/tests/pty/vt.{c,h} may change. Original git blobs
-are checked by revision and SHA256; arbitrary working-copy edits are refused.
-Expected patched bytes derive from the checked-in literal edit specification.
+Two adaptations, each a checked-in literal edit specification:
+  - the non-visual protocol extension of the test VT: tests/pty/vt.{c,h}
+    (tests/oracle-vt/shift-capture.json), pins in target/oracle/vt.sha256;
+  - the harness's read after the reap (yew#124): tests/pty/harness.c
+    (tests/oracle-harness/restore-after-reap.json), pins in
+    target/oracle/harness.sha256.
+Only those three files beneath target/oracle/sagitta may change. Original git
+blobs are checked by revision and SHA256; arbitrary working-copy edits are
+refused. Expected patched bytes derive from the checked-in specifications.
 The resulting SHA256 pins are printed and saved for the build rig to record.
-The C editor and every original golden remain untouched.
+The C editor, the cases and every original golden remain untouched.
 """
 import argparse
 import hashlib
@@ -19,17 +25,24 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 FILES = frozenset(('tests/pty/vt.c', 'tests/pty/vt.h'))
 SPEC = ROOT/'tests/oracle-vt/shift-capture.json'
+HARNESS_FILES = frozenset(('tests/pty/harness.c',))
+HARNESS_SPEC = ROOT/'tests/oracle-harness/restore-after-reap.json'
+# (spec, the files it may change, its pin file, what the refusal names)
+ADAPTATIONS = (
+    (SPEC, FILES, 'vt.sha256', 'the two oracle test-VT files'),
+    (HARNESS_SPEC, HARNESS_FILES, 'harness.sha256', 'the oracle harness file'),
+)
 
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def expected_files(spec, originals):
-    if set(spec['files']) != FILES or set(originals) != FILES:
-        raise ValueError('only the two oracle test-VT files may be adapted')
+def expected_files(spec, originals, files=FILES, what='the two oracle test-VT files'):
+    if set(spec['files']) != files or set(originals) != files:
+        raise ValueError('only '+what+' may be adapted')
     result = {}
-    for name in sorted(FILES):
+    for name in sorted(files):
         change = spec['files'][name]
         original = originals[name]
         if sha(original) != change['before_sha256']:
@@ -54,10 +67,9 @@ def atomic_bytes(path, data):
             os.unlink(temporary)
 
 
-def install_files(tree, originals, expected, verify=False):
-    # Validate every input before writing either file. Atomic replacement also
-    # avoids modifying an original inode if a copy was accidentally hardlinked.
-    for name in sorted(FILES):
+def check_files(tree, originals, expected, verify=False, files=FILES):
+    """Refuse a symlink or unrecognized bytes in any of these files, writing nothing."""
+    for name in sorted(files):
         path = tree/name
         if path.is_symlink():
             raise ValueError('refuse symlinked test-VT input: '+name)
@@ -65,11 +77,17 @@ def install_files(tree, originals, expected, verify=False):
         allowed = (expected[name],) if verify else (originals[name], expected[name])
         if data not in allowed:
             raise ValueError('unrecognized working-copy bytes: '+name)
+
+
+def install_files(tree, originals, expected, verify=False, files=FILES):
+    # Validate every input before writing either file. Atomic replacement also
+    # avoids modifying an original inode if a copy was accidentally hardlinked.
+    check_files(tree, originals, expected, verify, files)
     if not verify:
-        for name in sorted(FILES):
+        for name in sorted(files):
             if (tree/name).read_bytes() != expected[name]:
                 atomic_bytes(tree/name, expected[name])
-    return ''.join(sha(expected[name])+'  '+name+'\n' for name in sorted(FILES))
+    return ''.join(sha(expected[name])+'  '+name+'\n' for name in sorted(files))
 
 
 def main():
@@ -84,21 +102,29 @@ def main():
                  allowed/'tests', allowed/'tests/pty'):
         if path.is_symlink():
             raise ValueError('refuse symlinked oracle path: '+str(path))
-    spec = json.loads(SPEC.read_text())
     rev = subprocess.check_output(['git','-C',str(allowed),'rev-parse','HEAD'],text=True).strip()
-    if rev != spec['revision']:
-        raise ValueError('oracle revision differs from test-VT patch pin')
+    adaptable = frozenset().union(*(files for _, files, _, _ in ADAPTATIONS))
     changed = subprocess.check_output(['git','-C',str(allowed),'diff','--name-only','HEAD'],text=True).splitlines()
-    if set(changed) - FILES:
-        raise ValueError('non-VT oracle files were modified: '+', '.join(sorted(set(changed)-FILES)))
-    originals = {name:subprocess.check_output(['git','-C',str(allowed),'show',rev+':'+name])
-                 for name in FILES}
-    expected = expected_files(spec, originals)
-    manifest = install_files(allowed, originals, expected, a.verify)
-    atomic_bytes(ROOT/'target/oracle/vt.sha256', manifest.encode())
-    for row in manifest.splitlines():
-        print('oracle-vt: '+row, flush=True)
-    print('oracle-vt: only copied test VT adapted; C editor and goldens unchanged', flush=True)
+    if set(changed) - adaptable:
+        raise ValueError('oracle files outside the adaptations were modified: '
+                         +', '.join(sorted(set(changed)-adaptable)))
+    plans = []
+    for spec_path, files, pin, what in ADAPTATIONS:
+        spec = json.loads(spec_path.read_text())
+        if rev != spec['revision']:
+            raise ValueError('oracle revision differs from the pin of '+spec_path.name)
+        originals = {name:subprocess.check_output(['git','-C',str(allowed),'show',rev+':'+name])
+                     for name in files}
+        plans.append((files, pin, originals, expected_files(spec, originals, files, what)))
+    # Every adaptation's inputs are checked before any file is written.
+    for files, _, originals, expected in plans:
+        check_files(allowed, originals, expected, a.verify, files)
+    for files, pin, originals, expected in plans:
+        manifest = install_files(allowed, originals, expected, a.verify, files)
+        atomic_bytes(ROOT/'target/oracle'/pin, manifest.encode())
+        for row in manifest.splitlines():
+            print('oracle-vt: '+row, flush=True)
+    print('oracle-vt: only the copied test VT and harness adapted; C editor, cases and goldens unchanged', flush=True)
     return 0
 
 
