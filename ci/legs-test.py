@@ -39,6 +39,10 @@
   L5  ci/nightly-red.sh against a stand-in `gh`: no open issue opens one,
       labelled, under the one title; an open one gets a comment and no new
       issue; a label that already exists is no failure.
+  L8  what a run writes where anyone can read it: no annotation in the
+      workflows carries an internal word, nor anything ci/nightly-red.sh
+      writes (the issue's title and body, a comment, the label); a record
+      adds the words of the file PUBLIC_TEXT_REFUSE names.
 
 Exit 0 when every check passes, 1 otherwise.
 """
@@ -333,6 +337,34 @@ for path in sorted(glob.glob(os.path.join(ROOT, ".github", "workflows", "*")) + 
         if "ubuntu-latest" in line:
             stale.append("%s:%d" % (os.path.relpath(path, ROOT), n))
 say(not stale, "L7 no workflow or planner leg says ubuntu-latest, the runner image is pinned" + ("" if not stale else ": " + ", ".join(stale)))
+
+# L8 what a run writes where anyone can read it: its annotations and the red
+# nightly's issue. The plain rule holds in every run: no lane, ruling, crawl or
+# sprint word and no internal tag (two letters and two or three digits). A local
+# record also passes PUBLIC_TEXT_REFUSE, a file of further words kept outside this
+# repository; a word from that file is reported by its line number, never spelt.
+PLAIN = re.compile(r"\b(?:lanes?|rulings?|crawls?|sprints?)\b|\b[a-z]{2}\d{2,3}[a-z]?\b", re.I)
+LISTED = []
+if os.environ.get("PUBLIC_TEXT_REFUSE"):
+    with open(os.environ["PUBLIC_TEXT_REFUSE"], encoding="utf-8") as fh:
+        LISTED = [(n, re.compile(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(w.strip()), re.I))
+                  for n, w in enumerate(fh, 1) if w.strip() and not w.startswith("#")]
+
+
+def internal(text):
+    return sorted({m.group(0) for m in PLAIN.finditer(text)}) + ["listed word %d" % n for n, rx in LISTED if rx.search(text)]
+
+
+rule = "the plain rule and %d listed words" % len(LISTED) if LISTED else "the plain rule"
+said = []
+for path in sorted(glob.glob(os.path.join(ROOT, ".github", "workflows", "*.yml"))):
+    for n, line in enumerate(open(path, encoding="utf-8"), 1):
+        if re.search(r"::(?:error|warning|notice)\b", line):
+            said += ["%s:%d %s" % (os.path.relpath(path, ROOT), n, w) for w in internal(line)]
+say(not said, "L8 no annotation a workflow writes carries an internal word (%s)%s" % (rule, ": " + "; ".join(said) if said else ""))
+written = "\n".join(c for e in ("", "41") for c in nightly_red(existing=e)[1] if not c.startswith("issue list"))
+said = internal(written)
+say(bool(written) and not said, "L8 nothing the nightly's issue writes carries an internal word (%s)%s" % (rule, ": " + ", ".join(said) if said else ""))
 
 print("legs-test: %s" % ("PASS" if fails == 0 else "FAIL (%d)" % fails))
 sys.exit(1 if fails else 0)
