@@ -142,8 +142,10 @@ for j in ("port", "oracle"):
 # shard 4/6 at its 120-minute cap (wolf test 57 minutes, the native lane
 # 63 when cut) and ran 5/6 in 114. At eight shards the slowest ran 111
 # minutes (run 42996095311's shard 2/8; a hosted runner's speed varies by
-# up to about 40 % from run to run), so the cap is 150 (L6).
-UNIT_MEASURED_8 = 111
+# up to about 40 % from run to run), so the cap is 150 (L6). Since the
+# syntax engine's tests the slowest is 124.1 (shard 8/8 in runs 45076451516
+# and 45130155672), so the cap is 162.
+UNIT_MEASURED_8 = 124.1
 un = blocks["unit"]
 ucap = re.search(r"^    timeout-minutes: (\d+)$", un, re.M)
 say("    needs: legs\n" in un and re.search(r"^    runs-on: ubuntu-24.04$", un, re.M) is not None
@@ -234,7 +236,7 @@ exit 0
 SLOWEST = {
     ("legs", None): 1,
     ("port", "ubuntu-24.04"): 66, ("port", "ubuntu-24.04-arm"): 57, ("port", "macos-latest"): 189,
-    ("unit", None): 111,
+    ("unit", None): 124.1,            # shard 8/8 in 45076451516 and 45130155672
     ("macos-unit", None): 102,
     ("fuzz", "port"): 120,            # cut on 42996771451: its one long step, 115.2 when cut
     ("fuzz", "port-2"): 66,
@@ -245,7 +247,9 @@ SLOWEST = {
     ("fuzz", "against-c-5"): 56.1,    # fuzz_groups 55.1 (cut at 52.3 once) and the C build
     ("checked-cases", None): 60.2,    # cut on 44996018243's first attempt: shard 2/4, on a runner about
                                       # 1.4 times slower (43.1-47.2 in four other runs); shard 4/4 57.3 there
-    ("oracle", "ubuntu-24.04"): 231, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 198,
+    # The oracle's two release builds of the whole program take 47-78 minutes each on Linux and
+    # 52-68 on macOS since the syntax engine: 244.1 in 45075029709, 255.6 in 45129915974.
+    ("oracle", "ubuntu-24.04"): 244.1, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 255.6,
     ("oracle-cmdcomp", None): 63,
     ("macos-fuzz", "against-c-1"): 75,
     ("macos-fuzz", "against-c-2"): 64.8,  # fuzz_tabs 57.1, fuzz_gitignore 6.9 and the C build
