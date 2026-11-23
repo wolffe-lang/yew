@@ -24,6 +24,11 @@ digests before compiling, as well as pinning the checked-in edit specification.
 A deliberate acceptance-drop plant has a different derived C-file digest and
 must have its own rig pin. Do not relax the production pin to run a plant.
 
+The same tool applies a second specification, the harness's read after the
+reap (`tests/oracle-harness/`, yew#124), to `tests/pty/harness.c` alone. It
+saves that file's digest in `target/oracle/harness.sha256`; this file's pins
+in `vt.sha256` do not change.
+
 ## Protocol and state
 
 Exactly `CSI > 0 s` and `CSI > 1 s` are accepted. They do not alter cells,
