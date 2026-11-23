@@ -245,8 +245,8 @@ SLOWEST = {
     ("fuzz", "against-c-3"): 72,
     ("fuzz", "against-c-4"): 65,      # fuzz_panes
     ("fuzz", "against-c-5"): 56.1,    # fuzz_groups 55.1 (cut at 52.3 once) and the C build
-    ("checked-cases", None): 60.2,    # cut on 44996018243's first attempt: shard 2/4, on a runner about
-                                      # 1.4 times slower (43.1-47.2 in four other runs); shard 4/4 57.3 there
+    ("checked-cases", None): 60.2,    # shard 2/4 cut in 44996018243's first attempt and in 45129915974;
+                                      # 43.1-58.1 in seven other runs; shard 4/4 57.3 in 44996018243
     # The oracle's two release builds of the whole program take 47-78 minutes each on Linux and
     # 52-68 on macOS since the syntax engine: 244.1 in 45075029709, 255.6 in 45129915974.
     ("oracle", "ubuntu-24.04"): 244.1, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 255.6,
