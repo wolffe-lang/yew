@@ -120,8 +120,9 @@ def validate(text):
     # again; macOS keeps its 240.
     port = job(text, "port")
     cap = re.search(r"^    timeout-minutes: \$\{\{ matrix\.os == 'macos-latest' && (\d+) \|\| (\d+) \}\}$", port, re.M)
-    # yw13s: macOS 250 (its leg took 189 in the nightly 42862922049).
-    assert cap is not None and int(cap.group(1)) == 250
+    # yw13s: macOS 250 (its leg took 189 in the nightly 42862922049). Since
+    # the syntax engine it took 219.8 (the nightly 45048816590): 286.
+    assert cap is not None and int(cap.group(1)) == 286
     assert int(cap.group(2)) >= 90
     # yw13s: fuzz_panes alone in its family on both hosts, fuzz_cmdparse
     # without it, every cap at least 30 % over the measured time.
