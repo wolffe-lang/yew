@@ -235,10 +235,11 @@ exit 0
 # depends on, or None).
 SLOWEST = {
     ("legs", None): 1,
-    ("port", "ubuntu-24.04"): 66, ("port", "ubuntu-24.04-arm"): 57, ("port", "macos-latest"): 189,
+    ("port", "ubuntu-24.04"): 66, ("port", "ubuntu-24.04-arm"): 57,
+    ("port", "macos-latest"): 219.8,  # the nightly 45048816590
     ("unit", None): 124.1,            # shard 8/8 in 45076451516 and 45130155672
     ("macos-unit", None): 102,
-    ("fuzz", "port"): 120,            # cut on 42996771451: its one long step, 115.2 when cut
+    ("fuzz", "port"): 147.0,          # 45130155672; cut on 42996771451 at 120, its one long step 115.2
     ("fuzz", "port-2"): 66,
     ("fuzz", "against-c-1"): 62.3,    # fuzz_cmdparse 61.3 and the C build
     ("fuzz", "against-c-2"): 67.7,    # fuzz_tabs 66.7 and the C build
@@ -251,7 +252,7 @@ SLOWEST = {
     # 52-68 on macOS since the syntax engine: 244.1 in 45075029709, 255.6 in 45129915974.
     ("oracle", "ubuntu-24.04"): 244.1, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 255.6,
     ("oracle-cmdcomp", None): 63,
-    ("macos-fuzz", "against-c-1"): 75,
+    ("macos-fuzz", "against-c-1"): 92.5,  # 45076451516
     ("macos-fuzz", "against-c-2"): 64.8,  # fuzz_tabs 57.1, fuzz_gitignore 6.9 and the C build
     ("macos-fuzz", "against-c-3"): 61,    # fuzz_panes
     ("macos-fuzz", "against-c-4"): 57.6,  # fuzz_groups 56.8 and the C build
