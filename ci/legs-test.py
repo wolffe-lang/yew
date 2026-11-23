@@ -243,7 +243,8 @@ SLOWEST = {
     ("fuzz", "against-c-3"): 72,
     ("fuzz", "against-c-4"): 65,      # fuzz_panes
     ("fuzz", "against-c-5"): 56.1,    # fuzz_groups 55.1 (cut at 52.3 once) and the C build
-    ("checked-cases", None): 45,
+    ("checked-cases", None): 60.2,    # cut on 44996018243's first attempt: shard 2/4, on a runner about
+                                      # 1.4 times slower (43.1-47.2 in four other runs); shard 4/4 57.3 there
     ("oracle", "ubuntu-24.04"): 231, ("oracle", "ubuntu-24.04-arm"): 4, ("oracle", "macos-latest"): 198,
     ("oracle-cmdcomp", None): 63,
     ("macos-fuzz", "against-c-1"): 75,
