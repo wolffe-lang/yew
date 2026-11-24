@@ -139,6 +139,18 @@ Builds and tests run on linux x86-64 and macOS arm64; on linux aarch64
 wolf builds no tier at the pin (wolf-lang#614) and CI asserts the refusal
 by name, as pelt does. The oracle builds everywhere.
 
+CI reports the largest explicit wolf build's peak RSS, its native-tier
+maximum, the runner's total memory and the remaining nominal margin in each
+compiler job's log and summary. These are compiler-memory observations,
+not editor runtime-memory measurements or simultaneous process-tree totals.
+With wolf pinned at 0.2.36 they describe today's builds; the next pin change
+will show its memory cost on the first run. No extra builds are added.
+The row reports and does not gate: `YEW_BUILD_MEMORY_ENFORCE=0` keeps the
+memory-share policy off while baselines accumulate. Each job retains its
+`report.json` and invocation records for 30 days in a stable
+`build-memory-<job>-<matrix>` artifact. An incomplete observation never claims
+a certified safe margin; a lost runner cannot produce its final summary.
+
 ## Runtime and completion
 
 `YEW_RUNTIME_DIR` explicitly selects a runtime directory. Otherwise the
