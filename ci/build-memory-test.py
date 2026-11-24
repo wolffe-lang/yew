@@ -256,7 +256,9 @@ def workflow_controls():
                 assert "          retention-days: 30" in block
                 assert "          path: ${{ runner.temp }}/yew-build-memory/" in block
         assert reporters == (JOBS if path.endswith("ci.yml") else {"collector"}), reporters
-        assert workflow_workload(text.replace("tools/build --all", "tools/build --native", 1)) != digest if path.endswith("ci.yml") else True
+        if path.endswith("ci.yml"):
+            broken = text.replace("        run: tools/build --all", "        run: tools/build --native", 1)
+            assert workflow_workload(broken) != digest, "native-build mutation was accepted"
     # Existing planner/split guards are pure controls, never compiler builds.
     for name in ("legs-test.py", "macos-split-test.py"):
         child = subprocess.run([sys.executable, "-I", str(ROOT / "ci" / name)], capture_output=True, text=True)
