@@ -33,3 +33,14 @@ want=$(toml_value std rev)
 have=$(cat "$WOLF_STD/STD-REV")
 [ "$have" = "$want" ] || fail_pin "std identity: have $have, pin wants $want"
 export WOLF LUPIN WOLF_STD
+
+# Observe only explicit builds, after every real-pin check above. Re-sourcing
+# resolves WOLF_BIN afresh, so neither identity nor runtime-library checks see
+# the wrapper, and a nested tool cannot wrap the wrapper.
+if [ "${YEW_BUILD_MEMORY:-0}" = 1 ]; then
+    YEW_MEMORY_REAL_WOLF=$WOLF
+    YEW_MEMORY_REAL_WOLF_ID=$(toml_value wolf version_line)
+    export YEW_MEMORY_REAL_WOLF YEW_MEMORY_REAL_WOLF_ID
+    WOLF=$YEW_ROOT/tools/wolf-memory
+    export WOLF
+fi
