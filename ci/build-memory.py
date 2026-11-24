@@ -251,6 +251,7 @@ def report(directory, job, matrix, summary, enforce, percent, expect_builds=Fals
         state = "not-run"
     peak = winner["peak_bytes"] if winner else None
     result = {"job": job, "matrix": matrix, "state": state,
+              "run_id": os.environ.get("GITHUB_RUN_ID"), "head_sha": os.environ.get("GITHUB_SHA"),
               "completed": len(rows), "started": started,
               "largest": winner["name"] if winner else None,
               "tier": winner["tier"] if winner else None,
@@ -270,6 +271,12 @@ def report(directory, job, matrix, summary, enforce, percent, expect_builds=Fals
               "floor_limited": winner["floor_limited"] if winner else None,
               "policy": "enforce" if enforce else "report-only", "limit_percent": percent,
               "errors": errors}
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        atomic_json(directory / "report.json", result)
+    except OSError as error:
+        diagnostic(error)
+        errors.append("baseline artifact write failed")
     line = "build-memory " + json.dumps(result, sort_keys=True, separators=(",", ":"))
     print(line, flush=True)
     if summary:

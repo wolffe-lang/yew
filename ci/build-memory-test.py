@@ -66,8 +66,8 @@ def controls(work):
     assert reader.status_code(2 << 8) == 2
     assert reader.status_code(9) == -9
     assert reader.physical_total("linux", "MemTotal: 123 kB\n") == 125952
-    assert not reader.exceeds(85, 100, 85)
-    assert reader.exceeds(86, 100, 85)
+    if reader.exceeds(85, 100, 85) or not reader.exceeds(86, 100, 85):
+        raise AssertionError("build-memory-share-gate threshold equality/one-byte-over")
     assert reader.build_name(["build", "src/a.lu", "-o", "out"]) == ("src/a.lu -> out", "native")
     assert reader.build_name(["build", "--release", "src/a.lu"])[1] == "release"
     records = work / "fixture-records"
@@ -87,9 +87,10 @@ def controls(work):
     assert result["policy"] == "report-only"
     assert result["margin_bytes"] == result["runner_total_bytes"] - result["peak_bytes"]
     assert result["native_largest"] == "fixture"
-    # The same observed data fails a deliberately tiny synthetic policy.
-    with contextlib.redirect_stdout(io.StringIO()):
-        assert reader.report(records, "fixture", "{}", None, True, 1) in (0, 1)
+    assert json.loads((records / "report.json").read_text()) == result
+    print("PASS build-memory-share-gate")
+    # Policy boundaries below use a synthetic denominator, never an assumption
+    # about this host's physical memory.
     empty = work / "empty"
     empty.mkdir()
     with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -123,6 +124,15 @@ def controls(work):
     reader.atomic_json(records / (saved["id"] + ".start.json"),
                        {key: saved[key] for key in ("schema", "id", "name", "tier", "argv", "cwd", "compiler", "platform", "raw_unit")})
     print("PASS build-memory-reader-controls")
+    parallel = work / "parallel"
+    children = [subprocess.Popen([sys.executable, "-I", str(ROOT / "ci/build-memory.py"),
+                                 "run", "--records", str(parallel), "--name", str(index),
+                                 "--", sys.executable, "-I", "-c", "pass"])
+                for index in range(2)]
+    assert [child.wait() for child in children] == [0, 0]
+    started, rows, errors = reader.read_records(parallel)
+    assert started == len(rows) == 2 and not errors
+    print("PASS build-memory-concurrent-records")
 
 
 def transport(work):
@@ -143,6 +153,8 @@ def transport(work):
 import json,os,sys
 if sys.argv[1:] == ["--version"]:
     print({identity!r}); raise SystemExit(0)
+if sys.argv[1:2] == ["probe"]:
+    assert sys.stdin.read() == "input", "stdin changed"
 with open(os.environ["FAKE_COMMANDS"], "a") as stream:
     stream.write(json.dumps({{"argv":sys.argv[1:],"cwd":os.getcwd(),"std":os.environ.get("WOLF_STD")}})+"\\n")
 if sys.argv[1:2] == ["build"]:
@@ -178,10 +190,14 @@ raise SystemExit(int(os.environ.get("FAKE_EXIT","0")))
         script = '. tools/lib-toolchain.sh; . tools/lib-toolchain.sh; "$WOLF" probe "space argument"'
         result = subprocess.run(["sh", "-c", script], cwd=root, env=env, input="input", capture_output=True, text=True)
         assert result.returncode == 2 and "fake stdout" in result.stdout and "fake stderr" in result.stderr
+        script = '. tools/lib-toolchain.sh; "$WOLF" build --deny-warnings src/a_test.lu -o target/tests/exit2'
+        result = subprocess.run(["sh", "-c", script], cwd=root, env=env, capture_output=True, text=True)
+        assert result.returncode == 2, "build exit 2 was masked"
         sequences.append(commands.read_text())
         if enabled == "1":
             started, rows, errors = module().read_records(Path(env["YEW_BUILD_MEMORY_DIR"]))
-            assert started == len(rows) == 4 and not errors  # 2 editor tiers, 2 shard files
+            assert started == len(rows) == 5 and not errors  # 2 tiers, 2 shard files, exit-2 build
+            assert [row["exit_code"] for row in rows].count(2) == 1
             assert len([row for row in rows if row["tier"] == "release"]) == 1
     assert sequences[0] == sequences[1], "opt-in changed argv/cwd/std or shard selection"
     print("PASS build-memory-command-transport")
@@ -236,6 +252,9 @@ def workflow_controls():
                 reporters.add(name)
                 assert block.count("- name: compiler memory report") == 1
                 assert "        if: ${{ always() }}" in block
+                assert block.count("- name: compiler memory baseline artifact") == 1
+                assert "          retention-days: 30" in block
+                assert "          path: ${{ runner.temp }}/yew-build-memory/" in block
         assert reporters == (JOBS if path.endswith("ci.yml") else {"collector"}), reporters
         assert workflow_workload(text.replace("tools/build --all", "tools/build --native", 1)) != digest if path.endswith("ci.yml") else True
     # Existing planner/split guards are pure controls, never compiler builds.
