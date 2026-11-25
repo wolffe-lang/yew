@@ -455,7 +455,7 @@ class FakeAPI:
                 pass
 
         self.server = QuietServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
 
     def close(self):
