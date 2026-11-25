@@ -331,6 +331,9 @@ def main(argv=None):
     expected = args.job in {"port", "unit", "macos-unit", "fuzz", "oracle", "oracle-cmdcomp", "macos-fuzz", "macos-perf", "collector"}
     if args.job == "oracle" and matrix.get("port") is False:
         expected = False
+    # The editor perf family restores the macOS oracle leg's builds; it builds nothing.
+    if args.job == "macos-perf" and matrix.get("family") == "editor":
+        expected = False
     return report(args.records, args.job, args.matrix, args.summary, enforce == "1", percent, expected)
 
 
