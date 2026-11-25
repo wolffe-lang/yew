@@ -279,6 +279,29 @@ raise SystemExit(3)
     print("PASS build-memory-path-only-caller")
 
 
+def no_build_families(work):
+    """A job that builds nothing by design says so, with nothing an enforcing
+    gate could fail on; a job that should build and observed none is not-run."""
+    cases = (("checked-cases", {"shard": 1}, "no-explicit-wolf-builds", 0),
+             ("oracle", {"os": "ubuntu-24.04-arm", "port": False}, "no-explicit-wolf-builds", 0),
+             ("macos-perf", {"family": "editor"}, "no-explicit-wolf-builds", 0),
+             ("macos-perf", {"family": "components"}, "not-run", 1),
+             ("unit", {"shard": 1}, "not-run", 1))
+    env = {"PATH": os.environ["PATH"], "HOME": str(work), "LANG": "C.UTF-8",
+           "YEW_BUILD_MEMORY_ENFORCE": "1", "YEW_BUILD_MEMORY_LIMIT_PERCENT": "85"}
+    for index, (job, matrix, state, code) in enumerate(cases):
+        child = subprocess.run([sys.executable, "-I", str(ROOT / "ci/build-memory.py"), "report",
+                                "--records", str(work / ("families-%d" % index)),
+                                "--job", job, "--matrix", json.dumps(matrix)],
+                               env=env, capture_output=True, text=True)
+        line = next((l for l in child.stdout.splitlines() if l.startswith("build-memory ")), "")
+        got = json.loads(line.removeprefix("build-memory ")) if line else {}
+        if got.get("state") != state or child.returncode != code or (code == 0 and got.get("errors")):
+            raise AssertionError("build-memory-no-build-families %s %s state=%s exit=%d" %
+                                 (job, json.dumps(matrix), got.get("state"), child.returncode))
+    print("PASS build-memory-no-build-families")
+
+
 WORKFLOWS = {
     ".github/workflows/ci.yml": "99b6b77edccab30f4e9e0fc97fc5d98adc3955436fbc74967b1d0b2b403667ed",
     ".github/workflows/toyvm.yml": "dd36e8c9db62dfe80a252f6a064524b528762d0a48646984fbca54a7d70dd89f",
@@ -355,6 +378,7 @@ def main():
         controls(work)
         transport(work)
         path_only_caller(work)
+        no_build_families(work)
         if "--workflows" in sys.argv[1:]:
             workflow_controls()
 
