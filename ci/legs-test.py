@@ -167,6 +167,33 @@ say("        run: python3 ci/legs-test.py\n" in lg and 'run: python3 ci/legs.py 
     and re.search(r"^    runs-on: ubuntu-24.04$", lg, re.M) is not None,
     "L4 the legs job runs this file, then plans from the event, on ubuntu")
 say(all(("      %s: ${{ steps.legs.outputs.%s }}\n" % (k, k)) in lg for k in BEFORE), "L4 the legs job declares each matrix")
+# The trunk push's lookup (L8): the legs job alone may read the actions API,
+# names the tree it tests in a step's name (the jobs listing shows it), and
+# hands the plan's step alone the workflow's own token.
+say(re.search(r"^    permissions:\n      contents: read\n      actions: read\n(?!      \S)", lg, re.M) is not None,
+    "L4 the legs job's token reads the repository and its runs, and nothing more")
+TREE_NAME = "      - name: the tree under test is ${{ steps.tree.outputs.tree }}\n"
+say("        id: tree\n" in lg and TREE_NAME in lg
+    and lg.index("        id: tree\n") < lg.index(TREE_NAME) < lg.index("ci/legs.py --github-output")
+    and "test \"$(git rev-parse 'HEAD^{tree}')\" = \"${{ steps.tree.outputs.tree }}\"" in lg,
+    "L4 the legs job names the tree it tests in a step's name, checked, before the plan")
+say(lg.count("github.token") == 1 and wf.count("LEGS_TOKEN") == 1
+    and re.search(r"^        id: legs\n        env:\n(          .*\n)*          LEGS_TOKEN: \$\{\{ github\.token \}\}\n", lg, re.M) is not None,
+    "L4 the plan's step, and no other, is given the workflow's token")
+say("    if: ${{ needs.legs.outputs.macos_fuzz == 'true' }}\n" in blocks["macos-fuzz"]
+    and "    if: ${{ needs.legs.outputs.macos_perf == 'true' }}\n" in blocks["macos-perf"],
+    "L4 macos-fuzz and macos-perf run where the plan says")
+# The names the lookup matches are the ones this workflow gives its macOS jobs.
+rendered = []
+for j in ("macos-fuzz", "macos-perf"):
+    nm = re.search(r"^    name: (.*)$", blocks[j], re.M)
+    fam = re.search(r"^        family: \[([^\]]+)\]$", blocks[j], re.M)
+    rendered += [nm.group(1).replace("${{ matrix.family }}", f.strip()) for f in fam.group(1).split(",")] if nm and fam else []
+mac_oracle = [l for l in plan("schedule").get("matrix_oracle", []) if l["os"] == M]
+oracle_name = ["oracle (%s)" % ", ".join(str(v).lower() if isinstance(v, bool) else v for v in l.values()) for l in mac_oracle]
+say(oracle_name == [MAC_ORACLE] and not re.search(r"^    name: ", blocks["oracle"], re.M) and rendered == MAC_FUZZ + MAC_PERF
+    and all(re.search(r"^    runs-on: macos-latest$", blocks[j], re.M) for j in ("macos-fuzz", "macos-perf")),
+    "L4 the macOS jobs a trunk push looks for are named as this workflow names them: %s" % (oracle_name + rendered))
 for j in ("port", "oracle"):
     b = blocks[j]
     say("    needs: legs\n" in b and ("        include: ${{ fromJSON(needs.legs.outputs.matrix_%s || '[]') }}\n" % j) in b
