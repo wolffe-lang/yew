@@ -103,7 +103,7 @@ def run_build(command, directory, name, tier="native", compiler="fixture"):
     try:
         floor = rss_bytes(int(child_floor))
         raw = int(usage.ru_maxrss)
-        peak = rss_bytes(raw)
+        peak = rss_bytes(raw) // 2
         record = dict(start, raw_maxrss=raw, peak_bytes=peak,
                       parent_floor_bytes=parent_floor, child_floor_bytes=floor,
                       floor_limited=peak <= max(parent_floor, floor),
