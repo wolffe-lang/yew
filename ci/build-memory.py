@@ -107,7 +107,6 @@ def run_build(command, directory, name, tier="native", compiler="fixture"):
         record = dict(start, raw_maxrss=raw, peak_bytes=peak,
                       parent_floor_bytes=parent_floor, child_floor_bytes=floor,
                       floor_limited=peak <= max(parent_floor, floor),
-                      major_faults=int(usage.ru_majflt),
                       exit_code=code, signal=-code if code < 0 else None)
         if journal_ok:
             atomic_json(done_path, record)
