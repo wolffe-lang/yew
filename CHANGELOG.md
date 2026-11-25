@@ -5,6 +5,22 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### A trunk push skips macOS jobs already green at its commit (2026-11-25)
+
+- Merges are fast-forwards, so a push to trunk runs the commit its pull
+  request's run has just passed. On a push the `legs` job now reads this
+  workflow's runs at the pushed commit and skips a macOS job (the oracle's
+  macOS leg, `macos-fuzz`, `macos-perf`) when a completed, successful pull
+  request or dispatch run there tested the same tree and ran every job of
+  that kind green on macOS. Each run names the tree it tests in a step of
+  its `legs` job, because a pull request's run tests its merge with the
+  base. A lookup that fails, a missing or extra job, or any other doubt runs
+  the job. Where `macos-perf` runs, the oracle's macOS leg runs too, since
+  it reads that leg's artifact. The `legs` job's log and step summary name
+  each skipped job and the run it relied on. The job's token gains
+  `actions: read`. `ci/legs-test.py` L8 checks the lookup against a stand-in
+  API, and L4 checks the wiring.
+
 ### The version is 0.1.0, from one source (2026-11-22)
 
 - `yew --version` prints `yew 0.1.0`, no longer C yew's `yew 1.0.0-dev`.
