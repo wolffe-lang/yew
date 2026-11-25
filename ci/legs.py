@@ -174,7 +174,7 @@ def tested_tree(jobs):
 def green_kind(jobs, names):
     """Whether every job of the kind is in the run once, green, on macOS."""
     found = [[j for j in jobs if j.get("name") == n] for n in names]
-    return all(len(f) == 1 and f[0].get("conclusion") == "success" and MAC in (f[0].get("labels") or []) for f in found)
+    return all(len(f) == 1 and f[0].get("conclusion") == "success" and MAC in (f[0].get("labels") or []) for f in found if f)
 
 
 def git(*args):
