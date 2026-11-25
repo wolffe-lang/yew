@@ -143,6 +143,8 @@ CI reports the largest explicit wolf build's peak RSS, its native-tier
 maximum, the runner's total memory and the remaining nominal margin in each
 compiler job's log and summary. These are compiler-memory observations,
 not editor runtime-memory measurements or simultaneous process-tree totals.
+Each build also keeps its major page-fault count, since on a runner short of
+memory paging can hold a build's resident peak below what it needs.
 With wolf pinned at 0.2.36 they describe today's builds; the next pin change
 will show its memory cost on the first run. No extra builds are added.
 The row reports and does not gate: `YEW_BUILD_MEMORY_ENFORCE=0` keeps the
