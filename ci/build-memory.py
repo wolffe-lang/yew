@@ -3,6 +3,8 @@
 
 wait4 ru_maxrss is a high-water RSS, not simultaneous process-tree memory.
 Darwin reports bytes; Linux reports KiB. Never subtract the pre-exec floor.
+The same wait4 call's ru_majflt is kept as major_faults: on a runner short of
+memory, paging can hold a build's resident peak below what it needs.
 YEW_BUILD_MEMORY_ENFORCE=0 is deliberately report-only. The owner must approve
 an enforcing percentage before changing that setting to 1.
 """
@@ -105,6 +107,7 @@ def run_build(command, directory, name, tier="native", compiler="fixture"):
         record = dict(start, raw_maxrss=raw, peak_bytes=peak,
                       parent_floor_bytes=parent_floor, child_floor_bytes=floor,
                       floor_limited=peak <= max(parent_floor, floor),
+                      major_faults=int(usage.ru_majflt),
                       exit_code=code, signal=-code if code < 0 else None)
         if journal_ok:
             atomic_json(done_path, record)
@@ -202,7 +205,7 @@ def read_records(directory):
             start = json.loads(starts[ident].read_text())
             if any(row[key] != value for key, value in start.items()):
                 raise ValueError("start/completion mismatch")
-            for key in ("raw_maxrss", "peak_bytes", "parent_floor_bytes", "child_floor_bytes"):
+            for key in ("raw_maxrss", "peak_bytes", "parent_floor_bytes", "child_floor_bytes", "major_faults"):
                 if type(row[key]) is not int or row[key] < 0:
                     raise ValueError("invalid " + key)
             if row["peak_bytes"] <= 0 or row["peak_bytes"] != rss_bytes(row["raw_maxrss"], row["platform"]):
@@ -269,6 +272,7 @@ def report(directory, job, matrix, summary, enforce, percent, expect_builds=Fals
               "percent": round(100 * peak / total, 2) if total and peak is not None else None,
               "reader_floor_bytes": max(winner["parent_floor_bytes"], winner["child_floor_bytes"]) if winner else None,
               "floor_limited": winner["floor_limited"] if winner else None,
+              "major_faults": winner["major_faults"] if winner else None,
               "policy": "enforce" if enforce else "report-only", "limit_percent": percent,
               "errors": errors}
     try:
