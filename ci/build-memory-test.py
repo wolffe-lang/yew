@@ -46,6 +46,32 @@ def lower_bound(work):
     print("PASS build-memory-fixture-lower-bound observed=%d floor=%d" % (observed, floor))
 
 
+def paging(work):
+    """Each completion keeps the child's major page faults from the same wait4
+    call, so a peak held down by paging on a small runner can be told apart."""
+    reader = module()
+    records = work / "fixture-records"
+    completed = list(records.glob("*.done.json"))
+    record = json.loads(completed[0].read_text()) if len(completed) == 1 else {}
+    faults = record.get("major_faults")
+    if type(faults) is not int or faults < 0:
+        raise AssertionError("build-memory-paging-recorded major_faults=%r in the fixture's record" % (faults,))
+    with contextlib.redirect_stdout(io.StringIO()) as output:
+        reader.report(records, "fixture", "{}", None, False, 85)
+    result = json.loads(output.getvalue().strip().removeprefix("build-memory "))
+    if result.get("major_faults") != faults:
+        raise AssertionError("build-memory-paging-recorded report major_faults=%r record=%d" %
+                             (result.get("major_faults"), faults))
+    bad = work / "paging-bad"
+    bad.mkdir()
+    start = {key: record[key] for key in ("schema", "id", "name", "tier", "argv", "cwd", "compiler", "platform", "raw_unit")}
+    reader.atomic_json(bad / (record["id"] + ".start.json"), start)
+    reader.atomic_json(bad / (record["id"] + ".done.json"), dict(record, major_faults=-1))
+    if not reader.read_records(bad)[2]:
+        raise AssertionError("build-memory-paging-recorded a negative major_faults was accepted")
+    print("PASS build-memory-paging-recorded")
+
+
 def module():
     spec = importlib.util.spec_from_file_location("build_memory", ROOT / "ci/build-memory.py")
     reader = importlib.util.module_from_spec(spec)
@@ -375,6 +401,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="reader-", dir=base) as scratch:
         work = Path(scratch)
         lower_bound(work)
+        paging(work)
         controls(work)
         transport(work)
         path_only_caller(work)
