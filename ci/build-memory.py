@@ -298,6 +298,9 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "wolf":
         real, args = argv[1], argv[2:]
+        if not real:
+            print("wolf-memory: no real compiler", file=sys.stderr, flush=True)
+            return 127
         if os.environ.get("YEW_BUILD_MEMORY") != "1" or not args or args[0] != "build":
             os.execvpe(real, [real] + args, os.environ)
         name, tier = build_name(args)
