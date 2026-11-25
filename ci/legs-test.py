@@ -4,7 +4,8 @@
     ci/legs-test.py
 
   L1  the legs by event: a pull request and a trunk push run `oracle` on
-      every host and `port` on every host but macOS; the nightly and a
+      every host and `port` on every host but macOS, and both macOS jobs
+      of their own (`macos-fuzz`, `macos-perf`); the nightly and a
       dispatch run both on every host; an event the planner does not know
       gets the pull request's legs (never more); no event is a usage error.
   L2  what the pull request leaves is exactly the macOS port, and the
@@ -39,6 +40,18 @@
   L5  ci/nightly-red.sh against a stand-in `gh`: no open issue opens one,
       labelled, under the one title; an open one gets a comment and no new
       issue; a label that already exists is no failure.
+  L8  a trunk push's macOS jobs already green at its commit, against a
+      stand-in for the REST API and a scratch git repository: a completed,
+      successful pull request or dispatch run of ci.yml at the commit, whose
+      `legs` job tested the same tree and whose jobs of a macOS kind (the
+      oracle's macOS leg, macos-fuzz, macos-perf) are each there once and
+      green on macOS, lets the push leave that kind, and the plan names the
+      run; anything less runs it: no such run, another event, another tree,
+      no tree, a missing, duplicate, cancelled or non-macOS job, a jobs
+      listing short of its count, an error, a timeout, a redirect, an odd
+      answer, no token, a checkout that is not the pushed commit. Where
+      macos-perf runs, the oracle's macOS leg runs (its artifact). No other
+      event asks, and the token is never printed.
 
 Exit 0 when every check passes, 1 otherwise.
 """
@@ -64,7 +77,11 @@ def say(ok, what):
 
 
 def clean_env(**more):
-    env = {k: v for k, v in os.environ.items() if k not in ("EVENT",)}
+    # The runner's own GITHUB_* and any token in the caller's environment stay
+    # out: only the L8 rows give the planner a commit, an API and a token.
+    drop = ("EVENT", "LEGS_TOKEN", "LEGS_API_TIMEOUT", "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_SHA",
+            "GITHUB_REPOSITORY", "GITHUB_API_URL", "GITHUB_SERVER_URL", "GITHUB_STEP_SUMMARY")
+    env = {k: v for k, v in os.environ.items() if k not in drop}
     env.update(more)
     return env
 
@@ -84,12 +101,28 @@ BEFORE = {
     "matrix_oracle": [{"os": U, "ccs": "--cc clang --cc gcc", "port": True}, {"os": M, "ccs": "--cc clang", "port": True},
                       {"os": A, "ccs": "--cc clang --cc gcc", "port": False}],
 }
-MERGE = {"matrix_port": [BEFORE["matrix_port"][0], BEFORE["matrix_port"][2]], "matrix_oracle": BEFORE["matrix_oracle"]}
+# The macOS fuzz and perf jobs ran on every event before tl30 and still do,
+# unless a trunk push finds them green at its commit (L8).
+BEFORE.update(macos_fuzz=True, macos_perf=True)
+MERGE = {"matrix_port": [BEFORE["matrix_port"][0], BEFORE["matrix_port"][2]], "matrix_oracle": BEFORE["matrix_oracle"],
+         "macos_fuzz": True, "macos_perf": True}
 MOVED = {"matrix_port": [BEFORE["matrix_port"][1]], "matrix_oracle": []}
 
 
+def matrices(m):
+    return {k: v for k, v in m.items() if k.startswith("matrix_")}
+
+
+# The macOS jobs a trunk push may leave, by the names GitHub gives them (L4
+# reads them back from the workflow; L8 feeds them to the planner).
+MAC_ORACLE = "oracle (macos-latest, --cc clang, true)"
+MAC_FUZZ = ["fuzz (macOS arm64, against-c-%d)" % i for i in (1, 2, 3, 4)]
+MAC_PERF = ["perf (macOS arm64, editor)", "perf (macOS arm64, components)"]
+MAC_JOBS = [MAC_ORACLE] + MAC_FUZZ + MAC_PERF
+
+
 def hosts(m):
-    return {k: [l["os"] for l in v] for k, v in m.items()}
+    return {k: [l["os"] for l in v] for k, v in matrices(m).items()}
 
 
 # --- L1 the legs by event ---------------------------------------------------------
@@ -106,11 +139,13 @@ say(plan(None) == {"ERROR": 2}, "L1 no event is a usage error")
 # --- L2 what the pull request leaves ---------------------------------------------
 pr, night = plan("pull_request"), plan("schedule")
 if "ERROR" not in pr and "ERROR" not in night:
-    left = {k: [l for l in v if l not in pr.get(k, [])] for k, v in night.items()}
+    left = {k: [l for l in v if l not in pr.get(k, [])] for k, v in matrices(night).items()}
     say(left == MOVED, "L2 what a pull request leaves is exactly the macOS port: %s" % json.dumps({k: hosts({k: v})[k] for k, v in left.items() if v}))
-    say(all(l in night[k] for k, v in pr.items() for l in v), "L2 every leg a pull request runs, the nightly runs too")
+    say(all(l in night[k] for k, v in matrices(pr).items() for l in v), "L2 every leg a pull request runs, the nightly runs too")
     say(any(l["os"] == M for l in pr["matrix_oracle"]), "L2 a pull request keeps a macOS leg: the oracle's (its pty goldens, wolf-lang#794)")
-    every = [l for m in (plan(e) for e in ("pull_request", "push", "schedule", "workflow_dispatch")) for v in m.values() for l in v]
+    say(all(m.get(k) is True for m in (pr, night) for k in ("macos_fuzz", "macos_perf")),
+        "L2 a pull request and the nightly run macos-fuzz and macos-perf")
+    every = [l for m in (plan(e) for e in ("pull_request", "push", "schedule", "workflow_dispatch")) for v in matrices(m).values() for l in v]
     say(all(any(l in v for v in BEFORE.values()) for l in every), "L2 every leg of every event is one of the legs before tl30")
 else:
     say(False, "L2 the planner ran (%s, %s)" % (pr, night))
@@ -339,6 +374,339 @@ for path in sorted(glob.glob(os.path.join(ROOT, ".github", "workflows", "*")) + 
         if "ubuntu-latest" in line:
             stale.append("%s:%d" % (os.path.relpath(path, ROOT), n))
 say(not stale, "L7 no workflow or planner leg says ubuntu-latest, the runner image is pinned" + ("" if not stale else ": " + ", ".join(stale)))
+
+# --- L8 a trunk push's macOS jobs already green at its commit ---------------------
+# Merges are fast-forwards, so a trunk push runs the commit its pull request's
+# run has just passed. The plan asks the REST API for this workflow's runs at
+# the pushed commit and leaves a macOS kind only on positive evidence. These
+# rows run the planner as the workflow does (EVENT, GITHUB_SHA,
+# GITHUB_REPOSITORY, GITHUB_API_URL, LEGS_TOKEN) in a scratch git repository,
+# against a stand-in API on 127.0.0.1.
+import http.server
+import threading
+import time
+import urllib.parse
+
+REPO = "wolffe-lang/yew"
+TOKEN = "legs-test-stand-in-token-7c1e"
+
+
+class QuietServer(http.server.ThreadingHTTPServer):
+    # A client that timed out leaves a handler writing to a closed socket.
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+class FakeAPI:
+    """The REST API's two answers the plan reads: the runs of ci.yml at a
+    commit, and a run's jobs (paged). `fault` is (path prefix, kind)."""
+
+    def __init__(self, runs=(), jobs=None, fault=None, page_cap=100, ignore_filter=False, totals=None):
+        self.runs, self.jobs = list(runs), dict(jobs or {})
+        self.fault, self.page_cap, self.ignore_filter = fault, page_cap, ignore_filter
+        self.totals = dict(totals or {})
+        self.requests = []
+        self.redirect_to = None
+        api = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                api.requests.append((self.path, self.headers.get("Authorization")))
+                status, body, extra = api.answer(self.path)
+                data = body if isinstance(body, bytes) else json.dumps(body).encode()
+                self.send_response(status)
+                for k, v in extra.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = QuietServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def answer(self, path):
+        u = urllib.parse.urlsplit(path)
+        q = dict(urllib.parse.parse_qsl(u.query))
+        if self.fault and u.path.startswith(self.fault[0]):
+            kind = self.fault[1]
+            if kind in (500, 403, 404):
+                return kind, {"message": "stand-in error %d" % kind}, {}
+            if kind == "html":
+                return 200, b"<html>not json</html>", {}
+            if kind == "keys":
+                return 200, {"message": "an answer without the expected keys"}, {}
+            if kind == "slow":
+                time.sleep(4)
+            if kind == "redirect":
+                return 302, {}, {"Location": self.redirect_to + path}
+        if u.path == "/repos/%s/actions/workflows/ci.yml/runs" % REPO:
+            rs = [r for r in self.runs if self.ignore_filter or r["head_sha"] == q.get("head_sha")]
+            return 200, {"total_count": len(rs), "workflow_runs": rs}, {}
+        m = re.fullmatch(r"/repos/%s/actions/runs/(\d+)/jobs" % re.escape(REPO), u.path)
+        if m:
+            rid = int(m.group(1))
+            js = self.jobs.get(rid, [])
+            per = min(int(q.get("per_page", 30)), self.page_cap)
+            page = int(q.get("page", 1))
+            return 200, {"total_count": self.totals.get(rid, len(js)), "jobs": js[(page - 1) * per:page * per]}, {}
+        return 404, {"message": "Not Found"}, {}
+
+
+def scratch_repo():
+    d = tempfile.mkdtemp(prefix="legs-test-repo-")
+    g = ["git", "-C", d, "-c", "user.name=legs-test", "-c", "user.email=legs-test@invalid", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "-c", "init.defaultBranch=trunk", "init", "-q", d], check=True)
+    with open(os.path.join(d, "f"), "w") as f:
+        f.write("the pushed commit\n")
+    subprocess.run(g + ["add", "f"], check=True)
+    subprocess.run(g + ["commit", "-q", "-m", "the pushed commit"], check=True)
+    rev = lambda r: subprocess.run(["git", "-C", d, "rev-parse", r], capture_output=True, text=True, check=True).stdout.strip()
+    return d, rev("HEAD"), rev("HEAD^{tree}")
+
+
+GITDIR, SHA, TREE = scratch_repo()
+OTHER_TREE = "0" * 40
+
+
+def wrun(rid, event="pull_request", conclusion="success", status="completed", sha=None, path=".github/workflows/ci.yml"):
+    return {"id": rid, "event": event, "status": status, "conclusion": conclusion, "head_sha": sha or SHA, "path": path,
+            "run_attempt": 1, "html_url": "https://github.com/%s/actions/runs/%d" % (REPO, rid)}
+
+
+def wjob(name, conclusion="success", labels=None, steps=None):
+    if labels is None:
+        labels = ["macos-latest"] if name in MAC_JOBS else ["ubuntu-24.04"]
+    return {"name": name, "status": "completed", "conclusion": conclusion, "labels": labels, "steps": steps or []}
+
+
+def legs_job(tree=None, step=True):
+    steps = [{"name": "Set up job", "conclusion": "success"}]
+    if step:
+        steps.append({"name": "the tree under test is %s" % (tree or TREE), "conclusion": "success"})
+    return wjob("legs", steps=steps)
+
+
+LINUX_JOBS = ["port (ubuntu-24.04, true)", "oracle (ubuntu-24.04, --cc clang --cc gcc, true)", "fuzz (linux x86-64, port)"]
+
+
+def green(tree=None, step=True, drop=(), swap=None, extra=()):
+    """A run's jobs: the legs job, three Linux jobs, every macOS job green,
+    less `drop`, with `swap` {name: job} replacing some, plus `extra`."""
+    swap = swap or {}
+    js = [legs_job(tree, step)] + [wjob(n) for n in LINUX_JOBS]
+    js += [swap.get(n, wjob(n)) for n in MAC_JOBS if n not in drop]
+    return js + list(extra)
+
+
+FULL = MERGE
+NO_MAC = {"matrix_port": MERGE["matrix_port"], "matrix_oracle": [l for l in MERGE["matrix_oracle"] if l["os"] != M],
+          "macos_fuzz": False, "macos_perf": False}
+SEEN = []   # every plan's printed output, for the token check
+
+
+def push_plan(api, event="push", sha=None, token=TOKEN, timeout=None, summary=None, cwd=None):
+    env = clean_env(EVENT=event, GITHUB_SHA=sha or SHA, GITHUB_REPOSITORY=REPO, GITHUB_API_URL=api.url,
+                    GITHUB_SERVER_URL="https://github.com")
+    if token:
+        env["LEGS_TOKEN"] = token
+    if timeout:
+        env["LEGS_API_TIMEOUT"] = str(timeout)
+    if summary:
+        env["GITHUB_STEP_SUMMARY"] = summary
+    r = subprocess.run([sys.executable, PLAN, "--json"], capture_output=True, text=True, env=env, cwd=cwd or GITDIR, timeout=120)
+    SEEN.append(r.stdout + r.stderr)
+    got = {"ERROR": r.returncode}
+    if r.returncode == 0:
+        try:
+            got = json.loads(r.stdout)
+        except ValueError:
+            got = {"ERROR": "not JSON: %r" % r.stdout[:80]}
+    return got, r.stderr
+
+
+def mac_kinds(p):
+    if "ERROR" in p:
+        return p
+    return [k for k, on in (("oracle", any(l["os"] == M for l in p.get("matrix_oracle", []))),
+                            ("fuzz", p.get("macos_fuzz")), ("perf", p.get("macos_perf"))) if on]
+
+
+PLANS = []
+VERDICT = re.compile(r"^legs: (skip|keep) (oracle-macos|macos-fuzz|macos-perf): (.*)$", re.M)
+
+
+def row(what, api, want, **kw):
+    got, err = push_plan(api, **kw)
+    PLANS.append(got)
+    verdicts = VERDICT.findall(err)
+    kinds = sorted(k for _, k, _ in verdicts)
+    say(got == want and kinds == ["macos-fuzz", "macos-perf", "oracle-macos"],
+        "L8 %s: macOS %s, a verdict for each kind %s" % (what, mac_kinds(got), kinds))
+    return got, err, verdicts
+
+
+def skipped_by(verdicts):
+    out = {}
+    for v, k, why in verdicts:
+        if v == "skip":
+            m = re.match(r"green in (pull_request|workflow_dispatch) run (\d+) ", why)
+            out[k] = (m.group(1), int(m.group(2))) if m else None
+    return out
+
+
+# A green pull request run at the commit and tree: the push runs no macOS job,
+# and the plan names the run for each kind, in its log and its step summary.
+summary = os.path.join(tempfile.mkdtemp(prefix="legs-test-summary-"), "summary.md")
+api = FakeAPI([wrun(7001)], {7001: green()})
+got, err, v = row("a green pull request run at the commit and tree leaves every macOS kind", api, NO_MAC, summary=summary)
+say(skipped_by(v) == {k: ("pull_request", 7001) for k in ("oracle-macos", "macos-fuzz", "macos-perf")}
+    and all(SHA in why and TREE in why for _, _, why in v),
+    "L8 each skip names the run it relied on (pull_request run 7001), the commit and the tree")
+text = open(summary).read() if os.path.exists(summary) else ""
+say(text.count("7001") >= 3 and "macos-fuzz" in text, "L8 the step summary names the run for each skipped kind")
+jobs_q = [urllib.parse.parse_qs(urllib.parse.urlsplit(p).query) for p, _ in api.requests if "/jobs" in p]
+say(jobs_q and all(q.get("filter") == ["latest"] for q in jobs_q), "L8 a run's jobs are read at its latest attempt (filter=latest)")
+say(api.requests and all(a == "Bearer " + TOKEN for _, a in api.requests), "L8 every request carries the workflow's token, to the API it was given")
+api.close()
+
+api = FakeAPI([wrun(7002, event="workflow_dispatch")], {7002: green()})
+got, err, v = row("a green dispatch run at the commit counts", api, NO_MAC)
+say(skipped_by(v) == {k: ("workflow_dispatch", 7002) for k in ("oracle-macos", "macos-fuzz", "macos-perf")}, "L8 the dispatch run is named")
+api.close()
+
+for ev in ("schedule", "push"):
+    api = FakeAPI([wrun(7003, event=ev)], {7003: green()})
+    row("a green %s run at the commit does not count" % ev, api, FULL)
+    api.close()
+
+api = FakeAPI([wrun(7004, conclusion="failure"), wrun(7005, conclusion="cancelled"), wrun(7006, status="in_progress", conclusion=None)],
+              {7004: green(), 7005: green(), 7006: green()})
+row("a failed, a cancelled and a running pull request run do not count", api, FULL)
+api.close()
+
+api = FakeAPI([wrun(7007)], {7007: green(tree=OTHER_TREE)})
+row("a run that tested another tree (its base was not in the commit) does not count", api, FULL)
+api.close()
+
+api = FakeAPI([wrun(7008)], {7008: green(step=False)})
+row("a run whose legs job names no tree does not count", api, FULL)
+api.close()
+
+api = FakeAPI([wrun(7009)], {7009: [legs_job()] + [wjob(n) for n in LINUX_JOBS]})
+row("a green run with no macOS job at all: every macOS kind runs", api, FULL)
+api.close()
+
+api = FakeAPI([wrun(7010)], {7010: green(drop=MAC_FUZZ)})
+want = dict(NO_MAC, macos_fuzz=True)
+got, err, v = row("the macOS fuzz jobs never ran at the commit: they run, the green kinds do not", api, want)
+say(skipped_by(v) == {"oracle-macos": ("pull_request", 7010), "macos-perf": ("pull_request", 7010)}, "L8 only the green kinds are skipped")
+api.close()
+
+api = FakeAPI([wrun(7011)], {7011: green(swap={MAC_FUZZ[2]: wjob(MAC_FUZZ[2], conclusion="cancelled")})})
+row("one fuzz family cancelled in the latest attempt: macos-fuzz runs", api, dict(NO_MAC, macos_fuzz=True))
+api.close()
+
+api = FakeAPI([wrun(7012)], {7012: green(drop=[MAC_FUZZ[3]])})
+row("one fuzz family missing: macos-fuzz runs", api, dict(NO_MAC, macos_fuzz=True))
+api.close()
+
+api = FakeAPI([wrun(7013)], {7013: green(extra=[wjob(MAC_FUZZ[0], conclusion="failure")])})
+row("a fuzz family listed twice, once red: macos-fuzz runs", api, dict(NO_MAC, macos_fuzz=True))
+api.close()
+
+api = FakeAPI([wrun(7014)], {7014: green(swap={MAC_FUZZ[1]: wjob(MAC_FUZZ[1], labels=["ubuntu-24.04"])})})
+row("a fuzz family's job that ran on Linux: macos-fuzz runs", api, dict(NO_MAC, macos_fuzz=True))
+api.close()
+
+api = FakeAPI([wrun(7015)], {7015: green(drop=MAC_PERF)})
+got, err, v = row("the perf jobs absent: perf runs, and so does the oracle's macOS leg, whose artifact it reads", api,
+                  dict(FULL, macos_fuzz=False))
+say(skipped_by(v) == {"macos-fuzz": ("pull_request", 7015)}, "L8 only macos-fuzz is skipped when perf must run")
+api.close()
+
+api = FakeAPI([wrun(7016)], {7016: green(drop=[MAC_ORACLE])})
+row("the oracle's macOS leg absent: it runs, the green kinds do not", api, dict(FULL, macos_fuzz=False, macos_perf=False))
+api.close()
+
+api = FakeAPI([wrun(7017), wrun(7018, conclusion="failure")], {7017: green(drop=MAC_FUZZ), 7018: green()})
+got, err, v = row("two runs at the commit: only the green one counts", api, dict(NO_MAC, macos_fuzz=True))
+say(skipped_by(v) == {"oracle-macos": ("pull_request", 7017), "macos-perf": ("pull_request", 7017)}, "L8 the red run is not relied on")
+api.close()
+
+api = FakeAPI([wrun(7019), wrun(7020, event="workflow_dispatch")], {7019: green(drop=MAC_FUZZ), 7020: green(drop=MAC_PERF + [MAC_ORACLE])})
+got, err, v = row("two green runs, each with some kinds: each kind relies on a run that has it", api, NO_MAC)
+say(skipped_by(v) == {"oracle-macos": ("pull_request", 7019), "macos-perf": ("pull_request", 7019),
+                      "macos-fuzz": ("workflow_dispatch", 7020)}, "L8 each kind names the run it relied on")
+api.close()
+
+api = FakeAPI([wrun(7021)], {7021: green()}, page_cap=4)
+row("a jobs listing over several pages is read to its count", api, NO_MAC)
+say(len([p for p, _ in api.requests if "/jobs" in p]) >= 3, "L8 the planner read every page")
+api.close()
+
+api = FakeAPI([wrun(7022)], {7022: green()}, totals={7022: 99})
+row("a jobs listing short of its total_count is no evidence", api, FULL)
+api.close()
+
+api = FakeAPI([wrun(7023, sha="1" * 40), wrun(7024, path=".github/workflows/float-hosts.yml")], {7023: green(), 7024: green()},
+              ignore_filter=True)
+row("runs of another commit or another workflow, listed anyway, do not count", api, FULL)
+api.close()
+
+for where, kind in (("/repos/%s/actions/workflows" % REPO, 500), ("/repos/%s/actions/runs" % REPO, 403),
+                    ("/repos/%s/actions/workflows" % REPO, "html"), ("/repos/%s/actions/runs" % REPO, "keys"),
+                    ("/repos/%s/actions/workflows" % REPO, 404)):
+    api = FakeAPI([wrun(7030)], {7030: green()}, fault=(where, kind))
+    row("the lookup answered %s at %s: every macOS kind runs" % (kind, where.rsplit("/", 1)[-1]), api, FULL)
+    api.close()
+
+api = FakeAPI([wrun(7031)], {7031: green()}, fault=("/repos/%s/actions/workflows" % REPO, "slow"))
+t0 = time.time()
+row("the lookup timed out: every macOS kind runs", api, FULL, timeout=1)
+say(time.time() - t0 < 30, "L8 the timeout holds (%.1f s)" % (time.time() - t0))
+api.close()
+
+elsewhere = FakeAPI([wrun(7032)], {7032: green()})
+api = FakeAPI([wrun(7032)], {7032: green()}, fault=("/repos/%s/actions/workflows" % REPO, "redirect"))
+api.redirect_to = elsewhere.url
+row("the API redirected: not followed, every macOS kind runs", api, FULL)
+say(elsewhere.requests == [], "L8 a redirect takes the token nowhere (the other host saw %d requests)" % len(elsewhere.requests))
+api.close()
+elsewhere.close()
+
+api = FakeAPI([wrun(7033)], {7033: green()})
+row("no token: every macOS kind runs", api, FULL, token=None)
+say(api.requests == [], "L8 without a token nothing is asked")
+api.close()
+
+api = FakeAPI([wrun(7034, sha="2" * 40)], {7034: green()})
+row("the checkout is not the pushed commit: every macOS kind runs", api, FULL, sha="2" * 40)
+say(api.requests == [], "L8 a checkout that is not the pushed commit asks nothing")
+api.close()
+
+for ev, want in (("pull_request", MERGE), ("schedule", BEFORE), ("workflow_dispatch", BEFORE)):
+    api = FakeAPI([wrun(7040)], {7040: green()})
+    got, err = push_plan(api, event=ev)
+    say(got == want and api.requests == [] and not VERDICT.search(err),
+        "L8 a %s run asks nothing and keeps its legs (%s)" % (ev, mac_kinds(got)))
+    api.close()
+
+say(all("ERROR" not in p for p in PLANS), "L8 every trunk push plan exits 0")
+say(all("macos-latest" in [l["os"] for l in p.get("matrix_oracle", [])] for p in PLANS if p.get("macos_perf")),
+    "L8 wherever macos-perf runs, the oracle's macOS leg runs")
+say(SEEN and not any(TOKEN in s for s in SEEN), "L8 the token is never printed")
+shutil.rmtree(GITDIR, ignore_errors=True)
 
 print("legs-test: %s" % ("PASS" if fails == 0 else "FAIL (%d)" % fails))
 sys.exit(1 if fails else 0)
