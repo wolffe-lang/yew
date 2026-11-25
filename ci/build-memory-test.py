@@ -203,6 +203,82 @@ raise SystemExit(int(os.environ.get("FAKE_EXIT","0")))
     print("PASS build-memory-command-transport")
 
 
+def path_only_caller(work):
+    """$WOLF handed on as a bare path, the way tools/check-test-cases hands it on.
+
+    That tool sources the toolchain library in a subshell and keeps only the
+    printed path, so nothing else the library exported reaches the compiler's
+    environment. The observer must still run the real compiler unchanged."""
+    root = work / "path-only"
+    (root / "tools").mkdir(parents=True)
+    (root / "ci").mkdir()
+    (root / ".wolf-bin/std").mkdir(parents=True)
+    for name in ("lib-toolchain.sh", "lib-toml.sh", "wolf-memory", "check-test-cases"):
+        (root / "tools" / name).write_bytes((ROOT / "tools" / name).read_bytes())
+        (root / "tools" / name).chmod(0o755)
+    (root / "ci/build-memory.py").write_bytes((ROOT / "ci/build-memory.py").read_bytes())
+    manifest = (ROOT / "wolf-toolchain.toml").read_text()
+    (root / "wolf-toolchain.toml").write_text(manifest)
+    def pin(section, key):
+        block = manifest.split("[" + section + "]", 1)[1].split("[", 1)[0]
+        return next(line.split('"')[1] for line in block.splitlines() if line.startswith(key + " ="))
+    fake = '''#!{python}
+import json,sys
+if sys.argv[1:] == ["--version"]:
+    print({identity!r}); raise SystemExit(0)
+if sys.argv[1:2] == ["conform-run"]:
+    print(json.dumps({{"verdict":"exit(0)","stdout_inline":"a case: PASS"}})); raise SystemExit(0)
+if sys.argv[1:2] == ["build"]:
+    with open(sys.argv[sys.argv.index("-o")+1],"w") as stream: stream.write("built\\n")
+    raise SystemExit(0)
+raise SystemExit(3)
+'''
+    for tool in ("wolf", "lupin"):
+        path = root / ".wolf-bin" / tool
+        path.write_text(fake.format(python=sys.executable, identity=pin(tool, "version_line")))
+        path.chmod(0o755)
+    (root / ".wolf-bin/libwolf_rt.a").touch()
+    (root / ".wolf-bin/std/STD-REV").write_text(pin("std", "rev") + "\n")
+    (root / "tools/check-test-cases.txt").write_text("src/a_test.lu YEW_A_FIXTURE @wsstate-invalid\n")
+    invalid = root / "tests/unit/fixtures/wsstate/v1/invalid"
+    invalid.mkdir(parents=True)
+    for name in ("one.fl", "two.fl"):
+        (invalid / name).touch()
+    (root / "src").mkdir()
+    (root / "src/a_test.lu").touch()
+    # Only what a job step has: no WOLF_BIN, nothing the library exports.
+    records = work / "path-only-records"
+    env = {"PATH": os.environ["PATH"], "HOME": str(work), "SHELL": "/bin/sh", "LANG": "C.UTF-8",
+           "YEW_BUILD_MEMORY": "1", "YEW_BUILD_MEMORY_DIR": str(records)}
+    child = subprocess.run([sys.executable, "-I", "tools/check-test-cases", "src/a_test.lu"],
+                           cwd=root, env=env, capture_output=True, text=True)
+    if child.returncode != 0 or "2 cases over 1 files, 0 red" not in child.stdout:
+        red = next((line for line in child.stdout.splitlines() if ": RED " in line), child.stderr.strip()[-200:])
+        raise AssertionError("build-memory-path-only-caller check-test-cases exit=%d %s" % (child.returncode, red))
+    env["YEW_ROOT"] = str(root)
+    probe = subprocess.run(["sh", "-c", '. tools/lib-toolchain.sh && printf "%s" "$WOLF"'],
+                           cwd=root, env=env, capture_output=True, text=True)
+    wolf = probe.stdout
+    if probe.returncode != 0 or wolf != str(root / "tools/wolf-memory"):
+        raise AssertionError("build-memory-path-only-caller probe exit=%d wolf=%r" % (probe.returncode, wolf))
+    built = work / "path-only-built"
+    child = subprocess.run([wolf, "build", "src/a_test.lu", "-o", str(built)],
+                           cwd=root, env=env, capture_output=True, text=True)
+    started, rows, errors = module().read_records(records)
+    real = [row["argv"][0] for row in rows]
+    if child.returncode != 0 or not built.exists() or started != 1 or errors or real != [str(root / ".wolf-bin/wolf")]:
+        raise AssertionError("build-memory-path-only-caller build exit=%d started=%d real=%r errors=%r" %
+                             (child.returncode, started, real, errors))
+    # A compiler that cannot be found, or that is the observer itself, is
+    # refused in one line; never a traceback, never a loop.
+    child = subprocess.run([wolf, "conform-run"], cwd=root, env=dict(env, WOLF_BIN=wolf),
+                           capture_output=True, text=True, timeout=30)
+    if child.returncode != 127 or "Traceback" in child.stderr or not child.stderr.startswith("wolf-memory: "):
+        raise AssertionError("build-memory-path-only-caller refusal exit=%d stderr=%r" %
+                             (child.returncode, child.stderr.strip()[-200:]))
+    print("PASS build-memory-path-only-caller")
+
+
 WORKFLOWS = {
     ".github/workflows/ci.yml": "99b6b77edccab30f4e9e0fc97fc5d98adc3955436fbc74967b1d0b2b403667ed",
     ".github/workflows/toyvm.yml": "dd36e8c9db62dfe80a252f6a064524b528762d0a48646984fbca54a7d70dd89f",
@@ -278,6 +354,7 @@ def main():
         lower_bound(work)
         controls(work)
         transport(work)
+        path_only_caller(work)
         if "--workflows" in sys.argv[1:]:
             workflow_controls()
 
