@@ -238,9 +238,10 @@ changing the set; promoting an existing caret remains possible at the cap.
 Cursor additions can be recorded in macros. A mouse addition records the
 resolved document offset, not its screen coordinates, so replay does not
 follow a changed viewport. Injected-byte tests establish application behavior;
-physical terminal forwarding is separate. A chord that is not delivered is
-reported as not received, not assumed to be a decoder failure. Ctrl-click
-still opens the existing menu; definition navigation is a separate change.
+physical terminal forwarding is separate. During a physical byte capture,
+a missing chord is recorded as not received; injected bytes do not establish
+whether a desktop intercepted it. Ctrl-click still opens the existing menu;
+definition navigation is a separate change.
 
 Shadow suggestions are not implemented at this pin, so Insert Alt+Down
 currently always moves the line. Probe rows verify both routing branches;
