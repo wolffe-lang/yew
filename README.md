@@ -186,8 +186,11 @@ can forbid that request; right-click and keyboard commands remain available.
 `YEW_MOUSE=0` disables the request along with mouse reporting.
 
 The broader selection-mode redesign has held contracts in
-[`tests/selection/README.md`](tests/selection/README.md); their remaining reds
-are not a claim that new clipboard or cursor behavior is implemented.
+[`tests/selection/README.md`](tests/selection/README.md). Collapsed-caret
+additions in L/W/B/I are available as described below. H mixed-selection
+additions, strict-overlap geometry, internal paste, and their associated
+undo/session behavior remain held; the existing H commands keep their
+legacy behavior. Ctrl+V still uses the system clipboard.
 
 ## Keys
 
@@ -212,6 +215,32 @@ Default editing keys, independently of the command prompt:
   moves it down when no shadow suggestion is visible; otherwise it
   dispatches to shadow-line acceptance. L/W/B keep their git-hunk keys,
   and H keeps its unit-specific vertical Alt motions.
+
+- **L/W/B/Insert, collapsed carets only:** Ctrl+Alt+Up and Ctrl+Alt+Down
+  add a caret on the neighboring logical line, preserving its desired display
+  column. The target becomes primary, so repeats grow a column; short lines
+  clamp without padding. Reversing direction onto an existing caret promotes
+  it without adding a duplicate. At the first/last line there is no addition.
+- **Alt+left-click in document text:** in L/W/B/Insert, append a caret at the
+  clicked grapheme and make it primary. Clicking an existing caret promotes
+  it, never toggles it away. Mixed modifier clicks do not add carets; existing
+  context menus and pane/tab controls retain their actions. H additions that
+  mix carets and selections are not implemented by this change.
+
+When a terminal or desktop does not deliver Ctrl+Alt arrows, use
+`:cursor-above` or `:cursor-below`. `:cursor-drop` removes the latest secondary
+caret, preserving the primary; `:cursor-only` keeps only the primary. The
+existing dotted command names (`:cursor.add.above`, `:cursor.add.below`,
+`:cursor.drop`, `:cursor.collapse`) still work. There are no additional fallback
+key bindings. The cap is 10,000: a new caret past the cap is refused without
+changing the set; promoting an existing caret remains possible at the cap.
+
+Cursor additions can be recorded in macros. A mouse addition records the
+resolved document offset, not its screen coordinates, so replay does not
+follow a changed viewport. Injected-byte tests establish application behavior;
+physical terminal forwarding is separate. A chord that is not delivered is
+reported as not received, not assumed to be a decoder failure. Ctrl-click
+still opens the existing menu; definition navigation is a separate change.
 
 Shadow suggestions are not implemented at this pin, so Insert Alt+Down
 currently always moves the line. Probe rows verify both routing branches;
