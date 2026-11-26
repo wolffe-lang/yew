@@ -498,16 +498,25 @@ class FakeAPI:
         return 404, {"message": "Not Found"}, {}
 
 
+STAND_IN_GIT = """#!/bin/sh
+# A stand-in for git: the plan's two questions, the pushed commit and its tree,
+# and nothing else (any other call fails, so a plan that asks another fails too).
+if [ "$*" = "rev-parse HEAD" ]; then echo "$STAND_IN_HEAD"; exit 0; fi
+if [ "$*" = "rev-parse HEAD^{tree}" ]; then echo "$STAND_IN_TREE"; exit 0; fi
+echo "stand-in git: not answered: $*" >&2
+exit 1
+"""
+
+
 def scratch_repo():
-    d = tempfile.mkdtemp(prefix="legs-test-repo-")
-    g = ["git", "-C", d, "-c", "user.name=legs-test", "-c", "user.email=legs-test@invalid", "-c", "commit.gpgsign=false"]
-    subprocess.run(["git", "-c", "init.defaultBranch=trunk", "init", "-q", d], check=True)
-    with open(os.path.join(d, "f"), "w") as f:
-        f.write("the pushed commit\n")
-    subprocess.run(g + ["add", "f"], check=True)
-    subprocess.run(g + ["commit", "-q", "-m", "the pushed commit"], check=True)
-    rev = lambda r: subprocess.run(["git", "-C", d, "rev-parse", r], capture_output=True, text=True, check=True).stdout.strip()
-    return d, rev("HEAD"), rev("HEAD^{tree}")
+    """The checkout a trunk push plans in: a directory whose `git`, first on
+    the plan's PATH, answers for a pushed commit and its tree, so the L8 rows
+    need no git of their own."""
+    d = tempfile.mkdtemp(prefix="legs-test-git-")
+    with open(os.path.join(d, "git"), "w") as f:
+        f.write(STAND_IN_GIT)
+    os.chmod(os.path.join(d, "git"), 0o755)
+    return d, "a1" * 20, "b2" * 20
 
 
 GITDIR, SHA, TREE = scratch_repo()
@@ -552,7 +561,8 @@ SEEN = []   # every plan's printed output, for the token check
 
 def push_plan(api, event="push", sha=None, token=TOKEN, timeout=None, summary=None, cwd=None):
     env = clean_env(EVENT=event, GITHUB_SHA=sha or SHA, GITHUB_REPOSITORY=REPO, GITHUB_API_URL=api.url,
-                    GITHUB_SERVER_URL="https://github.com")
+                    GITHUB_SERVER_URL="https://github.com", STAND_IN_HEAD=SHA, STAND_IN_TREE=TREE)
+    env["PATH"] = GITDIR + os.pathsep + env.get("PATH", "")
     if token:
         env["LEGS_TOKEN"] = token
     if timeout:
