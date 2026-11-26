@@ -4,22 +4,30 @@ runner (yew#171).
 
 The driver bounds each check at 250 ms of the monotonic clock (the 32-rule
 set at 1,000 ms), as C's fuzz_gitignore.c does; a hosted runner can stall
-for longer than that while the matcher does microseconds of work. These
+for longer than that while the matcher does microseconds of work. The driver
 rows run the driver tools/build-fuzz-gitignore built, with the test hook
 YEW_FUZZ_GI_STALL spinning inside the named timed readings: one stalled
 reading must not fail a check, the 32-rule set or the growth row, and a
 check stalled on every reading must fail, naming each reading. No compiler
 runs here unless FUZZ_PREBUILT is unset, when the driver is built first.
 
+C's driver is the pinned oracle and keeps its single reading, so
+tools/run-fuzz-gitignore runs C's campaign once more when, and only when, C
+failed on its own timing bound. The oracle rows run that runner, unchanged,
+in a scratch root against stand-in drivers: no build and no real campaign.
+
   FUZZ_PREBUILT=1 python3 -I tools/check-fuzz-gitignore-timing
+  python3 -I tools/check-fuzz-gitignore-timing --oracle-rows
 
 Prints PASS or FAIL per row; exit 1 when any row failed.
 """
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DRIVER = ROOT / "target/tools/fuzz-gitignore"
@@ -48,19 +56,7 @@ def why(text):
     return next((line for line in text.splitlines() if ": FAIL " in line), last(text))
 
 
-def main():
-    if os.environ.get("FUZZ_PREBUILT") != "1":
-        built = subprocess.run(["tools/build-fuzz-gitignore", "--native"], cwd=ROOT)
-        if built.returncode != 0:
-            print("FAIL fuzz-gitignore-bound the driver did not build (exit %d)" % built.returncode)
-            return 1
-    failed = []
-
-    def verdict(row, ok, detail):
-        print(("PASS %s" % row) if ok else ("FAIL %s %s" % (row, detail)), flush=True)
-        if not ok:
-            failed.append(row)
-
+def driver_rows(verdict):
     campaign = ["--iters=64", "--seed=1"]
     code, out, err = run(campaign)
     base = out.strip()
@@ -92,6 +88,97 @@ def main():
             code == 0 and last(out).endswith(": linear") and "re-timed pattern" in err,
             "exit=%d %s %s" % (code, last(out), last(err)))
 
+
+# Stand-in drivers for the oracle rows. Both print the report line C's and
+# the port's campaigns print; C's follows FAKE_C_PLAN, one step per run,
+# counting its runs in FAKE_C_COUNT. Its failures are C's own lines
+# (fuzzlib.c's iteration FAIL line, then its minimizer's note).
+FAKE_PORT = '''
+print("fuzz_gitignore: seed=1 iters=10 corpus=5 hash=0123456789abcdef ok")
+'''
+FAKE_C = r'''
+import os
+import sys
+count = os.environ["FAKE_C_COUNT"]
+n = int(open(count).read()) if os.path.exists(count) else 0
+with open(count, "w") as stream:
+    stream.write(str(n + 1))
+plan = os.environ["FAKE_C_PLAN"].split(",")
+step = plan[n] if n < len(plan) else "ok"
+if step in ("ok", "mismatch"):
+    digest = "0123456789abcdef" if step == "ok" else "fedcba9876543210"
+    print("fuzz_gitignore: seed=1 iters=10 corpus=5 hash=" + digest + " ok")
+    sys.exit(0)
+reason = {
+    "timing": "pattern '?????????????????????????' took 257 ms against a 476-byte path",
+    "set-timing": "a 32-rule set took 1104 ms over 32 paths",
+    "other": "pattern '[' read past its end at byte 1",
+    "signal": "pattern '*\\' took 364 ms against a 166-byte path",
+}[step]
+sys.stderr.write("fuzz_gitignore: FAIL seed=1 iter=7 corpus=builtin/ascii op=chunk-swap: " + reason + "\n")
+sys.stderr.write("fuzz: minimized input saved to crashes/x (4 bytes)\n")
+sys.exit(139 if step == "signal" else 1)
+'''
+
+
+def oracle_run(plan):
+    """tools/run-fuzz-gitignore's campaign against the stand-ins: (exit, C's runs, stderr)."""
+    with tempfile.TemporaryDirectory(prefix="gi-oracle-") as scratch:
+        root = Path(scratch)
+        (root / "tools").mkdir()
+        runner = root / "tools/run-fuzz-gitignore"
+        shutil.copyfile(ROOT / "tools/run-fuzz-gitignore", runner)
+        runner.chmod(0o755)
+        for path, body in ((root / "target/tools/fuzz-gitignore", FAKE_PORT),
+                           (root / "target/oracle/sagitta/build/fuzz_gitignore", FAKE_C)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("#!" + sys.executable + " -I\n" + body)
+            path.chmod(0o755)
+        count = root / "c-runs"
+        env = dict(os.environ, FUZZ_PREBUILT="1", FAKE_C_PLAN=plan, FAKE_C_COUNT=str(count))
+        try:
+            out = subprocess.run(["bash", str(runner), "--native", "--campaign", "--against-oracle", "--iters=10"],
+                                 cwd=root, env=env, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as error:
+            return 127, 0, str(error)
+        runs = int(count.read_text()) if count.exists() else 0
+        return out.returncode, runs, out.stdout + out.stderr
+
+
+def oracle_rows(verdict):
+    cases = (
+        ("fuzz-gitignore-oracle-timing-rerun", "timing,ok", 0, 2),
+        ("fuzz-gitignore-oracle-set-timing-rerun", "set-timing,ok", 0, 2),
+        ("fuzz-gitignore-oracle-timing-twice", "timing,timing,ok", 1, 2),
+        ("fuzz-gitignore-oracle-other-failure", "other,ok", 1, 1),
+        ("fuzz-gitignore-oracle-report-mismatch", "mismatch,ok", 1, 1),
+        ("fuzz-gitignore-oracle-signal", "signal,ok", 1, 1),
+    )
+    for row, plan, code_wanted, runs_wanted in cases:
+        code, runs, text = oracle_run(plan)
+        ok = code == code_wanted and runs == runs_wanted
+        if ok and runs_wanted == 2:
+            ok = "running its campaign once more" in text
+        verdict(row, ok, "plan=%s exit=%d C-runs=%d %s" % (plan, code, runs, last(text)))
+
+
+def main():
+    only_oracle = "--oracle-rows" in sys.argv[1:]
+    if not only_oracle and os.environ.get("FUZZ_PREBUILT") != "1":
+        built = subprocess.run(["tools/build-fuzz-gitignore", "--native"], cwd=ROOT)
+        if built.returncode != 0:
+            print("FAIL fuzz-gitignore-bound the driver did not build (exit %d)" % built.returncode)
+            return 1
+    failed = []
+
+    def verdict(row, ok, detail):
+        print(("PASS %s" % row) if ok else ("FAIL %s %s" % (row, detail)), flush=True)
+        if not ok:
+            failed.append(row)
+
+    if not only_oracle:
+        driver_rows(verdict)
+    oracle_rows(verdict)
     return 1 if failed else 0
 
 
