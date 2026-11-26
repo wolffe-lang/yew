@@ -4,14 +4,17 @@
     ci/legs-test.py
 
   L1  the legs by event: a pull request and a trunk push run `oracle` on
-      every host and `port` on every host but macOS, and both macOS jobs
-      of their own (`macos-fuzz`, `macos-perf`); the nightly and a
-      dispatch run both on every host; an event the planner does not know
-      gets the pull request's legs (never more); no event is a usage error.
+      every host and `port` on every host but macOS, and `macos-perf`; a
+      trunk push also runs `macos-fuzz`, which a pull request leaves; the
+      nightly and a dispatch run every leg and both macOS jobs; an event the
+      planner does not know gets the pull request's legs (never more); no
+      event is a usage error.
   L2  what the pull request leaves is exactly the macOS port, and the
       nightly runs it; the pull request keeps a macOS leg (the oracle's: its
       pty goldens caught wolf-lang#794 on macOS); every leg of every event
-      is one of the legs before tl30.
+      is one of the legs before tl30. A pull request leaves `macos-fuzz`
+      and a trunk push, the nightly and a dispatch run it: the one red only
+      a macOS fuzz family caught (yew#100) came on a trunk push.
   L3  the hosts before tl30 (.github/workflows/ci.yml at trunk 9bd219c):
       the nightly's legs are exactly those, so no leg left the nightly.
   L4  the wiring of .github/workflows/ci.yml: `legs` is the first job and
@@ -101,11 +104,13 @@ BEFORE = {
     "matrix_oracle": [{"os": U, "ccs": "--cc clang --cc gcc", "port": True}, {"os": M, "ccs": "--cc clang", "port": True},
                       {"os": A, "ccs": "--cc clang --cc gcc", "port": False}],
 }
-# The macOS fuzz and perf jobs ran on every event before tl30 and still do,
-# unless a trunk push finds them green at its commit (L8).
+# The macOS fuzz and perf jobs ran on every event before tl30. A pull
+# request now leaves macos-fuzz; every other event runs both, unless a trunk
+# push finds them green at its commit (L8).
 BEFORE.update(macos_fuzz=True, macos_perf=True)
 MERGE = {"matrix_port": [BEFORE["matrix_port"][0], BEFORE["matrix_port"][2]], "matrix_oracle": BEFORE["matrix_oracle"],
-         "macos_fuzz": True, "macos_perf": True}
+         "macos_fuzz": False, "macos_perf": True}
+PUSH = dict(MERGE, macos_fuzz=True)
 MOVED = {"matrix_port": [BEFORE["matrix_port"][1]], "matrix_oracle": []}
 
 
@@ -126,9 +131,10 @@ def hosts(m):
 
 
 # --- L1 the legs by event ---------------------------------------------------------
-for ev in ("pull_request", "push"):
+for ev, want, fz in (("pull_request", MERGE, "no macos-fuzz"), ("push", PUSH, "macos-fuzz")):
     got = plan(ev)
-    say(got == MERGE, "L1 %s: oracle on every host, port on every host but macOS (%s)" % (ev, json.dumps(hosts(got)) if "ERROR" not in got else got))
+    say(got == want, "L1 %s: oracle on every host, port on every host but macOS, macos-perf, %s (%s, macos_fuzz=%s)"
+        % (ev, fz, json.dumps(hosts(got)) if "ERROR" not in got else got, got.get("macos_fuzz")))
 for ev in ("schedule", "workflow_dispatch"):
     got = plan(ev)
     say(got == BEFORE, "L1 %s: both jobs on every host (%s)" % (ev, json.dumps(hosts(got)) if "ERROR" not in got else got))
@@ -143,8 +149,10 @@ if "ERROR" not in pr and "ERROR" not in night:
     say(left == MOVED, "L2 what a pull request leaves is exactly the macOS port: %s" % json.dumps({k: hosts({k: v})[k] for k, v in left.items() if v}))
     say(all(l in night[k] for k, v in matrices(pr).items() for l in v), "L2 every leg a pull request runs, the nightly runs too")
     say(any(l["os"] == M for l in pr["matrix_oracle"]), "L2 a pull request keeps a macOS leg: the oracle's (its pty goldens, wolf-lang#794)")
-    say(all(m.get(k) is True for m in (pr, night) for k in ("macos_fuzz", "macos_perf")),
-        "L2 a pull request and the nightly run macos-fuzz and macos-perf")
+    say(all(m.get("macos_perf") is True for m in (pr, night)), "L2 a pull request and the nightly run macos-perf")
+    fz = {e: plan(e).get("macos_fuzz") for e in ("pull_request", "push", "schedule", "workflow_dispatch")}
+    say(fz == {"pull_request": False, "push": True, "schedule": True, "workflow_dispatch": True},
+        "L2 a pull request leaves macos-fuzz; a trunk push, the nightly and a dispatch run it (yew#100 came on a trunk push): %s" % fz)
     every = [l for m in (plan(e) for e in ("pull_request", "push", "schedule", "workflow_dispatch")) for v in matrices(m).values() for l in v]
     say(all(any(l in v for v in BEFORE.values()) for l in every), "L2 every leg of every event is one of the legs before tl30")
 else:
@@ -536,7 +544,7 @@ def green(tree=None, step=True, drop=(), swap=None, extra=()):
     return js + list(extra)
 
 
-FULL = MERGE
+FULL = PUSH
 NO_MAC = {"matrix_port": MERGE["matrix_port"], "matrix_oracle": [l for l in MERGE["matrix_oracle"] if l["os"] != M],
           "macos_fuzz": False, "macos_perf": False}
 SEEN = []   # every plan's printed output, for the token check
