@@ -5,6 +5,22 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### A stalled runner no longer fails the gitignore fuzz (2026-11-26)
+
+- The port's `fuzz_gitignore` driver bounds each check at 250 ms (the
+  32-rule set at 1,000 ms), as C's driver does. A hosted macOS runner can
+  stall longer than that while the matcher does microseconds of work, which
+  turned two trunk pushes red (yew#171). A check or a rule set over its
+  bound is now read again, up to three readings, and fails only if every
+  reading is over, naming each one. The answers are folded from the first
+  reading, so the report line and its hash stay C's. The growth row
+  (`--scale`) takes each size's least of three interleaved rounds. C's driver
+  is the pinned oracle and keeps its single reading. CI now runs
+  `tools/check-fuzz-gitignore-timing` after each gitignore campaign, on the
+  driver that campaign built. It runs the growth row and holds the verdict
+  against a stall injected through a test hook: one stalled reading passes,
+  a check stalled on every reading fails.
+
 ### A pull request leaves the macOS fuzz job to trunk pushes (2026-11-26)
 
 - The `legs` job no longer plans `macos-fuzz` (the four macOS fuzz
