@@ -329,7 +329,9 @@ def no_build_families(work):
 
 
 WORKFLOWS = {
-    ".github/workflows/ci.yml": "99b6b77edccab30f4e9e0fc97fc5d98adc3955436fbc74967b1d0b2b403667ed",
+    # ci.yml with the trunk push lookup: the legs job reads runs, names its tree and hands its
+    # step the token, and macos-fuzz and macos-perf run where the plan says. No build line moved.
+    ".github/workflows/ci.yml": "571b32bdb09e8a0fab238acc37267ab90fae5b918a1a22b3e16a13878858d992",
     ".github/workflows/toyvm.yml": "dd36e8c9db62dfe80a252f6a064524b528762d0a48646984fbca54a7d70dd89f",
     ".github/workflows/float-hosts.yml": "73ee4db9283aedc1c4c782dbbd1320a5f29305e1fb612410be013278c4347373",
 }
