@@ -81,7 +81,7 @@ ORACLE = [
 ]
 MATRIX = {"port": PORT, "oracle": ORACLE}
 EVERY_LEG_EVENTS = ("schedule", "workflow_dispatch")
-FUZZ_EVENTS = ("push",)  # with EVERY_LEG_EVENTS: the events macos-fuzz runs on
+FUZZ_EVENTS = ("pull_request",)  # with EVERY_LEG_EVENTS: the events macos-fuzz runs on
 MAC = "macos-latest"
 
 # The trunk push's lookup.
