@@ -5,6 +5,26 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Add collapsed carets with Ctrl+Alt arrows and Alt-click (2026-11-26)
+
+- In L/W/B/Insert, Ctrl+Alt+Up/Down adds one caret above or below the
+  primary at its desired display column. The target becomes primary, so
+  repeated presses keep growing a column; reversing onto an existing caret
+  promotes it without duplication. Short lines clamp and edges do nothing.
+- Alt-only left clicks in document text append or promote a caret without
+  moving the previous one. Mixed modifiers, context menus and chrome keep
+  their existing routing. New additions beyond 10,000 refuse atomically;
+  promotion at the cap still works.
+- Add `:cursor-above`, `:cursor-below`, `:cursor-drop` and `:cursor-only`
+  alongside the dotted command names, with no additional key bindings.
+  Drop preserves the primary and removes the latest secondary. Resolved
+  click additions are recordable and replay by document offset.
+- The keys help and README describe this collapsed-only scope. H mixed
+  selections, strict-overlap geometry, internal paste and their undo/session
+  integration remain held. Ctrl-click definition is not part of this change.
+  Byte-injection rows cover the application; physical terminal forwarding
+  remains separate.
+
 ### A pull request leaves the macOS fuzz job to trunk pushes (2026-11-26)
 
 - The `legs` job no longer plans `macos-fuzz` (the four macOS fuzz

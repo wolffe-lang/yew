@@ -1243,6 +1243,27 @@ own. Any changed C golden is separately listed and pinned in
   differences, and has mutation selftests; `tools/check-runtime` still
   compares every other runtime file and regenerates the embedded copy.
 
+- **Collapsed cursor additions** (`src/edit/cursor_add.lu`, `mouse.lu`,
+  `pane_cmds.lu`): Ctrl+Alt+Up/Down and Alt-only left clicks add or promote
+  collapsed carets in L/W/B/I. A vertical target becomes primary, so repeats
+  grow through consecutive logical lines; reversing onto an existing target
+  promotes it without another identity. Display-column goals survive short
+  lines; new additions at the 10,000 cap refuse atomically, while promotion
+  remains allowed. Existing H commands keep their legacy behavior; mixed
+  selections, strict-overlap geometry, internal paste and their undo/session
+  integration remain held. Ctrl-click still opens the menu, not definition.
+  Four command aliases provide the fallback: `:cursor-above`, `:cursor-below`,
+  `:cursor-drop` (latest secondary), `:cursor-only` (primary only); dotted
+  names remain. The resolved mouse command is `ed.cursor.add.at`, recorder
+  word `cursor_add_at`; macros store its document offset, not coordinates.
+  Registry help supplies the same limits and aliases to the keys picker.
+  Rows: `src/edit_cursor_add_test.lu`, including 1/3/12 repeated chords in
+  each document mode, reversal, short/edge/cap cases, exact mouse modifiers,
+  command metadata and viewport-independent macro replay; `tools/editing-row`
+  exercises the shipped editor through a PTY. The default binding changes
+  are declared in `tests/runtime-defaults.delta.json`. Injected bytes prove
+  application behavior, not physical terminal forwarding.
+
 - **Linux console F1–F5** (yew#118, `src/term/input.lu`): the legacy
   decoder accepts `ESC [ [ A` through `ESC [ [ E`, as documented in
   `console_codes(4)`, alongside the existing SS3 and tilde spellings.
@@ -1260,8 +1281,8 @@ own. Any changed C golden is separately listed and pinned in
   search/diagnostic backgrounds and precedes secondary cursors. The input
   setup requests XTSHIFTESCAPE and all shared restore blobs reset it.
   Rows: `src/edit_selection_visibility_test.lu` and the rendering cases in
-  `tests/selection/run.py`. The other selection contracts remain literal
-  reds until their implementation stages; the observer and physical-census
+  `tests/selection/run.py`. Selection behaviors beyond the collapsed-caret
+  additions above remain held until their implementation stages; the observer and physical-census
   driver have independent tests. The protocol is documented in
   [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html);
   application overrides can be forbidden by terminal configuration.
