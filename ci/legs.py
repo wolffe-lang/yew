@@ -31,6 +31,11 @@ THE LEGS. A leg is one entry of a job's matrix: one host.
                 builds there. Since yw14 the macOS unit lanes are the
                 `macos-unit` job's eight shards, which run wherever this
                 plan gives `port` its macOS leg.
+  macos-fuzz    a push to trunk, the nightly and a dispatch: the four
+                macOS fuzz families against C (about an hour of a slot
+                each). A pull request leaves them: the one red only a macOS
+                fuzz family caught (yew#100) came on a trunk push, and a
+                pull request's Linux `fuzz` job runs the same campaigns.
 
 THE TRUNK PUSH'S macOS JOBS. Merges are fast-forwards, so a push to trunk
 runs the commit its pull request's run has just passed. On a `push` the
@@ -76,6 +81,7 @@ ORACLE = [
 ]
 MATRIX = {"port": PORT, "oracle": ORACLE}
 EVERY_LEG_EVENTS = ("schedule", "workflow_dispatch")
+FUZZ_EVENTS = ("push",)  # with EVERY_LEG_EVENTS: the events macos-fuzz runs on
 MAC = "macos-latest"
 
 # The trunk push's lookup.
@@ -115,8 +121,10 @@ def legs(event, leave=()):
     out = {"matrix_" + j: [l for l in v if merge_leg(j, l)] for j, v in MATRIX.items()}
     if "oracle-macos" in leave:
         out["matrix_oracle"] = [l for l in out["matrix_oracle"] if l["os"] != MAC]
-    out.update(macos_fuzz="macos-fuzz" not in leave, macos_perf="macos-perf" not in leave)
+    out.update(macos_fuzz=event in FUZZ_EVENTS and "macos-fuzz" not in leave, macos_perf="macos-perf" not in leave)
     why = "%s: the merge's legs (the macOS port is the nightly's)" % (event or "no event")
+    if event not in FUZZ_EVENTS:
+        why += "; macos-fuzz is a trunk push's, the nightly's and a dispatch's"
     if leave:
         why += ", less the macOS kinds green at this commit: " + ", ".join(sorted(leave))
     return out, why
