@@ -5,6 +5,17 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### A pull request leaves the macOS fuzz job to trunk pushes (2026-11-26)
+
+- The `legs` job no longer plans `macos-fuzz` (the four macOS fuzz
+  families against C, about an hour of a macOS slot each) for a pull
+  request. A push to trunk, the nightly and a dispatch still run it: the
+  one red only a macOS fuzz family caught, yew#100, came on a trunk push,
+  and a pull request's Linux `fuzz` job runs the same campaigns. Because a
+  pull request's run no longer has the job, a trunk push finds it green
+  only in a dispatch run at its commit and otherwise runs it.
+  `ci/legs-test.py` L1, L2 and L8 check the plan by event.
+
 ### A trunk push skips macOS jobs already green at its commit (2026-11-25)
 
 - Merges are fast-forwards, so a push to trunk runs the commit its pull
