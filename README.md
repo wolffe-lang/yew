@@ -23,8 +23,11 @@ original golden or C editor. The copied test VT alone has a
 Shift mouse capture. Explicitly approved visual differences are listed in
 `tools/goldens-divergences.txt`: each names the port's expected snapshot and
 pins the unchanged C golden's SHA-256. The harness prints each divergence
-by name; a changed C golden requires re-evaluation. Fletch stays Fletch: its scripts, data
-files and recorder output run on both editors.
+by name; a changed C golden requires re-evaluation. Fletch's shared language
+and data formats remain compatible. Recordings that depend on yew-specific
+interaction behavior, including resolved cursor additions and primary-frontier
+growth, require yew; the cross-editor corpus does not claim those additions
+on C yew.
 
 C yew's numeric quality gates (keypress to paint p99 <= 5 ms, cold start
 <= 20 ms, a 100 MB file <= 150 ms, binary <= 2,310,144 B, memory <= 1.6x
