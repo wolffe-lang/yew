@@ -240,7 +240,12 @@ changing the set; promoting an existing caret remains possible at the cap.
 
 Cursor additions can be recorded in macros. A mouse addition records the
 resolved document offset, not its screen coordinates, so replay does not
-follow a changed viewport. Injected-byte tests establish application behavior;
+follow a changed viewport. While recording, an Alt-click in another view is
+refused before changing focus; select the view before starting the recording. Without recording,
+the clicked view owns its own cursor set. Ordinary clicks retain noncoincident
+secondary carets and normalize matching points; `:cursor-only` is the explicit
+way to keep one caret. Escape retains its existing mode behavior.
+Injected-byte tests establish application behavior;
 physical terminal forwarding is separate. During a physical byte capture,
 a missing chord is recorded as not received; injected bytes do not establish
 whether a desktop intercepted it. Ctrl-click still opens the existing menu;
