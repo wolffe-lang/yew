@@ -16,7 +16,7 @@ import sys
 
 import os
 
-FILES = ["init.fl", "themes/quiver-dark.fl", "themes/quiver-light.fl"]
+FILES = ["init.fl", "themes/quiver-dark.fl", "themes/quiver-light.fl", "themes/quiver-16.fl"]
 
 
 def completions(root):
