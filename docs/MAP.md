@@ -1259,7 +1259,10 @@ own. Any changed C golden is separately listed and pinned in
   integration remain held. Ctrl-click still opens the menu, not definition.
   Four command aliases provide the fallback: `:cursor-above`, `:cursor-below`,
   `:cursor-drop` (latest secondary), `:cursor-only` (primary only); dotted
-  names remain. The resolved mouse command is `ed.cursor.add.at`, recorder
+  names retain C's previous-primary behavior. The new Ctrl+Alt keys use
+  distinct recordable `ed.cursor.key.above`/`below` operations; key-frontier
+  replay does not change the legacy dotted commands or their macro words.
+  The resolved mouse command is `ed.cursor.add.at`, recorder
   word `cursor_add_at`; macros store its document offset, not coordinates.
   Registry help supplies the same limits and aliases to the keys picker.
   Rows: `src/edit_cursor_add_test.lu`, including 1/3/12 repeated chords in

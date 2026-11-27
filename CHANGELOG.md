@@ -5,6 +5,15 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Keep legacy cursor commands compatible with C (2026-11-27)
+
+- The existing dotted add-above/below commands and their aliases retain the
+  previous primary like C yew. The new Ctrl+Alt keys have separate recordable
+  operations that promote the destination, including during macro replay.
+- The common LSP fixture sequences and strict C/port snapshot comparison are
+  unchanged. Independent checks now pin edited/restored text, two carets and
+  exact saved bytes instead of relying only on each server matching its disk.
+
 ### Add collapsed carets with Ctrl+Alt arrows and Alt-click (2026-11-26)
 
 - In L/W/B/Insert, Ctrl+Alt+Up/Down adds one caret above or below the

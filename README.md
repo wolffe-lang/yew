@@ -236,11 +236,15 @@ Default editing keys, independently of the command prompt:
   their actions. H additions that mix carets and selections are not
   implemented by this change.
 
-When a terminal or desktop does not deliver Ctrl+Alt arrows, use
-`:cursor-above` or `:cursor-below`. `:cursor-drop` removes the latest secondary
-caret, preserving the primary; `:cursor-only` keeps only the primary. The
-existing dotted command names (`:cursor.add.above`, `:cursor.add.below`,
-`:cursor.drop`, `:cursor.collapse`) still work. There are no additional fallback
+`:cursor-above` or `:cursor-below` adds a neighbouring caret while retaining
+its previous primary, like the existing dotted commands in C yew. These
+compatibility aliases do not advance the Ctrl+Alt key's primary frontier.
+`:cursor-drop` removes the latest secondary caret, preserving the primary;
+`:cursor-only` keeps only the primary. The existing dotted command names
+(`:cursor.add.above`, `:cursor.add.below`, `:cursor.drop`, `:cursor.collapse`)
+still work. The new keys use separate recordable operations, so their
+promotion survives macro replay without changing legacy command semantics.
+There are no additional fallback
 key bindings. The cap is 10,000: a new caret past the cap is refused without
 changing the set; promoting an existing caret remains possible at the cap.
 
