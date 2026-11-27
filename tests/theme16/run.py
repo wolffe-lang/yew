@@ -57,7 +57,7 @@ def document(vt):
     raise ValueError('complete current document absent from document rows')
 
 
-def judge(raw):
+def judge(raw, mode='indexed'):
     vt = VT()
     vt.feed(raw)
     first, offsets = document(vt)
@@ -67,12 +67,19 @@ def judge(raw):
         cells = [vt.cells[first + n, x + k] for k in range(len(token))]
         actual[name] = {'row': first + n, 'column': x, 'text': token,
                         'styles': [c[1] for c in cells]}
-        matched[name] = all(c[1] == (('index', pen), ('index', 0), attrs) for c in cells)
+        if mode == 'dark16':
+            pen = 8 if name in ('boolean', 'number', 'comment') else 7
+        expected = (('index', pen), ('index', 0), attrs)
+        if mode in ('mono', 'dumb'):
+            expected = (('default',), ('default',), () if mode == 'dumb' else attrs)
+        matched[name] = all(c[1] == expected for c in cells)
     results = {
         'syntax16-auto-keyword-pen': matched['keyword'] and matched['plain'],
         'syntax16-auto-boolean-pen': matched['boolean'] and matched['plain'],
         'syntax16-auto-palette': all(matched[k] for k in ('number', 'string', 'function', 'comment')),
     }
+    if mode != 'indexed':
+        results = {name.replace('auto', mode): ok for name, ok in results.items()}
     return results, actual, vt
 
 
@@ -110,7 +117,7 @@ def self_test():
 
 
 class Session:
-    def __init__(self, binary, out, term, extra):
+    def __init__(self, binary, out, term, extra, theme=None, config=None, custom=False):
         self.out, self.raw = out, bytearray()
         self.cwd = out / 'scratch'
         self.cwd.mkdir()
@@ -118,6 +125,16 @@ class Session:
             (self.cwd / p).mkdir()
         fixture = self.cwd / 'sample.lu'
         fixture.write_text(SAMPLE)
+        config_dir = self.cwd / 'config' / 'yew'
+        if config or custom:
+            config_dir.mkdir()
+        if config:
+            (config_dir / 'init.fl').write_text(f'set({{ theme: "{config}" }})\n')
+        if custom:
+            (config_dir / 'themes').mkdir()
+            src = (HERE.parent.parent / 'runtime/themes/quiver-16.fl').read_text()
+            assert src.count('name: "quiver-16"') == 1
+            (config_dir / 'themes' / 'fixture-custom.fl').write_text(src.replace('name: "quiver-16"', 'name: "fixture-custom"'))
         env = os.environ.copy()
         for key in ('YEW_THEME', 'YEW_COLORS', 'NO_COLOR', 'YEW_RUNTIME_DIR', 'COLORTERM', 'TERM_PROGRAM'):
             env.pop(key, None)
@@ -132,7 +149,10 @@ class Session:
         if not self.pid:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
             os.chdir(self.cwd)
-            os.execve(binary, [binary, str(fixture)], env)
+            argv = [binary, '--no-workspace-config']
+            if theme:
+                argv += ['--theme', theme]
+            os.execve(binary, argv + [str(fixture)], env)
         (out / 'pid').write_text(str(self.pid) + '\n')
         os.set_blocking(self.fd, False)
 
@@ -160,6 +180,11 @@ class Session:
         os.write(self.fd, b':q!\r')
         self.pump(1)
         pid, status = os.waitpid(self.pid, os.WNOHANG)
+        deadline = time.monotonic() + 2
+        while not pid and time.monotonic() < deadline:
+            # EOF can precede process exit; still reap this exact recorded child.
+            select.select([], [], [], .01)
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
         (self.out / 'session.raw').write_bytes(self.raw)
         os.close(self.fd)
         if not pid:
@@ -174,6 +199,11 @@ def main():
     parser.add_argument('--out', type=Path)
     parser.add_argument('--term', default='linux')
     parser.add_argument('--env', action='append', default=[])
+    parser.add_argument('--theme')
+    parser.add_argument('--config-theme')
+    parser.add_argument('--custom', action='store_true')
+    parser.add_argument('--style-mode', choices=('indexed', 'dark16', 'mono', 'dumb', 'observe'), default='indexed')
+    parser.add_argument('--reference', type=Path)
     args = parser.parse_args()
     if args.self_test:
         self_test()
@@ -181,12 +211,18 @@ def main():
     if not args.binary or not args.out:
         parser.error('--binary and --out required')
     binary = str(Path(args.binary).resolve())
+    if not Path(binary).is_file() or not os.access(binary, os.X_OK):
+        print('INFRA binary is absent or not executable', flush=True)
+        return 2
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     receipt = {'binary_sha256': digest(binary), 'sample_sha256': digest(HERE / 'sample.lu'),
                'judge_sha256': digest(__file__), 'platform': sys.platform, 'rows': 24, 'cols': 80,
-               'probe_replies': False, 'loose_assets': False}
-    session = Session(binary, out, args.term, dict(x.split('=', 1) for x in args.env))
+               'probe_replies': False, 'loose_assets': bool(args.custom)}
+    receipt['inputs'] = {'cli_theme': args.theme, 'config_theme': args.config_theme,
+                         'custom': args.custom, 'style_mode': args.style_mode}
+    session = Session(binary, out, args.term, dict(x.split('=', 1) for x in args.env),
+                      args.theme, args.config_theme, args.custom)
     receipt['environment'] = session.env
     results = {}
     error = ''
@@ -194,7 +230,19 @@ def main():
         session.pump(1.5)
         frame = bytes(session.raw)
         (out / 'frame.raw').write_bytes(frame)
-        results, actual, vt = judge(frame)
+        results, actual, vt = judge(frame, args.style_mode)
+        if args.style_mode == 'observe':
+            results = {}
+            print('OBSERVE explicit reference document (not an indexed-palette pass)', flush=True)
+        if args.reference:
+            ref = json.loads(args.reference.read_text())
+            assert ref['document_verified'] and ref['editor_exit'] == 0
+            assert ref['binary_sha256'] == receipt['binary_sha256']
+            assert ref['sample_sha256'] == receipt['sample_sha256']
+            assert ref['judge_sha256'] == receipt['judge_sha256']
+            current = json.loads(json.dumps(actual))
+            results = {'syntax16-rich-auto-matches-explicit-dark': current == ref['actual']}
+            receipt['reference_sha256'] = digest(args.reference)
         receipt.update(document_verified=True, results=results, actual=actual,
                        frame_sha256=hashlib.sha256(frame).hexdigest(),
                        cells=[{'row': y, 'column': x, 'text': ch, 'style': style}
@@ -202,7 +250,7 @@ def main():
         for name, passed in results.items():
             print(('PASS ' if passed else 'FAIL ') + name, flush=True)
         print('ACTUAL ' + json.dumps(actual, sort_keys=True), flush=True)
-    except (ValueError, KeyError, IndexError, RuntimeError) as exc:
+    except (ValueError, KeyError, IndexError, RuntimeError, AssertionError, OSError) as exc:
         error = str(exc)
         receipt.update(document_verified=False, error=error)
         print('INFRA ' + error, flush=True)
@@ -218,7 +266,7 @@ def main():
         (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     if error or status != 0:
         return 2
-    return 0 if results and all(results.values()) else 1
+    return 0 if (results and all(results.values())) or (args.style_mode == 'observe' and not args.reference) else 1
 
 
 if __name__ == '__main__':
