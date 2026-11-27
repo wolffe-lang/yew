@@ -5,6 +5,23 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
+### Explicit sixteen-colour syntax and automatic selection (2026-11-27)
+
+- The requested `theme` now defaults to `auto`, resolving to the new
+  `quiver-16` only for the active sixteen-colour rendition and `quiver-dark`
+  otherwise. The option retains the request; a late capability result can
+  change the active identity without repeatedly reloading the theme.
+- `quiver-16` gives all 54 syntax styles explicit ANSI indices against a
+  black document, preserving emphasis and monochrome behavior. Other UI
+  roles, the global quantizer, the original themes and the syntax definitions
+  are unchanged. Existing explicit names, XDG overrides, `--theme` and
+  `YEW_THEME` precedence remain, as do NO_COLOR and dumb-terminal suppression.
+- Exact runtime checks keep the theme-default change separate from the
+  binding ledger, conserve every original payload and verify the new
+  embedded asset. The actual Wolf sample covers 27 classes; the style legend
+  covers all 54. PAX console acceptance follows with the next editor pin
+  update; a rendering of captured terminal bytes is not a framebuffer take.
+
 ### A stalled runner no longer fails the gitignore fuzz (2026-11-26)
 
 - The port's `fuzz_gitignore` driver bounds each check at 250 ms (the
