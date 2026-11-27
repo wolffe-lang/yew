@@ -124,7 +124,8 @@ class Session:
         env.update(HOME=str(self.cwd / 'home'), XDG_CONFIG_HOME=str(self.cwd / 'config'),
                    XDG_STATE_HOME=str(self.cwd / 'state'), XDG_CACHE_HOME=str(self.cwd / 'cache'),
                    TMPDIR=str(self.cwd / 'tmp'), SHELL='/bin/sh', TERM=term,
-                   YEW_LOG=str(out / 'yew.log'), YEW_CLIPBOARD='none')
+                   PATH='/usr/bin:/bin', LANG='C.UTF-8',
+                   YEW_LOG=str(out / 'yew.log'), YEW_CLIPBOARD='none', YEW_OSC52='off')
         env.update(extra)
         self.env = {k: env.get(k) for k in ('TERM', 'YEW_THEME', 'YEW_COLORS', 'NO_COLOR', 'YEW_RUNTIME_DIR')}
         self.pid, self.fd = pty.fork()
@@ -132,6 +133,7 @@ class Session:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
             os.chdir(self.cwd)
             os.execve(binary, [binary, str(fixture)], env)
+        (out / 'pid').write_text(str(self.pid) + '\n')
         os.set_blocking(self.fd, False)
 
     def pump(self, seconds):
@@ -151,18 +153,17 @@ class Session:
             self.raw.extend(chunk)
 
     def finish(self):
-        os.write(self.fd, b'\x1b:q!\r')
+        # A contiguous ESC-colon is an Alt-colon key, not Escape then a prompt.
+        for _ in range(3):
+            os.write(self.fd, b'\x1b')
+            self.pump(.25)
+        os.write(self.fd, b':q!\r')
         self.pump(1)
         pid, status = os.waitpid(self.pid, os.WNOHANG)
-        if not pid:
-            # Quit normally; never silently accept a hung editor.
-            os.write(self.fd, b'\x1b:q!\r')
-            self.pump(1)
-            pid, status = os.waitpid(self.pid, os.WNOHANG)
-        if not pid:
-            raise RuntimeError('editor did not quit after two explicit quit commands')
-        os.close(self.fd)
         (self.out / 'session.raw').write_bytes(self.raw)
+        os.close(self.fd)
+        if not pid:
+            raise RuntimeError('editor did not quit after normalized Escape and explicit quit')
         return os.waitstatus_to_exitcode(status)
 
 
@@ -206,7 +207,13 @@ def main():
         receipt.update(document_verified=False, error=error)
         print('INFRA ' + error, flush=True)
     finally:
-        status = session.finish()
+        try:
+            status = session.finish()
+        except (RuntimeError, OSError) as exc:
+            status = None
+            error = str(exc)
+            receipt['cleanup_error'] = error
+            print('INFRA ' + error, flush=True)
         receipt['editor_exit'] = status
         (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     if error or status != 0:
