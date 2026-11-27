@@ -1239,9 +1239,25 @@ own. Any changed C golden is separately listed and pinned in
   Rows: `src/edit_editing_ergonomics_test.lu` and `tools/editing-row`.
   `tests/runtime-defaults.delta.json` records each key's old/new row and
   reason. `tools/check-runtime-delta` reconstructs the complete runtime
-  file from the pinned oracle plus those entries, rejects undeclared
-  differences, and has mutation selftests; `tools/check-runtime` still
-  compares every other runtime file and regenerates the embedded copy.
+  file from the pinned oracle plus those entries and the separate exact
+  theme-default delta, rejects undeclared differences, and has mutation
+  selftests; `tools/check-runtime` still compares every original asset and
+  regenerates the embedded copy.
+
+- **Indexed syntax and automatic theme selection**: the requested `theme`
+  defaults to `auto`; only the active sixteen-colour rendition resolves it to
+  the additive `quiver-16` theme. Truecolour, 256-colour, monochrome and dumb
+  retain `quiver-dark`; explicit names retain their existing loading and
+  startup precedence. The requested option and active identity are separate,
+  with resolution at startup and the existing late-probe seam, not a reload
+  loop. All 54 attrs use explicit indices; syntax flags and mono styles are
+  preserved. Only the document base becomes indexed 7/0; shared palette
+  symbols and every other UI role are unchanged. The two original themes,
+  seven syntax definitions and remaining runtime payloads stay byte-identical.
+  Rows: `src/edit_theme16_test.lu`, `tests/theme16/run.py` and
+  `tests/theme16/check.py`; the real Wolf sample emits 27 classes, not 54.
+  PAX console acceptance is a separate follow-up for the next editor pin
+  update, not established by a rendering of captured terminal bytes.
 
 - **Collapsed cursor additions** (`src/edit/cursor_add.lu`, `mouse.lu`,
   `pane_cmds.lu`): Ctrl+Alt+Up/Down and Alt-only left clicks add or promote
