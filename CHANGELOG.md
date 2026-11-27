@@ -20,6 +20,12 @@ The format follows Keep a Changelog; the port has no release yet.
   driver that campaign built. It runs the growth row and holds the verdict
   against a stall injected through a test hook: one stalled reading passes,
   a check stalled on every reading fails.
+- C's driver is the pinned oracle and keeps its single reading. So
+  `tools/run-fuzz-gitignore` runs C's campaign once more when, and only
+  when, C failed on its own timing bound: exit 1, with exactly one FAIL line
+  whose reason is one of C's two timing messages. Any other C failure, a
+  second failure or a report mismatch still fails at once. The same script's
+  oracle rows run the runner against stand-in drivers to hold this.
 
 ### A pull request leaves the macOS fuzz job to trunk pushes (2026-11-26)
 
