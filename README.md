@@ -225,10 +225,16 @@ Default editing keys, independently of the command prompt:
   clamp without padding. Reversing direction onto an existing caret promotes
   it without adding a duplicate. At the first/last line there is no addition.
 - **Alt+left-click in document text:** in L/W/B/Insert, append a caret at the
-  clicked grapheme and make it primary. Clicking an existing caret promotes
-  it, never toggles it away. Mixed modifier clicks do not add carets; existing
-  context menus and pane/tab controls retain their actions. H additions that
-  mix carets and selections are not implemented by this change.
+  clicked grapheme and make it primary. An independent click on an existing
+  caret promotes it, never toggles it away. A second Alt press in the same
+  cell and view within the double-click interval keeps the existing
+  whitespace-word selection gesture: it supersedes the first click's
+  speculative addition and restores the previous primary, without blanket
+  collapse of earlier secondary carets. Existing coincident-point
+  normalization is unchanged, and stamps are not rewound. Mixed modifier clicks
+  do not add carets; existing context menus and pane/tab controls retain
+  their actions. H additions that mix carets and selections are not
+  implemented by this change.
 
 When a terminal or desktop does not deliver Ctrl+Alt arrows, use
 `:cursor-above` or `:cursor-below`. `:cursor-drop` removes the latest secondary
@@ -240,7 +246,9 @@ changing the set; promoting an existing caret remains possible at the cap.
 
 Cursor additions can be recorded in macros. A mouse addition records the
 resolved document offset, not its screen coordinates, so replay does not
-follow a changed viewport. While recording, an Alt-click in another view is
+follow a changed viewport. When a double-click becomes word selection, its
+speculative addition is removed from the recording too; the word selection
+itself retains its legacy recording behavior. While recording, an Alt-click in another view is
 refused before changing focus; select the view before starting the recording. Without recording,
 the clicked view owns its own cursor set. Ordinary clicks retain noncoincident
 secondary carets and normalize matching points; `:cursor-only` is the explicit

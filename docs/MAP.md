@@ -1249,7 +1249,12 @@ own. Any changed C golden is separately listed and pinned in
   grow through consecutive logical lines; reversing onto an existing target
   promotes it without another identity. Display-column goals survive short
   lines; new additions at the 10,000 cap refuse atomically, while promotion
-  remains allowed. Existing H commands keep their legacy behavior; mixed
+  remains allowed. Alt-double-click retains whitespace-word selection: its
+  second press rolls back only the first speculative addition and its record
+  entry, restores the previous primary and preserves earlier secondary
+  carets without rewinding stamps (`cursor_click.lu`). Timing, cell/view and
+  invocation/buffer-generation guards prevent unrelated work from being
+  reverted. Existing H commands keep their legacy behavior; mixed
   selections, strict-overlap geometry, internal paste and their undo/session
   integration remain held. Ctrl-click still opens the menu, not definition.
   Four command aliases provide the fallback: `:cursor-above`, `:cursor-below`,
