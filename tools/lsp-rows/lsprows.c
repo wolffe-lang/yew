@@ -140,6 +140,44 @@ static void lsprow_dump(PtyCtx *c, const char *label)
     }
 }
 
+/* Preserve the actual saved file for an independent editing-intent oracle.
+ * A server whose own view matches its own disk is not that oracle. */
+static void lsprow_keep_saved(PtyCtx *c)
+{
+    const char *out = getenv("YEW_LSPROW_OUT");
+    char input[PATH_MAX], output[PATH_MAX];
+    Bytebuf bytes;
+    FILE *f;
+    int n, m, ch;
+    bool ok;
+
+    if (c->failed || out == NULL || out[0] == '\0')
+        return;
+    n = snprintf(input, sizeof(input), "%s/src/main.lu", c->workspace_dir);
+    m = snprintf(output, sizeof(output), "%s/run%u/%s.saved", out,
+                 lsprow_run, c->test->name);
+    if (n <= 0 || (size_t)n >= sizeof(input) ||
+        m <= 0 || (size_t)m >= sizeof(output)) {
+        ptc_check(c, false, "saved-byte receipt path overflow");
+        return;
+    }
+    f = fopen(input, "rb");
+    if (f == NULL) {
+        ptc_check(c, false, "could not read saved document for intent check");
+        return;
+    }
+    bytebuf_init(&bytes);
+    while ((ch = fgetc(f)) != EOF)
+        bytebuf_push_u8(&bytes, (u8)ch);
+    ok = !ferror(f);
+    if (fclose(f) != 0)
+        ok = false;
+    if (ok)
+        ok = write_bytes(output, bytes.data, bytes.len);
+    ptc_check(c, ok, "could not retain actual saved document bytes");
+    bytebuf_free(&bytes);
+}
+
 /* A wait that failed prints the screen it gave up on (the snapshot's text
  * section, the cursor first), so a red row says what it saw. */
 static void lsprow_show_failure(PtyCtx *c)
@@ -561,6 +599,7 @@ static void case_lspf_mirror_sync(PtyCtx *c)
     ptc_check(c, s43_screen_contains(&c->vt, "view matches disk"),
               "the server's view differs from the saved buffer");
     lsprow_dump(c, "1-saved");
+    lsprow_keep_saved(c);
     force_quit(c);
 }
 
