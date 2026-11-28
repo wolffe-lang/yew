@@ -131,6 +131,8 @@ tools/oracle --unit              # C yew at the pin, gcc and clang, its unit sui
 tools/goldens --yew target/release/yew
 tools/check-fletch-goldens target/release/yew   # Fletch: 39 units, stressed and twice
 python3 -I tools/editing-row target/native/yew # byte-exact editing regressions through a PTY
+python3 -I tests/theme16/matrix.py --binary target/native/yew --out target/theme16-fresh
+                                 # theme startup, overrides and suppression; destination must be new
 tools/check-fletch-coverage target/release/yew  # the coverage gate and its ledger
 python3 -I tools/check-syntax-cohort --yew target/release/yew --oracle target/oracle/sagitta --work NEW_DIR
                                  # the first 132 syntax goldens, each dumped twice
@@ -173,6 +175,29 @@ the row above and wraps at the top to the true last row, beyond the visible
 page if necessary. Up before entering the table still walks history.
 Down at the bottom still returns focus to the command line, keeping the
 last candidate.
+
+## Syntax themes
+
+`theme` defaults to `"auto"`: it selects `quiver-16` for the active sixteen-colour
+rendition and `quiver-dark` otherwise. The requested option stays `"auto"`;
+capability probing can change the active theme once at startup. `YEW_COLORS`
+still overrides the probe, which overrides the TERM-derived colour tier.
+`NO_COLOR`, including an empty value, and `TERM=dumb` still suppress colour.
+
+`quiver-16` uses explicit ANSI indices for all 54 syntax styles, with a black
+(index 0) document and light-grey (index 7) ordinary text. Bright colours are
+explicit indices, not normal hues made bright by bold. Existing emphasis,
+monochrome styles and other UI roles remain unchanged; the global RGB
+quantizer is unchanged. The sample in `tests/theme16/sample.lu` emits 27 Wolf
+classes; the remaining registered styles belong to other grammars or surfaces.
+
+Choose a fixed theme in `init.fl` with `set({ theme: "quiver-dark" })`,
+`"quiver-light"`, `"quiver-16"`, or a custom name. `yew --theme NAME FILE`
+still takes precedence over `YEW_THEME`; both override configuration.
+`$XDG_CONFIG_HOME/yew/themes/NAME.fl` still overrides the bundled theme.
+Setting a theme explicitly reloads its source; an unchanged probe result does
+not. The separate `theme_auto` background dark/light policy is unchanged.
+The full `tools/editing-row` run also gates the PTY theme matrix in hosted CI.
 
 ## Selection display
 
@@ -283,8 +308,9 @@ empty pair.
 
 These are intentional differences from C yew. The default-runtime delta
 in `tests/runtime-defaults.delta.json` names each changed binding and
-its reason; `tools/check-runtime` verifies the entire file against the
-oracle plus exactly that delta.
+its reason. The independent `tests/runtime-theme-default.delta.json` names
+only the exact `quiver-dark` to `auto` default change; `tools/check-runtime`
+verifies the entire file against the oracle plus exactly these deltas.
 
 The language-server keys: in L mode `K` hover, `g d` definition, `g D`
 declaration, `g y` type definition, `g i` implementation, `g r`
