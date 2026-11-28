@@ -5,11 +5,13 @@ The format follows Keep a Changelog; the port has no release yet.
 
 ## Unreleased
 
-### Keep legacy cursor commands compatible with C (2026-11-27)
+### Keep dotted cursor commands compatible with C (2026-11-28)
 
-- The existing dotted add-above/below commands and their aliases retain the
-  previous primary like C yew. The new Ctrl+Alt keys have separate recordable
-  operations that promote the destination, including during macro replay.
+- The existing dotted add-above/below commands retain the previous primary
+  like C yew. The new Ctrl+Alt keys and `:cursor-above`/`:cursor-below` aliases
+  share separate recordable operations that promote the destination and
+  advance the same frontier, including during macro replay. The aliases
+  are the matching fallback when a terminal does not deliver the chords.
 - The common LSP fixture sequences and strict C/port snapshot comparison are
   unchanged. Independent checks now pin edited/restored text, two carets and
   exact saved bytes instead of relying only on each server matching its disk.
